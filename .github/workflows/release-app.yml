@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Existing public-beta tag version"
+        description: "Existing release tag version"
         required: true
-        default: "0.2.0-beta.1"
+        default: "0.2.0"
         type: string
       toolchain_version:
         description: "Published toolchain version"
@@ -14,8 +14,9 @@ on:
         default: "2.0.0"
         type: string
       benchmark_run_id:
-        description: "Successful Release Benchmark Evidence workflow run ID"
-        required: true
+        description: "Optional authenticated Release Benchmark Evidence workflow run ID"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -23,28 +24,26 @@ permissions:
   actions: read
 
 concurrency:
-  group: public-beta-release
+  group: release-publication
   cancel-in-progress: false
 
 jobs:
-  build-and-test:
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: [self-hosted, macOS, ARM64, easysplat-release, easysplat-ephemeral]
+  live-policy-preflight:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: ubuntu-24.04
+    environment: release-verification
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      build_artifact_id: ${{ steps.upload-build.outputs.artifact-id }}
-      build_artifact_digest: ${{ format('sha256:{0}', steps.upload-build.outputs.artifact-digest) }}
-      benchmark_artifact_id: ${{ steps.benchmark-identity.outputs.artifact_id }}
-      benchmark_artifact_digest: ${{ steps.benchmark-identity.outputs.artifact_digest }}
+      source_commit: ${{ steps.authority.outputs.source_commit }}
+      benchmark_artifact_id: ${{ steps.authority.outputs.benchmark_artifact_id }}
+      benchmark_artifact_digest: ${{ steps.authority.outputs.benchmark_artifact_digest }}
+      authority_artifact_id: ${{ steps.upload-authority.outputs.artifact-id }}
+      authority_artifact_digest: ${{ format('sha256:{0}', steps.upload-authority.outputs.artifact-digest) }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-
-      - name: Verify protected source, tag, and repository policy
+      - name: Bind protected main and benchmark authority
+        id: authority
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
@@ -52,50 +51,321 @@ jobs:
           INPUT_TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
           INPUT_BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
         run: |
-          semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-          VERSION="$INPUT_VERSION"
-          TOOLCHAIN_VERSION="$INPUT_TOOLCHAIN_VERSION"
-          if ! [[ "$VERSION" =~ $semver_re ]] || [[ "$VERSION" != *-* ]]; then
-            echo "App version must be a semantic prerelease: $VERSION" >&2
-            exit 1
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$DEFAULT_BRANCH" = "main"
+          /usr/bin/python3 -I - "$INPUT_VERSION" "$INPUT_TOOLCHAIN_VERSION" "$INPUT_BENCHMARK_RUN_ID" <<'PY'
+          import re
+          import sys
+
+          app, toolchain, benchmark = sys.argv[1:]
+          core = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+          if re.fullmatch(core, app) is None:
+              raise SystemExit("app version must be stable semantic versioning without build metadata")
+          if re.fullmatch(core, toolchain) is None:
+              raise SystemExit("toolchain version must be stable semantic versioning without build metadata")
+          if benchmark and re.fullmatch(r"[1-9][0-9]*", benchmark) is None:
+              raise SystemExit("benchmark run ID must be a positive integer")
+          PY
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          CURRENT_HEAD="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          test "$CURRENT_HEAD" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          TAG="v$INPUT_VERSION"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
+          EXISTING_RELEASE="$RUNNER_TEMP/easysplat-existing-release.json"
+          if gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >"$EXISTING_RELEASE" 2>/dev/null; then
+            OWNER="easysplat-release-owner:v2:${GITHUB_RUN_ID}:${GITHUB_SHA}"
+            jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" --arg owner "<!-- $OWNER -->" '
+              (.id | type == "number" and . > 0) and
+              .tag_name == $tag and .target_commitish == $commit and
+              .draft == true and .prerelease == false and .immutable == false and
+              (.body | type == "string" and contains($owner))
+            ' "$EXISTING_RELEASE" >/dev/null
           fi
-          if ! [[ "$TOOLCHAIN_VERSION" =~ $semver_re ]]; then
-            echo "Invalid toolchain semantic version: $TOOLCHAIN_VERSION" >&2
-            exit 1
+          ARTIFACT_ID=""
+          ARTIFACT_DIGEST=""
+          if [ -n "$INPUT_BENCHMARK_RUN_ID" ]; then
+            RUN_API="repos/$GITHUB_REPOSITORY/actions/runs/$INPUT_BENCHMARK_RUN_ID"
+            test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$RUN_API" --jq .head_sha)" = "$GITHUB_SHA"
+            test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$RUN_API" --jq .event)" = "workflow_dispatch"
+            test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$RUN_API" --jq .conclusion)" = "success"
+            test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$RUN_API" --jq '.path | split("@")[0]')" = ".github/workflows/benchmark-release.yml"
+            EXPECTED_NAME="easysplat-benchmark-$GITHUB_SHA"
+            ARTIFACT_IDS="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' --paginate \
+              "$RUN_API/artifacts" --jq ".artifacts[] | select(.name == \"$EXPECTED_NAME\" and .expired == false) | .id")"
+            test "$(printf '%s\n' "$ARTIFACT_IDS" | sed '/^$/d' | wc -l | tr -d '[:space:]')" = "1"
+            ARTIFACT_ID="$(printf '%s\n' "$ARTIFACT_IDS" | sed '/^$/d')"
+            ARTIFACT_DIGEST="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .digest)"
+            [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           fi
-          if ! [[ "$INPUT_BENCHMARK_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "Benchmark run ID must be a positive integer." >&2
-            exit 1
-          fi
-          CURRENT_HEAD="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
-          test "$GITHUB_SHA" = "$CURRENT_HEAD"
-          test -z "$(git status --porcelain)"
-          TAG="v$VERSION"
-          test "$(git rev-parse "$TAG^{commit}")" = "$GITHUB_SHA"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
-          if gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists and will not be overwritten." >&2
-            exit 1
-          fi
+          AUTHORITY_ROOT="$RUNNER_TEMP/easysplat-live-release-authority"
+          test ! -e "$AUTHORITY_ROOT"
+          mkdir -m 0700 "$AUTHORITY_ROOT"
+          /usr/bin/python3 -I - \
+            "$AUTHORITY_ROOT/release-authority.json" \
+            "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$TAG" \
+            "$INPUT_VERSION" "$INPUT_TOOLCHAIN_VERSION" \
+            "$INPUT_BENCHMARK_RUN_ID" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$GITHUB_WORKFLOW_REF" "$GITHUB_WORKFLOW_SHA" <<'PY'
+          import json
+          import os
+          import sys
+
+          destination = sys.argv[1]
+          payload = {
+              "schemaVersion": 1,
+              "repository": sys.argv[2],
+              "sourceCommit": sys.argv[3],
+              "tag": sys.argv[4],
+              "appVersion": sys.argv[5],
+              "toolchainVersion": sys.argv[6],
+              "benchmark": (
+                  {
+                      "runID": sys.argv[7],
+                      "artifactID": sys.argv[8],
+                      "artifactDigest": sys.argv[9],
+                  }
+                  if sys.argv[7]
+                  else None
+              ),
+              "workflowRunID": sys.argv[10],
+              "workflowRunAttempt": sys.argv[11],
+              "workflowRef": sys.argv[12],
+              "workflowSHA": sys.argv[13],
+          }
+          descriptor = os.open(
+              destination,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+              0o600,
+          )
+          encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+          try:
+              if os.write(descriptor, encoded) != len(encoded):
+                  raise SystemExit("release authority write was incomplete")
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          PY
           {
-            echo "VERSION=$VERSION"
-            echo "TAG=$TAG"
-            echo "TOOLCHAIN_VERSION=$TOOLCHAIN_VERSION"
-            echo "TOOLCHAIN_TAG=toolchain-v$TOOLCHAIN_VERSION"
+            echo "source_commit=$GITHUB_SHA"
+            echo "benchmark_artifact_id=$ARTIFACT_ID"
+            echo "benchmark_artifact_digest=$ARTIFACT_DIGEST"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload exact live release authority
+        id: upload-authority
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-live-release-authority-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/easysplat-live-release-authority/release-authority.json
+          if-no-files-found: error
+          retention-days: 7
+
+  minimum-macos-compatibility:
+    needs: live-policy-preflight
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.live-policy-preflight.outputs.source_commit }}
+      - name: Prove the macOS 15 deployment contract
+        run: |
+          unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          test "$(uname -m)" = "arm64"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
+          swift test
+          BUILD_ROOT="$RUNNER_TEMP/easysplat-minimum-os"
+          /usr/bin/xcodebuild \
+            -scheme EasySplatApp \
+            -configuration Release \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$BUILD_ROOT" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            MACOSX_DEPLOYMENT_TARGET=15.0 \
+            SDKROOT=macosx \
+            build
+          APP_BINARY="$BUILD_ROOT/Build/Products/Release/EasySplatApp"
+          test "$(/usr/bin/lipo -archs "$APP_BINARY")" = "arm64"
+          /usr/bin/vtool -show-build "$APP_BINARY" >"$RUNNER_TEMP/minimum-os.txt"
+          test "$(grep -Ec '^[[:space:]]*minos 15\.0$' "$RUNNER_TEMP/minimum-os.txt")" = "1"
+          test "$(grep -Ec '^[[:space:]]*platform MACOS$' "$RUNNER_TEMP/minimum-os.txt")" = "1"
+
+  prepare-release:
+    needs: [live-policy-preflight, minimum-macos-compatibility]
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: macos-26
+    timeout-minutes: 240
+    outputs:
+      prepared_artifact_id: ${{ steps.upload-prepared.outputs.artifact-id }}
+      prepared_artifact_digest: ${{ format('sha256:{0}', steps.upload-prepared.outputs.artifact-digest) }}
+      benchmark_artifact_id: ${{ steps.bind-authority.outputs.benchmark_artifact_id }}
+      benchmark_artifact_digest: ${{ steps.bind-authority.outputs.benchmark_artifact_digest }}
+    steps:
+      - name: Reverify hosted live-release authority
+        id: hosted-authority
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTHORITY_ARTIFACT_ID: ${{ needs.live-policy-preflight.outputs.authority_artifact_id }}
+          AUTHORITY_ARTIFACT_DIGEST: ${{ needs.live-policy-preflight.outputs.authority_artifact_digest }}
+          AUTHORIZED_SOURCE: ${{ needs.live-policy-preflight.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$AUTHORITY_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$AUTHORITY_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          API="repos/$GITHUB_REPOSITORY/actions/artifacts/$AUTHORITY_ARTIFACT_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .expired)" = "false"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .digest)" = "$AUTHORITY_ARTIFACT_DIGEST"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .name)" = \
+            "easysplat-live-release-authority-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test "$AUTHORIZED_SOURCE" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$AUTHORIZED_SOURCE"
+
+      - name: Download exact live-release authority
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.live-policy-preflight.outputs.authority_artifact_id }}
+          path: ${{ runner.temp }}/live-release-authority
+
+      - name: Bind hosted authority before checkout
+        id: bind-authority
+        env:
+          AUTHORITY_PATH: ${{ runner.temp }}/live-release-authority/release-authority.json
+          EXPECTED_SOURCE: ${{ needs.live-policy-preflight.outputs.source_commit }}
+          EXPECTED_BENCHMARK_ARTIFACT_ID: ${{ needs.live-policy-preflight.outputs.benchmark_artifact_id }}
+          EXPECTED_BENCHMARK_ARTIFACT_DIGEST: ${{ needs.live-policy-preflight.outputs.benchmark_artifact_digest }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
+          INPUT_BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
+        run: |
+          /usr/bin/python3 -I - "$AUTHORITY_PATH" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          path = Path(sys.argv[1])
+          metadata = path.lstat()
+          if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or not 0 < metadata.st_size <= 16 * 1024:
+              raise SystemExit("live release authority is not a bounded ordinary file")
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          expected = {
+              "schemaVersion": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "sourceCommit": os.environ["EXPECTED_SOURCE"],
+              "tag": f"v{os.environ['INPUT_VERSION']}",
+              "appVersion": os.environ["INPUT_VERSION"],
+              "toolchainVersion": os.environ["INPUT_TOOLCHAIN_VERSION"],
+              "benchmark": (
+                  {
+                      "runID": os.environ["INPUT_BENCHMARK_RUN_ID"],
+                      "artifactID": os.environ["EXPECTED_BENCHMARK_ARTIFACT_ID"],
+                      "artifactDigest": os.environ["EXPECTED_BENCHMARK_ARTIFACT_DIGEST"],
+                  }
+                  if os.environ["INPUT_BENCHMARK_RUN_ID"]
+                  else None
+              ),
+              "workflowRunID": os.environ["GITHUB_RUN_ID"],
+              "workflowRunAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "workflowRef": os.environ["GITHUB_WORKFLOW_REF"],
+              "workflowSHA": os.environ["GITHUB_WORKFLOW_SHA"],
+          }
+          if payload != expected:
+              raise SystemExit("live release authority differs from this workflow invocation")
+          PY
+          {
+            echo "benchmark_artifact_id=$EXPECTED_BENCHMARK_ARTIFACT_ID"
+            echo "benchmark_artifact_digest=$EXPECTED_BENCHMARK_ARTIFACT_DIGEST"
+            echo "VERSION=$INPUT_VERSION"
+            echo "TAG=v$INPUT_VERSION"
+            echo "TOOLCHAIN_VERSION=$INPUT_TOOLCHAIN_VERSION"
+            echo "TOOLCHAIN_TAG=toolchain-v$INPUT_TOOLCHAIN_VERSION"
+            echo "BENCHMARK_RUN_ID=$INPUT_BENCHMARK_RUN_ID"
+          } >>"$GITHUB_OUTPUT"
+          {
+            echo "VERSION=$INPUT_VERSION"
+            echo "TAG=v$INPUT_VERSION"
+            echo "TOOLCHAIN_VERSION=$INPUT_TOOLCHAIN_VERSION"
+            echo "TOOLCHAIN_TAG=toolchain-v$INPUT_TOOLCHAIN_VERSION"
             echo "BENCHMARK_RUN_ID=$INPUT_BENCHMARK_RUN_ID"
           } >>"$GITHUB_ENV"
 
-      - name: Select Xcode 16.4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.live-policy-preflight.outputs.source_commit }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify the bound checkout
         run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          test "$(git rev-parse "$TAG^{commit}")" = "$GITHUB_SHA"
+
+      - name: Select the GitHub-hosted Xcode 26.6 build authority
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          test "$RUNNER_ENVIRONMENT" = "github-hosted"
           test "$(uname -m)" = "arm64"
-          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
-          test -d /Applications/Xcode_16.4.app
-          sudo xcode-select -s /Applications/Xcode_16.4.app
-          test "$(xcodebuild -version | sed -n '1s/^Xcode //p')" = "16.4"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "26"
+          test -d /Applications/Xcode_26.6.app/Contents/Developer
+          echo "DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer" >>"$GITHUB_ENV"
+          export DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer
+          test "$(/usr/bin/xcodebuild -version | sed -n '1s/^Xcode //p')" = "26.6"
+          test "$(/usr/bin/xcodebuild -version | sed -n '2s/^Build version //p')" = "17F113"
+          test "$(/usr/bin/xcrun --sdk macosx --show-sdk-version)" = "26.5"
+          test "$(/usr/bin/security find-identity -v -p codesigning | tail -1 | tr -d '[:space:]')" = "0valididentitiesfound"
 
       - name: Run source gates
         run: |
-          ./scripts/test.sh
+          set -euo pipefail
+          unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          XCTEST_LOG="$RUNNER_TEMP/easysplat-release-xctest.log"
+          test ! -e "$XCTEST_LOG"
+          original_umask="$(umask)"
+          umask 077
+          : >"$XCTEST_LOG"
+          umask "$original_umask"
+          test "$(stat -f '%Lp' "$XCTEST_LOG")" = "600"
+          set +e
+          ./scripts/test.sh 2>&1 | tee -a "$XCTEST_LOG"
+          pipeline_status=("${PIPESTATUS[@]}")
+          xctest_status="${pipeline_status[0]}"
+          tee_status="${pipeline_status[1]}"
+          set -e
+          test "$(stat -f '%Lp' "$XCTEST_LOG")" = "600"
+          if [ "$xctest_status" -ne 0 ]; then
+            exit "$xctest_status"
+          fi
+          if [ "$tee_status" -ne 0 ]; then
+            exit "$tee_status"
+          fi
+          if grep -Fq 'Test skipped' "$XCTEST_LOG"; then
+            echo "Physical release XCTest execution contains a skipped test." >&2
+            exit 1
+          fi
           swift test --package-path Tools/ManifestTool
           ./scripts/test_python_tools.sh
           ./scripts/ci/check_repo_health.sh
@@ -117,8 +387,9 @@ jobs:
             --dir Toolchains/out \
             --pattern manifest.json \
             --pattern toolchain-release-request.json \
-            --pattern authority-envelope.json \
-            --pattern authority-receipt.json \
+            --pattern toolchain-authority-envelope.json \
+            --pattern toolchain-authority-receipt.json \
+            --pattern toolchain-benchmark-evidence.json \
             --pattern "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
             --pattern "toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
             --pattern "toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"
@@ -130,67 +401,935 @@ jobs:
             EasySplatApp/Resources/public_key_ed25519.txt \
             Toolchains/public_key_ed25519.txt
 
-      - name: Build unsigned public beta
+      - name: Prepare data-only uncredentialed app handoff
         run: |
+          set -euo pipefail
+          unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          PREPARED_ROOT="$RUNNER_TEMP/easysplat-prepared-release"
+          PREPARED_BUILD="$RUNNER_TEMP/easysplat-prepared-build"
+          PREPARED_ARCHIVE="$RUNNER_TEMP/easysplat-prepared-release.tar"
+          test ! -e "$PREPARED_ROOT"
+          test ! -e "$PREPARED_BUILD"
+          test ! -e "$PREPARED_ARCHIVE"
+          mkdir -m 0700 "$PREPARED_ROOT"
+          mkdir -m 0700 \
+            "$PREPARED_ROOT/product" \
+            "$PREPARED_ROOT/toolchain"
+          mkdir -m 0700 "$PREPARED_ROOT/toolchain/out"
+          install -m 0600 Toolchains/manifest.json "$PREPARED_ROOT/toolchain/manifest.json"
+          install -m 0600 Toolchains/public_key_ed25519.txt "$PREPARED_ROOT/toolchain/public_key_ed25519.txt"
+          for name in \
+            "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
+            "toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
+            "toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip" \
+            toolchain-release-request.json \
+            toolchain-authority-envelope.json \
+            toolchain-authority-receipt.json \
+            toolchain-benchmark-evidence.json; do
+            install -m 0600 "Toolchains/out/$name" "$PREPARED_ROOT/toolchain/out/$name"
+          done
+          MANIFEST_TOOL_BUILD="$RUNNER_TEMP/easysplat-manifest-tool-build"
+          /usr/bin/swift build \
+            -c release \
+            --package-path Tools/ManifestTool \
+            --scratch-path "$MANIFEST_TOOL_BUILD" \
+            --product ManifestTool
           BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TOOLCHAIN_TAG"
-          scripts/release/build_dmg.sh \
+          scripts/release/build_app.sh \
+            --manifest-url "$BASE_URL/manifest.json" \
+            --public-key-path "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
+            --version "$VERSION" \
+            --bootstrap-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
+            --bootstrap-core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
+            --project-url "https://github.com/$GITHUB_REPOSITORY" \
+            --build-root "$PREPARED_BUILD" \
+            --manifest-tool-bin "$MANIFEST_TOOL_BUILD/release/ManifestTool" \
+            --prepare-release
+          /usr/bin/ditto --noqtn \
+            "$PREPARED_BUILD/Export/EasySplat.app" \
+            "$PREPARED_ROOT/product/EasySplat.app"
+          /usr/bin/ditto --noqtn \
+            "$PREPARED_BUILD/Export/EasySplat.app.dSYM" \
+            "$PREPARED_ROOT/product/EasySplat.app.dSYM"
+          APP_BINARY="$PREPARED_ROOT/product/EasySplat.app/Contents/MacOS/EasySplatApp"
+          test "$(/usr/bin/lipo -archs "$APP_BINARY")" = "arm64"
+          /usr/bin/vtool -show-build "$APP_BINARY" >"$RUNNER_TEMP/prepared-app-build-version.txt"
+          test "$(grep -Ec '^[[:space:]]*minos 15\.0$' "$RUNNER_TEMP/prepared-app-build-version.txt")" = "1"
+          test "$(grep -Ec '^[[:space:]]*platform MACOS$' "$RUNNER_TEMP/prepared-app-build-version.txt")" = "1"
+          /usr/bin/python3 -I scripts/release/prepared_release.py create \
+            --root "$PREPARED_ROOT" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
             --app-version "$VERSION" \
             --toolchain-version "$TOOLCHAIN_VERSION" \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --core-artifact-url "$BASE_URL/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
-            --da3-base-artifact-url "$BASE_URL/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
-            --da3-small-artifact-url "$BASE_URL/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip" \
-            --project-url "https://github.com/$GITHUB_REPOSITORY" \
-            --use-existing-toolchain \
-            --unsigned-beta
-
-      - name: Verify beta artifacts and cached offline use
-        env:
-          RELEASE_FIXTURE: ${{ vars.EASYSPLAT_RELEASE_FIXTURE }}
-        run: |
-          test -n "$RELEASE_FIXTURE" && test -e "$RELEASE_FIXTURE"
-          swift build -c release --product EasySplatReleaseVerifier
-          CACHE_ROOT="$RUNNER_TEMP/easysplat-release-toolchains"
-          rm -rf "$CACHE_ROOT"
-          mkdir -p "$CACHE_ROOT"
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TOOLCHAIN_TAG"
-          scripts/release/verify_beta.sh \
-            --app build/Export/EasySplat.app \
-            --dmg "release/DMG/EasySplat-$VERSION-unsigned.dmg" \
-            --expected-version "$VERSION" \
-            --artifacts \
-            --source-url "https://github.com/$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --builder-environment github-hosted \
+            --xcode-version 26.6 \
+            --xcode-build 17F113 \
+            --macos-sdk-version 26.5
+          /usr/bin/python3 -I scripts/release/prepared_release.py verify \
+            --root "$PREPARED_ROOT" \
+            --source-repository "$GITHUB_REPOSITORY" \
             --source-commit "$GITHUB_SHA" \
-            --release-manifest Toolchains/manifest.json \
-            --core-archive "Toolchains/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
-            --da3-base-archive "Toolchains/out/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
-            --da3-small-archive "Toolchains/out/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip" \
-            --fixture "$RELEASE_FIXTURE" \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --public-key-file EasySplatApp/Resources/public_key_ed25519.txt \
-            --toolchain-root "$CACHE_ROOT" \
-            --e2e-runner .build/release/EasySplatReleaseVerifier \
-            --offline-cache-root "$CACHE_ROOT" \
-            --offline-runner .build/release/EasySplatReleaseVerifier
+            --app-version "$VERSION" \
+            --toolchain-version "$TOOLCHAIN_VERSION" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --builder-environment github-hosted \
+            --xcode-version 26.6 \
+            --xcode-build 17F113 \
+            --macos-sdk-version 26.5
+          /usr/bin/tar -cf "$PREPARED_ARCHIVE" \
+            -C "$RUNNER_TEMP" easysplat-prepared-release
+          test -s "$PREPARED_ARCHIVE"
 
-      - name: Verify packaged app UI
-        env:
-          EASYSPLAT_ISOLATED_UI_RUNNER: "1"
+      - name: Download bound benchmark artifact
+        if: inputs.benchmark_run_id != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          run-id: ${{ inputs.benchmark_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.bind-authority.outputs.benchmark_artifact_id }}
+          path: ${{ runner.temp }}/bound-benchmark
+
+      - name: Confirm compact benchmark closure is present
+        if: inputs.benchmark_run_id != ''
         run: |
-          UI_OUTPUT="$RUNNER_TEMP/easysplat-ui-verification"
-          rm -rf "$UI_OUTPUT"
-          scripts/release/verify_ui.sh \
-            --app "$GITHUB_WORKSPACE/build/Export/EasySplat.app" \
-            --output-dir "$UI_OUTPUT"
+          test -f "$RUNNER_TEMP/bound-benchmark/verified-suite.json"
+          test -f "$RUNNER_TEMP/bound-benchmark/evidence/reference_m4_max/prepared-index.json"
+          test -f "$RUNNER_TEMP/bound-benchmark/evidence/constrained_14_16gb/prepared-index.json"
+          test -f "$RUNNER_TEMP/bound-benchmark/evidence/eight_gb_fast/prepared-index.json"
 
-      - name: Preserve packaged UI evidence
-        if: ${{ always() }}
+      - name: Upload exact prepared release
+        id: upload-prepared
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: easysplat-ui-${{ github.sha }}
-          path: ${{ runner.temp }}/easysplat-ui-verification
-          if-no-files-found: warn
+          name: easysplat-prepared-release-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-prepared-release.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-and-notarize:
+    needs: [live-policy-preflight, prepare-release]
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: [self-hosted, macOS, ARM64, easysplat-signing, easysplat-ephemeral]
+    timeout-minutes: 240
+    environment: release-signing
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      signed_artifact_id: ${{ steps.upload-signed.outputs.artifact-id }}
+      signed_artifact_digest: ${{ format('sha256:{0}', steps.upload-signed.outputs.artifact-digest) }}
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -p -e -u -o pipefail {0}
+    steps:
+      - name: Verify signing host and prepared artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREPARED_ARTIFACT_ID: ${{ needs.prepare-release.outputs.prepared_artifact_id }}
+          PREPARED_ARTIFACT_DIGEST: ${{ needs.prepare-release.outputs.prepared_artifact_digest }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          test "$RUNNER_ENVIRONMENT" = "self-hosted"
+          test "$(/usr/bin/uname -m)" = "arm64"
+          test "$(/usr/bin/sw_vers -productVersion)" = "26.5.2"
+          test "$(/usr/bin/xcodebuild -version | /usr/bin/sed -n '1s/^Xcode //p')" = "26.6"
+          test "$(/usr/bin/xcodebuild -version | /usr/bin/sed -n '2s/^Build version //p')" = "17F113"
+          test "$(DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer /usr/bin/xcrun --sdk macosx --show-sdk-version)" = "26.5"
+          ARTIFACT_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$PREPARED_ARTIFACT_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$ARTIFACT_API" --jq .expired)" = "false"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$ARTIFACT_API" --jq .digest)" = "$PREPARED_ARTIFACT_DIGEST"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$ARTIFACT_API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$ARTIFACT_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          clean: true
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.live-policy-preflight.outputs.source_commit }}
+
+      - name: Prepare protected-main signing authority
+        run: |
+          unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+          test "$(git rev-parse "v${{ inputs.version }}^{commit}")" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          TRUSTED_BUILD="$RUNNER_TEMP/easysplat-trusted-manifest-tool"
+          test ! -e "$TRUSTED_BUILD"
+          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+            /usr/bin/swift build \
+              -c release \
+              --package-path Tools/ManifestTool \
+              --scratch-path "$TRUSTED_BUILD" \
+              --product ManifestTool
+          TRUSTED_AUTHORITY="$RUNNER_TEMP/easysplat-trusted-signing-authority"
+          test ! -e "$TRUSTED_AUTHORITY"
+          mkdir -m 0700 "$TRUSTED_AUTHORITY"
+          install -m 0500 \
+            "$TRUSTED_BUILD/release/ManifestTool" \
+            "$TRUSTED_AUTHORITY/ManifestTool"
+          echo "TRUSTED_MANIFEST_TOOL=$TRUSTED_AUTHORITY/ManifestTool" >>"$GITHUB_ENV"
+
+      - name: Download exact prepared release
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare-release.outputs.prepared_artifact_id }}
+          path: ${{ runner.temp }}/prepared-download
+
+      - name: Safely extract and reverify the immutable handoff
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/prepared-download/easysplat-prepared-release.tar"
+          EXTRACT_ROOT="$RUNNER_TEMP/prepared-extract"
+          test -f "$ARCHIVE" && test ! -L "$ARCHIVE"
+          /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/prepared_release.py" extract \
+            --archive "$ARCHIVE" \
+            --destination "$EXTRACT_ROOT"
+          PREPARED_ROOT="$EXTRACT_ROOT/easysplat-prepared-release"
+          /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/prepared_release.py" verify \
+            --root "$PREPARED_ROOT" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --app-version "${{ inputs.version }}" \
+            --toolchain-version "${{ inputs.toolchain_version }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --builder-environment github-hosted \
+            --xcode-version 26.6 \
+            --xcode-build 17F113 \
+            --macos-sdk-version 26.5
+          PREPARED_MANIFEST_SHA256="$(
+            /usr/bin/python3 -I - "$PREPARED_ROOT/prepared-release.json" <<'PY'
+          import hashlib
+          import os
+          import stat
+          import sys
+
+          path = sys.argv[1]
+          descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              before = os.fstat(descriptor)
+              if (
+                  not stat.S_ISREG(before.st_mode)
+                  or before.st_nlink != 1
+                  or before.st_size <= 0
+                  or before.st_size > 128 * 1024 * 1024
+              ):
+                  raise SystemExit("prepared release manifest cannot be bound")
+              digest = hashlib.sha256()
+              while chunk := os.read(descriptor, 1024 * 1024):
+                  digest.update(chunk)
+              after = os.fstat(descriptor)
+              if (
+                  after.st_dev,
+                  after.st_ino,
+                  after.st_size,
+                  after.st_mtime_ns,
+                  after.st_ctime_ns,
+              ) != (
+                  before.st_dev,
+                  before.st_ino,
+                  before.st_size,
+                  before.st_mtime_ns,
+                  before.st_ctime_ns,
+              ):
+                  raise SystemExit("prepared release manifest changed while binding")
+              print(digest.hexdigest())
+          finally:
+              os.close(descriptor)
+          PY
+          )"
+          [[ "$PREPARED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'PREPARED_MANIFEST_SHA256=%s\n' \
+            "$PREPARED_MANIFEST_SHA256" >>"$GITHUB_ENV"
+          test ! -e "$PREPARED_ROOT/source"
+          test ! -e "$PREPARED_ROOT/product/ManifestTool"
+          test ! -e "$PREPARED_ROOT/product/EasySplatReleaseVerifier"
+          chmod -R a-w "$PREPARED_ROOT"
+
+      - name: Reverify live protected main immediately before signing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          AUTHORIZED_SOURCE: ${{ needs.live-policy-preflight.outputs.source_commit }}
+          PREPARED_ARTIFACT_ID: ${{ needs.prepare-release.outputs.prepared_artifact_id }}
+          PREPARED_ARTIFACT_DIGEST: ${{ needs.prepare-release.outputs.prepared_artifact_digest }}
+          TAG: v${{ inputs.version }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$DEFAULT_BRANCH" = "main"
+          test "$AUTHORIZED_SOURCE" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq .name)" = "main"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$AUTHORIZED_SOURCE"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$AUTHORIZED_SOURCE"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$AUTHORIZED_SOURCE"
+          EXISTING_RELEASE="$RUNNER_TEMP/easysplat-existing-release-before-signing.json"
+          if gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >"$EXISTING_RELEASE" 2>/dev/null; then
+            OWNER="easysplat-release-owner:v2:${GITHUB_RUN_ID}:${GITHUB_SHA}"
+            test "$(/usr/bin/plutil -extract tag_name raw -o - "$EXISTING_RELEASE")" = "$TAG"
+            test "$(/usr/bin/plutil -extract target_commitish raw -o - "$EXISTING_RELEASE")" = "$AUTHORIZED_SOURCE"
+            test "$(/usr/bin/plutil -extract draft raw -o - "$EXISTING_RELEASE")" = "true"
+            test "$(/usr/bin/plutil -extract prerelease raw -o - "$EXISTING_RELEASE")" = "false"
+            test "$(/usr/bin/plutil -extract immutable raw -o - "$EXISTING_RELEASE")" = "false"
+            BODY="$(/usr/bin/plutil -extract body raw -o - "$EXISTING_RELEASE")"
+            [[ "$BODY" == *"<!-- $OWNER -->"* ]]
+          fi
+          API="repos/$GITHUB_REPOSITORY/actions/artifacts/$PREPARED_ARTIFACT_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .expired)" = "false"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .digest)" = "$PREPARED_ARTIFACT_DIGEST"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.head_sha)" = "$AUTHORIZED_SOURCE"
+
+      - name: Sign, notarize, and staple official artifacts
+        env:
+          EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1: ${{ secrets.EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1 }}
+          EASYSPLAT_DEVELOPER_TEAM_ID: ${{ secrets.EASYSPLAT_DEVELOPER_TEAM_ID }}
+          EASYSPLAT_NOTARY_KEYCHAIN_PROFILE: ${{ secrets.EASYSPLAT_NOTARY_KEYCHAIN_PROFILE }}
+        run: |
+          test -n "$EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1"
+          test -n "$EASYSPLAT_DEVELOPER_TEAM_ID"
+          test -n "$EASYSPLAT_NOTARY_KEYCHAIN_PROFILE"
+          unset BASH_ENV ENV CDPATH GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+            PYTHONHOME PYTHONPATH REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE \
+            SSL_CERT_DIR HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY DEVELOPER_DIR \
+            SDKROOT TOOLCHAINS DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH \
+            GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          PREPARED_ROOT="$RUNNER_TEMP/prepared-extract/easysplat-prepared-release"
+          SIGNED_OUTPUT="$RUNNER_TEMP/easysplat-signed-output"
+          SIGNING_BUILD="$RUNNER_TEMP/easysplat-signing-build"
+          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
+          /usr/bin/env -i \
+            HOME="$HOME" \
+            USER="$USER" \
+            LOGNAME="$LOGNAME" \
+            TMPDIR="$RUNNER_TEMP" \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            /bin/bash --noprofile --norc -p \
+            "$GITHUB_WORKSPACE/scripts/release/build_dmg.sh" \
+            --app-version "${{ inputs.version }}" \
+            --toolchain-version "${{ inputs.toolchain_version }}" \
+            --manifest-url "$BASE_URL/manifest.json" \
+            --core-artifact-url "$BASE_URL/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
+            --da3-base-artifact-url "$BASE_URL/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
+            --da3-small-artifact-url "$BASE_URL/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
+            --project-url "https://github.com/$GITHUB_REPOSITORY" \
+            --build-root "$SIGNING_BUILD" \
+            --output-dir "$SIGNED_OUTPUT" \
+            --prepared-release-root "$PREPARED_ROOT" \
+            --prepared-manifest-sha256 "$PREPARED_MANIFEST_SHA256" \
+            --source-commit "$GITHUB_SHA" \
+            --manifest-tool-bin "$TRUSTED_MANIFEST_TOOL" \
+            --use-existing-toolchain \
+            --production \
+            --identity-fingerprint "$EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1" \
+            --team-id "$EASYSPLAT_DEVELOPER_TEAM_ID" \
+            --notary-keychain-profile "$EASYSPLAT_NOTARY_KEYCHAIN_PROFILE"
+
+      - name: Create exact signed build closure
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          PREPARED_ROOT="$RUNNER_TEMP/prepared-extract/easysplat-prepared-release"
+          SIGNED_OUTPUT="$RUNNER_TEMP/easysplat-signed-output"
+          BUILD_BUNDLE="$RUNNER_TEMP/easysplat-signed-build-bundle"
+          mkdir -m 0700 "$BUILD_BUNDLE"
+          for name in \
+            "EasySplat-$VERSION.dmg" \
+            "EasySplat-$VERSION.dmg.sha256" \
+            "EasySplat-$VERSION.provenance.json" \
+            "EasySplat-$VERSION.spdx.json" \
+            "EasySplat-$VERSION-licenses.zip" \
+            "EasySplat-$VERSION-dSYM.zip" \
+            "EasySplat-$VERSION-release-notes.txt" \
+            "EasySplat-$VERSION.app-signing.json" \
+            "EasySplat-$VERSION.app-notarization.json" \
+            "EasySplat-$VERSION.dmg-signing.json" \
+            "EasySplat-$VERSION.dmg-notarization.json"; do
+            install -m 0600 "$SIGNED_OUTPUT/$name" "$BUILD_BUNDLE/$name"
+          done
+          install -m 0600 "$PREPARED_ROOT/toolchain/manifest.json" "$BUILD_BUNDLE/toolchain-manifest.json"
+          install -m 0600 "$PREPARED_ROOT/toolchain/out/toolchain-release-request.json" "$BUILD_BUNDLE/toolchain-release-request.json"
+          install -m 0600 "$PREPARED_ROOT/toolchain/out/toolchain-authority-envelope.json" "$BUILD_BUNDLE/toolchain-authority-envelope.json"
+          install -m 0600 "$PREPARED_ROOT/toolchain/out/toolchain-authority-receipt.json" "$BUILD_BUNDLE/toolchain-authority-receipt.json"
+          install -m 0600 "$PREPARED_ROOT/toolchain/out/toolchain-benchmark-evidence.json" "$BUILD_BUNDLE/toolchain-benchmark-evidence.json"
+          closure_args=(
+            create-build-closure
+            --release-mode production
+            --bundle "$BUILD_BUNDLE"
+            --app-version "$VERSION"
+            --toolchain-version "${{ inputs.toolchain_version }}"
+            --source-repository "$GITHUB_REPOSITORY"
+            --source-commit "$GITHUB_SHA"
+            --tag "v$VERSION"
+          )
+          if [ -n "${{ inputs.benchmark_run_id }}" ]; then
+            closure_args+=(
+              --benchmark-run-id "${{ inputs.benchmark_run_id }}"
+              --benchmark-artifact-id "${{ needs.prepare-release.outputs.benchmark_artifact_id }}"
+              --benchmark-artifact-digest "${{ needs.prepare-release.outputs.benchmark_artifact_digest }}"
+            )
+          fi
+          /usr/bin/python3 -I \
+            "$GITHUB_WORKSPACE/scripts/release/verify_publication_bundle.py" \
+            "${closure_args[@]}"
+
+      - name: Upload exact signed build closure
+        id: upload-signed
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-signed-build-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-signed-build-bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  quarantined-install:
+    needs: [prepare-release, sign-and-notarize]
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: macos-26
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      quarantine_artifact_id: ${{ steps.upload-quarantine.outputs.artifact-id }}
+      quarantine_artifact_digest: ${{ format('sha256:{0}', steps.upload-quarantine.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          clean: true
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Verify and download the exact signed closure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED_ARTIFACT_ID: ${{ needs.sign-and-notarize.outputs.signed_artifact_id }}
+          SIGNED_ARTIFACT_DIGEST: ${{ needs.sign-and-notarize.outputs.signed_artifact_digest }}
+          PREPARED_ARTIFACT_ID: ${{ needs.prepare-release.outputs.prepared_artifact_id }}
+          PREPARED_ARTIFACT_DIGEST: ${{ needs.prepare-release.outputs.prepared_artifact_digest }}
+        run: |
+          API="repos/$GITHUB_REPOSITORY/actions/artifacts/$SIGNED_ARTIFACT_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .expired)" = "false"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .digest)" = "$SIGNED_ARTIFACT_DIGEST"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+          PREPARED_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$PREPARED_ARTIFACT_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$PREPARED_API" --jq .expired)" = "false"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$PREPARED_API" --jq .digest)" = "$PREPARED_ARTIFACT_DIGEST"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$PREPARED_API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$PREPARED_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.sign-and-notarize.outputs.signed_artifact_id }}
+          path: ${{ runner.temp }}/signed-build
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare-release.outputs.prepared_artifact_id }}
+          path: ${{ runner.temp }}/prepared-download
+
+      - name: Safely extract the prepared verifier closure
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/prepared-download/easysplat-prepared-release.tar"
+          EXTRACT_ROOT="$RUNNER_TEMP/prepared-extract"
+          test -f "$ARCHIVE" && test ! -L "$ARCHIVE"
+          /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/prepared_release.py" extract \
+            --archive "$ARCHIVE" \
+            --destination "$EXTRACT_ROOT"
+          PREPARED_ROOT="$EXTRACT_ROOT/easysplat-prepared-release"
+          /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/prepared_release.py" verify \
+            --root "$PREPARED_ROOT" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --app-version "${{ inputs.version }}" \
+            --toolchain-version "${{ inputs.toolchain_version }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --builder-environment github-hosted \
+            --xcode-version 26.6 \
+            --xcode-build 17F113 \
+            --macos-sdk-version 26.5
+          test ! -e "$PREPARED_ROOT/source"
+          test ! -e "$PREPARED_ROOT/product/ManifestTool"
+          test ! -e "$PREPARED_ROOT/product/EasySplatReleaseVerifier"
+          chmod -R a-w "$PREPARED_ROOT"
+
+      - name: Build the protected-main release verifier
+        run: |
+          unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          export DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer
+          /usr/bin/swift build -c release --product EasySplatReleaseVerifier
+          VERIFIER_BIN="$(/usr/bin/swift build -c release --show-bin-path)/EasySplatReleaseVerifier"
+          test -x "$VERIFIER_BIN"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >>"$GITHUB_ENV"
+          echo "EASYSPLAT_TRUSTED_RELEASE_VERIFIER=$VERIFIER_BIN" >>"$GITHUB_ENV"
+
+      - name: Prove quarantined clean install and Gatekeeper launch
+        env:
+          EASYSPLAT_RELEASE_VERIFIER_TIMEOUT_SECONDS: "3600"
+        run: |
+          set -euo pipefail
+          unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          VERSION="${{ inputs.version }}"
+          DMG="$RUNNER_TEMP/signed-build/EasySplat-$VERSION.dmg"
+          EVIDENCE="$RUNNER_TEMP/easysplat-quarantine-evidence"
+          MOUNT="$RUNNER_TEMP/easysplat-quarantine-mount"
+          INSTALL="$RUNNER_TEMP/Applications/EasySplat.app"
+          HOME_ROOT="$RUNNER_TEMP/easysplat-quarantine-home"
+          mkdir -m 0700 "$EVIDENCE" "$MOUNT" "$(dirname "$INSTALL")" "$HOME_ROOT"
+          QUARANTINE="0081;$(printf '%x' "$(date +%s)");GitHubActions;$GITHUB_RUN_ID"
+          /usr/bin/xattr -w com.apple.quarantine "$QUARANTINE" "$DMG"
+          test "$(/usr/bin/xattr -p com.apple.quarantine "$DMG")" = "$QUARANTINE"
+          /usr/sbin/spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG" \
+            >"$EVIDENCE/spctl-open.txt" 2>&1
+          /usr/bin/xcrun stapler validate "$DMG" >"$EVIDENCE/stapler-dmg.txt" 2>&1
+          /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "$DMG" \
+            >"$EVIDENCE/hdiutil-attach.txt"
+          trap '/usr/bin/hdiutil detach "$MOUNT" >/dev/null 2>&1 || true' EXIT
+          /usr/bin/ditto "$MOUNT/EasySplat.app" "$INSTALL"
+          /usr/bin/hdiutil detach "$MOUNT" >"$EVIDENCE/hdiutil-detach.txt"
+          trap - EXIT
+          /usr/bin/unzip -q \
+            "$RUNNER_TEMP/signed-build/EasySplat-$VERSION-dSYM.zip" \
+            -d "$(dirname "$INSTALL")"
+          test -n "$(/usr/bin/xattr -p com.apple.quarantine "$INSTALL")"
+          /usr/bin/codesign --verify --deep --strict --verbose=4 "$INSTALL" \
+            >"$EVIDENCE/codesign.txt" 2>&1
+          /usr/bin/xcrun stapler validate "$INSTALL" >"$EVIDENCE/stapler-app.txt" 2>&1
+          /usr/sbin/spctl --assess --type execute --verbose=4 "$INSTALL" \
+            >"$EVIDENCE/spctl-execute.txt" 2>&1
+          /usr/bin/syspolicy_check distribution "$INSTALL" \
+            >"$EVIDENCE/syspolicy.txt" 2>&1
+          PREPARED_ROOT="$RUNNER_TEMP/prepared-extract/easysplat-prepared-release"
+          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
+          FIXTURE_ROOT="$RUNNER_TEMP/easysplat-release-fixture"
+          test ! -e "$FIXTURE_ROOT"
+          /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/generate_release_fixture.py" generate \
+            --output "$FIXTURE_ROOT" \
+            >"$EVIDENCE/release-fixture-generation.json"
+          /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/generate_release_fixture.py" verify \
+            --root "$FIXTURE_ROOT" \
+            >"$EVIDENCE/release-fixture-preflight.json"
+          cmp -s \
+            "$EVIDENCE/release-fixture-generation.json" \
+            "$EVIDENCE/release-fixture-preflight.json"
+          ONLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-online-toolchains"
+          OFFLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-offline-toolchains"
+          CACHED_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-cached-toolchains"
+          mkdir -m 0700 \
+            "$ONLINE_CACHE_ROOT" \
+            "$OFFLINE_CACHE_ROOT" \
+            "$CACHED_CACHE_ROOT"
+          "$GITHUB_WORKSPACE/scripts/release/verify_release.sh" \
+            --app "$INSTALL" \
+            --dmg "$DMG" \
+            --expected-version "$VERSION" \
+            --release-mode production \
+            --app-signing-receipt "$RUNNER_TEMP/signed-build/EasySplat-$VERSION.app-signing.json" \
+            --app-notarization-receipt "$RUNNER_TEMP/signed-build/EasySplat-$VERSION.app-notarization.json" \
+            --dmg-signing-receipt "$RUNNER_TEMP/signed-build/EasySplat-$VERSION.dmg-signing.json" \
+            --dmg-notarization-receipt "$RUNNER_TEMP/signed-build/EasySplat-$VERSION.dmg-notarization.json" \
+            --artifacts \
+            --packaged-app-smoke \
+            --source-url "https://github.com/$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --release-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
+            --core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
+            --da3-base-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
+            --da3-small-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
+            --fixture "$FIXTURE_ROOT" \
+            --manifest-url "$BASE_URL/manifest.json" \
+            --public-key-file "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
+            --toolchain-root "$ONLINE_CACHE_ROOT" \
+            --e2e-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
+            --offline-cache-root "$OFFLINE_CACHE_ROOT" \
+            --offline-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
+            --cached-cache-root "$CACHED_CACHE_ROOT" \
+            --cached-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
+            --evidence-dir "$EVIDENCE/full-verification"
+          HOME="$HOME_ROOT" TMPDIR="$HOME_ROOT" /usr/bin/open -n "$INSTALL"
+          sleep 5
+          /usr/bin/pgrep -f "$INSTALL/Contents/MacOS/EasySplatApp" \
+            >"$EVIDENCE/launched-pid.txt"
+          /usr/bin/pkill -TERM -f "$INSTALL/Contents/MacOS/EasySplatApp" || true
+          {
+            echo "source_commit=$GITHUB_SHA"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "dmg_sha256=$(shasum -a 256 "$DMG" | awk '{print $1}')"
+            echo "dmg_quarantine=$(/usr/bin/xattr -p com.apple.quarantine "$DMG")"
+            echo "app_quarantine=$(/usr/bin/xattr -p com.apple.quarantine "$INSTALL")"
+            /usr/bin/sw_vers
+            /usr/bin/uname -a
+          } >"$EVIDENCE/identity.txt"
+
+      - name: Upload quarantine evidence
+        if: ${{ always() }}
+        id: upload-quarantine
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-quarantined-install-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-quarantine-evidence
+          if-no-files-found: error
           retention-days: 30
+
+  macos15-signed-compatibility:
+    needs: [prepare-release, sign-and-notarize]
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: macos-15
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      compatibility_artifact_id: ${{ steps.upload-compatibility.outputs.artifact-id }}
+      compatibility_artifact_digest: ${{ format('sha256:{0}', steps.upload-compatibility.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          clean: true
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Bind the signed artifact to the macOS 15 arm64 host
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED_ARTIFACT_ID: ${{ needs.sign-and-notarize.outputs.signed_artifact_id }}
+          SIGNED_ARTIFACT_DIGEST: ${{ needs.sign-and-notarize.outputs.signed_artifact_digest }}
+          PREPARED_ARTIFACT_ID: ${{ needs.prepare-release.outputs.prepared_artifact_id }}
+          PREPARED_ARTIFACT_DIGEST: ${{ needs.prepare-release.outputs.prepared_artifact_digest }}
+        run: |
+          test "$(uname -m)" = "arm64"
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
+          test -d /Applications/Xcode_16.4.app/Contents/Developer
+          test "$(DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer /usr/bin/xcodebuild -version | sed -n '1s/^Xcode //p')" = "16.4"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          for binding in \
+            "$SIGNED_ARTIFACT_ID:$SIGNED_ARTIFACT_DIGEST" \
+            "$PREPARED_ARTIFACT_ID:$PREPARED_ARTIFACT_DIGEST"; do
+            artifact_id="${binding%%:*}"
+            artifact_digest="${binding#*:}"
+            API="repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+            test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .expired)" = "false"
+            test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .digest)" = "$artifact_digest"
+            test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+            test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+          done
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.sign-and-notarize.outputs.signed_artifact_id }}
+          path: ${{ runner.temp }}/signed-build
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare-release.outputs.prepared_artifact_id }}
+          path: ${{ runner.temp }}/prepared-download
+
+      - name: Extract and bind the data-only release handoff
+        run: |
+          unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          ARCHIVE="$RUNNER_TEMP/prepared-download/easysplat-prepared-release.tar"
+          EXTRACT_ROOT="$RUNNER_TEMP/prepared-extract"
+          /usr/bin/python3 -I scripts/release/prepared_release.py extract \
+            --archive "$ARCHIVE" \
+            --destination "$EXTRACT_ROOT"
+          PREPARED_ROOT="$EXTRACT_ROOT/easysplat-prepared-release"
+          /usr/bin/python3 -I scripts/release/prepared_release.py verify \
+            --root "$PREPARED_ROOT" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --app-version "${{ inputs.version }}" \
+            --toolchain-version "${{ inputs.toolchain_version }}" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --builder-environment github-hosted \
+            --xcode-version 26.6 \
+            --xcode-build 17F113 \
+            --macos-sdk-version 26.5
+          chmod -R a-w "$PREPARED_ROOT"
+
+      - name: Prove signed runtime and native splat pipeline on macOS 15
+        env:
+          EASYSPLAT_RELEASE_VERIFIER_TIMEOUT_SECONDS: "3600"
+          DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+        run: |
+          set -euo pipefail
+          unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+          VERSION="${{ inputs.version }}"
+          DMG="$RUNNER_TEMP/signed-build/EasySplat-$VERSION.dmg"
+          PREPARED_ROOT="$RUNNER_TEMP/prepared-extract/easysplat-prepared-release"
+          EVIDENCE="$RUNNER_TEMP/easysplat-macos15-compatibility"
+          MOUNT="$RUNNER_TEMP/easysplat-macos15-mount"
+          INSTALL_ROOT="$RUNNER_TEMP/easysplat-macos15-install"
+          INSTALL="$INSTALL_ROOT/EasySplat.app"
+          HOME_ROOT="$RUNNER_TEMP/easysplat-macos15-home"
+          mkdir -m 0700 "$EVIDENCE" "$MOUNT" "$INSTALL_ROOT" "$HOME_ROOT"
+          QUARANTINE="0081;$(printf '%x' "$(date +%s)");GitHubActions;$GITHUB_RUN_ID"
+          /usr/bin/xattr -w com.apple.quarantine "$QUARANTINE" "$DMG"
+          /usr/sbin/spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG" \
+            >"$EVIDENCE/spctl-open.txt" 2>&1
+          /usr/bin/xcrun stapler validate "$DMG" >"$EVIDENCE/stapler-dmg.txt" 2>&1
+          /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "$DMG" \
+            >"$EVIDENCE/hdiutil-attach.txt"
+          trap '/usr/bin/hdiutil detach "$MOUNT" >/dev/null 2>&1 || true' EXIT
+          /usr/bin/ditto "$MOUNT/EasySplat.app" "$INSTALL"
+          /usr/bin/hdiutil detach "$MOUNT" >"$EVIDENCE/hdiutil-detach.txt"
+          trap - EXIT
+          /usr/bin/unzip -q "$RUNNER_TEMP/signed-build/EasySplat-$VERSION-dSYM.zip" \
+            -d "$INSTALL_ROOT"
+          test -n "$(/usr/bin/xattr -p com.apple.quarantine "$INSTALL")"
+          /usr/bin/codesign --verify --deep --strict --verbose=4 "$INSTALL" \
+            >"$EVIDENCE/codesign.txt" 2>&1
+          /usr/bin/xcrun stapler validate "$INSTALL" >"$EVIDENCE/stapler-app.txt" 2>&1
+          /usr/sbin/spctl --assess --type execute --verbose=4 "$INSTALL" \
+            >"$EVIDENCE/spctl-execute.txt" 2>&1
+          /usr/bin/syspolicy_check distribution "$INSTALL" \
+            >"$EVIDENCE/syspolicy.txt" 2>&1
+          /usr/bin/swift build -c release --product EasySplatReleaseVerifier
+          VERIFIER_BIN="$(/usr/bin/swift build -c release --show-bin-path)/EasySplatReleaseVerifier"
+          test -x "$VERIFIER_BIN"
+          FIXTURE_ROOT="$RUNNER_TEMP/easysplat-release-fixture"
+          test ! -e "$FIXTURE_ROOT"
+          /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/generate_release_fixture.py" generate \
+            --output "$FIXTURE_ROOT" \
+            >"$EVIDENCE/release-fixture-generation.json"
+          /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/generate_release_fixture.py" verify \
+            --root "$FIXTURE_ROOT" \
+            >"$EVIDENCE/release-fixture-preflight.json"
+          cmp -s \
+            "$EVIDENCE/release-fixture-generation.json" \
+            "$EVIDENCE/release-fixture-preflight.json"
+          ONLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-online-toolchains"
+          OFFLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-offline-toolchains"
+          CACHED_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-cached-toolchains"
+          mkdir -m 0700 "$ONLINE_CACHE_ROOT" "$OFFLINE_CACHE_ROOT" "$CACHED_CACHE_ROOT"
+          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
+          scripts/release/verify_release.sh \
+            --app "$INSTALL" \
+            --dmg "$DMG" \
+            --expected-version "$VERSION" \
+            --release-mode production \
+            --app-signing-receipt "$RUNNER_TEMP/signed-build/EasySplat-$VERSION.app-signing.json" \
+            --app-notarization-receipt "$RUNNER_TEMP/signed-build/EasySplat-$VERSION.app-notarization.json" \
+            --dmg-signing-receipt "$RUNNER_TEMP/signed-build/EasySplat-$VERSION.dmg-signing.json" \
+            --dmg-notarization-receipt "$RUNNER_TEMP/signed-build/EasySplat-$VERSION.dmg-notarization.json" \
+            --artifacts \
+            --packaged-app-smoke \
+            --source-url "https://github.com/$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --release-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
+            --core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
+            --da3-base-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
+            --da3-small-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
+            --fixture "$FIXTURE_ROOT" \
+            --manifest-url "$BASE_URL/manifest.json" \
+            --public-key-file "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
+            --toolchain-root "$ONLINE_CACHE_ROOT" \
+            --e2e-runner "$VERIFIER_BIN" \
+            --offline-cache-root "$OFFLINE_CACHE_ROOT" \
+            --offline-runner "$VERIFIER_BIN" \
+            --cached-cache-root "$CACHED_CACHE_ROOT" \
+            --cached-runner "$VERIFIER_BIN" \
+            --evidence-dir "$EVIDENCE/full-verification"
+          {
+            echo "source_commit=$GITHUB_SHA"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "dmg_sha256=$(shasum -a 256 "$DMG" | awk '{print $1}')"
+            echo "runtime_macos_major=15"
+            echo "runtime_architecture=$(uname -m)"
+            /usr/bin/sw_vers
+          } >"$EVIDENCE/identity.txt"
+
+      - name: Upload macOS 15 compatibility evidence
+        if: ${{ always() }}
+        id: upload-compatibility
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-macos15-compatibility-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-macos15-compatibility
+          if-no-files-found: error
+          retention-days: 30
+
+  verify-publication:
+    needs: [prepare-release, sign-and-notarize, quarantined-install, macos15-signed-compatibility]
+    runs-on: macos-26
+    outputs:
+      publication_artifact_id: ${{ steps.upload-publication.outputs.artifact-id }}
+      publication_artifact_digest: ${{ format('sha256:{0}', steps.upload-publication.outputs.artifact-digest) }}
+      signed_artifact_id: ${{ needs.sign-and-notarize.outputs.signed_artifact_id }}
+      signed_artifact_digest: ${{ needs.sign-and-notarize.outputs.signed_artifact_digest }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Reverify protected source and artifact identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SIGNED_ARTIFACT_ID: ${{ needs.sign-and-notarize.outputs.signed_artifact_id }}
+          SIGNED_ARTIFACT_DIGEST: ${{ needs.sign-and-notarize.outputs.signed_artifact_digest }}
+          BENCHMARK_ARTIFACT_ID: ${{ needs.prepare-release.outputs.benchmark_artifact_id }}
+          BENCHMARK_ARTIFACT_DIGEST: ${{ needs.prepare-release.outputs.benchmark_artifact_digest }}
+          QUARANTINE_ARTIFACT_ID: ${{ needs.quarantined-install.outputs.quarantine_artifact_id }}
+          QUARANTINE_ARTIFACT_DIGEST: ${{ needs.quarantined-install.outputs.quarantine_artifact_digest }}
+        run: |
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)" = "$GITHUB_SHA"
+          test "$(git rev-parse "v${{ inputs.version }}^{commit}")" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/v${{ inputs.version }}" --jq .sha)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          SIGNED_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$SIGNED_ARTIFACT_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$SIGNED_API" --jq .expired)" = "false"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$SIGNED_API" --jq .digest)" = "$SIGNED_ARTIFACT_DIGEST"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$SIGNED_API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$SIGNED_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+          if [ -n "${{ inputs.benchmark_run_id }}" ]; then
+            BENCHMARK_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$BENCHMARK_ARTIFACT_ID"
+            test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .expired)" = "false"
+            test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .digest)" = "$BENCHMARK_ARTIFACT_DIGEST"
+            test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .workflow_run.id)" = "${{ inputs.benchmark_run_id }}"
+            test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+          fi
+          QUARANTINE_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$QUARANTINE_ARTIFACT_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$QUARANTINE_API" --jq .expired)" = "false"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$QUARANTINE_API" --jq .digest)" = "$QUARANTINE_ARTIFACT_DIGEST"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$QUARANTINE_API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$QUARANTINE_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+
+      - name: Download exact signed build bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.sign-and-notarize.outputs.signed_artifact_id }}
+          path: ${{ runner.temp }}/build-bundle
+
+      - name: Re-download exact prepared benchmark closure
+        if: inputs.benchmark_run_id != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          run-id: ${{ inputs.benchmark_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ needs.prepare-release.outputs.benchmark_artifact_id }}
+          path: ${{ runner.temp }}/prepared-benchmark
+
+      - name: Download exact quarantine evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.quarantined-install.outputs.quarantine_artifact_id }}
+          path: ${{ runner.temp }}/quarantine-evidence
+
+      - name: Bind quarantine evidence to the signed disk image
+        run: |
+          python3 - \
+            "$RUNNER_TEMP/quarantine-evidence/identity.txt" \
+            "$RUNNER_TEMP/build-bundle/EasySplat-${{ inputs.version }}.dmg" \
+            "$GITHUB_SHA" \
+            "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import hashlib
+          import re
+          import sys
+          from pathlib import Path
+
+          identity_path = Path(sys.argv[1])
+          dmg_path = Path(sys.argv[2])
+          commit, run_id, run_attempt = sys.argv[3:]
+          lines = identity_path.read_text(encoding="utf-8").splitlines()
+          values = {}
+          for line in lines:
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              if key in values:
+                  raise SystemExit(f"duplicate quarantine identity field: {key}")
+              values[key] = value
+          required = {
+              "source_commit": commit,
+              "run_id": run_id,
+              "run_attempt": run_attempt,
+          }
+          for key, expected in required.items():
+              if values.get(key) != expected:
+                  raise SystemExit(f"quarantine identity mismatch: {key}")
+          digest = hashlib.sha256(dmg_path.read_bytes()).hexdigest()
+          if not re.fullmatch(r"[0-9a-f]{64}", values.get("dmg_sha256", "")):
+              raise SystemExit("quarantine DMG digest is invalid")
+          if values["dmg_sha256"] != digest:
+              raise SystemExit("quarantine evidence does not bind the signed DMG")
+          PY
+
+      - name: Reaggregate benchmark evidence on the clean verifier
+        if: inputs.benchmark_run_id != ''
+        run: |
+          BENCHMARK_OUTPUT="$RUNNER_TEMP/verified-benchmark"
+          test ! -e "$BENCHMARK_OUTPUT"
+          python3 scripts/benchmark/aggregate_evidence.py \
+            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/reference_m4_max" \
+            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/constrained_14_16gb" \
+            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/eight_gb_fast" \
+            --output "$BENCHMARK_OUTPUT"
+          test -f "$BENCHMARK_OUTPUT/suite.json"
+          cmp -s \
+            "$RUNNER_TEMP/prepared-benchmark/verified-suite.json" \
+            "$BENCHMARK_OUTPUT/suite.json"
+
+      - name: Verify build closure and prepare inert publication bundle
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          PUBLICATION="$RUNNER_TEMP/easysplat-publication"
+          test ! -e "$PUBLICATION"
+          verify_args=(
+            verify-build
+            --release-mode production
+            --bundle "$RUNNER_TEMP/build-bundle"
+            --output "$PUBLICATION"
+            --toolchain-public-key EasySplatApp/Resources/public_key_ed25519.txt
+            --app-version "${{ inputs.version }}"
+            --toolchain-version "${{ inputs.toolchain_version }}"
+            --source-repository "$GITHUB_REPOSITORY"
+            --source-commit "$GITHUB_SHA"
+            --tag "v${{ inputs.version }}"
+            --signed-artifact-id "${{ needs.sign-and-notarize.outputs.signed_artifact_id }}"
+            --signed-artifact-digest "${{ needs.sign-and-notarize.outputs.signed_artifact_digest }}"
+            --workflow-run-id "$GITHUB_RUN_ID"
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+          )
+          if [ -n "${{ inputs.benchmark_run_id }}" ]; then
+            verify_args+=(
+              --benchmark-suite "$RUNNER_TEMP/verified-benchmark/suite.json"
+              --benchmark-run-id "${{ inputs.benchmark_run_id }}"
+              --benchmark-artifact-id "${{ needs.prepare-release.outputs.benchmark_artifact_id }}"
+              --benchmark-artifact-digest "${{ needs.prepare-release.outputs.benchmark_artifact_digest }}"
+            )
+          fi
+          python3 scripts/release/verify_publication_bundle.py "${verify_args[@]}"
 
       - name: Validate SPDX 2.3 output independently
         run: |
@@ -203,7 +1342,7 @@ jobs:
             --only-binary=:all: \
             --requirement scripts/release/spdx-requirements.txt
           "$SPDX_VENV/bin/pyspdxtools" \
-            -i "release/DMG/EasySplat-$VERSION.spdx.json"
+            -i "$RUNNER_TEMP/easysplat-publication/EasySplat-${{ inputs.version }}.spdx.json"
 
       - name: Scan shipped SBOM for actionable vulnerabilities
         env:
@@ -222,175 +1361,9 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" grype
           test "$("$RUNNER_TEMP/grype" version | sed -n 's/^Version:[[:space:]]*//p')" = "$GRYPE_VERSION"
           "$RUNNER_TEMP/grype" --config /dev/null \
-            "sbom:release/DMG/EasySplat-$VERSION.spdx.json" \
+            "sbom:$RUNNER_TEMP/easysplat-publication/EasySplat-${{ inputs.version }}.spdx.json" \
             --only-fixed \
             --fail-on high
-
-      - name: Bind the successful benchmark artifact
-        id: benchmark-identity
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          RUN_API="repos/$GITHUB_REPOSITORY/actions/runs/$BENCHMARK_RUN_ID"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$RUN_API" --jq .head_sha)" = "$GITHUB_SHA"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$RUN_API" --jq .event)" = "workflow_dispatch"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$RUN_API" --jq .conclusion)" = "success"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$RUN_API" --jq '.path | split("@")[0]')" = ".github/workflows/benchmark-release.yml"
-          EXPECTED_NAME="easysplat-benchmark-$GITHUB_SHA"
-          ARTIFACT_IDS="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" --paginate "$RUN_API/artifacts" \
-            --jq ".artifacts[] | select(.name == \"$EXPECTED_NAME\" and .expired == false) | .id")"
-          test "$(printf '%s\n' "$ARTIFACT_IDS" | sed '/^$/d' | wc -l | tr -d '[:space:]')" = "1"
-          ARTIFACT_ID="$(printf '%s\n' "$ARTIFACT_IDS" | sed '/^$/d')"
-          ARTIFACT_DIGEST="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .digest)"
-          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          {
-            echo "artifact_id=$ARTIFACT_ID"
-            echo "artifact_digest=$ARTIFACT_DIGEST"
-          } >>"$GITHUB_OUTPUT"
-
-      - name: Download bound benchmark artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          run-id: ${{ inputs.benchmark_run_id }}
-          github-token: ${{ github.token }}
-          artifact-ids: ${{ steps.benchmark-identity.outputs.artifact_id }}
-          path: ${{ runner.temp }}/bound-benchmark
-
-      - name: Confirm compact benchmark closure is present
-        run: |
-          test -f "$RUNNER_TEMP/bound-benchmark/suite.json"
-          test -f "$RUNNER_TEMP/bound-benchmark/evidence/reference_m4_max/prepared-index.json"
-          test -f "$RUNNER_TEMP/bound-benchmark/evidence/constrained_14_16gb/prepared-index.json"
-          test -f "$RUNNER_TEMP/bound-benchmark/evidence/eight_gb_fast/prepared-index.json"
-
-      - name: Create exact build bundle
-        run: |
-          BUILD_BUNDLE="$RUNNER_TEMP/easysplat-build-bundle"
-          rm -rf "$BUILD_BUNDLE"
-          mkdir -p "$BUILD_BUNDLE"
-          install -m 0644 "release/DMG/EasySplat-$VERSION-unsigned.dmg" "$BUILD_BUNDLE/"
-          install -m 0644 "release/DMG/EasySplat-$VERSION-unsigned.dmg.sha256" "$BUILD_BUNDLE/"
-          install -m 0644 "release/DMG/EasySplat-$VERSION.provenance.json" "$BUILD_BUNDLE/"
-          install -m 0644 "release/DMG/EasySplat-$VERSION.spdx.json" "$BUILD_BUNDLE/"
-          install -m 0644 "release/DMG/EasySplat-$VERSION-licenses.zip" "$BUILD_BUNDLE/"
-          install -m 0644 "release/DMG/EasySplat-$VERSION-dSYM.zip" "$BUILD_BUNDLE/"
-          install -m 0644 "release/DMG/EasySplat-$VERSION-release-notes.txt" "$BUILD_BUNDLE/"
-          install -m 0644 Toolchains/manifest.json "$BUILD_BUNDLE/toolchain-manifest.json"
-          install -m 0644 \
-            Toolchains/out/toolchain-release-request.json \
-            "$BUILD_BUNDLE/toolchain-release-request.json"
-          install -m 0644 \
-            Toolchains/out/authority-envelope.json \
-            "$BUILD_BUNDLE/toolchain-authority-envelope.json"
-          install -m 0644 \
-            Toolchains/out/authority-receipt.json \
-            "$BUILD_BUNDLE/toolchain-authority-receipt.json"
-          python3 scripts/release/verify_publication_bundle.py create-build-closure \
-            --bundle "$BUILD_BUNDLE" \
-            --app-version "$VERSION" \
-            --toolchain-version "$TOOLCHAIN_VERSION" \
-            --source-repository "$GITHUB_REPOSITORY" \
-            --source-commit "$GITHUB_SHA" \
-            --tag "$TAG" \
-            --benchmark-run-id "$BENCHMARK_RUN_ID" \
-            --benchmark-artifact-id "${{ steps.benchmark-identity.outputs.artifact_id }}" \
-            --benchmark-artifact-digest "${{ steps.benchmark-identity.outputs.artifact_digest }}"
-
-      - name: Upload exact build bundle
-        id: upload-build
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: easysplat-build-${{ github.sha }}
-          path: ${{ runner.temp }}/easysplat-build-bundle
-          if-no-files-found: error
-          retention-days: 7
-
-  verify-publication:
-    needs: build-and-test
-    runs-on: macos-15
-    outputs:
-      publication_artifact_id: ${{ steps.upload-publication.outputs.artifact-id }}
-      publication_artifact_digest: ${{ format('sha256:{0}', steps.upload-publication.outputs.artifact-digest) }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.sha }}
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-
-      - name: Reverify protected source and artifact identities
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          BUILD_ARTIFACT_ID: ${{ needs.build-and-test.outputs.build_artifact_id }}
-          BUILD_ARTIFACT_DIGEST: ${{ needs.build-and-test.outputs.build_artifact_digest }}
-          BENCHMARK_ARTIFACT_ID: ${{ needs.build-and-test.outputs.benchmark_artifact_id }}
-          BENCHMARK_ARTIFACT_DIGEST: ${{ needs.build-and-test.outputs.benchmark_artifact_digest }}
-        run: |
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)" = "$GITHUB_SHA"
-          test "$(git rev-parse "v${{ inputs.version }}^{commit}")" = "$GITHUB_SHA"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/v${{ inputs.version }}" --jq .sha)" = "$GITHUB_SHA"
-          test -z "$(git status --porcelain)"
-          BUILD_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$BUILD_ARTIFACT_ID"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BUILD_API" --jq .expired)" = "false"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BUILD_API" --jq .digest)" = "$BUILD_ARTIFACT_DIGEST"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BUILD_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
-          BENCHMARK_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$BENCHMARK_ARTIFACT_ID"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .expired)" = "false"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .digest)" = "$BENCHMARK_ARTIFACT_DIGEST"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .workflow_run.id)" = "${{ inputs.benchmark_run_id }}"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
-
-      - name: Download exact build bundle
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          artifact-ids: ${{ needs.build-and-test.outputs.build_artifact_id }}
-          path: ${{ runner.temp }}/build-bundle
-
-      - name: Re-download exact prepared benchmark closure
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          run-id: ${{ inputs.benchmark_run_id }}
-          github-token: ${{ github.token }}
-          artifact-ids: ${{ needs.build-and-test.outputs.benchmark_artifact_id }}
-          path: ${{ runner.temp }}/prepared-benchmark
-
-      - name: Reaggregate benchmark evidence on the clean verifier
-        run: |
-          BENCHMARK_OUTPUT="$RUNNER_TEMP/verified-benchmark"
-          test ! -e "$BENCHMARK_OUTPUT"
-          python3 scripts/benchmark/aggregate_evidence.py \
-            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/reference_m4_max" \
-            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/constrained_14_16gb" \
-            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/eight_gb_fast" \
-            --output "$BENCHMARK_OUTPUT"
-          test -f "$BENCHMARK_OUTPUT/suite.json"
-          cmp -s \
-            "$RUNNER_TEMP/prepared-benchmark/suite.json" \
-            "$BENCHMARK_OUTPUT/suite.json"
-
-      - name: Verify build closure and prepare inert publication bundle
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          PUBLICATION="$RUNNER_TEMP/easysplat-publication"
-          test ! -e "$PUBLICATION"
-          python3 scripts/release/verify_publication_bundle.py verify-build \
-            --bundle "$RUNNER_TEMP/build-bundle" \
-            --output "$PUBLICATION" \
-            --benchmark-suite "$RUNNER_TEMP/verified-benchmark/suite.json" \
-            --toolchain-public-key EasySplatApp/Resources/public_key_ed25519.txt \
-            --app-version "${{ inputs.version }}" \
-            --toolchain-version "${{ inputs.toolchain_version }}" \
-            --source-repository "$GITHUB_REPOSITORY" \
-            --source-commit "$GITHUB_SHA" \
-            --tag "v${{ inputs.version }}" \
-            --benchmark-run-id "${{ inputs.benchmark_run_id }}" \
-            --benchmark-artifact-id "${{ needs.build-and-test.outputs.benchmark_artifact_id }}" \
-            --benchmark-artifact-digest "${{ needs.build-and-test.outputs.benchmark_artifact_digest }}"
 
       - name: Upload exact publication bundle
         id: upload-publication
@@ -403,22 +1376,765 @@ jobs:
 
   publish:
     needs: verify-publication
-    runs-on: macos-15
+    runs-on: macos-26
     permissions:
-      contents: write
+      contents: read
       actions: read
-    environment: public-beta-release
+    environment: release-publication
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -p -e -u -o pipefail {0}
     steps:
+      - name: Prepare trusted release policy verifier
+        run: |
+          CHECKER="$RUNNER_TEMP/easysplat-release-policy.py"
+          WORKFLOW_PARSER="$RUNNER_TEMP/easysplat-workflow-policy.rb"
+          test ! -e "$CHECKER"
+          test ! -e "$WORKFLOW_PARSER"
+          umask 077
+          cat >"$WORKFLOW_PARSER" <<'RUBY'
+          #!/usr/bin/env ruby
+          # BEGIN TRUSTED WORKFLOW YAML POLICY PARSER
+
+          require "json"
+          require "psych"
+
+
+          EXPECTED_RUBY_VERSION = "2.6.10"
+          EXPECTED_PSYCH_VERSION = "3.1.0"
+          EXPECTED_LIBYAML_VERSION = [0, 2, 1].freeze
+          MAXIMUM_INPUT_BYTES = 8 * 1024 * 1024
+          RELEASE_WORKFLOW = ".github/workflows/release-app.yml"
+          ADMIN_TOKEN = /(?<![A-Za-z0-9_])EASYSPLAT_RELEASE_ADMIN_TOKEN(?![A-Za-z0-9_])/i
+          SIGNING_SECRET = /(?<![A-Za-z0-9_])EASYSPLAT_(?:DEVELOPER_ID_APPLICATION_SHA1|DEVELOPER_TEAM_ID|NOTARY_KEYCHAIN_PROFILE)(?![A-Za-z0-9_])/i
+          SIGNING_ENVIRONMENT = /(?<![A-Za-z0-9_-])release-signing(?![A-Za-z0-9_-])/i
+          RELEASE_ENVIRONMENT = /(?<![A-Za-z0-9_-])release-publication(?![A-Za-z0-9_-])/i
+          DYNAMIC_SECRET_INDEX = /(?<![A-Za-z0-9_])secrets\s*\[/i
+
+
+          class WorkflowPolicyError < StandardError
+          end
+
+
+          class WorkflowPolicy
+            def initialize(path, source)
+              @path = path
+              @source = source
+            end
+
+            def validate
+              stream = Psych.parse_stream(@source, filename: @path)
+              fail!("expected exactly one YAML document") unless stream.children.one?
+              document = stream.children.fetch(0)
+              unless Array(document.version).empty? && Array(document.tag_directives).empty?
+                fail!("YAML directives are forbidden")
+              end
+              root = decode(document.root)
+              fail!("workflow root must be a mapping") unless root.is_a?(Hash)
+
+              permission_entry = policy_entry(root, "permissions", "workflow root")
+              audit_permissions(permission_entry.last, "permissions") if permission_entry
+
+              jobs_entry = policy_entry(root, "jobs", "workflow root")
+              if jobs_entry
+                jobs = jobs_entry.last
+                fail!("jobs must be a mapping") unless jobs.is_a?(Hash)
+                jobs.each do |job_name, job|
+                  fail!("job #{job_name.inspect} must be a mapping") unless job.is_a?(Hash)
+                  entry = policy_entry(job, "permissions", "job #{job_name.inspect}")
+                  audit_permissions(entry.last, "jobs.#{job_name}.permissions") if entry
+                end
+              end
+
+              audit_release_boundary(root, jobs_entry&.last) unless @path == RELEASE_WORKFLOW
+            rescue Psych::SyntaxError => error
+              fail!("invalid YAML: #{error.message}")
+            end
+
+            private
+
+            def decode(node)
+              fail!("empty YAML document") unless node
+              reject_metadata(node)
+              case node
+              when Psych::Nodes::Mapping
+                fail_at(node, "malformed mapping") unless node.children.length.even?
+                result = {}
+                locations = {}
+                node.children.each_slice(2) do |key, value|
+                  reject_metadata(key)
+                  fail_at(key, "mapping keys must be scalars") unless key.is_a?(Psych::Nodes::Scalar)
+                  name = key.value
+                  fail_at(key, "merge keys are forbidden") if name == "<<"
+                  if locations.key?(name)
+                    fail_at(key, "duplicate key #{name.inspect}; first seen at #{locations.fetch(name)}")
+                  end
+                  locations[name] = location(key)
+                  result[name] = decode(value)
+                end
+                result
+              when Psych::Nodes::Sequence
+                node.children.map { |child| decode(child) }
+              when Psych::Nodes::Scalar
+                # Preserve lexical scalars so YAML 1.1 cannot coerce the Actions `on` key.
+                node.value
+              when Psych::Nodes::Alias
+                fail_at(node, "aliases are forbidden")
+              else
+                fail_at(node, "unsupported YAML node #{node.class}")
+              end
+            end
+
+            def reject_metadata(node)
+              fail_at(node, "aliases are forbidden") if node.is_a?(Psych::Nodes::Alias)
+              if node.respond_to?(:anchor) && !node.anchor.to_s.empty?
+                fail_at(node, "anchors are forbidden")
+              end
+              if node.respond_to?(:tag) && !node.tag.to_s.empty?
+                fail_at(node, "explicit YAML tags are forbidden")
+              end
+            end
+
+            def policy_entry(mapping, expected, context)
+              matches = mapping.select { |name, _| name.casecmp?(expected) }
+              fail!("#{context} defines #{expected} more than once") if matches.length > 1
+              matches.first
+            end
+
+            def audit_permissions(value, path)
+              case value
+              when String
+                normalized = value.downcase
+                fail!("#{path} requests write-all") if normalized == "write-all"
+                fail!("#{path} has an invalid scalar value") unless normalized == "read-all"
+              when Hash
+                normalized_scopes = {}
+                value.each do |scope, access|
+                  normalized_scope = scope.downcase
+                  fail!("#{path} defines #{scope} more than once") if normalized_scopes.key?(normalized_scope)
+                  normalized_scopes[normalized_scope] = true
+                  fail!("#{path}.#{scope} has an invalid access") unless access.is_a?(String)
+                  normalized_access = access.downcase
+                  unless ["read", "write", "none"].include?(normalized_access)
+                    fail!("#{path}.#{scope} has an invalid access #{access.inspect}")
+                  end
+                  if normalized_scope == "contents" && normalized_access == "write"
+                    fail!("#{path} requests contents: write")
+                  end
+                end
+              else
+                fail!("#{path} has an invalid shape")
+              end
+            end
+
+            def audit_release_boundary(root, jobs)
+              each_string(root) do |value|
+                if ADMIN_TOKEN.match?(value) || SIGNING_SECRET.match?(value) ||
+                   SIGNING_ENVIRONMENT.match?(value) || RELEASE_ENVIRONMENT.match?(value) ||
+                   DYNAMIC_SECRET_INDEX.match?(value)
+                  fail!("workflow can enter the release authority boundary")
+                end
+              end
+              return unless jobs.is_a?(Hash)
+              jobs.each do |job_name, job|
+                next unless job.is_a?(Hash)
+                environment_entry = policy_entry(job, "environment", "job #{job_name.inspect}")
+                next unless environment_entry
+                environment = environment_entry.last
+                environment = policy_entry(environment, "name", "job #{job_name.inspect} environment")&.last if environment.is_a?(Hash)
+                if environment.is_a?(String) && environment.include?("$" + "{{")
+                  fail!("job #{job_name.inspect} computes its release environment")
+                end
+              end
+            end
+
+            def each_string(value, &block)
+              case value
+              when Hash
+                value.each do |key, child|
+                  yield key
+                  each_string(child, &block)
+                end
+              when Array
+                value.each { |child| each_string(child, &block) }
+              when String
+                yield value
+              end
+            end
+
+            def location(node)
+              "#{@path}:#{node.start_line + 1}:#{node.start_column + 1}"
+            end
+
+            def fail_at(node, message)
+              fail!("#{message} at #{location(node)}")
+            end
+
+            def fail!(message)
+              raise WorkflowPolicyError, "#{@path}: #{message}"
+            end
+          end
+
+
+          begin
+            unless RUBY_VERSION == EXPECTED_RUBY_VERSION &&
+                   Psych::VERSION == EXPECTED_PSYCH_VERSION &&
+                   Psych.libyaml_version == EXPECTED_LIBYAML_VERSION
+              raise WorkflowPolicyError, "trusted YAML runtime identity differs"
+            end
+            payload = STDIN.read(MAXIMUM_INPUT_BYTES + 1)
+            raise WorkflowPolicyError, "workflow policy input is oversized" if payload.bytesize > MAXIMUM_INPUT_BYTES
+            payload.force_encoding(Encoding::UTF_8)
+            raise WorkflowPolicyError, "workflow policy input is not UTF-8" unless payload.valid_encoding?
+            workflows = JSON.parse(payload)
+            unless workflows.is_a?(Hash) && !workflows.empty?
+              raise WorkflowPolicyError, "workflow policy input must be a nonempty object"
+            end
+            workflows.each do |path, source|
+              unless path.is_a?(String) && path.start_with?(".github/workflows/") &&
+                     source.is_a?(String)
+                raise WorkflowPolicyError, "workflow path or source is invalid"
+              end
+              WorkflowPolicy.new(path, source).validate
+            end
+          rescue JSON::ParserError => error
+            warn "invalid workflow policy JSON: #{error.message}"
+            exit 1
+          rescue WorkflowPolicyError => error
+            warn error.message
+            exit 1
+          end
+          # END TRUSTED WORKFLOW YAML POLICY PARSER
+          RUBY
+          chmod 0500 "$WORKFLOW_PARSER"
+          WORKFLOW_PARSER_SHA256="$(shasum -a 256 "$WORKFLOW_PARSER" | awk '{print $1}')"
+          [[ "$WORKFLOW_PARSER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          cat >"$CHECKER" <<'PY'
+          #!/usr/bin/env python3
+          # BEGIN TRUSTED RELEASE POLICY CHECKER
+
+          import argparse
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          from urllib.parse import quote
+
+
+          API_VERSION = "2026-03-10"
+          GITHUB_ACTIONS_APP_ID = 15368
+          REQUIRED_CHECKS = {
+              "Swift · macOS 15 arm64 · Xcode 16.4",
+              "Real 8 GB-class policy lane",
+              "Native Metal trainer",
+              "Repository contracts",
+              "DA3 bridge · Python 3.12",
+              "Actions and shell lint",
+              "Python dependency audit",
+              "Full-history secret scan",
+              "Pull request dependency review",
+              "Analyze swift",
+              "Analyze python",
+              "Analyze c-cpp",
+              "Analyze actions",
+          }
+          SNAPSHOT_NAMES = {
+              "repository",
+              "branch",
+              "verification_environment",
+              "signing_environment",
+              "release_environment",
+              "authority",
+              "collaborators",
+              "keys",
+              "actions",
+              "rulesets",
+              "versions",
+              "workflows",
+          }
+
+
+          def fail(message):
+              raise SystemExit(message)
+
+
+          def require(condition, message):
+              if not condition:
+                  fail(message)
+
+
+          def read_json(path, maximum=8 * 1024 * 1024):
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  before = os.fstat(descriptor)
+                  identity = (
+                      before.st_dev,
+                      before.st_ino,
+                      before.st_mode,
+                      before.st_nlink,
+                      before.st_size,
+                      before.st_mtime_ns,
+                      before.st_ctime_ns,
+                  )
+                  require(
+                      stat.S_ISREG(before.st_mode)
+                      and before.st_nlink == 1
+                      and 0 < before.st_size <= maximum,
+                      f"release policy snapshot is invalid: {Path(path).name}",
+                  )
+                  chunks = []
+                  remaining = before.st_size
+                  while remaining:
+                      chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                      require(chunk, f"release policy snapshot was truncated: {Path(path).name}")
+                      chunks.append(chunk)
+                      remaining -= len(chunk)
+                  require(not os.read(descriptor, 1), f"release policy snapshot grew: {Path(path).name}")
+                  after = os.fstat(descriptor)
+                  require(
+                      identity
+                      == (
+                          after.st_dev,
+                          after.st_ino,
+                          after.st_mode,
+                          after.st_nlink,
+                          after.st_size,
+                          after.st_mtime_ns,
+                          after.st_ctime_ns,
+                      ),
+                      f"release policy snapshot changed: {Path(path).name}",
+                  )
+                  return json.loads(b"".join(chunks).decode("utf-8"))
+              finally:
+                  os.close(descriptor)
+
+
+          def validate_workflow_sources(workflows):
+              parser_value = os.environ.get("WORKFLOW_POLICY_PARSER", "")
+              expected_hash = os.environ.get("WORKFLOW_POLICY_PARSER_SHA256", "")
+              require(parser_value, "trusted workflow parser path is absent")
+              require(
+                  len(expected_hash) == 64
+                  and all(character in "0123456789abcdef" for character in expected_hash),
+                  "trusted workflow parser hash is invalid",
+              )
+              descriptor = os.open(
+                  parser_value,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+              )
+              try:
+                  before = os.fstat(descriptor)
+                  identity = (
+                      before.st_dev,
+                      before.st_ino,
+                      before.st_mode,
+                      before.st_nlink,
+                      before.st_size,
+                      before.st_mtime_ns,
+                      before.st_ctime_ns,
+                  )
+                  require(
+                      stat.S_ISREG(before.st_mode)
+                      and before.st_uid == os.getuid()
+                      and before.st_nlink == 1
+                      and stat.S_IMODE(before.st_mode) == 0o500
+                      and 0 < before.st_size <= 256 * 1024,
+                      "trusted workflow parser file is invalid",
+                  )
+                  digest = hashlib.sha256()
+                  remaining = before.st_size
+                  while remaining:
+                      chunk = os.read(descriptor, min(64 * 1024, remaining))
+                      require(chunk, "trusted workflow parser was truncated")
+                      digest.update(chunk)
+                      remaining -= len(chunk)
+                  require(not os.read(descriptor, 1), "trusted workflow parser grew")
+                  after = os.fstat(descriptor)
+                  require(
+                      identity
+                      == (
+                          after.st_dev,
+                          after.st_ino,
+                          after.st_mode,
+                          after.st_nlink,
+                          after.st_size,
+                          after.st_mtime_ns,
+                          after.st_ctime_ns,
+                      ),
+                      "trusted workflow parser changed",
+                  )
+                  require(digest.hexdigest() == expected_hash, "trusted workflow parser hash differs")
+                  os.lseek(descriptor, 0, os.SEEK_SET)
+                  payload = json.dumps(
+                      workflows,
+                      sort_keys=True,
+                      separators=(",", ":"),
+                  ).encode("utf-8")
+                  require(len(payload) <= 8 * 1024 * 1024, "tracked workflow closure is oversized")
+                  try:
+                      result = subprocess.run(
+                          [
+                              "/usr/bin/ruby",
+                              "--disable-gems",
+                              f"/dev/fd/{descriptor}",
+                          ],
+                          input=payload,
+                          capture_output=True,
+                          check=False,
+                          timeout=15,
+                          pass_fds=(descriptor,),
+                          env={
+                              "PATH": "/usr/bin:/bin",
+                              "RUBYLIB": "",
+                              "RUBYOPT": "",
+                          },
+                      )
+                  except subprocess.TimeoutExpired:
+                      fail("trusted workflow parser timed out")
+                  require(not result.stdout, "trusted workflow parser emitted unexpected output")
+                  if result.returncode != 0:
+                      detail = result.stderr[:4096].decode("utf-8", errors="replace").strip()
+                      fail(f"tracked workflow policy is invalid: {detail}")
+              finally:
+                  os.close(descriptor)
+
+
+          def write_json(root, name, value):
+              require(name in SNAPSHOT_NAMES, f"unknown release policy snapshot: {name}")
+              path = root / f"{name}.json"
+              payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+              require(len(payload) <= 8 * 1024 * 1024, f"release policy snapshot is oversized: {name}")
+              descriptor = os.open(
+                  path,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                  0o600,
+              )
+              try:
+                  written = 0
+                  while written < len(payload):
+                      count = os.write(descriptor, payload[written:])
+                      require(count > 0, f"release policy snapshot write stalled: {name}")
+                      written += count
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+
+
+          def api(endpoint, *, paginate=False):
+              gh = shutil.which("gh")
+              require(gh is not None, "GitHub CLI is unavailable")
+              command = [
+                  gh,
+                  "api",
+                  "-H",
+                  f"X-GitHub-Api-Version: {API_VERSION}",
+              ]
+              if paginate:
+                  command.extend(["--paginate", "--slurp"])
+              command.append(endpoint)
+              result = subprocess.run(command, check=False, capture_output=True)
+              require(result.returncode == 0, f"GitHub policy API failed for {endpoint}")
+              require(0 < len(result.stdout) <= 8 * 1024 * 1024, f"GitHub policy API response is invalid for {endpoint}")
+              try:
+                  return json.loads(result.stdout)
+              except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                  fail(f"GitHub policy API returned invalid JSON for {endpoint}: {error}")
+
+
+          def flatten_pages(value, endpoint):
+              require(isinstance(value, list) and value, f"GitHub pagination failed for {endpoint}")
+              rows = []
+              for page in value:
+                  require(isinstance(page, list), f"GitHub pagination shape differs for {endpoint}")
+                  rows.extend(page)
+              return rows
+
+
+          def environment_is_protected(environment, expected_name, authority):
+              require(environment.get("name") == expected_name, f"release environment identity differs: {expected_name}")
+              require(environment.get("can_admins_bypass") is False, f"{expected_name} must prevent administrator bypass")
+              policy = environment.get("deployment_branch_policy")
+              require(
+                  isinstance(policy, dict)
+                  and policy.get("protected_branches") is True
+                  and policy.get("custom_branch_policies") is False,
+                  f"{expected_name} must allow protected branches only",
+              )
+              reviewer_rules = [
+                  rule
+                  for rule in environment.get("protection_rules") or []
+                  if isinstance(rule, dict) and rule.get("type") == "required_reviewers"
+              ]
+              require(len(reviewer_rules) == 1, f"{expected_name} must have one required-reviewer rule")
+              rule = reviewer_rules[0]
+              require(rule.get("prevent_self_review") is True, f"{expected_name} must prevent self review")
+              reviewers = rule.get("reviewers")
+              require(isinstance(reviewers, list) and reviewers, f"{expected_name} must require an independent reviewer")
+              for reviewer in reviewers:
+                  require(
+                      isinstance(reviewer, dict)
+                      and reviewer.get("type") == "User"
+                      and isinstance(reviewer.get("reviewer"), dict),
+                      f"{expected_name} reviewer authority cannot be proven",
+                  )
+                  login = reviewer["reviewer"].get("login")
+                  require(isinstance(login, str) and login and login != authority, f"{expected_name} reviewer is not independent")
+
+
+          def validate(snapshot, repository, tag):
+              require(set(snapshot) == SNAPSHOT_NAMES, "release policy snapshot closure is incomplete")
+              versions = snapshot["versions"]
+              require(
+                  isinstance(versions, list) and API_VERSION in versions,
+                  f"GitHub REST API version {API_VERSION} is not currently supported",
+              )
+              repo = snapshot["repository"]
+              require(repo.get("full_name") == repository, "release repository identity differs")
+              require(repo.get("default_branch") == "main", "release repository default branch must be main")
+              require(repo.get("private") is False and repo.get("visibility") == "public", "release repository must be public")
+              owner = repo.get("owner")
+              require(isinstance(owner, dict) and owner.get("type") == "User", "exclusive release authority requires a personal repository")
+              authority = snapshot["authority"]
+              require(authority.get("type") == "User" and authority.get("login") == owner.get("login"), "release token must authenticate as the repository owner")
+              authority_login = authority["login"]
+              require(
+                  repo.get("allow_squash_merge") is True
+                  and repo.get("allow_merge_commit") is False
+                  and repo.get("allow_rebase_merge") is False
+                  and repo.get("delete_branch_on_merge") is True,
+                  "repository must be squash-only and delete merged branches",
+              )
+
+              branch = snapshot["branch"]
+              reviews = branch.get("required_pull_request_reviews")
+              require(isinstance(reviews, dict), "main must require pull-request reviews")
+              require(reviews.get("required_approving_review_count", 0) >= 1, "main must require at least one approval")
+              require(reviews.get("dismiss_stale_reviews") is True, "main must dismiss stale reviews")
+              require(reviews.get("require_last_push_approval") is True, "main must require approval after the last push")
+              bypass = reviews.get("bypass_pull_request_allowances")
+              require(
+                  isinstance(bypass, dict)
+                  and set(bypass) == {"users", "teams", "apps"}
+                  and not bypass["users"]
+                  and not bypass["teams"]
+                  and not bypass["apps"],
+                  "main pull-request protection must have no bypass actors",
+              )
+              require(branch.get("enforce_admins", {}).get("enabled") is True, "main protection must include administrators")
+              checks = branch.get("required_status_checks")
+              require(isinstance(checks, dict) and checks.get("strict") is True, "main status checks must be strict")
+              require(set(checks.get("contexts") or []) == REQUIRED_CHECKS, "main required check contexts differ")
+              check_rows = checks.get("checks")
+              require(isinstance(check_rows, list), "main required check applications are absent")
+              actual_checks = {
+                  (row.get("context"), row.get("app_id"))
+                  for row in check_rows
+                  if isinstance(row, dict)
+              }
+              expected_checks = {(context, GITHUB_ACTIONS_APP_ID) for context in REQUIRED_CHECKS}
+              require(actual_checks == expected_checks and len(check_rows) == len(expected_checks), "main required checks are not bound to GitHub Actions")
+              require(branch.get("required_linear_history", {}).get("enabled") is True, "main must require linear history")
+              require(branch.get("required_conversation_resolution", {}).get("enabled") is True, "main must require conversation resolution")
+              require(branch.get("allow_force_pushes", {}).get("enabled") is False, "main must disable force pushes")
+              require(branch.get("allow_deletions", {}).get("enabled") is False, "main must disable branch deletion")
+
+              environment_is_protected(snapshot["verification_environment"], "release-verification", authority_login)
+              environment_is_protected(snapshot["signing_environment"], "release-signing", authority_login)
+              environment_is_protected(snapshot["release_environment"], "release-publication", authority_login)
+
+              collaborators = snapshot["collaborators"]
+              require(isinstance(collaborators, list) and collaborators, "repository collaborator authority cannot be proven")
+              writers = []
+              authority_rows = []
+              for collaborator in collaborators:
+                  permissions = collaborator.get("permissions") if isinstance(collaborator, dict) else None
+                  require(isinstance(permissions, dict), "repository collaborator permissions are incomplete")
+                  if any(permissions.get(name) is True for name in ("push", "maintain", "admin")):
+                      writers.append(collaborator.get("login"))
+                  if collaborator.get("login") == authority_login:
+                      authority_rows.append(collaborator)
+              require(
+                  len(writers) == 1 and set(writers) == {authority_login},
+                  "repository has a release writer other than the authenticated owner",
+              )
+              require(
+                  len(authority_rows) == 1
+                  and authority_rows[0]["permissions"].get("admin") is True,
+                  "release token authority is not the repository administrator",
+              )
+
+              keys = snapshot["keys"]
+              require(isinstance(keys, list), "deploy-key closure cannot be proven")
+              require(all(isinstance(key, dict) and key.get("read_only") is True for key in keys), "a deploy key can write release contents")
+              actions = snapshot["actions"]
+              require(
+                  actions.get("default_workflow_permissions") == "read"
+                  and actions.get("can_approve_pull_request_reviews") is False,
+                  "GitHub Actions must be read-only and unable to approve pull requests",
+              )
+              workflows = snapshot["workflows"]
+              require(isinstance(workflows, dict) and workflows, "tracked workflow permission closure cannot be proven")
+              for path, source in workflows.items():
+                  require(isinstance(path, str) and path.startswith(".github/workflows/"), "tracked workflow path is invalid")
+                  require(isinstance(source, str), f"tracked workflow source is invalid: {path}")
+              validate_workflow_sources(workflows)
+
+              rulesets = snapshot["rulesets"]
+              require(isinstance(rulesets, list), "tag ruleset closure cannot be proven")
+              exact_ref = f"refs/tags/{tag}"
+              candidates = []
+              for ruleset in rulesets:
+                  conditions = ruleset.get("conditions") if isinstance(ruleset, dict) else None
+                  ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+                  if (
+                      ruleset.get("target") == "tag"
+                      and ruleset.get("enforcement") == "active"
+                      and isinstance(ref_name, dict)
+                      and ref_name.get("include") == [exact_ref]
+                      and ref_name.get("exclude") == []
+                  ):
+                      candidates.append(ruleset)
+              require(len(candidates) == 1, "exact release-tag ruleset is absent or ambiguous")
+              tag_ruleset = candidates[0]
+              require(tag_ruleset.get("bypass_actors") == [], "release-tag ruleset must have no bypass actors")
+              rule_types = {
+                  rule.get("type")
+                  for rule in tag_ruleset.get("rules") or []
+                  if isinstance(rule, dict)
+              }
+              require({"update", "deletion"}.issubset(rule_types), "release tag must reject updates and deletion")
+
+
+          def load_snapshot(root):
+              require(root.is_dir() and not root.is_symlink(), "release policy snapshot directory is invalid")
+              return {name: read_json(root / f"{name}.json") for name in SNAPSHOT_NAMES}
+
+
+          def live_snapshot(repository):
+              versions = api("/versions")
+              repository_data = api(f"repos/{repository}")
+              branch = api(f"repos/{repository}/branches/main/protection")
+              verification_environment = api(f"repos/{repository}/environments/release-verification")
+              signing_environment = api(f"repos/{repository}/environments/release-signing")
+              release_environment = api(f"repos/{repository}/environments/release-publication")
+              authority = api("/user")
+
+              collaborator_endpoint = f"repos/{repository}/collaborators?affiliation=all&per_page=100"
+              collaborators = flatten_pages(api(collaborator_endpoint, paginate=True), collaborator_endpoint)
+              key_endpoint = f"repos/{repository}/keys?per_page=100"
+              keys = flatten_pages(api(key_endpoint, paginate=True), key_endpoint)
+              actions = api(f"repos/{repository}/actions/permissions/workflow")
+              ruleset_endpoint = f"repos/{repository}/rulesets?targets=tag&per_page=100"
+              ruleset_rows = flatten_pages(api(ruleset_endpoint, paginate=True), ruleset_endpoint)
+              rulesets = []
+              for row in ruleset_rows:
+                  ruleset_id = row.get("id") if isinstance(row, dict) else None
+                  require(isinstance(ruleset_id, int) and ruleset_id > 0, "tag ruleset identifier is invalid")
+                  rulesets.append(api(f"repos/{repository}/rulesets/{ruleset_id}"))
+
+              workflow_listing = api(f"repos/{repository}/contents/.github/workflows?ref=main")
+              require(isinstance(workflow_listing, list) and workflow_listing, "tracked workflow listing is unavailable")
+              workflows = {}
+              for entry in workflow_listing:
+                  path = entry.get("path") if isinstance(entry, dict) else None
+                  if not isinstance(path, str) or not path.endswith((".yml", ".yaml")):
+                      continue
+                  encoded_path = quote(path, safe="/")
+                  content = api(f"repos/{repository}/contents/{encoded_path}?ref=main")
+                  require(content.get("encoding") == "base64" and isinstance(content.get("content"), str), f"tracked workflow content is unavailable: {path}")
+                  try:
+                      encoded = "".join(content["content"].split())
+                      workflows[path] = base64.b64decode(encoded, validate=True).decode("utf-8")
+                  except (ValueError, UnicodeDecodeError) as error:
+                      fail(f"tracked workflow encoding is invalid: {path}: {error}")
+              return {
+                  "repository": repository_data,
+                  "branch": branch,
+                  "verification_environment": verification_environment,
+                  "signing_environment": signing_environment,
+                  "release_environment": release_environment,
+                  "authority": authority,
+                  "collaborators": collaborators,
+                  "keys": keys,
+                  "actions": actions,
+                  "rulesets": rulesets,
+                  "versions": versions,
+                  "workflows": workflows,
+              }
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              subparsers = parser.add_subparsers(dest="command", required=True)
+              live = subparsers.add_parser("live")
+              live.add_argument("--evidence-dir", required=True, type=Path)
+              live.add_argument("--repository", required=True)
+              live.add_argument("--tag", required=True)
+              verify = subparsers.add_parser("verify-snapshot")
+              verify.add_argument("--snapshot-dir", required=True, type=Path)
+              verify.add_argument("--repository", required=True)
+              verify.add_argument("--tag", required=True)
+              arguments = parser.parse_args()
+              if arguments.command == "live":
+                  root = arguments.evidence_dir
+                  require(root.is_dir() and not root.is_symlink(), "release policy evidence directory is invalid")
+                  require(not any(root.iterdir()), "release policy evidence directory must be empty")
+                  snapshot = live_snapshot(arguments.repository)
+                  for name in sorted(SNAPSHOT_NAMES):
+                      write_json(root, name, snapshot[name])
+                  validate(snapshot, arguments.repository, arguments.tag)
+                  root_descriptor = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+                  try:
+                      os.fsync(root_descriptor)
+                  finally:
+                      os.close(root_descriptor)
+              else:
+                  snapshot = load_snapshot(arguments.snapshot_dir)
+                  validate(snapshot, arguments.repository, arguments.tag)
+              print(
+                  f"Draft policy verified for {arguments.repository} {arguments.tag}. "
+                  "GitHub App write authority is not authoritatively inventoryable by the release PAT; "
+                  "automatic publication remains forbidden."
+              )
+
+
+          if __name__ == "__main__":
+              main()
+          # END TRUSTED RELEASE POLICY CHECKER
+          PY
+          chmod 0500 "$CHECKER"
+          CHECKER_SHA256="$(shasum -a 256 "$CHECKER" | awk '{print $1}')"
+          [[ "$CHECKER_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo "RELEASE_POLICY_CHECKER=$CHECKER"
+            echo "RELEASE_POLICY_CHECKER_SHA256=$CHECKER_SHA256"
+            echo "WORKFLOW_POLICY_PARSER=$WORKFLOW_PARSER"
+            echo "WORKFLOW_POLICY_PARSER_SHA256=$WORKFLOW_PARSER_SHA256"
+          } >>"$GITHUB_ENV"
+
       - name: Reverify publication artifact identity
         env:
           GH_TOKEN: ${{ github.token }}
           PUBLICATION_ARTIFACT_ID: ${{ needs.verify-publication.outputs.publication_artifact_id }}
           PUBLICATION_ARTIFACT_DIGEST: ${{ needs.verify-publication.outputs.publication_artifact_digest }}
+          SIGNED_ARTIFACT_ID: ${{ needs.verify-publication.outputs.signed_artifact_id }}
+          SIGNED_ARTIFACT_DIGEST: ${{ needs.verify-publication.outputs.signed_artifact_digest }}
         run: |
           ARTIFACT_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$PUBLICATION_ARTIFACT_ID"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$ARTIFACT_API" --jq .expired)" = "false"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$ARTIFACT_API" --jq .digest)" = "$PUBLICATION_ARTIFACT_DIGEST"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$ARTIFACT_API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$ARTIFACT_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+          SIGNED_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$SIGNED_ARTIFACT_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$SIGNED_API" --jq .expired)" = "false"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$SIGNED_API" --jq .digest)" = "$SIGNED_ARTIFACT_DIGEST"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$SIGNED_API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$SIGNED_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
 
       - name: Download exact publication bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -432,6 +2148,8 @@ jobs:
           VERSION: ${{ inputs.version }}
           TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
           BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
+          SIGNED_ARTIFACT_ID: ${{ needs.verify-publication.outputs.signed_artifact_id }}
+          SIGNED_ARTIFACT_DIGEST: ${{ needs.verify-publication.outputs.signed_artifact_digest }}
         run: |
           python3 - <<'PY'
           import hashlib, json, os, re, stat
@@ -442,17 +2160,18 @@ jobs:
           manifest_name = "publication-manifest.json"
           stem = f"EasySplat-{version}"
           names = {
-              f"{stem}-unsigned.dmg",
-              f"{stem}-unsigned.dmg.sha256",
+              f"{stem}.dmg",
+              f"{stem}.dmg.sha256",
               f"{stem}.provenance.json",
               f"{stem}.spdx.json",
               f"{stem}-licenses.zip",
               f"{stem}-dSYM.zip",
-              f"{stem}-benchmark.json",
               f"{stem}-release-notes.txt",
           }
+          if os.environ["BENCHMARK_RUN_ID"]:
+              names.add(f"{stem}-benchmark.json")
           limits = {name: 2_147_483_648 for name in names}
-          limits[f"{stem}-unsigned.dmg.sha256"] = 1024
+          limits[f"{stem}.dmg.sha256"] = 1024
           limits[f"{stem}.provenance.json"] = 8 * 1024 * 1024
           limits[f"{stem}.spdx.json"] = 64 * 1024 * 1024
           limits[f"{stem}-benchmark.json"] = 128 * 1024 * 1024
@@ -475,69 +2194,237 @@ jobs:
           if not stat.S_ISREG(metadata.st_mode) or manifest_path.is_symlink() or metadata.st_nlink != 1 or not 0 < metadata.st_size <= 4 * 1024 * 1024:
               raise SystemExit("publication manifest is not a bounded single-link regular file")
           manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-          expected_keys = {"schema_version", "app_version", "toolchain_version", "source_repository", "source_commit", "tag", "release_mode", "benchmark", "files"}
+          expected_keys = {"schema_version", "app_version", "toolchain_version", "source_repository", "source_commit", "tag", "release_mode", "benchmark", "signed_build", "files"}
           if set(manifest) != expected_keys:
               raise SystemExit("publication manifest fields are invalid")
           if manifest["schema_version"] != 1 or manifest["app_version"] != version or manifest["toolchain_version"] != os.environ["TOOLCHAIN_VERSION"]:
               raise SystemExit("publication manifest version identity is invalid")
-          if manifest["source_repository"] != os.environ["GITHUB_REPOSITORY"] or manifest["source_commit"] != os.environ["GITHUB_SHA"] or manifest["tag"] != f"v{version}" or manifest["release_mode"] != "unsigned-beta":
+          if manifest["source_repository"] != os.environ["GITHUB_REPOSITORY"] or manifest["source_commit"] != os.environ["GITHUB_SHA"] or manifest["tag"] != f"v{version}" or manifest["release_mode"] != "production":
               raise SystemExit("publication manifest source identity is invalid")
           benchmark = manifest["benchmark"]
-          if set(benchmark) != {"run_id", "artifact_id", "artifact_digest", "suite_sha256"} or benchmark["run_id"] != os.environ["BENCHMARK_RUN_ID"]:
-              raise SystemExit("publication manifest benchmark identity is invalid")
-          if not re.fullmatch(r"sha256:[0-9a-f]{64}", benchmark["artifact_digest"]) or not re.fullmatch(r"[0-9a-f]{64}", benchmark["suite_sha256"]):
-              raise SystemExit("publication manifest benchmark digest is invalid")
+          if os.environ["BENCHMARK_RUN_ID"]:
+              if set(benchmark) != {"run_id", "artifact_id", "artifact_digest", "suite_sha256"} or benchmark["run_id"] != os.environ["BENCHMARK_RUN_ID"]:
+                  raise SystemExit("publication manifest benchmark identity is invalid")
+              if not re.fullmatch(r"sha256:[0-9a-f]{64}", benchmark["artifact_digest"]) or not re.fullmatch(r"[0-9a-f]{64}", benchmark["suite_sha256"]):
+                  raise SystemExit("publication manifest benchmark digest is invalid")
+          elif benchmark is not None:
+              raise SystemExit("publication manifest contains unauthenticated benchmark evidence")
+          signed_build = manifest["signed_build"]
+          expected_signed_build = {
+              "artifact_digest": os.environ["SIGNED_ARTIFACT_DIGEST"],
+              "artifact_id": os.environ["SIGNED_ARTIFACT_ID"],
+              "source_commit": os.environ["GITHUB_SHA"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+          }
+          if signed_build != expected_signed_build:
+              raise SystemExit("publication manifest signed build identity is invalid")
           records = [record(root / name) for name in sorted(names)]
           if manifest["files"] != records:
               raise SystemExit("publication payload differs from its manifest")
-          benchmark_record = next(row for row in records if row["name"] == f"{stem}-benchmark.json")
-          if benchmark["suite_sha256"] != benchmark_record["sha256"]:
-              raise SystemExit("publication benchmark digest is invalid")
-          checksum = (root / f"{stem}-unsigned.dmg.sha256").read_text(encoding="ascii")
-          dmg_record = next(row for row in records if row["name"] == f"{stem}-unsigned.dmg")
-          if checksum != f"{dmg_record['sha256']}  {stem}-unsigned.dmg\n":
+          if benchmark is not None:
+              benchmark_record = next(row for row in records if row["name"] == f"{stem}-benchmark.json")
+              if benchmark["suite_sha256"] != benchmark_record["sha256"]:
+                  raise SystemExit("publication benchmark digest is invalid")
+          checksum = (root / f"{stem}.dmg.sha256").read_text(encoding="ascii")
+          dmg_record = next(row for row in records if row["name"] == f"{stem}.dmg")
+          if checksum != f"{dmg_record['sha256']}  {stem}.dmg\n":
               raise SystemExit("publication DMG checksum is invalid")
           PY
 
-      - name: Reverify tag and release policy
+      - name: Reverify policy, create or resume draft, and upload exact assets
         env:
           GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           TAG: v${{ inputs.version }}
-        run: |
-          test -n "$GH_TOKEN"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = "true"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)" = "$GITHUB_SHA"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
-          if gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists and will not be overwritten." >&2
-            exit 1
-          fi
-
-      - name: Create draft and upload exact assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: v${{ inputs.version }}
           VERSION: ${{ inputs.version }}
           PUBLICATION_ROOT: ${{ runner.temp }}/publication
         run: |
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "EasySplat $VERSION" \
-            --notes-file "$PUBLICATION_ROOT/EasySplat-$VERSION-release-notes.txt" \
-            --draft \
-            --prerelease
-          touch "$RUNNER_TEMP/easysplat-draft-created"
-          gh release upload "$TAG" \
-            "$PUBLICATION_ROOT/EasySplat-$VERSION-unsigned.dmg" \
-            "$PUBLICATION_ROOT/EasySplat-$VERSION-unsigned.dmg.sha256" \
-            "$PUBLICATION_ROOT/EasySplat-$VERSION.provenance.json" \
-            "$PUBLICATION_ROOT/EasySplat-$VERSION.spdx.json" \
-            "$PUBLICATION_ROOT/EasySplat-$VERSION-licenses.zip" \
-            "$PUBLICATION_ROOT/EasySplat-$VERSION-dSYM.zip" \
-            "$PUBLICATION_ROOT/EasySplat-$VERSION-benchmark.json" \
-            --repo "$GITHUB_REPOSITORY"
+          test -n "$GH_TOKEN"
+          unset BASH_ENV ENV GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+            PYTHONHOME PYTHONPATH REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE \
+            SSL_CERT_DIR HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY
+          PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+          export PATH
+          LIVE_POLICY_ROOT="$RUNNER_TEMP/easysplat-pre-draft-policy"
+          test ! -e "$LIVE_POLICY_ROOT"
+          mkdir -m 0700 "$LIVE_POLICY_ROOT"
+          test "$(shasum -a 256 "$RELEASE_POLICY_CHECKER" | awk '{print $1}')" = \
+            "$RELEASE_POLICY_CHECKER_SHA256"
+          "$RELEASE_POLICY_CHECKER" live \
+            --evidence-dir "$LIVE_POLICY_ROOT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$DEFAULT_BRANCH" = "main"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
+          DRAFT_OWNER_FILE="$RUNNER_TEMP/easysplat-draft-owner"
+          DRAFT_RELEASE_ID_FILE="$RUNNER_TEMP/easysplat-draft-release-id"
+          DRAFT_NOTES_FILE="$RUNNER_TEMP/easysplat-owned-release-notes.txt"
+          DRAFT_LIST_JSON="$RUNNER_TEMP/easysplat-release-list.json"
+          DRAFT_JSON="$RUNNER_TEMP/easysplat-owned-draft.json"
+          DRAFT_MODE_FILE="$RUNNER_TEMP/easysplat-draft-mode"
+          PENDING_ASSETS_FILE="$RUNNER_TEMP/easysplat-pending-assets"
+          test ! -e "$DRAFT_OWNER_FILE"
+          test ! -e "$DRAFT_RELEASE_ID_FILE"
+          test ! -e "$DRAFT_NOTES_FILE"
+          test ! -e "$DRAFT_LIST_JSON"
+          test ! -e "$DRAFT_JSON"
+          test ! -e "$DRAFT_MODE_FILE"
+          test ! -e "$PENDING_ASSETS_FILE"
+          DRAFT_OWNER="easysplat-release-owner:v2:${GITHUB_RUN_ID}:${GITHUB_SHA}"
+          umask 077
+          printf '%s\n' "$DRAFT_OWNER" >"$DRAFT_OWNER_FILE"
+          cp "$PUBLICATION_ROOT/EasySplat-$VERSION-release-notes.txt" "$DRAFT_NOTES_FILE"
+          printf '\n\n<!-- %s -->\n' "$DRAFT_OWNER" >>"$DRAFT_NOTES_FILE"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$DRAFT_LIST_JSON"
+          python3 - \
+            "$DRAFT_LIST_JSON" "$DRAFT_RELEASE_ID_FILE" "$DRAFT_MODE_FILE" "$TAG" <<'PY'
+          # BEGIN TRUSTED DRAFT RESOLVER
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          listing_path, identifier_path, mode_path = map(Path, sys.argv[1:4])
+          expected_tag = sys.argv[4]
+          metadata = listing_path.stat()
+          if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 32 * 1024 * 1024:
+              raise SystemExit("release listing is invalid")
+          pages = json.loads(listing_path.read_text(encoding="utf-8"))
+          if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+              raise SystemExit("release listing has an invalid schema")
+          matches = [row for page in pages for row in page if isinstance(row, dict) and row.get("tag_name") == expected_tag]
+          if len(matches) > 1:
+              raise SystemExit("multiple releases claim the stable tag")
+          mode = "create"
+          if matches:
+              release_id = matches[0].get("id")
+              if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
+                  raise SystemExit("existing draft has an invalid identifier")
+              identifier_path.write_text(f"{release_id}\n", encoding="ascii")
+              mode = "resume"
+          mode_path.write_text(f"{mode}\n", encoding="ascii")
+          # END TRUSTED DRAFT RESOLVER
+          PY
+          DRAFT_MODE="$(cat "$DRAFT_MODE_FILE")"
+          case "$DRAFT_MODE" in
+            create)
+              gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+                --method POST "repos/$GITHUB_REPOSITORY/releases" \
+                -f tag_name="$TAG" \
+                -f target_commitish="$GITHUB_SHA" \
+                -f name="EasySplat $VERSION" \
+                -F draft=true \
+                -F prerelease=false \
+                -f make_latest=false \
+                -F body="@$DRAFT_NOTES_FILE" >"$DRAFT_JSON"
+              ;;
+            resume)
+              RELEASE_ID="$(cat "$DRAFT_RELEASE_ID_FILE")"
+              [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+              gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+                "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$DRAFT_JSON"
+              ;;
+            *) echo "Draft resolution returned an invalid mode." >&2; exit 1 ;;
+          esac
+          python3 - \
+            "$DRAFT_JSON" "$DRAFT_NOTES_FILE" "$DRAFT_RELEASE_ID_FILE" \
+            "$PENDING_ASSETS_FILE" "$TAG" "$GITHUB_SHA" "$VERSION" <<'PY'
+          # BEGIN TRUSTED DRAFT ASSET PLAN
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          response_path, notes_path, identifier_path, pending_path = map(Path, sys.argv[1:5])
+          expected_tag, expected_commit, version = sys.argv[5:]
+          metadata = response_path.stat()
+          if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 4 * 1024 * 1024:
+              raise SystemExit("owned draft response is invalid")
+          release = json.loads(response_path.read_text(encoding="utf-8"))
+          release_id = release.get("id")
+          if not isinstance(release_id, int) or isinstance(release_id, bool) or release_id <= 0:
+              raise SystemExit("owned draft has an invalid identifier")
+          if identifier_path.exists():
+              identifier = identifier_path.read_text(encoding="ascii")
+              if re.fullmatch(r"[1-9][0-9]*\n", identifier) is None or int(identifier) != release_id:
+                  raise SystemExit("resumed draft identifier differs")
+          else:
+              identifier_path.write_text(f"{release_id}\n", encoding="ascii")
+          if release.get("tag_name") != expected_tag or release.get("target_commitish") != expected_commit:
+              raise SystemExit("owned draft source identity differs")
+          if release.get("name") != f"EasySplat {version}":
+              raise SystemExit("owned draft name differs")
+          if release.get("draft") is not True or release.get("prerelease") is not False or release.get("immutable") is True:
+              raise SystemExit("owned release is not a mutable stable draft release")
+          if release.get("body") != notes_path.read_text(encoding="utf-8"):
+              raise SystemExit("owned draft marker differs")
+          root = Path(os.environ["PUBLICATION_ROOT"])
+          manifest = json.loads((root / "publication-manifest.json").read_text(encoding="utf-8"))
+          records = manifest.get("files")
+          if not isinstance(records, list) or len(records) not in {7, 8}:
+              raise SystemExit("publication manifest is missing release assets")
+          expected = {row.get("name"): row for row in records if isinstance(row, dict)}
+          if len(expected) != len(records):
+              raise SystemExit("publication manifest has duplicate release assets")
+          assets = release.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("owned draft assets are invalid")
+          by_name = {}
+          for asset in assets:
+              name = asset.get("name") if isinstance(asset, dict) else None
+              if name not in expected or name in by_name:
+                  raise SystemExit("owned draft contains an unexpected or duplicate asset")
+              by_name[name] = asset
+          pending = []
+          for name in sorted(expected):
+              record = expected[name]
+              asset = by_name.get(name)
+              if asset is None:
+                  pending.append(name)
+                  continue
+              if (
+                  asset.get("state") != "uploaded"
+                  or asset.get("size") != record.get("size_bytes")
+                  or asset.get("digest") != f"sha256:{record.get('sha256')}"
+              ):
+                  raise SystemExit(f"existing asset differs from the publication manifest: {name}")
+          pending_path.write_text("".join(f"{name}\n" for name in pending), encoding="utf-8")
+          # END TRUSTED DRAFT ASSET PLAN
+          PY
+          chmod 0600 \
+            "$DRAFT_OWNER_FILE" "$DRAFT_RELEASE_ID_FILE" "$DRAFT_NOTES_FILE" \
+            "$DRAFT_LIST_JSON" "$DRAFT_JSON" "$DRAFT_MODE_FILE" "$PENDING_ASSETS_FILE"
+          RELEASE_ID="$(cat "$DRAFT_RELEASE_ID_FILE")"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          while IFS= read -r asset_name; do
+            test -n "$asset_name"
+            asset_path="$PUBLICATION_ROOT/$asset_name"
+            test -f "$asset_path" && test ! -L "$asset_path"
+            printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" \
+              | curl --config - \
+                --fail-with-body \
+                --silent \
+                --show-error \
+                --request POST \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2026-03-10" \
+                --header "Content-Type: application/octet-stream" \
+                --data-binary "@$asset_path" \
+                "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$asset_name" \
+                >/dev/null
+          done <"$PENDING_ASSETS_FILE"
 
       - name: Verify remote draft assets without executing them
         env:
@@ -546,60 +2433,117 @@ jobs:
           VERSION: ${{ inputs.version }}
           PUBLICATION_ROOT: ${{ runner.temp }}/publication
         run: |
+          DRAFT_OWNER_FILE="$RUNNER_TEMP/easysplat-draft-owner"
+          DRAFT_RELEASE_ID_FILE="$RUNNER_TEMP/easysplat-draft-release-id"
+          DRAFT_NOTES_FILE="$RUNNER_TEMP/easysplat-owned-release-notes.txt"
+          test -f "$DRAFT_OWNER_FILE"
+          test -f "$DRAFT_RELEASE_ID_FILE"
+          test -f "$DRAFT_NOTES_FILE"
+          RELEASE_ID="$(cat "$DRAFT_RELEASE_ID_FILE")"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           DRAFT_JSON="$RUNNER_TEMP/draft-release.json"
-          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >"$DRAFT_JSON"
-          python3 - <<'PY'
+          DRAFT_ASSET_IDS="$RUNNER_TEMP/draft-asset-ids.tsv"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$DRAFT_JSON"
+          python3 - "$DRAFT_JSON" "$DRAFT_OWNER_FILE" "$DRAFT_NOTES_FILE" "$DRAFT_ASSET_IDS" <<'PY'
           import hashlib, json, os
           from pathlib import Path
+          import re
+          import sys
+
           version = os.environ["VERSION"]
           root = Path(os.environ["PUBLICATION_ROOT"])
-          names = [
-              f"EasySplat-{version}-unsigned.dmg",
-              f"EasySplat-{version}-unsigned.dmg.sha256",
+          release_path, owner_path, notes_path, asset_ids_path = map(Path, sys.argv[1:])
+          names = {
+              f"EasySplat-{version}.dmg",
+              f"EasySplat-{version}.dmg.sha256",
               f"EasySplat-{version}.provenance.json",
               f"EasySplat-{version}.spdx.json",
               f"EasySplat-{version}-licenses.zip",
               f"EasySplat-{version}-dSYM.zip",
               f"EasySplat-{version}-benchmark.json",
+              f"EasySplat-{version}-release-notes.txt",
+          }
+          publication_manifest = json.loads((root / "publication-manifest.json").read_text(encoding="utf-8"))
+          if publication_manifest.get("benchmark") is None:
+              names.remove(f"EasySplat-{version}-benchmark.json")
+          release_records = [
+              record for record in publication_manifest.get("files", [])
+              if record.get("name") in names
           ]
-          release_path = Path(os.environ["RUNNER_TEMP"]) / "draft-release.json"
+          expected_records = {record["name"]: record for record in release_records}
+          if len(release_records) != len(names) or set(expected_records) != names:
+              raise SystemExit("publication manifest is missing a release asset record")
           if not 0 < release_path.stat().st_size <= 1024 * 1024:
               raise SystemExit("draft release API response is oversized")
           release = json.loads(release_path.read_text(encoding="utf-8"))
-          if release.get("draft") is not True or release.get("prerelease") is not True:
-              raise SystemExit("uploaded release is not a draft prerelease")
+          owner = owner_path.read_text(encoding="utf-8").strip()
+          if not re.fullmatch(
+              r"easysplat-release-owner:v2:[1-9][0-9]*:[0-9a-f]{40}",
+              owner,
+          ):
+              raise SystemExit("draft owner marker is invalid")
+          expected_id = int((Path(os.environ["RUNNER_TEMP"]) / "easysplat-draft-release-id").read_text(encoding="ascii"))
+          if release.get("id") != expected_id:
+              raise SystemExit("draft release identifier differs")
+          if release.get("tag_name") != os.environ["TAG"] or release.get("target_commitish") != os.environ["GITHUB_SHA"]:
+              raise SystemExit("draft release source identity differs")
+          if release.get("draft") is not True or release.get("prerelease") is not False or release.get("immutable") is True:
+              raise SystemExit("uploaded release is not a stable draft release")
+          if release.get("body") != notes_path.read_text(encoding="utf-8") or f"<!-- {owner} -->" not in release.get("body", ""):
+              raise SystemExit("draft release owner body differs")
           assets = release.get("assets")
-          if not isinstance(assets, list) or {row.get("name") for row in assets} != set(names):
+          if not isinstance(assets, list) or len(assets) != len(names) or {row.get("name") for row in assets} != names:
               raise SystemExit("draft release asset set is invalid")
           by_name = {row["name"]: row for row in assets}
-          for name in names:
+          asset_id_lines = []
+          for name in sorted(names):
               path = root / name
               digest = hashlib.sha256()
               with path.open("rb") as stream:
                   for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                       digest.update(chunk)
-              if by_name[name].get("size") != path.stat().st_size or by_name[name].get("digest") != f"sha256:{digest.hexdigest()}":
+              expected = expected_records[name]
+              if path.stat().st_size != expected.get("size_bytes") or digest.hexdigest() != expected.get("sha256"):
+                  raise SystemExit(f"local publication asset differs from its manifest: {name}")
+              asset = by_name[name]
+              asset_id = asset.get("id")
+              if not isinstance(asset_id, int) or asset_id <= 0 or asset.get("state") != "uploaded":
+                  raise SystemExit(f"draft asset state is invalid: {name}")
+              if asset.get("size") != expected["size_bytes"] or asset.get("digest") != f"sha256:{expected['sha256']}":
                   raise SystemExit(f"draft asset API identity differs: {name}")
+              asset_id_lines.append(f"{asset_id}\t{name}\n")
+          asset_ids_path.write_text("".join(asset_id_lines), encoding="utf-8")
           PY
           REMOTE="$RUNNER_TEMP/remote-draft-assets"
-          rm -rf "$REMOTE"
-          mkdir -p "$REMOTE"
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$REMOTE"
+          test ! -e "$REMOTE"
+          mkdir -m 0700 "$REMOTE"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+            [[ "$asset_name" != */* ]]
+            gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+              -H "Accept: application/octet-stream" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >"$REMOTE/$asset_name"
+          done <"$DRAFT_ASSET_IDS"
           python3 - <<'PY'
-          import hashlib, os
+          import hashlib, json, os
           from pathlib import Path
           version = os.environ["VERSION"]
           local = Path(os.environ["PUBLICATION_ROOT"])
           remote = Path(os.environ["RUNNER_TEMP"]) / "remote-draft-assets"
           names = {
-              f"EasySplat-{version}-unsigned.dmg",
-              f"EasySplat-{version}-unsigned.dmg.sha256",
+              f"EasySplat-{version}.dmg",
+              f"EasySplat-{version}.dmg.sha256",
               f"EasySplat-{version}.provenance.json",
               f"EasySplat-{version}.spdx.json",
               f"EasySplat-{version}-licenses.zip",
               f"EasySplat-{version}-dSYM.zip",
               f"EasySplat-{version}-benchmark.json",
+              f"EasySplat-{version}-release-notes.txt",
           }
+          publication_manifest = json.loads((local / "publication-manifest.json").read_text(encoding="utf-8"))
+          if publication_manifest.get("benchmark") is None:
+              names.remove(f"EasySplat-{version}-benchmark.json")
           if {path.name for path in remote.iterdir()} != names:
               raise SystemExit("downloaded draft asset set is invalid")
           def digest(path):
@@ -613,35 +2557,507 @@ jobs:
                   raise SystemExit(f"downloaded draft asset differs: {name}")
           PY
 
-      - name: Publish and confirm immutable prerelease
+      - name: Attest draft for manual publication
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           TAG: v${{ inputs.version }}
+          VERSION: ${{ inputs.version }}
+          PUBLICATION_ROOT: ${{ runner.temp }}/publication
         run: |
-          RELEASE_ID="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id)"
-          gh api -H "X-GitHub-Api-Version: 2026-03-10" --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-            -F draft=false \
-            -F prerelease=true >/dev/null
-          for attempt in {1..10}; do
-            if [ "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .immutable)" = "true" ]; then
-              break
-            fi
-            if [ "$attempt" = "10" ]; then
-              echo "Published prerelease did not become immutable." >&2
-              exit 1
-            fi
-            sleep 2
-          done
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .draft)" = "false"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .prerelease)" = "true"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.assets | length')" = "7"
+          test -n "$GH_TOKEN"
+          unset BASH_ENV ENV GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+            PYTHONHOME PYTHONPATH REQUESTS_CA_BUNDLE CURL_CA_BUNDLE SSL_CERT_FILE \
+            SSL_CERT_DIR HTTPS_PROXY HTTP_PROXY ALL_PROXY NO_PROXY
+          PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+          export PATH
+          DRAFT_OWNER_FILE="$RUNNER_TEMP/easysplat-draft-owner"
+          DRAFT_RELEASE_ID_FILE="$RUNNER_TEMP/easysplat-draft-release-id"
+          DRAFT_NOTES_FILE="$RUNNER_TEMP/easysplat-owned-release-notes.txt"
+          test -f "$DRAFT_OWNER_FILE"
+          test -f "$DRAFT_RELEASE_ID_FILE"
+          test -f "$DRAFT_NOTES_FILE"
+          RELEASE_ID="$(cat "$DRAFT_RELEASE_ID_FILE")"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$DEFAULT_BRANCH" = "main"
+          LOCAL_ASSET_EVIDENCE="$RUNNER_TEMP/easysplat-final-local-assets.json"
+          test ! -e "$LOCAL_ASSET_EVIDENCE"
+          umask 077
+          python3 - \
+            "$PUBLICATION_ROOT" \
+            "$DRAFT_OWNER_FILE" \
+            "$DRAFT_RELEASE_ID_FILE" \
+            "$DRAFT_NOTES_FILE" \
+            "$LOCAL_ASSET_EVIDENCE" \
+            "$TAG" \
+            "$GITHUB_SHA" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
 
-      - name: Remove an incomplete release
+          (
+              root_value,
+              owner_value,
+              release_id_value,
+              notes_value,
+              evidence_value,
+              expected_tag,
+              expected_commit,
+          ) = sys.argv[1:]
+          root = Path(root_value)
+          evidence_path = Path(evidence_value)
+
+          def identity(metadata):
+              return (
+                  metadata.st_dev,
+                  metadata.st_ino,
+                  metadata.st_mode,
+                  metadata.st_nlink,
+                  metadata.st_size,
+                  metadata.st_mtime_ns,
+                  metadata.st_ctime_ns,
+              )
+
+          def read_stable_file(path, maximum):
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  before = os.fstat(descriptor)
+                  if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= maximum:
+                      raise SystemExit(f"release evidence input is invalid: {path.name}")
+                  chunks = []
+                  remaining = before.st_size
+                  while remaining:
+                      chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                      if not chunk:
+                          raise SystemExit(f"release evidence input was truncated: {path.name}")
+                      chunks.append(chunk)
+                      remaining -= len(chunk)
+                  if os.read(descriptor, 1):
+                      raise SystemExit(f"release evidence input grew while reading: {path.name}")
+                  after = os.fstat(descriptor)
+                  if identity(before) != identity(after):
+                      raise SystemExit(f"release evidence input changed while reading: {path.name}")
+                  return b"".join(chunks)
+              finally:
+                  os.close(descriptor)
+
+          root_descriptor = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY)
+          try:
+              root_identity = identity(os.fstat(root_descriptor))
+              manifest_descriptor = os.open(
+                  "publication-manifest.json",
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                  dir_fd=root_descriptor,
+              )
+              try:
+                  manifest_before = os.fstat(manifest_descriptor)
+                  if not stat.S_ISREG(manifest_before.st_mode) or manifest_before.st_nlink != 1 or not 0 < manifest_before.st_size <= 4 * 1024 * 1024:
+                      raise SystemExit("publication manifest is not a bounded single-link regular file")
+                  manifest_chunks = []
+                  remaining = manifest_before.st_size
+                  while remaining:
+                      chunk = os.read(manifest_descriptor, min(1024 * 1024, remaining))
+                      if not chunk:
+                          raise SystemExit("publication manifest was truncated while reading")
+                      manifest_chunks.append(chunk)
+                      remaining -= len(chunk)
+                  if os.read(manifest_descriptor, 1):
+                      raise SystemExit("publication manifest grew while reading")
+                  if identity(manifest_before) != identity(os.fstat(manifest_descriptor)):
+                      raise SystemExit("publication manifest changed while reading")
+                  manifest_data = b"".join(manifest_chunks)
+              finally:
+                  os.close(manifest_descriptor)
+              manifest = json.loads(manifest_data.decode("utf-8"))
+              all_records = manifest.get("files")
+              if not isinstance(all_records, list):
+                  raise SystemExit("publication manifest file records are invalid")
+              version = os.environ["VERSION"]
+              expected_names = {
+                  f"EasySplat-{version}.dmg",
+                  f"EasySplat-{version}.dmg.sha256",
+                  f"EasySplat-{version}.provenance.json",
+                  f"EasySplat-{version}.spdx.json",
+                  f"EasySplat-{version}-licenses.zip",
+                  f"EasySplat-{version}-dSYM.zip",
+                  f"EasySplat-{version}-benchmark.json",
+                  f"EasySplat-{version}-release-notes.txt",
+              }
+              if manifest.get("benchmark") is None:
+                  expected_names.remove(f"EasySplat-{version}-benchmark.json")
+              release_records = [record for record in all_records if isinstance(record, dict) and record.get("name") in expected_names]
+              if len(release_records) != len(expected_names) or {record["name"] for record in release_records} != expected_names:
+                  raise SystemExit("publication manifest must bind the exact public release assets")
+              bound_assets = []
+              for record in sorted(release_records, key=lambda item: item["name"]):
+                  if set(record) != {"name", "sha256", "size_bytes"}:
+                      raise SystemExit("publication manifest release record fields are invalid")
+                  name = record["name"]
+                  if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+                      raise SystemExit("publication manifest release asset name is invalid")
+                  if not isinstance(record["size_bytes"], int) or isinstance(record["size_bytes"], bool) or not 0 < record["size_bytes"] <= 2_147_483_648:
+                      raise SystemExit(f"publication manifest release asset size is invalid: {name}")
+                  if not isinstance(record["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"]):
+                      raise SystemExit(f"publication manifest release asset digest is invalid: {name}")
+                  descriptor = os.open(
+                      name,
+                      os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                      dir_fd=root_descriptor,
+                  )
+                  try:
+                      before = os.fstat(descriptor)
+                      if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size != record["size_bytes"]:
+                          raise SystemExit(f"local publication asset metadata differs: {name}")
+                      digest = hashlib.sha256()
+                      remaining = before.st_size
+                      while remaining:
+                          chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                          if not chunk:
+                              raise SystemExit(f"local publication asset was truncated: {name}")
+                          digest.update(chunk)
+                          remaining -= len(chunk)
+                      if os.read(descriptor, 1):
+                          raise SystemExit(f"local publication asset grew while hashing: {name}")
+                      after = os.fstat(descriptor)
+                      if identity(before) != identity(after) or digest.hexdigest() != record["sha256"]:
+                          raise SystemExit(f"local publication asset differs from its manifest: {name}")
+                      bound_assets.append({
+                          "digest": f"sha256:{record['sha256']}",
+                          "name": name,
+                          "size_bytes": record["size_bytes"],
+                      })
+                  finally:
+                      os.close(descriptor)
+              if identity(os.fstat(root_descriptor))[:3] != root_identity[:3]:
+                  raise SystemExit("publication directory identity changed while hashing")
+          finally:
+              os.close(root_descriptor)
+
+          owner = read_stable_file(Path(owner_value), 512).decode("utf-8").strip()
+          if not re.fullmatch(
+              r"easysplat-release-owner:v2:[1-9][0-9]*:[0-9a-f]{40}",
+              owner,
+          ):
+              raise SystemExit("draft owner marker is invalid")
+          release_id_text = read_stable_file(Path(release_id_value), 64).decode("ascii").strip()
+          if not re.fullmatch(r"[1-9][0-9]*", release_id_text):
+              raise SystemExit("draft release identifier is invalid")
+          body = read_stable_file(Path(notes_value), 128 * 1024).decode("utf-8")
+          if f"<!-- {owner} -->" not in body:
+              raise SystemExit("draft owner body is invalid")
+          evidence = {
+              "assets": bound_assets,
+              "body": body,
+              "owner": owner,
+              "release_id": int(release_id_text),
+              "schema_version": 1,
+              "source_commit": expected_commit,
+              "tag": expected_tag,
+          }
+          payload = (json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+          if len(payload) > 256 * 1024:
+              raise SystemExit("final local release evidence is oversized")
+          output_descriptor = os.open(
+              evidence_path,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+              0o600,
+          )
+          try:
+              written = 0
+              while written < len(payload):
+                  count = os.write(output_descriptor, payload[written:])
+                  if count <= 0:
+                      raise SystemExit("final local release evidence write made no progress")
+                  written += count
+              os.fsync(output_descriptor)
+              output_metadata = os.fstat(output_descriptor)
+              if not stat.S_ISREG(output_metadata.st_mode) or output_metadata.st_nlink != 1 or output_metadata.st_size != len(payload) or output_metadata.st_mode & 0o077:
+                  raise SystemExit("final local release evidence was not published privately")
+          finally:
+              os.close(output_descriptor)
+          PY
+
+          validate_owned_release() {
+            local release_json="$1"
+            local expected_draft="$2"
+            local expected_immutable="$3"
+            python3 - "$release_json" "$LOCAL_ASSET_EVIDENCE" \
+              "$expected_draft" "$expected_immutable" <<'PY'
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          (
+              release_path,
+              evidence_path,
+              expected_draft,
+              expected_immutable,
+          ) = sys.argv[1:]
+
+          def read_bound_json(path_value, maximum, require_private=False):
+              path = Path(path_value)
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  before = os.fstat(descriptor)
+                  identity = (
+                      before.st_dev,
+                      before.st_ino,
+                      before.st_mode,
+                      before.st_nlink,
+                      before.st_size,
+                      before.st_mtime_ns,
+                      before.st_ctime_ns,
+                  )
+                  if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= maximum:
+                      raise SystemExit(f"bounded release JSON is invalid: {path.name}")
+                  if require_private and before.st_mode & 0o077:
+                      raise SystemExit("final local release evidence is not private")
+                  chunks = []
+                  remaining = before.st_size
+                  while remaining:
+                      chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                      if not chunk:
+                          raise SystemExit(f"bounded release JSON was truncated: {path.name}")
+                      chunks.append(chunk)
+                      remaining -= len(chunk)
+                  if os.read(descriptor, 1):
+                      raise SystemExit(f"bounded release JSON grew while reading: {path.name}")
+                  after = os.fstat(descriptor)
+                  if identity != (
+                      after.st_dev,
+                      after.st_ino,
+                      after.st_mode,
+                      after.st_nlink,
+                      after.st_size,
+                      after.st_mtime_ns,
+                      after.st_ctime_ns,
+                  ):
+                      raise SystemExit(f"bounded release JSON changed while reading: {path.name}")
+                  return json.loads(b"".join(chunks).decode("utf-8"))
+              finally:
+                  os.close(descriptor)
+
+          evidence = read_bound_json(evidence_path, 256 * 1024, require_private=True)
+          if not isinstance(evidence, dict) or set(evidence) != {"assets", "body", "owner", "release_id", "schema_version", "source_commit", "tag"} or evidence["schema_version"] != 1:
+              raise SystemExit("final local release evidence fields are invalid")
+          if not isinstance(evidence["release_id"], int) or evidence["release_id"] <= 0:
+              raise SystemExit("final local release identifier is invalid")
+          if not isinstance(evidence["tag"], str) or not isinstance(evidence["source_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", evidence["source_commit"]):
+              raise SystemExit("final local release source identity is invalid")
+          expected_assets = evidence["assets"]
+          if not isinstance(expected_assets, list) or len(expected_assets) not in {7, 8}:
+              raise SystemExit("final local release evidence must bind seven or eight public assets")
+          if any(set(asset) != {"digest", "name", "size_bytes"} for asset in expected_assets):
+              raise SystemExit("final local release asset evidence fields are invalid")
+          expected_records = {asset["name"]: asset for asset in expected_assets}
+          if len(expected_records) != len(expected_assets):
+              raise SystemExit("final local release evidence contains duplicate assets")
+          for name, asset in expected_records.items():
+              if not isinstance(name, str) or not name or "/" in name or "\\" in name:
+                  raise SystemExit("final local release asset name is invalid")
+              if not isinstance(asset["size_bytes"], int) or isinstance(asset["size_bytes"], bool) or not 0 < asset["size_bytes"] <= 2_147_483_648:
+                  raise SystemExit(f"final local release asset size is invalid: {name}")
+              if not isinstance(asset["digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", asset["digest"]):
+                  raise SystemExit(f"final local release asset digest is invalid: {name}")
+          owner = evidence["owner"]
+          if not re.fullmatch(
+              r"easysplat-release-owner:v2:[1-9][0-9]*:[0-9a-f]{40}",
+              owner,
+          ):
+              raise SystemExit("draft owner marker is invalid")
+          if not isinstance(evidence["body"], str) or f"<!-- {owner} -->" not in evidence["body"]:
+              raise SystemExit("final local release owner body is invalid")
+          release = read_bound_json(release_path, 1024 * 1024)
+          if release.get("id") != evidence["release_id"]:
+              raise SystemExit("release identifier differs")
+          if release.get("tag_name") != evidence["tag"] or release.get("target_commitish") != evidence["source_commit"]:
+              raise SystemExit("release source identity differs")
+          if release.get("draft") is not (expected_draft == "true"):
+              raise SystemExit("release draft state differs")
+          if release.get("prerelease") is not False:
+              raise SystemExit("release is not a stable release")
+          immutable = release.get("immutable")
+          if expected_immutable == "pending":
+              if not isinstance(immutable, bool):
+                  raise SystemExit("release immutable state is invalid")
+          elif immutable is not (expected_immutable == "true"):
+              raise SystemExit("release immutable state differs")
+          body = release.get("body")
+          if body != evidence["body"] or f"<!-- {owner} -->" not in body:
+              raise SystemExit("release owner body differs")
+          assets = release.get("assets")
+          if not isinstance(assets, list) or len(assets) != len(expected_records) or {asset.get("name") for asset in assets} != set(expected_records):
+              raise SystemExit("release asset set differs")
+          by_name = {asset["name"]: asset for asset in assets}
+          for name in sorted(expected_records):
+              expected = expected_records[name]
+              asset = by_name[name]
+              if not isinstance(asset.get("id"), int) or asset["id"] <= 0 or asset.get("state") != "uploaded":
+                  raise SystemExit(f"release asset state differs: {name}")
+              if asset.get("size") != expected["size_bytes"] or asset.get("digest") != expected["digest"]:
+                  raise SystemExit(f"release asset identity differs: {name}")
+          PY
+          }
+
+          FINAL_POLICY_ROOT="$RUNNER_TEMP/easysplat-final-draft-policy"
+          test ! -e "$FINAL_POLICY_ROOT"
+          mkdir -m 0700 "$FINAL_POLICY_ROOT"
+          test "$(shasum -a 256 "$RELEASE_POLICY_CHECKER" | awk '{print $1}')" = \
+            "$RELEASE_POLICY_CHECKER_SHA256"
+          "$RELEASE_POLICY_CHECKER" live \
+            --evidence-dir "$FINAL_POLICY_ROOT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
+          VERIFIED_DRAFT_JSON="$RUNNER_TEMP/easysplat-owned-release-ready-for-manual-publication.json"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$VERIFIED_DRAFT_JSON"
+          validate_owned_release "$VERIFIED_DRAFT_JSON" true false
+          EVIDENCE_ROOT="$RUNNER_TEMP/easysplat-manual-publication-evidence"
+          test ! -e "$EVIDENCE_ROOT"
+          mkdir -m 0700 "$EVIDENCE_ROOT"
+          install -m 0600 "$LOCAL_ASSET_EVIDENCE" "$EVIDENCE_ROOT/local-assets.json"
+          install -m 0600 "$VERIFIED_DRAFT_JSON" "$EVIDENCE_ROOT/verified-draft.json"
+          cp -R "$FINAL_POLICY_ROOT" "$EVIDENCE_ROOT/final-policy"
+          chmod -R go-rwx "$EVIDENCE_ROOT/final-policy"
+          python3 - "$DRAFT_NOTES_FILE" "$EVIDENCE_ROOT/manual-publication-request.json" \
+            "$TAG" "$GITHUB_SHA" "$VERSION" "$RELEASE_ID" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          notes_path, output_path, tag, commit, version, release_id = sys.argv[1:]
+          request = {
+              "api_has_compare_and_swap": False,
+              "body": Path(notes_path).read_text(encoding="utf-8"),
+              "draft": False,
+              "github_app_inventory": "not_authoritatively_queryable_by_release_pat",
+              "make_latest": "false",
+              "name": f"EasySplat {version}",
+              "publication_boundary": "independent_human_exact_id_refetch",
+              "publication_requires_asset_id_size_digest_match": True,
+              "publication_requires_draft_identity_match": True,
+              "prerelease": False,
+              "release_id": int(release_id),
+              "schema_version": 1,
+              "tag_name": tag,
+              "target_commitish": commit,
+          }
+          output = Path(output_path)
+          payload = (json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+          descriptor = os.open(
+              output,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+              0o600,
+          )
+          try:
+              written = 0
+              while written < len(payload):
+                  count = os.write(descriptor, payload[written:])
+                  if count <= 0:
+                      raise SystemExit("manual publication request write stalled")
+                  written += count
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          directory = os.open(output.parent, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+          try:
+              os.fsync(directory)
+          finally:
+              os.close(directory)
+          PY
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Stable release draft ready
+
+          Draft release ID: \`$RELEASE_ID\`
+
+          GitHub's release API does not expose compare-and-swap or a queryable exclusive lease, and the release PAT cannot authoritatively inventory GitHub App writers. Another contents writer can mutate the draft after this attestation. Before publishing, re-fetch this exact release ID and match its tag, target commit, body, draft/stable-release state, and every asset ID, size, and SHA-256 digest. This workflow intentionally leaves the verified stable release as a draft.
+          EOF
+          echo "Verified stable release draft $RELEASE_ID is ready for final human publication review."
+
+      - name: Preserve manual publication evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-manual-publication-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-manual-publication-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Report the preserved owned draft
         if: ${{ failure() }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: v${{ inputs.version }}
         run: |
-          if [ -f "$RUNNER_TEMP/easysplat-draft-created" ] && [ "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable 2>/dev/null || true)" != "true" ]; then
-            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          DRAFT_OWNER_FILE="$RUNNER_TEMP/easysplat-draft-owner"
+          DRAFT_RELEASE_ID_FILE="$RUNNER_TEMP/easysplat-draft-release-id"
+          DRAFT_NOTES_FILE="$RUNNER_TEMP/easysplat-owned-release-notes.txt"
+          test -f "$DRAFT_OWNER_FILE" || exit 0
+          test -f "$DRAFT_RELEASE_ID_FILE" || exit 0
+          test -f "$DRAFT_NOTES_FILE" || exit 0
+          STORED_RELEASE_ID="$(cat "$DRAFT_RELEASE_ID_FILE")"
+          [[ "$STORED_RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+          RELEASE_JSON="$RUNNER_TEMP/easysplat-incomplete-release.json"
+          if ! gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/$STORED_RELEASE_ID" >"$RELEASE_JSON" 2>/dev/null
+          then
+            echo "Stored release ID $STORED_RELEASE_ID could not be reverified; no cleanup was attempted." >&2
+            exit 0
+          fi
+          OWNED_DRAFT="$(python3 - \
+            "$RELEASE_JSON" \
+            "$TAG" \
+            "$DRAFT_OWNER_FILE" \
+            "$DRAFT_NOTES_FILE" \
+            "$STORED_RELEASE_ID" \
+            "$GITHUB_REPOSITORY" \
+            "$GITHUB_SHA" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          path, expected_tag, owner_path, notes_path, expected_id, repository, expected_commit = sys.argv[1:]
+          owner = Path(owner_path).read_text(encoding="utf-8").strip()
+          if not re.fullmatch(
+              r"easysplat-release-owner:v2:[1-9][0-9]*:[0-9a-f]{40}",
+              owner,
+          ):
+              raise SystemExit("draft owner marker is invalid")
+          with open(path, encoding="utf-8") as stream:
+              release = json.load(stream)
+          if release.get("id") != int(expected_id):
+              raise SystemExit(0)
+          if release.get("tag_name") != expected_tag or release.get("target_commitish") != expected_commit:
+              raise SystemExit(0)
+          expected_body = Path(notes_path).read_text(encoding="utf-8")
+          if release.get("body") != expected_body or f"<!-- {owner} -->" not in expected_body:
+              raise SystemExit(0)
+          if release.get("draft") is not True or release.get("prerelease") is not False or release.get("immutable") is not False:
+              raise SystemExit(0)
+          release_id = release.get("id")
+          if not isinstance(release_id, int) or release_id <= 0:
+              raise SystemExit(0)
+          expected_url = f"https://github.com/{repository}/releases/tag/{expected_tag}"
+          if release.get("html_url") != expected_url:
+              raise SystemExit(0)
+          print(f"{release_id}\t{expected_url}")
+          PY
+          )"
+          if [ -n "$OWNED_DRAFT" ]; then
+            IFS=$'\t' read -r owned_release_id owned_release_url <<<"$OWNED_DRAFT"
+            echo "Owned draft preserved for manual review or cleanup. Release ID: $owned_release_id URL: $owned_release_url" >&2
           fi

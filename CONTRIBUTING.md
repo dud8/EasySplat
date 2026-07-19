@@ -36,7 +36,7 @@ shellcheck $(git ls-files 'scripts/*.sh' 'scripts/**/*.sh')
 actionlint
 ```
 
-Native trainer or packaging changes also require `./scripts/ci/test_msplat_native_build.sh`. Packaged-app release changes must pass the full `verify_beta.sh` and isolated `verify_ui.sh` jobs in the Release App workflow.
+Native trainer or packaging changes also require `./scripts/ci/test_msplat_native_build.sh`. Packaged-app changes must pass the Release App workflow's full signed, notarized, online, cached-offline, and quarantined-install verification. Do not run global input-event or UI automation against a developer's interactive Mac session.
 
 ## Change guidelines
 
@@ -48,6 +48,7 @@ Native trainer or packaging changes also require `./scripts/ci/test_msplat_nativ
 - Prefer targeted tests for bug fixes and structural refactors.
 - Keep docs aligned when you add or change scripts, env vars, packaging behavior, or project-bundle semantics.
 - `ProjectDiagnosticBundle.build` defaults to `includeNotes: false`. Diagnostics must remove project identity, scrub local paths and credentials, and show a preview before sharing.
+- Never add analytics, telemetry, advertising, or crash-reporting SDKs without an explicit product and privacy review.
 
 ## Pull requests
 

@@ -9,6 +9,7 @@ SECURITY="$ROOT/.github/workflows/security.yml"
 CODEQL="$ROOT/.github/workflows/codeql.yml"
 RELEASE_GATE="$ROOT/.github/workflows/release-app.yml"
 TOOLCHAIN_GATE="$ROOT/.github/workflows/toolchain-build.yml"
+TOOLCHAIN_PUBLISH="$ROOT/.github/workflows/toolchain-publish.yml"
 BENCHMARK_GATE="$ROOT/.github/workflows/benchmark-release.yml"
 
 fail() {
@@ -44,7 +45,7 @@ require_job_count() {
   [ "$count" -eq "$expected" ] || fail "${file#"$ROOT/"} must contain exactly $expected jobs"
 }
 
-for workflow in "$TESTS" "$SECURITY" "$CODEQL" "$RELEASE_GATE" "$TOOLCHAIN_GATE" "$BENCHMARK_GATE"; do
+for workflow in "$TESTS" "$SECURITY" "$CODEQL" "$RELEASE_GATE" "$TOOLCHAIN_GATE" "$TOOLCHAIN_PUBLISH" "$BENCHMARK_GATE"; do
   require_file "$workflow"
 done
 
@@ -94,32 +95,75 @@ if grep -Fq '${{ matrix.' "$CODEQL"; then
 fi
 require_line '^[[:space:]]+security-events: write$' "$CODEQL"
 
-require_job_count "$RELEASE_GATE" 3
+require_job_count "$RELEASE_GATE" 8
 require_line '^  workflow_dispatch:$' "$RELEASE_GATE"
+for job in \
+  live-policy-preflight \
+  minimum-macos-compatibility \
+  prepare-release \
+  sign-and-notarize \
+  quarantined-install \
+  macos15-signed-compatibility \
+  verify-publication \
+  publish; do
+  require_line "^  $job:$" "$RELEASE_GATE"
+done
 require_line '^    if: github\.ref == '\''refs/heads/main'\'' && github\.event\.repository\.default_branch == '\''main'\''$' "$RELEASE_GATE"
-require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-release, easysplat-ephemeral\]$' "$RELEASE_GATE"
+require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-signing, easysplat-ephemeral\]$' "$RELEASE_GATE"
 require_line '^    runs-on: macos-15$' "$RELEASE_GATE"
-require_line '^    environment: public-beta-verification$' "$RELEASE_GATE"
-require_line '^    environment: public-beta-release$' "$RELEASE_GATE"
-require_line '^[[:space:]]+scripts/release/build_dmg\.sh \\$' "$RELEASE_GATE"
-require_line '^[[:space:]]+scripts/release/verify_beta\.sh \\$' "$RELEASE_GATE"
-require_line '^[[:space:]]+scripts/release/verify_ui\.sh \\$' "$RELEASE_GATE"
+require_line '^    runs-on: macos-26$' "$RELEASE_GATE"
+require_line '^    runs-on: ubuntu-24\.04$' "$RELEASE_GATE"
+require_line '^    environment: release-verification$' "$RELEASE_GATE"
+require_line '^    environment: release-signing$' "$RELEASE_GATE"
+require_line '^    environment: release-publication$' "$RELEASE_GATE"
+require_text '"$GITHUB_WORKSPACE/scripts/release/build_dmg.sh" \' "$RELEASE_GATE"
+require_text '"$GITHUB_WORKSPACE/scripts/release/verify_release.sh" \' "$RELEASE_GATE"
 require_line '^[[:space:]]+--artifacts \\$' "$RELEASE_GATE"
-require_text 'EASYSPLAT_ISOLATED_UI_RUNNER: "1"' "$RELEASE_GATE"
-require_text 'name: easysplat-ui-${{ github.sha }}' "$RELEASE_GATE"
 require_text 'benchmark_run_id:' "$RELEASE_GATE"
-require_text 'artifact-ids: ${{ steps.benchmark-identity.outputs.artifact_id }}' "$RELEASE_GATE"
+require_text 'artifact-ids: ${{ steps.bind-authority.outputs.benchmark_artifact_id }}' "$RELEASE_GATE"
 require_text 'scripts/benchmark/aggregate_evidence.py' "$RELEASE_GATE"
-require_text 'scripts/release/verify_publication_bundle.py create-build-closure' "$RELEASE_GATE"
-require_text 'scripts/release/verify_publication_bundle.py verify-build' "$RELEASE_GATE"
-require_text 'build_artifact_id:' "$RELEASE_GATE"
-require_text 'build_artifact_digest:' "$RELEASE_GATE"
+require_text 'closure_args=(' "$RELEASE_GATE"
+require_text 'create-build-closure' "$RELEASE_GATE"
+require_text 'verify_args=(' "$RELEASE_GATE"
+require_text 'verify-build' "$RELEASE_GATE"
+require_text 'scripts/release/verify_publication_bundle.py' "$RELEASE_GATE"
+if grep -Fq 'EASYSPLAT_RELEASE_FIXTURE' "$RELEASE_GATE"; then
+  fail "app release verification must not depend on a caller or repository fixture variable"
+fi
+require_text 'signed_artifact_id:' "$RELEASE_GATE"
+require_text 'signed_artifact_digest:' "$RELEASE_GATE"
+require_text 'prepared_artifact_id:' "$RELEASE_GATE"
+require_text 'prepared_artifact_digest:' "$RELEASE_GATE"
+require_text 'quarantine_artifact_id:' "$RELEASE_GATE"
+require_text 'quarantine_artifact_digest:' "$RELEASE_GATE"
+require_text 'compatibility_artifact_id:' "$RELEASE_GATE"
+require_text 'compatibility_artifact_digest:' "$RELEASE_GATE"
 require_text 'benchmark_artifact_id:' "$RELEASE_GATE"
 require_text 'benchmark_artifact_digest:' "$RELEASE_GATE"
 require_text 'publication_artifact_id:' "$RELEASE_GATE"
 require_text 'publication_artifact_digest:' "$RELEASE_GATE"
-require_text 'source scripts/release/lib/strict_semver.sh' "$RELEASE_GATE"
-require_text 'easysplat_is_strict_semver_prerelease_without_build_metadata' "$RELEASE_GATE"
+release_source_gate_block="$(sed -n '/name: Run source gates/,/name: Fetch signed toolchain closure/p' "$RELEASE_GATE")"
+for contract in \
+  'XCTEST_LOG="$RUNNER_TEMP/easysplat-release-xctest.log"' \
+  'test ! -e "$XCTEST_LOG"' \
+  'umask 077' \
+  ': >"$XCTEST_LOG"' \
+  'umask "$original_umask"' \
+  './scripts/test.sh 2>&1 | tee -a "$XCTEST_LOG"' \
+  'pipeline_status=("${PIPESTATUS[@]}")' \
+  'xctest_status="${pipeline_status[0]}"' \
+  'tee_status="${pipeline_status[1]}"' \
+  'test "$(stat -f '\''%Lp'\'' "$XCTEST_LOG")" = "600"' \
+  "grep -Fq 'Test skipped' \"\$XCTEST_LOG\"" \
+  'exit "$xctest_status"'; do
+  grep -Fq -- "$contract" <<<"$release_source_gate_block" \
+    || fail "physical release source gate is missing zero-skip contract: $contract"
+done
+if grep -Fq 'Test skipped' "$TESTS"; then
+  fail "ordinary pull-request tests must not inherit the physical release zero-skip policy"
+fi
+require_text 'app version must be stable semantic versioning without build metadata' "$RELEASE_GATE"
+require_text 'toolchain version must be stable semantic versioning without build metadata' "$RELEASE_GATE"
 require_text 'secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN' "$RELEASE_GATE"
 require_text 'repos/$GITHUB_REPOSITORY/immutable-releases' "$RELEASE_GATE"
 if grep -Fq 'EASYSPLAT_IMMUTABLE_RELEASES_ENABLED' "$RELEASE_GATE"; then
@@ -132,34 +176,179 @@ require_text 'GRYPE_VERSION: 0.115.0' "$RELEASE_GATE"
 require_text 'GRYPE_DARWIN_ARM64_SHA256: a5faa957bca6f39e252a046b9431cd79745030c692dd400ab4c0c74266edc406' "$RELEASE_GATE"
 require_text 'GRYPE_DB_REQUIRE_UPDATE_CHECK: "true"' "$RELEASE_GATE"
 require_text '"$RUNNER_TEMP/grype" --config /dev/null \' "$RELEASE_GATE"
-require_text '"sbom:release/DMG/EasySplat-$VERSION.spdx.json" \' "$RELEASE_GATE"
+require_text '"sbom:$RUNNER_TEMP/easysplat-publication/EasySplat-${{ inputs.version }}.spdx.json" \' "$RELEASE_GATE"
 require_text '--only-fixed \' "$RELEASE_GATE"
 require_line '^[[:space:]]+--fail-on high$' "$RELEASE_GATE"
 spdx_validation_line="$(grep -n -m1 'name: Validate SPDX 2.3 output independently' "$RELEASE_GATE" | cut -d: -f1)"
 vulnerability_scan_line="$(grep -n -m1 'name: Scan shipped SBOM for actionable vulnerabilities' "$RELEASE_GATE" | cut -d: -f1)"
-draft_release_line="$(grep -n -m1 'name: Create draft and upload exact assets' "$RELEASE_GATE" | cut -d: -f1)"
+draft_release_line="$(grep -n -m1 'name: Reverify policy, create or resume draft, and upload exact assets' "$RELEASE_GATE" | cut -d: -f1)"
 test -n "$spdx_validation_line"
 test -n "$vulnerability_scan_line"
 test -n "$draft_release_line"
 test "$spdx_validation_line" -lt "$vulnerability_scan_line"
 test "$vulnerability_scan_line" -lt "$draft_release_line"
-build_release_block="$(sed -n '/^  build-and-test:/,/^  verify-publication:/p' "$RELEASE_GATE")"
+minimum_release_block="$(sed -n '/^  minimum-macos-compatibility:/,/^  prepare-release:/p' "$RELEASE_GATE")"
+preflight_release_block="$(sed -n '/^  live-policy-preflight:/,/^  minimum-macos-compatibility:/p' "$RELEASE_GATE")"
+prepare_release_block="$(sed -n '/^  prepare-release:/,/^  sign-and-notarize:/p' "$RELEASE_GATE")"
+signing_release_block="$(sed -n '/^  sign-and-notarize:/,/^  quarantined-install:/p' "$RELEASE_GATE")"
+quarantine_release_block="$(sed -n '/^  quarantined-install:/,/^  verify-publication:/p' "$RELEASE_GATE")"
+quarantine_fixture_block="$(sed -n '/^  quarantined-install:/,/^  macos15-signed-compatibility:/p' "$RELEASE_GATE")"
+macos15_fixture_block="$(sed -n '/^  macos15-signed-compatibility:/,/^  verify-publication:/p' "$RELEASE_GATE")"
 verify_release_block="$(sed -n '/^  verify-publication:/,/^  publish:/p' "$RELEASE_GATE")"
 publish_release_block="$(sed -n '/^  publish:/,$p' "$RELEASE_GATE")"
-if grep -Eq 'environment: public-beta-release|contents: write|EASYSPLAT_RELEASE_ADMIN_TOKEN' <<<"$build_release_block"; then
-  fail "the self-hosted build job must stay inside verification authority"
+grep -Fq 'runs-on: ubuntu-24.04' <<<"$preflight_release_block" \
+  || fail "live release preflight must run on a fresh GitHub-hosted runner"
+grep -Fq 'environment: release-verification' <<<"$preflight_release_block" \
+  || fail "live release authority must use the protected verification environment"
+if grep -Eq 'actions/(checkout|setup-python)@|scripts/|swift[[:space:]]|secrets\.' <<<"$preflight_release_block"; then
+  fail "live release preflight must not checkout or execute repository code or receive secrets"
 fi
-grep -Fq 'runs-on: macos-15' <<<"$verify_release_block" \
-  || fail "publication verification must run on a fresh GitHub-hosted runner"
-if grep -Eq '^[[:space:]]+environment:|contents: write|EASYSPLAT_RELEASE_ADMIN_TOKEN|verify_beta\.sh|verify_ui\.sh' <<<"$verify_release_block"; then
+for contract in \
+  'source_commit=' \
+  'authority_artifact_id:' \
+  'authority_artifact_digest:' \
+  'release-authority.json' \
+  'benchmark_artifact_id=' \
+  'benchmark_artifact_digest=' \
+  'repos/$GITHUB_REPOSITORY/branches/main' \
+  'repos/$GITHUB_REPOSITORY/commits/main' \
+  '.github/workflows/benchmark-release.yml'; do
+  grep -Fq -- "$contract" <<<"$preflight_release_block" \
+    || fail "live release preflight is missing: $contract"
+done
+grep -Fq 'needs: live-policy-preflight' <<<"$minimum_release_block" \
+  || fail "minimum compatibility must wait for live protected-main preflight"
+grep -Fq 'runs-on: macos-15' <<<"$minimum_release_block" \
+  || fail "minimum deployment compatibility must run on macOS 15"
+grep -Fq 'needs: [live-policy-preflight, minimum-macos-compatibility]' <<<"$prepare_release_block" \
+  || fail "release preparation must wait for hosted policy and compatibility"
+grep -Fq 'ref: ${{ needs.live-policy-preflight.outputs.source_commit }}' <<<"$prepare_release_block" \
+  || fail "build-authority checkout must bind the hosted preflight source commit"
+if grep -Eq '^[[:space:]]+environment:' <<<"$prepare_release_block"; then
+  fail "release preparation must not inherit protected environment authority"
+fi
+grep -Fq 'runs-on: macos-26' <<<"$prepare_release_block" \
+  || fail "release preparation must use the clean GitHub-hosted macOS authority"
+for contract in \
+  'RUNNER_ENVIRONMENT: ${{ runner.environment }}' \
+  'test "$RUNNER_ENVIRONMENT" = "github-hosted"' \
+  '/Applications/Xcode_26.6.app/Contents/Developer' \
+  'xcrun --sdk macosx --show-sdk-version' \
+  'authority_artifact_id' \
+  'authority_artifact_digest' \
+  'release-authority.json' \
+  '0valididentitiesfound'; do
+  grep -Fq -- "$contract" <<<"$prepare_release_block" \
+    || fail "identity-free builder attestation is missing: $contract"
+done
+if grep -Eq 'environment: release-(signing|release)|contents: write|EASYSPLAT_(RELEASE_ADMIN_TOKEN|DEVELOPER_ID_APPLICATION_SHA1|DEVELOPER_TEAM_ID|NOTARY_KEYCHAIN_PROFILE)' <<<"$prepare_release_block"; then
+  fail "uncredentialed release preparation must not enter signing or publication authority"
+fi
+grep -Fq 'environment: release-signing' <<<"$signing_release_block" \
+  || fail "Developer ID production must use the protected signing environment"
+grep -Fq 'easysplat-signing' <<<"$signing_release_block" \
+  || fail "Developer ID production must use the isolated signing runner"
+grep -Fq 'shell: /bin/bash --noprofile --norc -p -e -u -o pipefail {0}' <<<"$signing_release_block" \
+  || fail "credentialed app signing must reject inherited Bash startup code"
+for secret in \
+  EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1 \
+  EASYSPLAT_DEVELOPER_TEAM_ID \
+  EASYSPLAT_NOTARY_KEYCHAIN_PROFILE; do
+  count="$(grep -Fc "secrets.$secret" <<<"$signing_release_block")"
+  [ "$count" -eq 1 ] \
+    || fail "$secret must enter exactly one signing step"
+done
+for contract in \
+  '/usr/bin/env -i' \
+  'PATH=/usr/bin:/bin:/usr/sbin:/sbin' \
+  '/bin/bash --noprofile --norc -p' \
+  '"$GITHUB_WORKSPACE/scripts/release/build_dmg.sh"' \
+  '--manifest-tool-bin "$TRUSTED_MANIFEST_TOOL"'; do
+  grep -Fq -- "$contract" <<<"$signing_release_block" \
+    || fail "credentialed app signing is missing: $contract"
+done
+for contract in \
+  'test "$RUNNER_ENVIRONMENT" = "self-hosted"' \
+  'Prepare protected-main signing authority' \
+  'ref: ${{ needs.live-policy-preflight.outputs.source_commit }}' \
+  'test ! -e "$PREPARED_ROOT/source"' \
+  'test ! -e "$PREPARED_ROOT/product/ManifestTool"' \
+  'repos/$GITHUB_REPOSITORY/branches/main' \
+  'repos/$GITHUB_REPOSITORY/commits/main'; do
+  grep -Fq -- "$contract" <<<"$signing_release_block" \
+    || fail "last-moment signing authority is missing: $contract"
+done
+signing_live_check_line="$(grep -n -m1 'repos/\$GITHUB_REPOSITORY/commits/main' <<<"$signing_release_block" | cut -d: -f1)"
+signing_command_line="$(grep -n -m1 '\$GITHUB_WORKSPACE/scripts/release/build_dmg\.sh' <<<"$signing_release_block" | cut -d: -f1)"
+test -n "$signing_live_check_line" && test -n "$signing_command_line"
+test "$signing_live_check_line" -lt "$signing_command_line" \
+  || fail "protected-main freshness must be checked immediately before signing"
+if grep -Eq 'EASYSPLAT_RELEASE_ADMIN_TOKEN|contents: write' <<<"$signing_release_block"; then
+  fail "the signing producer must not receive publication authority"
+fi
+grep -Fq 'runs-on: macos-26' <<<"$quarantine_release_block" \
+  || fail "quarantined install proof must run on a fresh macOS 26 host"
+grep -Fq 'verify_release.sh' <<<"$quarantine_release_block" \
+  || fail "the quarantined host must run the full packaged-app verifier"
+for block in "$quarantine_fixture_block" "$macos15_fixture_block"; do
+  for contract in \
+    'FIXTURE_ROOT="$RUNNER_TEMP/easysplat-release-fixture"' \
+    'generate_release_fixture.py" generate \' \
+    '--output "$FIXTURE_ROOT"' \
+    'generate_release_fixture.py" verify \' \
+    '--root "$FIXTURE_ROOT"' \
+    '--fixture "$FIXTURE_ROOT"'; do
+    grep -Fq -- "$contract" <<<"$block" \
+      || fail "hosted release verification is missing hermetic fixture contract: $contract"
+  done
+done
+fixture_generation_count="$(grep -Fc 'generate_release_fixture.py" generate \' "$RELEASE_GATE")"
+[ "$fixture_generation_count" -eq 2 ] \
+  || fail "each hosted release-verification job must generate its fixture exactly once"
+if grep -Eq '^[[:space:]]+environment:|secrets\.|contents: write' <<<"$quarantine_release_block"; then
+  fail "the quarantine verifier must remain secret-free"
+fi
+grep -Fq 'runs-on: macos-26' <<<"$verify_release_block" \
+  || fail "publication verification must run on a fresh macOS 26 host"
+for contract in \
+  'signed_artifact_id: ${{ needs.sign-and-notarize.outputs.signed_artifact_id }}' \
+  'signed_artifact_digest: ${{ needs.sign-and-notarize.outputs.signed_artifact_digest }}'; do
+  grep -Fq -- "$contract" <<<"$verify_release_block" \
+    || fail "publication verification is missing final signed-artifact binding: $contract"
+done
+if grep -Eq '^[[:space:]]+environment:|contents: write|EASYSPLAT_RELEASE_ADMIN_TOKEN|verify_release\.sh' <<<"$verify_release_block"; then
   fail "the clean publication verifier must be static and secret-free"
 fi
 grep -Fq 'contents: read' <<<"$publish_release_block" \
   || fail "the publish workflow token must remain read-only"
 grep -Fq 'secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN' <<<"$publish_release_block" \
   || fail "the publish job must use protected explicit release authority"
-grep -Fq 'environment: public-beta-release' <<<"$publish_release_block" \
+grep -Fq 'environment: release-publication' <<<"$publish_release_block" \
   || fail "the publish job must use the protected release environment"
+for contract in \
+  'SIGNED_ARTIFACT_ID: ${{ needs.verify-publication.outputs.signed_artifact_id }}' \
+  'SIGNED_ARTIFACT_DIGEST: ${{ needs.verify-publication.outputs.signed_artifact_digest }}' \
+  'SIGNED_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$SIGNED_ARTIFACT_ID"' \
+  '"artifact_id": os.environ["SIGNED_ARTIFACT_ID"]' \
+  '"artifact_digest": os.environ["SIGNED_ARTIFACT_DIGEST"]' \
+  '"workflow_run_id": os.environ["GITHUB_RUN_ID"]' \
+  '"workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"]'; do
+  grep -Fq -- "$contract" <<<"$publish_release_block" \
+    || fail "publication is missing final signed-artifact revalidation: $contract"
+done
+release_admin_count="$(grep -Fc 'secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN' <<<"$publish_release_block")"
+[ "$release_admin_count" -eq 2 ] \
+  || fail "publication authority must enter exactly two fixed phases"
+if grep -Fq 'name: Verify live release policy' <<<"$publish_release_block"; then
+  fail "publication must not spend a separate early admin-token phase"
+fi
+for contract in \
+  'easysplat-release-owner:v2:' \
+  'name: Reverify policy, create or resume draft, and upload exact assets' \
+  'existing asset differs from the publication manifest'; do
+  grep -Fq -- "$contract" <<<"$publish_release_block" \
+    || fail "idempotent draft publication is missing: $contract"
+done
 if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]|hdiutil|open[[:space:]].*EasySplat' <<<"$publish_release_block"; then
   fail "the publish job must not checkout or execute repository, app, or toolchain code"
 fi
@@ -170,260 +359,268 @@ if grep -Fq 'softprops/action-gh-release' "$RELEASE_GATE"; then
   fail "release publication must use the audited GitHub CLI path"
 fi
 if grep -Eq '^[[:space:]]*(pull_request|pull_request_target):' "$RELEASE_GATE"; then
-  fail "public beta gate must never run pull-request code"
+  fail "release gate must never run pull-request code"
 fi
 
 require_job_count "$TOOLCHAIN_GATE" 4
 require_line '^  workflow_dispatch:$' "$TOOLCHAIN_GATE"
-require_line '^  policy-preflight:$' "$TOOLCHAIN_GATE"
-require_line '^  build:$' "$TOOLCHAIN_GATE"
-require_line '^  policy-postflight:$' "$TOOLCHAIN_GATE"
-require_line '^  derive-signing-request:$' "$TOOLCHAIN_GATE"
+for input in version app_version_minimum app_version_maximum_exclusive; do
+  require_line "^      $input:$" "$TOOLCHAIN_GATE"
+done
+for job in metadata-preflight build-unsigned sign-and-notarize derive-post-sign-request; do
+  require_line "^  $job:$" "$TOOLCHAIN_GATE"
+done
 require_line '^    if: github\.ref == '\''refs/heads/main'\'' && github\.event\.repository\.default_branch == '\''main'\''$' "$TOOLCHAIN_GATE"
-require_line '^    needs: policy-preflight$' "$TOOLCHAIN_GATE"
-require_line '^    needs: build$' "$TOOLCHAIN_GATE"
-require_line '^    needs: \[build, policy-postflight\]$' "$TOOLCHAIN_GATE"
-require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-ephemeral\]$' "$TOOLCHAIN_GATE"
+require_line '^    needs: metadata-preflight$' "$TOOLCHAIN_GATE"
+require_line '^    needs: \[metadata-preflight, build-unsigned\]$' "$TOOLCHAIN_GATE"
+require_line '^    needs: \[metadata-preflight, sign-and-notarize\]$' "$TOOLCHAIN_GATE"
+require_line '^    environment: toolchain-release$' "$TOOLCHAIN_GATE"
+require_line '^    environment: toolchain-signing$' "$TOOLCHAIN_GATE"
+require_line '^    runs-on: ubuntu-latest$' "$TOOLCHAIN_GATE"
 require_line '^    runs-on: macos-15$' "$TOOLCHAIN_GATE"
-environment_count="$(grep -Ec '^    environment: toolchain-release$' "$TOOLCHAIN_GATE")"
-[ "$environment_count" -eq 2 ] \
-  || fail "toolchain policy preflight and postflight must use the protected environment"
-require_text 'name: toolchain-components-${{ steps.release.outputs.version }}' "$TOOLCHAIN_GATE"
-require_text 'name: toolchain-signing-request-${{ inputs.version }}' "$TOOLCHAIN_GATE"
-require_text 'ManifestTool prepare-release' "$TOOLCHAIN_GATE"
-require_text 'source scripts/release/lib/strict_semver.sh' "$TOOLCHAIN_GATE"
-require_text 'test "$DEFAULT_BRANCH" = "main"' "$TOOLCHAIN_GATE"
-require_text 'test "$GITHUB_REF" = "refs/heads/main"' "$TOOLCHAIN_GATE"
-require_text '"repos/$GITHUB_REPOSITORY" --jq .default_branch' "$TOOLCHAIN_GATE"
-require_text '"repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH"' "$TOOLCHAIN_GATE"
-require_text '"repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100"' "$TOOLCHAIN_GATE"
-require_text '"repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=true"' "$TOOLCHAIN_GATE"
-require_text 'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' "$TOOLCHAIN_GATE"
-require_text 'artifact-ids: ${{ needs.build.outputs.artifact_id }}' "$TOOLCHAIN_GATE"
-require_text 'actions/artifacts/$ARTIFACT_ID' "$TOOLCHAIN_GATE"
-toolchain_preflight_block="$(sed -n '/^  policy-preflight:/,/^  build:/p' "$TOOLCHAIN_GATE")"
-toolchain_build_block="$(sed -n '/^  build:/,/^  policy-postflight:/p' "$TOOLCHAIN_GATE")"
-toolchain_postflight_block="$(sed -n '/^  policy-postflight:/,/^  derive-signing-request:/p' "$TOOLCHAIN_GATE")"
-toolchain_derive_block="$(sed -n '/^  derive-signing-request:/,$p' "$TOOLCHAIN_GATE")"
-grep -Fq 'easysplat-ephemeral' <<<"$toolchain_build_block" \
-  || fail "toolchain compilation must use the isolated Apple Silicon builder"
-grep -Fq 'runs-on: macos-15' <<<"$toolchain_derive_block" \
-  || fail "toolchain signing-request derivation must use a fresh hosted runner"
-for policy_block in "$toolchain_preflight_block" "$toolchain_postflight_block"; do
-  grep -Fq 'runs-on: macos-15' <<<"$policy_block" \
-    || fail "toolchain policy verification must use a GitHub-hosted runner"
-  grep -Fq 'environment: toolchain-release' <<<"$policy_block" \
-    || fail "toolchain policy verification must use the protected environment"
-  grep -Fq 'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' <<<"$policy_block" \
-    || fail "toolchain policy verification must use protected policy authority"
-  grep -Fq 'test "$DEFAULT_BRANCH" = "main"' <<<"$policy_block" \
-    || fail "toolchain policy verification must require main as the event default"
-  grep -Fq 'test "$GITHUB_REF" = "refs/heads/main"' <<<"$policy_block" \
-    || fail "toolchain policy verification must require the main workflow ref"
-  grep -Fq '"repos/$GITHUB_REPOSITORY" --jq .default_branch' <<<"$policy_block" \
-    || fail "toolchain policy verification must query the live default branch"
-  grep -Fq '"repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha' <<<"$policy_block" \
-    || fail "toolchain policy verification must require the current main head"
-  grep -Fq '"repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100"' <<<"$policy_block" \
-    || fail "toolchain policy verification must fetch effective main rules"
-  grep -Fq '"repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=true"' <<<"$policy_block" \
-    || fail "toolchain policy verification must inspect every effective ruleset"
-  if grep -Eq 'actions/checkout@|^[[:space:]]+uses:|scripts/|swift[[:space:]]' <<<"$policy_block"; then
-    fail "toolchain policy jobs must not checkout or execute repository code"
-  fi
+require_text '"self-hosted","macOS","ARM64","easysplat-toolchain-builder","easysplat-ephemeral"' "$TOOLCHAIN_GATE"
+require_text '"self-hosted","macOS","ARM64","easysplat-toolchain-signing","easysplat-ephemeral"' "$TOOLCHAIN_GATE"
+require_text 'concurrency:' "$TOOLCHAIN_GATE"
+require_text 'cancel-in-progress: false' "$TOOLCHAIN_GATE"
+
+toolchain_preflight_block="$(sed -n '/^  metadata-preflight:/,/^  build-unsigned:/p' "$TOOLCHAIN_GATE")"
+toolchain_builder_block="$(sed -n '/^  build-unsigned:/,/^  sign-and-notarize:/p' "$TOOLCHAIN_GATE")"
+toolchain_signing_block="$(sed -n '/^  sign-and-notarize:/,/^  derive-post-sign-request:/p' "$TOOLCHAIN_GATE")"
+toolchain_post_sign_block="$(sed -n '/^  derive-post-sign-request:/,$p' "$TOOLCHAIN_GATE")"
+
+for contract in \
+  'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' \
+  'repos/$GITHUB_REPOSITORY/branches/main' \
+  'repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG'; do
+  grep -Fq -- "$contract" <<<"$toolchain_preflight_block" \
+    || fail "toolchain metadata preflight is missing: $contract"
 done
-for unprivileged_block in "$toolchain_build_block" "$toolchain_derive_block"; do
-  if grep -Eq 'EASYSPLAT_RELEASE_POLICY_TOKEN|environment: toolchain-release' <<<"$unprivileged_block"; then
-    fail "the protected policy token must not reach build or signing-request derivation"
-  fi
-done
-policy_token_count="$(grep -Fc 'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' "$TOOLCHAIN_GATE")"
-[ "$policy_token_count" -eq 2 ] \
-  || fail "the protected policy token must appear only in preflight and postflight"
-if grep -Eq 'contents: write|sign-release|gh release|TOOLCHAIN_PRIVATE_KEY|private[_-]key' "$TOOLCHAIN_GATE"; then
-  fail "the source toolchain workflow must remain read-only and unable to sign or publish"
-fi
-postflight_head_line="$(grep -n -m1 'name: Reverify protected main policy after build' "$TOOLCHAIN_GATE" | cut -d: -f1)"
-derive_job_line="$(grep -n -m1 '^  derive-signing-request:$' "$TOOLCHAIN_GATE" | cut -d: -f1)"
-derive_head_line="$(grep -n -m1 'name: Reverify current main head before signing-request upload' "$TOOLCHAIN_GATE" | cut -d: -f1)"
-signing_upload_line="$(grep -n -m1 'name: Upload exact prepared signing request' "$TOOLCHAIN_GATE" | cut -d: -f1)"
-test -n "$postflight_head_line"
-test -n "$derive_job_line"
-test -n "$derive_head_line"
-test -n "$signing_upload_line"
-test "$postflight_head_line" -lt "$derive_job_line"
-test "$derive_head_line" -lt "$signing_upload_line"
-if grep -Eq '^[[:space:]]*(pull_request|pull_request_target):' "$TOOLCHAIN_GATE"; then
-  fail "toolchain build requests must never run pull-request code"
+if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]' <<<"$toolchain_preflight_block"; then
+  fail "toolchain metadata preflight must not checkout or execute repository code"
 fi
 
-TOOLCHAIN_WORKFLOW="$TOOLCHAIN_GATE" python3 - <<'PY'
-import copy
-import json
-import os
-from pathlib import Path
-import re
-import subprocess
-import sys
-import tempfile
-import textwrap
+for contract in \
+  'identity-free-production-builder' \
+  'security find-identity -v -p codesigning' \
+  'scripts/benchmark/verify_shipping_host.sh' \
+  'scripts/toolchain/build_colmap.sh' \
+  'scripts/toolchain/build_msplat.sh' \
+  'scripts/toolchain/build_da3_mps.sh' \
+  'ManifestTool prepare-release' \
+  'toolchain-unsigned-components-${{ inputs.version }}' \
+  'toolchain-unsigned-request-${{ inputs.version }}' \
+  'compression-level: 0'; do
+  grep -Fq -- "$contract" <<<"$toolchain_builder_block" \
+    || fail "identity-free toolchain builder is missing: $contract"
+done
+if grep -Eq '^[[:space:]]+environment:|secrets\.|EASYSPLAT_TOOLCHAIN_DEVELOPER|notarytool|contents: write|gh release' <<<"$toolchain_builder_block"; then
+  fail "identity-free toolchain builder received signing or publication authority"
+fi
 
-workflow = Path(os.environ["TOOLCHAIN_WORKFLOW"]).read_text(encoding="utf-8")
-pattern = re.compile(
-    r"^          # BEGIN TOOLCHAIN PROTECTED MAIN POLICY CHECKER\n"
-    r"(?P<body>.*?)"
-    r"^          # END TOOLCHAIN PROTECTED MAIN POLICY CHECKER$",
-    re.MULTILINE | re.DOTALL,
-)
-checkers = [textwrap.dedent(match.group("body")) for match in pattern.finditer(workflow)]
-if len(checkers) != 2 or checkers[0] != checkers[1]:
-    raise SystemExit("toolchain preflight and postflight must embed the same tested policy checker")
-checker = checkers[0]
+for variable in \
+  EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1 \
+  EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID \
+  EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE; do
+  count="$(grep -Fc "$variable" <<<"$toolchain_signing_block")"
+  [ "$count" -ge 2 ] \
+    || fail "$variable must be validated and used inside the protected signing job"
+done
+for contract in \
+  'Authenticate builder artifacts before repository checkout' \
+  '/usr/bin/python3 -I' \
+  'urllib.request.ProxyHandler({})' \
+  'github-authority.json' \
+  'scripts/release/finalize_signed_toolchain.py' \
+  '--github-authority-receipt "$RUNNER_TEMP/toolchain-builder-authority/github-authority.json"' \
+  'scripts/release/notarize_artifact.sh' \
+  'toolchain-signed-intermediate-${{ inputs.version }}'; do
+  grep -Fq -- "$contract" <<<"$toolchain_signing_block" \
+    || fail "protected toolchain signing is missing: $contract"
+done
+if grep -Eq 'EASYSPLAT_RELEASE_POLICY_TOKEN|EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN|authority_|contents: write|gh release' <<<"$toolchain_signing_block"; then
+  fail "protected toolchain signer received authority or publication access"
+fi
+signer_token_line="$(grep -n -m1 'GH_TOKEN: \${{ github.token }}' <<<"$toolchain_signing_block" | cut -d: -f1)"
+signer_checkout_line="$(grep -n -m1 'actions/checkout@' <<<"$toolchain_signing_block" | cut -d: -f1)"
+signer_execution_line="$(grep -n -m1 'Developer ID sign and notarize exact producer bytes' <<<"$toolchain_signing_block" | cut -d: -f1)"
+test -n "$signer_token_line" && test -n "$signer_checkout_line" && test -n "$signer_execution_line"
+test "$signer_token_line" -lt "$signer_checkout_line" && test "$signer_checkout_line" -lt "$signer_execution_line" \
+  || fail "GitHub authority must be captured before repository code reaches the signing runner"
+signer_before_checkout="$(sed -n "1,${signer_checkout_line}p" <<<"$toolchain_signing_block")"
+if grep -Fq 'gh api' <<<"$signer_before_checkout"; then
+  fail "the signing token must only enter the immutable system Python authority capture"
+fi
+signer_after_checkout="$(sed -n "${signer_checkout_line},\$p" <<<"$toolchain_signing_block")"
+if grep -Eq 'GH_TOKEN|GITHUB_TOKEN' <<<"$signer_after_checkout"; then
+  fail "repository code must not receive a GitHub token on the signing runner"
+fi
 
-expected_checks = [
-    "Swift · macOS 15 arm64 · Xcode 16.4",
-    "Real 8 GB-class policy lane",
-    "Native Metal trainer",
-    "Repository contracts",
-    "DA3 bridge · Python 3.12",
-    "Actions and shell lint",
-    "Python dependency audit",
-    "Full-history secret scan",
-    "Pull request dependency review",
-    "Analyze swift",
-    "Analyze python",
-    "Analyze c-cpp",
-    "Analyze actions",
-]
+for contract in \
+  'artifact-ids: ${{ needs.sign-and-notarize.outputs.artifact_id }}' \
+  'ManifestTool prepare-release' \
+  '--core-zip "$FINAL/toolchain-macos-arm64-$VERSION-core.zip"' \
+  '--da3-base-zip "$FINAL/toolchain-geometry-da3-base-$VERSION.zip"' \
+  '--da3-small-zip "$FINAL/toolchain-geometry-da3-small-$VERSION.zip"' \
+  'scripts/release/toolchain_publication.py validate-producer' \
+  'toolchain-final-producer-${{ inputs.version }}' \
+  'toolchain-post-sign-request-${{ inputs.version }}'; do
+  grep -Fq -- "$contract" <<<"$toolchain_post_sign_block" \
+    || fail "post-sign toolchain derivation is missing: $contract"
+done
+if grep -Eq '^[[:space:]]+environment:|secrets\.|codesign|notarytool|contents: write|gh release' <<<"$toolchain_post_sign_block"; then
+  fail "post-sign request derivation must remain identity-free and secretless"
+fi
 
+producer_policy_token_count="$(grep -Fc 'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' "$TOOLCHAIN_GATE")"
+[ "$producer_policy_token_count" -eq 1 ] \
+  || fail "toolchain producer policy token must appear only in metadata preflight"
+if grep -Eq 'EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN|TOOLCHAIN_PRIVATE_KEY|private[_-]key|sourceArtifacts|softprops/action-gh-release|contents: write|^[[:space:]]*(pull_request|pull_request_target):' "$TOOLCHAIN_GATE"; then
+  fail "toolchain producer must not contain authority keys, legacy sourceArtifacts, or publication behavior"
+fi
 
-def effective_rule(ruleset_id, rule_type, parameters=None):
-    rule = {
-        "type": rule_type,
-        "ruleset_id": ruleset_id,
-        "ruleset_source_type": "Repository",
-        "ruleset_source": "dud8/EasySplat",
-    }
-    if parameters is not None:
-        rule["parameters"] = parameters
-    return rule
+require_job_count "$TOOLCHAIN_PUBLISH" 4
+require_line '^  workflow_dispatch:$' "$TOOLCHAIN_PUBLISH"
+for input in \
+  version app_version app_version_minimum app_version_maximum_exclusive \
+  producer_run_id producer_run_attempt producer_artifact_id producer_artifact_digest \
+  request_artifact_id request_artifact_digest request_sha256 \
+  authority_commit authority_run_id authority_run_attempt \
+  authority_payload_artifact_id authority_payload_artifact_name authority_payload_artifact_digest \
+  authority_receipt_artifact_id authority_receipt_artifact_name authority_receipt_artifact_digest \
+  benchmark_run_id benchmark_run_attempt benchmark_artifact_id benchmark_artifact_name benchmark_artifact_digest; do
+  require_line "^      $input:$" "$TOOLCHAIN_PUBLISH"
+done
+for job in metadata-preflight verify-publication minimum-macos-compatibility stage-draft-release; do
+  require_line "^  $job:$" "$TOOLCHAIN_PUBLISH"
+done
+require_line '^    needs: metadata-preflight$' "$TOOLCHAIN_PUBLISH"
+require_line '^    needs: verify-publication$' "$TOOLCHAIN_PUBLISH"
+require_line '^    needs: \[verify-publication, minimum-macos-compatibility\]$' "$TOOLCHAIN_PUBLISH"
+require_line '^    runs-on: ubuntu-latest$' "$TOOLCHAIN_PUBLISH"
+require_line '^    runs-on: macos-15$' "$TOOLCHAIN_PUBLISH"
+require_line '^    environment: toolchain-release$' "$TOOLCHAIN_PUBLISH"
+require_line '^    environment: toolchain-publication$' "$TOOLCHAIN_PUBLISH"
+require_text '"self-hosted","macOS","ARM64","easysplat-toolchain-verifier","easysplat-ephemeral"' "$TOOLCHAIN_PUBLISH"
 
+toolchain_publish_preflight_block="$(sed -n '/^  metadata-preflight:/,/^  verify-publication:/p' "$TOOLCHAIN_PUBLISH")"
+toolchain_verifier_block="$(sed -n '/^  verify-publication:/,/^  minimum-macos-compatibility:/p' "$TOOLCHAIN_PUBLISH")"
+minimum_toolchain_block="$(sed -n '/^  minimum-macos-compatibility:/,/^  stage-draft-release:/p' "$TOOLCHAIN_PUBLISH")"
+stage_draft_block="$(sed -n '/^  stage-draft-release:/,$p' "$TOOLCHAIN_PUBLISH")"
 
-def valid_policy():
-    first_checks = [
-        {"context": context, "integration_id": 15368}
-        for context in expected_checks[:6]
-    ]
-    second_checks = [
-        {"context": context, "integration_id": 15368}
-        for context in expected_checks[6:]
-    ]
-    effective = [
-        effective_rule(101, "deletion"),
-        effective_rule(101, "required_linear_history"),
-        effective_rule(
-            101,
-            "pull_request",
-            {
-                "allowed_merge_methods": ["squash", "rebase"],
-                "dismiss_stale_reviews_on_push": True,
-                "require_last_push_approval": False,
-                "required_approving_review_count": 0,
-                "required_review_thread_resolution": False,
-            },
-        ),
-        effective_rule(
-            101,
-            "required_status_checks",
-            {
-                "strict_required_status_checks_policy": False,
-                "required_status_checks": first_checks,
-            },
-        ),
-        effective_rule(202, "non_fast_forward"),
-        effective_rule(
-            202,
-            "pull_request",
-            {
-                "allowed_merge_methods": ["squash", "merge"],
-                "dismiss_stale_reviews_on_push": False,
-                "require_last_push_approval": True,
-                "required_approving_review_count": 1,
-                "required_review_thread_resolution": True,
-            },
-        ),
-        effective_rule(
-            202,
-            "required_status_checks",
-            {
-                "strict_required_status_checks_policy": True,
-                "required_status_checks": second_checks,
-            },
-        ),
-    ]
-    rulesets = {
-        101: {
-            "id": 101,
-            "target": "branch",
-            "enforcement": "active",
-            "bypass_actors": [],
-        },
-        202: {
-            "id": 202,
-            "target": "branch",
-            "enforcement": "active",
-            "bypass_actors": [],
-        },
-    }
-    return effective, rulesets
+for contract in \
+  'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' \
+  'actions/artifacts/$PRODUCER_ARTIFACT_ID/zip' \
+  'actions/artifacts/$REQUEST_ARTIFACT_ID/zip' \
+  'actions/artifacts/$BENCHMARK_ARTIFACT_ID/zip' \
+  'actions/artifacts/$AUTHORITY_PAYLOAD_ARTIFACT_ID/zip' \
+  'actions/artifacts/$AUTHORITY_RECEIPT_ARTIFACT_ID/zip' \
+  'benchmark-transport.json' \
+  'verifiedSuiteSHA256' \
+  'toolchain-authority-handoff-${{ github.run_id }}-${{ github.run_attempt }}'; do
+  grep -Fq -- "$contract" <<<"$toolchain_publish_preflight_block" \
+    || fail "toolchain publication metadata preflight is missing: $contract"
+done
+if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]' <<<"$toolchain_publish_preflight_block"; then
+  fail "toolchain publication preflight must not checkout or execute repository code"
+fi
 
+for contract in \
+  'artifact-ids: ${{ needs.metadata-preflight.outputs.handoff_artifact_id }}' \
+  'scripts/release/toolchain_publication.py verify' \
+  '--producer-run-attempt "${{ inputs.producer_run_attempt }}"' \
+  '--request-sha256 "${{ inputs.request_sha256 }}"' \
+  '--benchmark-evidence "$HANDOFF/benchmark/benchmark-transport.json"' \
+  '--benchmark-run-attempt "${{ inputs.benchmark_run_attempt }}"' \
+  '--benchmark-artifact-name "${{ inputs.benchmark_artifact_name }}"' \
+  '--benchmark-artifact-digest "${{ inputs.benchmark_artifact_digest }}"' \
+  'verified-toolchain-publication-${{ inputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}'; do
+  grep -Fq -- "$contract" <<<"$toolchain_verifier_block" \
+    || fail "secretless toolchain publication verification is missing: $contract"
+done
+if grep -Eq '^[[:space:]]+environment:|secrets\.|github-token:|GH_TOKEN|GITHUB_TOKEN|contents: write|codesign|notarytool|gh release' <<<"$toolchain_verifier_block"; then
+  fail "toolchain publication verifier must remain secretless"
+fi
 
-def run_policy(effective, rulesets, expect_success):
-    with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
-        root.chmod(0o700)
-        files = {"effective-rules.json": effective}
-        files.update({f"ruleset-{ruleset_id}.json": value for ruleset_id, value in rulesets.items()})
-        for name, value in files.items():
-            path = root / name
-            path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
-            path.chmod(0o600)
-        result = subprocess.run(
-            [sys.executable, "-c", checker, os.fspath(root)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if expect_success and result.returncode != 0:
-            raise SystemExit(f"valid layered toolchain policy failed: {result.stderr}")
-        if not expect_success and result.returncode == 0:
-            raise SystemExit("invalid layered toolchain policy was accepted")
+for contract in \
+  'runs-on: macos-15' \
+  'artifact-ids: ${{ needs.verify-publication.outputs.artifact_id }}' \
+  'colmap" help' \
+  'easysplat-train" --self-check'; do
+  grep -Fq -- "$contract" <<<"$minimum_toolchain_block" \
+    || fail "minimum macOS toolchain compatibility is missing: $contract"
+done
+if grep -Eq '^[[:space:]]+environment:|secrets\.|contents: write' <<<"$minimum_toolchain_block"; then
+  fail "minimum macOS compatibility must remain secret-free"
+fi
 
+for contract in \
+  'environment: toolchain-publication' \
+  'contents: read' \
+  'secrets.EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN' \
+  'Create or resume the exact draft release' \
+  'draft=true' \
+  'prerelease=false' \
+  'toolchain-release-request.json' \
+  'toolchain-authority-envelope.json' \
+  'toolchain-authority-receipt.json' \
+  'toolchain-benchmark-evidence.json' \
+  'http.client.HTTPSConnection'; do
+  grep -Fq -- "$contract" <<<"$stage_draft_block" \
+    || fail "toolchain draft publication is missing: $contract"
+done
+if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]|notarize_artifact|finalize_signed_toolchain|read_bytes\(' <<<"$stage_draft_block"; then
+  fail "toolchain publication must only stream the exact verified artifact closure"
+fi
+if grep -Eq 'contents: write|git tag|git push|gh release edit|prerelease=true' <<<"$stage_draft_block"; then
+  fail "toolchain publication must stage, but never publish, the stable draft"
+fi
 
-effective, rulesets = valid_policy()
-run_policy(effective, rulesets, True)
+publisher_policy_token_count="$(grep -Fc 'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' "$TOOLCHAIN_PUBLISH")"
+[ "$publisher_policy_token_count" -eq 1 ] \
+  || fail "toolchain publication policy token must appear only in metadata preflight"
+publication_token_count="$(grep -Fc 'secrets.EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN' "$TOOLCHAIN_PUBLISH")"
+[ "$publication_token_count" -eq 1 ] \
+  || fail "toolchain publication token must appear only in draft staging"
+if grep -Eq 'TOOLCHAIN_PRIVATE_KEY|private[_-]key|sourceArtifacts|softprops/action-gh-release|contents: write|^[[:space:]]*(pull_request|pull_request_target):' "$TOOLCHAIN_PUBLISH"; then
+  fail "toolchain publisher must not contain private authority keys, legacy sourceArtifacts, or GitHub-token write authority"
+fi
 
-with_bypass = copy.deepcopy(rulesets)
-with_bypass[202]["bypass_actors"] = [{"actor_id": 1, "actor_type": "RepositoryRole"}]
-run_policy(effective, with_bypass, False)
-
-without_bypass_field = copy.deepcopy(rulesets)
-del without_bypass_field[101]["bypass_actors"]
-run_policy(effective, without_bypass_field, False)
-
-incomplete_status_union = copy.deepcopy(effective)
-incomplete_status_union[-1]["parameters"]["required_status_checks"].pop()
-run_policy(incomplete_status_union, rulesets, False)
-PY
-
-require_job_count "$BENCHMARK_GATE" 8
+require_job_count "$BENCHMARK_GATE" 9
 require_line '^  workflow_dispatch:$' "$BENCHMARK_GATE"
+for job in bind-toolchain prepare reference constrained eight-gb derive-reference derive-constrained derive-eight-gb aggregate; do
+  require_line "^  $job:$" "$BENCHMARK_GATE"
+done
 require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-reference, easysplat-ephemeral\]$' "$BENCHMARK_GATE"
 require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-constrained, easysplat-ephemeral\]$' "$BENCHMARK_GATE"
 require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-8gb, easysplat-ephemeral\]$' "$BENCHMARK_GATE"
 require_line '^    runs-on: macos-15$' "$BENCHMARK_GATE"
 require_line '^    environment: benchmark-release$' "$BENCHMARK_GATE"
 require_text 'scripts/benchmark/render-requirements.txt' "$BENCHMARK_GATE"
+benchmark_bind_block="$(sed -n '/^  bind-toolchain:/,/^  prepare:/p' "$BENCHMARK_GATE")"
+benchmark_prepare_block="$(sed -n '/^  prepare:/,/^  reference:/p' "$BENCHMARK_GATE")"
+for contract in \
+  'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' \
+  'toolchain-benchmark-handoff-${{ github.run_id }}-${{ github.run_attempt }}' \
+  'authority-transport.json'; do
+  grep -Fq -- "$contract" <<<"$benchmark_bind_block" \
+    || fail "signed toolchain benchmark binding is missing: $contract"
+done
+if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]' <<<"$benchmark_bind_block"; then
+  fail "signed toolchain benchmark binding must remain checkout-free"
+fi
+for contract in \
+  'needs: bind-toolchain' \
+  'artifact-ids: ${{ needs.bind-toolchain.outputs.artifact_id }}' \
+  'scripts/release/toolchain_publication.py verify-authority' \
+  'ManifestTool verify-release' \
+  'full_toolchain_identity' \
+  'signed-toolchain-root'; do
+  grep -Fq -- "$contract" <<<"$benchmark_prepare_block" \
+    || fail "benchmark prepare does not bind the final signed toolchain: $contract"
+done
+if grep -Eq 'secrets\.|github-token:|GH_TOKEN|GITHUB_TOKEN|EASYSPLAT_BENCHMARK_REFERENCE_TOOLCHAIN_ROOT' <<<"$benchmark_prepare_block"; then
+  fail "benchmark prepare must verify the final signed closure without a token or alternate candidate toolchain"
+fi
 base_install_count="$(grep -Fc 'name: Install protected benchmark dependencies' "$BENCHMARK_GATE")"
 [ "$base_install_count" -eq 8 ] \
   || fail "every benchmark job must install the base evidence dependencies"
@@ -431,12 +628,6 @@ render_install_count="$(grep -Fc 'name: Install protected render-scoring depende
 [ "$render_install_count" -eq 1 ] \
   || fail "only no-secret reference derivation may install render scoring"
 for required in \
-  EASYSPLAT_BENCHMARK_REFERENCE_RUNNER \
-  EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER \
-  EASYSPLAT_BENCHMARK_8GB_RUNNER \
-  EASYSPLAT_BENCHMARK_REFERENCE_RUNNER_SHA256 \
-  EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER_SHA256 \
-  EASYSPLAT_BENCHMARK_8GB_RUNNER_SHA256 \
   EASYSPLAT_BENCHMARK_BASELINE_TOOLCHAIN_ROOT \
   EASYSPLAT_BENCHMARK_LPIPS_BACKBONE \
   scripts/benchmark/run_lane.py \
@@ -448,11 +639,23 @@ for required in \
   'easysplat-benchmark-${{ github.sha }}'; do
   require_text "$required" "$BENCHMARK_GATE"
 done
+for removed in \
+  EASYSPLAT_BENCHMARK_REFERENCE_RUNNER \
+  EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER \
+  EASYSPLAT_BENCHMARK_8GB_RUNNER; do
+  if grep -Fq "$removed" "$BENCHMARK_GATE"; then
+    fail "measurement runner must be built from protected source: $removed"
+  fi
+done
 if grep -Fq 'EASYSPLAT_BENCHMARK_RENDERING_DRIVER_SHA256' "$BENCHMARK_GATE"; then
   fail "the protected renderer identity must be derived from the exact source build"
 fi
 require_text '--product EasySplatBenchmarkDriver' "$BENCHMARK_GATE"
 require_text 'renderer_closure.py build' "$BENCHMARK_GATE"
+require_text '--product EasySplatMeasurementRunner' "$BENCHMARK_GATE"
+require_text 'measurement_runner_closure.py build' "$BENCHMARK_GATE"
+require_text 'measurement_runner_closure.py verify' "$BENCHMARK_GATE"
+require_text 'easysplat-measurement-runner-${{ github.sha }}' "$BENCHMARK_GATE"
 require_text '--rendering-driver-identity "$RENDERER_PACKAGE/identity.json"' "$BENCHMARK_GATE"
 require_text 'easysplat-benchmark-renderer-${{ github.sha }}' "$BENCHMARK_GATE"
 require_text '--rendering-driver-closure "$RUNNER_TEMP/renderer-package/closure"' "$BENCHMARK_GATE"
@@ -470,6 +673,7 @@ require_text '${{ needs.derive-constrained.outputs.prepared_artifact_digest }}' 
 require_text '${{ needs.derive-eight-gb.outputs.prepared_artifact_digest }}' "$BENCHMARK_GATE"
 require_text 'actions/artifacts/$artifact_id' "$BENCHMARK_GATE"
 require_text 'artifact-digest' "$BENCHMARK_GATE"
+require_text 'verified-suite.json' "$BENCHMARK_GATE"
 if grep -Eq 'BENCHMARK_EVIDENCE_(PRIVATE|PUBLIC)_KEY|benchmark-evidence-signing|seal_evidence\.py|signing-requirements|benchmark/public_key_ed25519\.txt|--private-key-stdin|--sealed-root' "$BENCHMARK_GATE"; then
   fail "benchmark evidence must not claim a repository-controlled signing authority"
 fi
@@ -485,6 +689,15 @@ done
 self_hosted_count="$(grep -Ec '^    runs-on: \[self-hosted, macOS, ARM64, .*easysplat-ephemeral\]$' "$BENCHMARK_GATE")"
 [ "$self_hosted_count" -eq 4 ] \
   || fail "every self-hosted benchmark job must require the ephemeral-runner label"
+for lane_job in reference constrained eight-gb; do
+  lane_block="$(sed -n "/^  $lane_job:/,/^  [A-Za-z0-9_-]*:/p" "$BENCHMARK_GATE")"
+  if grep -Eq 'secrets\.|github-token:|GH_TOKEN|GITHUB_TOKEN' <<<"$lane_block"; then
+    fail "$lane_job must not expose a GitHub token to self-hosted repository code"
+  fi
+done
+benchmark_policy_token_count="$(grep -Fc 'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' "$BENCHMARK_GATE")"
+[ "$benchmark_policy_token_count" -eq 1 ] \
+  || fail "benchmark policy token must appear only in checkout-free toolchain binding"
 if grep -Eq '^[[:space:]]*(pull_request|pull_request_target):' "$BENCHMARK_GATE"; then
   fail "release benchmark must never run pull-request code"
 fi

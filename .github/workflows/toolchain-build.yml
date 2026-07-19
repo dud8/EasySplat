@@ -1,4 +1,4 @@
-name: Toolchain Build Signing Request
+name: Toolchain Producer
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       app_version_minimum:
         description: "Minimum compatible EasySplat app version"
         required: true
-        default: "0.2.0-beta.1"
+        default: "0.2.0"
         type: string
       app_version_maximum_exclusive:
         description: "Exclusive maximum compatible EasySplat app version"
@@ -23,657 +23,80 @@ permissions:
   actions: read
 
 concurrency:
-  group: toolchain-release-${{ inputs.version }}
+  group: toolchain-producer-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
-  policy-preflight:
+  metadata-preflight:
     if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: toolchain-release
     permissions:
       contents: read
-      actions: read
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      source_commit: ${{ steps.metadata.outputs.source_commit }}
     steps:
-      - name: Verify protected main policy before build
+      - name: Bind protected main and release tag
+        id: metadata
         env:
-          # GitHub reveals ruleset bypass actors only to Administration-write authority.
-          # This job performs GET requests only and never checks out repository code.
           GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_POLICY_TOKEN }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERSION: ${{ inputs.version }}
+          APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
+          APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
-          test "$DEFAULT_BRANCH" = "main"
-          test "$GITHUB_REF" = "refs/heads/main"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
-          test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
-          POLICY_ROOT="$RUNNER_TEMP/easysplat-toolchain-policy-$GITHUB_JOB"
-          test ! -e "$POLICY_ROOT"
-          mkdir -m 0700 "$POLICY_ROOT"
-          umask 077
-          EFFECTIVE_RULES="$POLICY_ROOT/effective-rules.json"
-          gh api -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" >"$EFFECTIVE_RULES"
-          RULESET_IDS="$(python3 - "$EFFECTIVE_RULES" <<'PY'
-          import json, os, stat, sys
-
-          path = sys.argv[1]
-          descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-          try:
-              metadata = os.fstat(descriptor)
-              if (
-                  not stat.S_ISREG(metadata.st_mode)
-                  or metadata.st_uid != os.getuid()
-                  or metadata.st_nlink != 1
-                  or stat.S_IMODE(metadata.st_mode) != 0o600
-                  or not 0 < metadata.st_size <= 8 * 1024 * 1024
-              ):
-                  raise SystemExit("effective main rules are not a bounded private regular file")
-              payload = os.read(descriptor, metadata.st_size + 1)
-              if len(payload) != metadata.st_size or os.read(descriptor, 1):
-                  raise SystemExit("effective main rules changed while reading")
-              rules = json.loads(payload.decode("utf-8"))
-          finally:
-              os.close(descriptor)
-          if not isinstance(rules, list) or not rules:
-              raise SystemExit("effective main rules are absent or invalid")
-          identifiers = set()
-          for rule in rules:
-              if not isinstance(rule, dict) or type(rule.get("ruleset_id")) is not int or rule["ruleset_id"] <= 0:
-                  raise SystemExit("effective main rule has no valid ruleset identity")
-              identifiers.add(rule["ruleset_id"])
-          print(*sorted(identifiers), sep="\n")
-          PY
-          )"
-          test -n "$RULESET_IDS"
-          for ruleset_id in $RULESET_IDS; do
-            gh api -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=true" \
-              >"$POLICY_ROOT/ruleset-$ruleset_id.json"
-          done
-          python3 - "$POLICY_ROOT" <<'PY'
-          # BEGIN TOOLCHAIN PROTECTED MAIN POLICY CHECKER
-          import json
-          import os
-          from pathlib import Path
-          import stat
+          python3 - "$VERSION" "$APP_VERSION_MINIMUM" "$APP_VERSION_MAXIMUM_EXCLUSIVE" <<'PY'
+          import re
           import sys
 
-          EXPECTED_CHECKS = {
-              ("Swift · macOS 15 arm64 · Xcode 16.4", 15368),
-              ("Real 8 GB-class policy lane", 15368),
-              ("Native Metal trainer", 15368),
-              ("Repository contracts", 15368),
-              ("DA3 bridge · Python 3.12", 15368),
-              ("Actions and shell lint", 15368),
-              ("Python dependency audit", 15368),
-              ("Full-history secret scan", 15368),
-              ("Pull request dependency review", 15368),
-              ("Analyze swift", 15368),
-              ("Analyze python", 15368),
-              ("Analyze c-cpp", 15368),
-              ("Analyze actions", 15368),
-          }
-
-
-          def require(condition, message):
-              if not condition:
-                  raise SystemExit(message)
-
-
-          def read_private_json(path, maximum):
-              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-              try:
-                  before = os.fstat(descriptor)
-                  identity = (
-                      before.st_dev,
-                      before.st_ino,
-                      before.st_mode,
-                      before.st_uid,
-                      before.st_nlink,
-                      before.st_size,
-                      before.st_mtime_ns,
-                      before.st_ctime_ns,
-                  )
-                  require(
-                      stat.S_ISREG(before.st_mode)
-                      and before.st_uid == os.getuid()
-                      and before.st_nlink == 1
-                      and stat.S_IMODE(before.st_mode) == 0o600
-                      and 0 < before.st_size <= maximum,
-                      f"policy response is not a bounded private regular file: {Path(path).name}",
-                  )
-                  payload = os.read(descriptor, before.st_size + 1)
-                  require(len(payload) == before.st_size, f"policy response changed while reading: {Path(path).name}")
-                  require(not os.read(descriptor, 1), f"policy response grew while reading: {Path(path).name}")
-                  after = os.fstat(descriptor)
-                  require(
-                      identity
-                      == (
-                          after.st_dev,
-                          after.st_ino,
-                          after.st_mode,
-                          after.st_uid,
-                          after.st_nlink,
-                          after.st_size,
-                          after.st_mtime_ns,
-                          after.st_ctime_ns,
-                      ),
-                      f"policy response identity changed: {Path(path).name}",
-                  )
-                  return json.loads(payload.decode("utf-8"))
-              finally:
-                  os.close(descriptor)
-
-
-          def validate(root_value):
-              root = Path(root_value)
-              metadata = root.lstat()
-              require(
-                  stat.S_ISDIR(metadata.st_mode)
-                  and not root.is_symlink()
-                  and metadata.st_uid == os.getuid()
-                  and stat.S_IMODE(metadata.st_mode) == 0o700,
-                  "toolchain policy directory is not private",
-              )
-              effective = read_private_json(root / "effective-rules.json", 8 * 1024 * 1024)
-              require(isinstance(effective, list) and effective, "effective main rules are absent or invalid")
-              identifiers = set()
-              for rule in effective:
-                  require(isinstance(rule, dict), "effective main rule is invalid")
-                  identifier = rule.get("ruleset_id")
-                  require(type(identifier) is int and identifier > 0, "effective main rule has no valid ruleset identity")
-                  identifiers.add(identifier)
-              expected_names = {"effective-rules.json"} | {
-                  f"ruleset-{identifier}.json" for identifier in identifiers
-              }
-              require(
-                  {path.name for path in root.iterdir()} == expected_names,
-                  "effective ruleset response closure is incomplete",
-              )
-              for identifier in identifiers:
-                  ruleset = read_private_json(root / f"ruleset-{identifier}.json", 2 * 1024 * 1024)
-                  require(isinstance(ruleset, dict), "ruleset policy response is invalid")
-                  require(ruleset.get("id") == identifier, "ruleset identity differs from effective rule")
-                  require(ruleset.get("target") == "branch", "effective ruleset does not target branches")
-                  require(ruleset.get("enforcement") == "active", "effective ruleset is not active")
-                  require("bypass_actors" in ruleset, "ruleset bypass actors were not disclosed")
-                  require(ruleset["bypass_actors"] == [], "effective main ruleset permits bypass actors")
-
-              by_type = {}
-              for rule in effective:
-                  rule_type = rule.get("type")
-                  require(isinstance(rule_type, str) and rule_type, "effective main rule type is invalid")
-                  by_type.setdefault(rule_type, []).append(rule)
-              for rule_type in ("deletion", "non_fast_forward", "required_linear_history"):
-                  require(rule_type in by_type, f"main protection is missing {rule_type}")
-
-              merge_methods = None
-              maximum_reviews = 0
-              dismiss_stale = False
-              approve_last_push = False
-              resolve_threads = False
-              for rule in by_type.get("pull_request", []):
-                  parameters = rule.get("parameters")
-                  require(isinstance(parameters, dict), "pull-request rule parameters are invalid")
-                  methods = parameters.get("allowed_merge_methods")
-                  require(
-                      isinstance(methods, list)
-                      and methods
-                      and all(method in {"merge", "squash", "rebase"} for method in methods),
-                      "pull-request merge methods are invalid",
-                  )
-                  current_methods = set(methods)
-                  merge_methods = current_methods if merge_methods is None else merge_methods & current_methods
-                  for name in (
-                      "dismiss_stale_reviews_on_push",
-                      "require_last_push_approval",
-                      "required_review_thread_resolution",
-                  ):
-                      require(type(parameters.get(name)) is bool, f"pull-request boolean is invalid: {name}")
-                  review_count = parameters.get("required_approving_review_count")
-                  require(type(review_count) is int and review_count >= 0, "required review count is invalid")
-                  maximum_reviews = max(maximum_reviews, review_count)
-                  dismiss_stale = dismiss_stale or parameters["dismiss_stale_reviews_on_push"]
-                  approve_last_push = approve_last_push or parameters["require_last_push_approval"]
-                  resolve_threads = resolve_threads or parameters["required_review_thread_resolution"]
-              require(merge_methods == {"squash"}, "effective pull-request merge method must be squash only")
-              require(maximum_reviews >= 1, "effective pull-request policy requires no approval")
-              require(dismiss_stale, "effective pull-request policy does not dismiss stale reviews")
-              require(approve_last_push, "effective pull-request policy does not require last-push approval")
-              require(resolve_threads, "effective pull-request policy does not resolve review threads")
-
-              status_checks = set()
-              strict_status_checks = False
-              for rule in by_type.get("required_status_checks", []):
-                  parameters = rule.get("parameters")
-                  require(isinstance(parameters, dict), "status-check rule parameters are invalid")
-                  strict = parameters.get("strict_required_status_checks_policy")
-                  require(type(strict) is bool, "strict status-check policy is invalid")
-                  strict_status_checks = strict_status_checks or strict
-                  checks = parameters.get("required_status_checks")
-                  require(isinstance(checks, list), "required status checks are invalid")
-                  for check in checks:
-                      require(isinstance(check, dict), "required status check is invalid")
-                      context = check.get("context")
-                      integration = check.get("integration_id")
-                      require(isinstance(context, str) and context, "required status-check context is invalid")
-                      require(type(integration) is int, "required status-check integration is invalid")
-                      status_checks.add((context, integration))
-              require(strict_status_checks, "effective status checks are not strict")
-              require(status_checks == EXPECTED_CHECKS, "effective required status checks differ from release policy")
-
-
-          validate(sys.argv[1])
-          # END TOOLCHAIN PROTECTED MAIN POLICY CHECKER
+          core = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+          identifier = r"[0-9A-Za-z-]+"
+          prerelease = rf"{identifier}(?:\.{identifier})*"
+          for value in sys.argv[1:]:
+              if re.fullmatch(rf"{core}(?:-{prerelease})?", value) is None:
+                  raise SystemExit(f"invalid semantic version: {value}")
+              if "-" not in value:
+                  continue
+              for part in value.split("-", 1)[1].split("."):
+                  if part.isdigit() and len(part) > 1 and part.startswith("0"):
+                      raise SystemExit(f"numeric prerelease identifier contains leading zeroes: {value}")
           PY
+          TAG="toolchain-v$VERSION"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)" = "$GITHUB_SHA"
+          {
+            echo "version=$VERSION"
+            echo "release_tag=$TAG"
+            echo "source_commit=$GITHUB_SHA"
+          } >>"$GITHUB_OUTPUT"
 
-  build:
-    if: github.ref == format('refs/heads/{0}', 'main') && github.event.repository.default_branch == 'main'
-    needs: policy-preflight
-    runs-on: [self-hosted, macOS, ARM64, easysplat-ephemeral]
+  build-unsigned:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: metadata-preflight
+    runs-on: ${{ fromJSON('["self-hosted","macOS","ARM64","easysplat-toolchain-builder","easysplat-ephemeral"]') }}
     timeout-minutes: 300
     permissions:
       contents: read
       actions: read
     outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
-      artifact_digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
+      artifact_id: ${{ steps.upload-components.outputs.artifact-id }}
+      artifact_digest: ${{ format('sha256:{0}', steps.upload-components.outputs.artifact-digest) }}
+      request_artifact_id: ${{ steps.upload-request.outputs.artifact-id }}
+      request_artifact_digest: ${{ format('sha256:{0}', steps.upload-request.outputs.artifact-digest) }}
+      request_sha256: ${{ steps.package.outputs.request_sha256 }}
     env:
       HOMEBREW_NO_ANALYTICS: "1"
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       HOMEBREW_NO_INSTALL_FROM_API: "1"
       HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.sha }}
-
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.12"
-
-      - name: Validate source and release inputs
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
-          INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
-        run: |
-          set -euo pipefail
-          test "$DEFAULT_BRANCH" = "main"
-          test "$GITHUB_REF" = "refs/heads/main"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
-          test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
-          source scripts/release/lib/strict_semver.sh
-          test -z "$(git status --porcelain)"
-          if ! easysplat_is_strict_semver_without_build_metadata "$INPUT_VERSION"; then
-            echo "Toolchain version must be strict semantic versioning without build metadata: $INPUT_VERSION" >&2
-            exit 1
-          fi
-          if ! easysplat_is_strict_semver_without_build_metadata "$INPUT_APP_VERSION_MINIMUM"; then
-            echo "Minimum app version must be strict semantic versioning without build metadata: $INPUT_APP_VERSION_MINIMUM" >&2
-            exit 1
-          fi
-          if ! easysplat_is_strict_semver_without_build_metadata "$INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE"; then
-            echo "Maximum app version must be strict semantic versioning without build metadata: $INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE" >&2
-            exit 1
-          fi
-          {
-            echo "version=$INPUT_VERSION"
-            echo "app_minimum=$INPUT_APP_VERSION_MINIMUM"
-            echo "app_maximum=$INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE"
-          } >>"$GITHUB_OUTPUT"
-
-      - name: Validate ephemeral build host
-        run: |
-          set -euo pipefail
-          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
-          test -d /Applications/Xcode_16.4.app
-          sudo xcode-select -s /Applications/Xcode_16.4.app
-          test "$(xcodebuild -version | sed -n '1s/^Xcode //p')" = "16.4"
-          command -v cmake
-          command -v ninja
-          command -v unzstd
-          command -v zip
-
-      - name: Build pinned native COLMAP support closure
-        run: scripts/toolchain/build_colmap_support.sh
-
-      - name: Build pinned static Ceres
-        run: scripts/toolchain/build_ceres.sh
-
-      - name: Build pinned static OpenImageIO
-        run: scripts/toolchain/build_openimageio.sh
-
-      - name: Build native COLMAP
-        run: scripts/toolchain/build_colmap.sh
-
-      - name: Build msplat
-        run: scripts/toolchain/build_msplat.sh
-
-      - name: Build pinned DA3-MPS bundle
-        run: |
-          set -euo pipefail
-          case "${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}" in
-            ""|0|false|FALSE|no|NO|off|OFF) ;;
-            *)
-              echo "Toolchain builds require pinned DA3 source provenance." >&2
-              exit 1
-              ;;
-          esac
-          scripts/toolchain/build_da3_mps.sh
-
-      - name: Package exact component archives
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          set -euo pipefail
-          scripts/toolchain/package_toolchain.sh --version "$VERSION"
-          STAGE="$RUNNER_TEMP/toolchain-build"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          cp "Toolchains/out/toolchain-macos-arm64-$VERSION-core.zip" "$STAGE/"
-          cp "Toolchains/out/toolchain-geometry-da3-base-$VERSION.zip" "$STAGE/"
-          cp "Toolchains/out/toolchain-geometry-da3-small-$VERSION.zip" "$STAGE/"
-          VERSION="$VERSION" STAGE="$STAGE" python3 - <<'PY'
-          import os, stat
-          from pathlib import Path
-
-          root = Path(os.environ["STAGE"])
-          version = os.environ["VERSION"]
-          expected = {
-              f"toolchain-macos-arm64-{version}-core.zip",
-              f"toolchain-geometry-da3-base-{version}.zip",
-              f"toolchain-geometry-da3-small-{version}.zip",
-          }
-          if root.is_symlink() or not root.is_dir() or {path.name for path in root.iterdir()} != expected:
-              raise SystemExit("toolchain build artifact file set is invalid")
-          for path in root.iterdir():
-              metadata = path.lstat()
-              if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_nlink != 1:
-                  raise SystemExit(f"toolchain component is not a single-link regular file: {path.name}")
-              if not 0 < metadata.st_size < 2_147_483_648:
-                  raise SystemExit(f"toolchain component is empty or exceeds GitHub's asset limit: {path.name}")
-          sizes = {path.name: path.stat().st_size for path in root.iterdir()}
-          core = sizes[f"toolchain-macos-arm64-{version}-core.zip"]
-          if core > 2_500_000_000:
-              raise SystemExit("core-only toolchain exceeds the 2.5 GB download budget")
-          if sum(sizes.values()) > 6_000_000_000:
-              raise SystemExit("full optional toolchain exceeds the 6 GB download budget")
-          PY
-
-      - name: Upload exact unsigned component closure
-        id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: toolchain-components-${{ steps.release.outputs.version }}
-          path: ${{ runner.temp }}/toolchain-build
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
-
-  policy-postflight:
-    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
-    needs: build
-    runs-on: macos-15
-    timeout-minutes: 10
-    environment: toolchain-release
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Reverify protected main policy after build
-        env:
-          # GitHub reveals ruleset bypass actors only to Administration-write authority.
-          # This job performs GET requests only and never checks out repository code.
-          GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_POLICY_TOKEN }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          test -n "$GH_TOKEN"
-          test "$DEFAULT_BRANCH" = "main"
-          test "$GITHUB_REF" = "refs/heads/main"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
-          test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
-          POLICY_ROOT="$RUNNER_TEMP/easysplat-toolchain-policy-$GITHUB_JOB"
-          test ! -e "$POLICY_ROOT"
-          mkdir -m 0700 "$POLICY_ROOT"
-          umask 077
-          EFFECTIVE_RULES="$POLICY_ROOT/effective-rules.json"
-          gh api -H "X-GitHub-Api-Version: 2026-03-10" \
-            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" >"$EFFECTIVE_RULES"
-          RULESET_IDS="$(python3 - "$EFFECTIVE_RULES" <<'PY'
-          import json, os, stat, sys
-
-          path = sys.argv[1]
-          descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-          try:
-              metadata = os.fstat(descriptor)
-              if (
-                  not stat.S_ISREG(metadata.st_mode)
-                  or metadata.st_uid != os.getuid()
-                  or metadata.st_nlink != 1
-                  or stat.S_IMODE(metadata.st_mode) != 0o600
-                  or not 0 < metadata.st_size <= 8 * 1024 * 1024
-              ):
-                  raise SystemExit("effective main rules are not a bounded private regular file")
-              payload = os.read(descriptor, metadata.st_size + 1)
-              if len(payload) != metadata.st_size or os.read(descriptor, 1):
-                  raise SystemExit("effective main rules changed while reading")
-              rules = json.loads(payload.decode("utf-8"))
-          finally:
-              os.close(descriptor)
-          if not isinstance(rules, list) or not rules:
-              raise SystemExit("effective main rules are absent or invalid")
-          identifiers = set()
-          for rule in rules:
-              if not isinstance(rule, dict) or type(rule.get("ruleset_id")) is not int or rule["ruleset_id"] <= 0:
-                  raise SystemExit("effective main rule has no valid ruleset identity")
-              identifiers.add(rule["ruleset_id"])
-          print(*sorted(identifiers), sep="\n")
-          PY
-          )"
-          test -n "$RULESET_IDS"
-          for ruleset_id in $RULESET_IDS; do
-            gh api -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=true" \
-              >"$POLICY_ROOT/ruleset-$ruleset_id.json"
-          done
-          python3 - "$POLICY_ROOT" <<'PY'
-          # BEGIN TOOLCHAIN PROTECTED MAIN POLICY CHECKER
-          import json
-          import os
-          from pathlib import Path
-          import stat
-          import sys
-
-          EXPECTED_CHECKS = {
-              ("Swift · macOS 15 arm64 · Xcode 16.4", 15368),
-              ("Real 8 GB-class policy lane", 15368),
-              ("Native Metal trainer", 15368),
-              ("Repository contracts", 15368),
-              ("DA3 bridge · Python 3.12", 15368),
-              ("Actions and shell lint", 15368),
-              ("Python dependency audit", 15368),
-              ("Full-history secret scan", 15368),
-              ("Pull request dependency review", 15368),
-              ("Analyze swift", 15368),
-              ("Analyze python", 15368),
-              ("Analyze c-cpp", 15368),
-              ("Analyze actions", 15368),
-          }
-
-
-          def require(condition, message):
-              if not condition:
-                  raise SystemExit(message)
-
-
-          def read_private_json(path, maximum):
-              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-              try:
-                  before = os.fstat(descriptor)
-                  identity = (
-                      before.st_dev,
-                      before.st_ino,
-                      before.st_mode,
-                      before.st_uid,
-                      before.st_nlink,
-                      before.st_size,
-                      before.st_mtime_ns,
-                      before.st_ctime_ns,
-                  )
-                  require(
-                      stat.S_ISREG(before.st_mode)
-                      and before.st_uid == os.getuid()
-                      and before.st_nlink == 1
-                      and stat.S_IMODE(before.st_mode) == 0o600
-                      and 0 < before.st_size <= maximum,
-                      f"policy response is not a bounded private regular file: {Path(path).name}",
-                  )
-                  payload = os.read(descriptor, before.st_size + 1)
-                  require(len(payload) == before.st_size, f"policy response changed while reading: {Path(path).name}")
-                  require(not os.read(descriptor, 1), f"policy response grew while reading: {Path(path).name}")
-                  after = os.fstat(descriptor)
-                  require(
-                      identity
-                      == (
-                          after.st_dev,
-                          after.st_ino,
-                          after.st_mode,
-                          after.st_uid,
-                          after.st_nlink,
-                          after.st_size,
-                          after.st_mtime_ns,
-                          after.st_ctime_ns,
-                      ),
-                      f"policy response identity changed: {Path(path).name}",
-                  )
-                  return json.loads(payload.decode("utf-8"))
-              finally:
-                  os.close(descriptor)
-
-
-          def validate(root_value):
-              root = Path(root_value)
-              metadata = root.lstat()
-              require(
-                  stat.S_ISDIR(metadata.st_mode)
-                  and not root.is_symlink()
-                  and metadata.st_uid == os.getuid()
-                  and stat.S_IMODE(metadata.st_mode) == 0o700,
-                  "toolchain policy directory is not private",
-              )
-              effective = read_private_json(root / "effective-rules.json", 8 * 1024 * 1024)
-              require(isinstance(effective, list) and effective, "effective main rules are absent or invalid")
-              identifiers = set()
-              for rule in effective:
-                  require(isinstance(rule, dict), "effective main rule is invalid")
-                  identifier = rule.get("ruleset_id")
-                  require(type(identifier) is int and identifier > 0, "effective main rule has no valid ruleset identity")
-                  identifiers.add(identifier)
-              expected_names = {"effective-rules.json"} | {
-                  f"ruleset-{identifier}.json" for identifier in identifiers
-              }
-              require(
-                  {path.name for path in root.iterdir()} == expected_names,
-                  "effective ruleset response closure is incomplete",
-              )
-              for identifier in identifiers:
-                  ruleset = read_private_json(root / f"ruleset-{identifier}.json", 2 * 1024 * 1024)
-                  require(isinstance(ruleset, dict), "ruleset policy response is invalid")
-                  require(ruleset.get("id") == identifier, "ruleset identity differs from effective rule")
-                  require(ruleset.get("target") == "branch", "effective ruleset does not target branches")
-                  require(ruleset.get("enforcement") == "active", "effective ruleset is not active")
-                  require("bypass_actors" in ruleset, "ruleset bypass actors were not disclosed")
-                  require(ruleset["bypass_actors"] == [], "effective main ruleset permits bypass actors")
-
-              by_type = {}
-              for rule in effective:
-                  rule_type = rule.get("type")
-                  require(isinstance(rule_type, str) and rule_type, "effective main rule type is invalid")
-                  by_type.setdefault(rule_type, []).append(rule)
-              for rule_type in ("deletion", "non_fast_forward", "required_linear_history"):
-                  require(rule_type in by_type, f"main protection is missing {rule_type}")
-
-              merge_methods = None
-              maximum_reviews = 0
-              dismiss_stale = False
-              approve_last_push = False
-              resolve_threads = False
-              for rule in by_type.get("pull_request", []):
-                  parameters = rule.get("parameters")
-                  require(isinstance(parameters, dict), "pull-request rule parameters are invalid")
-                  methods = parameters.get("allowed_merge_methods")
-                  require(
-                      isinstance(methods, list)
-                      and methods
-                      and all(method in {"merge", "squash", "rebase"} for method in methods),
-                      "pull-request merge methods are invalid",
-                  )
-                  current_methods = set(methods)
-                  merge_methods = current_methods if merge_methods is None else merge_methods & current_methods
-                  for name in (
-                      "dismiss_stale_reviews_on_push",
-                      "require_last_push_approval",
-                      "required_review_thread_resolution",
-                  ):
-                      require(type(parameters.get(name)) is bool, f"pull-request boolean is invalid: {name}")
-                  review_count = parameters.get("required_approving_review_count")
-                  require(type(review_count) is int and review_count >= 0, "required review count is invalid")
-                  maximum_reviews = max(maximum_reviews, review_count)
-                  dismiss_stale = dismiss_stale or parameters["dismiss_stale_reviews_on_push"]
-                  approve_last_push = approve_last_push or parameters["require_last_push_approval"]
-                  resolve_threads = resolve_threads or parameters["required_review_thread_resolution"]
-              require(merge_methods == {"squash"}, "effective pull-request merge method must be squash only")
-              require(maximum_reviews >= 1, "effective pull-request policy requires no approval")
-              require(dismiss_stale, "effective pull-request policy does not dismiss stale reviews")
-              require(approve_last_push, "effective pull-request policy does not require last-push approval")
-              require(resolve_threads, "effective pull-request policy does not resolve review threads")
-
-              status_checks = set()
-              strict_status_checks = False
-              for rule in by_type.get("required_status_checks", []):
-                  parameters = rule.get("parameters")
-                  require(isinstance(parameters, dict), "status-check rule parameters are invalid")
-                  strict = parameters.get("strict_required_status_checks_policy")
-                  require(type(strict) is bool, "strict status-check policy is invalid")
-                  strict_status_checks = strict_status_checks or strict
-                  checks = parameters.get("required_status_checks")
-                  require(isinstance(checks, list), "required status checks are invalid")
-                  for check in checks:
-                      require(isinstance(check, dict), "required status check is invalid")
-                      context = check.get("context")
-                      integration = check.get("integration_id")
-                      require(isinstance(context, str) and context, "required status-check context is invalid")
-                      require(type(integration) is int, "required status-check integration is invalid")
-                      status_checks.add((context, integration))
-              require(strict_status_checks, "effective status checks are not strict")
-              require(status_checks == EXPECTED_CHECKS, "effective required status checks differ from release policy")
-
-
-          validate(sys.argv[1])
-          # END TOOLCHAIN PROTECTED MAIN POLICY CHECKER
-          PY
-
-  derive-signing-request:
-    needs: [build, policy-postflight]
-    runs-on: macos-15
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      artifact_id: ${{ steps.upload.outputs.artifact-id }}
-      artifact_digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -681,41 +104,91 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Verify exact build artifact identity
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
-          ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
-          VERSION: ${{ inputs.version }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Attest exact shipping build host and absence of signing identities
         run: |
           set -euo pipefail
-          test "$ARTIFACT_ID" -gt 0
-          test "$ARTIFACT_DIGEST" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .digest)"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .expired)" = "false"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .name)" = "toolchain-components-$VERSION"
+          test "$DEVELOPER_DIR" = "/Applications/Xcode.app/Contents/Developer"
+          scripts/benchmark/verify_shipping_host.sh
+          identity_count="$(
+            security find-identity -v -p codesigning | awk '
+              /^[[:space:]]*[0-9]+ valid identities found[.]?[[:space:]]*$/ {
+                identity_count = $1
+                found = 1
+              }
+              END {
+                if (!found) exit 1
+                print identity_count
+              }
+            '
+          )"
+          test "$identity_count" = "0"
+          python3 - <<'PY' >"$RUNNER_TEMP/toolchain-build-host.json"
+          import json
+          import subprocess
 
-      - name: Download exact unsigned component closure
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          artifact-ids: ${{ needs.build.outputs.artifact_id }}
-          path: ${{ runner.temp }}/toolchain-build
+          def run(command):
+              return subprocess.check_output(command, text=True).strip()
 
-      - name: Derive canonical signing request
+          payload = {
+              "schemaVersion": 1,
+              "hostRole": "identity-free-production-builder",
+              "macOS": "macOS 26.5.2",
+              "macOSBuild": "25F84",
+              "developerDir": "/Applications/Xcode.app/Contents/Developer",
+              "xcode": "Xcode 26.6",
+              "xcodeBuild": "17F113",
+              "sdk": "SDK 26.5",
+              "sdkBuild": "25F70",
+              "architecture": run(["/usr/bin/uname", "-m"]),
+              "swift": run(["/usr/bin/xcrun", "swift", "--version"]).splitlines()[0],
+              "clang": run(["/usr/bin/xcrun", "clang", "--version"]).splitlines()[0],
+              "metal": run(["/usr/bin/xcrun", "metal", "--version"]).splitlines()[0],
+          }
+          print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+          PY
+
+      - name: Build native toolchain closure
+        run: |
+          set -euo pipefail
+          scripts/toolchain/build_colmap_support.sh
+          scripts/toolchain/build_ceres.sh
+          scripts/toolchain/build_openimageio.sh
+          scripts/toolchain/build_colmap.sh
+          scripts/toolchain/build_msplat.sh
+          case "${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}" in
+            ""|0|false|FALSE|no|NO|off|OFF) ;;
+            *)
+              echo "Unpinned DA3 source overrides are forbidden in release toolchain builds." >&2
+              exit 1
+              ;;
+          esac
+          scripts/toolchain/build_da3_mps.sh
+
+      - name: Package data-only unsigned producer
+        id: package
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ needs.metadata-preflight.outputs.version }}
           APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
           APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
         run: |
           set -euo pipefail
-          BUILD="$RUNNER_TEMP/toolchain-build"
-          PREPARED="$RUNNER_TEMP/toolchain-prepared"
-          rm -rf "$PREPARED"
-          mkdir -p "$PREPARED"
-          TRACKED_KEY="EasySplatApp/Resources/public_key_ed25519.txt"
-          test -s "$TRACKED_KEY"
-          test "$(tr -d '[:space:]' <"$TRACKED_KEY")" = "$(git show "$GITHUB_SHA:$TRACKED_KEY" | tr -d '[:space:]')"
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION"
+          scripts/toolchain/package_toolchain.sh --version "$VERSION"
+          COMPONENTS="$RUNNER_TEMP/toolchain-components"
+          REQUEST="$RUNNER_TEMP/toolchain-signing-request"
+          rm -rf "$COMPONENTS" "$REQUEST"
+          mkdir -m 0700 "$COMPONENTS" "$REQUEST"
+          cp "Toolchains/out/toolchain-macos-arm64-$VERSION-core.zip" "$COMPONENTS/"
+          cp "Toolchains/out/toolchain-geometry-da3-base-$VERSION.zip" "$COMPONENTS/"
+          cp "Toolchains/out/toolchain-geometry-da3-small-$VERSION.zip" "$COMPONENTS/"
+          cp "$RUNNER_TEMP/toolchain-build-host.json" "$COMPONENTS/"
+          unzip -q "$COMPONENTS/toolchain-macos-arm64-$VERSION-core.zip" -d "$RUNNER_TEMP/core-probe"
+          scripts/benchmark/verify_shipping_host.sh \
+            --binary "$RUNNER_TEMP/core-probe/bin/colmap" \
+            --binary "$RUNNER_TEMP/core-probe/bin/easysplat-train"
           swift run --package-path Tools/ManifestTool ManifestTool prepare-release \
             --repository "$GITHUB_REPOSITORY" \
             --source-commit "$GITHUB_SHA" \
@@ -723,47 +196,369 @@ jobs:
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --app-version-minimum "$APP_VERSION_MINIMUM" \
             --app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE" \
-            --public-key-file "$TRACKED_KEY" \
-            --core-zip "$BUILD/toolchain-macos-arm64-$VERSION-core.zip" \
-            --core-url "$BASE_URL/toolchain-macos-arm64-$VERSION-core.zip" \
-            --da3-base-zip "$BUILD/toolchain-geometry-da3-base-$VERSION.zip" \
-            --da3-base-url "$BASE_URL/toolchain-geometry-da3-base-$VERSION.zip" \
-            --da3-small-zip "$BUILD/toolchain-geometry-da3-small-$VERSION.zip" \
-            --da3-small-url "$BASE_URL/toolchain-geometry-da3-small-$VERSION.zip" \
-            --request-out "$PREPARED/toolchain-release-request.json"
-          PREPARED="$PREPARED" python3 - <<'PY'
-          import json, os, stat
+            --public-key-file "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --core-zip "$COMPONENTS/toolchain-macos-arm64-$VERSION-core.zip" \
+            --core-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-macos-arm64-$VERSION-core.zip" \
+            --da3-base-zip "$COMPONENTS/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-small-zip "$COMPONENTS/toolchain-geometry-da3-small-$VERSION.zip" \
+            --da3-small-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-small-$VERSION.zip" \
+            --request-out "$REQUEST/toolchain-release-request.json"
+          python3 - "$COMPONENTS" "$REQUEST" "$VERSION" <<'PY'
+          import stat
+          import sys
           from pathlib import Path
 
-          root = Path(os.environ["PREPARED"])
-          expected = {"toolchain-release-request.json"}
-          if root.is_symlink() or not root.is_dir() or {path.name for path in root.iterdir()} != expected:
-              raise SystemExit("prepared signing artifact file set is invalid")
-          path = root / "toolchain-release-request.json"
-          metadata = path.lstat()
-          if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_nlink != 1:
-              raise SystemExit("prepared signing request is not a single-link regular file")
-          if not 0 < metadata.st_size <= 8 * 1024 * 1024:
-              raise SystemExit("prepared signing request is empty or oversized")
-          request = json.loads(path.read_text(encoding="utf-8"))
-          if request.get("sourceRepository") != os.environ["GITHUB_REPOSITORY"] or request.get("sourceCommit") != os.environ["GITHUB_SHA"]:
-              raise SystemExit("prepared signing request source identity is invalid")
+          root = Path(sys.argv[1])
+          request = Path(sys.argv[2])
+          version = sys.argv[3]
+          expected = {
+              f"toolchain-macos-arm64-{version}-core.zip",
+              f"toolchain-geometry-da3-base-{version}.zip",
+              f"toolchain-geometry-da3-small-{version}.zip",
+              "toolchain-build-host.json",
+          }
+          if {path.name for path in root.iterdir()} != expected:
+              raise SystemExit("unsigned component file set is invalid")
+          if {path.name for path in request.iterdir()} != {"toolchain-release-request.json"}:
+              raise SystemExit("signing request file set is invalid")
+          for path in [*root.iterdir(), *request.iterdir()]:
+              metadata = path.lstat()
+              if path.suffix in {".sh", ".py"}:
+                  raise SystemExit("unsigned handoff contains an executable control surface")
+              if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_nlink != 1 or metadata.st_size <= 0:
+                  raise SystemExit(f"unsigned handoff file is unsafe: {path.name}")
+              if path.suffix == ".zip" and metadata.st_size >= 2_147_483_648:
+                  raise SystemExit("component exceeds GitHub release asset limit")
           PY
+          REQUEST_SHA256="$(shasum -a 256 "$REQUEST/toolchain-release-request.json" | awk '{print $1}')"
+          [[ "$REQUEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          echo "request_sha256=$REQUEST_SHA256" >>"$GITHUB_OUTPUT"
 
-      - name: Reverify current main head before signing-request upload
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
-          test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
-
-      - name: Upload exact prepared signing request
-        id: upload
+      - name: Upload identity-free unsigned producer
+        id: upload-components
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: toolchain-signing-request-${{ inputs.version }}
-          path: ${{ runner.temp }}/toolchain-prepared/toolchain-release-request.json
+          name: toolchain-unsigned-components-${{ inputs.version }}
+          path: ${{ runner.temp }}/toolchain-components
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+
+      - name: Upload exact unsigned request
+        id: upload-request
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-unsigned-request-${{ inputs.version }}
+          path: ${{ runner.temp }}/toolchain-signing-request/toolchain-release-request.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  sign-and-notarize:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: [metadata-preflight, build-unsigned]
+    runs-on: ${{ fromJSON('["self-hosted","macOS","ARM64","easysplat-toolchain-signing","easysplat-ephemeral"]') }}
+    timeout-minutes: 180
+    environment: toolchain-signing
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -p -e -u -o pipefail {0}
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
+    steps:
+      - name: Download exact unsigned producer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-unsigned.outputs.artifact_id }}
+          path: ${{ runner.temp }}/toolchain-components
+          merge-multiple: true
+
+      - name: Download exact unsigned request
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-unsigned.outputs.request_artifact_id }}
+          path: ${{ runner.temp }}/toolchain-signing-request
+          merge-multiple: true
+
+      - name: Authenticate builder artifacts before repository checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UNSIGNED_ARTIFACT_ID: ${{ needs.build-unsigned.outputs.artifact_id }}
+          REQUEST_ARTIFACT_ID: ${{ needs.build-unsigned.outputs.request_artifact_id }}
+        run: |
+          set -euo pipefail
+          unset BASH_ENV ENV PYTHONHOME PYTHONPATH PYTHONSTARTUP
+          [[ "$UNSIGNED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$REQUEST_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          AUTHORITY="$RUNNER_TEMP/toolchain-builder-authority"
+          rm -rf "$AUTHORITY"
+          mkdir -m 0700 "$AUTHORITY"
+          /usr/bin/python3 -I - "$AUTHORITY/github-authority.json" <<'PY'
+          import json
+          import os
+          import ssl
+          import sys
+          import urllib.request
+          from pathlib import Path
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *_args, **_kwargs):
+                  return None
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          endpoints = {
+              f"repos/{repository}/actions/artifacts/{os.environ['UNSIGNED_ARTIFACT_ID']}",
+              f"repos/{repository}/actions/artifacts/{os.environ['REQUEST_ARTIFACT_ID']}",
+              f"repos/{repository}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              f"repos/{repository}/branches/main",
+          }
+          context = ssl.create_default_context(cafile="/private/etc/ssl/cert.pem")
+          opener = urllib.request.build_opener(
+              urllib.request.ProxyHandler({}),
+              urllib.request.HTTPSHandler(context=context),
+              NoRedirect(),
+          )
+          responses = {}
+          for endpoint in sorted(endpoints):
+              request = urllib.request.Request(
+                  f"https://api.github.com/{endpoint}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2026-03-10",
+                      "User-Agent": "EasySplat-toolchain-authority-capture/1",
+                  },
+              )
+              with opener.open(request, timeout=30) as response:
+                  data = response.read(1_048_577)
+                  if response.status != 200 or not data or len(data) > 1_048_576:
+                      raise SystemExit("GitHub authority response is invalid")
+              responses[endpoint] = json.loads(data)
+          payload = {"schemaVersion": 1, "responses": responses}
+          Path(sys.argv[1]).write_text(
+              json.dumps(payload, sort_keys=True, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+          chmod 0400 "$AUTHORITY/github-authority.json"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Validate isolated signing host and inert builder handoff
+        env:
+          VERSION: ${{ needs.metadata-preflight.outputs.version }}
+          EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1: ${{ vars.EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1 }}
+          EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID: ${{ vars.EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID }}
+          EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE: ${{ vars.EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE }}
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR SDKROOT TOOLCHAINS
+          [[ "$EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1" =~ ^[0-9A-Fa-f]{40}$ ]]
+          [[ "$EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]
+          [[ "$EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+          test "$(/usr/bin/uname -m)" = "arm64"
+          python3 - "$RUNNER_TEMP/toolchain-components" "$RUNNER_TEMP/toolchain-signing-request" "$VERSION" <<'PY'
+          import stat
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          request = Path(sys.argv[2])
+          version = sys.argv[3]
+          expected = {
+              f"toolchain-macos-arm64-{version}-core.zip",
+              f"toolchain-geometry-da3-base-{version}.zip",
+              f"toolchain-geometry-da3-small-{version}.zip",
+              "toolchain-build-host.json",
+          }
+          if {path.name for path in root.iterdir()} != expected:
+              raise SystemExit("unsigned component file set is invalid for signing")
+          if {path.name for path in request.iterdir()} != {"toolchain-release-request.json"}:
+              raise SystemExit("unsigned request file set is invalid for signing")
+          for path in [*root.iterdir(), *request.iterdir()]:
+              metadata = path.lstat()
+              if path.suffix in {".py", ".sh"} or metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                  raise SystemExit("unsigned handoff contains an executable control surface")
+              if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_nlink != 1 or metadata.st_size <= 0:
+                  raise SystemExit(f"unsigned handoff file is unsafe: {path.name}")
+          PY
+
+      - name: Developer ID sign and notarize exact producer bytes
+        env:
+          VERSION: ${{ needs.metadata-preflight.outputs.version }}
+          UNSIGNED_ARTIFACT_ID: ${{ needs.build-unsigned.outputs.artifact_id }}
+          UNSIGNED_ARTIFACT_DIGEST: ${{ needs.build-unsigned.outputs.artifact_digest }}
+          REQUEST_ARTIFACT_ID: ${{ needs.build-unsigned.outputs.request_artifact_id }}
+          REQUEST_ARTIFACT_DIGEST: ${{ needs.build-unsigned.outputs.request_artifact_digest }}
+          REQUEST_SHA256: ${{ needs.build-unsigned.outputs.request_sha256 }}
+          IDENTITY_FINGERPRINT: ${{ vars.EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1 }}
+          TEAM_ID: ${{ vars.EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID }}
+          PROFILE: ${{ vars.EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE }}
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR SDKROOT TOOLCHAINS
+          UNSIGNED="$RUNNER_TEMP/toolchain-components"
+          REQUEST="$RUNNER_TEMP/toolchain-signing-request/toolchain-release-request.json"
+          FINALIZED="$RUNNER_TEMP/toolchain-signed-producer"
+          rm -rf "$FINALIZED"
+          test "$(shasum -a 256 "$REQUEST" | awk '{print $1}')" = "$REQUEST_SHA256"
+          python3 scripts/release/finalize_signed_toolchain.py \
+            --version "$VERSION" \
+            --core-zip "$UNSIGNED/toolchain-macos-arm64-$VERSION-core.zip" \
+            --base-zip "$UNSIGNED/toolchain-geometry-da3-base-$VERSION.zip" \
+            --small-zip "$UNSIGNED/toolchain-geometry-da3-small-$VERSION.zip" \
+            --unsigned-release-request "$REQUEST" \
+            --builder-attested-unsigned-request-sha256 "$REQUEST_SHA256" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --source-commit "$GITHUB_SHA" \
+            --unsigned-artifact-id "$UNSIGNED_ARTIFACT_ID" \
+            --unsigned-artifact-digest "$UNSIGNED_ARTIFACT_DIGEST" \
+            --request-artifact-id "$REQUEST_ARTIFACT_ID" \
+            --request-artifact-digest "$REQUEST_ARTIFACT_DIGEST" \
+            --github-authority-receipt "$RUNNER_TEMP/toolchain-builder-authority/github-authority.json" \
+            --output-directory "$FINALIZED" \
+            --identity-fingerprint "$IDENTITY_FINGERPRINT" \
+            --team-id "$TEAM_ID" \
+            --receipt "$FINALIZED/distribution-signing-finalization.json"
+          bash scripts/release/notarize_artifact.sh \
+            --type zip \
+            --artifact "$FINALIZED/toolchain-macos-arm64-$VERSION-core.zip" \
+            --keychain-profile "$PROFILE" \
+            --receipt "$FINALIZED/core-notarization.json" \
+            --diagnostics-dir "$RUNNER_TEMP/notary-core"
+          bash scripts/release/notarize_artifact.sh \
+            --type zip \
+            --artifact "$FINALIZED/toolchain-geometry-da3-base-$VERSION.zip" \
+            --keychain-profile "$PROFILE" \
+            --receipt "$FINALIZED/da3-base-notarization.json" \
+            --diagnostics-dir "$RUNNER_TEMP/notary-da3-base"
+          cp "$UNSIGNED/toolchain-build-host.json" "$FINALIZED/toolchain-build-host.json"
+          echo "FINALIZED=$FINALIZED" >>"$GITHUB_ENV"
+
+      - name: Upload exact signed intermediate
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-signed-intermediate-${{ inputs.version }}
+          path: ${{ env.FINALIZED }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  derive-post-sign-request:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: [metadata-preflight, sign-and-notarize]
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source_run_id: ${{ steps.derive.outputs.source_run_id }}
+      source_run_attempt: ${{ steps.derive.outputs.source_run_attempt }}
+      producer_artifact_id: ${{ steps.upload-producer.outputs.artifact-id }}
+      producer_artifact_digest: ${{ format('sha256:{0}', steps.upload-producer.outputs.artifact-digest) }}
+      request_artifact_id: ${{ steps.upload-request.outputs.artifact-id }}
+      request_artifact_digest: ${{ format('sha256:{0}', steps.upload-request.outputs.artifact-digest) }}
+      request_sha256: ${{ steps.derive.outputs.request_sha256 }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download exact signed intermediate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.sign-and-notarize.outputs.artifact_id }}
+          path: ${{ runner.temp }}/toolchain-final-producer
+          merge-multiple: true
+
+      - name: Derive authority request from final signed archives
+        id: derive
+        env:
+          VERSION: ${{ needs.metadata-preflight.outputs.version }}
+          APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
+          APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
+        run: |
+          set -euo pipefail
+          FINAL="$RUNNER_TEMP/toolchain-final-producer"
+          REQUEST="$RUNNER_TEMP/toolchain-post-sign-request"
+          mkdir -m 0700 "$REQUEST"
+          swift run --package-path Tools/ManifestTool ManifestTool prepare-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --version "$VERSION" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --app-version-minimum "$APP_VERSION_MINIMUM" \
+            --app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE" \
+            --public-key-file "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --core-zip "$FINAL/toolchain-macos-arm64-$VERSION-core.zip" \
+            --core-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-macos-arm64-$VERSION-core.zip" \
+            --da3-base-zip "$FINAL/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-small-zip "$FINAL/toolchain-geometry-da3-small-$VERSION.zip" \
+            --da3-small-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-small-$VERSION.zip" \
+            --request-out "$REQUEST/toolchain-release-request.json"
+          python3 scripts/release/toolchain_publication.py validate-producer \
+            --producer "$FINAL" \
+            --request "$REQUEST/toolchain-release-request.json" \
+            --version "$VERSION" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA"
+          REQUEST_SHA256="$(shasum -a 256 "$REQUEST/toolchain-release-request.json" | awk '{print $1}')"
+          [[ "$REQUEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo "request_sha256=$REQUEST_SHA256"
+            echo "source_run_id=${{ github.run_id }}"
+            echo "source_run_attempt=${{ github.run_attempt }}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload final signed producer
+        id: upload-producer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-final-producer-${{ inputs.version }}
+          path: ${{ runner.temp }}/toolchain-final-producer
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload post-sign authority request
+        id: upload-request
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-post-sign-request-${{ inputs.version }}
+          path: ${{ runner.temp }}/toolchain-post-sign-request/toolchain-release-request.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Record exact external-authority inputs
+        env:
+          REQUEST_SHA256: ${{ steps.derive.outputs.request_sha256 }}
+          PRODUCER_ARTIFACT_ID: ${{ steps.upload-producer.outputs.artifact-id }}
+          PRODUCER_ARTIFACT_DIGEST: ${{ format('sha256:{0}', steps.upload-producer.outputs.artifact-digest) }}
+          REQUEST_ARTIFACT_ID: ${{ steps.upload-request.outputs.artifact-id }}
+          REQUEST_ARTIFACT_DIGEST: ${{ format('sha256:{0}', steps.upload-request.outputs.artifact-digest) }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Toolchain authority handoff"
+            echo "- Source run: $GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "- Producer artifact: $PRODUCER_ARTIFACT_ID ($PRODUCER_ARTIFACT_DIGEST)"
+            echo "- Request artifact: $REQUEST_ARTIFACT_ID ($REQUEST_ARTIFACT_DIGEST)"
+            echo "- Request SHA-256: $REQUEST_SHA256"
+          } >>"$GITHUB_STEP_SUMMARY"

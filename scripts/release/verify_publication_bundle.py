@@ -7,22 +7,27 @@ import argparse
 import base64
 import binascii
 import contextlib
+import ctypes
+import errno
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Iterator, NoReturn
+from typing import Any, BinaryIO, Iterator, NamedTuple, NoReturn
 
 
 BUILD_CLOSURE_NAME = "build-closure.json"
@@ -30,6 +35,7 @@ PUBLICATION_MANIFEST_NAME = "publication-manifest.json"
 TOOLCHAIN_AUTHORITY_RECEIPT_NAME = "toolchain-authority-receipt.json"
 TOOLCHAIN_AUTHORITY_ENVELOPE_NAME = "toolchain-authority-envelope.json"
 TOOLCHAIN_RELEASE_REQUEST_NAME = "toolchain-release-request.json"
+TOOLCHAIN_BENCHMARK_EVIDENCE_NAME = "toolchain-benchmark-evidence.json"
 AUTHORITY_RECEIPT_SIGNATURE_DOMAIN = b"EasySplat Release Authority Receipt v1\n"
 CANONICAL_SOURCE_REPOSITORY = "dud8/EasySplat"
 CANONICAL_SOURCE_REPOSITORY_ID = 1_143_631_347
@@ -84,6 +90,24 @@ APP_TOOLCHAIN_RESOURCE_PATHS = (
 )
 
 
+def load_release_helper(filename: str, module_name: str) -> Any:
+    path = Path(__file__).resolve().with_name(filename)
+    specification = importlib.util.spec_from_file_location(module_name, path)
+    if specification is None or specification.loader is None:
+        raise RuntimeError(f"cannot load release helper: {filename}")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+SIGNING_HELPER = load_release_helper(
+    "sign_macos_distribution.py", "easysplat_publication_signing_helper"
+)
+NOTARY_HELPER = load_release_helper(
+    "verify_notarization_receipt.py", "easysplat_publication_notary_helper"
+)
+
+
 class PublicationError(ValueError):
     pass
 
@@ -92,44 +116,87 @@ def fail(message: str) -> NoReturn:
     raise PublicationError(message)
 
 
-def build_file_limits(app_version: str) -> dict[str, int]:
+def validate_release_mode(release_mode: str) -> None:
+    if release_mode not in {"development-unsigned", "production"}:
+        fail(f"unsupported release mode: {release_mode}")
+
+
+def build_file_limits(
+    app_version: str, release_mode: str = "development-unsigned"
+) -> dict[str, int]:
+    validate_release_mode(release_mode)
     stem = f"EasySplat-{app_version}"
-    return {
-        f"{stem}-unsigned.dmg": MAX_RELEASE_ASSET_BYTES,
-        f"{stem}-unsigned.dmg.sha256": 1_024,
+    suffix = "-unsigned" if release_mode == "development-unsigned" else ""
+    limits = {
+        f"{stem}{suffix}.dmg": MAX_RELEASE_ASSET_BYTES,
+        f"{stem}{suffix}.dmg.sha256": 1_024,
         f"{stem}.provenance.json": 8 * 1_024 * 1_024,
         f"{stem}.spdx.json": 64 * 1_024 * 1_024,
         f"{stem}-licenses.zip": MAX_RELEASE_ASSET_BYTES,
         f"{stem}-dSYM.zip": MAX_RELEASE_ASSET_BYTES,
         f"{stem}-release-notes.txt": 64 * 1_024,
-        "toolchain-manifest.json": 64 * 1_024 * 1_024,
+        "toolchain-manifest.json": 8 * 1_024 * 1_024,
         TOOLCHAIN_AUTHORITY_RECEIPT_NAME: 1 * 1_024 * 1_024,
         TOOLCHAIN_AUTHORITY_ENVELOPE_NAME: 64 * 1_024 * 1_024,
-        TOOLCHAIN_RELEASE_REQUEST_NAME: 64 * 1_024 * 1_024,
+        TOOLCHAIN_RELEASE_REQUEST_NAME: 8 * 1_024 * 1_024,
+        TOOLCHAIN_BENCHMARK_EVIDENCE_NAME: 8 * 1_024 * 1_024,
     }
+    if release_mode == "production":
+        limits.update(
+            {
+                f"{stem}.app-signing.json": 16 * 1_024 * 1_024,
+                f"{stem}.app-notarization.json": 4 * 1_024 * 1_024,
+                f"{stem}.dmg-signing.json": 4 * 1_024 * 1_024,
+                f"{stem}.dmg-notarization.json": 4 * 1_024 * 1_024,
+            }
+        )
+    return limits
 
 
-def publication_payload_names(app_version: str) -> tuple[str, ...]:
+def publication_payload_names(
+    app_version: str,
+    release_mode: str = "development-unsigned",
+    *,
+    include_benchmark: bool = True,
+) -> tuple[str, ...]:
+    validate_release_mode(release_mode)
     stem = f"EasySplat-{app_version}"
-    return (
-        f"{stem}-unsigned.dmg",
-        f"{stem}-unsigned.dmg.sha256",
+    suffix = "-unsigned" if release_mode == "development-unsigned" else ""
+    names = [
+        f"{stem}{suffix}.dmg",
+        f"{stem}{suffix}.dmg.sha256",
         f"{stem}.provenance.json",
         f"{stem}.spdx.json",
         f"{stem}-licenses.zip",
         f"{stem}-dSYM.zip",
-        f"{stem}-benchmark.json",
         f"{stem}-release-notes.txt",
-    )
+    ]
+    if include_benchmark:
+        names.insert(-1, f"{stem}-benchmark.json")
+    return tuple(names)
 
 
-def publication_file_limits(app_version: str) -> dict[str, int]:
-    limits = build_file_limits(app_version)
+def publication_file_limits(
+    app_version: str,
+    release_mode: str = "development-unsigned",
+    *,
+    include_benchmark: bool = True,
+) -> dict[str, int]:
+    limits = build_file_limits(app_version, release_mode)
     limits.pop("toolchain-manifest.json")
     limits.pop(TOOLCHAIN_AUTHORITY_RECEIPT_NAME)
     limits.pop(TOOLCHAIN_AUTHORITY_ENVELOPE_NAME)
     limits.pop(TOOLCHAIN_RELEASE_REQUEST_NAME)
-    limits[f"EasySplat-{app_version}-benchmark.json"] = 128 * 1_024 * 1_024
+    limits.pop(TOOLCHAIN_BENCHMARK_EVIDENCE_NAME)
+    for suffix in (
+        ".app-signing.json",
+        ".app-notarization.json",
+        ".dmg-signing.json",
+        ".dmg-notarization.json",
+    ):
+        limits.pop(f"EasySplat-{app_version}{suffix}", None)
+    if include_benchmark:
+        limits[f"EasySplat-{app_version}-benchmark.json"] = 128 * 1_024 * 1_024
     return limits
 
 
@@ -160,8 +227,13 @@ def sha256_stream(stream: BinaryIO, *, limit: int = MAX_HASH_BYTES) -> str:
 
 
 def sha256_file(path: Path, *, limit: int = MAX_HASH_BYTES) -> str:
-    with path.open("rb") as stream:
-        return sha256_stream(stream, limit=limit)
+    return snapshot_bounded_regular_file(
+        path,
+        path.name or str(path),
+        limit=limit,
+        capture_bytes=False,
+        allow_empty=True,
+    ).sha256
 
 
 def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -180,10 +252,10 @@ def reject_json_constant(value: str) -> NoReturn:
 def load_json(
     path: Path, label: str, *, limit: int = 64 * 1_024 * 1_024
 ) -> dict[str, Any]:
-    require_regular_file(path, label, maximum_size=limit)
+    raw = read_bounded_regular_file(path, label, limit=limit)
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            raw.decode("utf-8"),
             object_pairs_hook=reject_duplicate_keys,
             parse_constant=reject_json_constant,
         )
@@ -197,9 +269,27 @@ def load_json(
 def load_compact_canonical_json(
     path: Path, label: str, *, limit: int = 1 * 1_024 * 1_024
 ) -> dict[str, Any]:
-    require_regular_file(path, label, maximum_size=limit)
+    payload, _digest = load_compact_canonical_json_with_sha256(
+        path,
+        label,
+        limit=limit,
+    )
+    return payload
+
+
+def load_compact_canonical_json_with_sha256(
+    path: Path, label: str, *, limit: int = 1 * 1_024 * 1_024
+) -> tuple[dict[str, Any], str]:
+    snapshot = snapshot_bounded_regular_file(
+        path,
+        label,
+        limit=limit,
+        capture_bytes=True,
+    )
+    raw = snapshot.data
+    if raw is None:
+        fail(f"cannot safely retain {label}")
     try:
-        raw = path.read_bytes()
         payload = json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=reject_duplicate_keys,
@@ -211,7 +301,7 @@ def load_compact_canonical_json(
         fail(f"{label} must be a JSON object")
     if raw != signature_json_bytes(payload):
         fail(f"{label} is not canonical compact JSON")
-    return payload
+    return payload, snapshot.sha256
 
 
 def require_exact_keys(value: dict[str, Any], expected: set[str], label: str) -> None:
@@ -272,6 +362,541 @@ def require_regular_file(
     return metadata
 
 
+class BoundedRegularFileSnapshot(NamedTuple):
+    data: bytes | None
+    sha256: str
+    size_bytes: int
+
+
+class BoundedRegularFileIdentity(NamedTuple):
+    device: int
+    inode: int
+    mode: int
+    link_count: int
+    size_bytes: int
+    modified_ns: int
+    changed_ns: int
+
+
+class BoundedRegularFileCopy(NamedTuple):
+    snapshot: BoundedRegularFileSnapshot
+    destination_identity: BoundedRegularFileIdentity
+
+
+class StagedPublicationPayload(NamedTuple):
+    records: list[dict[str, Any]]
+    bindings: dict[str, BoundedRegularFileCopy]
+
+
+def rename_entry_exclusive_raw(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    if (
+        not source_name
+        or Path(source_name).name != source_name
+        or not destination_name
+        or Path(destination_name).name != destination_name
+    ):
+        raise OSError(errno.EINVAL, "invalid directory entry name")
+    try:
+        function = ctypes.CDLL(None, use_errno=True).renameatx_np
+    except (AttributeError, OSError) as error:
+        raise OSError(
+            errno.ENOSYS,
+            f"exclusive rename is unavailable: {error}",
+        ) from error
+    function.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    function.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = function(
+        parent_descriptor,
+        os.fsencode(source_name),
+        parent_descriptor,
+        os.fsencode(destination_name),
+        0x00000004,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def quarantine_owned_entry(
+    parent_descriptor: int,
+    name: str,
+    owned_identity: BoundedRegularFileIdentity,
+) -> bool:
+    """Hide an owned entry without ever unlinking a raced replacement."""
+
+    for _attempt in range(8):
+        quarantine_name = f".{name}.abandoned-{uuid.uuid4().hex}"
+        try:
+            rename_entry_exclusive_raw(
+                parent_descriptor,
+                name,
+                quarantine_name,
+            )
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                continue
+            return False
+        try:
+            quarantined = bounded_regular_file_identity(
+                os.stat(
+                    quarantine_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            )
+        except OSError:
+            return False
+        if (quarantined.device, quarantined.inode) == (
+            owned_identity.device,
+            owned_identity.inode,
+        ):
+            return True
+
+        # The name was replaced before the rename. Put that replacement back
+        # when possible, and never delete it if another entry won the race.
+        try:
+            rename_entry_exclusive_raw(
+                parent_descriptor,
+                quarantine_name,
+                name,
+            )
+        except OSError:
+            pass
+        return False
+    return False
+
+
+def remove_owned_regular_file(
+    path: Path,
+    owned_identity: BoundedRegularFileIdentity,
+) -> None:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None:
+        return
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path.parent,
+            os.O_RDONLY
+            | nofollow
+            | directory_flag
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        return
+    try:
+        quarantine_owned_entry(descriptor, path.name, owned_identity)
+    finally:
+        os.close(descriptor)
+
+
+def bounded_regular_file_identity(
+    metadata: os.stat_result,
+) -> BoundedRegularFileIdentity:
+    return BoundedRegularFileIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        link_count=metadata.st_nlink,
+        size_bytes=metadata.st_size,
+        modified_ns=metadata.st_mtime_ns,
+        changed_ns=metadata.st_ctime_ns,
+    )
+
+
+@contextlib.contextmanager
+def open_bounded_regular_file(
+    path: Path | str,
+    label: str,
+    *,
+    limit: int,
+    allow_empty: bool = False,
+    directory_descriptor: int | None = None,
+) -> Iterator[tuple[int, BoundedRegularFileIdentity]]:
+    if limit <= 0:
+        fail(f"{label} has an invalid size limit")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        fail(f"cannot safely open {label}: O_NOFOLLOW is unavailable")
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= nofollow
+    try:
+        descriptor = os.open(path, flags, dir_fd=directory_descriptor)
+    except OSError as error:
+        fail(f"cannot safely open {label}: {error}")
+    try:
+        try:
+            before_metadata = os.fstat(descriptor)
+        except OSError as error:
+            fail(f"cannot inspect opened {label}: {error}")
+        before = bounded_regular_file_identity(before_metadata)
+        if not stat.S_ISREG(before.mode) or before.link_count != 1:
+            fail(f"{label} must be a bounded single-link regular file")
+        if (
+            before.size_bytes < 0
+            or (before.size_bytes == 0 and not allow_empty)
+            or before.size_bytes > limit
+        ):
+            fail(f"{label} exceeds its size limit or is empty")
+
+        try:
+            yield descriptor, before
+        except BaseException:
+            raise
+        else:
+            try:
+                after = bounded_regular_file_identity(os.fstat(descriptor))
+                path_after = bounded_regular_file_identity(
+                    os.stat(
+                        path,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+            except OSError as error:
+                fail(f"cannot re-inspect opened {label}: {error}")
+            if before != after or before != path_after:
+                fail(f"{label} changed while it was read")
+    finally:
+        os.close(descriptor)
+
+
+def snapshot_opened_regular_file(
+    descriptor: int,
+    identity: BoundedRegularFileIdentity,
+    label: str,
+    *,
+    capture_bytes: bool,
+    destination_descriptor: int | None = None,
+) -> BoundedRegularFileSnapshot:
+    digest = hashlib.sha256()
+    chunks: list[bytes] | None = [] if capture_bytes else None
+    remaining = identity.size_bytes
+    while remaining:
+        try:
+            chunk = os.read(descriptor, min(remaining, 1_024 * 1_024))
+        except InterruptedError:
+            continue
+        except OSError as error:
+            fail(f"cannot safely read {label}: {error}")
+        if not chunk:
+            fail(f"{label} changed while it was read")
+        digest.update(chunk)
+        if chunks is not None:
+            chunks.append(chunk)
+        if destination_descriptor is not None:
+            written = 0
+            while written < len(chunk):
+                try:
+                    count = os.write(destination_descriptor, chunk[written:])
+                except InterruptedError:
+                    continue
+                except OSError as error:
+                    fail(f"cannot safely copy {label}: {error}")
+                if count <= 0:
+                    fail(f"cannot safely copy {label}: short write")
+                written += count
+        remaining -= len(chunk)
+    while True:
+        try:
+            extra = os.read(descriptor, 1)
+            break
+        except InterruptedError:
+            continue
+        except OSError as error:
+            fail(f"cannot safely finish reading {label}: {error}")
+    if extra:
+        fail(f"{label} changed while it was read")
+    data = b"".join(chunks) if chunks is not None else None
+    if data is not None and len(data) != identity.size_bytes:
+        fail(f"{label} changed while it was read")
+    return BoundedRegularFileSnapshot(
+        data=data,
+        sha256=digest.hexdigest(),
+        size_bytes=identity.size_bytes,
+    )
+
+
+def snapshot_bounded_regular_file(
+    path: Path,
+    label: str,
+    *,
+    limit: int,
+    capture_bytes: bool,
+    allow_empty: bool = False,
+) -> BoundedRegularFileSnapshot:
+    with open_bounded_regular_file(
+        path,
+        label,
+        limit=limit,
+        allow_empty=allow_empty,
+    ) as (descriptor, identity):
+        return snapshot_opened_regular_file(
+            descriptor,
+            identity,
+            label,
+            capture_bytes=capture_bytes,
+        )
+
+
+def bind_bounded_regular_file(
+    path: Path | str,
+    label: str,
+    *,
+    limit: int,
+    directory_descriptor: int | None = None,
+) -> BoundedRegularFileCopy:
+    with open_bounded_regular_file(
+        path,
+        label,
+        limit=limit,
+        directory_descriptor=directory_descriptor,
+    ) as (descriptor, identity):
+        snapshot = snapshot_opened_regular_file(
+            descriptor,
+            identity,
+            label,
+            capture_bytes=False,
+        )
+    return BoundedRegularFileCopy(
+        snapshot=snapshot,
+        destination_identity=identity,
+    )
+
+
+def copy_opened_bounded_regular_file(
+    source_descriptor: int,
+    source_identity: BoundedRegularFileIdentity,
+    destination: Path,
+    label: str,
+) -> BoundedRegularFileCopy:
+    destination_descriptor: int | None = None
+    owned_destination: BoundedRegularFileIdentity | None = None
+    try:
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            destination_descriptor = os.open(destination, flags, 0o600)
+        except OSError as error:
+            fail(f"cannot create bounded copy for {label}: {error}")
+        try:
+            owned_destination = bounded_regular_file_identity(
+                os.fstat(destination_descriptor)
+            )
+        except OSError as error:
+            fail(f"cannot inspect bounded copy for {label}: {error}")
+        if (
+            not stat.S_ISREG(owned_destination.mode)
+            or owned_destination.link_count != 1
+        ):
+            fail(f"bounded copy destination is unsafe for {label}")
+        snapshot = snapshot_opened_regular_file(
+            source_descriptor,
+            source_identity,
+            label,
+            capture_bytes=False,
+            destination_descriptor=destination_descriptor,
+        )
+        try:
+            os.fsync(destination_descriptor)
+        except OSError as error:
+            fail(f"cannot commit bounded copy for {label}: {error}")
+        try:
+            destination_before = bounded_regular_file_identity(
+                os.fstat(destination_descriptor)
+            )
+            os.lseek(destination_descriptor, 0, os.SEEK_SET)
+        except OSError as error:
+            fail(f"cannot verify bounded copy for {label}: {error}")
+        destination_snapshot = snapshot_opened_regular_file(
+            destination_descriptor,
+            destination_before,
+            f"{label} destination",
+            capture_bytes=False,
+        )
+        try:
+            destination_after = bounded_regular_file_identity(
+                os.fstat(destination_descriptor)
+            )
+            destination_path = bounded_regular_file_identity(
+                os.stat(destination, follow_symlinks=False)
+            )
+        except OSError as error:
+            fail(f"bounded copy destination changed for {label}: {error}")
+        if (
+            not stat.S_ISREG(destination_before.mode)
+            or destination_before.link_count != 1
+            or destination_before != destination_after
+            or destination_before != destination_path
+            or destination_snapshot != snapshot
+        ):
+            fail(f"bounded copy destination changed for {label}")
+        return BoundedRegularFileCopy(
+            snapshot=snapshot,
+            destination_identity=destination_before,
+        )
+    except BaseException:
+        if destination_descriptor is not None and owned_destination is not None:
+            remove_owned_regular_file(destination, owned_destination)
+        raise
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+
+
+def copy_bounded_regular_file_with_identity(
+    source: Path | str,
+    destination: Path,
+    label: str,
+    *,
+    limit: int,
+    allow_empty: bool = False,
+    source_directory_descriptor: int | None = None,
+) -> BoundedRegularFileCopy:
+    copied: BoundedRegularFileCopy | None = None
+    try:
+        with open_bounded_regular_file(
+            source,
+            label,
+            limit=limit,
+            allow_empty=allow_empty,
+            directory_descriptor=source_directory_descriptor,
+        ) as (source_descriptor, source_identity):
+            copied = copy_opened_bounded_regular_file(
+                source_descriptor,
+                source_identity,
+                destination,
+                label,
+            )
+        return copied
+    except BaseException:
+        if copied is not None:
+            remove_owned_regular_file(
+                destination,
+                copied.destination_identity,
+            )
+        raise
+
+
+def copy_bounded_regular_file(
+    source: Path | str,
+    destination: Path,
+    label: str,
+    *,
+    limit: int,
+    allow_empty: bool = False,
+    source_directory_descriptor: int | None = None,
+) -> BoundedRegularFileSnapshot:
+    return copy_bounded_regular_file_with_identity(
+        source,
+        destination,
+        label,
+        limit=limit,
+        allow_empty=allow_empty,
+        source_directory_descriptor=source_directory_descriptor,
+    ).snapshot
+
+
+def stage_exact_directory(
+    source: Path,
+    destination: Path,
+    limits: dict[str, int],
+    *,
+    label: str,
+) -> dict[str, BoundedRegularFileSnapshot]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None:
+        fail(f"cannot safely stage {label}: directory safety flags are unavailable")
+    flags = os.O_RDONLY | nofollow | directory_flag
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as error:
+        fail(f"cannot safely open {label}: {error}")
+    try:
+        try:
+            before = bounded_regular_file_identity(os.fstat(descriptor))
+        except OSError as error:
+            fail(f"cannot inspect opened {label}: {error}")
+        if not stat.S_ISDIR(before.mode):
+            fail(f"{label} must be a real directory")
+        try:
+            names_before = set(os.listdir(descriptor))
+        except OSError as error:
+            fail(f"cannot enumerate opened {label}: {error}")
+        if names_before != set(limits):
+            fail(f"{label} must contain the exact file set {sorted(limits)}")
+        try:
+            destination.mkdir(mode=0o700)
+        except OSError as error:
+            fail(f"cannot create private stage for {label}: {error}")
+
+        snapshots: dict[str, BoundedRegularFileSnapshot] = {}
+        with contextlib.ExitStack() as opened_sources:
+            opened: dict[
+                str, tuple[int, BoundedRegularFileIdentity]
+            ] = {}
+            for name in sorted(limits):
+                opened[name] = opened_sources.enter_context(
+                    open_bounded_regular_file(
+                        name,
+                        f"{label} file {name}",
+                        limit=limits[name],
+                        directory_descriptor=descriptor,
+                    )
+                )
+            for name in sorted(limits):
+                source_descriptor, source_identity = opened[name]
+                copied = copy_opened_bounded_regular_file(
+                    source_descriptor,
+                    source_identity,
+                    destination / name,
+                    f"{label} file {name}",
+                )
+                snapshots[name] = copied.snapshot
+        try:
+            names_after = set(os.listdir(descriptor))
+            after = bounded_regular_file_identity(os.fstat(descriptor))
+            path_after = bounded_regular_file_identity(
+                os.stat(source, follow_symlinks=False)
+            )
+        except OSError as error:
+            fail(f"cannot re-inspect opened {label}: {error}")
+        if names_after != names_before or after != before or path_after != before:
+            fail(f"{label} changed while it was staged")
+        return snapshots
+    finally:
+        os.close(descriptor)
+
+
+def read_bounded_regular_file(path: Path, label: str, *, limit: int) -> bytes:
+    snapshot = snapshot_bounded_regular_file(
+        path,
+        label,
+        limit=limit,
+        capture_bytes=True,
+    )
+    if snapshot.data is None:
+        fail(f"cannot safely retain {label}")
+    return snapshot.data
+
+
 def require_exact_directory(root: Path, limits: dict[str, int], *, label: str) -> None:
     try:
         metadata = root.lstat()
@@ -292,19 +917,17 @@ def require_exact_directory(root: Path, limits: dict[str, int], *, label: str) -
 
 
 def file_record(path: Path, *, maximum_size: int) -> dict[str, Any]:
-    metadata = require_regular_file(path, path.name, maximum_size=maximum_size)
-    before = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
-    digest = sha256_file(path, limit=maximum_size)
-    after_metadata = path.lstat()
-    after = (
-        after_metadata.st_dev,
-        after_metadata.st_ino,
-        after_metadata.st_size,
-        after_metadata.st_mtime_ns,
+    snapshot = snapshot_bounded_regular_file(
+        path,
+        path.name,
+        limit=maximum_size,
+        capture_bytes=False,
     )
-    if before != after or after_metadata.st_nlink != 1:
-        fail(f"file changed while hashing: {path.name}")
-    return {"name": path.name, "sha256": digest, "size_bytes": metadata.st_size}
+    return {
+        "name": path.name,
+        "sha256": snapshot.sha256,
+        "size_bytes": snapshot.size_bytes,
+    }
 
 
 def validate_identity(
@@ -314,33 +937,48 @@ def validate_identity(
     source_repository: str,
     source_commit: str,
     tag: str,
-    benchmark_run_id: str,
-    benchmark_artifact_id: str,
-    benchmark_artifact_digest: str,
+    benchmark_run_id: str | None,
+    benchmark_artifact_id: str | None,
+    benchmark_artifact_digest: str | None,
+    release_mode: str,
 ) -> None:
+    validate_release_mode(release_mode)
     try:
         _app_core, app_prerelease = parse_semver(app_version)
-        parse_semver(toolchain_version)
+        _toolchain_core, toolchain_prerelease = parse_semver(toolchain_version)
     except PublicationError:
         fail("app and toolchain versions must use strict semantic versioning")
     if "+" in app_version or "+" in toolchain_version:
         fail(
             "public release versions must not contain semantic version build metadata"
         )
-    if app_prerelease is None:
-        fail("app version must be a semantic prerelease")
+    if release_mode == "production" and (
+        app_prerelease is not None or toolchain_prerelease is not None
+    ):
+        fail("production app and toolchain versions must be stable semantic versioning")
     if not REPOSITORY.fullmatch(source_repository):
         fail("source repository must be owner/name")
     if not COMMIT.fullmatch(source_commit):
         fail("source commit must be a lowercase full SHA")
     if tag != f"v{app_version}":
         fail("release tag does not match the app version")
-    if not benchmark_run_id.isdecimal() or int(benchmark_run_id) <= 0:
-        fail("benchmark run ID must be a positive integer")
-    if not benchmark_artifact_id.isdecimal() or int(benchmark_artifact_id) <= 0:
-        fail("benchmark artifact ID must be a positive integer")
-    if not SHA256_DIGEST.fullmatch(benchmark_artifact_digest):
-        fail("benchmark artifact digest must be sha256:<64 lowercase hex>")
+    benchmark_values = (
+        benchmark_run_id,
+        benchmark_artifact_id,
+        benchmark_artifact_digest,
+    )
+    if any(value is not None for value in benchmark_values):
+        if any(value is None for value in benchmark_values):
+            fail("benchmark identity must be supplied as one complete set")
+        assert benchmark_run_id is not None
+        assert benchmark_artifact_id is not None
+        assert benchmark_artifact_digest is not None
+        if not benchmark_run_id.isdecimal() or int(benchmark_run_id) <= 0:
+            fail("benchmark run ID must be a positive integer")
+        if not benchmark_artifact_id.isdecimal() or int(benchmark_artifact_id) <= 0:
+            fail("benchmark artifact ID must be a positive integer")
+        if not SHA256_DIGEST.fullmatch(benchmark_artifact_digest):
+            fail("benchmark artifact digest must be sha256:<64 lowercase hex>")
 
 
 def create_build_closure(
@@ -351,9 +989,10 @@ def create_build_closure(
     source_repository: str,
     source_commit: str,
     tag: str,
-    benchmark_run_id: str,
-    benchmark_artifact_id: str,
-    benchmark_artifact_digest: str,
+    benchmark_run_id: str | None = None,
+    benchmark_artifact_id: str | None = None,
+    benchmark_artifact_digest: str | None = None,
+    release_mode: str = "development-unsigned",
 ) -> dict[str, Any]:
     validate_identity(
         app_version=app_version,
@@ -364,8 +1003,9 @@ def create_build_closure(
         benchmark_run_id=benchmark_run_id,
         benchmark_artifact_id=benchmark_artifact_id,
         benchmark_artifact_digest=benchmark_artifact_digest,
+        release_mode=release_mode,
     )
-    limits = build_file_limits(app_version)
+    limits = build_file_limits(app_version, release_mode)
     require_exact_directory(bundle, limits, label="build bundle")
     payload = {
         "schema_version": 1,
@@ -374,12 +1014,16 @@ def create_build_closure(
         "source_repository": source_repository,
         "source_commit": source_commit,
         "tag": tag,
-        "release_mode": "unsigned-beta",
-        "benchmark": {
-            "run_id": benchmark_run_id,
-            "artifact_id": benchmark_artifact_id,
-            "artifact_digest": benchmark_artifact_digest,
-        },
+        "release_mode": release_mode,
+        "benchmark": (
+            {
+                "run_id": benchmark_run_id,
+                "artifact_id": benchmark_artifact_id,
+                "artifact_digest": benchmark_artifact_digest,
+            }
+            if benchmark_run_id is not None
+            else None
+        ),
         "files": [
             file_record(bundle / name, maximum_size=limits[name])
             for name in sorted(limits)
@@ -414,9 +1058,10 @@ def validate_build_bundle(
     source_repository: str,
     source_commit: str,
     tag: str,
-    benchmark_run_id: str,
-    benchmark_artifact_id: str,
-    benchmark_artifact_digest: str,
+    benchmark_run_id: str | None = None,
+    benchmark_artifact_id: str | None = None,
+    benchmark_artifact_digest: str | None = None,
+    release_mode: str = "development-unsigned",
 ) -> dict[str, Any]:
     validate_identity(
         app_version=app_version,
@@ -427,8 +1072,9 @@ def validate_build_bundle(
         benchmark_run_id=benchmark_run_id,
         benchmark_artifact_id=benchmark_artifact_id,
         benchmark_artifact_digest=benchmark_artifact_digest,
+        release_mode=release_mode,
     )
-    limits = build_file_limits(app_version)
+    limits = build_file_limits(app_version, release_mode)
     closure_limits = dict(limits)
     closure_limits[BUILD_CLOSURE_NAME] = 4 * 1_024 * 1_024
     require_exact_directory(bundle, closure_limits, label="build bundle")
@@ -457,19 +1103,21 @@ def validate_build_bundle(
         "source_repository": source_repository,
         "source_commit": source_commit,
         "tag": tag,
-        "release_mode": "unsigned-beta",
+        "release_mode": release_mode,
     }
     for key, expected in expected_scalars.items():
         if closure[key] != expected:
             fail(f"build closure {key} does not match the release")
     benchmark = closure["benchmark"]
-    if not isinstance(benchmark, dict):
-        fail("build closure benchmark identity must be an object")
-    expected_benchmark = {
-        "run_id": benchmark_run_id,
-        "artifact_id": benchmark_artifact_id,
-        "artifact_digest": benchmark_artifact_digest,
-    }
+    expected_benchmark = (
+        {
+            "run_id": benchmark_run_id,
+            "artifact_id": benchmark_artifact_id,
+            "artifact_digest": benchmark_artifact_digest,
+        }
+        if benchmark_run_id is not None
+        else None
+    )
     if benchmark != expected_benchmark:
         fail("build closure benchmark identity does not match")
     validate_file_records(closure["files"], bundle, limits, "build")
@@ -479,8 +1127,12 @@ def validate_build_bundle(
 def validate_dmg_checksum(dmg: Path, checksum: Path) -> None:
     expected = f"{sha256_file(dmg)}  {dmg.name}\n"
     try:
-        actual = checksum.read_text(encoding="ascii")
-    except (OSError, UnicodeDecodeError) as error:
+        actual = read_bounded_regular_file(
+            checksum,
+            "DMG checksum",
+            limit=1_024,
+        ).decode("ascii")
+    except UnicodeDecodeError as error:
         fail(f"cannot read DMG checksum: {error}")
     if actual != expected:
         fail("DMG checksum does not exactly name and hash the release image")
@@ -516,6 +1168,7 @@ def validate_provenance_shape(
     toolchain_version: str,
     source_repository: str,
     source_commit: str,
+    release_mode: str = "development-unsigned",
 ) -> None:
     require_exact_keys(
         payload,
@@ -537,7 +1190,7 @@ def validate_provenance_shape(
         "schemaVersion": 2,
         "appVersion": app_version,
         "toolchainVersion": toolchain_version,
-        "releaseMode": "unsigned-beta",
+        "releaseMode": release_mode,
         "bundleIdentifier": "com.easysplat.app",
     }
     for key, value in expected.items():
@@ -589,6 +1242,7 @@ def validate_provenance(
     source_commit: str,
     dmg: Path,
     manifest: Path,
+    release_mode: str = "development-unsigned",
 ) -> dict[str, Any]:
     payload = load_json(path, "release provenance", limit=8 * 1_024 * 1_024)
     validate_provenance_shape(
@@ -597,6 +1251,7 @@ def validate_provenance(
         toolchain_version=toolchain_version,
         source_repository=source_repository,
         source_commit=source_commit,
+        release_mode=release_mode,
     )
     artifacts = payload["artifacts"]
     expected_keys = {
@@ -628,15 +1283,25 @@ def validate_provenance(
         ):
             fail(f"artifact {identifier} URL is invalid")
     local_artifacts = {
-        "dmg": (dmg, dmg.name),
-        "manifest": (manifest, "manifest.json"),
+        "dmg": (dmg, dmg.name, MAX_RELEASE_ASSET_BYTES),
+        "manifest": (manifest, "manifest.json", 8 * 1_024 * 1_024),
     }
-    for identifier, (local_path, expected_filename) in local_artifacts.items():
+    for identifier, (
+        local_path,
+        expected_filename,
+        maximum_size,
+    ) in local_artifacts.items():
         row = artifacts[identifier]
+        snapshot = snapshot_bounded_regular_file(
+            local_path,
+            f"release provenance {identifier}",
+            limit=maximum_size,
+            capture_bytes=False,
+        )
         if (
             row["file"] != expected_filename
-            or row["size"] != local_path.stat().st_size
-            or row["sha256"] != sha256_file(local_path)
+            or row["size"] != snapshot.size_bytes
+            or row["sha256"] != snapshot.sha256
         ):
             fail(f"release provenance {identifier} does not match the build bundle")
     expected_download_urls = {
@@ -1043,44 +1708,46 @@ def zip_entry_type(info: zipfile.ZipInfo) -> int:
     return stat.S_IFMT(info.external_attr >> 16)
 
 
-def validate_zip(
-    path: Path,
+def validate_open_zip(
+    archive: zipfile.ZipFile,
     *,
     label: str,
     allowed_prefixes: tuple[str, ...],
     required_files: set[str],
     maximum_expanded_size: int = 2 * 1_024 * 1_024 * 1_024,
     maximum_entry_size: int = 1_024 * 1_024 * 1_024,
+    maximum_entries: int = 4_096,
 ) -> dict[str, zipfile.ZipInfo]:
     total = 0
     entries: dict[str, zipfile.ZipInfo] = {}
-    try:
-        with zipfile.ZipFile(path) as archive:
-            for info in archive.infolist():
-                name = safe_zip_name(info.filename.rstrip("/"), f"{label} entry")
-                if name in entries:
-                    fail(f"{label} contains duplicate entry {name}")
-                if not any(
-                    name == prefix.rstrip("/") or name.startswith(prefix)
-                    for prefix in allowed_prefixes
-                ):
-                    fail(f"{label} contains unallowlisted entry {name}")
-                kind = zip_entry_type(info)
-                if info.is_dir():
-                    if kind not in {0, stat.S_IFDIR}:
-                        fail(f"{label} directory has an invalid type: {name}")
-                elif kind not in {0, stat.S_IFREG}:
-                    fail(f"{label} contains a link or special file: {name}")
-                if info.flag_bits & 0x1:
-                    fail(f"{label} contains an encrypted entry: {name}")
-                if info.file_size < 0 or info.file_size > maximum_entry_size:
-                    fail(f"{label} entry exceeds its size limit: {name}")
-                total += info.file_size
-                if total > maximum_expanded_size:
-                    fail(f"{label} expands beyond its size limit")
-                entries[name] = info
-    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
-        fail(f"cannot inspect {label}: {error}")
+    infos = archive.infolist()
+    if len(infos) > maximum_entries:
+        fail(f"{label} exceeds its entry count limit")
+    validate_zip_structure(archive, infos, label=label)
+    for info in infos:
+        name = safe_zip_name(info.filename.rstrip("/"), f"{label} entry")
+        if name in entries:
+            fail(f"{label} contains duplicate entry {name}")
+        if not any(
+            name == prefix.rstrip("/")
+            or (prefix.endswith("/") and name.startswith(prefix))
+            for prefix in allowed_prefixes
+        ):
+            fail(f"{label} contains unallowlisted entry {name}")
+        kind = zip_entry_type(info)
+        if info.is_dir():
+            if kind not in {0, stat.S_IFDIR}:
+                fail(f"{label} directory has an invalid type: {name}")
+        elif kind not in {0, stat.S_IFREG}:
+            fail(f"{label} contains a link or special file: {name}")
+        if info.flag_bits & 0x1:
+            fail(f"{label} contains an encrypted entry: {name}")
+        if info.file_size < 0 or info.file_size > maximum_entry_size:
+            fail(f"{label} entry exceeds its size limit: {name}")
+        total += info.file_size
+        if total > maximum_expanded_size:
+            fail(f"{label} expands beyond its size limit")
+        entries[name] = info
     missing = required_files - set(entries)
     if missing:
         fail(f"{label} is missing required files: {sorted(missing)}")
@@ -1089,6 +1756,294 @@ def validate_zip(
         if info.is_dir() or zip_entry_type(info) not in {0, stat.S_IFREG} or info.file_size == 0:
             fail(f"{label} required file must be a nonempty regular file: {required}")
     return entries
+
+
+def read_zip_bytes(
+    stream: BinaryIO,
+    size: int,
+    label: str,
+) -> bytes:
+    data = stream.read(size)
+    if len(data) != size:
+        fail(f"{label} has a truncated ZIP structure")
+    return data
+
+
+def validate_zip_structure(
+    archive: zipfile.ZipFile,
+    infos: list[zipfile.ZipInfo],
+    *,
+    label: str,
+) -> None:
+    stream = archive.fp
+    if stream is None:
+        fail(f"{label} has no open ZIP descriptor")
+    original_offset = 0
+    try:
+        original_offset = stream.tell()
+        stream.seek(0, os.SEEK_END)
+        archive_size = stream.tell()
+        if archive_size < 22:
+            fail(f"{label} has an invalid ZIP structure")
+        stream.seek(archive_size - 22)
+        end_record = read_zip_bytes(stream, 22, label)
+        (
+            signature,
+            disk_number,
+            central_disk,
+            disk_entry_count,
+            entry_count,
+            central_size,
+            central_offset,
+            comment_size,
+        ) = struct.unpack("<4s4H2LH", end_record)
+        if (
+            signature != b"PK\x05\x06"
+            or disk_number != 0
+            or central_disk != 0
+            or disk_entry_count != entry_count
+            or entry_count != len(infos)
+            or entry_count == 0xFFFF
+            or central_size == 0xFFFFFFFF
+            or central_offset == 0xFFFFFFFF
+            or comment_size != 0
+            or archive.comment
+            or archive.start_dir != central_offset
+            or central_offset + central_size != archive_size - 22
+        ):
+            fail(f"{label} has an invalid ZIP structure")
+
+        local_cursor = 0
+        for info in sorted(infos, key=lambda candidate: candidate.header_offset):
+            if (
+                info.header_offset != local_cursor
+                or info.flag_bits != 0
+                or info.extra
+                or info.comment
+                or info.compress_type
+                not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+            ):
+                fail(f"{label} has unbound ZIP metadata")
+            try:
+                encoded_name = info.filename.encode("ascii")
+            except UnicodeEncodeError:
+                fail(f"{label} contains a non-ASCII ZIP entry")
+            stream.seek(local_cursor)
+            local_header = read_zip_bytes(stream, 30, label)
+            (
+                local_signature,
+                _extract_version,
+                local_flags,
+                local_compression,
+                _modified_time,
+                _modified_date,
+                local_crc,
+                local_compressed_size,
+                local_file_size,
+                local_name_size,
+                local_extra_size,
+            ) = struct.unpack("<4s5H3L2H", local_header)
+            local_name = read_zip_bytes(stream, local_name_size, label)
+            local_extra = read_zip_bytes(stream, local_extra_size, label)
+            if (
+                local_signature != b"PK\x03\x04"
+                or local_flags != info.flag_bits
+                or local_compression != info.compress_type
+                or local_crc != info.CRC
+                or local_compressed_size != info.compress_size
+                or local_file_size != info.file_size
+                or local_name != encoded_name
+                or local_extra
+            ):
+                fail(f"{label} has an invalid local ZIP record")
+            local_cursor = (
+                local_cursor
+                + 30
+                + local_name_size
+                + local_extra_size
+                + info.compress_size
+            )
+        if local_cursor != central_offset:
+            fail(f"{label} has unbound bytes before its central directory")
+
+        central_cursor = central_offset
+        for info in infos:
+            stream.seek(central_cursor)
+            central_header = read_zip_bytes(stream, 46, label)
+            (
+                central_signature,
+                created_version,
+                extracted_version,
+                central_flags,
+                central_compression,
+                _modified_time,
+                _modified_date,
+                central_crc,
+                central_compressed_size,
+                central_file_size,
+                central_name_size,
+                central_extra_size,
+                central_comment_size,
+                central_disk_number,
+                central_internal_attr,
+                central_external_attr,
+                local_offset,
+            ) = struct.unpack("<4s6H3L5H2L", central_header)
+            central_name = read_zip_bytes(stream, central_name_size, label)
+            central_extra = read_zip_bytes(stream, central_extra_size, label)
+            central_comment = read_zip_bytes(stream, central_comment_size, label)
+            try:
+                encoded_name = info.filename.encode("ascii")
+            except UnicodeEncodeError:
+                fail(f"{label} contains a non-ASCII ZIP entry")
+            if (
+                central_signature != b"PK\x01\x02"
+                or created_version & 0xFF != info.create_version
+                or created_version >> 8 != info.create_system
+                or extracted_version != info.extract_version
+                or central_flags != info.flag_bits
+                or central_compression != info.compress_type
+                or central_crc != info.CRC
+                or central_compressed_size != info.compress_size
+                or central_file_size != info.file_size
+                or central_name != encoded_name
+                or central_extra
+                or central_comment
+                or central_disk_number != 0
+                or central_internal_attr != info.internal_attr
+                or central_external_attr != info.external_attr
+                or local_offset != info.header_offset
+            ):
+                fail(f"{label} has an invalid central ZIP record")
+            central_cursor += (
+                46
+                + central_name_size
+                + central_extra_size
+                + central_comment_size
+            )
+        if central_cursor != archive_size - 22:
+            fail(f"{label} has unbound bytes in its central directory")
+    except (OSError, struct.error) as error:
+        fail(f"cannot inspect {label} ZIP structure: {error}")
+    finally:
+        try:
+            stream.seek(original_offset)
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def open_zip_from_descriptor(
+    descriptor: int,
+    label: str,
+    *,
+    maximum_entries: int = 4_096,
+) -> Iterator[zipfile.ZipFile]:
+    try:
+        archive_size = os.fstat(descriptor).st_size
+        if archive_size < 22:
+            fail(f"{label} has an invalid ZIP structure")
+        end_record = os.pread(descriptor, 22, archive_size - 22)
+    except OSError as error:
+        fail(f"cannot preflight {label}: {error}")
+    if len(end_record) != 22:
+        fail(f"{label} has a truncated ZIP structure")
+    try:
+        (
+            signature,
+            disk_number,
+            central_disk,
+            disk_entry_count,
+            entry_count,
+            central_size,
+            central_offset,
+            comment_size,
+        ) = struct.unpack("<4s4H2LH", end_record)
+    except struct.error as error:
+        fail(f"cannot preflight {label}: {error}")
+    if (
+        signature != b"PK\x05\x06"
+        or disk_number != 0
+        or central_disk != 0
+        or disk_entry_count != entry_count
+        or entry_count == 0xFFFF
+        or central_size == 0xFFFFFFFF
+        or central_offset == 0xFFFFFFFF
+        or comment_size != 0
+        or central_offset + central_size != archive_size - 22
+    ):
+        fail(f"{label} has an invalid ZIP structure")
+    if entry_count > maximum_entries:
+        fail(f"{label} exceeds its entry count limit")
+    try:
+        duplicate = os.dup(descriptor)
+    except OSError as error:
+        fail(f"cannot duplicate {label} descriptor: {error}")
+    stream = os.fdopen(duplicate, "rb")
+    try:
+        try:
+            archive = zipfile.ZipFile(stream)
+        except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+            fail(f"cannot inspect {label}: {error}")
+        try:
+            yield archive
+        finally:
+            archive.close()
+    finally:
+        stream.close()
+
+
+def validate_zip_descriptor(
+    descriptor: int,
+    *,
+    label: str,
+    allowed_prefixes: tuple[str, ...],
+    required_files: set[str],
+    maximum_expanded_size: int = 2 * 1_024 * 1_024 * 1_024,
+    maximum_entry_size: int = 1_024 * 1_024 * 1_024,
+    maximum_entries: int = 4_096,
+) -> dict[str, zipfile.ZipInfo]:
+    with open_zip_from_descriptor(
+        descriptor,
+        label,
+        maximum_entries=maximum_entries,
+    ) as archive:
+        return validate_open_zip(
+            archive,
+            label=label,
+            allowed_prefixes=allowed_prefixes,
+            required_files=required_files,
+            maximum_expanded_size=maximum_expanded_size,
+            maximum_entry_size=maximum_entry_size,
+            maximum_entries=maximum_entries,
+        )
+
+
+def validate_zip(
+    path: Path,
+    *,
+    label: str,
+    allowed_prefixes: tuple[str, ...],
+    required_files: set[str],
+    maximum_expanded_size: int = 2 * 1_024 * 1_024 * 1_024,
+    maximum_entry_size: int = 1_024 * 1_024 * 1_024,
+    maximum_archive_size: int = MAX_RELEASE_ASSET_BYTES,
+    maximum_entries: int = 4_096,
+) -> dict[str, zipfile.ZipInfo]:
+    with open_bounded_regular_file(
+        path,
+        label,
+        limit=maximum_archive_size,
+    ) as (descriptor, _identity):
+        return validate_zip_descriptor(
+            descriptor,
+            label=label,
+            allowed_prefixes=allowed_prefixes,
+            required_files=required_files,
+            maximum_expanded_size=maximum_expanded_size,
+            maximum_entry_size=maximum_entry_size,
+            maximum_entries=maximum_entries,
+        )
 
 
 def read_canonical_archive_json(
@@ -1117,22 +2072,43 @@ def read_canonical_archive_json(
 
 
 def supply_chain_archive_for_path(path: str) -> str:
-    if path.startswith("da3_mps/models/DA3-BASE/"):
-        return "geometry-da3-base"
+    archive_matches: list[str] = []
+    if (
+        path.startswith(("bin/", "lib/", "licenses/", "provenance/"))
+        or path == "supply-chain/components.json"
+        or path in {"msplat/build_info.json", "msplat/LICENSE"}
+    ):
+        archive_matches.append("core")
+    if (
+        path.startswith(
+            (
+                "da3_mps/bin/",
+                "da3_mps/python/",
+                "da3_mps/app/",
+                "da3_mps/vendor/",
+                "da3_mps/licenses/",
+                "da3_mps/models/DA3-BASE/",
+            )
+        )
+        or path == "da3_mps/build_info.json"
+    ):
+        archive_matches.append("geometry-da3-base")
     if path.startswith("da3_mps/models/DA3-SMALL/"):
-        return "geometry-da3-small"
-    return "core"
+        archive_matches.append("geometry-da3-small")
+    if len(archive_matches) != 1:
+        fail(f"toolchain closure path has no unique production archive: {path}")
+    return archive_matches[0]
 
 
-def validate_license_archive(
-    path: Path,
+def validate_open_license_archive(
+    archive: zipfile.ZipFile,
     provenance: dict[str, Any],
     manifest: dict[str, Any],
     *,
     toolchain_version: str,
 ) -> dict[str, Any]:
-    entries = validate_zip(
-        path,
+    entries = validate_open_zip(
+        archive,
         label="license archive",
         allowed_prefixes=(
             "EasySplat/",
@@ -1151,17 +2127,18 @@ def validate_license_archive(
         maximum_entry_size=256 * 1_024 * 1_024,
     )
     try:
-        with zipfile.ZipFile(path) as archive:
-            components_payload, components_raw = read_canonical_archive_json(
-                archive,
-                entries["Toolchain/supply-chain/components.json"],
-                "toolchain component closure",
-            )
-            archive_closure, _ = read_canonical_archive_json(
-                archive,
-                entries["toolchain-closure.json"],
-                "toolchain archive closure",
-            )
+        components_payload, components_raw = read_canonical_archive_json(
+            archive,
+            entries["Toolchain/supply-chain/components.json"],
+            "toolchain component closure",
+            maximum_size=16 * 1_024 * 1_024,
+        )
+        archive_closure, _ = read_canonical_archive_json(
+            archive,
+            entries["toolchain-closure.json"],
+            "toolchain archive closure",
+            maximum_size=1 * 1_024 * 1_024,
+        )
     except (OSError, zipfile.BadZipFile, RuntimeError) as error:
         fail(f"cannot read license archive closure: {error}")
 
@@ -1198,7 +2175,12 @@ def validate_license_archive(
         "dependencies",
         "files",
     }
-    component_optional = {"artifact", "artifactSha256", "incorporatedInto"}
+    component_optional = {
+        "artifact",
+        "artifactSha256",
+        "incorporatedInto",
+        "sourceArtifacts",
+    }
     for index, component in enumerate(component_rows):
         if not isinstance(component, dict):
             fail(f"toolchain component {index} must be an object")
@@ -1256,6 +2238,59 @@ def validate_license_archive(
             validate_https_url(
                 artifact, f"toolchain component {component_id} artifact"
             )
+        source_artifacts = component.get("sourceArtifacts")
+        if component["type"] == "model" and source_artifacts is None:
+            fail(f"toolchain component {component_id} sourceArtifacts are missing")
+        if source_artifacts is not None:
+            if component["type"] != "model" or not isinstance(source_artifacts, list) or not source_artifacts:
+                fail(f"toolchain component {component_id} sourceArtifacts are invalid")
+            artifact_names: list[str] = []
+            artifact_urls: set[str] = set()
+            for artifact_index, source_artifact in enumerate(source_artifacts):
+                label = (
+                    f"toolchain component {component_id} "
+                    f"sourceArtifacts[{artifact_index}]"
+                )
+                if not isinstance(source_artifact, dict):
+                    fail(f"{label} must be an object")
+                require_exact_keys(
+                    source_artifact,
+                    {"name", "url", "sha256", "size"},
+                    label,
+                )
+                artifact_name = source_artifact["name"]
+                if (
+                    not isinstance(artifact_name, str)
+                    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", artifact_name)
+                    is None
+                ):
+                    fail(f"{label} name is invalid")
+                artifact_url = validate_https_url(
+                    source_artifact["url"], f"{label} url"
+                )
+                parsed_artifact_url = urllib.parse.urlparse(artifact_url)
+                if (
+                    parsed_artifact_url.query
+                    or parsed_artifact_url.fragment
+                    or any(ord(character) < 0x20 for character in artifact_url)
+                ):
+                    fail(f"{label} url must be a credential-free HTTPS URL")
+                if (
+                    not isinstance(source_artifact["sha256"], str)
+                    or not SHA256.fullmatch(source_artifact["sha256"])
+                    or type(source_artifact["size"]) is not int
+                    or source_artifact["size"] <= 0
+                ):
+                    fail(f"{label} digest or size is invalid")
+                artifact_names.append(artifact_name)
+                if artifact_url in artifact_urls:
+                    fail(f"toolchain component {component_id} sourceArtifacts are duplicated")
+                artifact_urls.add(artifact_url)
+            if artifact_names != sorted(set(artifact_names)):
+                fail(
+                    f"toolchain component {component_id} sourceArtifacts are "
+                    "duplicated or unsorted"
+                )
         components[component_id] = component
         component_ids.append(component_id)
     if component_ids != sorted(component_ids):
@@ -1304,6 +2339,56 @@ def validate_license_archive(
     for component_id, component in components.items():
         if component["files"] != sorted(owned_files[component_id]):
             fail(f"toolchain component {component_id} file ownership differs")
+        if component["type"] == "model":
+            source_artifacts = component["sourceArtifacts"]
+            source_artifact_names = {
+                source_artifact["name"] for source_artifact in source_artifacts
+            }
+            expected_source_artifact_names = {"config.json", "model.safetensors"}
+            model_license_roots = {
+                PurePosixPath(license_path).parent
+                for license_path in component["licenseFiles"]
+                if PurePosixPath(license_path).name == "LICENSE"
+            }
+            if (
+                source_artifact_names != expected_source_artifact_names
+                or len(model_license_roots) != 1
+            ):
+                fail(
+                    f"toolchain component {component_id} model payload source "
+                    "closure is invalid"
+                )
+            model_root = next(iter(model_license_roots))
+            expected_payload_paths = {
+                (model_root / artifact_name).as_posix()
+                for artifact_name in expected_source_artifact_names
+            }
+            relevant_payload_paths = {
+                owned_path
+                for owned_path in owned_files[component_id]
+                if PurePosixPath(owned_path).parent == model_root
+                and PurePosixPath(owned_path).name
+                not in {"LICENSE", "easysplat_model_info.json"}
+            }
+            if relevant_payload_paths != expected_payload_paths:
+                fail(
+                    f"toolchain component {component_id} model payload file "
+                    "closure is invalid"
+                )
+            for source_artifact in source_artifacts:
+                payload_path = (model_root / source_artifact["name"]).as_posix()
+                payload_row = files.get(payload_path)
+                if (
+                    payload_row is None
+                    or payload_row["component"] != component_id
+                    or payload_row["kind"] != "file"
+                    or payload_row["sha256"] != source_artifact["sha256"]
+                    or payload_row["size"] != source_artifact["size"]
+                ):
+                    fail(
+                        f"toolchain component {component_id} model payload "
+                        f"does not match sourceArtifacts: {source_artifact['name']}"
+                    )
         for relation in (*component["dependencies"], *component.get("incorporatedInto", [])):
             if relation not in components or relation == component_id:
                 fail(f"toolchain component {component_id} has an invalid relationship")
@@ -1319,18 +2404,44 @@ def validate_license_archive(
             ):
                 fail(f"toolchain component {component_id} license closure is incomplete")
             mapped_license_paths.add(license_path)
+    fixed_legal_sources = {
+        "EasySplat/LICENSE": REPOSITORY_ROOT / "LICENSE",
+        "EasySplat/NOTICE.md": REPOSITORY_ROOT / "NOTICE.md",
+        "MetalSplatter/LICENSE": (
+            REPOSITORY_ROOT / "ThirdParty/MetalSplatter/LICENSE"
+        ),
+    }
+    expected_archive_entries = {
+        *fixed_legal_sources,
+        "Toolchain/supply-chain/components.json",
+        "toolchain-closure.json",
+        *(f"Toolchain/{path}" for path in mapped_license_paths),
+    }
+    if set(entries) != expected_archive_entries:
+        fail("license archive does not contain the exact legal-file closure")
     try:
-        with zipfile.ZipFile(path) as archive:
-            for license_path in sorted(mapped_license_paths):
-                file_row = files[license_path]
-                archived_license = entries[f"Toolchain/{license_path}"]
-                with archive.open(archived_license) as stream:
-                    digest = sha256_stream(stream, limit=256 * 1_024 * 1_024)
-                if (
-                    archived_license.file_size != file_row["size"]
-                    or digest != file_row["sha256"]
-                ):
-                    fail(f"toolchain license bytes differ from the signed closure: {license_path}")
+        for archive_name, source_path in fixed_legal_sources.items():
+            archived = archive.read(entries[archive_name])
+            trusted = read_bounded_regular_file(
+                source_path,
+                f"trusted public legal file {archive_name}",
+                limit=8 * 1_024 * 1_024,
+            )
+            if archived != trusted:
+                fail(
+                    "license archive public legal file differs from its "
+                    f"trusted source: {archive_name}"
+                )
+        for license_path in sorted(mapped_license_paths):
+            file_row = files[license_path]
+            archived_license = entries[f"Toolchain/{license_path}"]
+            with archive.open(archived_license) as stream:
+                digest = sha256_stream(stream, limit=256 * 1_024 * 1_024)
+            if (
+                archived_license.file_size != file_row["size"]
+                or digest != file_row["sha256"]
+            ):
+                fail(f"toolchain license bytes differ from the signed closure: {license_path}")
     except (OSError, zipfile.BadZipFile, RuntimeError) as error:
         fail(f"cannot verify toolchain license bytes: {error}")
 
@@ -1401,6 +2512,31 @@ def validate_license_archive(
     }
 
 
+def validate_license_archive(
+    path: Path,
+    provenance: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    toolchain_version: str,
+) -> dict[str, Any]:
+    with open_bounded_regular_file(
+        path,
+        "license archive",
+        limit=MAX_RELEASE_ASSET_BYTES,
+    ) as (descriptor, _identity):
+        with open_zip_from_descriptor(
+            descriptor,
+            "license archive",
+            maximum_entries=2_048,
+        ) as archive:
+            return validate_open_license_archive(
+                archive,
+                provenance,
+                manifest,
+                toolchain_version=toolchain_version,
+            )
+
+
 def run_static(arguments: list[str]) -> subprocess.CompletedProcess[str]:
     if not arguments or arguments[0] not in SYSTEM_TOOLS.values():
         fail("publication verifier attempted a non-static subprocess")
@@ -1413,7 +2549,30 @@ def run_static(arguments: list[str]) -> subprocess.CompletedProcess[str]:
             timeout=120,
             env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"},
         )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+    except subprocess.CalledProcessError as error:
+        output = "\n".join(
+            value
+            for value in (error.stdout, error.stderr)
+            if isinstance(value, str) and value
+        )
+        suffix = f"\n{output[:64 * 1_024]}" if output else ""
+        fail(
+            f"static inspection command failed: {arguments[0]}: "
+            f"exit {error.returncode}{suffix}"
+        )
+    except subprocess.TimeoutExpired as error:
+        output = "\n".join(
+            value.decode("utf-8", errors="replace")
+            if isinstance(value, bytes)
+            else value
+            for value in (error.stdout, error.stderr)
+            if isinstance(value, (bytes, str)) and value
+        )
+        suffix = f"\n{output[:64 * 1_024]}" if output else ""
+        fail(
+            f"static inspection command timed out: {arguments[0]}{suffix}"
+        )
+    except OSError as error:
         fail(f"static inspection command failed: {arguments[0]}: {error}")
 
 
@@ -1438,7 +2597,9 @@ def load_plist(path: Path, label: str) -> dict[str, Any]:
     return payload
 
 
-def expected_app_plist(app_version: str) -> tuple[tuple[str, str], ...]:
+def expected_app_plist(
+    app_version: str, release_mode: str = "development-unsigned"
+) -> tuple[tuple[str, str], ...]:
     base_version = app_version.split("-", 1)[0]
     return (
         ("CFBundleExecutable", "EasySplatApp"),
@@ -1447,15 +2608,17 @@ def expected_app_plist(app_version: str) -> tuple[tuple[str, str], ...]:
         ("CFBundlePackageType", "APPL"),
         ("CFBundleShortVersionString", base_version),
         ("CFBundleVersion", base_version),
-        ("EasySplatReleaseChannel", "unsigned-beta"),
+        ("EasySplatReleaseChannel", release_mode),
         ("EasySplatReleaseVersion", app_version),
         ("LSMinimumSystemVersion", "15.0"),
     )
 
 
-def validate_app_plist(path: Path, *, app_version: str) -> None:
+def validate_app_plist(
+    path: Path, *, app_version: str, release_mode: str = "development-unsigned"
+) -> None:
     payload = load_plist(path, "app Info.plist")
-    for key, expected in expected_app_plist(app_version):
+    for key, expected in expected_app_plist(app_version, release_mode):
         actual = payload.get(key)
         if actual != expected:
             fail(f"Info.plist {key} is {actual!r}, expected {expected!r}")
@@ -1464,9 +2627,18 @@ def validate_app_plist(path: Path, *, app_version: str) -> None:
             fail(f"Info.plist must not contain {forbidden}")
 
 
-def validate_regular_tree(root: Path, *, maximum_bytes: int) -> None:
+def validate_regular_tree(
+    root: Path,
+    *,
+    maximum_bytes: int,
+    maximum_entries: int = 100_000,
+) -> None:
     total = 0
-    for path in sorted(root.rglob("*")):
+    entry_count = 0
+    for path in root.rglob("*"):
+        entry_count += 1
+        if entry_count > maximum_entries:
+            fail("app bundle exceeds its entry count limit")
         metadata = path.lstat()
         if path.is_symlink():
             fail(f"app bundle contains a symbolic link: {path.relative_to(root)}")
@@ -1544,6 +2716,7 @@ def validate_app_bundle(
     toolchain_version: str,
     source_repository: str,
     toolchain_public_key: Path,
+    release_mode: str = "development-unsigned",
 ) -> str:
     if app.is_symlink() or not app.is_dir():
         fail("DMG must contain a real EasySplat.app directory")
@@ -1567,7 +2740,7 @@ def validate_app_bundle(
         fail("app executable is missing")
     if {entry.name for entry in executable.parent.iterdir()} != {"EasySplatApp"}:
         fail("app MacOS directory contains an unexpected executable")
-    validate_app_plist(plist, app_version=app_version)
+    validate_app_plist(plist, app_version=app_version, release_mode=release_mode)
     architectures = run_static(
         [SYSTEM_TOOLS["lipo"], "-archs", str(executable)]
     ).stdout.strip()
@@ -1576,13 +2749,16 @@ def validate_app_bundle(
     run_static([SYSTEM_TOOLS["codesign"], "--verify", "--deep", "--strict", str(app)])
     signing = run_static([SYSTEM_TOOLS["codesign"], "-dvvv", str(app)])
     details = signing.stdout + signing.stderr
-    for required in (
-        "Identifier=com.easysplat.app",
-        "Signature=adhoc",
-        "TeamIdentifier=not set",
-    ):
+    required_signing = ["Identifier=com.easysplat.app"]
+    if release_mode == "development-unsigned":
+        required_signing.extend(("Signature=adhoc", "TeamIdentifier=not set"))
+    else:
+        required_signing.extend(("flags=0x10000(runtime)", "TeamIdentifier="))
+        if "Signature=adhoc" in details or "TeamIdentifier=not set" in details:
+            fail("production app is not Developer ID signed")
+    for required in required_signing:
         if required not in details:
-            fail(f"unsigned-beta signing state is missing {required}")
+            fail(f"{release_mode} signing state is missing {required}")
     return parse_uuid(
         run_static([SYSTEM_TOOLS["dwarfdump"], "--uuid", str(executable)]).stdout,
         "app executable",
@@ -1597,47 +2773,123 @@ def mounted_dmg(path: Path) -> Iterator[Path]:
         mount = Path(temporary) / "volume"
         mount.mkdir()
         run_static([SYSTEM_TOOLS["hdiutil"], "verify", str(path)])
-        run_static(
-            [
-                SYSTEM_TOOLS["hdiutil"],
-                "attach",
-                "-readonly",
-                "-nobrowse",
-                "-noautoopen",
-                "-owners",
-                "off",
-                "-mountpoint",
-                str(mount),
-                str(path),
-            ]
-        )
+        attachment_devices: tuple[str, ...] = ()
+        try:
+            attachment = run_static(
+                [
+                    SYSTEM_TOOLS["hdiutil"],
+                    "attach",
+                    "-readonly",
+                    "-nobrowse",
+                    "-noautoopen",
+                    "-owners",
+                    "off",
+                    "-mountpoint",
+                    str(mount),
+                    str(path),
+                ]
+            )
+            attachment_devices = hdiutil_device_nodes(
+                attachment.stdout,
+                attachment.stderr,
+            )
+        except BaseException as error:
+            attachment_devices = hdiutil_device_nodes(str(error))
+            detach_hdiutil_attachment(
+                mount,
+                attachment_devices,
+                suppress_errors=True,
+            )
+            raise
         try:
             yield mount
         finally:
-            run_static([SYSTEM_TOOLS["hdiutil"], "detach", str(mount)])
+            detach_hdiutil_attachment(
+                mount,
+                attachment_devices,
+                suppress_errors=False,
+            )
 
 
-def validate_dsym_archive(path: Path, app_binary: Path | str) -> None:
+def hdiutil_device_nodes(*outputs: str) -> tuple[str, ...]:
+    nodes: list[str] = []
+    seen: set[str] = set()
+    pattern = re.compile(r"(?m)^(/dev/disk[0-9]+(?:s[0-9]+)*)[\t ]")
+    for output in outputs:
+        if not isinstance(output, str):
+            continue
+        for match in pattern.finditer(output):
+            node = match.group(1)
+            if node not in seen:
+                seen.add(node)
+                nodes.append(node)
+    return tuple(nodes)
+
+
+def detach_hdiutil_attachment(
+    mount: Path,
+    device_nodes: tuple[str, ...],
+    *,
+    suppress_errors: bool,
+) -> None:
+    failures: list[PublicationError] = []
+    try:
+        run_static([SYSTEM_TOOLS["hdiutil"], "detach", str(mount)])
+        return
+    except PublicationError as error:
+        failures.append(error)
+    ordered_nodes = sorted(
+        device_nodes,
+        key=lambda node: re.fullmatch(r"/dev/disk[0-9]+", node) is None,
+    )
+    for node in ordered_nodes:
+        try:
+            run_static([SYSTEM_TOOLS["hdiutil"], "detach", node])
+            return
+        except PublicationError as error:
+            failures.append(error)
+    if not suppress_errors and failures:
+        raise failures[-1]
+
+
+def validate_open_dsym_archive(
+    archive: zipfile.ZipFile, app_binary: Path | str
+) -> None:
     dwarf_name = "EasySplat.app.dSYM/Contents/Resources/DWARF/EasySplatApp"
     plist_name = "EasySplat.app.dSYM/Contents/Info.plist"
-    entries = validate_zip(
-        path,
+    relocation_name = (
+        "EasySplat.app.dSYM/Contents/Resources/Relocations/"
+        "aarch64/EasySplatApp.yml"
+    )
+    expected_directories = {
+        "EasySplat.app.dSYM",
+        "EasySplat.app.dSYM/Contents",
+        "EasySplat.app.dSYM/Contents/Resources",
+        "EasySplat.app.dSYM/Contents/Resources/DWARF",
+        "EasySplat.app.dSYM/Contents/Resources/Relocations",
+        "EasySplat.app.dSYM/Contents/Resources/Relocations/aarch64",
+    }
+    required_files = {dwarf_name, plist_name, relocation_name}
+    entries = validate_open_zip(
+        archive,
         label="dSYM archive",
         allowed_prefixes=("EasySplat.app.dSYM/",),
-        required_files={dwarf_name, plist_name},
+        required_files=required_files,
         maximum_expanded_size=2 * 1_024 * 1_024 * 1_024,
         maximum_entry_size=1_024 * 1_024 * 1_024,
+        maximum_entries=16,
     )
+    if set(entries) != required_files | expected_directories:
+        fail("dSYM archive does not contain the exact debug-symbol closure")
     with tempfile.TemporaryDirectory(prefix="easysplat-publication-dsym-") as temporary:
         root = Path(temporary)
         extracted: dict[str, Path] = {}
-        with zipfile.ZipFile(path) as archive:
-            for name in (dwarf_name, plist_name):
-                info = entries[name]
-                target = root / Path(name).name
-                with archive.open(info) as source, target.open("xb") as destination:
-                    shutil.copyfileobj(source, destination, length=1_024 * 1_024)
-                extracted[name] = target
+        for name in sorted(required_files):
+            info = entries[name]
+            target = root / Path(name).name
+            with archive.open(info) as source, target.open("xb") as destination:
+                shutil.copyfileobj(source, destination, length=1_024 * 1_024)
+            extracted[name] = target
         if plist_value(extracted[plist_name], "CFBundlePackageType") != "dSYM":
             fail("dSYM Info.plist package type is invalid")
         app_uuid = parse_uuid(
@@ -1652,6 +2904,20 @@ def validate_dsym_archive(path: Path, app_binary: Path | str) -> None:
         )
         if app_uuid != dsym_uuid:
             fail("dSYM UUID does not match the app executable")
+
+
+def validate_dsym_archive(path: Path, app_binary: Path | str) -> None:
+    with open_bounded_regular_file(
+        path,
+        "dSYM archive",
+        limit=MAX_RELEASE_ASSET_BYTES,
+    ) as (descriptor, _identity):
+        with open_zip_from_descriptor(
+            descriptor,
+            "dSYM archive",
+            maximum_entries=16,
+        ) as archive:
+            validate_open_dsym_archive(archive, app_binary)
 
 
 # RFC 8032 verification. The release verifier intentionally carries no third-party runtime.
@@ -1802,7 +3068,7 @@ def validate_toolchain_manifest(
     toolchain_version: str,
     source_repository: str,
 ) -> dict[str, Any]:
-    manifest = load_json(path, "toolchain manifest", limit=64 * 1_024 * 1_024)
+    manifest = load_json(path, "toolchain manifest", limit=8 * 1_024 * 1_024)
     require_exact_keys(
         manifest,
         {
@@ -1822,12 +3088,14 @@ def validate_toolchain_manifest(
     if manifest["version"] != toolchain_version:
         fail("toolchain manifest version does not match the release")
     validate_utc_timestamp(manifest["publishedAt"], "toolchain manifest publishedAt")
-    require_regular_file(
-        trust_root_path,
-        "tracked toolchain public key",
-        maximum_size=1_024,
-    )
-    public_key_text = trust_root_path.read_text(encoding="ascii").strip()
+    try:
+        public_key_text = read_bounded_regular_file(
+            trust_root_path,
+            "tracked toolchain public key",
+            limit=1_024,
+        ).decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        fail(f"toolchain public key is not ASCII: {error}")
     public_key = decode_base64(public_key_text, "toolchain public key", 32)
     if manifest["keyID"] != hashlib.sha256(public_key).hexdigest():
         fail("toolchain manifest key identifier is invalid")
@@ -1849,7 +3117,7 @@ def validate_toolchain_manifest(
         fail("toolchain manifest does not support this app version")
     components = manifest["components"]
     if not isinstance(components, list) or len(components) != 3:
-        fail("toolchain manifest must contain the three public-beta components")
+        fail("toolchain manifest must contain the three release components")
     expected_names = {"macos-arm64-core", "geometry-da3-base", "geometry-da3-small"}
     seen: set[str] = set()
     for component in components:
@@ -1864,6 +3132,7 @@ def validate_toolchain_manifest(
                 "sha256",
                 "sizeBytes",
                 "expandedSizeBytes",
+                "expandedClosureSHA256",
                 "contents",
                 "criticalFileHashes",
                 "dependencies",
@@ -1890,10 +3159,29 @@ def validate_toolchain_manifest(
             component["sha256"]
         ):
             fail(f"toolchain component digest is invalid: {name}")
+        if not isinstance(component["expandedClosureSHA256"], str) or not SHA256.fullmatch(
+            component["expandedClosureSHA256"]
+        ):
+            fail(f"toolchain expanded closure digest is invalid: {name}")
         if not isinstance(component["sizeBytes"], int) or not (
             0 < component["sizeBytes"] <= MAX_RELEASE_ASSET_BYTES
         ):
             fail(f"toolchain component size is invalid: {name}")
+        if not isinstance(component["expandedSizeBytes"], int) or not (
+            0 < component["expandedSizeBytes"] <= 16 * 1_024 * 1_024 * 1_024
+        ):
+            fail(f"toolchain expanded component size is invalid: {name}")
+        contents = component["contents"]
+        hashes = component["criticalFileHashes"]
+        if (
+            not isinstance(contents, list)
+            or not contents
+            or len(contents) != len(set(contents))
+            or not isinstance(hashes, dict)
+            or set(hashes) != set(contents)
+            or any(not isinstance(value, str) or not SHA256.fullmatch(value) for value in hashes.values())
+        ):
+            fail(f"toolchain expanded file closure is invalid: {name}")
     if seen != expected_names:
         fail("toolchain component set is incomplete")
     return manifest
@@ -1962,9 +3250,9 @@ def validate_toolchain_release_request(
     manifest: dict[str, Any],
     *,
     source_repository: str,
-) -> dict[str, Any]:
-    request = load_compact_canonical_json(
-        path, "toolchain release request", limit=64 * 1_024 * 1_024
+) -> tuple[dict[str, Any], str]:
+    request, request_digest = load_compact_canonical_json_with_sha256(
+        path, "toolchain release request", limit=8 * 1_024 * 1_024
     )
     require_exact_keys(
         request,
@@ -1978,7 +3266,7 @@ def validate_toolchain_release_request(
         "toolchain release request",
     )
     if (
-        request["schemaVersion"] != 1
+        request["schemaVersion"] != 2
         or source_repository != CANONICAL_SOURCE_REPOSITORY
         or request["sourceRepository"] != source_repository
         or not isinstance(request["sourceCommit"], str)
@@ -1995,18 +3283,18 @@ def validate_toolchain_release_request(
         or request["manifestSHA256"] != unsigned_digest
     ):
         fail("toolchain release request does not bind the unsigned manifest")
-    return request
+    return request, request_digest
 
 
 def validate_toolchain_authority_envelope(
     path: Path,
-    release_request_path: Path,
+    release_request_sha256: str,
     release_request: dict[str, Any],
     *,
     source_repository: str,
     toolchain_version: str,
-) -> dict[str, Any]:
-    envelope = load_compact_canonical_json(
+) -> tuple[dict[str, Any], str]:
+    envelope, envelope_digest = load_compact_canonical_json_with_sha256(
         path, "toolchain authority envelope", limit=64 * 1_024 * 1_024
     )
     require_exact_keys(
@@ -2061,14 +3349,13 @@ def validate_toolchain_authority_envelope(
         toolchain_version=toolchain_version,
         label="toolchain authority envelope",
     )
-    request_digest = sha256_file(release_request_path, limit=64 * 1_024 * 1_024)
     if (
-        envelope["sourceReleaseRequestSHA256"] != request_digest
+        envelope["sourceReleaseRequestSHA256"] != release_request_sha256
         or envelope["unsignedManifestSHA256"] != release_request["manifestSHA256"]
         or envelope["manifest"] != release_request["manifest"]
     ):
         fail("toolchain authority envelope does not bind the release request")
-    return envelope
+    return envelope, envelope_digest
 
 
 def validate_toolchain_authority_receipt(
@@ -2160,7 +3447,11 @@ def validate_toolchain_authority_receipt(
         label="toolchain authority receipt",
     )
 
-    manifest_bytes = manifest_path.read_bytes()
+    manifest_bytes = read_bounded_regular_file(
+        manifest_path,
+        "signed toolchain manifest",
+        limit=8 * 1_024 * 1_024,
+    )
     if manifest_bytes != signature_json_bytes(manifest):
         fail("signed toolchain manifest is not canonical compact JSON")
     unsigned_manifest = dict(manifest)
@@ -2173,16 +3464,15 @@ def validate_toolchain_authority_receipt(
     ):
         fail("toolchain authority receipt does not bind the signed manifest")
 
-    require_regular_file(
-        trust_root_path,
-        "tracked toolchain public key",
-        maximum_size=1_024,
-    )
-    public_key = decode_base64(
-        trust_root_path.read_text(encoding="ascii").strip(),
-        "toolchain public key",
-        32,
-    )
+    try:
+        public_key_text = read_bounded_regular_file(
+            trust_root_path,
+            "tracked toolchain public key",
+            limit=1_024,
+        ).decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        fail(f"toolchain public key is not ASCII: {error}")
+    public_key = decode_base64(public_key_text, "toolchain public key", 32)
     if receipt["keyID"] != hashlib.sha256(public_key).hexdigest():
         fail("toolchain authority receipt key identifier is invalid")
     signature = decode_base64(
@@ -2210,14 +3500,14 @@ def validate_toolchain_authority_closure(
     source_repository: str,
     toolchain_version: str,
 ) -> dict[str, dict[str, Any]]:
-    request = validate_toolchain_release_request(
+    request, request_digest = validate_toolchain_release_request(
         release_request_path,
         manifest,
         source_repository=source_repository,
     )
-    envelope = validate_toolchain_authority_envelope(
+    envelope, envelope_digest = validate_toolchain_authority_envelope(
         envelope_path,
-        release_request_path,
+        request_digest,
         request,
         source_repository=source_repository,
         toolchain_version=toolchain_version,
@@ -2252,10 +3542,8 @@ def validate_toolchain_authority_closure(
     if any(receipt[field] != envelope[field] for field in shared_fields):
         fail("toolchain authority receipt and envelope identity differ")
     if (
-        receipt["sourceReleaseRequestSHA256"]
-        != sha256_file(release_request_path, limit=64 * 1_024 * 1_024)
-        or receipt["authorityEnvelopeSHA256"]
-        != sha256_file(envelope_path, limit=64 * 1_024 * 1_024)
+        receipt["sourceReleaseRequestSHA256"] != request_digest
+        or receipt["authorityEnvelopeSHA256"] != envelope_digest
         or receipt["unsignedManifestSHA256"] != request["manifestSHA256"]
     ):
         fail("toolchain authority receipt does not bind its provenance closure")
@@ -2298,6 +3586,7 @@ def validate_remote_toolchain_assets(
     release_request_path: Path,
     authority_envelope_path: Path,
     authority_receipt_path: Path,
+    benchmark_evidence_path: Path,
     manifest: dict[str, Any],
     *,
     source_repository: str,
@@ -2329,28 +3618,39 @@ def validate_remote_toolchain_assets(
         if name in by_name:
             fail(f"published toolchain release has duplicate asset {name}")
         by_name[name] = asset
-    expected: dict[str, tuple[int, str, str]] = {
-        "manifest.json": (
-            manifest_path.stat().st_size,
-            sha256_file(manifest_path),
-            f"https://github.com/{source_repository}/releases/download/toolchain-v{toolchain_version}/manifest.json",
+    local_assets = {
+        "manifest.json": (manifest_path, 8 * 1_024 * 1_024),
+        TOOLCHAIN_AUTHORITY_RECEIPT_NAME: (
+            authority_receipt_path,
+            1 * 1_024 * 1_024,
         ),
-        "authority-receipt.json": (
-            authority_receipt_path.stat().st_size,
-            sha256_file(authority_receipt_path),
-            f"https://github.com/{source_repository}/releases/download/toolchain-v{toolchain_version}/authority-receipt.json",
+        TOOLCHAIN_AUTHORITY_ENVELOPE_NAME: (
+            authority_envelope_path,
+            64 * 1_024 * 1_024,
         ),
-        "authority-envelope.json": (
-            authority_envelope_path.stat().st_size,
-            sha256_file(authority_envelope_path),
-            f"https://github.com/{source_repository}/releases/download/toolchain-v{toolchain_version}/authority-envelope.json",
+        TOOLCHAIN_BENCHMARK_EVIDENCE_NAME: (
+            benchmark_evidence_path,
+            8 * 1_024 * 1_024,
         ),
         "toolchain-release-request.json": (
-            release_request_path.stat().st_size,
-            sha256_file(release_request_path),
-            f"https://github.com/{source_repository}/releases/download/toolchain-v{toolchain_version}/toolchain-release-request.json",
+            release_request_path,
+            8 * 1_024 * 1_024,
         ),
     }
+    expected: dict[str, tuple[int, str, str]] = {}
+    for name, (path, limit) in local_assets.items():
+        snapshot = snapshot_bounded_regular_file(
+            path,
+            f"local toolchain release asset {name}",
+            limit=limit,
+            capture_bytes=False,
+        )
+        expected[name] = (
+            snapshot.size_bytes,
+            snapshot.sha256,
+            f"https://github.com/{source_repository}/releases/download/"
+            f"toolchain-v{toolchain_version}/{name}",
+        )
     for component in manifest["components"]:
         name = Path(component["url"]).name
         expected[name] = (component["sizeBytes"], component["sha256"], component["url"])
@@ -2374,6 +3674,7 @@ def full_toolchain_identity(manifest: dict[str, Any]) -> str:
         "sha256",
         "sizeBytes",
         "expandedSizeBytes",
+        "expandedClosureSHA256",
         "contents",
         "criticalFileHashes",
         "dependencies",
@@ -2418,17 +3719,96 @@ def full_toolchain_identity(manifest: dict[str, Any]) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def validate_release_notes(path: Path, *, app_version: str) -> None:
+def validate_release_notes(
+    path: Path, *, app_version: str, release_mode: str = "development-unsigned"
+) -> None:
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+        text = read_bounded_regular_file(
+            path,
+            "release notes",
+            limit=64 * 1_024,
+        ).decode("utf-8")
+    except UnicodeDecodeError as error:
         fail(f"release notes are invalid: {error}")
-    expected = (
-        f"EasySplat {app_version} is an unsigned public beta.\n"
-        "macOS will require the user to confirm opening an app from an unidentified developer.\n"
-    )
+    if release_mode == "production":
+        expected = (
+            f"EasySplat {app_version} is a Developer ID-signed and notarized release.\n"
+            "It runs locally on Apple Silicon Macs.\n"
+        )
+    else:
+        expected = (
+            f"EasySplat {app_version} is an unsigned developer build, not a release artifact.\n"
+            "macOS will require the user to confirm opening an app from an unidentified developer.\n"
+        )
     if text != expected:
-        fail("release notes do not exactly describe the unsigned public beta")
+        fail(f"release notes do not exactly describe the {release_mode}")
+
+
+def validate_signed_artifact_evidence(
+    artifact: Path,
+    *,
+    artifact_type: str,
+    signing_receipt: Path,
+    notarization_receipt: Path,
+) -> dict[str, str]:
+    initial = load_json(
+        signing_receipt,
+        f"{artifact_type} signing receipt",
+        limit=16 * 1_024 * 1_024,
+    )
+    fingerprint = initial.get("identityFingerprintSHA1")
+    team_id = initial.get("teamID")
+    if (
+        not isinstance(fingerprint, str)
+        or re.fullmatch(r"[0-9A-F]{40}", fingerprint) is None
+        or not isinstance(team_id, str)
+        or re.fullmatch(r"[A-Z0-9]{10}", team_id) is None
+    ):
+        fail(f"{artifact_type} signing receipt has an invalid Developer ID identity")
+    try:
+        signing = SIGNING_HELPER.validate_signing_receipt(
+            signing_receipt.resolve(strict=True),
+            kind=artifact_type,
+            identity_fingerprint=fingerprint,
+            team_id=team_id,
+        )
+        notarization = NOTARY_HELPER.validate_notarization_receipt(
+            notarization_receipt.resolve(strict=True),
+            artifact.resolve(strict=True),
+            artifact_type,
+            signing_receipt=signing_receipt.resolve(strict=True),
+        )
+    except (OSError, SIGNING_HELPER.SigningError, NOTARY_HELPER.ReceiptError) as error:
+        fail(f"{artifact_type} signing/notarization evidence is invalid: {error}")
+    if (
+        signing.get("identityFingerprintSHA1") != fingerprint
+        or signing.get("teamID") != team_id
+    ):
+        fail(f"{artifact_type} signing identity changed during verification")
+    signing_payload, signing_sha256 = load_json_with_sha256(
+        signing_receipt,
+        f"{artifact_type} signing receipt",
+        limit=16 * 1_024 * 1_024,
+    )
+    notarization_payload, notarization_sha256 = load_json_with_sha256(
+        notarization_receipt,
+        f"{artifact_type} notarization receipt",
+        limit=4 * 1_024 * 1_024,
+    )
+    if signing_payload != signing or notarization_payload != notarization:
+        fail(f"{artifact_type} signing/notarization evidence changed")
+    post_staple_sha256 = notarization.get("postStapleSHA256")
+    if not isinstance(post_staple_sha256, str) or not SHA256.fullmatch(
+        post_staple_sha256
+    ):
+        fail(f"{artifact_type} notarization receipt has no final artifact digest")
+    return {
+        "identity_fingerprint_sha1": fingerprint,
+        "team_id": team_id,
+        "signing_receipt_sha256": signing_sha256,
+        "notarization_receipt_sha256": notarization_sha256,
+        "post_staple_sha256": post_staple_sha256,
+    }
 
 
 def validate_benchmark_suite(
@@ -2460,8 +3840,18 @@ def validate_benchmark_suite(
         "missing_requirements",
     }
     require_exact_keys(payload, expected_keys, "verified benchmark suite")
-    if payload["schema_version"] != 1 or payload["profile"] != "release":
+    if payload["schema_version"] != 2 or payload["profile"] != "release":
         fail("verified benchmark suite schema or profile is invalid")
+    try:
+        suite_run_id = uuid.UUID(payload["run_id"])
+    except (AttributeError, TypeError, ValueError):
+        fail("verified benchmark suite run ID is invalid")
+    if (
+        str(suite_run_id) != payload["run_id"]
+        or suite_run_id.version != 5
+        or suite_run_id.variant != uuid.RFC_4122
+    ):
+        fail("verified benchmark suite run ID is invalid")
     if (
         payload["status"] != "passed"
         or payload["blocking_reasons"] != []
@@ -2484,6 +3874,115 @@ def validate_benchmark_suite(
     return payload
 
 
+def load_json_with_sha256(
+    path: Path, label: str, *, limit: int
+) -> tuple[dict[str, Any], str]:
+    raw = read_bounded_regular_file(path, label, limit=limit)
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"invalid {label}: {error}")
+    if not isinstance(payload, dict):
+        fail(f"{label} must be a JSON object")
+    if raw != canonical_json_bytes(payload):
+        fail(f"{label} is not canonical JSON")
+    return payload, hashlib.sha256(raw).hexdigest()
+
+
+def require_positive_decimal_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.isdecimal() or int(value) <= 0:
+        fail(f"{label} must be a positive decimal string")
+    return value
+
+
+def build_publication_manifest_payload(
+    *,
+    app_version: str,
+    toolchain_version: str,
+    source_repository: str,
+    source_commit: str,
+    tag: str,
+    release_mode: str,
+    benchmark_run_id: str | None,
+    benchmark_artifact_id: str | None,
+    benchmark_artifact_digest: str | None,
+    benchmark_suite_sha256: str | None,
+    files: list[dict[str, Any]],
+    signed_build: dict[str, str] | None,
+) -> dict[str, Any]:
+    validate_release_mode(release_mode)
+    benchmark_values = (
+        benchmark_run_id,
+        benchmark_artifact_id,
+        benchmark_artifact_digest,
+        benchmark_suite_sha256,
+    )
+    if any(value is not None for value in benchmark_values):
+        if any(value is None for value in benchmark_values):
+            fail("benchmark publication identity must be supplied as one complete set")
+        assert benchmark_suite_sha256 is not None
+        if not SHA256.fullmatch(benchmark_suite_sha256):
+            fail("benchmark suite digest must be 64 lowercase hex")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "app_version": app_version,
+        "toolchain_version": toolchain_version,
+        "source_repository": source_repository,
+        "source_commit": source_commit,
+        "tag": tag,
+        "release_mode": release_mode,
+        "benchmark": (
+            {
+                "run_id": benchmark_run_id,
+                "artifact_id": benchmark_artifact_id,
+                "artifact_digest": benchmark_artifact_digest,
+                "suite_sha256": benchmark_suite_sha256,
+            }
+            if benchmark_run_id is not None
+            else None
+        ),
+        "files": files,
+    }
+    if release_mode == "production":
+        if signed_build is None:
+            fail("production publication requires signed build identity")
+        require_exact_keys(
+            signed_build,
+            {
+                "artifact_id",
+                "artifact_digest",
+                "workflow_run_id",
+                "workflow_run_attempt",
+                "source_commit",
+            },
+            "signed build record",
+        )
+        require_positive_decimal_string(
+            signed_build["artifact_id"], "signed build artifact ID"
+        )
+        require_positive_decimal_string(
+            signed_build["workflow_run_id"], "signed build workflow run ID"
+        )
+        require_positive_decimal_string(
+            signed_build["workflow_run_attempt"],
+            "signed build workflow run attempt",
+        )
+        if (
+            signed_build["source_commit"] != source_commit
+            or not isinstance(signed_build["artifact_digest"], str)
+            or not SHA256_DIGEST.fullmatch(signed_build["artifact_digest"])
+        ):
+            fail("signed build record identity is invalid")
+        payload["signed_build"] = signed_build
+    elif signed_build is not None:
+        fail("development-unsigned publication must not include signed build identity")
+    return payload
+
+
 def validate_publication_output_root(root: Path) -> None:
     if root.exists():
         if root.is_symlink() or not root.is_dir() or any(root.iterdir()):
@@ -2492,22 +3991,466 @@ def validate_publication_output_root(root: Path) -> None:
         root.mkdir(parents=True)
 
 
+def rename_directory_exclusive(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    try:
+        rename_entry_exclusive_raw(
+            parent_descriptor,
+            source_name,
+            destination_name,
+        )
+        return
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            fail("publication output appeared during the transaction")
+        if error.errno == errno.EINVAL:
+            fail("publication transaction has an invalid directory name")
+        fail(
+            "cannot commit publication transaction exclusively: "
+            f"{error}"
+        )
+
+
+@contextlib.contextmanager
+def transactional_publication_output(
+    output: Path,
+    *,
+    expected_names: set[str],
+    commit_bindings: dict[str, BoundedRegularFileCopy],
+) -> Iterator[Path]:
+    if not expected_names or any(
+        not name or Path(name).name != name for name in expected_names
+    ):
+        fail("publication transaction has invalid expected file names")
+    if output.exists() or output.is_symlink():
+        fail("publication output must not exist before the transaction")
+    parent = output.parent
+    try:
+        parent_metadata = parent.lstat()
+    except OSError as error:
+        fail(f"cannot inspect publication output parent: {error}")
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent.is_symlink()
+        or parent_metadata.st_uid != os.geteuid()
+        or parent_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        fail(
+            "publication output parent must be an owned, private real directory"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None:
+        fail("publication transaction directory safety flags are unavailable")
+    try:
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | nofollow
+            | directory_flag
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened_parent = bounded_regular_file_identity(
+            os.fstat(parent_descriptor)
+        )
+    except OSError as error:
+        fail(f"cannot pin publication output parent: {error}")
+    if opened_parent != bounded_regular_file_identity(parent_metadata):
+        os.close(parent_descriptor)
+        fail("publication output parent changed while it was opened")
+    staging_descriptor: int | None = None
+    try:
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{output.name}.publication-",
+                dir=parent,
+            )
+        )
+        staging_descriptor = os.open(
+            staging.name,
+            os.O_RDONLY
+            | nofollow
+            | directory_flag
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_descriptor,
+        )
+        os.fchmod(staging_descriptor, 0o700)
+        staging_metadata = os.fstat(staging_descriptor)
+        staging_path_metadata = os.stat(
+            staging.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        staging_identity = bounded_regular_file_identity(staging_metadata)
+        if (
+            staging_identity
+            != bounded_regular_file_identity(staging_path_metadata)
+            or not stat.S_ISDIR(staging_metadata.st_mode)
+            or staging_metadata.st_uid != os.geteuid()
+            or staging_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            fail("publication transaction staging directory is unsafe")
+    except (OSError, PublicationError) as error:
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
+        os.close(parent_descriptor)
+        fail(f"cannot create private publication transaction: {error}")
+    renamed = False
+    try:
+        yield staging
+        frozen_bindings = dict(commit_bindings)
+        if set(frozen_bindings) != expected_names or any(
+            not isinstance(binding, BoundedRegularFileCopy)
+            for binding in frozen_bindings.values()
+        ):
+            fail("publication transaction commit binding is incomplete")
+        try:
+            staged_names = set(os.listdir(staging_descriptor))
+        except OSError as error:
+            fail(f"cannot inspect completed publication transaction: {error}")
+        if staged_names != expected_names:
+            fail("publication transaction does not contain its exact file closure")
+
+        with contextlib.ExitStack() as opened_files:
+            for name in sorted(expected_names):
+                expected = frozen_bindings[name]
+                descriptor, identity = opened_files.enter_context(
+                    open_bounded_regular_file(
+                        name,
+                        f"publication commit file {name}",
+                        limit=max(expected.snapshot.size_bytes, 1),
+                        directory_descriptor=staging_descriptor,
+                    )
+                )
+                if identity != expected.destination_identity:
+                    fail(f"publication commit file identity changed: {name}")
+                snapshot = snapshot_opened_regular_file(
+                    descriptor,
+                    identity,
+                    f"publication commit file {name}",
+                    capture_bytes=False,
+                )
+                if snapshot != expected.snapshot:
+                    fail(f"publication commit file digest changed: {name}")
+
+            try:
+                os.fsync(staging_descriptor)
+                current_parent_metadata = os.stat(parent, follow_symlinks=False)
+                current_staging = bounded_regular_file_identity(
+                    os.stat(
+                        staging.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+            except OSError as error:
+                fail(f"cannot revalidate publication transaction: {error}")
+            current_parent = bounded_regular_file_identity(
+                current_parent_metadata
+            )
+            if (
+                current_parent.device,
+                current_parent.inode,
+                current_parent.mode,
+                current_parent_metadata.st_uid,
+            ) != (
+                opened_parent.device,
+                opened_parent.inode,
+                opened_parent.mode,
+                parent_metadata.st_uid,
+            ) or (
+                current_staging.device,
+                current_staging.inode,
+            ) != (
+                staging_identity.device,
+                staging_identity.inode,
+            ):
+                fail("publication transaction identity changed before commit")
+            rename_directory_exclusive(
+                parent_descriptor,
+                staging.name,
+                output.name,
+            )
+            renamed = True
+            try:
+                output_identity = bounded_regular_file_identity(
+                    os.stat(
+                        output.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                os.fsync(parent_descriptor)
+                final_parent_metadata = os.stat(
+                    parent,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                fail(f"cannot commit publication transaction: {error}")
+            if (staging_identity.device, staging_identity.inode) != (
+                output_identity.device,
+                output_identity.inode,
+            ) or (
+                final_parent_metadata.st_dev,
+                final_parent_metadata.st_ino,
+                final_parent_metadata.st_mode,
+                final_parent_metadata.st_uid,
+            ) != (
+                opened_parent.device,
+                opened_parent.inode,
+                opened_parent.mode,
+                parent_metadata.st_uid,
+            ):
+                fail("publication transaction identity changed during commit")
+    except BaseException:
+        if renamed:
+            quarantine_owned_entry(
+                parent_descriptor,
+                output.name,
+                staging_identity,
+            )
+        raise
+    finally:
+        if staging_descriptor is not None:
+            os.close(staging_descriptor)
+        os.close(parent_descriptor)
+
+
+def copy_staged_publication_payload(
+    *,
+    sources: dict[str, Path],
+    expected: dict[str, BoundedRegularFileSnapshot],
+    output: Path,
+    limits: dict[str, int],
+) -> StagedPublicationPayload:
+    names = set(limits)
+    if set(sources) != names or set(expected) != names:
+        fail("staged publication payload closure is not exact")
+    validate_publication_output_root(output)
+    created: list[tuple[Path, BoundedRegularFileIdentity]] = []
+    records: list[dict[str, Any]] = []
+    bindings: dict[str, BoundedRegularFileCopy] = {}
+    try:
+        for name in sorted(names):
+            destination = output / name
+            copied = copy_bounded_regular_file_with_identity(
+                sources[name],
+                destination,
+                f"staged publication file {name}",
+                limit=limits[name],
+            )
+            snapshot = copied.snapshot
+            created.append((destination, copied.destination_identity))
+            bindings[name] = copied
+            if snapshot != expected[name]:
+                fail(f"staged publication file {name} changed after acquisition")
+            records.append(
+                {
+                    "name": name,
+                    "sha256": snapshot.sha256,
+                    "size_bytes": snapshot.size_bytes,
+                }
+            )
+        require_exact_directory(output, limits, label="publication payload")
+        rebound = [
+            file_record(output / name, maximum_size=limits[name])
+            for name in sorted(names)
+        ]
+        if rebound != records:
+            fail("publication payload changed after its bounded copy")
+        return StagedPublicationPayload(
+            records=records,
+            bindings=bindings,
+        )
+    except BaseException:
+        for path, owned_identity in created:
+            remove_owned_regular_file(path, owned_identity)
+        raise
+
+
 def verify_and_prepare_publication(
     *,
     bundle: Path,
     output: Path,
-    benchmark_suite: Path,
+    benchmark_suite: Path | None,
     toolchain_public_key: Path,
     app_version: str,
     toolchain_version: str,
     source_repository: str,
     source_commit: str,
     tag: str,
-    benchmark_run_id: str,
-    benchmark_artifact_id: str,
-    benchmark_artifact_digest: str,
+    benchmark_run_id: str | None,
+    benchmark_artifact_id: str | None,
+    benchmark_artifact_digest: str | None,
     github_token: str,
+    release_mode: str = "development-unsigned",
+    signed_artifact_id: str | None = None,
+    signed_artifact_digest: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_run_attempt: str | None = None,
 ) -> None:
+    signed_values = {
+        "signed artifact ID": signed_artifact_id,
+        "signed artifact digest": signed_artifact_digest,
+        "workflow run ID": workflow_run_id,
+        "workflow run attempt": workflow_run_attempt,
+    }
+    signed_build: dict[str, str] | None = None
+    if release_mode == "production":
+        missing = sorted(
+            label for label, value in signed_values.items() if value is None
+        )
+        if missing:
+            fail(
+                "production publication requires complete signed build "
+                f"identity; missing {', '.join(missing)}"
+            )
+        assert signed_artifact_id is not None
+        assert signed_artifact_digest is not None
+        assert workflow_run_id is not None
+        assert workflow_run_attempt is not None
+        require_positive_decimal_string(
+            signed_artifact_id, "signed build artifact ID"
+        )
+        require_positive_decimal_string(
+            workflow_run_id, "signed build workflow run ID"
+        )
+        require_positive_decimal_string(
+            workflow_run_attempt, "signed build workflow run attempt"
+        )
+        if not SHA256_DIGEST.fullmatch(signed_artifact_digest):
+            fail("signed build artifact digest is invalid")
+        signed_build = {
+            "artifact_id": signed_artifact_id,
+            "artifact_digest": signed_artifact_digest,
+            "workflow_run_id": workflow_run_id,
+            "workflow_run_attempt": workflow_run_attempt,
+            "source_commit": source_commit,
+        }
+    elif any(value is not None for value in signed_values.values()):
+        fail("development-unsigned publication must not receive signed build identity")
+
+    benchmark_identity_present = benchmark_run_id is not None
+    if benchmark_identity_present != (benchmark_suite is not None):
+        fail("benchmark suite and authenticated benchmark identity must be supplied together")
+
+    validate_identity(
+        app_version=app_version,
+        toolchain_version=toolchain_version,
+        source_repository=source_repository,
+        source_commit=source_commit,
+        tag=tag,
+        benchmark_run_id=benchmark_run_id,
+        benchmark_artifact_id=benchmark_artifact_id,
+        benchmark_artifact_digest=benchmark_artifact_digest,
+        release_mode=release_mode,
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="easysplat-publication-inputs-"
+    ) as temporary:
+        stage = Path(temporary)
+        bundle_limits = build_file_limits(app_version, release_mode)
+        bundle_limits[BUILD_CLOSURE_NAME] = 4 * 1_024 * 1_024
+        staged_bundle = stage / "bundle"
+        bundle_snapshots = stage_exact_directory(
+            bundle,
+            staged_bundle,
+            bundle_limits,
+            label="build bundle",
+        )
+        staged_benchmark: Path | None = None
+        benchmark_snapshot: BoundedRegularFileSnapshot | None = None
+        if benchmark_suite is not None:
+            staged_benchmark = stage / "benchmark-suite.json"
+            benchmark_snapshot = copy_bounded_regular_file(
+                benchmark_suite,
+                staged_benchmark,
+                "benchmark suite",
+                limit=128 * 1_024 * 1_024,
+            )
+        staged_public_key = stage / "toolchain-public-key.txt"
+        copy_bounded_regular_file(
+            toolchain_public_key,
+            staged_public_key,
+            "tracked toolchain public key",
+            limit=1_024,
+        )
+
+        benchmark_name = f"EasySplat-{app_version}-benchmark.json"
+        expected_publication_snapshots = {
+            name: bundle_snapshots[name]
+            for name in publication_payload_names(
+                app_version,
+                release_mode,
+                include_benchmark=benchmark_identity_present,
+            )
+            if name != benchmark_name
+        }
+        if benchmark_snapshot is not None:
+            expected_publication_snapshots[benchmark_name] = benchmark_snapshot
+        expected_output_names = {
+            *publication_payload_names(
+                app_version,
+                release_mode,
+                include_benchmark=benchmark_identity_present,
+            ),
+            PUBLICATION_MANIFEST_NAME,
+        }
+        commit_bindings: dict[str, BoundedRegularFileCopy] = {}
+        with transactional_publication_output(
+            output,
+            expected_names=expected_output_names,
+            commit_bindings=commit_bindings,
+        ) as staged_output:
+            commit_bindings.update(
+                _verify_staged_publication(
+                    bundle=staged_bundle,
+                    output=staged_output,
+                    benchmark_suite=staged_benchmark,
+                    toolchain_public_key=staged_public_key,
+                    app_version=app_version,
+                    toolchain_version=toolchain_version,
+                    source_repository=source_repository,
+                    source_commit=source_commit,
+                    tag=tag,
+                    benchmark_run_id=benchmark_run_id,
+                    benchmark_artifact_id=benchmark_artifact_id,
+                    benchmark_artifact_digest=benchmark_artifact_digest,
+                    github_token=github_token,
+                    release_mode=release_mode,
+                    signed_build=signed_build,
+                    expected_publication_snapshots=(
+                        expected_publication_snapshots
+                    ),
+                )
+            )
+
+
+def _verify_staged_publication(
+    *,
+    bundle: Path,
+    output: Path,
+    benchmark_suite: Path | None,
+    toolchain_public_key: Path,
+    app_version: str,
+    toolchain_version: str,
+    source_repository: str,
+    source_commit: str,
+    tag: str,
+    benchmark_run_id: str | None,
+    benchmark_artifact_id: str | None,
+    benchmark_artifact_digest: str | None,
+    github_token: str,
+    release_mode: str,
+    signed_build: dict[str, str] | None,
+    expected_publication_snapshots: dict[
+        str, BoundedRegularFileSnapshot
+    ],
+) -> dict[str, BoundedRegularFileCopy]:
     validate_build_bundle(
         bundle,
         app_version=app_version,
@@ -2518,10 +4461,12 @@ def verify_and_prepare_publication(
         benchmark_run_id=benchmark_run_id,
         benchmark_artifact_id=benchmark_artifact_id,
         benchmark_artifact_digest=benchmark_artifact_digest,
+        release_mode=release_mode,
     )
     stem = f"EasySplat-{app_version}"
-    dmg = bundle / f"{stem}-unsigned.dmg"
-    checksum = bundle / f"{stem}-unsigned.dmg.sha256"
+    suffix = "-unsigned" if release_mode == "development-unsigned" else ""
+    dmg = bundle / f"{stem}{suffix}.dmg"
+    checksum = bundle / f"{stem}{suffix}.dmg.sha256"
     provenance_path = bundle / f"{stem}.provenance.json"
     spdx = bundle / f"{stem}.spdx.json"
     licenses = bundle / f"{stem}-licenses.zip"
@@ -2531,6 +4476,11 @@ def verify_and_prepare_publication(
     release_request_path = bundle / TOOLCHAIN_RELEASE_REQUEST_NAME
     authority_envelope_path = bundle / TOOLCHAIN_AUTHORITY_ENVELOPE_NAME
     authority_receipt_path = bundle / TOOLCHAIN_AUTHORITY_RECEIPT_NAME
+    benchmark_evidence_path = bundle / TOOLCHAIN_BENCHMARK_EVIDENCE_NAME
+    app_signing_receipt = bundle / f"{stem}.app-signing.json"
+    app_notary_receipt = bundle / f"{stem}.app-notarization.json"
+    dmg_signing_receipt = bundle / f"{stem}.dmg-signing.json"
+    dmg_notary_receipt = bundle / f"{stem}.dmg-notarization.json"
 
     validate_dmg_checksum(dmg, checksum)
     provenance = validate_provenance(
@@ -2541,8 +4491,18 @@ def verify_and_prepare_publication(
         source_commit=source_commit,
         dmg=dmg,
         manifest=manifest_path,
+        release_mode=release_mode,
     )
-    validate_release_notes(notes, app_version=app_version)
+    rebound_provenance, _ = load_json_with_sha256(
+        provenance_path,
+        "release provenance",
+        limit=8 * 1_024 * 1_024,
+    )
+    if rebound_provenance != provenance:
+        fail("release provenance changed during verification")
+    validate_release_notes(
+        notes, app_version=app_version, release_mode=release_mode
+    )
     manifest = validate_toolchain_manifest(
         manifest_path,
         toolchain_public_key,
@@ -2578,17 +4538,28 @@ def verify_and_prepare_publication(
         release_request_path,
         authority_envelope_path,
         authority_receipt_path,
+        benchmark_evidence_path,
         manifest,
         source_repository=source_repository,
         toolchain_version=toolchain_version,
         github_token=github_token,
     )
-    validate_benchmark_suite(
-        benchmark_suite,
-        app_version=app_version,
-        source_commit=source_commit,
-        toolchain_identity=full_toolchain_identity(manifest),
-    )
+    if benchmark_suite is not None:
+        validate_benchmark_suite(
+            benchmark_suite,
+            app_version=app_version,
+            source_commit=source_commit,
+            toolchain_identity=full_toolchain_identity(manifest),
+        )
+
+    dmg_signing_evidence: dict[str, str] | None = None
+    if release_mode == "production":
+        dmg_signing_evidence = validate_signed_artifact_evidence(
+            dmg,
+            artifact_type="dmg",
+            signing_receipt=dmg_signing_receipt,
+            notarization_receipt=dmg_notary_receipt,
+        )
 
     # The DMG is mounted read-only. Its binary is only parsed by system inspection tools.
     with mounted_dmg(dmg) as mount:
@@ -2610,7 +4581,23 @@ def verify_and_prepare_publication(
             toolchain_version=toolchain_version,
             source_repository=source_repository,
             toolchain_public_key=toolchain_public_key,
+            release_mode=release_mode,
         )
+        if release_mode == "production":
+            app_signing_evidence = validate_signed_artifact_evidence(
+                app,
+                artifact_type="app",
+                signing_receipt=app_signing_receipt,
+                notarization_receipt=app_notary_receipt,
+            )
+            if (
+                dmg_signing_evidence is None
+                or app_signing_evidence["identity_fingerprint_sha1"]
+                != dmg_signing_evidence["identity_fingerprint_sha1"]
+                or app_signing_evidence["team_id"]
+                != dmg_signing_evidence["team_id"]
+            ):
+                fail("app and disk image use different Developer ID identities")
         app_binary = app / "Contents/MacOS/EasySplatApp"
         validate_dsym_archive(dsym, app_binary)
         if app_uuid != parse_uuid(
@@ -2638,38 +4625,91 @@ def verify_and_prepare_publication(
         ):
             fail(f"provenance and signed manifest differ for {provenance_name}")
 
-    validate_publication_output_root(output)
-    public_names = publication_payload_names(app_version)
+    include_benchmark = benchmark_suite is not None
+    public_names = publication_payload_names(
+        app_version,
+        release_mode,
+        include_benchmark=include_benchmark,
+    )
     benchmark_name = f"{stem}-benchmark.json"
     source_by_name = {
         name: bundle / name for name in public_names if name != benchmark_name
     }
-    source_by_name[benchmark_name] = benchmark_suite
-    for name in public_names:
-        shutil.copyfile(source_by_name[name], output / name)
-    limits = publication_file_limits(app_version)
-    require_exact_directory(output, limits, label="publication payload")
-    manifest_payload = {
-        "schema_version": 1,
-        "app_version": app_version,
-        "toolchain_version": toolchain_version,
-        "source_repository": source_repository,
-        "source_commit": source_commit,
-        "tag": tag,
-        "release_mode": "unsigned-beta",
-        "benchmark": {
-            "run_id": benchmark_run_id,
-            "artifact_id": benchmark_artifact_id,
-            "artifact_digest": benchmark_artifact_digest,
-            "suite_sha256": sha256_file(benchmark_suite, limit=128 * 1_024 * 1_024),
-        },
-        "files": [
-            file_record(output / name, maximum_size=limits[name])
-            for name in sorted(limits)
-        ],
+    if benchmark_suite is not None:
+        source_by_name[benchmark_name] = benchmark_suite
+    limits = publication_file_limits(
+        app_version,
+        release_mode,
+        include_benchmark=include_benchmark,
+    )
+    publication_payload = copy_staged_publication_payload(
+        sources=source_by_name,
+        expected=expected_publication_snapshots,
+        output=output,
+        limits=limits,
+    )
+    manifest_payload = build_publication_manifest_payload(
+        app_version=app_version,
+        toolchain_version=toolchain_version,
+        source_repository=source_repository,
+        source_commit=source_commit,
+        tag=tag,
+        release_mode=release_mode,
+        benchmark_run_id=benchmark_run_id,
+        benchmark_artifact_id=benchmark_artifact_id,
+        benchmark_artifact_digest=benchmark_artifact_digest,
+        benchmark_suite_sha256=(
+            expected_publication_snapshots[benchmark_name].sha256
+            if include_benchmark
+            else None
+        ),
+        files=publication_payload.records,
+        signed_build=signed_build,
+    )
+    manifest_bytes = canonical_json_bytes(manifest_payload)
+    manifest_path = output / PUBLICATION_MANIFEST_NAME
+    manifest_descriptor: int | None = None
+    try:
+        manifest_descriptor = os.open(
+            manifest_path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | os.O_NOFOLLOW,
+            0o600,
+        )
+        written = 0
+        while written < len(manifest_bytes):
+            try:
+                count = os.write(manifest_descriptor, manifest_bytes[written:])
+            except InterruptedError:
+                continue
+            if count <= 0:
+                fail("cannot write publication manifest: short write")
+            written += count
+        os.fsync(manifest_descriptor)
+    except OSError as error:
+        fail(f"cannot write publication manifest: {error}")
+    finally:
+        if manifest_descriptor is not None:
+            os.close(manifest_descriptor)
+    manifest_binding = bind_bounded_regular_file(
+        manifest_path,
+        "publication manifest",
+        limit=16 * 1_024 * 1_024,
+    )
+    expected_manifest_snapshot = BoundedRegularFileSnapshot(
+        data=None,
+        sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        size_bytes=len(manifest_bytes),
+    )
+    if manifest_binding.snapshot != expected_manifest_snapshot:
+        fail("publication manifest changed after creation")
+    return {
+        **publication_payload.bindings,
+        PUBLICATION_MANIFEST_NAME: manifest_binding,
     }
-    with (output / PUBLICATION_MANIFEST_NAME).open("xb") as stream:
-        stream.write(canonical_json_bytes(manifest_payload))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2677,14 +4717,19 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
 
     def add_identity(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "--release-mode",
+            choices=("development-unsigned", "production"),
+            default="development-unsigned",
+        )
         command.add_argument("--app-version", required=True)
         command.add_argument("--toolchain-version", required=True)
         command.add_argument("--source-repository", required=True)
         command.add_argument("--source-commit", required=True)
         command.add_argument("--tag", required=True)
-        command.add_argument("--benchmark-run-id", required=True)
-        command.add_argument("--benchmark-artifact-id", required=True)
-        command.add_argument("--benchmark-artifact-digest", required=True)
+        command.add_argument("--benchmark-run-id")
+        command.add_argument("--benchmark-artifact-id")
+        command.add_argument("--benchmark-artifact-digest")
 
     create = commands.add_parser("create-build-closure")
     create.add_argument("--bundle", type=Path, required=True)
@@ -2693,8 +4738,12 @@ def parser() -> argparse.ArgumentParser:
     verify = commands.add_parser("verify-build")
     verify.add_argument("--bundle", type=Path, required=True)
     verify.add_argument("--output", type=Path, required=True)
-    verify.add_argument("--benchmark-suite", type=Path, required=True)
+    verify.add_argument("--benchmark-suite", type=Path)
     verify.add_argument("--toolchain-public-key", type=Path, required=True)
+    verify.add_argument("--signed-artifact-id")
+    verify.add_argument("--signed-artifact-digest")
+    verify.add_argument("--workflow-run-id")
+    verify.add_argument("--workflow-run-attempt")
     verify.add_argument("--github-token-env", default="GITHUB_TOKEN")
     add_identity(verify)
     return root
@@ -2712,6 +4761,7 @@ def main(arguments: list[str] | None = None) -> int:
             "benchmark_run_id": args.benchmark_run_id,
             "benchmark_artifact_id": args.benchmark_artifact_id,
             "benchmark_artifact_digest": args.benchmark_artifact_digest,
+            "release_mode": args.release_mode,
         }
         if args.command == "create-build-closure":
             create_build_closure(args.bundle, **identity)
@@ -2722,6 +4772,10 @@ def main(arguments: list[str] | None = None) -> int:
                 benchmark_suite=args.benchmark_suite,
                 toolchain_public_key=args.toolchain_public_key,
                 github_token=os.environ.get(args.github_token_env, ""),
+                signed_artifact_id=args.signed_artifact_id,
+                signed_artifact_digest=args.signed_artifact_digest,
+                workflow_run_id=args.workflow_run_id,
+                workflow_run_attempt=args.workflow_run_attempt,
                 **identity,
             )
     except PublicationError as error:

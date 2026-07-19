@@ -933,7 +933,11 @@ def verify_license_zip(path: Path, expected: dict[str, bytes]) -> None:
 def common_args(parser: argparse.ArgumentParser, *, require_urls: bool) -> None:
     parser.add_argument("--app-version", required=True)
     parser.add_argument("--toolchain-version", required=True)
-    parser.add_argument("--release-mode", choices=("unsigned-beta", "production"), required=True)
+    parser.add_argument(
+        "--release-mode",
+        choices=("development-unsigned", "production"),
+        required=True,
+    )
     parser.add_argument("--dmg", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--manifest-url", required=require_urls)

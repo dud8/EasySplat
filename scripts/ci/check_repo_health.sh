@@ -198,6 +198,17 @@ if rg -n -i 'global_mapper|globalmapper|global mapper' \
   exit 1
 fi
 
+for colmap_contract_path in \
+  "$ROOT/EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManager+Validation.swift" \
+  "$ROOT/scripts/benchmark_da3.sh" \
+  "$ROOT/scripts/toolchain/build_colmap_impl.sh" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh"; do
+  if ! rg -n -F 'TwoViewGeometry.random_seed' "$colmap_contract_path" >/dev/null; then
+    echo "Native COLMAP contract does not require deterministic two-view geometry: $colmap_contract_path" >&2
+    exit 1
+  fi
+done
+
 if git -C "$ROOT" ls-files scripts/benchmark | rg '(^|/)suite\.json$|(^|/)raw/|\.(mov|mp4|m4v|heic|jpe?g|png|tiff?)$' >/dev/null; then
   echo "Generated benchmark results or corpus media are tracked in Git." >&2
   exit 1

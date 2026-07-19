@@ -1,20 +1,32 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
+# shellcheck source-path=SCRIPTDIR
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=lib/strict_semver.sh
+source "$ROOT/scripts/release/lib/strict_semver.sh"
 MANIFEST_URL=""
 PUBLIC_KEY_PATH=""
 PROJECT_URL=""
 VERSION=""
 RELEASE_MODE=""
+IDENTITY_FINGERPRINT=""
+TEAM_ID=""
+IDENTITY_FINGERPRINT_SET=0
+TEAM_ID_SET=0
 BOOTSTRAP_MANIFEST=""
 BOOTSTRAP_CORE_ARCHIVE=""
+PREPARED_BOOTSTRAP_VERIFIER=""
 BUILD_ROOT="$ROOT/build"
 XCODEBUILD_BIN="${EASYSPLAT_XCODEBUILD_BIN:-xcodebuild}"
 CODESIGN_BIN="${EASYSPLAT_CODESIGN_BIN:-codesign}"
+XCRUN_BIN="${EASYSPLAT_XCRUN_BIN:-xcrun}"
 INPUT_SNAPSHOT_DIR=""
 BUILD_LOCK=""
 BUILD_LOCK_HELD=0
+APP_BUNDLE=""
+SIGNING_RECEIPT=""
+SIGNED_BUILD_COMPLETE=0
 
 cleanup() {
   local status=$?
@@ -25,6 +37,10 @@ cleanup() {
   fi
   if [ -n "$INPUT_SNAPSHOT_DIR" ]; then
     rm -rf "$INPUT_SNAPSHOT_DIR"
+  fi
+  if [ "$RELEASE_MODE" = production ] && [ "$SIGNED_BUILD_COMPLETE" -ne 1 ]; then
+    [ -z "$APP_BUNDLE" ] || rm -rf "$APP_BUNDLE"
+    [ -z "$SIGNING_RECEIPT" ] || rm -f "$SIGNING_RECEIPT"
   fi
   exit "$status"
 }
@@ -72,12 +88,20 @@ while [[ $# -gt 0 ]]; do
       BUILD_ROOT="$2"
       shift 2
       ;;
-    --unsigned-beta)
+    --manifest-tool-bin)
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--manifest-tool-bin requires an absolute executable path." >&2
+        exit 1
+      fi
+      PREPARED_BOOTSTRAP_VERIFIER="$2"
+      shift 2
+      ;;
+    --development-unsigned)
       if [ -n "$RELEASE_MODE" ]; then
         echo "Choose exactly one release mode." >&2
         exit 1
       fi
-      RELEASE_MODE="unsigned-beta"
+      RELEASE_MODE="development-unsigned"
       shift
       ;;
     --production)
@@ -85,8 +109,42 @@ while [[ $# -gt 0 ]]; do
         echo "Choose exactly one release mode." >&2
         exit 1
       fi
-      echo "Production app builds are not available until signing, notarization, Gatekeeper, and clean-Mac installation gates are complete." >&2
-      exit 1
+      RELEASE_MODE="production"
+      shift
+      ;;
+    --prepare-release)
+      if [ -n "$RELEASE_MODE" ]; then
+        echo "Choose exactly one release mode." >&2
+        exit 1
+      fi
+      RELEASE_MODE="prepare-release"
+      shift
+      ;;
+    --identity-fingerprint)
+      if [ "$IDENTITY_FINGERPRINT_SET" -eq 1 ]; then
+        echo "--identity-fingerprint may be supplied only once." >&2
+        exit 1
+      fi
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--identity-fingerprint requires a 40-hex value." >&2
+        exit 1
+      fi
+      IDENTITY_FINGERPRINT="$2"
+      IDENTITY_FINGERPRINT_SET=1
+      shift 2
+      ;;
+    --team-id)
+      if [ "$TEAM_ID_SET" -eq 1 ]; then
+        echo "--team-id may be supplied only once." >&2
+        exit 1
+      fi
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--team-id requires a 10-character value." >&2
+        exit 1
+      fi
+      TEAM_ID="$2"
+      TEAM_ID_SET=1
+      shift 2
       ;;
     *)
       echo "Unknown arg: $1" >&2
@@ -95,9 +153,70 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
+
 if [ -z "$MANIFEST_URL" ] || [ -z "$PUBLIC_KEY_PATH" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> --bootstrap-manifest <path> --bootstrap-core-archive <path> [--project-url <url>] [--build-root <absolute-path>] --unsigned-beta" >&2
+  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> --bootstrap-manifest <path> --bootstrap-core-archive <path> [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release | --production --identity-fingerprint <sha1> --team-id <id>)" >&2
   exit 1
+fi
+if [ "$RELEASE_MODE" = production ]; then
+  if ! [[ "$IDENTITY_FINGERPRINT" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+    echo "Production builds require an exact 40-hex Developer ID fingerprint." >&2
+    exit 1
+  fi
+  if ! [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+    echo "Production builds require an exact 10-character Team ID." >&2
+    exit 1
+  fi
+  if [ -n "${EASYSPLAT_XCODEBUILD_BIN:-}" ] \
+      || [ -n "${EASYSPLAT_CODESIGN_BIN:-}" ] \
+      || [ -n "${EASYSPLAT_SKIP_METAL_TOOLCHAIN_CHECK:-}" ]; then
+    echo "Production build command overrides are not permitted." >&2
+    exit 1
+  fi
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin
+  export PATH
+  unset DEVELOPER_DIR SDKROOT TOOLCHAINS
+  unset CC CXX LD AR AS NM STRIP LIBTOOL SWIFT_EXEC
+  unset CFLAGS CPPFLAGS CXXFLAGS LDFLAGS
+  while IFS='=' read -r inherited_name _; do
+    case "$inherited_name" in
+      DYLD_*|LD_*) unset "$inherited_name" ;;
+    esac
+  done < <(/usr/bin/env)
+  DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+  MACOSX_DEPLOYMENT_TARGET=15.0
+  export DEVELOPER_DIR MACOSX_DEPLOYMENT_TARGET
+  XCODEBUILD_BIN=/usr/bin/xcodebuild
+  CODESIGN_BIN=/usr/bin/codesign
+  XCRUN_BIN=/usr/bin/xcrun
+elif [ -n "$IDENTITY_FINGERPRINT" ] || [ -n "$TEAM_ID" ]; then
+  echo "Signing identity arguments require --production." >&2
+  exit 1
+fi
+if [ "$RELEASE_MODE" = prepare-release ]; then
+  if [ -n "${EASYSPLAT_XCODEBUILD_BIN:-}" ] \
+      || [ -n "${EASYSPLAT_CODESIGN_BIN:-}" ] \
+      || [ -n "${EASYSPLAT_SKIP_METAL_TOOLCHAIN_CHECK:-}" ]; then
+    echo "Prepared production build command overrides are not permitted." >&2
+    exit 1
+  fi
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin
+  export PATH
+  unset DEVELOPER_DIR SDKROOT TOOLCHAINS
+  unset CC CXX LD AR AS NM STRIP LIBTOOL SWIFT_EXEC
+  unset CFLAGS CPPFLAGS CXXFLAGS LDFLAGS
+  while IFS='=' read -r inherited_name _; do
+    case "$inherited_name" in
+      DYLD_*|LD_*) unset "$inherited_name" ;;
+    esac
+  done < <(/usr/bin/env)
+  DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+  MACOSX_DEPLOYMENT_TARGET=15.0
+  export DEVELOPER_DIR MACOSX_DEPLOYMENT_TARGET
+  XCODEBUILD_BIN=/usr/bin/xcodebuild
+  CODESIGN_BIN=/usr/bin/codesign
+  XCRUN_BIN=/usr/bin/xcrun
 fi
 if { [ -n "$BOOTSTRAP_MANIFEST" ] && [ -z "$BOOTSTRAP_CORE_ARCHIVE" ]; } \
   || { [ -z "$BOOTSTRAP_MANIFEST" ] && [ -n "$BOOTSTRAP_CORE_ARCHIVE" ]; }; then
@@ -105,11 +224,32 @@ if { [ -n "$BOOTSTRAP_MANIFEST" ] && [ -z "$BOOTSTRAP_CORE_ARCHIVE" ]; } \
   exit 1
 fi
 if [ -z "$BOOTSTRAP_MANIFEST" ]; then
-  echo "Unsigned beta app builds require --bootstrap-manifest and --bootstrap-core-archive." >&2
+  echo "Release app builds require --bootstrap-manifest and --bootstrap-core-archive." >&2
   exit 1
 fi
+if [ -n "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
+  if [ "$RELEASE_MODE" != prepare-release ] \
+      || [ ! -x "$PREPARED_BOOTSTRAP_VERIFIER" ] \
+      || [ -L "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
+    echo "A prebuilt ManifestTool is only accepted for a prepared production build." >&2
+    exit 1
+  fi
+  PREPARED_BOOTSTRAP_VERIFIER="$(/usr/bin/python3 -I - "$PREPARED_BOOTSTRAP_VERIFIER" <<'PY'
+import os
+import sys
 
-validated_build_root="$(python3 - "$BUILD_ROOT" "$ROOT" <<'PY'
+value = sys.argv[1]
+if not os.path.isabs(value) or os.path.normpath(value) != value:
+    raise SystemExit("ManifestTool path must be absolute and normalized.")
+resolved = os.path.realpath(value)
+if resolved != value:
+    raise SystemExit("ManifestTool path must contain no symlink ancestry.")
+print(resolved)
+PY
+)" || exit 1
+fi
+
+validated_build_root="$(/usr/bin/python3 -I - "$BUILD_ROOT" "$ROOT" <<'PY'
 import os
 import sys
 
@@ -145,7 +285,7 @@ PY
 )" || exit 1
 BUILD_ROOT="$validated_build_root"
 
-python3 - "$MANIFEST_URL" "$PROJECT_URL" <<'PY'
+/usr/bin/python3 -I - "$MANIFEST_URL" "$PROJECT_URL" <<'PY'
 import sys
 from urllib.parse import urlparse
 
@@ -157,20 +297,18 @@ for label, value in (("Manifest URL", sys.argv[1]), ("Project URL", sys.argv[2])
         raise SystemExit(f"{label} must use HTTPS and contain no credentials.")
 PY
 
-SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-if ! [[ "$VERSION" =~ $SEMVER_RE ]]; then
-  echo "Invalid app semantic version: $VERSION" >&2
+if ! easysplat_is_strict_semver_without_build_metadata "$VERSION"; then
+  echo "App version must be strict semantic versioning without build metadata: $VERSION" >&2
   exit 1
 fi
-
-NUMERIC_VERSION="${VERSION%%+*}"
-NUMERIC_VERSION="${NUMERIC_VERSION%%-*}"
-if [[ "$VERSION" != *-* ]]; then
-  echo "Unsigned public beta versions must include a prerelease suffix." >&2
+if [ "$RELEASE_MODE" != development-unsigned ] \
+    && ! easysplat_is_strict_semver_stable "$VERSION"; then
+  echo "Prepared and production releases require a stable semantic version without build metadata: $VERSION" >&2
   exit 1
 fi
+NUMERIC_VERSION="${VERSION%%-*}"
 
-python3 - "$PUBLIC_KEY_PATH" "$BOOTSTRAP_MANIFEST" "$BOOTSTRAP_CORE_ARCHIVE" <<'PY'
+/usr/bin/python3 -I - "$PUBLIC_KEY_PATH" "$BOOTSTRAP_MANIFEST" "$BOOTSTRAP_CORE_ARCHIVE" <<'PY'
 import os
 import stat
 import sys
@@ -210,7 +348,11 @@ verify_bootstrap() {
     --app-version "$VERSION"
     --core-zip "$core_archive"
   )
-  swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
+  if [ -n "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
+    "$PREPARED_BOOTSTRAP_VERIFIER" "${args[@]}"
+  else
+    /usr/bin/swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
+  fi
 }
 verify_bootstrap \
   "$SNAPSHOT_PUBLIC_KEY" \
@@ -225,7 +367,7 @@ if [ "${XCODEBUILD_BIN##*/}" = "xcodebuild" ]; then
 fi
 
 if [ "${EASYSPLAT_SKIP_METAL_TOOLCHAIN_CHECK:-}" != "1" ] && [ "${XCODEBUILD_BIN##*/}" = "xcodebuild" ]; then
-  if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+  if ! "$XCRUN_BIN" -sdk macosx metal -v >/dev/null 2>&1; then
     echo "Metal Toolchain not installed. Run: xcodebuild -downloadComponent MetalToolchain" >&2
     exit 1
   fi
@@ -249,6 +391,7 @@ OUT="$BUILD_ROOT/Export"
 BIN_PATH="$DERIVED/Build/Products/Release/EasySplatApp"
 BUILT_DSYM_PATH="$DERIVED/Build/Products/Release/EasySplatApp.dSYM"
 APP_BUNDLE="$OUT/EasySplat.app"
+SIGNING_RECEIPT="$OUT/EasySplat.app-signing.json"
 EXPORTED_DSYM_PATH="$OUT/EasySplat.app.dSYM"
 RES_DIR="$APP_BUNDLE/Contents/Resources"
 MACOS_DIR="$APP_BUNDLE/Contents/MacOS"
@@ -276,6 +419,8 @@ rm -rf "$DERIVED" "$OUT"
   CLANG_COVERAGE_MAPPING=NO \
   CLANG_COVERAGE_MAPPING_LINKER_ARGS=NO \
   DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
+  MACOSX_DEPLOYMENT_TARGET=15.0 \
+  SDKROOT=macosx \
   build
 
 if [ ! -f "$BIN_PATH" ]; then
@@ -303,6 +448,8 @@ cp "$BIN_PATH" "$MACOS_DIR/EasySplatApp"
 chmod +x "$MACOS_DIR/EasySplatApp"
 "$CODESIGN_BIN" --verify --strict "$MACOS_DIR/EasySplatApp"
 
+APP_RELEASE_CHANNEL="$RELEASE_MODE"
+
 cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -323,7 +470,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <key>CFBundleVersion</key>
   <string>$NUMERIC_VERSION</string>
   <key>EasySplatReleaseChannel</key>
-  <string>$RELEASE_MODE</string>
+  <string>$APP_RELEASE_CHANNEL</string>
   <key>EasySplatReleaseVersion</key>
   <string>$VERSION</string>
   <key>LSMinimumSystemVersion</key>
@@ -365,7 +512,13 @@ printf "%s" "$MANIFEST_URL" > "$OVERRIDE_RES_DIR/toolchain_manifest_url.txt"
 install -m 0644 "$SNAPSHOT_PUBLIC_KEY" "$OVERRIDE_RES_DIR/public_key_ed25519.txt"
 printf "%s" "$PROJECT_URL" > "$OVERRIDE_RES_DIR/project_home_url.txt"
 cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/"
-printf '%s' 'unsigned public beta' >"$RES_DIR/release_channel.txt"
+if [ "$RELEASE_MODE" = production ]; then
+  printf '%s' 'production release' >"$RES_DIR/release_channel.txt"
+elif [ "$RELEASE_MODE" = prepare-release ]; then
+  printf '%s' 'prepared release candidate' >"$RES_DIR/release_channel.txt"
+else
+  printf '%s' 'unsigned developer build' >"$RES_DIR/release_channel.txt"
+fi
 
 # Copy SwiftPM resource bundles (if present)
 if [ -d "$DERIVED/Build/Products/Release/EasySplat_EasySplatApp.bundle" ]; then
@@ -401,8 +554,29 @@ verify_bootstrap "$BUNDLED_PUBLIC_KEY" \
   "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"
 
 plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
-"$CODESIGN_BIN" --force --deep --sign - --timestamp=none "$APP_BUNDLE"
-"$CODESIGN_BIN" --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+if [ "$RELEASE_MODE" = production ]; then
+  signing_args=(
+    --root "$APP_BUNDLE"
+    --kind app
+    --identity-fingerprint "$IDENTITY_FINGERPRINT"
+    --team-id "$TEAM_ID"
+    --receipt "$SIGNING_RECEIPT"
+  )
+  /usr/bin/python3 -I "$ROOT/scripts/release/sign_macos_distribution.py" \
+    "${signing_args[@]}"
+  /usr/bin/python3 -I "$ROOT/scripts/release/sign_macos_distribution.py" \
+    --verify-only \
+    --bind-receipt-to-current-artifact \
+    --root "$APP_BUNDLE" \
+    --kind app \
+    --identity-fingerprint "$IDENTITY_FINGERPRINT" \
+    --team-id "$TEAM_ID" \
+    --receipt "$SIGNING_RECEIPT"
+  SIGNED_BUILD_COMPLETE=1
+else
+  "$CODESIGN_BIN" --force --deep --sign - --timestamp=none "$APP_BUNDLE"
+  "$CODESIGN_BIN" --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+fi
 
 echo "Built app at: $APP_BUNDLE"
 echo "Preserved dSYM at: $EXPORTED_DSYM_PATH"

@@ -2,13 +2,13 @@
 
 ## Supported versions
 
-Security fixes target the `0.2.x` beta line. No public beta has been published yet. The planned beta is unsigned and not notarized; that limitation is stated in the DMG filename, app metadata, release notes, and provenance.
+Security fixes target the stable `0.2.x` line. Update to the latest published `0.2.x` release before reporting a problem that may already be fixed.
 
 ## Report privately
 
 Do not open a public issue for a vulnerability. Use GitHub private vulnerability reporting for [dud8/EasySplat](https://github.com/dud8/EasySplat/security/advisories/new). If that form is unavailable, contact the maintainer privately before disclosure.
 
-Public-beta packaging independently validates the generated SPDX 2.3 SBOM and blocks fixed High or Critical vulnerabilities before creating a draft release.
+Release packaging independently validates the generated SPDX 2.3 SBOM and blocks fixed High or Critical vulnerabilities before creating a draft release.
 
 Include the affected version or commit, reproduction steps, impact, and any known mitigation. Do not attach private source media, project notes, credentials, or signing keys.
 
@@ -20,7 +20,7 @@ Include the affected version or commit, reproduction steps, impact, and any know
 - Archive traversal, absolute paths, and escaping symlinks are rejected.
 - Stored project paths are relative and pass the project-root resolver.
 - Private signing keys must remain in protected release environments or owner-only local files. They must never appear in arguments, logs, commits, or artifacts.
-- Production packaging is disabled until the full signing, notarization, stapling, Gatekeeper, and clean-Mac installation gates exist. It never falls back to an unsigned production artifact.
+- Direct GitHub releases are Developer ID signed with the hardened runtime, notarized, and stapled. Release verification checks nested code, notarization receipts, Gatekeeper assessment, and a quarantined clean installation. Production packaging never falls back to an unsigned artifact.
 
 ## Diagnostics
 

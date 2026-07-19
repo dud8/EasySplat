@@ -2,18 +2,13 @@
 
 EasySplat turns video, photos, or both into a 3D Gaussian splat on an Apple Silicon Mac. Processing stays on the Mac. The result is a conventional PLY file.
 
-The next release target is `v0.2.0-beta.1`, an unsigned public beta for macOS 15 and later. It is not a production-signed release: there is no Developer ID signature, notarization, or Gatekeeper approval yet.
+The first stable release is `v0.2.0` for macOS 15 and later.
 
-## Install the beta
+## Install EasySplat
 
-`v0.2.0-beta.1` is not published yet. When it appears under [GitHub Releases](https://github.com/dud8/EasySplat/releases):
+Download `EasySplat-0.2.0.dmg` from [GitHub Releases](https://github.com/dud8/EasySplat/releases), open it, and drag EasySplat to Applications. Launch the app normally from Applications.
 
-1. Download `EasySplat-0.2.0-beta.1-unsigned.dmg`.
-2. Drag EasySplat to Applications.
-3. On first launch, Control-click EasySplat, choose **Open**, then confirm.
-4. Let EasySplat download and verify the components required for the selected job.
-
-The app is unsigned, but downloaded toolchain components are bound to a signed manifest and verified before use.
+The GitHub build is Developer ID signed, notarized, stapled, and checked by Gatekeeper during release verification. EasySplat then downloads only the toolchain components needed for the selected job. Each component is bound to a signed manifest and verified before installation.
 
 ## Make a splat
 
@@ -61,6 +56,13 @@ If the overlap graph is disconnected, EasySplat stops and explains the capture p
 
 Memory budgets are proactive. EasySplat does not deliberately run out of memory to discover a limit.
 
+## Current limits
+
+- EasySplat reconstructs static scenes. Moving people, vehicles, foliage, water, reflections, and changing light can leave gaps or artifacts.
+- PLY is the only public export format in `0.2.0`.
+- Only one reconstruction runs at a time.
+- The app opens projects written by the current project format. It leaves incompatible older project bundles untouched and omits them from the library.
+
 ## Privacy
 
 EasySplat has no cloud processing, analytics, telemetry, advertising SDK, or crash SDK. Source media, notes, projects, checkpoints, and outputs remain local unless you explicitly export or share a result.
@@ -88,7 +90,7 @@ Stored artifact paths are project-relative and resolved through the safe project
 
 ## Troubleshooting
 
-- **The app will not open:** use Control-click → Open. This is expected for the unsigned beta.
+- **The app will not open:** confirm that you downloaded the DMG from the official GitHub release, then download a fresh copy. Do not bypass a Gatekeeper warning for an unverified copy.
 - **Setup failed:** try again. A failed tool download does not create a bogus project and preserves the selected input.
 - **The scene will not reconstruct:** capture more overlap, remove unrelated clips, or choose the correct Capture Path, Lens, and Input Order.
 - **Memory pressure:** choose Fast and Conserve Memory, then reduce capture length if needed.
@@ -132,7 +134,7 @@ input
   → validated Output/splat.ply
 ```
 
-COLMAP is the automatic geometry route for this beta. It is not a user-facing backend choice. A single-batch DA3 initializer remains available only to the typed benchmark override until it clears the full quality corpus. MetalSplatter is the native result viewer.
+COLMAP is the automatic geometry route in `0.2.0`. It is not a user-facing backend choice. A single-batch DA3 initializer remains available only to the typed benchmark override until it clears the full quality corpus. MetalSplatter is the native result viewer.
 
 The release toolchain is split into signed capabilities:
 
@@ -140,7 +142,7 @@ The release toolchain is split into signed capabilities:
 - `geometry-da3-base`
 - `geometry-da3-small`
 
-Normal runs install only the capabilities they need. The automatic route uses native COLMAP from the core component and does not download DA3 or its Python runtime. The optional Base component carries the DA3 runtime; Small adds only the fallback weights.
+Normal runs install only the capabilities they need. The automatic route uses native COLMAP from the core component and does not download DA3 or its Python runtime. The optional Base component carries the DA3 runtime; constrained DA3 runs select the Small weights before execution.
 
 See [ONBOARDING.md](ONBOARDING.md) for maintainer architecture and [CONTRIBUTING.md](CONTRIBUTING.md) for change rules.
 
@@ -161,27 +163,32 @@ gitleaks git --redact
 ```
 
 The full release benchmark needs the external 26-scene corpus described by `scripts/benchmark/corpus.json`; large media is intentionally not stored in Git.
-Native trainer changes also run `./scripts/ci/test_msplat_native_build.sh`. The Release App workflow supplies the signed toolchain, fixture, online/offline runners, and caches to `verify_beta.sh`, then runs `verify_ui.sh` from an isolated interactive macOS 15/Xcode 16.4 account. Printing either script's help is not a release check.
+Native trainer changes also run `./scripts/ci/test_msplat_native_build.sh`. The Release App workflow generates the pinned synthetic fixture under the hosted runner's temporary root, then reuses those exact bytes for packaged-app, remote-only, bundled-offline, and cached-only verification. It does not accept a repository variable or external fixture path. `scripts/release/release_fixture_manifest.json` binds the MIT generator, camera construction, per-image hashes and sizes, and aggregate closure digest.
 
-## Release modes
+Fixture reproducibility proves input integrity only. The integrated geometry-conditioning gate rejects weak camera support, collapsed trajectories, inadequate parallax, and degenerate point distributions before training. Packaged release verification also requires the exact generated corpus to pass signed-core reconstruction for at least 11 of 12 views plus native msplat training on macOS 15 and macOS 26.
 
-Build the unsigned beta only with the explicit mode:
+## Release builds
+
+Stable release packaging consumes an already signed toolchain closure. The production build uses explicit release inputs:
 
 ```bash
 ./scripts/release/build_dmg.sh \
-  --app-version 0.2.0-beta.1 \
+  --app-version 0.2.0 \
   --toolchain-version 2.0.0 \
   --manifest-url https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json \
   --core-artifact-url https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-macos-arm64-2.0.0-core.zip \
   --da3-base-artifact-url https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-geometry-da3-base-2.0.0.zip \
   --da3-small-artifact-url https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-geometry-da3-small-2.0.0.zip \
   --use-existing-toolchain \
-  --unsigned-beta
+  --production \
+  --identity-fingerprint "$EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1" \
+  --team-id "$EASYSPLAT_DEVELOPER_TEAM_ID" \
+  --notary-keychain-profile "$EASYSPLAT_NOTARY_KEYCHAIN_PROFILE"
 ```
 
-The signed manifest, public key, and component archives must already be present under `Toolchains/`. The Toolchain Build workflow creates unsigned archives and a signing request. An independent release-authority workflow verifies, signs, and publishes that closure. `./scripts/run.sh` owns local development builds.
+The signed manifest, public key, and component archives must already be present under `Toolchains/`. Toolchain Producer builds the native components on an identity-free host, signs and notarizes them in isolation, then emits a request over those final bytes. The external authority signs that exact request. Release benchmarks bind the resulting closure; Toolchain Publication verifies its authority and benchmark evidence before staging the release. `./scripts/run.sh` remains the development entry point.
 
-Production packaging is intentionally disabled. `v1.0.0` remains blocked until Developer ID signing, hardened runtime, notarization, stapling, strict code-sign verification, Gatekeeper assessment, and a quarantined clean-Mac install all pass.
+The release workflow builds from a version tag on protected `main`, verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, a quarantined install, the DMG, checksums, SBOM, licenses, and provenance. Publication remains a human action.
 
 ## License
 

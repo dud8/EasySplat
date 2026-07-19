@@ -6,9 +6,7 @@ Start with `./scripts/run.sh`. Do not add another launcher.
 
 ## Product boundary
 
-The beta supports static-scene reconstruction from video, photo folders, and mixed input. It exports PLY and renders it with MetalSplatter.
-
-`v0.2.0-beta.1` is the current unsigned public-beta target. It is not published or production-signed. Only one reconstruction runs at a time.
+EasySplat `0.2.0` supports static-scene reconstruction from video, photo folders, and mixed input. It exports PLY and renders it with MetalSplatter. Only one reconstruction runs at a time.
 
 It does not include cloud processing, telemetry, 4D reconstruction, meshes, measurements, a plugin system, generated sharing copy, or additional public export formats.
 
@@ -28,7 +26,7 @@ Implementation names belong in Technical Details and maintainer logs. The main U
 - `Tools/ManifestTool/`: manifest builder, critical-file hashing, Ed25519 signing, and release key utilities.
 - `ThirdParty/MetalSplatter/`: native viewer dependency.
 - `scripts/benchmark/`: corpus contracts, machine metadata, evidence validation, and release gates.
-- `scripts/release/`: unsigned-beta packaging and verification; production entry points fail closed.
+- `scripts/release/`: signed release packaging, notarization, provenance, and verification.
 
 Nested `AGENTS.md` files document local source and test conventions.
 
@@ -104,7 +102,7 @@ The new-project order is deliberate:
 
 A setup failure therefore creates no failed project and keeps input available for Try Again.
 
-`project.json` format v13 is the only supported project format. The project library logs and skips older, newer, malformed, and unsafe bundles without changing or deleting them.
+EasySplat reads only the project format written by the current build. The project library logs and skips older, newer, malformed, and unsafe bundles without changing or deleting them.
 
 ## Durable stages and recovery
 
@@ -119,7 +117,7 @@ Do not call an intermediate file a checkpoint or snapshot unless its complete-st
 
 ## Geometry
 
-The public-beta route uses bounded COLMAP matching and camera reconstruction. A DA3 Base experiment remains behind the typed candidate override, with DA3 Small as its memory-failure retry: one coherent batch of at most 29 images at 336 px, followed by triangulation and bounded bundle adjustment. The runner rejects a second inference window because independently inferred windows do not share a trustworthy coordinate frame.
+The `0.2.0` route uses bounded COLMAP matching and camera reconstruction. A DA3 experiment remains behind the typed candidate override. Its resolved run plan selects Base for standard or performance memory tiers and Small for the constrained tier before any tool starts. Each run uses that one model for one coherent batch of at most 29 images at 336 px, followed by triangulation and bounded bundle adjustment. A memory failure ends that exact candidate; the runner neither substitutes models nor accepts a second inference window because independently inferred windows do not share a trustworthy coordinate frame.
 
 Video extraction is dual-purpose: low-resolution analysis chooses useful timestamps, and only selected timestamps are extracted at training resolution. Selected-frame names and manifests preserve exact video timestamps.
 
@@ -145,7 +143,7 @@ Accepted geometry must provide:
 
 The retained COLMAP runtime supplies feature extraction, FAISS and exact matching, `point_triangulator`, bounded `bundle_adjuster`, classic incremental `mapper`, conversion, and analysis. It is the correctness reference and recovery route, not a user option.
 
-The release benchmark calls the 3,000-frame measurement the long-sequence route. It measures whichever route actually ships. The beta does not claim a separate streaming engine or package unless one later clears the same license, memory, throughput, and quality gates.
+The release benchmark calls the 3,000-frame measurement the long-sequence route. It measures whichever route actually ships. EasySplat does not claim a separate streaming engine or package unless one clears the same license, memory, throughput, and quality gates.
 
 ### Research ledger · July 2026
 
@@ -153,7 +151,7 @@ Novelty is not a shipping criterion. Code, weights, training data, transitive li
 
 | Work | Current decision |
 | --- | --- |
-| Native COLMAP | The packaged Apple-Silicon runtime is a pinned, arm64-only COLMAP 4.1.0 source build with the exact nine-command surface EasySplat uses. It ships in the core component with its reviewed `libomp` runtime dependency; PyCOLMAP is not shipped. |
+| Native COLMAP | The packaged Apple-Silicon runtime is a pinned, arm64-only COLMAP 4.1.1 source build with the exact nine-command surface EasySplat uses. It ships in the core component with its reviewed `libomp` runtime dependency; PyCOLMAP is not shipped. |
 | COLMAP integrated `global_mapper` | Removed. The measured candidate was 2.45× slower in geometric mean and used more peak memory than the optimized incremental mapper. Its occasional coverage recovery did not meet the 30% speedup retention gate. |
 | [FastMap](https://github.com/pals-ttic/fastmap) | Do not ship the PyTorch runtime or its internally inconsistent sparse-model export, which writes 3D tracks referencing image records with zero 2D observations. On the M4 Max, the pinned CPU implementation was 1.73× slower than the current mapper on the apartment walkthrough and 3.66× slower on the DJI orbit. A future unshipped Metal/Accelerate experiment is limited to its voting, accumulation, and fused-gradient kernels; it must also cap quadratic track completion and beat the full current mapper by at least 2× before product integration. |
 | [XFeat](https://github.com/verlab/accelerated_features) | Highest-priority learned-feature challenger, not a default. A fixed-shape Core ML backbone ran in 3.53 ms and a 30-view apartment graph registered 30/30 where the same SIFT graph registered 15/30. The DJI subset also registered 30/30, but its p90 residual reached 2.86 px and SIFT retained more inliers. Redistribution remains blocked on explicit checkpoint and training-lineage clearance. LighterGlue was not benchmarked and receives no product slot unless XFeat first clears licensing and corpus gates. |
@@ -168,7 +166,7 @@ Novelty is not a shipping criterion. Code, weights, training data, transitive li
 | [LingBot-Map](https://arxiv.org/abs/2604.14141) | Do not port or redistribute yet. The official path is CUDA/FlashInfer, its checkpoints are executable `.pt` files, and the paper lists Waymo training data. [Waymo's terms](https://waymo.com/open/terms/) treat trained parameters as derivative IP restricted to non-commercial use. Written lineage clearance is required first. |
 | [Anchor3R](https://arxiv.org/abs/2606.05035) | Best current long-sequence architecture to watch: transient anchors, loop reinsertion, and motion averaging. No auditable implementation or weights are available. |
 | [GLUEMAP](https://github.com/colmap/gluemap) | Use the local-estimate/global-fusion design as a future reference, not as a current implementation or dependency. The reference stack combines several large or license-sensitive learned systems. |
-| [LongStream](https://arxiv.org/abs/2602.13172) | Reject for this beta. The public lineage is VGGT-derived, the available checkpoint is large and executable, and redistribution terms are not explicit. |
+| [LongStream](https://arxiv.org/abs/2602.13172) | Rejected for `0.2.0`. The public lineage is VGGT-derived, the available checkpoint is large and executable, and redistribution terms are not explicit. |
 | [Glob3R](https://arxiv.org/abs/2607.09225) | Architecture reference only. Code is not public, its Pi3X weight lineage is non-commercial, and the reported 2.06 FPS is from an NVIDIA L20. |
 | [InstantSfM](https://arxiv.org/abs/2510.13310) | Paper-only Metal sparse-solver experiment. The surviving implementation snapshot is non-commercial; Apache-2.0 [BAE](https://github.com/pypose/bae) is a numerical reference, not a portable runtime. |
 | [Speed3R](https://github.com/Visual-AI/speed3r) | Reuse the sparse-attention principle only. Its Pi3-derived weights are non-commercial. |
@@ -215,7 +213,7 @@ The run seed fixes COLMAP sampling, orientation bootstrap sampling, and trainer 
 
 ## Toolchain trust
 
-Manifest schema 2 has exactly three beta components:
+Manifest schema 2 has exactly three release components:
 
 - `macos-arm64-core`
 - `geometry-da3-base`
@@ -271,14 +269,12 @@ actionlint
 gitleaks git --redact
 ```
 
-The full benchmark requires external media matching `scripts/benchmark/corpus.json`. Never fabricate evidence or mark an unavailable scene as passed. The Release App workflow invokes `verify_beta.sh` with the built app, DMG, signed component closure, real fixture, and online/offline runners, then invokes `verify_ui.sh` on its isolated interactive runner. `--help` output is not verification.
+The full benchmark requires external media matching `scripts/benchmark/corpus.json`. Never fabricate evidence or mark an unavailable scene as passed. The Release App workflow runs the packaged verifier with the built app, DMG, signed component closure, generated fixture, and online/offline runners. Geometry conditioning is part of the production pipeline and is recomputed when a geometry artifact is loaded. The packaged fixture must reconstruct at least 11 of 12 views before native training. Release verification also checks the signed and notarized app, stapled DMG, Gatekeeper assessment, quarantined installation, SBOM, licenses, provenance, checksums, and cached offline reuse.
 
 ## Releases
 
-Unsigned beta packaging consumes an existing signed toolchain closure. Call `build_dmg.sh` with explicit HTTPS URLs for the manifest and every component plus `--use-existing-toolchain`; it never builds a toolchain or creates a release key locally. Use `./scripts/run.sh` for local toolchain builds and development.
+Production packaging consumes an existing signed toolchain closure. Call `build_dmg.sh` with explicit HTTPS URLs for the manifest and every component, `--use-existing-toolchain`, and `--production`. It never builds a toolchain, creates a release key, or falls back to an unsigned artifact. Use `./scripts/run.sh` for local toolchain builds and development.
 
-Unsigned beta artifacts say so in the filename, plist, release notes, provenance, and verification output. `--production` fails closed in both app and DMG builders.
+The app release workflow is manual and requires a stable version tag pointing at current protected `main`. Build, signing, notarization, and packaged verification run on isolated Apple Silicon release hosts. The workflow verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, and a quarantined clean installation before assembling the final release closure.
 
-The app release workflow is manual and requires a version tag pointing at current `main`. Build and packaged verification use an isolated self-hosted Apple Silicon runner; publication is a separate hosted job behind the `public-beta-release` environment. The workflow refuses to overwrite an existing GitHub release, creates and verifies a draft prerelease, then publishes it as immutable. It never creates or moves the tag.
-
-Production packaging is intentionally disabled until Developer ID signing, hardened runtime, notarization, stapling, strict nested-code verification, Gatekeeper assessment, and a quarantined clean-Mac install all pass. It must never fall back to an unsigned artifact.
+Publication is a separate human-approved step. The workflow refuses to overwrite an existing GitHub release and never creates or moves the version tag. Final artifacts must come from the merged tagged commit, not a feature-branch candidate.
