@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 public struct ManifestDocument: Codable, Equatable {
@@ -33,6 +34,7 @@ public struct ManifestDocument: Codable, Equatable {
         public var sha256: String
         public var sizeBytes: UInt64
         public var expandedSizeBytes: UInt64
+        public var expandedClosureSHA256: String
         public var contents: [String]
         public var criticalFileHashes: [String: String]
         public var dependencies: [String]
@@ -45,6 +47,7 @@ public struct ManifestDocument: Codable, Equatable {
             sha256: String,
             sizeBytes: UInt64,
             expandedSizeBytes: UInt64? = nil,
+            expandedClosureSHA256: String = String(repeating: "0", count: 64),
             contents: [String],
             criticalFileHashes: [String: String],
             dependencies: [String],
@@ -56,6 +59,7 @@ public struct ManifestDocument: Codable, Equatable {
             self.sha256 = sha256
             self.sizeBytes = sizeBytes
             self.expandedSizeBytes = expandedSizeBytes ?? sizeBytes
+            self.expandedClosureSHA256 = expandedClosureSHA256
             self.contents = contents
             self.criticalFileHashes = criticalFileHashes
             self.dependencies = dependencies
@@ -126,7 +130,7 @@ public struct ReleaseSigningRequest: Codable, Equatable {
     public var manifest: ManifestDocument
 
     public init(
-        schemaVersion: Int = 1,
+        schemaVersion: Int = 2,
         sourceRepository: String,
         sourceCommit: String,
         manifestSHA256: String,
@@ -141,6 +145,8 @@ public struct ReleaseSigningRequest: Codable, Equatable {
 }
 
 public enum ManifestBuilder {
+    public static let maximumEncodedManifestBytes = 8 * 1_024 * 1_024
+    public static let maximumReleaseSigningRequestBytes = 8 * 1_024 * 1_024
     public static let maximumReleaseAssetBytes: UInt64 = 2_147_483_648
     public static let maximumCoreDownloadBytes: UInt64 = 2_500_000_000
     public static let maximumFullToolchainDownloadBytes: UInt64 = 6_000_000_000
@@ -177,6 +183,16 @@ public enum ManifestBuilder {
         let key = try privateKey(from: privateKeyBase64)
         let builtComponents = try components.map(makeComponent)
         try validateContentOwnership(builtComponents)
+        if components.map(\.name) == productionComponentNames,
+           ProductionProvenanceValidator.hasSourceSnapshotForTesting {
+            try ProductionProvenanceValidator.validate(
+                version: version,
+                sourceRepository: nil,
+                sourceCommit: nil,
+                inputs: components,
+                components: builtComponents
+            )
+        }
         let publicKeyData = key.publicKey.rawRepresentation
         let keyID = SHA256.hash(data: publicKeyData).map { String(format: "%02x", $0) }.joined()
         var manifest = ManifestDocument(
@@ -188,6 +204,7 @@ public enum ManifestBuilder {
             signatureEd25519: ""
         )
         manifest.signatureEd25519 = try key.signature(for: canonicalData(for: manifest)).base64EncodedString()
+        try requireEncodedManifestWithinLimit(manifest)
         return manifest
     }
 
@@ -198,6 +215,19 @@ public enum ManifestBuilder {
             "geometry-da3-base": "\(base)/toolchain-geometry-da3-base-\(version).zip",
             "geometry-da3-small": "\(base)/toolchain-geometry-da3-small-\(version).zip",
         ]
+    }
+
+    public static func requireDirectSigningAllowed(
+        components: [ManifestArtifactInput]
+    ) throws {
+        guard components.map(\.name) == productionComponentNames else { return }
+        guard components.allSatisfy({ explicitLoopbackURL($0.artifactURL) }) else {
+            try releaseFailure(
+                "Direct signing is limited to explicit loopback development manifests. "
+                    + "Use ManifestTool prepare-release and the reviewed signing-request authority "
+                    + "for production toolchains."
+            )
+        }
     }
 
     public static func prepareRelease(
@@ -217,6 +247,15 @@ public enum ManifestBuilder {
         let keyID = sha256Hex(data: publicKeyData)
         let builtComponents = try components.map(makeComponent)
         try validateContentOwnership(builtComponents)
+        if components.map(\.name) == productionComponentNames {
+            try ProductionProvenanceValidator.validate(
+                version: version,
+                sourceRepository: repository,
+                sourceCommit: sourceCommit,
+                inputs: components,
+                components: builtComponents
+            )
+        }
         let manifest = ManifestDocument(
             keyID: keyID,
             version: version,
@@ -225,6 +264,9 @@ public enum ManifestBuilder {
             components: builtComponents,
             signatureEd25519: ""
         )
+        var signedSizeProbe = manifest
+        signedSizeProbe.signatureEd25519 = Data(repeating: 0, count: 64).base64EncodedString()
+        try requireEncodedManifestWithinLimit(signedSizeProbe)
         let request = ReleaseSigningRequest(
             sourceRepository: repository,
             sourceCommit: sourceCommit,
@@ -239,6 +281,7 @@ public enum ManifestBuilder {
             expectedAppVersionRange: appVersionRange,
             publicKeyData: publicKeyData
         )
+        try requireReleaseSigningRequestWithinLimit(request)
         return request
     }
 
@@ -253,7 +296,11 @@ public enum ManifestBuilder {
         _ request: ReleaseSigningRequest,
         to url: URL
     ) throws {
-        try canonicalData(for: request).write(to: url, options: [.atomic])
+        let data = try canonicalData(for: request)
+        guard data.count <= maximumReleaseSigningRequestBytes else {
+            try releaseFailure("Release signing request exceeds the 8 MiB authority acceptance limit.")
+        }
+        try data.write(to: url, options: [.atomic])
     }
 
     public static func generateKeypair() -> (publicKeyBase64: String, privateKeyBase64: String) {
@@ -348,12 +395,13 @@ public enum ManifestBuilder {
             guard try archiveContents(at: archiveURL) == component.contents.sorted() else {
                 try fail("Release component contents do not match the signed manifest: \(name)")
             }
-            let hashes = try archiveCriticalFileHashes(
+            let expandedClosure = try archiveExpandedClosure(
                 zipURL: archiveURL,
-                paths: component.criticalFileHashes.keys.sorted()
+                paths: component.contents
             )
-            guard hashes == component.criticalFileHashes else {
-                try fail("Release component critical-file hashes do not match: \(name)")
+            guard expandedClosure.fileHashes == component.criticalFileHashes,
+                  expandedClosure.sha256 == component.expandedClosureSHA256 else {
+                try fail("Release component expanded closure does not match: \(name)")
             }
         }
     }
@@ -400,7 +448,11 @@ public enum ManifestBuilder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(manifest).write(to: url, options: [.atomic])
+        let data = try encoder.encode(manifest)
+        guard data.count <= maximumEncodedManifestBytes else {
+            try releaseFailure("Signed manifest exceeds the 8 MiB application acceptance limit.")
+        }
+        try data.write(to: url, options: [.atomic])
     }
 
     public static func sha256Hex(url: URL) throws -> String {
@@ -458,21 +510,22 @@ public enum ManifestBuilder {
         let sha = try sha256Hex(url: input.zipURL)
         let contents = input.deriveExactContents ? try archiveContents(at: input.zipURL) : input.contents
         let expandedSize = try archiveExpandedSize(at: input.zipURL)
-        var criticalFilePaths = Set(input.criticalFilePaths)
+        var requiredCriticalPaths = Set(input.criticalFilePaths)
         if input.name == "macos-arm64-core" {
-            criticalFilePaths.formUnion(
-                ManifestToolDefaults.criticalCoreFiles(in: contents)
-            )
-            criticalFilePaths.formUnion(try archiveExecutablePaths(at: input.zipURL))
+            requiredCriticalPaths.formUnion(ManifestToolDefaults.criticalCoreFiles(in: contents))
         } else if input.name == "geometry-da3-base" {
-            criticalFilePaths.formUnion(
-                ManifestToolDefaults.criticalDa3BaseFiles(in: contents)
-            )
-            criticalFilePaths.formUnion(try archiveExecutablePaths(at: input.zipURL))
+            requiredCriticalPaths.formUnion(ManifestToolDefaults.criticalDa3BaseFiles(in: contents))
         }
-        let criticalFileHashes = try archiveCriticalFileHashes(
+        guard requiredCriticalPaths.isSubset(of: Set(contents)) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Critical file is missing from the component archive."]
+            )
+        }
+        let expandedClosure = try archiveExpandedClosure(
             zipURL: input.zipURL,
-            paths: criticalFilePaths.sorted()
+            paths: contents
         )
         return ManifestDocument.Component(
             name: input.name,
@@ -481,11 +534,29 @@ public enum ManifestBuilder {
             sha256: sha,
             sizeBytes: size,
             expandedSizeBytes: expandedSize,
+            expandedClosureSHA256: expandedClosure.sha256,
             contents: contents,
-            criticalFileHashes: criticalFileHashes,
+            criticalFileHashes: expandedClosure.fileHashes,
             dependencies: input.dependencies,
             requirement: input.requirement
         )
+    }
+
+    private static func requireEncodedManifestWithinLimit(_ manifest: ManifestDocument) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        guard try encoder.encode(manifest).count <= maximumEncodedManifestBytes else {
+            try releaseFailure("Signed manifest exceeds the 8 MiB application acceptance limit.")
+        }
+    }
+
+    private static func requireReleaseSigningRequestWithinLimit(
+        _ request: ReleaseSigningRequest
+    ) throws {
+        guard try canonicalData(for: request).count <= maximumReleaseSigningRequestBytes else {
+            try releaseFailure("Release signing request exceeds the 8 MiB authority acceptance limit.")
+        }
     }
 
     private static func privateKey(from privateKeyBase64: String) throws -> Curve25519.Signing.PrivateKey {
@@ -503,7 +574,7 @@ public enum ManifestBuilder {
         expectedAppVersionRange: ManifestDocument.AppVersionRange,
         publicKeyData: Data
     ) throws {
-        guard request.schemaVersion == 1 else {
+        guard request.schemaVersion == 2 else {
             try releaseFailure("Release signing request schema is invalid.")
         }
         try requireValidRepository(expectedRepository)
@@ -548,6 +619,19 @@ public enum ManifestBuilder {
         "geometry-da3-small",
     ]
 
+    private static func explicitLoopbackURL(_ value: String) -> Bool {
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host?.lowercased(),
+              url.user == nil,
+              url.password == nil,
+              url.fragment == nil else {
+            return false
+        }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+
     private static func validateProductionReleasePolicy(
         _ manifest: ManifestDocument,
         requireCanonicalReleaseURLs: Bool = false
@@ -568,11 +652,13 @@ public enum ManifestBuilder {
                   component.sizeBytes < maximumReleaseAssetBytes,
                   component.expandedSizeBytes > 0,
                   component.expandedSizeBytes <= maximumExpandedComponentBytes,
+                  component.expandedClosureSHA256.count == 64,
+                  component.expandedClosureSHA256.allSatisfy(isLowercaseHex),
                   component.contents == component.contents.sorted(),
                   !component.contents.isEmpty,
                   Set(component.contents).count == component.contents.count,
                   !component.criticalFileHashes.isEmpty,
-                  Set(component.criticalFileHashes.keys).isSubset(of: Set(component.contents)),
+                  Set(component.criticalFileHashes.keys) == Set(component.contents),
                   component.criticalFileHashes.values.allSatisfy({
                       $0.count == 64 && $0.allSatisfy(isLowercaseHex)
                   }) else {
@@ -659,12 +745,13 @@ public enum ManifestBuilder {
         guard try archiveContents(at: archiveURL) == component.contents else {
             try releaseFailure("\(purpose) core archive contents do not match the signed manifest.")
         }
-        let hashes = try archiveCriticalFileHashes(
+        let expandedClosure = try archiveExpandedClosure(
             zipURL: archiveURL,
-            paths: component.criticalFileHashes.keys.sorted()
+            paths: component.contents
         )
-        guard hashes == component.criticalFileHashes else {
-            try releaseFailure("\(purpose) core archive critical-file hashes do not match the signed manifest.")
+        guard expandedClosure.fileHashes == component.criticalFileHashes,
+              expandedClosure.sha256 == component.expandedClosureSHA256 else {
+            try releaseFailure("\(purpose) core archive expanded closure does not match the signed manifest.")
         }
     }
 
@@ -872,10 +959,17 @@ public enum ManifestBuilder {
         let entries = String(decoding: output, as: UTF8.self)
             .split(whereSeparator: \.isNewline)
             .map(String.init)
-            .filter { !$0.hasSuffix("/") }
         try validateArchivePaths(entries)
-        guard !entries.isEmpty, Set(entries).count == entries.count else {
-            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Archive contents are empty or duplicated"])
+        guard !entries.isEmpty,
+              Set(entries).count == entries.count,
+              !entries.contains(where: { $0.hasSuffix("/") }) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Archive contents are empty, duplicated, or contain unsigned directory entries"
+                ]
+            )
         }
         return entries.sorted()
     }
@@ -991,6 +1085,185 @@ public enum ManifestBuilder {
         return paths
     }
 
+    private static func archiveExpandedClosure(
+        zipURL: URL,
+        paths: [String]
+    ) throws -> (sha256: String, fileHashes: [String: String]) {
+        guard !paths.isEmpty else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Component archive has no signed file closure"]
+            )
+        }
+        try validateArchivePaths(paths)
+        let modes = try archiveNormalizedFileModes(at: zipURL)
+        guard Set(modes.keys) == Set(paths) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Component archive mode closure is incomplete"]
+            )
+        }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try runUnzip(arguments: ["-qq", zipURL.path, "-d", root.path])
+
+        var hasher = SHA256()
+        hasher.update(data: Data("EasySplat expanded component closure v1\n".utf8))
+        var hashes: [String: String] = [:]
+        var totalBytes: UInt64 = 0
+        for path in paths.sorted() {
+            let evidence = try stableRegularFileEvidence(
+                at: root.appendingPathComponent(path, isDirectory: false),
+                maximumBytes: maximumExpandedComponentBytes - totalBytes
+            )
+            let sum = totalBytes.addingReportingOverflow(evidence.size)
+            guard !sum.overflow, sum.partialValue <= maximumExpandedComponentBytes else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 10,
+                    userInfo: [NSLocalizedDescriptionKey: "Expanded component exceeds the 16 GiB safety limit."]
+                )
+            }
+            totalBytes = sum.partialValue
+            hashes[path] = evidence.sha256
+            hasher.update(data: Data(path.utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(String(modes[path]!).utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(String(evidence.size).utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(evidence.sha256.utf8))
+            hasher.update(data: Data([10]))
+        }
+        return (
+            hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            hashes
+        )
+    }
+
+    private static func archiveNormalizedFileModes(at zipURL: URL) throws -> [String: UInt16] {
+        let process = Process()
+        let stdout = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        process.arguments = ["-l", zipURL.path]
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to inspect component archive permissions"]
+            )
+        }
+
+        var result: [String: UInt16] = [:]
+        for line in String(decoding: output, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            guard line.first == "-" else { continue }
+            let fields = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: true)
+            guard fields.count == 10 else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to parse component archive permissions"]
+                )
+            }
+            let permissions = String(fields[0].prefix(10))
+            let mode: UInt16
+            switch permissions {
+            case "-rw-r--r--": mode = 0o644
+            case "-rwxr-xr-x": mode = 0o755
+            default:
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Component archive file mode is not canonical: \(fields[9])"]
+                )
+            }
+            let path = String(fields[9])
+            guard result.updateValue(mode, forKey: path) == nil else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Component archive contains duplicate mode metadata"]
+                )
+            }
+        }
+        try validateArchivePaths(Array(result.keys))
+        return result
+    }
+
+    private static func stableRegularFileEvidence(
+        at url: URL,
+        maximumBytes: UInt64
+    ) throws -> (sha256: String, size: UInt64) {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Unable to open expanded component file safely"])
+        }
+        defer { Darwin.close(descriptor) }
+        var initial = stat()
+        guard fstat(descriptor, &initial) == 0,
+              (initial.st_mode & S_IFMT) == S_IFREG,
+              initial.st_nlink == 1,
+              initial.st_size >= 0,
+              UInt64(initial.st_size) <= maximumBytes else {
+            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Expanded component file is not a bounded ordinary single-link file"])
+        }
+
+        var digest = SHA256()
+        var bytesRead: UInt64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1_024 * 1_024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(descriptor, $0.baseAddress, $0.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else {
+                throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Unable to hash expanded component file safely"])
+            }
+            if count == 0 { break }
+            bytesRead += UInt64(count)
+            guard bytesRead <= maximumBytes else {
+                throw NSError(domain: "ManifestTool", code: 10, userInfo: [NSLocalizedDescriptionKey: "Expanded component exceeds its signed size bound"])
+            }
+            digest.update(data: Data(buffer[0..<count]))
+        }
+
+        var final = stat()
+        var finalPath = stat()
+        guard fstat(descriptor, &final) == 0,
+              lstat(url.path, &finalPath) == 0,
+              bytesRead == UInt64(initial.st_size),
+              sameFileIdentity(initial, final),
+              sameFileIdentity(initial, finalPath) else {
+            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Expanded component file changed while being hashed"])
+        }
+        return (
+            digest.finalize().map { String(format: "%02x", $0) }.joined(),
+            UInt64(initial.st_size)
+        )
+    }
+
+    private static func sameFileIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
+        lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+            && lhs.st_nlink == rhs.st_nlink
+            && lhs.st_mode == rhs.st_mode
+            && lhs.st_size == rhs.st_size
+            && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec
+            && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+            && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec
+            && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+    }
+
     private static func archiveCriticalFileHashes(zipURL: URL, paths: [String]) throws -> [String: String] {
         guard !paths.isEmpty else { return [:] }
         try validateArchivePaths(paths)
@@ -1033,7 +1306,7 @@ public enum ManifestBuilder {
             guard !path.isEmpty,
                   !path.hasPrefix("/"),
                   !path.contains("\\"),
-                  !parts.contains(where: { $0 == "." || $0 == ".." }) else {
+                  parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
                 throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Archive contains an unsafe path"])
             }
         }
@@ -1065,6 +1338,7 @@ public enum ManifestToolDefaults {
 
     public static func isAllowedCoreFile(_ path: String) -> Bool {
         criticalCoreAnchors.contains(path)
+            || path == "provenance/distribution-signing.json"
             || (path.hasPrefix("licenses/") && path.count > "licenses/".count)
     }
 

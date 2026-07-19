@@ -10,7 +10,7 @@ fail() {
 }
 
 usage() {
-  echo "Usage: validate_native_msplat.sh --source <msplat-root> | --packaged <toolchain-root> | --archive <core.zip>" >&2
+  echo "Usage: validate_native_msplat.sh --source <msplat-root> | --packaged <toolchain-root> | --packaged-static <toolchain-root> | --archive <core.zip>" >&2
   exit 2
 }
 
@@ -27,10 +27,13 @@ reject_raster_test_symbols() {
     msplat_set_exact_execution_capacity_for_testing \
     msplat_set_exact_capacity_limit_for_testing \
     msplat_set_raster_memory_budget_for_testing \
+    msplat_simulate_gpu_allocation_failure_for_testing \
+    msplat_set_raster_memory_budget_and_fail_for_testing \
     msplat_set_geometry_adam_fusion_enabled_for_testing \
     msplat_fail_next_sync_for_testing \
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_exact_radix_pass_count_for_testing \
+    msplat_exact_prefix_sum_for_testing \
     msplat_exact_radix_sort_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
     msplat_gpu_frequency_from_timestamp_pairs_for_testing \
@@ -38,7 +41,8 @@ reject_raster_test_symbols() {
     msplat_stage_timing_aggregate_coherent_for_testing \
     msplat_enable_stage_profiling_for_testing \
     msplat_gpu_timestamp_calibration_for_testing \
-    msplat_copy_last_raster_debug; do
+    msplat_copy_last_raster_debug \
+    msplat_copy_last_raster_reference_debug; do
     if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
       fail "native trainer exports raster test hook: $symbol"
     fi
@@ -97,6 +101,8 @@ except Exception as exc:
 expected_keys = {
     "build_configuration",
     "build_timestamp",
+    "allocation_pressure_patch_sha256",
+    "exact_prefix_hardening_patch_sha256",
     "cmake",
     "cmake_arguments",
     "checkpoint_patch_sha256",
@@ -139,8 +145,8 @@ exact_values = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
-    "overlay_sha256": "0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6",
-    "raster_test_sha256": "7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7",
+    "overlay_sha256": "fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc",
+    "raster_test_sha256": "3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934",
     "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
     "numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3",
@@ -152,6 +158,8 @@ exact_values = {
     "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
     "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
     "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
+    "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
+    "exact_prefix_hardening_patch_sha256": "99022e824c91ca57b34f60f21b29753db788290541c3c6bc52a5b496794d9683",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -200,6 +208,8 @@ for key in (
     "row_span_culling_patch_sha256",
     "geometry_adam_fusion_patch_sha256",
     "parallel_radix_scan_patch_sha256",
+    "allocation_pressure_patch_sha256",
+    "exact_prefix_hardening_patch_sha256",
     "raster_test_sha256",
     "executable_sha256",
     "metallib_sha256",
@@ -238,8 +248,14 @@ PY
 validate_binary() {
   local executable="$1"
   local metallib="$2"
+  local validation_mode="${3:-runtime}"
   local description dependency
   local stdout_file stderr_file
+
+  case "$validation_mode" in
+    runtime|static) ;;
+    *) fail "invalid native trainer validation mode: $validation_mode" ;;
+  esac
 
   [ -x "$executable" ] || fail "native trainer is not executable: $executable"
   [ -s "$metallib" ] || fail "default.metallib is empty: $metallib"
@@ -256,6 +272,10 @@ validate_binary() {
       *) fail "native trainer has a non-system dynamic dependency: $dependency" ;;
     esac
   done < <(/usr/bin/otool -L "$executable" | tail -n +2 | awk '{print $1}')
+
+  if [ "$validation_mode" = static ]; then
+    return
+  fi
 
   stdout_file="$(mktemp "${TMPDIR:-/tmp}/easysplat-msplat-self-check.XXXXXX")"
   stderr_file="$stdout_file.stderr"
@@ -327,6 +347,7 @@ validate_source() {
 
 validate_packaged() {
   local root="$1"
+  local validation_mode="${2:-runtime}"
   local actual expected
   [ -d "$root" ] || fail "packaged toolchain root is missing: $root"
   [ ! -L "$root" ] || fail "packaged toolchain root must not be a symlink: $root"
@@ -369,7 +390,10 @@ validate_packaged() {
     "$root/msplat/build_info.json" \
     "$root/bin/easysplat-train" \
     "$root/bin/default.metallib" || return 1
-  validate_binary "$root/bin/easysplat-train" "$root/bin/default.metallib" || return 1
+  validate_binary \
+    "$root/bin/easysplat-train" \
+    "$root/bin/default.metallib" \
+    "$validation_mode" || return 1
 }
 
 validate_archive() {
@@ -561,6 +585,9 @@ case "$1" in
     ;;
   --packaged)
     validate_packaged "$2"
+    ;;
+  --packaged-static)
+    validate_packaged "$2" static
     ;;
   --archive)
     validate_archive "$2"

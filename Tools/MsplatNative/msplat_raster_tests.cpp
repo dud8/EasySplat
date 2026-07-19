@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -19,12 +20,35 @@
 #include "loaders.hpp"
 #include "model.hpp"
 
+void msplat_copy_last_raster_reference_debug(
+    float *xys,
+    float *depths,
+    int *radii,
+    float *aabb,
+    float *conics,
+    float *raw_colors,
+    float *render_gradients,
+    float *projected_position_gradients,
+    float *raster_color_gradients,
+    float *opacity_gradients,
+    int point_count,
+    int pixel_count
+);
+void msplat_exact_prefix_sum_for_testing(
+    const std::int32_t *input,
+    std::uint32_t count,
+    std::uint64_t *output
+);
+
 namespace {
 
 constexpr std::uint64_t memoryBudgetBytes = 512ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t benchmarkMemoryBudgetBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr float relativeTolerance = 2.0e-3f;
 constexpr float absoluteTolerance = 2.0e-4f;
+// A near-threshold reciprocal with enough headroom for projected attenuation.
+// At the splat center, (1 - opacity)^2050 stays above the 1e-4 early stop.
+constexpr float overflowReferenceOpacity = 1.0f / 240.0f;
 constexpr int stageTimingIterations = 512;
 constexpr int geometryAdamShDegreeInterval = 4;
 
@@ -64,6 +88,57 @@ void verifyExactRadixPassPlanning() {
     }
     if (!rejectedEmptyGrid) {
         throw std::runtime_error("exact radix planner accepted an empty tile grid");
+    }
+}
+
+void verifyExactPrefixCase(std::uint32_t count) {
+    constexpr std::size_t canaryCount = 16;
+    constexpr std::uint64_t canary = 0xd15ea5e5c0decafeULL;
+    std::vector<std::int32_t> input(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        input[index] = static_cast<std::int32_t>((index * 17u + index / 13u) % 11u) - 3;
+    }
+    const std::vector<std::int32_t> original = input;
+    std::vector<std::uint64_t> expected(count);
+    std::uint64_t running = 0;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        running += static_cast<std::uint64_t>(std::max(input[index], 0));
+        expected[index] = running;
+    }
+    std::vector<std::uint64_t> actual(
+        static_cast<std::size_t>(count) + canaryCount,
+        canary
+    );
+    msplat_exact_prefix_sum_for_testing(input.data(), count, actual.data());
+    for (std::uint32_t index = 0; index < count; ++index) {
+        if (actual[index] != expected[index]) {
+            throw std::runtime_error(
+                "exact prefix count " + std::to_string(count) +
+                " differs at index " + std::to_string(index) +
+                ": expected=" + std::to_string(expected[index]) +
+                " actual=" + std::to_string(actual[index])
+            );
+        }
+    }
+    for (std::size_t index = count; index < actual.size(); ++index) {
+        if (actual[index] != canary) {
+            throw std::runtime_error(
+                "exact prefix count " + std::to_string(count) +
+                " wrote beyond its logical output"
+            );
+        }
+    }
+    if (input != original) {
+        throw std::runtime_error(
+            "exact prefix count " + std::to_string(count) + " modified its input"
+        );
+    }
+    std::cout << "exact_prefix_oracle count=" << count << " final=" << running << '\n';
+}
+
+void verifyExactPrefixOracle() {
+    for (const std::uint32_t count : {1023u, 1024u, 1025u, 2048u, 2049u}) {
+        verifyExactPrefixCase(count);
     }
 }
 
@@ -494,8 +569,33 @@ struct RasterResult {
     std::vector<float> colorSecondMoment;
     std::vector<float> opacityFirstMoment;
     std::vector<float> opacitySecondMoment;
+    std::vector<std::uint32_t> contributingPixelCounts;
+    std::size_t maxContributorsPerPixel = 0;
+    float maximumCandidateAlpha = 0.0f;
     MsplatRasterStats stats {};
 };
+
+struct RasterReferenceInputs {
+    int width = 0;
+    int height = 0;
+    std::vector<float> xys;
+    std::vector<float> depths;
+    std::vector<int> radii;
+    std::vector<float> aabb;
+    std::vector<float> conics;
+    std::vector<float> rawColors;
+    std::vector<float> opacityLogits;
+    std::vector<float> renderGradients;
+    std::vector<float> projectedPositionGradients;
+    std::vector<float> rasterColorGradients;
+    std::vector<float> opacityGradients;
+};
+
+void requireNear(
+    const std::string &label,
+    const std::vector<float> &reference,
+    const std::vector<float> &candidate
+);
 
 struct ModelSnapshot {
     std::vector<float> positions;
@@ -543,6 +643,18 @@ Model makeModel(const InputData &inputData, int shDegreeInterval = 1000) {
         3000,
         false,
         background
+    );
+}
+
+void setUniformOpacity(Model &model, float opacity) {
+    if (!(opacity > 1.0f / 255.0f && opacity < 1.0f)) {
+        throw std::runtime_error("test opacity must survive the raster alpha threshold");
+    }
+    const float logit = std::log(opacity / (1.0f - opacity));
+    std::fill(
+        model.opacities.data<float>(),
+        model.opacities.data<float>() + model.opacities.numel(),
+        logit
     );
 }
 
@@ -672,10 +784,16 @@ void makeBroadSplats(Model &model) {
     std::fill(scales, scales + model.scales.numel(), 0.0f);
 }
 
+void configureOverflowReferenceModel(Model &model) {
+    makeBroadSplats(model);
+    setUniformOpacity(model, overflowReferenceOpacity);
+}
+
 RasterResult runSingleStep(
     const std::string &dataset,
     bool forceExact,
-    bool tileSpanCulling = false
+    bool tileSpanCulling = false,
+    bool overflowReferenceConfiguration = false
 ) {
     cleanup_msplat_metal();
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
@@ -696,6 +814,7 @@ RasterResult runSingleStep(
         }
 
         Model model = makeModel(inputData);
+        if (overflowReferenceConfiguration) configureOverflowReferenceModel(model);
         if (forceExact) {
             // The production path discovers exact capacity from the GPU count,
             // then replays the failed iteration without committing optimizer
@@ -755,6 +874,298 @@ RasterResult runSingleStep(
     }
     cleanup_msplat_metal();
     return result;
+}
+
+RasterReferenceInputs runOverflowReferenceFixture(const std::string &dataset) {
+    if (std::pow(1.0f - overflowReferenceOpacity, 2050.0f) <= 1.0e-4f) {
+        throw std::runtime_error("overflow reference opacity cannot expose points after 2048");
+    }
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(true);
+
+    RasterReferenceInputs result;
+    {
+        InputData inputData = inputDataFromX(dataset);
+        if (inputData.cameras.empty() || inputData.points.count <= 2048) {
+            throw std::runtime_error("overflow reference fixture must exceed 2048 points");
+        }
+        Camera &camera = inputData.cameras.front();
+        camera.loadImage(1.0f);
+        Model model = makeModel(inputData);
+        configureOverflowReferenceModel(model);
+        result.opacityLogits = copyTensor(model.opacities);
+
+        enqueueStep(model, camera, 1, 0);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats overflow = msplat_get_raster_stats();
+        if (!overflow.capacity_exceeded || overflow.latest_intersection_count <= 2048 ||
+            overflow.dropped_intersection_count != 0) {
+            throw std::runtime_error("overflow reference probe did not exceed 2048 intersections");
+        }
+        model.adam_step_count = 0;
+        model.schedulersStep(0);
+        msplat_grow_exact_raster_capacity(overflow.latest_intersection_count);
+        msplat_clear_raster_capacity_failure();
+        enqueueStep(model, camera, 1, 0);
+        msplat_gpu_sync();
+
+        const int pointCount = model.num_active;
+        const int pixelCount = model.lastWidth * model.lastHeight;
+        result.width = model.lastWidth;
+        result.height = model.lastHeight;
+        result.xys.resize(static_cast<std::size_t>(pointCount) * 2);
+        result.depths.resize(pointCount);
+        result.radii.resize(pointCount);
+        result.aabb.resize(static_cast<std::size_t>(pointCount) * 2);
+        result.conics.resize(static_cast<std::size_t>(pointCount) * 3);
+        result.rawColors.resize(static_cast<std::size_t>(pointCount) * 3);
+        result.renderGradients.resize(static_cast<std::size_t>(pixelCount) * 3);
+        result.projectedPositionGradients.resize(static_cast<std::size_t>(pointCount) * 2);
+        result.rasterColorGradients.resize(static_cast<std::size_t>(pointCount) * 3);
+        result.opacityGradients.resize(pointCount);
+        msplat_copy_last_raster_reference_debug(
+            result.xys.data(), result.depths.data(), result.radii.data(), result.aabb.data(),
+            result.conics.data(), result.rawColors.data(), result.renderGradients.data(),
+            result.projectedPositionGradients.data(), result.rasterColorGradients.data(),
+            result.opacityGradients.data(), pointCount, pixelCount
+        );
+        const MsplatRasterStats completed = msplat_get_raster_stats();
+        if (completed.fallback_count != 1 || completed.capacity_exceeded ||
+            completed.dropped_intersection_count != 0) {
+            throw std::runtime_error("overflow reference exact rerun was not lossless");
+        }
+    }
+    cleanup_msplat_metal();
+    return result;
+}
+
+RasterResult cpuRasterReference(const RasterReferenceInputs &input) {
+    const std::size_t pointCount = input.depths.size();
+    const std::size_t pixelCount = static_cast<std::size_t>(input.width) * input.height;
+    if (pointCount <= 2048 || input.opacityLogits.size() != pointCount) {
+        throw std::runtime_error("CPU raster reference received an invalid overflow fixture");
+    }
+    RasterResult result;
+    result.rgb.assign(pixelCount * 3, 0.0f);
+    result.alpha.assign(pixelCount, 0.0f);
+    result.positionGradients.assign(pointCount * 2, 0.0f);
+    result.colorGradients.assign(pointCount * 3, 0.0f);
+    result.opacityGradients.assign(pointCount, 0.0f);
+    result.contributingPixelCounts.assign(pointCount, 0);
+
+    std::vector<std::size_t> depthOrder(pointCount);
+    std::iota(depthOrder.begin(), depthOrder.end(), 0);
+    std::stable_sort(depthOrder.begin(), depthOrder.end(), [&](std::size_t lhs, std::size_t rhs) {
+        return input.depths[lhs] < input.depths[rhs];
+    });
+
+    struct Contribution { std::size_t point; float alpha; };
+    std::vector<Contribution> contributions;
+    contributions.reserve(pointCount);
+    const int tilesX = (input.width + 15) / 16;
+    const int tilesY = (input.height + 15) / 16;
+    for (int py = 0; py < input.height; ++py) {
+        for (int px = 0; px < input.width; ++px) {
+            const std::size_t pixel = static_cast<std::size_t>(py) * input.width + px;
+            const int pixelTileX = px / 16;
+            const int pixelTileY = py / 16;
+            contributions.clear();
+            float transmittance = 1.0f;
+            float color[3] = {0.0f, 0.0f, 0.0f};
+            for (const std::size_t point : depthOrder) {
+                if (input.radii[point] <= 0) continue;
+                const float centerX = input.xys[point * 2];
+                const float centerY = input.xys[point * 2 + 1];
+                const float radiusX = input.aabb[point * 2];
+                const float radiusY = input.aabb[point * 2 + 1];
+                const int tileMinX = std::clamp(static_cast<int>(centerX / 16.0f - radiusX / 16.0f), 0, tilesX);
+                const int tileMaxX = std::clamp(static_cast<int>(centerX / 16.0f + radiusX / 16.0f + 1.0f), 0, tilesX);
+                const int tileMinY = std::clamp(static_cast<int>(centerY / 16.0f - radiusY / 16.0f), 0, tilesY);
+                const int tileMaxY = std::clamp(static_cast<int>(centerY / 16.0f + radiusY / 16.0f + 1.0f), 0, tilesY);
+                if (pixelTileX < tileMinX || pixelTileX >= tileMaxX ||
+                    pixelTileY < tileMinY || pixelTileY >= tileMaxY) continue;
+                const float dx = centerX - static_cast<float>(px);
+                const float dy = centerY - static_cast<float>(py);
+                const float *conic = &input.conics[point * 3];
+                const float sigma = 0.5f * (conic[0] * dx * dx + conic[2] * dy * dy) +
+                    conic[1] * dx * dy;
+                if (sigma < 0.0f || sigma >= 5.55f) continue;
+                const float opacity = 1.0f / (1.0f + std::exp(-input.opacityLogits[point]));
+                const float alpha = std::min(0.999f, opacity * std::exp(-sigma));
+                result.maximumCandidateAlpha = std::max(result.maximumCandidateAlpha, alpha);
+                if (alpha < 1.0f / 255.0f) continue;
+                const float nextTransmittance = transmittance * (1.0f - alpha);
+                if (nextTransmittance <= 1.0e-4f) break;
+                contributions.push_back({point, alpha});
+                for (int channel = 0; channel < 3; ++channel) {
+                    const float rgb = std::max(input.rawColors[point * 3 + channel] + 0.5f, 0.0f);
+                    color[channel] = std::fma(rgb, alpha * transmittance, color[channel]);
+                }
+                transmittance = nextTransmittance;
+            }
+            result.alpha[pixel] = 1.0f - transmittance;
+            result.maxContributorsPerPixel = std::max(
+                result.maxContributorsPerPixel,
+                contributions.size()
+            );
+            for (const Contribution &contribution : contributions) {
+                ++result.contributingPixelCounts[contribution.point];
+            }
+            for (int channel = 0; channel < 3; ++channel) {
+                result.rgb[pixel * 3 + channel] = std::clamp(color[channel], 0.0f, 1.0f);
+            }
+
+            float reverseTransmittance = transmittance;
+            float buffer[3] = {0.0f, 0.0f, 0.0f};
+            for (auto iterator = contributions.rbegin(); iterator != contributions.rend(); ++iterator) {
+                const std::size_t point = iterator->point;
+                const float alpha = iterator->alpha;
+                if (alpha >= 0.999f) continue;
+                const float reciprocalAlpha = 1.0f / (1.0f - alpha);
+                reverseTransmittance *= reciprocalAlpha;
+                const float factor = alpha * reverseTransmittance;
+                float vAlpha = 0.0f;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const float outputGradient = input.renderGradients[pixel * 3 + channel];
+                    const float unclampedRgb = input.rawColors[point * 3 + channel] + 0.5f;
+                    if (unclampedRgb >= 0.0f) {
+                        result.colorGradients[point * 3 + channel] += factor * outputGradient;
+                    }
+                    const float rgb = std::max(unclampedRgb, 0.0f);
+                    vAlpha += (rgb * reverseTransmittance - buffer[channel] * reciprocalAlpha) * outputGradient;
+                    buffer[channel] = std::fma(rgb, factor, buffer[channel]);
+                }
+                const float vSigma = -alpha * vAlpha;
+                const float dx = input.xys[point * 2] - static_cast<float>(px);
+                const float dy = input.xys[point * 2 + 1] - static_cast<float>(py);
+                const float *conic = &input.conics[point * 3];
+                result.positionGradients[point * 2] +=
+                    vSigma * (conic[0] * dx + conic[1] * dy);
+                result.positionGradients[point * 2 + 1] +=
+                    vSigma * (conic[1] * dx + conic[2] * dy);
+                const float opacity = 1.0f / (1.0f + std::exp(-input.opacityLogits[point]));
+                result.opacityGradients[point] += -vSigma * (1.0f - opacity);
+            }
+        }
+    }
+    return result;
+}
+
+float maximumAbsoluteGradientAfter(
+    const std::vector<float> &gradients,
+    std::size_t pointBoundary,
+    std::size_t valuesPerPoint
+) {
+    const std::size_t first = pointBoundary * valuesPerPoint;
+    if (valuesPerPoint == 0 || first >= gradients.size() ||
+        gradients.size() % valuesPerPoint != 0) {
+        throw std::runtime_error("invalid tail-gradient boundary");
+    }
+    float maximum = 0.0f;
+    for (std::size_t index = first; index < gradients.size(); ++index) {
+        maximum = std::max(maximum, std::abs(gradients[index]));
+    }
+    return maximum;
+}
+
+void requireMeaningfulTailGradient(
+    const std::string &label,
+    const std::vector<float> &gradients,
+    std::size_t pointBoundary,
+    std::size_t valuesPerPoint
+) {
+    const float overall = maximumAbsoluteGradientAfter(gradients, 0, valuesPerPoint);
+    const float tail = maximumAbsoluteGradientAfter(
+        gradients,
+        pointBoundary,
+        valuesPerPoint
+    );
+    const float minimum = std::max(1.0e-12f, overall * 1.0e-6f);
+    if (!std::isfinite(tail) || tail < minimum) {
+        throw std::runtime_error(
+            label + " has no meaningful gradient at or after point " +
+            std::to_string(pointBoundary) + ": tail=" + std::to_string(tail) +
+            " required=" + std::to_string(minimum)
+        );
+    }
+}
+
+void requireOverflowTailEvidence(
+    const RasterResult &reference,
+    const RasterResult &actual,
+    std::size_t pointBoundary
+) {
+    const std::size_t firstTailPoint = pointBoundary + 1;
+    if (firstTailPoint >= reference.contributingPixelCounts.size()) {
+        throw std::runtime_error("invalid overflow contribution boundary");
+    }
+    const std::uint64_t tailContributions = std::accumulate(
+        reference.contributingPixelCounts.begin() + firstTailPoint,
+        reference.contributingPixelCounts.end(),
+        std::uint64_t {0}
+    );
+    if (tailContributions == 0) {
+        throw std::runtime_error(
+            "CPU raster reference has no supporting contribution after point " +
+            std::to_string(pointBoundary) + "; maximum contributors per pixel=" +
+            std::to_string(reference.maxContributorsPerPixel) +
+            " maximum candidate alpha=" + std::to_string(reference.maximumCandidateAlpha)
+        );
+    }
+
+    requireMeaningfulTailGradient(
+        "CPU projected-position oracle", reference.positionGradients, firstTailPoint, 2
+    );
+    requireMeaningfulTailGradient(
+        "GPU projected-position result", actual.positionGradients, firstTailPoint, 2
+    );
+    requireMeaningfulTailGradient(
+        "CPU raster-color oracle", reference.colorGradients, firstTailPoint, 3
+    );
+    requireMeaningfulTailGradient(
+        "GPU raster-color result", actual.colorGradients, firstTailPoint, 3
+    );
+    requireMeaningfulTailGradient(
+        "CPU opacity oracle", reference.opacityGradients, firstTailPoint, 1
+    );
+    requireMeaningfulTailGradient(
+        "GPU opacity result", actual.opacityGradients, firstTailPoint, 1
+    );
+    std::cout << "overflow_tail_evidence after_index=" << pointBoundary
+              << " supporting_contributions=" << tailContributions << '\n';
+}
+
+void verifyOverflowCPUReference(const std::string &dataset) {
+    const RasterReferenceInputs exact = runOverflowReferenceFixture(dataset);
+    const RasterResult reference = cpuRasterReference(exact);
+    RasterResult actual;
+    actual.rgb.resize(reference.rgb.size());
+    actual.alpha.resize(reference.alpha.size());
+    actual.positionGradients = exact.projectedPositionGradients;
+    actual.colorGradients = exact.rasterColorGradients;
+    actual.opacityGradients = exact.opacityGradients;
+    requireOverflowTailEvidence(reference, actual, 1024);
+    requireOverflowTailEvidence(reference, actual, 2048);
+
+    cleanup_msplat_metal();
+    // The raw image/alpha debug values are copied by the existing test hook in
+    // a separate exact run, keeping the CPU oracle independent of exact bins.
+    const RasterResult raw = runSingleStep(
+        dataset,
+        true,
+        false,
+        true
+    );
+    actual.rgb = raw.rgb;
+    actual.alpha = raw.alpha;
+    requireNear("overflow_cpu_forward_rgb", reference.rgb, actual.rgb);
+    requireNear("overflow_cpu_forward_alpha", reference.alpha, actual.alpha);
+    requireNear("overflow_cpu_position_gradients", reference.positionGradients, actual.positionGradients);
+    requireNear("overflow_cpu_color_gradients", reference.colorGradients, actual.colorGradients);
+    requireNear("overflow_cpu_opacity_gradients", reference.opacityGradients, actual.opacityGradients);
+    std::cout << "overflow_cpu_raster_reference passed\n";
 }
 
 void requireNear(
@@ -2095,6 +2506,10 @@ void verifyStageTiming(const std::string &dataset) {
 int main(int argc, char **argv) {
     try {
         verifyExactRadixPassPlanning();
+        if (argc == 2 && std::string(argv[1]) == "--prefix-oracle") {
+            verifyExactPrefixOracle();
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--radix-oracle") {
             verifyExactRadixOracle();
             return 0;
@@ -2107,12 +2522,18 @@ int main(int argc, char **argv) {
             verifyStageTiming(argv[2]);
             return 0;
         }
+        if (argc == 3 && std::string(argv[1]) == "--overflow-cpu-reference") {
+            verifyOverflowCPUReference(argv[2]);
+            return 0;
+        }
         if (argc != 7) {
             throw std::runtime_error(
                 "usage: msplat-raster-tests <parity dataset> <mixed-resolution dataset> "
                 "<overflow dataset> <broad-overflow dataset> "
                 "<increasing-overflow dataset> <exact-budget dataset>\n"
+                "       msplat-raster-tests --prefix-oracle\n"
                 "       msplat-raster-tests --radix-oracle\n"
+                "       msplat-raster-tests --overflow-cpu-reference <overflow dataset>\n"
                 "       msplat-raster-tests --stage-timing <profile dataset>\n"
                 "       msplat-raster-tests --geometry-adam-benchmark <dataset>"
             );
@@ -2188,6 +2609,8 @@ int main(int argc, char **argv) {
                   << exact.stats.latest_intersection_count
                   << " candidate=" << culledExact.stats.latest_intersection_count
                   << '\n';
+
+        verifyOverflowCPUReference(argv[3]);
 
         std::vector<double> disabledSamples;
         std::vector<double> enabledSamples;

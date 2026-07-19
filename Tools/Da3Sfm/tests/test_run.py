@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import gc
 import json
 import os
 import sys
 import tempfile
 import types
 import unittest
-import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -73,8 +71,21 @@ class Da3RunTests(unittest.TestCase):
             (model / "model.safetensors").write_bytes(b"0")
             self.assertEqual(_model_path(Path(temp_dir), "DA3-BASE"), model)
 
-    def test_select_device_falls_back_from_cuda(self) -> None:
-        self.assertEqual(_select_device("cuda"), "cpu")
+    def test_select_device_rejects_non_mps_execution(self) -> None:
+        for requested in ("cuda", "cpu", ""):
+            with self.subTest(requested=requested):
+                with self.assertRaisesRegex(RuntimeError, "requires MPS"):
+                    _select_device(requested)
+
+    def test_select_device_rejects_unavailable_requested_mps(self) -> None:
+        fake_torch = types.SimpleNamespace(
+            backends=types.SimpleNamespace(
+                mps=types.SimpleNamespace(is_available=lambda: False)
+            )
+        )
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            with self.assertRaisesRegex(RuntimeError, "MPS is unavailable"):
+                _select_device("mps")
 
     def test_parser_exposes_offline_bridge_arguments(self) -> None:
         parser = build_arg_parser()
@@ -90,8 +101,6 @@ class Da3RunTests(unittest.TestCase):
                 "mps",
                 "--model-subdir",
                 "DA3-BASE",
-                "--fallback-model-subdir",
-                "DA3-SMALL",
                 "--process-res",
                 "504",
                 "--max-points",
@@ -108,7 +117,6 @@ class Da3RunTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.model_subdir, "DA3-BASE")
-        self.assertEqual(args.fallback_model_subdir, "DA3-SMALL")
         self.assertTrue(args.shared_camera)
 
     def test_parser_accepts_input_ordering(self) -> None:
@@ -865,7 +873,7 @@ class Da3RunTests(unittest.TestCase):
                 Image.new("RGB", (8, 8)).save(images / f"img{index:02d}.jpg")
 
             with mock.patch("easysplat_da3_sfm.run._select_device") as select_device:
-                with mock.patch("easysplat_da3_sfm.run._run_da3_attempt") as run_attempt:
+                with mock.patch("easysplat_da3_sfm.run._run_da3_model") as run_model:
                     with self.assertRaisesRegex(
                         SystemExit,
                         "one coherent batch of at most 29 images",
@@ -886,9 +894,9 @@ class Da3RunTests(unittest.TestCase):
                         )
 
             select_device.assert_not_called()
-            run_attempt.assert_not_called()
+            run_model.assert_not_called()
 
-    def test_main_forces_offline_env_and_retries_small_on_oom(self) -> None:
+    def test_main_oom_does_not_switch_models_or_publish_partial_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             images = root / "images"
@@ -910,55 +918,46 @@ class Da3RunTests(unittest.TestCase):
 
             def fake_run(args, image_paths, model_dir, selected_device, sparse_path):
                 calls.append(model_dir)
-                self.assertEqual(selected_device, "cpu")
+                self.assertEqual(selected_device, "mps")
                 self.assertEqual(len(image_paths), 4)
                 self.assertEqual(sparse_path, out_sparse)
-                if model_dir.name == "DA3-BASE":
-                    raise RuntimeError("MPS backend out of memory")
-                return 4, {
-                    "batches": [list(range(4))],
-                    "anchor_indices": [0, 1, 2],
-                    "alignment_edge_count": 0,
-                    "max_alignment_rmse": 0.0,
-                    "alignment_complete": True,
-                    "input_ordering": "continuous",
-                    "raw_point_sample_count": 16,
-                    "fused_sparse_point_count": 8,
-                }
+                self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+                self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
+                self.assertEqual(os.environ["HF_HUB_DISABLE_TELEMETRY"], "1")
+                self.assertEqual(os.environ["DO_NOT_TRACK"], "1")
+                self.assertEqual(os.environ["PYTORCH_ENABLE_MPS_FALLBACK"], "0")
+                sparse_path.mkdir(parents=True)
+                (sparse_path / "partial.txt").write_text("partial", encoding="utf-8")
+                manifest.write_text("partial", encoding="utf-8")
+                raise RuntimeError("MPS backend out of memory")
 
             with mock.patch(
                 "easysplat_da3_sfm.run._run_da3_model", side_effect=fake_run
+            ), mock.patch(
+                "easysplat_da3_sfm.run._select_device", return_value="mps"
             ):
                 with mock.patch.dict(os.environ, {}, clear=True):
-                    exit_code = main(
-                        [
-                            "--images",
-                            str(images),
-                            "--out-sparse",
-                            str(out_sparse),
-                            "--models-dir",
-                            str(models),
-                            "--manifest-out",
-                            str(manifest),
-                            "--device",
-                            "cpu",
-                        ]
-                    )
+                    with self.assertRaisesRegex(RuntimeError, "out of memory"):
+                        main(
+                            [
+                                "--images",
+                                str(images),
+                                "--out-sparse",
+                                str(out_sparse),
+                                "--models-dir",
+                                str(models),
+                                "--manifest-out",
+                                str(manifest),
+                                "--device",
+                                "mps",
+                            ]
+                        )
 
-            self.assertEqual(exit_code, 0)
-            self.assertEqual([call.name for call in calls], ["DA3-BASE", "DA3-SMALL"])
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(payload["selected_device"], "cpu")
-            self.assertEqual(payload["model_subdir"], "DA3-SMALL")
-            self.assertEqual(payload["registered_image_count"], 4)
-            self.assertEqual(payload["raw_point_sample_count"], 16)
-            self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
-            self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
-            self.assertEqual(os.environ["HF_HUB_DISABLE_TELEMETRY"], "1")
-            self.assertEqual(os.environ["DO_NOT_TRACK"], "1")
-            self.assertEqual(os.environ["PYTORCH_ENABLE_MPS_FALLBACK"], "1")
+            self.assertEqual([call.name for call in calls], ["DA3-BASE"])
+            self.assertFalse(out_sparse.exists())
+            self.assertFalse(manifest.exists())
 
-    def test_main_oom_discards_partial_seed_before_restart_on_small(self) -> None:
+    def test_main_runs_explicit_small_model_as_the_only_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             images = root / "images"
@@ -978,15 +977,6 @@ class Da3RunTests(unittest.TestCase):
 
             def fake_run(args, image_paths, model_dir, selected_device, sparse_path):
                 attempts.append(model_dir.name)
-                if model_dir.name == "DA3-BASE":
-                    sparse_path.mkdir(parents=True)
-                    (sparse_path / "partial.txt").write_text(
-                        "mixed model output", encoding="utf-8"
-                    )
-                    manifest.write_text("partial", encoding="utf-8")
-                    raise RuntimeError("MPS backend out of memory")
-                self.assertFalse((sparse_path / "partial.txt").exists())
-                self.assertFalse(manifest.exists())
                 sparse_path.mkdir(parents=True)
                 for name in ("cameras.txt", "images.txt", "points3D.txt"):
                     (sparse_path / name).write_text("# empty\n", encoding="utf-8")
@@ -1002,6 +992,8 @@ class Da3RunTests(unittest.TestCase):
 
             with mock.patch(
                 "easysplat_da3_sfm.run._run_da3_model", side_effect=fake_run
+            ), mock.patch(
+                "easysplat_da3_sfm.run._select_device", return_value="mps"
             ):
                 exit_code = main(
                     [
@@ -1012,7 +1004,9 @@ class Da3RunTests(unittest.TestCase):
                         "--models-dir",
                         str(models),
                         "--device",
-                        "cpu",
+                        "mps",
+                        "--model-subdir",
+                        "DA3-SMALL",
                         "--input-ordering",
                         "continuous",
                         "--window-size",
@@ -1025,127 +1019,11 @@ class Da3RunTests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(attempts, ["DA3-BASE", "DA3-SMALL"])
+            self.assertEqual(attempts, ["DA3-SMALL"])
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["model_subdir"], "DA3-SMALL")
+            self.assertNotIn("fallback_model_subdir", payload)
             self.assertEqual(payload["export_strategy"], "aligned_pose_depth_seed")
-
-    def test_seed_oom_restarts_the_coherent_batch_with_small_model(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            images = root / "images"
-            models = root / "models"
-            out_sparse = root / "seed" / "0"
-            manifest = root / "manifest.json"
-            images.mkdir()
-            for index in range(4):
-                Image.new("RGB", (8, 8)).save(images / f"img{index}.jpg")
-            for model_name in ("DA3-BASE", "DA3-SMALL"):
-                model = models / model_name
-                model.mkdir(parents=True)
-                (model / "config.json").write_text("{}", encoding="utf-8")
-                (model / "model.safetensors").write_bytes(b"0")
-
-            calls: dict[str, list[list[str]]] = {"DA3-BASE": [], "DA3-SMALL": []}
-            loads: list[str] = []
-            base_model_ref: weakref.ReferenceType[object] | None = None
-
-            class FakeModel:
-                def __init__(self, name: str):
-                    self.name = name
-
-                def to(self, device):
-                    return self
-
-                def inference(self, **kwargs):
-                    names = [Path(value).name for value in kwargs["image"]]
-                    calls[self.name].append(names)
-                    if self.name == "DA3-BASE":
-                        raise RuntimeError("MPS backend out of memory")
-                    centers = []
-                    for name in names:
-                        index = int(name.removeprefix("img").removesuffix(".jpg"))
-                        centers.append(
-                            np.array(
-                                [
-                                    float(index % 3),
-                                    float(index // 3),
-                                    float((index * index) % 5) * 0.1,
-                                ]
-                            )
-                        )
-                    poses = np.repeat(np.eye(4)[None, ...], len(names), axis=0)
-                    poses[:, :3, 3] = -np.stack(centers)
-                    return {
-                        "extrinsics": poses,
-                        "intrinsics": np.repeat(
-                            np.eye(3)[None, ...], len(names), axis=0
-                        ),
-                        "depth": np.ones((len(names), 2, 2)),
-                        "conf": np.ones((len(names), 2, 2)),
-                    }
-
-            class FakeDepthAnything3:
-                @staticmethod
-                def from_pretrained(path, local_files_only=False):
-                    nonlocal base_model_ref
-                    name = Path(path).name
-                    loads.append(name)
-                    if name == "DA3-SMALL":
-                        gc.collect()
-                        if base_model_ref is not None and base_model_ref() is not None:
-                            raise AssertionError(
-                                "BASE model remained live when SMALL started loading"
-                            )
-                    model = FakeModel(name)
-                    if name == "DA3-BASE":
-                        base_model_ref = weakref.ref(model)
-                    return model
-
-            depth_anything_module = types.ModuleType("depth_anything_3")
-            api_module = types.ModuleType("depth_anything_3.api")
-            api_module.DepthAnything3 = FakeDepthAnything3
-            with mock.patch.dict(
-                sys.modules,
-                {
-                    "depth_anything_3": depth_anything_module,
-                    "depth_anything_3.api": api_module,
-                },
-            ):
-                exit_code = main(
-                    [
-                        "--images",
-                        str(images),
-                        "--out-sparse",
-                        str(out_sparse),
-                        "--models-dir",
-                        str(models),
-                        "--device",
-                        "cpu",
-                        "--input-ordering",
-                        "continuous",
-                        "--window-size",
-                        "4",
-                        "--window-overlap",
-                        "3",
-                        "--manifest-out",
-                        str(manifest),
-                    ]
-                )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(loads, ["DA3-BASE", "DA3-SMALL"])
-            self.assertEqual(
-                calls["DA3-BASE"],
-                [["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"]],
-            )
-            self.assertEqual(
-                calls["DA3-SMALL"][0], ["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"]
-            )
-            self.assertEqual(len(calls["DA3-SMALL"]), 1)
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(payload["model_subdir"], "DA3-SMALL")
-            self.assertEqual(payload["registered_image_count"], 4)
 
     def test_main_does_not_retry_non_memory_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1166,7 +1044,9 @@ class Da3RunTests(unittest.TestCase):
             with mock.patch(
                 "easysplat_da3_sfm.run._run_da3_model",
                 side_effect=RuntimeError("bad geometry"),
-            ) as run_mock:
+            ) as run_mock, mock.patch(
+                "easysplat_da3_sfm.run._select_device", return_value="mps"
+            ):
                 with self.assertRaisesRegex(RuntimeError, "bad geometry"):
                     main(
                         [
@@ -1177,7 +1057,7 @@ class Da3RunTests(unittest.TestCase):
                             "--models-dir",
                             str(models),
                             "--device",
-                            "cpu",
+                            "mps",
                         ]
                     )
 

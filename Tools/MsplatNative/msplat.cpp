@@ -2011,6 +2011,8 @@ int main(int argc, char *argv[]) {
     std::string expectedGeometryDigest;
     std::uint64_t seed = 42;
     std::uint64_t memoryBudgetBytes = 0;
+    int iterationLimitOverride = 0;
+    int plateauWindowOverride = 0;
     int eventsFileDescriptor = -1;
     bool selfCheck = false;
     std::string plyToValidate;
@@ -2024,6 +2026,18 @@ int main(int argc, char *argv[]) {
     CLI::Option *profileOption = app.add_option(
         "--profile", profileName, "Training profile: fast, balanced, or high-detail"
     );
+    CLI::Option *iterationLimitOption = app.add_option(
+        "--iteration-limit",
+        iterationLimitOverride,
+        "Positive training iteration limit"
+    );
+    iterationLimitOption->check(CLI::Range(1, 1000000));
+    CLI::Option *plateauWindowOption = app.add_option(
+        "--plateau-window",
+        plateauWindowOverride,
+        "Positive early-stop plateau window"
+    );
+    plateauWindowOption->check(CLI::Range(1, 1000000));
     CLI::Option *seedOption = app.add_option(
         "--seed", seed, "UInt64 seed for reproducible camera ordering"
     );
@@ -2194,7 +2208,16 @@ int main(int argc, char *argv[]) {
             );
         }
         if (eventsOption->count() == 0) throw std::runtime_error("--events-fd is required for training");
-        const TrainingProfileConfig &profile = trainingProfileNamed(profileName);
+        TrainingProfileConfig profile = trainingProfileNamed(profileName);
+        if (iterationLimitOption->count() != 0) {
+            profile.iterationLimit = iterationLimitOverride;
+        }
+        if (plateauWindowOption->count() != 0) {
+            profile.plateauWindow = plateauWindowOverride;
+        }
+        if (profile.plateauWindow > profile.iterationLimit) {
+            throw std::runtime_error("--plateau-window cannot exceed --iteration-limit");
+        }
         if (!fs::is_directory(datasetPath)) throw std::runtime_error("dataset directory does not exist");
         if (fs::path(outputPath).extension() != ".ply") throw std::runtime_error("--output must end in .ply");
         msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);

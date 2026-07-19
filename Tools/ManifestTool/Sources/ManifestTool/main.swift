@@ -137,12 +137,13 @@ struct ManifestTool {
             let version = try parser.require("--version")
             let publishedAtValue = try parser.require("--published-at")
             let manifestOut = try parser.require("--manifest-out")
-            let privateKey = try ManifestKeyInput.resolvePrivateKeyBase64(parser: &parser)
             let publishedAt = try parsePublishedAt(publishedAtValue)
             let minimumAppVersion = try parser.require("--app-version-minimum")
             let maximumAppVersion = try parser.require("--app-version-maximum-exclusive")
 
             let componentInputs = try buildComponentInputs(parser: &parser)
+            try ManifestBuilder.requireDirectSigningAllowed(components: componentInputs)
+            let privateKey = try ManifestKeyInput.resolvePrivateKeyBase64(parser: &parser)
             let manifest = try ManifestBuilder.build(
                 version: version,
                 publishedAt: publishedAt,
@@ -165,7 +166,7 @@ struct ManifestTool {
         Generate keypair:
           ManifestTool generate-keypair --public-key-out <path> --private-key-out <path>
 
-        Generate schema-2 component manifest:
+        Generate a local-development schema-2 component manifest:
           ManifestTool --core-zip <path> --core-url <url> \\
             --da3-base-zip <path> --da3-base-url <url> \\
             --da3-small-zip <path> --da3-small-url <url> \\

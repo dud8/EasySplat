@@ -10,12 +10,16 @@ DEPS_DIR="$BUILD_DIR/dependencies"
 INSTALL_PARENT="$BUILD_DIR/install"
 INSTALL_DIR="$INSTALL_PARENT/msplat"
 STAGE_DIR="$INSTALL_PARENT/msplat.stage.$$"
-BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
+PROMOTER="$ROOT/scripts/toolchain/atomic_swap_install.py"
+PYTHON_BIN="/usr/bin/python3"
+INSTALL_STAGE_OWNED=0
+INSTALL_STAGE_DEVICE=""
+INSTALL_STAGE_INODE=""
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
-OVERLAY_SHA256="0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6"
+OVERLAY_SHA256="fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7"
+RASTER_TEST_SHA256="3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"
@@ -38,6 +42,10 @@ GEOMETRY_ADAM_FUSION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-geometry-adam-
 GEOMETRY_ADAM_FUSION_PATCH_SHA256="927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c"
 PARALLEL_RADIX_SCAN_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-parallel-radix-scan.patch"
 PARALLEL_RADIX_SCAN_PATCH_SHA256="1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"
+ALLOCATION_PRESSURE_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-allocation-pressure.patch"
+ALLOCATION_PRESSURE_PATCH_SHA256="d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"
+EXACT_PREFIX_HARDENING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-prefix-hardening.patch"
+EXACT_PREFIX_HARDENING_PATCH_SHA256="99022e824c91ca57b34f60f21b29753db788290541c3c6bc52a5b496794d9683"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
@@ -52,18 +60,39 @@ NANOFLANN_SHA256="57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6
 CLI11_URL="https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.4.2.zip"
 CLI11_SHA256="43e650d5e1a3acaaf419d1e61a81f77b408d0696f472be0599ddf877d40984b0"
 
+STAGE_CLEANUP_ALLOWED=1
+
 cleanup() {
   local status=$?
-  rm -rf "$STAGE_DIR"
-  if [ "$status" -ne 0 ] && [ -d "$BACKUP_DIR" ] && [ ! -e "$INSTALL_DIR" ]; then
-    mv "$BACKUP_DIR" "$INSTALL_DIR"
+  local install_cleanup_status=0
+  trap - EXIT
+  trap '' INT TERM HUP
+  if [ "$STAGE_CLEANUP_ALLOWED" = "1" ] && [ "$INSTALL_STAGE_OWNED" = "1" ]; then
+    if [ -n "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ] && \
+      [ -f "$PROMOTER" ] && [ ! -L "$PROMOTER" ]; then
+      "$PYTHON_BIN" "$PROMOTER" \
+        --remove-owned-tree \
+        "$STAGE_DIR" \
+        "$INSTALL_STAGE_DEVICE" \
+        "$INSTALL_STAGE_INODE" \
+        --allow-symlinks || install_cleanup_status=$?
+    else
+      install_cleanup_status=1
+    fi
+    if [ "$install_cleanup_status" -ne 0 ]; then
+      printf '%s\n' \
+        "native msplat cleanup preserved an unverified staged install: $STAGE_DIR" >&2
+    fi
   fi
-  if [ "$status" -eq 0 ]; then
-    rm -rf "$BACKUP_DIR"
+  if [ "$status" -eq 0 ] && [ "$install_cleanup_status" -ne 0 ]; then
+    status="$install_cleanup_status"
   fi
   exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 die() {
   echo "native msplat build failed: $*" >&2
@@ -78,6 +107,34 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+create_owned_install_stage() {
+  local identity
+  identity="$(
+    "$PYTHON_BIN" "$PROMOTER" --create-owned-tree "$STAGE_DIR"
+  )" || die "could not create and bind native msplat install stage"
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || \
+    die "native msplat install stage identity is malformed"
+  INSTALL_STAGE_DEVICE="${identity%%:*}"
+  INSTALL_STAGE_INODE="${identity#*:}"
+  INSTALL_STAGE_OWNED=1
+}
+
+recover_stale_promotions() {
+  local journal path
+  for journal in "$INSTALL_PARENT"/msplat.stage.*.promotion-state; do
+    [ -e "$journal" ] || [ -L "$journal" ] || continue
+    "$PYTHON_BIN" "$PROMOTER" --recover "$journal" || \
+      die "could not recover interrupted msplat promotion: $journal"
+  done
+  for path in "$INSTALL_PARENT"/msplat.stage.* "$INSTALL_PARENT"/msplat.previous.*; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    case "$path" in
+      *.promotion-state) continue ;;
+    esac
+    die "ambiguous staged install requires recovery: $path"
+  done
+}
+
 reject_raster_test_symbols() {
   local binary="$1"
   local symbol
@@ -87,11 +144,14 @@ reject_raster_test_symbols() {
     msplat_set_exact_execution_capacity_for_testing \
     msplat_set_exact_capacity_limit_for_testing \
     msplat_set_raster_memory_budget_for_testing \
+    msplat_simulate_gpu_allocation_failure_for_testing \
+    msplat_set_raster_memory_budget_and_fail_for_testing \
     msplat_set_tile_culling_min_area_for_testing \
     msplat_set_geometry_adam_fusion_enabled_for_testing \
     msplat_fail_next_sync_for_testing \
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_exact_radix_pass_count_for_testing \
+    msplat_exact_prefix_sum_for_testing \
     msplat_exact_radix_sort_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
     msplat_gpu_frequency_from_timestamp_pairs_for_testing \
@@ -99,7 +159,8 @@ reject_raster_test_symbols() {
     msplat_stage_timing_aggregate_coherent_for_testing \
     msplat_enable_stage_profiling_for_testing \
     msplat_gpu_timestamp_calibration_for_testing \
-    msplat_copy_last_raster_debug; do
+    msplat_copy_last_raster_debug \
+    msplat_copy_last_raster_reference_debug; do
     if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
       die "staged CLI exports raster test hook: $symbol"
     fi
@@ -111,9 +172,11 @@ preflight() {
   if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" = "1" ]; then
     die "must run outside Rosetta"
   fi
-  for command in cmake ninja git curl shasum xcrun ditto file python3; do
+  for command in cmake ninja git curl shasum xcrun ditto file; do
     require_command "$command"
   done
+  [ -x "$PYTHON_BIN" ] || die "selected Python executable is unavailable"
+  [ -x "$PROMOTER" ] || die "atomic install promoter is missing or not executable"
   if ! xcrun -f metal >/dev/null 2>&1 || ! xcrun -f metallib >/dev/null 2>&1; then
     echo "Xcode's optional Metal compiler is required." >&2
     echo "Install it with: xcodebuild -downloadComponent MetalToolchain" >&2
@@ -159,6 +222,14 @@ preflight() {
     || die "missing parallel radix-scan patch: $PARALLEL_RADIX_SCAN_PATCH"
   [ "$(sha256 "$PARALLEL_RADIX_SCAN_PATCH")" = "$PARALLEL_RADIX_SCAN_PATCH_SHA256" ] \
     || die "parallel radix-scan patch SHA-256 mismatch"
+  [ -f "$ALLOCATION_PRESSURE_PATCH" ] \
+    || die "missing allocation-pressure patch: $ALLOCATION_PRESSURE_PATCH"
+  [ "$(sha256 "$ALLOCATION_PRESSURE_PATCH")" = "$ALLOCATION_PRESSURE_PATCH_SHA256" ] \
+    || die "allocation-pressure patch SHA-256 mismatch"
+  [ -f "$EXACT_PREFIX_HARDENING_PATCH" ] \
+    || die "missing exact-prefix hardening patch: $EXACT_PREFIX_HARDENING_PATCH"
+  [ "$(sha256 "$EXACT_PREFIX_HARDENING_PATCH")" = "$EXACT_PREFIX_HARDENING_PATCH_SHA256" ] \
+    || die "exact-prefix hardening patch SHA-256 mismatch"
   for source in \
     "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
     "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -262,6 +333,10 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply "$GEOMETRY_ADAM_FUSION_PATCH"
   git -C "$SOURCE_DIR" apply --check "$PARALLEL_RADIX_SCAN_PATCH"
   git -C "$SOURCE_DIR" apply "$PARALLEL_RADIX_SCAN_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$ALLOCATION_PRESSURE_PATCH"
+  git -C "$SOURCE_DIR" apply "$ALLOCATION_PRESSURE_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$EXACT_PREFIX_HARDENING_PATCH"
+  git -C "$SOURCE_DIR" apply "$EXACT_PREFIX_HARDENING_PATCH"
 }
 
 configure_and_build() {
@@ -297,7 +372,7 @@ configure_and_build() {
   "$NATIVE_BUILD_DIR/tile_span_metal_tests" \
     "$NATIVE_BUILD_DIR/tile_span_property.metallib"
   rm -rf "$RASTER_TEST_FIXTURES"
-  python3 "$FIXTURE_GENERATOR" --output "$RASTER_TEST_FIXTURES"
+  "$PYTHON_BIN" "$FIXTURE_GENERATOR" --output "$RASTER_TEST_FIXTURES"
   "$NATIVE_BUILD_DIR/msplat_raster_tests" \
     "$RASTER_TEST_FIXTURES/01-sphere-500" \
     "$RASTER_TEST_FIXTURES/14-mixed-resolution-500" \
@@ -307,13 +382,14 @@ configure_and_build() {
     "$RASTER_TEST_FIXTURES/17-exact-budget-1279"
   "$NATIVE_BUILD_DIR/msplat_raster_tests" \
     --stage-timing "$RASTER_TEST_FIXTURES/01-sphere-500"
+  "$NATIVE_BUILD_DIR/msplat_raster_tests" --prefix-oracle
   "$NATIVE_BUILD_DIR/msplat_raster_tests" --radix-oracle
 }
 
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -332,10 +408,12 @@ write_build_info() {
   row_span_culling_patch_sha256="$(sha256 "$ROW_SPAN_CULLING_PATCH")"
   geometry_adam_fusion_patch_sha256="$(sha256 "$GEOMETRY_ADAM_FUSION_PATCH")"
   parallel_radix_scan_patch_sha256="$(sha256 "$PARALLEL_RADIX_SCAN_PATCH")"
+  allocation_pressure_patch_sha256="$(sha256 "$ALLOCATION_PRESSURE_PATCH")"
+  exact_prefix_hardening_patch_sha256="$(sha256 "$EXACT_PREFIX_HARDENING_PATCH")"
 
-  python3 - "$build_info" \
+  "$PYTHON_BIN" - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" "$parallel_radix_scan_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" "$parallel_radix_scan_patch_sha256" "$allocation_pressure_patch_sha256" "$exact_prefix_hardening_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -361,6 +439,8 @@ import sys
     row_span_culling_patch_sha256,
     geometry_adam_fusion_patch_sha256,
     parallel_radix_scan_patch_sha256,
+    allocation_pressure_patch_sha256,
+    exact_prefix_hardening_patch_sha256,
     nlohmann_json_sha256,
     nanoflann_sha256,
     cli11_sha256,
@@ -391,6 +471,8 @@ payload = {
     "row_span_culling_patch_sha256": row_span_culling_patch_sha256,
     "geometry_adam_fusion_patch_sha256": geometry_adam_fusion_patch_sha256,
     "parallel_radix_scan_patch_sha256": parallel_radix_scan_patch_sha256,
+    "allocation_pressure_patch_sha256": allocation_pressure_patch_sha256,
+    "exact_prefix_hardening_patch_sha256": exact_prefix_hardening_patch_sha256,
     "dependencies": {
         "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
         "nanoflann_v1.5.5_sha256": nanoflann_sha256,
@@ -425,7 +507,6 @@ PY
 }
 
 stage_install() {
-  rm -rf "$STAGE_DIR"
   mkdir -p "$STAGE_DIR/bin"
   install -m 0755 "$NATIVE_BUILD_DIR/msplat" "$STAGE_DIR/bin/easysplat-train"
   install -m 0644 "$NATIVE_BUILD_DIR/default.metallib" "$STAGE_DIR/bin/default.metallib"
@@ -435,6 +516,223 @@ stage_install() {
   executable_sha256="$(sha256 "$STAGE_DIR/bin/easysplat-train")"
   metallib_sha256="$(sha256 "$STAGE_DIR/bin/default.metallib")"
   write_build_info "$executable_sha256" "$metallib_sha256"
+}
+
+audit_stage_extended_metadata() {
+  local mode="$1"
+  "$PYTHON_BIN" - \
+    "$STAGE_DIR" \
+    "$INSTALL_STAGE_DEVICE" \
+    "$INSTALL_STAGE_INODE" \
+    "$mode" <<'PY'
+import ctypes
+import errno
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+ACL_TYPE_EXTENDED = 0x00000100
+SYSTEM_PROVENANCE = "com.apple.provenance"
+XATTR_SHOWCOMPRESSION = 0x0020
+
+root = Path(sys.argv[1])
+expected_root = (int(sys.argv[2]), int(sys.argv[3]))
+mode = sys.argv[4]
+if mode not in {"normalize", "validate"}:
+    raise SystemExit("native msplat metadata mode is invalid")
+
+libc = ctypes.CDLL(None, use_errno=True)
+flistxattr = libc.flistxattr
+flistxattr.argtypes = (
+    ctypes.c_int,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_int,
+)
+flistxattr.restype = ctypes.c_ssize_t
+acl_get_fd = libc.acl_get_fd_np
+acl_get_fd.argtypes = (ctypes.c_int, ctypes.c_int)
+acl_get_fd.restype = ctypes.c_void_p
+acl_free = libc.acl_free
+acl_free.argtypes = (ctypes.c_void_p,)
+acl_free.restype = ctypes.c_int
+
+
+def attribute_names(descriptor: int) -> tuple[str, ...]:
+    ctypes.set_errno(0)
+    size = flistxattr(descriptor, None, 0, XATTR_SHOWCOMPRESSION)
+    if size < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if size == 0:
+        return ()
+    buffer = ctypes.create_string_buffer(size)
+    ctypes.set_errno(0)
+    actual = flistxattr(descriptor, buffer, size, XATTR_SHOWCOMPRESSION)
+    if actual < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if actual != size:
+        raise OSError("extended attribute list changed during audit")
+    return tuple(
+        sorted(
+            os.fsdecode(name)
+            for name in bytes(buffer.raw[:actual]).split(b"\0")
+            if name
+        )
+    )
+
+
+def has_extended_acl(descriptor: int) -> bool:
+    ctypes.set_errno(0)
+    acl = acl_get_fd(descriptor, ACL_TYPE_EXTENDED)
+    if not acl:
+        error = ctypes.get_errno()
+        if error == errno.ENOENT:
+            return False
+        raise OSError(error, os.strerror(error))
+    if acl_free(acl) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return True
+
+
+paths = [root]
+for current, directory_names, file_names in os.walk(root, followlinks=False):
+    directory_names.sort()
+    file_names.sort()
+    current_path = Path(current)
+    paths.extend(current_path / name for name in directory_names)
+    paths.extend(current_path / name for name in file_names)
+
+records = []
+try:
+    for path in paths:
+        before = os.lstat(path)
+        if stat.S_ISDIR(before.st_mode):
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        elif stat.S_ISREG(before.st_mode):
+            if before.st_nlink != 1:
+                raise SystemExit(
+                    "native msplat metadata audit rejects a multiply linked "
+                    f"file: {path}"
+                )
+            flags = os.O_RDONLY
+        else:
+            raise SystemExit(
+                "native msplat metadata audit rejects an unsupported entry: "
+                f"{path}"
+            )
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            os.close(descriptor)
+            raise SystemExit(f"native msplat metadata entry changed: {path}")
+        if path == root and (opened.st_dev, opened.st_ino) != expected_root:
+            os.close(descriptor)
+            raise SystemExit("native msplat install stage owned identity changed")
+        records.append((path, descriptor, opened))
+
+    bound_attributes = []
+    for path, descriptor, _ in records:
+        if has_extended_acl(descriptor):
+            raise SystemExit(f"native msplat install has an extended ACL: {path}")
+        names = attribute_names(descriptor)
+        unexpected = tuple(name for name in names if name != SYSTEM_PROVENANCE)
+        if unexpected:
+            raise SystemExit(
+                "native msplat install has an unexpected extended attribute: "
+                f"{unexpected[0]} on {path}"
+            )
+        if mode == "validate" and names:
+            raise SystemExit(f"native msplat install has extended attributes: {path}")
+        bound_attributes.append((path, descriptor, names))
+
+finally:
+    for _, descriptor, _ in reversed(records):
+        os.close(descriptor)
+
+root_after = os.lstat(root)
+if (root_after.st_dev, root_after.st_ino) != expected_root:
+    raise SystemExit("native msplat install stage changed during metadata audit")
+if mode == "normalize":
+    for path, _, expected in reversed(records):
+        named = os.lstat(path)
+        if (named.st_dev, named.st_ino) != (expected.st_dev, expected.st_ino):
+            raise SystemExit(f"native msplat metadata entry changed: {path}")
+        if stat.S_ISDIR(expected.st_mode):
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        else:
+            flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            names = attribute_names(descriptor)
+        finally:
+            os.close(descriptor)
+        if names:
+            removal = subprocess.run(
+                [
+                    "/usr/bin/xattr",
+                    "-s",
+                    "-d",
+                    SYSTEM_PROVENANCE,
+                    os.fspath(path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if removal.returncode != 0:
+                raise SystemExit(
+                    "native msplat system provenance cleanup failed: "
+                    f"{path}: {removal.stderr.strip()}"
+                )
+        named_after = os.lstat(path)
+        if (named_after.st_dev, named_after.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise SystemExit(
+                f"native msplat metadata entry changed during cleanup: {path}"
+            )
+
+    for path, _, expected in records:
+        if stat.S_ISDIR(expected.st_mode):
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        else:
+            flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            reopened = os.fstat(descriptor)
+            if (reopened.st_dev, reopened.st_ino) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                raise SystemExit(
+                    f"native msplat metadata entry changed after cleanup: {path}"
+                )
+            remaining = attribute_names(descriptor)
+            if remaining:
+                raise SystemExit(
+                    "native msplat metadata normalization was incomplete: "
+                    f"{path} ({remaining})"
+                )
+        finally:
+            os.close(descriptor)
+PY
+}
+
+normalize_stage_system_metadata() {
+  audit_stage_extended_metadata normalize
+}
+
+validate_stage_extended_metadata() {
+  audit_stage_extended_metadata validate
 }
 
 validate_stage() {
@@ -458,7 +756,7 @@ validate_stage() {
   expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./build_info.json'
   [ "$actual_files" = "$expected_files" ] || die "unexpected staged files"
 
-  if ! python3 - "$STAGE_DIR/build_info.json" "$(sha256 "$binary")" "$(sha256 "$metallib")" <<'PY'
+  if ! "$PYTHON_BIN" - "$STAGE_DIR/build_info.json" "$(sha256 "$binary")" "$(sha256 "$metallib")" <<'PY'
 import json
 import sys
 
@@ -495,25 +793,30 @@ PY
 }
 
 promote_install() {
-  rm -rf "$BACKUP_DIR"
-  if [ -e "$INSTALL_DIR" ]; then
-    mv "$INSTALL_DIR" "$BACKUP_DIR"
-  fi
-  if ! mv "$STAGE_DIR" "$INSTALL_DIR"; then
-    [ ! -e "$INSTALL_DIR" ] || rm -rf "$INSTALL_DIR"
-    [ ! -d "$BACKUP_DIR" ] || mv "$BACKUP_DIR" "$INSTALL_DIR"
-    die "could not promote staged install"
-  fi
-  rm -rf "$BACKUP_DIR"
+  local journal="$STAGE_DIR.promotion-state" tree_receipt
+  validate_stage_extended_metadata
+  tree_receipt="$("$PYTHON_BIN" "$PROMOTER" --tree-receipt \
+    "$STAGE_DIR" "$INSTALL_STAGE_DEVICE" "$INSTALL_STAGE_INODE")" || \
+    die "could not bind the validated native msplat tree"
+  validate_stage_extended_metadata
+  STAGE_CLEANUP_ALLOWED=0
+  "$PYTHON_BIN" "$PROMOTER" "$STAGE_DIR" "$INSTALL_DIR" "$tree_receipt" || \
+    die "could not promote staged install; recovery state preserved"
+  "$PYTHON_BIN" "$PROMOTER" --commit "$journal" || \
+    die "could not finalize staged install; recovery state preserved"
 }
 
 preflight
 mkdir -p "$BUILD_DIR" "$INSTALL_PARENT"
+recover_stale_promotions
+create_owned_install_stage
 prepare_dependencies
 prepare_source
 configure_and_build
 stage_install
+normalize_stage_system_metadata
 validate_stage
+validate_stage_extended_metadata
 promote_install
 
 echo "native msplat ready at $INSTALL_DIR"

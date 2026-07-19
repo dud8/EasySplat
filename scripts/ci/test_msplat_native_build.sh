@@ -18,6 +18,8 @@ DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-
 ROW_SPAN_CULLING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-row-span-culling.patch"
 GEOMETRY_ADAM_FUSION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-geometry-adam-fusion.patch"
 PARALLEL_RADIX_SCAN_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-parallel-radix-scan.patch"
+ALLOCATION_PRESSURE_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-allocation-pressure.patch"
+EXACT_PREFIX_HARDENING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-prefix-hardening.patch"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
@@ -25,6 +27,8 @@ SWIFT_VALIDATOR="$ROOT/EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManage
 SWIFT_FIXTURE="$ROOT/EasySplatCore/Tests/EasySplatCoreTests/ToolchainFixtureBuilder.swift"
 INSTALL_DIR="${EASYSPLAT_MSPLAT_INSTALL_DIR:-$ROOT/Toolchains/build/msplat/install/msplat}"
 RASTER_TEST_BIN="${EASYSPLAT_MSPLAT_RASTER_TEST_BIN:-$ROOT/Toolchains/build/msplat/native-build/msplat_raster_tests}"
+NATIVE_BUILD_DIR="${EASYSPLAT_MSPLAT_NATIVE_BUILD_DIR:-$ROOT/Toolchains/build/msplat/native-build}"
+ALLOCATION_PRESSURE_TEST_BIN="$NATIVE_BUILD_DIR/msplat_allocation_pressure_cli"
 
 fail() {
   echo "native msplat build contract failed: $*" >&2
@@ -63,6 +67,8 @@ require_file "$DENSIFICATION_MEMORY_PATCH"
 require_file "$ROW_SPAN_CULLING_PATCH"
 require_file "$GEOMETRY_ADAM_FUSION_PATCH"
 require_file "$PARALLEL_RADIX_SCAN_PATCH"
+require_file "$ALLOCATION_PRESSURE_PATCH"
+require_file "$EXACT_PREFIX_HARDENING_PATCH"
 for source in \
   "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
   "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -82,11 +88,11 @@ require_contains 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$BU
 require_contains 'MSPLAT_VERSION="1.1.3"' "$BUILD_SCRIPT"
 require_contains 'UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$UPSTREAM_PATCH")" = "$UPSTREAM_PATCH_SHA256" ]' "$BUILD_SCRIPT"
-require_contains 'OVERLAY_SHA256="0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6"' "$BUILD_SCRIPT"
+require_contains 'OVERLAY_SHA256="fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT"
-require_contains '"overlay_sha256": "0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6"' "$VALIDATOR"
+require_contains '"overlay_sha256": "fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc"' "$VALIDATOR"
 require_contains '"patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$VALIDATOR"
-require_contains 'RASTER_TEST_SHA256="7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7"' "$BUILD_SCRIPT"
+require_contains 'RASTER_TEST_SHA256="3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$BUILD_SCRIPT"
 require_contains 'NANOFLANN_SHA256="57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc"' "$BUILD_SCRIPT"
@@ -195,12 +201,63 @@ require_contains 'msplat_exact_radix_sort_for_testing' "$RASTER_TEST_SOURCE"
 require_contains 'verifyExactRadixOracle' "$RASTER_TEST_SOURCE"
 require_contains '--radix-oracle' "$RASTER_TEST_SOURCE"
 require_contains '"$NATIVE_BUILD_DIR/msplat_raster_tests" --radix-oracle' "$BUILD_SCRIPT"
+require_contains 'msplat-1.1.3-allocation-pressure.patch' "$BUILD_SCRIPT"
+require_contains 'ALLOCATION_PRESSURE_PATCH_SHA256="d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$BUILD_SCRIPT"
+actual_allocation_pressure_patch_sha256="$(shasum -a 256 "$ALLOCATION_PRESSURE_PATCH" | awk '{print $1}')"
+[ "$actual_allocation_pressure_patch_sha256" = "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083" ] \
+  || fail "allocation-pressure patch SHA-256 mismatch"
+require_contains '[ "$(sha256 "$ALLOCATION_PRESSURE_PATCH")" = "$ALLOCATION_PRESSURE_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$ALLOCATION_PRESSURE_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$ALLOCATION_PRESSURE_PATCH"' "$BUILD_SCRIPT"
+require_contains 'allocation_pressure_patch_sha256' "$BUILD_SCRIPT"
+require_contains '"allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$VALIDATOR"
+require_contains 'metal_allocation_unavailable' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'msplat_metal_allocation_was_unavailable' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'msplat_simulate_gpu_allocation_failure_for_testing' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'msplat_set_raster_memory_budget_and_fail_for_testing' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'add_executable(msplat_allocation_pressure_cli cli/msplat.cpp)' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'msplat_core_raster_tests CLI11::CLI11 pthread' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'msplat_set_raster_memory_budget_bytes=msplat_set_raster_memory_budget_and_fail_for_testing' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'MSPLAT_ENABLE_RASTER_TEST_HOOKS' "$ALLOCATION_PRESSURE_PATCH"
+require_absent 'add_option("--simulate' "$ALLOCATION_PRESSURE_PATCH"
+require_absent 'add_flag("--simulate' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'return 71;' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'EXACT_PREFIX_HARDENING_PATCH_SHA256="99022e824c91ca57b34f60f21b29753db788290541c3c6bc52a5b496794d9683"' "$BUILD_SCRIPT"
+actual_exact_prefix_hardening_patch_sha256="$(shasum -a 256 "$EXACT_PREFIX_HARDENING_PATCH" | awk '{print $1}')"
+[ "$actual_exact_prefix_hardening_patch_sha256" = "99022e824c91ca57b34f60f21b29753db788290541c3c6bc52a5b496794d9683" ] \
+  || fail "exact-prefix hardening patch SHA-256 mismatch"
+require_contains '[ "$(sha256 "$EXACT_PREFIX_HARDENING_PATCH")" = "$EXACT_PREFIX_HARDENING_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$EXACT_PREFIX_HARDENING_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$EXACT_PREFIX_HARDENING_PATCH"' "$BUILD_SCRIPT"
+require_contains 'exact_prefix_hardening_patch_sha256' "$BUILD_SCRIPT"
+require_contains 'exact_block_offsets_u64_kernel' "$EXACT_PREFIX_HARDENING_PATCH"
+require_contains 'block_totals[group] + inclusive[lane]' "$EXACT_PREFIX_HARDENING_PATCH"
+require_contains '-        for (uint prior = 0; prior < group; ++prior)' "$EXACT_PREFIX_HARDENING_PATCH"
+require_absent '+        for (uint prior = 0; prior < group; ++prior)' "$EXACT_PREFIX_HARDENING_PATCH"
+require_contains 'msplat_copy_last_raster_reference_debug' "$EXACT_PREFIX_HARDENING_PATCH"
+require_contains 'msplat_exact_prefix_sum_for_testing' "$EXACT_PREFIX_HARDENING_PATCH"
+require_contains 'msplat_exact_prefix_sum_for_testing' "$RASTER_TEST_SOURCE"
+require_contains 'verifyExactPrefixOracle' "$RASTER_TEST_SOURCE"
+require_contains '{1023u, 1024u, 1025u, 2048u, 2049u}' "$RASTER_TEST_SOURCE"
+require_contains '"$NATIVE_BUILD_DIR/msplat_raster_tests" --prefix-oracle' "$BUILD_SCRIPT"
+require_contains 'cpuRasterReference' "$RASTER_TEST_SOURCE"
+require_contains 'verifyOverflowCPUReference(argv[3]);' "$RASTER_TEST_SOURCE"
+require_contains 'overflowReferenceOpacity = 1.0f / 240.0f' "$RASTER_TEST_SOURCE"
+require_contains 'std::pow(1.0f - overflowReferenceOpacity, 2050.0f)' "$RASTER_TEST_SOURCE"
+require_contains 'requireOverflowTailEvidence(reference, actual, 1024);' "$RASTER_TEST_SOURCE"
+require_contains 'requireOverflowTailEvidence(reference, actual, 2048);' "$RASTER_TEST_SOURCE"
+require_contains 'overflow_cpu_position_gradients' "$RASTER_TEST_SOURCE"
+require_contains 'overflow_cpu_color_gradients' "$RASTER_TEST_SOURCE"
+require_contains 'overflow_cpu_opacity_gradients' "$RASTER_TEST_SOURCE"
 require_contains 'project_geometry_adam_backward_kernel' "$GEOMETRY_ADAM_FUSION_PATCH"
 require_contains 'sh_adam_backward_kernel' "$GEOMETRY_ADAM_FUSION_PATCH"
 require_contains 'msplat_set_geometry_adam_fusion_enabled_for_testing' "$RASTER_TEST_SOURCE"
 for symbol_contract in "$BUILD_SCRIPT" "$VALIDATOR"; do
   require_contains 'msplat_set_geometry_adam_fusion_enabled_for_testing' "$symbol_contract"
+  require_contains 'msplat_exact_prefix_sum_for_testing' "$symbol_contract"
   require_contains 'msplat_exact_radix_sort_for_testing' "$symbol_contract"
+  require_contains 'msplat_set_raster_memory_budget_and_fail_for_testing' "$symbol_contract"
+  require_contains 'msplat_copy_last_raster_reference_debug' "$symbol_contract"
 done
 require_contains 'geometryAdamShDegreeInterval = 4' "$RASTER_TEST_SOURCE"
 require_contains 'makeModel(inputData, geometryAdamShDegreeInterval)' "$RASTER_TEST_SOURCE"
@@ -257,11 +314,15 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'row_span_culling_patch_sha256' "$contract_file"
   require_contains 'geometry_adam_fusion_patch_sha256' "$contract_file"
   require_contains 'parallel_radix_scan_patch_sha256' "$contract_file"
+  require_contains 'allocation_pressure_patch_sha256' "$contract_file"
+  require_contains 'exact_prefix_hardening_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
-  require_contains '"overlay_sha256": "0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6"' "$contract_file"
-  require_contains '"raster_test_sha256": "7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7"' "$contract_file"
+  require_contains '"overlay_sha256": "fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc"' "$contract_file"
+  require_contains '"raster_test_sha256": "3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
+  require_contains '"allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$contract_file"
+  require_contains '"exact_prefix_hardening_patch_sha256": "99022e824c91ca57b34f60f21b29753db788290541c3c6bc52a5b496794d9683"' "$contract_file"
 done
 require_contains 'scene_bounds_status' "$SWIFT_VALIDATOR"
 require_contains 'python3 - "$build_info"' "$BUILD_SCRIPT"
@@ -274,7 +335,7 @@ for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.
   require_absent "$forbidden" "$BUILD_SCRIPT"
 done
 
-for flag in --dataset --output --profile --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --benchmark-decode --benchmark-decode-output --version --help; do
+for flag in --dataset --output --profile --iteration-limit --plateau-window --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --benchmark-decode --benchmark-decode-output --version --help; do
   require_contains "$flag" "$OVERLAY"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -496,6 +557,27 @@ done
 [ -x "$BIN" ] || fail "native CLI is not executable: $BIN"
 [ -s "$METALLIB" ] || fail "metallib is empty: $METALLIB"
 
+[ -f "$NATIVE_BUILD_DIR/CMakeCache.txt" ] \
+  || fail "native build directory is not configured: $NATIVE_BUILD_DIR"
+production_binary_hash_before="$(shasum -a 256 "$BIN" | awk '{print $1}')"
+production_provenance_hash_before="$(shasum -a 256 "$BUILD_INFO" | awk '{print $1}')"
+cmake --build "$NATIVE_BUILD_DIR" --target msplat_allocation_pressure_cli
+require_file "$ALLOCATION_PRESSURE_TEST_BIN"
+[ -x "$ALLOCATION_PRESSURE_TEST_BIN" ] \
+  || fail "allocation-pressure test CLI is not executable"
+/usr/bin/file -b "$ALLOCATION_PRESSURE_TEST_BIN" | grep -q 'Mach-O 64-bit executable arm64' \
+  || fail "allocation-pressure test CLI is not an arm64 Mach-O"
+for symbol in \
+  msplat_simulate_gpu_allocation_failure_for_testing \
+  msplat_set_raster_memory_budget_and_fail_for_testing; do
+  /usr/bin/nm -gU "$ALLOCATION_PRESSURE_TEST_BIN" | grep -Fq "$symbol" \
+    || fail "allocation-pressure test CLI is missing test hook: $symbol"
+done
+[ "$(shasum -a 256 "$BIN" | awk '{print $1}')" = "$production_binary_hash_before" ] \
+  || fail "building the allocation-pressure test CLI changed the production binary"
+[ "$(shasum -a 256 "$BUILD_INFO" | awk '{print $1}')" = "$production_provenance_hash_before" ] \
+  || fail "building the allocation-pressure test CLI changed production provenance"
+
 actual_files="$(cd "$INSTALL_DIR" && find . -type f -print | LC_ALL=C sort)"
 expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./build_info.json'
 [ "$actual_files" = "$expected_files" ] || fail "unexpected staged install contents:\n$actual_files"
@@ -507,9 +589,12 @@ for symbol in \
   msplat_set_exact_execution_capacity_for_testing \
   msplat_set_exact_capacity_limit_for_testing \
   msplat_set_raster_memory_budget_for_testing \
+  msplat_simulate_gpu_allocation_failure_for_testing \
+  msplat_set_raster_memory_budget_and_fail_for_testing \
   msplat_set_geometry_adam_fusion_enabled_for_testing \
   msplat_fail_next_sync_for_testing \
   msplat_pending_exact_raster_timing_handlers_for_testing \
+  msplat_exact_prefix_sum_for_testing \
   msplat_exact_radix_sort_for_testing \
   msplat_gpu_ticks_to_seconds_for_testing \
   msplat_gpu_frequency_from_timestamp_pairs_for_testing \
@@ -517,7 +602,8 @@ for symbol in \
   msplat_stage_timing_aggregate_coherent_for_testing \
   msplat_enable_stage_profiling_for_testing \
   msplat_gpu_timestamp_calibration_for_testing \
-  msplat_copy_last_raster_debug; do
+  msplat_copy_last_raster_debug \
+  msplat_copy_last_raster_reference_debug; do
   if nm -gU "$BIN" | grep -Fq "$symbol"; then
     fail "production CLI exports raster test hook: $symbol"
   fi
@@ -530,7 +616,12 @@ done
 done
 "$BIN" --version | grep -Fq '1.1.3' || fail "CLI version does not report 1.1.3"
 help="$($BIN --help)"
-for flag in --dataset --output --profile --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --benchmark-decode --benchmark-decode-output --version --help; do
+test_help="$($ALLOCATION_PRESSURE_TEST_BIN --help)"
+production_help_options="$(grep -Eo -- '--[a-z][a-z0-9-]*' <<<"$help" | LC_ALL=C sort -u)"
+test_help_options="$(grep -Eo -- '--[a-z][a-z0-9-]*' <<<"$test_help" | LC_ALL=C sort -u)"
+[ "$test_help_options" = "$production_help_options" ] \
+  || fail "allocation-pressure test CLI changed the production option surface"
+for flag in --dataset --output --profile --iteration-limit --plateau-window --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --benchmark-decode --benchmark-decode-output --version --help; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -704,11 +795,57 @@ closed_fd_status=$?
   >"$negative_dir/invalid-profile.stdout" \
   2>"$negative_dir/invalid-profile.stderr"
 invalid_profile_status=$?
+"$BIN" --self-check --iteration-limit 10 --iteration-limit 11 \
+  >"$negative_dir/duplicate-iteration.stdout" \
+  2>"$negative_dir/duplicate-iteration.stderr"
+duplicate_iteration_status=$?
+"$BIN" --self-check --iteration-limit 0 \
+  >"$negative_dir/zero-iteration.stdout" \
+  2>"$negative_dir/zero-iteration.stderr"
+zero_iteration_status=$?
+"$BIN" --self-check --iteration-limit=-1 \
+  >"$negative_dir/negative-iteration.stdout" \
+  2>"$negative_dir/negative-iteration.stderr"
+negative_iteration_status=$?
+"$BIN" --self-check --iteration-limit 1000001 \
+  >"$negative_dir/overflow-iteration.stdout" \
+  2>"$negative_dir/overflow-iteration.stderr"
+overflow_iteration_status=$?
+"$BIN" --dataset "$negative_dir" --output "$negative_dir/invalid-budget.ply" \
+  --profile balanced --iteration-limit 10 --plateau-window 11 \
+  --checkpoint "$negative_dir/invalid-budget-checkpoint" --seed 42 \
+  --memory-budget-bytes 536870912 --events-fd 1 \
+  >"$negative_dir/plateau-exceeds-iteration.stdout" \
+  2>"$negative_dir/plateau-exceeds-iteration.stderr"
+plateau_exceeds_iteration_status=$?
+"$BIN" --self-check --not-a-real-option \
+  >"$negative_dir/unknown-option.stdout" \
+  2>"$negative_dir/unknown-option.stderr"
+unknown_option_status=$?
 set -e
 [ "$closed_fd_status" -ne 0 ] || fail "closed event file descriptor falsely succeeded"
 grep -qi 'file descriptor' "$negative_dir/closed-fd.stderr" || fail "closed event-fd diagnostic is not useful"
 [ "$invalid_profile_status" -ne 0 ] || fail "unknown training profile falsely succeeded"
 grep -qi 'profile' "$negative_dir/invalid-profile.stderr" || fail "unknown profile diagnostic is not useful"
+[ "$duplicate_iteration_status" -ne 0 ] || fail "duplicate iteration limit falsely succeeded"
+grep -Eqi 'iteration-limit|specified more than once' "$negative_dir/duplicate-iteration.stderr" \
+  || fail "duplicate iteration-limit diagnostic is not useful"
+[ "$zero_iteration_status" -ne 0 ] || fail "zero iteration limit falsely succeeded"
+grep -qi 'iteration-limit' "$negative_dir/zero-iteration.stderr" \
+  || fail "zero iteration-limit diagnostic is not useful"
+[ "$negative_iteration_status" -ne 0 ] || fail "negative iteration limit falsely succeeded"
+grep -qi 'iteration-limit' "$negative_dir/negative-iteration.stderr" \
+  || fail "negative iteration-limit diagnostic is not useful"
+[ "$overflow_iteration_status" -ne 0 ] || fail "overflow iteration limit falsely succeeded"
+grep -qi 'iteration-limit' "$negative_dir/overflow-iteration.stderr" \
+  || fail "overflow iteration-limit diagnostic is not useful"
+[ "$plateau_exceeds_iteration_status" -ne 0 ] \
+  || fail "plateau window above iteration limit falsely succeeded"
+grep -Eqi 'plateau-window.*iteration-limit' "$negative_dir/plateau-exceeds-iteration.stderr" \
+  || fail "plateau-window relationship diagnostic is not useful"
+[ "$unknown_option_status" -ne 0 ] || fail "unknown native trainer option falsely succeeded"
+grep -Eqi 'not-a-real-option|not expected|unrecognized' "$negative_dir/unknown-option.stderr" \
+  || fail "unknown-option diagnostic is not useful"
 
 python3 - "$BIN" "$negative_dir/broken-pipe.stdout" "$negative_dir/broken-pipe.stderr" <<'PY'
 import os
@@ -800,6 +937,127 @@ valid_ply="$negative_dir/valid.ply"
 require_contains '"event":"output_validation"' "$negative_dir/valid-ply.stdout"
 require_contains '"status":"ok"' "$negative_dir/valid-ply.stdout"
 
+allocation_pressure_dir="$negative_dir/allocation-pressure"
+allocation_output="$allocation_pressure_dir/existing-valid.ply"
+allocation_checkpoint="$allocation_pressure_dir/checkpoint"
+mkdir -p "$allocation_pressure_dir/dataset" "$allocation_checkpoint/optimizer"
+cp "$valid_ply" "$allocation_output"
+printf 'checkpoint receipt sentinel\n' >"$allocation_checkpoint/receipt.json"
+printf '\001\003\003\007checkpoint-state\000' >"$allocation_checkpoint/optimizer/state.bin"
+allocation_output_hash_before="$(shasum -a 256 "$allocation_output" | awk '{print $1}')"
+
+snapshot_checkpoint_tree() {
+  /usr/bin/python3 - "$1" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+entries = []
+for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix().encode()):
+    relative = path.relative_to(root).as_posix()
+    status = path.lstat()
+    if stat.S_ISDIR(status.st_mode):
+        entries.append({
+            "mode": stat.S_IMODE(status.st_mode),
+            "path": relative,
+            "type": "directory",
+        })
+    elif stat.S_ISREG(status.st_mode):
+        entries.append({
+            "bytes": status.st_size,
+            "mode": stat.S_IMODE(status.st_mode),
+            "path": relative,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "type": "file",
+        })
+    else:
+        raise SystemExit(f"unexpected checkpoint entry type: {relative}")
+json.dump(entries, sys.stdout, separators=(",", ":"), sort_keys=True)
+PY
+}
+
+snapshot_checkpoint_tree "$allocation_checkpoint" \
+  >"$allocation_pressure_dir/checkpoint-before.json"
+
+set +e
+"$ALLOCATION_PRESSURE_TEST_BIN" \
+  --dataset "$allocation_pressure_dir/dataset" \
+  --output "$allocation_output" \
+  --profile fast \
+  --iteration-limit 1 \
+  --plateau-window 1 \
+  --checkpoint "$allocation_checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes 536870912 \
+  --events-fd 1 \
+  >"$allocation_pressure_dir/events.jsonl" \
+  2>"$allocation_pressure_dir/stderr.log"
+allocation_pressure_status=$?
+set -e
+[ "$allocation_pressure_status" = 71 ] \
+  || fail "allocation-pressure test CLI exited with $allocation_pressure_status instead of 71"
+/usr/bin/python3 - "$allocation_pressure_dir/events.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+if len(lines) != 1:
+    raise SystemExit(f"allocation pressure emitted {len(lines)} records instead of one")
+event = json.loads(lines[0], parse_constant=reject_constant)
+expected_keys = {
+    "budget_bytes",
+    "current_allocated_bytes",
+    "event",
+    "iteration",
+    "max_buffer_bytes",
+    "recommended_working_set_bytes",
+    "requested_bytes",
+    "required_bytes",
+    "schema_version",
+    "sequence",
+}
+if set(event) != expected_keys:
+    raise SystemExit(f"allocation event schema is not closed: {sorted(event)}")
+if event["event"] != "metal_allocation_unavailable":
+    raise SystemExit(f"unexpected allocation event: {event['event']!r}")
+if event["schema_version"] != 2 or event["sequence"] != 1 or event["iteration"] != 0:
+    raise SystemExit("allocation event sequencing or terminal iteration is wrong")
+integer_fields = expected_keys - {"event"}
+if any(type(event[field]) is not int for field in integer_fields):
+    raise SystemExit("allocation event contains a non-integer numeric field")
+if event["budget_bytes"] != 536_870_912 or event["requested_bytes"] != 67_108_864:
+    raise SystemExit("allocation event lost the configured budget or deterministic request")
+if event["current_allocated_bytes"] < 0:
+    raise SystemExit("allocation event reported a negative current allocation")
+if event["required_bytes"] != event["current_allocated_bytes"] + event["requested_bytes"]:
+    raise SystemExit("allocation event required-byte arithmetic is inconsistent")
+if event["max_buffer_bytes"] <= 0 or event["recommended_working_set_bytes"] <= 0:
+    raise SystemExit("allocation event omitted live Metal device limits")
+PY
+grep -Fq 'metal_allocation_unavailable requested_bytes=67108864' \
+  "$allocation_pressure_dir/stderr.log" \
+  || fail "allocation-pressure stderr omitted the native Metal allocation diagnostic"
+[ "$(shasum -a 256 "$allocation_output" | awk '{print $1}')" = "$allocation_output_hash_before" ] \
+  || fail "allocation pressure changed the preexisting valid PLY"
+"$BIN" --validate-ply "$allocation_output" --events-fd 1 \
+  >"$allocation_pressure_dir/valid-ply-after.stdout" \
+  2>"$allocation_pressure_dir/valid-ply-after.stderr"
+snapshot_checkpoint_tree "$allocation_checkpoint" \
+  >"$allocation_pressure_dir/checkpoint-after.json"
+cmp -s \
+  "$allocation_pressure_dir/checkpoint-before.json" \
+  "$allocation_pressure_dir/checkpoint-after.json" \
+  || fail "allocation pressure changed preexisting checkpoint bytes or entries"
+
 truncated_ply="$negative_dir/truncated.ply"
 cp "$valid_ply" "$truncated_ply"
 truncate -s -4 "$truncated_ply"
@@ -811,7 +1069,7 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
@@ -824,10 +1082,12 @@ densification_memory_patch_hash="$(shasum -a 256 "$DENSIFICATION_MEMORY_PATCH" |
 row_span_culling_patch_hash="$(shasum -a 256 "$ROW_SPAN_CULLING_PATCH" | awk '{print $1}')"
 geometry_adam_fusion_patch_hash="$(shasum -a 256 "$GEOMETRY_ADAM_FUSION_PATCH" | awk '{print $1}')"
 parallel_radix_scan_patch_hash="$(shasum -a 256 "$PARALLEL_RADIX_SCAN_PATCH" | awk '{print $1}')"
+allocation_pressure_patch_hash="$(shasum -a 256 "$ALLOCATION_PRESSURE_PATCH" | awk '{print $1}')"
+exact_prefix_hardening_patch_hash="$(shasum -a 256 "$EXACT_PREFIX_HARDENING_PATCH" | awk '{print $1}')"
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" "$allocation_pressure_patch_hash" "$exact_prefix_hardening_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -851,9 +1111,11 @@ expected = {
     "row_span_culling_patch_sha256": sys.argv[9],
     "geometry_adam_fusion_patch_sha256": sys.argv[10],
     "parallel_radix_scan_patch_sha256": sys.argv[11],
-    "raster_test_sha256": sys.argv[12],
-    "executable_sha256": sys.argv[13],
-    "metallib_sha256": sys.argv[14],
+    "allocation_pressure_patch_sha256": sys.argv[12],
+    "exact_prefix_hardening_patch_sha256": sys.argv[13],
+    "raster_test_sha256": sys.argv[14],
+    "executable_sha256": sys.argv[15],
+    "metallib_sha256": sys.argv[16],
 }
 for key, value in expected.items():
     if payload.get(key) != value:
@@ -1300,6 +1562,7 @@ require_file "$RASTER_TEST_BIN"
   "$fixture_root/16-broad-overflow-2304" \
   "$fixture_root/15-increasing-overflow-10000" \
   "$fixture_root/17-exact-budget-1279"
+"$RASTER_TEST_BIN" --prefix-oracle
 "$RASTER_TEST_BIN" --radix-oracle
 fixture_count=0
 while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do

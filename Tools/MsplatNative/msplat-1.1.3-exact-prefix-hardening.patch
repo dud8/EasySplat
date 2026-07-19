@@ -1,0 +1,243 @@
+diff --git a/core/metal/bindings.h b/core/metal/bindings.h
+index 8028a5a..bd4296c 100644
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -87,6 +87,11 @@ void msplat_set_raster_memory_budget_and_fail_for_testing(uint64_t budget_bytes)
+ void msplat_fail_next_sync_for_testing();
+ uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
+ uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count);
++void msplat_exact_prefix_sum_for_testing(
++    const int32_t* input,
++    uint32_t count,
++    uint64_t* output
++);
+ void msplat_exact_radix_sort_for_testing(
+     const uint64_t* keys,
+     const uint32_t* values,
+@@ -121,6 +126,20 @@ void msplat_copy_last_raster_debug(
+     float* opacity_gradients,
+     int point_count
+ );
++void msplat_copy_last_raster_reference_debug(
++    float* xys,
++    float* depths,
++    int* radii,
++    float* aabb,
++    float* conics,
++    float* raw_colors,
++    float* render_gradients,
++    float* projected_position_gradients,
++    float* raster_color_gradients,
++    float* opacity_gradients,
++    int point_count,
++    int pixel_count
++);
+ #endif
+ MsplatRasterStats msplat_get_raster_stats();
+ bool msplat_raster_memory_budget_was_exceeded();
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+index d5140c1..fb938d3 100644
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -1003,6 +1003,22 @@ kernel void exact_block_reduce_u64_kernel(
+     if (lane == 0) block_totals[group] = values[0];
+ }
+ 
++kernel void exact_block_offsets_u64_kernel(
++    constant uint& count [[buffer(0)]],
++    device uint64_t* block_totals [[buffer(1)]],
++    device atomic_uint* overflow_flag [[buffer(2)]],
++    uint index [[thread_position_in_grid]]
++) {
++    if (index != 0 || atomic_load_explicit(overflow_flag, memory_order_relaxed) == 0u) return;
++    const uint block_count = (count + EXACT_PREFIX_TG_SIZE - 1) / EXACT_PREFIX_TG_SIZE;
++    uint64_t running = 0;
++    for (uint block = 0; block < block_count; ++block) {
++        const uint64_t total = block_totals[block];
++        block_totals[block] = running;
++        running += total;
++    }
++}
++
+ kernel void exact_block_scan_propagate_u64_kernel(
+     constant uint& count [[buffer(0)]],
+     device const int32_t* input [[buffer(1)]],
+@@ -1017,16 +1033,13 @@ kernel void exact_block_scan_propagate_u64_kernel(
+     uint index = group * EXACT_PREFIX_TG_SIZE + lane;
+     inclusive[lane] = index < count ? (uint64_t)max(input[index], 0) : 0u;
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+-    if (lane == 0) {
+-        uint64_t running = 0;
+-        for (uint prior = 0; prior < group; ++prior) running += block_totals[prior];
+-        for (uint offset = 0; offset < EXACT_PREFIX_TG_SIZE; ++offset) {
+-            running += inclusive[offset];
+-            inclusive[offset] = running;
+-        }
++    for (uint offset = 1; offset < EXACT_PREFIX_TG_SIZE; offset <<= 1) {
++        const uint64_t addend = lane >= offset ? inclusive[lane - offset] : 0u;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        inclusive[lane] += addend;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+-    threadgroup_barrier(mem_flags::mem_threadgroup);
+-    if (index < count) output[index] = inclusive[lane];
++    if (index < count) output[index] = block_totals[group] + inclusive[lane];
+ }
+ 
+ kernel void prepare_exact_raster_kernel(
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+index 1f68342..7015a2c 100644
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -316,6 +316,7 @@ struct MetalContext {
+     id<MTLComputePipelineState> clear_exact_tile_bins_kernel_cpso;
+     id<MTLComputePipelineState> count_exact_tile_intersections_kernel_cpso;
+     id<MTLComputePipelineState> exact_block_reduce_u64_kernel_cpso;
++    id<MTLComputePipelineState> exact_block_offsets_u64_kernel_cpso;
+     id<MTLComputePipelineState> exact_block_scan_propagate_u64_kernel_cpso;
+     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
+     id<MTLComputePipelineState> radix_sort_histogram_kernel_cpso;
+@@ -456,6 +457,7 @@ MetalContext* init_msplat_metal_context() {
+     ctx->count_exact_tile_intersections_kernel_cpso =
+         load(@"count_exact_tile_intersections_kernel");
+     ctx->exact_block_reduce_u64_kernel_cpso       = load(@"exact_block_reduce_u64_kernel");
++    ctx->exact_block_offsets_u64_kernel_cpso      = load(@"exact_block_offsets_u64_kernel");
+     ctx->exact_block_scan_propagate_u64_kernel_cpso =
+         load(@"exact_block_scan_propagate_u64_kernel");
+     ctx->map_gaussian_to_intersects_kernel_cpso   = load(@"map_gaussian_to_intersects_kernel");
+@@ -1241,6 +1243,74 @@ uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count) {
+     return exact_radix_pass_count(tile_count);
+ }
+ 
++void msplat_exact_prefix_sum_for_testing(
++    const int32_t* input,
++    uint32_t count,
++    uint64_t* output
++) {
++    if (count == 0) return;
++    if (!input || !output) {
++        throw std::invalid_argument("msplat: exact prefix oracle received a null buffer");
++    }
++
++    MetalContext *context = get_global_context();
++    const uint32_t block_count =
++        count / 1024u + static_cast<uint32_t>(count % 1024u != 0);
++    MTensor device_input = mtensor_empty(
++        context->device,
++        {static_cast<int64_t>(count)},
++        DType::Int32
++    );
++    MTensor device_output = mtensor_empty(
++        context->device,
++        {static_cast<int64_t>(count)},
++        DType::Int64
++    );
++    MTensor block_totals = mtensor_empty(
++        context->device,
++        {static_cast<int64_t>(block_count)},
++        DType::Int64
++    );
++    MTensor overflow = mtensor_zeros(context->device, {1}, DType::Int32);
++    std::memcpy(
++        device_input.data<int32_t>(),
++        input,
++        static_cast<size_t>(count) * sizeof(*input)
++    );
++    overflow.data<uint32_t>()[0] = 1;
++
++    id<MTLCommandBuffer> command_buffer = context->getCommandBuffer();
++    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
++    [encoder setComputePipelineState:context->exact_block_reduce_u64_kernel_cpso];
++    ENC_SCALAR(encoder, count, 0); ENC_BUF(encoder, device_input, 1);
++    ENC_BUF(encoder, block_totals, 2); ENC_BUF(encoder, overflow, 3);
++    [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1)
++                threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
++    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
++
++    [encoder setComputePipelineState:context->exact_block_offsets_u64_kernel_cpso];
++    ENC_SCALAR(encoder, count, 0); ENC_BUF(encoder, block_totals, 1);
++    ENC_BUF(encoder, overflow, 2);
++    [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
++       threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
++    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
++
++    [encoder setComputePipelineState:context->exact_block_scan_propagate_u64_kernel_cpso];
++    ENC_SCALAR(encoder, count, 0); ENC_BUF(encoder, device_input, 1);
++    ENC_BUF(encoder, device_output, 2); ENC_BUF(encoder, block_totals, 3);
++    ENC_BUF(encoder, overflow, 4);
++    [encoder dispatchThreadgroups:MTLSizeMake(block_count, 1, 1)
++                threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
++    [encoder endEncoding];
++    context->syncCB();
++
++    std::memcpy(
++        output,
++        device_output.data<uint64_t>(),
++        static_cast<size_t>(count) * sizeof(*output)
++    );
++}
++
+ void msplat_exact_radix_sort_for_testing(
+     const uint64_t* keys,
+     const uint32_t* values,
+@@ -1873,6 +1943,47 @@ void msplat_copy_last_raster_debug(
+     std::memcpy(opacity_gradients, g_tcache.v_opacity.data<float>(),
+                 static_cast<size_t>(point_count) * sizeof(float));
+ }
++
++void msplat_copy_last_raster_reference_debug(
++    float* xys,
++    float* depths,
++    int* radii,
++    float* aabb,
++    float* conics,
++    float* raw_colors,
++    float* render_gradients,
++    float* projected_position_gradients,
++    float* raster_color_gradients,
++    float* opacity_gradients,
++    int point_count,
++    int pixel_count
++) {
++    if (xys == nullptr || depths == nullptr || radii == nullptr || aabb == nullptr ||
++        conics == nullptr || raw_colors == nullptr || render_gradients == nullptr ||
++        projected_position_gradients == nullptr || raster_color_gradients == nullptr ||
++        opacity_gradients == nullptr || point_count <= 0 || pixel_count <= 0 ||
++        g_tcache.xys.numel() != static_cast<int64_t>(point_count) * 2 ||
++        g_tcache.depths.numel() != point_count || g_tcache.radii_out.numel() != point_count ||
++        g_tcache.aabb.numel() != static_cast<int64_t>(point_count) * 2 ||
++        g_tcache.conics.numel() != static_cast<int64_t>(point_count) * 3 ||
++        g_tcache.colors.numel() != static_cast<int64_t>(point_count) * 3 ||
++        g_tcache.v_rendered.numel() != static_cast<int64_t>(pixel_count) * 3 ||
++        g_tcache.v_xy.numel() != static_cast<int64_t>(point_count) * 2 ||
++        g_tcache.v_colors_rast.numel() != static_cast<int64_t>(point_count) * 3 ||
++        g_tcache.v_opacity.numel() != point_count) {
++        throw std::runtime_error("msplat: CPU raster reference snapshot dimensions are invalid");
++    }
++    std::memcpy(xys, g_tcache.xys.data<float>(), static_cast<size_t>(point_count) * 2 * sizeof(float));
++    std::memcpy(depths, g_tcache.depths.data<float>(), static_cast<size_t>(point_count) * sizeof(float));
++    std::memcpy(radii, g_tcache.radii_out.data<int>(), static_cast<size_t>(point_count) * sizeof(int));
++    std::memcpy(aabb, g_tcache.aabb.data<float>(), static_cast<size_t>(point_count) * 2 * sizeof(float));
++    std::memcpy(conics, g_tcache.conics.data<float>(), static_cast<size_t>(point_count) * 3 * sizeof(float));
++    std::memcpy(raw_colors, g_tcache.colors.data<float>(), static_cast<size_t>(point_count) * 3 * sizeof(float));
++    std::memcpy(render_gradients, g_tcache.v_rendered.data<float>(), static_cast<size_t>(pixel_count) * 3 * sizeof(float));
++    std::memcpy(projected_position_gradients, g_tcache.v_xy.data<float>(), static_cast<size_t>(point_count) * 2 * sizeof(float));
++    std::memcpy(raster_color_gradients, g_tcache.v_colors_rast.data<float>(), static_cast<size_t>(point_count) * 3 * sizeof(float));
++    std::memcpy(opacity_gradients, g_tcache.v_opacity.data<float>(), static_cast<size_t>(point_count) * sizeof(float));
++}
+ #endif
+ 
+ static void throw_if_raster_failed() {
+@@ -2049,6 +2160,12 @@ static void encode_exact_raster_fallback(
+                           threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+ 
++    [enc setComputePipelineState:ctx->exact_block_offsets_u64_kernel_cpso];
++    ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, g_tcache.block_totals, 1);
++    ENC_BUF(enc, g_tcache.overflow_flag, 2);
++    [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
++    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
++
+     [enc setComputePipelineState:ctx->exact_block_scan_propagate_u64_kernel_cpso];
+     ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, g_tcache.num_tiles_hit, 1);
+     ENC_BUF(enc, g_tcache.cum_tiles_hit, 2); ENC_BUF(enc, g_tcache.block_totals, 3);

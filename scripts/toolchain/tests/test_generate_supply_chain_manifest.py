@@ -5,6 +5,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -16,7 +17,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-COLMAP_SOURCE_COMMIT = "fa8e3b3ff591552855f8ad2806723c80f963f69c"
+COLMAP_SOURCE_COMMIT = "a0d785fba74b2664f31edc4a29026a8b27c00f67"
 FAISS_SOURCE_COMMIT = "5622e93733b64b2e033362dbdfda019b2ab33ef0"
 ANTLR_LICENSE_SHA256 = (
     "b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a"
@@ -207,7 +208,18 @@ class SupplementalLicenseTests(unittest.TestCase):
             root = Path(temporary)
             reviewed = self._write_fixture(root)
 
-            MODULE.validate_supplemental_license_receipts(root, reviewed=reviewed)
+            ownership = MODULE.validate_supplemental_license_receipts(
+                root, reviewed=reviewed
+            )
+            installed = (
+                root
+                / "da3_mps/python/lib/python3.13/site-packages"
+                / "antlr4_python3_runtime-4.9.3.dist-info/licenses/UPSTREAM_LICENSE.txt"
+            )
+            self.assertEqual(
+                ownership,
+                {installed.resolve(): "python:antlr4-python3-runtime"},
+            )
 
             notice = json.loads(
                 (
@@ -312,6 +324,14 @@ class MachOPortabilityTests(unittest.TestCase):
 
 
 class FilesystemSafetyTests(unittest.TestCase):
+    def test_tracked_source_inputs_pin_current_colmap_patch(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            '"scripts/toolchain/patches/colmap-4.1.1-easysplat.patch"',
+            source,
+        )
+        self.assertNotIn("colmap-4.1.0-easysplat.patch", source)
+
     def test_file_closure_is_sorted_by_relative_path(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         sort_files = source.index('files.sort(key=lambda entry: entry["path"])')
@@ -372,6 +392,10 @@ class BuildCommandTests(unittest.TestCase):
             MODULE.component_build_command("msplat", {}),
             "./scripts/toolchain/build_msplat.sh",
         )
+        self.assertEqual(
+            MODULE.component_build_command("easysplat-distribution-signing", {}),
+            "./scripts/release/finalize_signed_toolchain.py",
+        )
         with self.assertRaisesRegex(SystemExit, "no reviewed build command"):
             MODULE.component_build_command("unreviewed-component", {})
 
@@ -405,6 +429,24 @@ class DependencyClosureTests(unittest.TestCase):
         self.assertEqual(
             components["python:package"]["dependencies"], ["python:installed"]
         )
+
+    def test_component_urls_reject_credentials_query_and_fragment(self) -> None:
+        base = {
+            "component": {
+                "source": "https://example.com/source",
+                "sourceArtifacts": [],
+            }
+        }
+        MODULE.validate_component_urls(base)
+        for url in (
+            "https://user:secret@example.com/source",
+            "https://example.com/source?token=secret",
+            "https://example.com/source#fragment",
+        ):
+            with self.subTest(url=url):
+                bad = {"component": {"source": url, "sourceArtifacts": []}}
+                with self.assertRaisesRegex(SystemExit, "public HTTPS URL"):
+                    MODULE.validate_component_urls(bad)
 
 
 class PythonRecordTests(unittest.TestCase):
@@ -440,7 +482,7 @@ class PythonRecordTests(unittest.TestCase):
                     distribution="package",
                 )
 
-    def test_missing_non_bytecode_record_member_fails_closed(self) -> None:
+    def test_only_unhashed_missing_bytecode_record_members_are_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with self.assertRaisesRegex(SystemExit, "RECORD member is missing"):
@@ -460,6 +502,117 @@ class PythonRecordTests(unittest.TestCase):
                     distribution="package",
                 )
             )
+            with self.assertRaisesRegex(SystemExit, "RECORD member is missing"):
+                MODULE.validate_record_member(
+                    root / "__pycache__/bound.pyc",
+                    "sha256=" + "A" * 43,
+                    "1",
+                    python_root=root,
+                    distribution="package",
+                )
+
+    def _python_fixture(self, root: Path, *, extra: bool = False) -> None:
+        site = root / "da3_mps/python/lib/python3.13/site-packages"
+        dist = site / "sample-1.0.dist-info"
+        module = site / "sample"
+        dist.mkdir(parents=True)
+        module.mkdir()
+        metadata = dist / "METADATA"
+        license_path = dist / "LICENSE"
+        source = module / "__init__.py"
+        (site / "README.txt").write_text(
+            "This directory exists so that third-party packages can be installed.\n",
+            encoding="utf-8",
+        )
+        metadata.write_text(
+            "Metadata-Version: 2.4\nName: sample\nVersion: 1.0\n"
+            "License-Expression: MIT\n\n",
+            encoding="utf-8",
+        )
+        license_path.write_text("MIT\n", encoding="utf-8")
+        source.write_text("__all__ = []\n", encoding="utf-8")
+
+        def row(path: Path) -> str:
+            digest = base64.urlsafe_b64encode(
+                hashlib.sha256(path.read_bytes()).digest()
+            ).rstrip(b"=").decode("ascii")
+            return (
+                f"{path.relative_to(site).as_posix()},sha256={digest},"
+                f"{path.stat().st_size}\n"
+            )
+
+        record = dist / "RECORD"
+        record.write_text(
+            row(metadata)
+            + row(license_path)
+            + row(source)
+            + "sample-1.0.dist-info/RECORD,,\n",
+            encoding="utf-8",
+        )
+        lock = root / "da3_mps/licenses/python-packages-requirements.txt"
+        lock.parent.mkdir(parents=True)
+        lock.write_text("sample==1.0 \\\n    --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8")
+        report = root / "da3_mps/licenses/python-packages-install-report.json"
+        report.write_text(
+            json.dumps(
+                {
+                    "install": [
+                        {
+                            "metadata": {"name": "sample", "version": "1.0"},
+                            "download_info": {
+                                "url": "https://example.com/sample.whl",
+                                "archive_info": {"hashes": {"sha256": "a" * 64}},
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        if extra:
+            (site / "evil.py").write_text("evil\n", encoding="utf-8")
+
+    def test_python_lock_report_dist_info_and_record_ownership_are_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._python_fixture(root)
+            components, ownership = MODULE.python_components(root)
+            self.assertEqual(set(components), {"python:sample"})
+            self.assertIn(
+                (root / "da3_mps/python/lib/python3.13/site-packages/sample/__init__.py").resolve(),
+                ownership,
+            )
+
+            root = Path(temporary) / "extra"
+            self._python_fixture(root, extra=True)
+            with self.assertRaisesRegex(SystemExit, "no exact Python RECORD owner"):
+                MODULE.python_components(root)
+
+    def test_python_lock_report_and_installed_versions_must_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._python_fixture(root)
+            lock = root / "da3_mps/licenses/python-packages-requirements.txt"
+            lock.write_text(
+                "different==1.0 \\\n    --hash=sha256:" + "a" * 64 + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "must match exactly"):
+                MODULE.python_components(root)
+
+    def test_python_report_artifact_hash_must_be_allowed_by_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._python_fixture(root)
+            report = root / "da3_mps/licenses/python-packages-install-report.json"
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            payload["install"][0]["download_info"]["archive_info"]["hashes"][
+                "sha256"
+            ] = "b" * 64
+            report.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "artifact hash"):
+                MODULE.python_components(root)
 
 
 class NativeColmapComponentTests(unittest.TestCase):
@@ -479,7 +632,7 @@ class NativeColmapComponentTests(unittest.TestCase):
             "schema_version": 2,
             "toolchain_name": "colmap",
             "source_url": "https://github.com/colmap/colmap.git",
-            "source_version": "4.1.0",
+            "source_version": "4.1.1",
             "source_commit": COLMAP_SOURCE_COMMIT,
             "license": "BSD-3-Clause",
             "executable_sha256": hashlib.sha256(self.executable.read_bytes()).hexdigest(),
@@ -541,6 +694,26 @@ class NativeColmapComponentTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "installed executable"):
             MODULE.native_colmap_components(self.root)
 
+    def test_native_colmap_accepts_only_exact_distribution_signing_bridge(self) -> None:
+        unsigned = self.receipt["executable_sha256"]
+        self.executable.write_bytes(b"Developer ID signed colmap")
+        signed = hashlib.sha256(self.executable.read_bytes()).hexdigest()
+        distribution = {
+            "machOFiles": [
+                {
+                    "path": "bin/colmap",
+                    "preSignSHA256": unsigned,
+                    "postSignSHA256": signed,
+                }
+            ]
+        }
+        component = MODULE.native_colmap_components(self.root, distribution)["colmap"]
+        self.assertEqual(component["id"], "colmap")
+
+        distribution["machOFiles"][0]["preSignSHA256"] = "f" * 64
+        with self.assertRaisesRegex(SystemExit, "installed executable"):
+            MODULE.native_colmap_components(self.root, distribution)
+
     def test_native_dependency_records_pinned_source_archive(self) -> None:
         component = MODULE.receipt_dependency_component(
             "openimageio:libpng",
@@ -558,6 +731,131 @@ class NativeColmapComponentTests(unittest.TestCase):
 
         self.assertEqual(component["artifact"], "https://example.com/libpng-1.6.58.tar.gz")
         self.assertEqual(component["artifactSha256"], "a" * 64)
+
+
+class DistributionSigningReceiptTests(unittest.TestCase):
+    def fixture(self, root: Path) -> tuple[Path, set[Path], dict[str, object]]:
+        repository_root = SCRIPT.parents[2]
+        executable = root / "bin/colmap"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"signed Mach-O")
+        source_row = {
+            "path": "bin/colmap",
+            "component": "colmap",
+            "kind": "mach-o",
+            "sha256": "a" * 64,
+            "size": len(b"unsigned Mach-O"),
+        }
+        manifest = root / "supply-chain/components.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "toolchainVersion": "2.0.0",
+                    "components": [],
+                    "files": [source_row],
+                }
+            ),
+            encoding="utf-8",
+        )
+        commit = subprocess.run(
+            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        source_inputs = [
+            {
+                "path": relative,
+                "sha256": MODULE.sha256(repository_root / relative),
+            }
+            for relative in sorted(MODULE.DISTRIBUTION_SIGNING_SOURCE_INPUTS)
+        ]
+        receipt: dict[str, object] = {
+            "schemaVersion": 1,
+            "kind": "easysplat-distribution-signing",
+            "toolchainVersion": "2.0.0",
+            "identityFingerprintSHA1": "A" * 40,
+            "teamID": "TEAMID1234",
+            "signedAt": "2026-07-18T00:00:00Z",
+            "sourceCommit": commit,
+            "sourceInputs": source_inputs,
+            "unsignedComponentArchives": [
+                {
+                    "component": component,
+                    "name": f"{component}.zip",
+                    "sha256": character * 64,
+                    "size": 100,
+                }
+                for component, character in (
+                    ("core", "1"),
+                    ("base", "2"),
+                    ("small", "3"),
+                )
+            ],
+            "builderAttestedUnsignedRequestSHA256": "4" * 64,
+            "builderAttestedUnsignedManifestSHA256": "5" * 64,
+            "unsignedSupplyChainSHA256": MODULE.sha256(manifest),
+            "machOFiles": [
+                {
+                    "path": "bin/colmap",
+                    "component": "colmap",
+                    "preSignSHA256": "a" * 64,
+                    "postSignSHA256": MODULE.sha256(executable),
+                    "preSignProvenance": [
+                        {
+                            "kind": "supply-chain",
+                            "path": "supply-chain/components.json",
+                            "component": "colmap",
+                            "sha256": "a" * 64,
+                        }
+                    ],
+                    "codesign": {
+                        "teamIdentifier": "TEAMID1234",
+                        "hardenedRuntime": True,
+                    },
+                }
+            ],
+            "recordRepairs": [],
+        }
+        path = root / "provenance/distribution-signing.json"
+        path.parent.mkdir()
+        path.write_text(json.dumps(receipt), encoding="utf-8")
+        return path, {executable.resolve()}, receipt
+
+    def test_internal_receipt_binds_source_and_signed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            path, machos, receipt = self.fixture(root)
+            self.assertEqual(
+                MODULE.load_distribution_signing_receipt(
+                    root, path, "2.0.0", machos
+                ),
+                receipt,
+            )
+
+            receipt["machOFiles"][0]["postSignSHA256"] = "f" * 64
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "stale or invalid"):
+                MODULE.load_distribution_signing_receipt(root, path, "2.0.0", machos)
+
+    def test_internal_receipt_requires_release_request_and_manifest_digests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            path, machos, receipt = self.fixture(root)
+            for field in (
+                "builderAttestedUnsignedRequestSHA256",
+                "builderAttestedUnsignedManifestSHA256",
+            ):
+                with self.subTest(field=field):
+                    mutated = dict(receipt)
+                    mutated[field] = "f" * 63
+                    path.write_text(json.dumps(mutated), encoding="utf-8")
+                    with self.assertRaisesRegex(SystemExit, "identity or version"):
+                        MODULE.load_distribution_signing_receipt(
+                            root, path, "2.0.0", machos
+                        )
 
 
 class Da3ModelComponentTests(unittest.TestCase):
@@ -718,6 +1016,22 @@ class Da3ModelComponentTests(unittest.TestCase):
                 ],
             )
 
+    def test_builder_revision_uses_tracked_repository_root(self) -> None:
+        calls: list[Path | None] = []
+
+        def capture_run(*_command: str, cwd=None) -> str:
+            calls.append(cwd)
+            return "f" * 40 + "\n"
+
+        with (
+            mock.patch.object(MODULE, "aggregate_native_components", return_value={}),
+            mock.patch.object(MODULE, "run", side_effect=capture_run),
+            mock.patch.object(MODULE, "DA3_MODEL_LOCK", self.model_lock),
+        ):
+            MODULE.builder_components(self.root, "2.0.0", {})
+
+        self.assertEqual(calls, [SCRIPT.parents[2]])
+
     def test_model_component_rejects_bytes_that_do_not_match_provenance(self) -> None:
         path = self.root / "da3_mps/models/DA3-BASE/model.safetensors"
         content = path.read_bytes()
@@ -760,6 +1074,7 @@ class PackageScriptTests(unittest.TestCase):
             "scripts/toolchain/build_msplat.sh",
             "scripts/toolchain/generate_supply_chain_manifest.py",
             "scripts/toolchain/package_toolchain.sh",
+            "scripts/toolchain/secure_colmap_build.py",
             "scripts/toolchain/validate_native_msplat.sh",
         ):
             self.assertIn(source, self.script)
@@ -774,6 +1089,7 @@ class PackageScriptTests(unittest.TestCase):
         ):
             self.assertIn(command, self.script)
         self.assertIn("Mapper.min_num_matches", self.script)
+        self.assertIn("TwoViewGeometry.random_seed", self.script)
         self.assertIn("FeatureExtraction.max_image_size", self.script)
         self.assertNotIn("SiftExtraction.max_image_size", self.script)
         self.assertIn("BundleAdjustmentCeres.max_num_iterations", self.script)

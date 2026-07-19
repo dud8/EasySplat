@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import os
 import shutil
@@ -29,7 +28,6 @@ from .alignment import (
 
 SUPPORTED_CAMERA_TYPES = ("SIMPLE_RADIAL", "SIMPLE_PINHOLE", "PINHOLE", "OPENCV", "OPENCV_FISHEYE")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
-OOM_MARKERS = ("out of memory", "mps backend out of memory", "allocation failed")
 
 
 def _default_models_dir() -> str | None:
@@ -76,21 +74,19 @@ def _compute_image_descriptors(image_paths: list[Path]) -> np.ndarray:
 
 def _select_device(requested: str) -> str:
     normalized = requested.strip().lower()
-    if normalized == "mps":
-        try:
-            import torch
-
-            if torch.backends.mps.is_available():
-                return "mps"
-            print("DA3: requested mps but MPS is unavailable; falling back to cpu", file=sys.stderr)
-            return "cpu"
-        except Exception as exc:  # noqa: BLE001
-            print(f"DA3: torch MPS probe failed ({exc}); falling back to cpu", file=sys.stderr)
-            return "cpu"
-    if normalized == "cuda":
-        print("DA3: CUDA is not an EasySplat hot-path device on macOS; falling back to cpu", file=sys.stderr)
-        return "cpu"
-    return normalized or "cpu"
+    if normalized != "mps":
+        raise RuntimeError("EasySplat DA3 requires MPS on Apple Silicon")
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"DA3 could not probe MPS through PyTorch: {exc}") from exc
+    try:
+        is_available = bool(torch.backends.mps.is_available())
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"DA3 could not probe MPS availability: {exc}") from exc
+    if not is_available:
+        raise RuntimeError("DA3 requested MPS, but MPS is unavailable")
+    return "mps"
 
 
 def _model_path(models_dir: Path, subdir: str) -> Path:
@@ -102,11 +98,6 @@ def _model_path(models_dir: Path, subdir: str) -> Path:
     if not (candidate / "model.safetensors").is_file():
         raise FileNotFoundError(f"DA3 model weights missing: {candidate / 'model.safetensors'}")
     return candidate
-
-
-def _is_memory_error(error: BaseException) -> bool:
-    text = str(error).lower()
-    return any(marker in text for marker in OOM_MARKERS)
 
 
 def _remove_path(path: Path) -> None:
@@ -595,7 +586,6 @@ def _write_manifest(
         "requested_device": args.device,
         "selected_device": selected_device,
         "model_subdir": model_subdir,
-        "fallback_model_subdir": args.fallback_model_subdir,
         "process_res": args.process_res,
         "camera_type": args.camera_type,
         "shared_camera": bool(args.shared_camera),
@@ -884,7 +874,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="mps")
     parser.add_argument("--input-ordering", choices=("automatic", "continuous", "unordered"), default="automatic")
     parser.add_argument("--model-subdir", default="DA3-BASE")
-    parser.add_argument("--fallback-model-subdir", default="DA3-SMALL")
     parser.add_argument("--process-res", type=int, default=504)
     parser.add_argument("--max-points", type=int, default=120_000)
     parser.add_argument("--camera-type", choices=SUPPORTED_CAMERA_TYPES, default="PINHOLE")
@@ -893,38 +882,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window-overlap", type=int, default=2)
     parser.add_argument("--manifest-out", type=Path)
     return parser
-
-
-def _release_accelerator_memory() -> None:
-    gc.collect()
-    try:
-        import torch
-
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _run_da3_attempt(
-    args: argparse.Namespace,
-    image_paths: list[Path],
-    model_dir: Path,
-    selected_device: str,
-    out_sparse: Path,
-) -> tuple[tuple[int, dict[str, Any]] | None, str | None]:
-    try:
-        return _run_da3_model(args, image_paths, model_dir, selected_device, out_sparse), None
-    except Exception as exc:  # noqa: BLE001
-        if not _is_memory_error(exc):
-            raise
-        message = str(exc)
-        # A traceback retains every inference frame, including the model. Clear
-        # it before returning so SMALL loads outside the failed BASE lifetime.
-        exc.__traceback__ = None
-        del exc
-        _release_accelerator_memory()
-        return None, message
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -948,47 +905,30 @@ def main(argv: list[str] | None = None) -> int:
             f"{args.window_size} images"
         )
 
-    selected_device = _select_device(args.device)
-    primary_model = _model_path(models_dir, args.model_subdir)
-    fallback_model = _model_path(models_dir, args.fallback_model_subdir)
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
     os.environ["DO_NOT_TRACK"] = "1"
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+    selected_device = _select_device(args.device)
+    model = _model_path(models_dir, args.model_subdir)
 
     _remove_path(args.out_sparse)
     if args.manifest_out:
         _remove_path(args.manifest_out)
-    primary_result, primary_memory_failure = _run_da3_attempt(
-        args,
-        image_paths,
-        primary_model,
-        selected_device,
-        args.out_sparse,
-    )
-    if primary_result is not None:
-        registered_count, alignment_evidence = primary_result
-        model_subdir = args.model_subdir
-    else:
-        assert primary_memory_failure is not None
-        print(f"DA3: {args.model_subdir} ran out of memory; retrying with {args.fallback_model_subdir}", file=sys.stderr)
-        _remove_path(args.out_sparse)
-        if args.manifest_out:
-            _remove_path(args.manifest_out)
-        fallback_result, fallback_memory_failure = _run_da3_attempt(
+    try:
+        registered_count, alignment_evidence = _run_da3_model(
             args,
             image_paths,
-            fallback_model,
+            model,
             selected_device,
             args.out_sparse,
         )
-        if fallback_result is None:
-            raise RuntimeError(
-                f"DA3 {args.fallback_model_subdir} also ran out of memory: {fallback_memory_failure}"
-            )
-        registered_count, alignment_evidence = fallback_result
-        model_subdir = args.fallback_model_subdir
+    except BaseException:
+        _remove_path(args.out_sparse)
+        if args.manifest_out:
+            _remove_path(args.manifest_out)
+        raise
 
     if args.manifest_out:
         _write_manifest(
@@ -996,7 +936,7 @@ def main(argv: list[str] | None = None) -> int:
             args=args,
             image_paths=image_paths,
             selected_device=selected_device,
-            model_subdir=model_subdir,
+            model_subdir=args.model_subdir,
             registered_image_count=registered_count,
             alignment_evidence=alignment_evidence,
         )

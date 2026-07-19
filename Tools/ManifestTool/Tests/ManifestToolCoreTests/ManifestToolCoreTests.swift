@@ -4,6 +4,154 @@ import XCTest
 @testable import ManifestToolCore
 
 final class ManifestToolCoreTests: XCTestCase {
+    func testBuilderRejectsUnsignedDirectoryEntries() throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let source = tempDir.appendingPathComponent("directory-entry-source", isDirectory: true)
+        let unsignedDirectory = source.appendingPathComponent("unsigned", isDirectory: true)
+        try FileManager.default.createDirectory(at: unsignedDirectory, withIntermediateDirectories: true)
+        let payload = source.appendingPathComponent("payload.txt")
+        try Data("payload".utf8).write(to: payload)
+        let archive = tempDir.appendingPathComponent("directory-entry.zip")
+        try runZip(["-q", archive.path, "payload.txt", "unsigned/"], in: source)
+
+        XCTAssertThrowsError(try ManifestBuilder.build(
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            components: [
+                .init(
+                    name: "fixture",
+                    artifactURL: "https://example.com/fixture.zip",
+                    zipURL: archive,
+                    capabilities: ["fixture"],
+                    dependencies: [],
+                    requirement: .required,
+                    criticalFilePaths: ["payload.txt"]
+                )
+            ],
+            privateKeyBase64: ManifestBuilder.generateKeypair().privateKeyBase64
+        ))
+    }
+
+    func testBuilderRejectsRepeatedSeparatorArchiveAliases() throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let archive = try makeZip(
+            named: "repeated-separator",
+            files: ["a/xb": Data("payload".utf8)],
+            in: tempDir
+        )
+        var bytes = try Data(contentsOf: archive)
+        let original = Data("a/xb".utf8)
+        let alias = Data("a//b".utf8)
+        var replacements = 0
+        while let range = bytes.range(of: original) {
+            bytes.replaceSubrange(range, with: alias)
+            replacements += 1
+        }
+        XCTAssertEqual(replacements, 2)
+        try bytes.write(to: archive)
+
+        XCTAssertThrowsError(try ManifestBuilder.build(
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            components: [
+                .init(
+                    name: "fixture",
+                    artifactURL: "https://example.com/fixture.zip",
+                    zipURL: archive,
+                    capabilities: ["fixture"],
+                    dependencies: [],
+                    requirement: .required,
+                    criticalFilePaths: ["a//b"]
+                )
+            ],
+            privateKeyBase64: ManifestBuilder.generateKeypair().privateKeyBase64
+        ))
+    }
+
+    func testWriteManifestRejectsOversizedAllowedLicenseClosure() throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let suffix = String(repeating: "x", count: 96)
+        let contents = (0..<80_000).map { "licenses/\($0)-\(suffix).txt" }
+        let hashes = Dictionary(uniqueKeysWithValues: contents.map {
+            ($0, String(repeating: "a", count: 64))
+        })
+        let manifest = ManifestDocument(
+            keyID: String(repeating: "b", count: 64),
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            components: [
+                .init(
+                    name: "macos-arm64-core",
+                    capabilities: ManifestToolDefaults.coreCapabilities,
+                    url: "https://example.com/core.zip",
+                    sha256: String(repeating: "c", count: 64),
+                    sizeBytes: 1,
+                    expandedSizeBytes: 1,
+                    expandedClosureSHA256: String(repeating: "d", count: 64),
+                    contents: contents,
+                    criticalFileHashes: hashes,
+                    dependencies: [],
+                    requirement: .required
+                )
+            ],
+            signatureEd25519: Data(repeating: 0, count: 64).base64EncodedString()
+        )
+        let output = tempDir.appendingPathComponent("manifest.json")
+
+        XCTAssertThrowsError(try ManifestBuilder.writeManifest(manifest, to: output))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testBuildAndPrepareReleaseRejectEncodedManifestAboveApplicationLimit() throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let archive = try makeZip(
+            named: "oversized-manifest",
+            files: ["payload.txt": Data("payload".utf8)],
+            in: tempDir
+        )
+        let suffix = String(repeating: "x", count: 256)
+        let oversizedCapabilities = (0..<70_000).map { "capability.\($0).\(suffix)" }
+        let input = ManifestArtifactInput(
+            name: "fixture",
+            artifactURL: "https://example.com/fixture.zip",
+            zipURL: archive,
+            capabilities: oversizedCapabilities,
+            dependencies: [],
+            requirement: .required,
+            criticalFilePaths: ["payload.txt"]
+        )
+        let keypair = ManifestBuilder.generateKeypair()
+
+        XCTAssertThrowsError(try ManifestBuilder.build(
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            components: [input],
+            privateKeyBase64: keypair.privateKeyBase64
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("8 MiB"))
+        }
+
+        XCTAssertThrowsError(try ManifestBuilder.prepareRelease(
+            repository: "dud8/EasySplat",
+            sourceCommit: String(repeating: "a", count: 40),
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            publicKeyBase64: keypair.publicKeyBase64,
+            components: [input]
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("8 MiB"))
+        }
+    }
+
     func testProductionComponentDefaultsSplitNativeCoreFromOptionalDA3Runtime() {
         XCTAssertEqual(
             ManifestToolDefaults.coreCapabilities,
@@ -177,19 +325,20 @@ final class ManifestToolCoreTests: XCTestCase {
     func testReleaseVerifierAuthenticatesManifestURLsAndArchives() throws {
         let tempDir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tempDir) }
+        let files = try ProductionToolchainFileFixture()
         let coreZip = try makeZip(
             named: "core",
-            files: Dictionary(uniqueKeysWithValues: ManifestToolDefaults.criticalCoreFiles.map { ($0, Data($0.utf8)) }),
+            files: files.core,
             in: tempDir
         )
         let baseZip = try makeZip(
             named: "base",
-            files: Dictionary(uniqueKeysWithValues: ManifestToolDefaults.da3BaseContents.map { ($0, Data($0.utf8)) }),
+            files: files.base,
             in: tempDir
         )
         let smallZip = try makeZip(
             named: "small",
-            files: Dictionary(uniqueKeysWithValues: ManifestToolDefaults.da3SmallContents.map { ($0, Data($0.utf8)) }),
+            files: files.small,
             in: tempDir
         )
         let urls = [
@@ -198,17 +347,19 @@ final class ManifestToolCoreTests: XCTestCase {
             "geometry-da3-small": "https://example.com/small.zip",
         ]
         let keypair = ManifestBuilder.generateKeypair()
-        let manifest = try ManifestBuilder.build(
-            version: "2.0.0",
-            publishedAt: Date(timeIntervalSince1970: 0),
-            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
-            components: [
-                .init(name: "macos-arm64-core", artifactURL: urls["macos-arm64-core"]!, zipURL: coreZip, capabilities: ManifestToolDefaults.coreCapabilities, dependencies: [], requirement: .required, criticalFilePaths: ManifestToolDefaults.criticalCoreFiles),
-                .init(name: "geometry-da3-base", artifactURL: urls["geometry-da3-base"]!, zipURL: baseZip, capabilities: ["geometry.da3.runtime", "geometry.da3.base"], dependencies: ["macos-arm64-core"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3BaseContents),
-                .init(name: "geometry-da3-small", artifactURL: urls["geometry-da3-small"]!, zipURL: smallZip, capabilities: ["geometry.da3.small"], dependencies: ["geometry-da3-base"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3SmallContents),
-            ],
-            privateKeyBase64: keypair.privateKeyBase64
-        )
+        let manifest = try files.withReviewedSourceSnapshot {
+            try ManifestBuilder.build(
+                version: "2.0.0",
+                publishedAt: Date(timeIntervalSince1970: 0),
+                appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+                components: [
+                    .init(name: "macos-arm64-core", artifactURL: urls["macos-arm64-core"]!, zipURL: coreZip, capabilities: ManifestToolDefaults.coreCapabilities, dependencies: [], requirement: .required, criticalFilePaths: ManifestToolDefaults.criticalCoreFiles),
+                    .init(name: "geometry-da3-base", artifactURL: urls["geometry-da3-base"]!, zipURL: baseZip, capabilities: ["geometry.da3.runtime", "geometry.da3.base"], dependencies: ["macos-arm64-core"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3BaseContents),
+                    .init(name: "geometry-da3-small", artifactURL: urls["geometry-da3-small"]!, zipURL: smallZip, capabilities: ["geometry.da3.small"], dependencies: ["geometry-da3-base"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3SmallContents),
+                ],
+                privateKeyBase64: keypair.privateKeyBase64
+            )
+        }
 
         XCTAssertNoThrow(try ManifestBuilder.verifyRelease(
             manifest: manifest,
@@ -326,24 +477,22 @@ final class ManifestToolCoreTests: XCTestCase {
         let tempDir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let corePaths = ManifestToolDefaults.criticalCoreFiles
-        let coreFiles = Dictionary(uniqueKeysWithValues: corePaths.enumerated().map {
-            ($0.element, Data("core-\($0.offset)".utf8))
-        })
-        let basePaths = ManifestToolDefaults.da3BaseContents + [
+        var files = try ProductionToolchainFileFixture()
+        let extraBasePaths = [
             "da3_mps/vendor/depth-anything-3/src/depth_anything_3/configs/da3-base.yaml",
-            "da3_mps/python/bin/torchrun",
-            "da3_mps/python/lib/python3.11/site-packages/torch/bin/protoc",
-            "da3_mps/python/lib/python3.11/site-packages/foo/native_helper",
-            "da3_mps/python/lib/python3.11/site-packages/native_extension.so",
+            "da3_mps/bin/torchrun",
+            "da3_mps/app/easysplat_da3_sfm/native_helper",
+            "da3_mps/vendor/depth-anything-3/src/depth_anything_3/native_extension.so",
+            "da3_mps/licenses/generated-runtime-note.txt",
         ]
-        let baseFiles = Dictionary(uniqueKeysWithValues: basePaths.enumerated().map {
-            ($0.element, Data("base-\($0.offset)".utf8))
-        })
-        let smallFiles = Dictionary(uniqueKeysWithValues: ManifestToolDefaults.da3SmallContents.enumerated().map {
-            ($0.element, Data("small-\($0.offset)".utf8))
-        })
-        let nativeHelper = "da3_mps/python/lib/python3.11/site-packages/foo/native_helper"
+        for (offset, path) in extraBasePaths.enumerated() {
+            files.base[path] = Data("extra-base-\(offset)".utf8)
+        }
+        try files.refreshSupplyChain()
+        let coreFiles = files.core
+        let baseFiles = files.base
+        let smallFiles = files.small
+        let nativeHelper = "da3_mps/app/easysplat_da3_sfm/native_helper"
         let coreZip = try makeZip(
             named: "core",
             files: coreFiles,
@@ -358,11 +507,12 @@ final class ManifestToolCoreTests: XCTestCase {
         let smallZip = try makeZip(named: "small", files: smallFiles, in: tempDir)
         let keypair = ManifestBuilder.generateKeypair()
 
-        var manifest = try ManifestBuilder.build(
-            version: "2.0.0",
-            publishedAt: Date(timeIntervalSince1970: 0),
-            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
-            components: [
+        var manifest = try files.withReviewedSourceSnapshot {
+            try ManifestBuilder.build(
+                version: "2.0.0",
+                publishedAt: Date(timeIntervalSince1970: 0),
+                appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+                components: [
                 .init(
                     name: "macos-arm64-core",
                     artifactURL: "https://example.com/core.zip",
@@ -390,9 +540,10 @@ final class ManifestToolCoreTests: XCTestCase {
                     requirement: .optional,
                     criticalFilePaths: ManifestToolDefaults.da3SmallContents
                 ),
-            ],
-            privateKeyBase64: keypair.privateKeyBase64
-        )
+                ],
+                privateKeyBase64: keypair.privateKeyBase64
+            )
+        }
 
         XCTAssertEqual(manifest.schemaVersion, 2)
         XCTAssertEqual(manifest.toolchainAPI, 2)
@@ -425,10 +576,10 @@ final class ManifestToolCoreTests: XCTestCase {
             XCTAssertTrue(component.criticalFileHashes.values.allSatisfy { $0.count == 64 })
         }
         XCTAssertNotNil(manifest.components[0].criticalFileHashes["msplat/LICENSE"])
-        XCTAssertNotNil(manifest.components[1].criticalFileHashes["da3_mps/python/bin/torchrun"])
+        XCTAssertNotNil(manifest.components[1].criticalFileHashes["da3_mps/bin/torchrun"])
         XCTAssertNotNil(
             manifest.components[1].criticalFileHashes[
-                "da3_mps/python/lib/python3.11/site-packages/torch/bin/protoc"
+                "da3_mps/vendor/depth-anything-3/src/depth_anything_3/native_extension.so"
             ]
         )
         XCTAssertNotNil(manifest.components[1].criticalFileHashes[nativeHelper])
@@ -454,6 +605,9 @@ final class ManifestToolCoreTests: XCTestCase {
         XCTAssertTrue(components.allSatisfy { $0["criticalFileHashes"] != nil })
         XCTAssertTrue(components.allSatisfy { $0["executableHashes"] == nil })
         XCTAssertTrue(components.allSatisfy { $0["expandedSizeBytes"] != nil })
+        XCTAssertTrue(components.allSatisfy {
+            (($0["expandedClosureSHA256"] as? String)?.count ?? 0) == 64
+        })
 
         var expandedSizeTamper = manifest
         expandedSizeTamper.components[1].expandedSizeBytes += 1
@@ -485,6 +639,39 @@ final class ManifestToolCoreTests: XCTestCase {
             "expandedSizeBytes": 2,
             "contents": ["bin/colmap"],
             "executableHashes": {"bin/colmap":"\(hash)"},
+            "dependencies": [],
+            "requirement": "required"
+          }],
+          "signatureEd25519": ""
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        XCTAssertThrowsError(
+            try decoder.decode(ManifestDocument.self, from: Data(json.utf8))
+        )
+    }
+
+    func testManifestRejectsMissingExpandedClosureDigest() throws {
+        let hash = String(repeating: "a", count: 64)
+        let json = """
+        {
+          "schemaVersion": 2,
+          "toolchainAPI": 2,
+          "keyID": "\(hash)",
+          "version": "2.0.0",
+          "publishedAt": "1970-01-01T00:00:00Z",
+          "appVersionRange": {"minimum":"0.2.0-beta.1","maximumExclusive":"0.3.0"},
+          "components": [{
+            "name": "macos-arm64-core",
+            "capabilities": ["runtime.core"],
+            "url": "https://example.com/core.zip",
+            "sha256": "\(hash)",
+            "sizeBytes": 1,
+            "expandedSizeBytes": 1,
+            "contents": ["bin/colmap"],
+            "criticalFileHashes": {"bin/colmap":"\(hash)"},
             "dependencies": [],
             "requirement": "required"
           }],
@@ -758,6 +945,20 @@ final class ManifestToolCoreTests: XCTestCase {
             )
         }
         return zip
+    }
+
+    private func runZip(_ arguments: [String], in directory: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        process.currentDirectoryURL = directory
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw NSError(domain: "ManifestToolCoreTests", code: 2)
+        }
     }
 }
 

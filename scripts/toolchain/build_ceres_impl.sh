@@ -3,6 +3,15 @@
 BOOTSTRAP_CMAKE_BIN="${EASYSPLAT_BOOTSTRAP_CMAKE:-}"
 BOOTSTRAP_NINJA_BIN="${EASYSPLAT_BOOTSTRAP_NINJA:-}"
 BOOTSTRAP_RG_BIN="${EASYSPLAT_BOOTSTRAP_RG:-}"
+FROZEN_ROOT="${EASYSPLAT_FROZEN_ROOT:-}"
+FROZEN_FREEZER_FD="${EASYSPLAT_FROZEN_FREEZER_FD:-}"
+FROZEN_FREEZER_SHA256="${EASYSPLAT_FROZEN_FREEZER_SHA256:-}"
+FROZEN_WRAPPER_FD="${EASYSPLAT_FROZEN_WRAPPER_FD:-}"
+FROZEN_WRAPPER_SHA256="${EASYSPLAT_FROZEN_WRAPPER_SHA256:-}"
+FROZEN_IMPLEMENTATION_FD="${EASYSPLAT_FROZEN_IMPLEMENTATION_FD:-}"
+FROZEN_IMPLEMENTATION_SHA256="${EASYSPLAT_FROZEN_IMPLEMENTATION_SHA256:-}"
+FROZEN_PROMOTER_FD="${EASYSPLAT_FROZEN_PROMOTER_FD:-}"
+FROZEN_PROMOTER_SHA256="${EASYSPLAT_FROZEN_PROMOTER_SHA256:-}"
 
 INHERITED_FUNCTIONS="$(builtin declare -F)"
 if [ -n "$INHERITED_FUNCTIONS" ]; then
@@ -19,7 +28,7 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 set -euo pipefail
 umask 022
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+ROOT="$FROZEN_ROOT"
 WORK="$ROOT/Toolchains/build/ceres"
 DOWNLOADS="$WORK/downloads"
 SOURCES="$WORK/sources"
@@ -29,10 +38,7 @@ INSTALL="$WORK/install"
 STAGE="$WORK/install.stage.$$"
 SUPPORT="$ROOT/Toolchains/build/colmap-support/install"
 LOCK="$ROOT/scripts/toolchain/ceres-lock.json"
-WRAPPER="$ROOT/scripts/toolchain/build_ceres.sh"
-IMPLEMENTATION="$ROOT/scripts/toolchain/build_ceres_impl.sh"
 EXTRACTOR="$ROOT/scripts/toolchain/safe_extract_source.py"
-PROMOTER="$ROOT/scripts/toolchain/atomic_swap_install.py"
 TESTS="$ROOT/scripts/toolchain/tests/test_ceres_builder.py"
 BUILD_LOCK="$WORK/.build.lock"
 BUILD_HOME="$WORK/home"
@@ -40,6 +46,9 @@ BUILD_TMP="$WORK/tmp"
 DEPLOYMENT_TARGET="15.0"
 NORMALIZED_MTIME_EPOCH="946684800"
 LOCK_OWNED=0
+INSTALL_STAGE_OWNED=0
+INSTALL_STAGE_DEVICE=""
+INSTALL_STAGE_INODE=""
 
 AR_BIN=""
 CLANG_BIN=""
@@ -81,36 +90,251 @@ sha256() {
   "$SHASUM_BIN" -a 256 "$1" | /usr/bin/awk '{print $1}'
 }
 
+validate_frozen_control_inputs() {
+  /usr/bin/python3 - \
+    "$FROZEN_FREEZER_FD" "$FROZEN_FREEZER_SHA256" \
+    "$FROZEN_WRAPPER_FD" "$FROZEN_WRAPPER_SHA256" \
+    "$FROZEN_IMPLEMENTATION_FD" "$FROZEN_IMPLEMENTATION_SHA256" \
+    "$FROZEN_PROMOTER_FD" "$FROZEN_PROMOTER_SHA256" <<'PY'
+import fcntl
+import hashlib
+import os
+import stat
+import sys
+
+arguments = sys.argv[1:]
+if len(arguments) != 8:
+    raise SystemExit("frozen control descriptor arguments are incomplete")
+for label, offset in (
+    ("control freezer", 0),
+    ("wrapper", 2),
+    ("implementation", 4),
+    ("promoter", 6),
+):
+    try:
+        descriptor = int(arguments[offset])
+    except ValueError as error:
+        raise SystemExit(f"invalid frozen {label} descriptor") from error
+    expected = arguments[offset + 1]
+    if descriptor < 100:
+        raise SystemExit(f"unsafe frozen {label} descriptor number")
+    if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+        raise SystemExit(f"invalid frozen {label} digest")
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 0
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+        or metadata.st_size <= 0
+        or stat.S_IMODE(metadata.st_mode) != 0o400
+        or (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDONLY
+    ):
+        raise SystemExit(f"unsafe frozen {label} descriptor")
+    payload = b"".join(
+        os.pread(descriptor, min(1024 * 1024, metadata.st_size - offset), offset)
+        for offset in range(0, metadata.st_size, 1024 * 1024)
+    )
+    if len(payload) != metadata.st_size or hashlib.sha256(payload).hexdigest() != expected:
+        raise SystemExit(f"frozen {label} payload digest mismatch")
+PY
+}
+
+run_promoter() {
+  /usr/bin/python3 -I -S - "$FROZEN_PROMOTER_FD" "$FROZEN_PROMOTER_SHA256" "$@" <<'PY'
+import fcntl
+import hashlib
+import os
+import stat
+import sys
+
+descriptor = int(sys.argv[1])
+expected = sys.argv[2]
+arguments = sys.argv[3:]
+metadata = os.fstat(descriptor)
+if (
+    descriptor < 100
+    or not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_nlink != 0
+    or metadata.st_uid != os.getuid()
+    or metadata.st_gid != os.getgid()
+    or metadata.st_size <= 0
+    or stat.S_IMODE(metadata.st_mode) != 0o400
+    or (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDONLY
+):
+    raise SystemExit("unsafe frozen promoter descriptor")
+payload = b"".join(
+    os.pread(descriptor, min(1024 * 1024, metadata.st_size - offset), offset)
+    for offset in range(0, metadata.st_size, 1024 * 1024)
+)
+if len(payload) != metadata.st_size or hashlib.sha256(payload).hexdigest() != expected:
+    raise SystemExit("frozen promoter payload digest mismatch")
+script = f"/dev/fd/{descriptor}"
+sys.argv = [script, *arguments]
+namespace = {
+    "__name__": "__main__",
+    "__file__": script,
+    "__package__": None,
+    "__cached__": None,
+}
+exec(compile(payload, script, "exec"), namespace)
+PY
+}
+
 resolve_xcode_tool() {
   DEVELOPER_DIR="$XCODE_DEVELOPER_DIR" "$XCRUN_BIN" --find "$1"
 }
 
+STAGE_CLEANUP_ALLOWED=1
+
 cleanup() {
   local status=$?
+  local install_cleanup_status=0
   trap - EXIT
-  rm -rf "$STAGE"
+  if [ "$STAGE_CLEANUP_ALLOWED" = "1" ] && [ "$INSTALL_STAGE_OWNED" = "1" ]; then
+    if [ -n "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ]; then
+      run_promoter \
+        --remove-owned-tree \
+        "$STAGE" \
+        "$INSTALL_STAGE_DEVICE" \
+        "$INSTALL_STAGE_INODE" \
+        --allow-symlinks || install_cleanup_status=$?
+    else
+      install_cleanup_status=1
+    fi
+    if [ "$install_cleanup_status" -ne 0 ]; then
+      printf '%s\n' \
+        "Ceres build cleanup preserved an unverified staged install: $STAGE" >&2
+    fi
+  fi
   if [ "$LOCK_OWNED" = "1" ]; then
     exec 9>&-
   fi
+  if [ "$status" -eq 0 ] && [ "$install_cleanup_status" -ne 0 ]; then
+    status="$install_cleanup_status"
+  fi
   exit "$status"
+}
+
+create_owned_install_stage() {
+  local identity
+  identity="$(
+    run_promoter --create-owned-tree "$STAGE"
+  )" || die "could not create and bind Ceres install stage"
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || \
+    die "Ceres install stage identity is malformed"
+  INSTALL_STAGE_DEVICE="${identity%%:*}"
+  INSTALL_STAGE_INODE="${identity#*:}"
+  INSTALL_STAGE_OWNED=1
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-acquire_build_lock() {
-  mkdir -p "$WORK"
-  exec 9>"$BUILD_LOCK"
-  "$LOCKF_BIN" -s -t 0 9 || die "another Ceres build is running"
-  LOCK_OWNED=1
+validate_build_lock() {
+  /usr/bin/python3 - "$WORK" "$BUILD_LOCK" 9 <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+work, path, descriptor_raw = sys.argv[1:]
+descriptor = int(descriptor_raw)
+name = os.path.basename(path)
+
+
+def reject() -> None:
+    raise SystemExit("unsafe build lock")
+
+
+if not name or name in {".", ".."} or os.path.dirname(path) != work:
+    reject()
+directory = -1
+named_descriptor = -1
+try:
+    directory = os.open(
+        work,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    directory_status = os.fstat(directory)
+    work_status = os.stat(work, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(directory_status.st_mode)
+        or directory_status.st_uid != os.getuid()
+        or directory_status.st_gid != os.getgid()
+        or (directory_status.st_dev, directory_status.st_ino)
+        != (work_status.st_dev, work_status.st_ino)
+    ):
+        reject()
+    named_descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory,
+    )
+    opened = os.fstat(descriptor)
+    named_opened = os.fstat(named_descriptor)
+    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or opened.st_gid != os.getgid()
+        or (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDWR
+        or (opened.st_dev, opened.st_ino)
+        != (named_opened.st_dev, named_opened.st_ino)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        reject()
+    os.fchmod(descriptor, 0o600)
+    opened_after = os.fstat(descriptor)
+    named_after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    directory_after = os.fstat(directory)
+    work_after = os.stat(work, follow_symlinks=False)
+    if (
+        (opened.st_dev, opened.st_ino)
+        != (opened_after.st_dev, opened_after.st_ino)
+        or (opened.st_dev, opened.st_ino)
+        != (named_after.st_dev, named_after.st_ino)
+        or opened_after.st_nlink != 1
+        or stat.S_IMODE(opened_after.st_mode) != 0o600
+        or (directory_status.st_dev, directory_status.st_ino)
+        != (directory_after.st_dev, directory_after.st_ino)
+        or (directory_status.st_dev, directory_status.st_ino)
+        != (work_after.st_dev, work_after.st_ino)
+    ):
+        reject()
+except OSError:
+    reject()
+finally:
+    if named_descriptor >= 0:
+        os.close(named_descriptor)
+    if directory >= 0:
+        os.close(directory)
+PY
 }
 
-remove_stale_stages() {
-  local path
+acquire_build_lock() {
+  mkdir -p "$WORK"
+  exec 9<>"$BUILD_LOCK"
+  validate_build_lock || die "Ceres build lock is unsafe"
+  "$LOCKF_BIN" -s -t 0 9 || die "another Ceres build is running"
+  LOCK_OWNED=1
+  validate_build_lock || die "Ceres build lock changed during acquisition"
+}
+
+recover_stale_promotions() {
+  local journal path
+  for journal in "$WORK"/install.stage.*.promotion-state; do
+    [ -e "$journal" ] || [ -L "$journal" ] || continue
+    run_promoter --recover "$journal" || \
+      die "could not recover interrupted Ceres promotion: $journal"
+  done
   for path in "$WORK"/install.stage.*; do
     [ -e "$path" ] || [ -L "$path" ] || continue
-    [ "$path" = "$STAGE" ] && continue
-    rm -rf "$path"
+    case "$path" in
+      *.promotion-state) continue ;;
+    esac
+    die "ambiguous staged install requires recovery: $path"
   done
 }
 
@@ -122,12 +346,7 @@ preflight() {
     *[[:space:]]*) die "checkout path contains whitespace; move the source checkout before building" ;;
   esac
   [ -s "$LOCK" ] || die "ceres-lock.json is missing"
-  [ -x "$WRAPPER" ] || die "hermetic build wrapper is missing or not executable"
-  [ -f "$IMPLEMENTATION" ] && [ ! -L "$IMPLEMENTATION" ] || \
-    die "hermetic build implementation is missing or unsafe"
-  [ ! -x "$IMPLEMENTATION" ] || die "hermetic build implementation must not be executable"
   [ -x "$EXTRACTOR" ] || die "safe source extractor is missing or not executable"
-  [ -x "$PROMOTER" ] || die "atomic install promoter is missing or not executable"
   [ -f "$TESTS" ] || die "Ceres artifact tests are missing"
   [ -d "$SUPPORT" ] && [ ! -L "$SUPPORT" ] || die "promoted COLMAP support prefix is missing"
   [ -s "$SUPPORT/build_info.json" ] || die "COLMAP support receipt is missing"
@@ -682,7 +901,9 @@ validate_install_tree() {
 
 stage_receipt() {
   "$PYTHON_BIN" - \
-    "$LOCK" "$STAGE" "$SUPPORT" "$WRAPPER" "$IMPLEMENTATION" "$EXTRACTOR" "$PROMOTER" \
+    "$LOCK" "$STAGE" "$SUPPORT" "$FROZEN_FREEZER_SHA256" \
+    "$FROZEN_WRAPPER_SHA256" "$FROZEN_IMPLEMENTATION_SHA256" \
+    "$EXTRACTOR" "$FROZEN_PROMOTER_SHA256" \
     "$AR_BIN" "$CLANG_BIN" "$CLANGXX_BIN" "$CMAKE_BIN" "$CURL_BIN" "$LD_BIN" \
     "$LIPO_BIN" "$LOCKF_BIN" "$NINJA_BIN" "$NM_BIN" "$OTOOL_BIN" "$PYTHON_BIN" \
     "$RANLIB_BIN" "$RG_BIN" "$SHASUM_BIN" "$STRINGS_BIN" "$VTOOL_BIN" "$XATTR_BIN" \
@@ -696,13 +917,14 @@ import sys
 from pathlib import Path
 
 (
-    lock_raw, root_raw, support_raw, wrapper_raw, implementation_raw, extractor_raw, promoter_raw,
+    lock_raw, root_raw, support_raw, freezer_sha256, wrapper_sha256,
+    implementation_sha256, extractor_raw, promoter_sha256,
     ar_raw, clang_raw, clangxx_raw, cmake_raw, curl_raw, ld_raw, lipo_raw, lockf_raw,
     ninja_raw, nm_raw, otool_raw, python_raw, ranlib_raw, rg_raw, shasum_raw, strings_raw,
     vtool_raw, xattr_raw, xcodebuild_raw, xcrun_raw, sdk_version, sdk_settings_raw, epoch_raw,
 ) = sys.argv[1:]
 lock_path, root, support = Path(lock_raw), Path(root_raw), Path(support_raw)
-wrapper, implementation, extractor, promoter = map(Path, (wrapper_raw, implementation_raw, extractor_raw, promoter_raw))
+extractor = Path(extractor_raw)
 sdk_settings = Path(sdk_settings_raw)
 lock = json.loads(lock_path.read_text(encoding="utf-8"))
 
@@ -787,11 +1009,12 @@ payload = {
     "source_date_epoch": 0,
     "normalized_mtime_epoch": int(epoch_raw),
     "ownership_policy": "invoking-build-user-and-primary-group",
-    "builder_sha256": file_sha256(wrapper),
-    "builder_implementation_sha256": file_sha256(implementation),
+    "control_freezer_sha256": freezer_sha256,
+    "builder_sha256": wrapper_sha256,
+    "builder_implementation_sha256": implementation_sha256,
     "source_lock_sha256": file_sha256(lock_path),
     "extractor_sha256": file_sha256(extractor),
-    "promoter_sha256": file_sha256(promoter),
+    "promoter_sha256": promoter_sha256,
     "support_receipt_sha256": file_sha256(support_receipt_path),
     "support_install_tree_sha256": support_receipt["install_tree_sha256"],
     "macos_sdk_settings_sha256": file_sha256(sdk_settings),
@@ -815,7 +1038,9 @@ PY
 validate_receipt() {
   local root="$1"
   "$PYTHON_BIN" - \
-    "$root" "$SUPPORT" "$LOCK" "$WRAPPER" "$IMPLEMENTATION" "$EXTRACTOR" "$PROMOTER" \
+    "$root" "$SUPPORT" "$LOCK" "$FROZEN_FREEZER_SHA256" \
+    "$FROZEN_WRAPPER_SHA256" "$FROZEN_IMPLEMENTATION_SHA256" \
+    "$EXTRACTOR" "$FROZEN_PROMOTER_SHA256" \
     "$MACOS_SDK/SDKSettings.json" "$NORMALIZED_MTIME_EPOCH" \
     "$AR_BIN" "$CLANG_BIN" "$CLANGXX_BIN" "$CMAKE_BIN" "$CURL_BIN" "$LD_BIN" \
     "$LIPO_BIN" "$LOCKF_BIN" "$NINJA_BIN" "$NM_BIN" "$OTOOL_BIN" "$PYTHON_BIN" \
@@ -829,12 +1054,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-root, support, lock, wrapper, implementation, extractor, promoter, sdk_settings = map(Path, sys.argv[1:9])
-epoch = int(sys.argv[9])
+root, support, lock = map(Path, sys.argv[1:4])
+freezer_sha256, wrapper_sha256, implementation_sha256 = sys.argv[4:7]
+extractor = Path(sys.argv[7])
+promoter_sha256 = sys.argv[8]
+sdk_settings = Path(sys.argv[9])
+epoch = int(sys.argv[10])
 tool_names = ("ar", "clang", "clangxx", "cmake", "curl", "ld", "lipo", "lockf", "ninja", "nm", "otool", "python", "ranlib", "ripgrep", "shasum", "strings", "vtool", "xattr", "xcodebuild", "xcrun")
-if len(sys.argv[10:]) != len(tool_names):
+if len(sys.argv[11:]) != len(tool_names):
     raise SystemExit("internal validator tool argument mismatch")
-tool_paths = dict(zip(tool_names, map(Path, sys.argv[10:])))
+tool_paths = dict(zip(tool_names, map(Path, sys.argv[11:])))
 receipt = json.loads((root / "build_info.json").read_text(encoding="utf-8"))
 
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -855,11 +1084,12 @@ def tree_sha256(path):
     return digest.hexdigest()
 
 expected = {
-    "builder_sha256": sha(wrapper),
-    "builder_implementation_sha256": sha(implementation),
+    "control_freezer_sha256": freezer_sha256,
+    "builder_sha256": wrapper_sha256,
+    "builder_implementation_sha256": implementation_sha256,
     "source_lock_sha256": sha(lock),
     "extractor_sha256": sha(extractor),
-    "promoter_sha256": sha(promoter),
+    "promoter_sha256": promoter_sha256,
     "support_receipt_sha256": sha(support / "build_info.json"),
     "support_install_tree_sha256": json.loads((support / "build_info.json").read_text())["install_tree_sha256"],
     "macos_sdk_settings_sha256": sha(sdk_settings),
@@ -1053,9 +1283,32 @@ PY
   rm -rf "$check"
 }
 
+promote_install() {
+  local journal="$STAGE.promotion-state" tree_receipt
+  tree_receipt="$(run_promoter --tree-receipt \
+    "$STAGE" "$INSTALL_STAGE_DEVICE" "$INSTALL_STAGE_INODE")" || \
+    die "could not bind the validated Ceres tree"
+  STAGE_CLEANUP_ALLOWED=0
+  run_promoter "$STAGE" "$INSTALL" "$tree_receipt" || \
+    die "atomic Ceres promotion failed; recovery state preserved"
+  if ! (
+    validate_install_tree "$INSTALL" &&
+    validate_receipt "$INSTALL" &&
+    validate_relocated_consumer "$INSTALL"
+  ); then
+    if run_promoter --recover "$journal"; then
+      die "post-promotion validation failed; previous Ceres state restored"
+    fi
+    die "post-promotion validation and rollback failed; recovery state preserved"
+  fi
+  run_promoter --commit "$journal" || \
+    die "could not finalize Ceres promotion; recovery state preserved"
+}
+
 main() {
+  validate_frozen_control_inputs || die "frozen build controls are invalid"
   acquire_build_lock
-  remove_stale_stages
+  recover_stale_promotions
   preflight
   sanitize_environment
   mkdir -p "$DOWNLOADS" "$SOURCES" "$BUILDS" "$LOGS" "$BUILD_HOME" "$BUILD_TMP"
@@ -1071,8 +1324,7 @@ main() {
     echo "Validated Ceres install: $candidate"
     return
   fi
-  rm -rf "$STAGE"
-  mkdir -p "$STAGE"
+  create_owned_install_stage
   verify_support_prefix
   build_eigen
   build_ceres
@@ -1087,21 +1339,7 @@ main() {
   normalize_metadata "$STAGE"
   validate_install_tree "$STAGE"
   validate_receipt "$STAGE"
-  "$PYTHON_BIN" "$PROMOTER" "$STAGE" "$INSTALL" || die "atomic Ceres promotion failed"
-  if ! (
-    validate_install_tree "$INSTALL" &&
-    validate_receipt "$INSTALL" &&
-    validate_relocated_consumer "$INSTALL"
-  ); then
-    if [ -d "$STAGE" ]; then
-      "$PYTHON_BIN" "$PROMOTER" "$STAGE" "$INSTALL" || \
-        die "post-promotion validation failed and rollback failed"
-      die "post-promotion validation failed; prior Ceres install restored"
-    fi
-    "$PYTHON_BIN" "$PROMOTER" "$INSTALL" "$STAGE" || \
-      die "post-promotion validation failed and new install quarantine failed"
-    die "post-promotion validation failed; invalid first install removed"
-  fi
+  promote_install
   echo "Ceres installed to: $INSTALL"
 }
 

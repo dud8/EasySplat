@@ -85,6 +85,7 @@ final class BootstrapVerificationTests: XCTestCase {
         let mutations: [(inout ManifestDocument) -> Void] = [
             { $0.components[0].sizeBytes += 1 },
             { $0.components[0].expandedSizeBytes += 1 },
+            { $0.components[0].expandedClosureSHA256 = String(repeating: "0", count: 64) },
             { $0.components[0].sha256 = String(repeating: "0", count: 64) },
             {
                 $0.components[0].contents.append("licenses/additional.txt")
@@ -146,40 +147,41 @@ final class BootstrapVerificationTests: XCTestCase {
     private func makeFixture() throws -> BootstrapFixture {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let files = try ProductionToolchainFileFixture(
+            version: "2.0.0",
+            sourceRepository: "dud8/EasySplat",
+            sourceCommit: String(repeating: "a", count: 40)
+        )
         let coreArchive = try makeZip(
             named: "bootstrap-core",
-            files: Dictionary(uniqueKeysWithValues: ManifestToolDefaults.criticalCoreFiles.map {
-                ($0, Data($0.utf8))
-            }),
+            files: files.core,
             in: root
         )
         let baseArchive = try makeZip(
             named: "build-base",
-            files: Dictionary(uniqueKeysWithValues: ManifestToolDefaults.da3BaseContents.map {
-                ($0, Data($0.utf8))
-            }),
+            files: files.base,
             in: root
         )
         let smallArchive = try makeZip(
             named: "build-small",
-            files: Dictionary(uniqueKeysWithValues: ManifestToolDefaults.da3SmallContents.map {
-                ($0, Data($0.utf8))
-            }),
+            files: files.small,
             in: root
         )
         let keypair = ManifestBuilder.generateKeypair()
-        let urls = ManifestBuilder.releaseComponentURLs(repository: "owner/repository", version: "2.0.0")
-        let manifest = try ManifestBuilder.build(
-            version: "2.0.0",
-            publishedAt: Date(timeIntervalSince1970: 0),
-            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
-            components: [
-                .init(name: "macos-arm64-core", artifactURL: urls["macos-arm64-core"]!, zipURL: coreArchive, capabilities: ManifestToolDefaults.coreCapabilities, dependencies: [], requirement: .required, criticalFilePaths: ManifestToolDefaults.criticalCoreFiles),
-                .init(name: "geometry-da3-base", artifactURL: urls["geometry-da3-base"]!, zipURL: baseArchive, capabilities: ["geometry.da3.runtime", "geometry.da3.base"], dependencies: ["macos-arm64-core"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3BaseContents),
-                .init(name: "geometry-da3-small", artifactURL: urls["geometry-da3-small"]!, zipURL: smallArchive, capabilities: ["geometry.da3.small"], dependencies: ["geometry-da3-base"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3SmallContents),
-            ],
-            privateKeyBase64: keypair.privateKeyBase64
-        )
+        let urls = ManifestBuilder.releaseComponentURLs(repository: "dud8/EasySplat", version: "2.0.0")
+        let manifest = try files.withReviewedSourceSnapshot {
+            try ManifestBuilder.build(
+                version: "2.0.0",
+                publishedAt: Date(timeIntervalSince1970: 0),
+                appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+                components: [
+                    .init(name: "macos-arm64-core", artifactURL: urls["macos-arm64-core"]!, zipURL: coreArchive, capabilities: ManifestToolDefaults.coreCapabilities, dependencies: [], requirement: .required, criticalFilePaths: ManifestToolDefaults.criticalCoreFiles),
+                    .init(name: "geometry-da3-base", artifactURL: urls["geometry-da3-base"]!, zipURL: baseArchive, capabilities: ["geometry.da3.runtime", "geometry.da3.base"], dependencies: ["macos-arm64-core"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3BaseContents),
+                    .init(name: "geometry-da3-small", artifactURL: urls["geometry-da3-small"]!, zipURL: smallArchive, capabilities: ["geometry.da3.small"], dependencies: ["geometry-da3-base"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3SmallContents),
+                ],
+                privateKeyBase64: keypair.privateKeyBase64
+            )
+        }
         try FileManager.default.removeItem(at: baseArchive)
         try FileManager.default.removeItem(at: smallArchive)
         return BootstrapFixture(root: root, coreArchive: coreArchive, keypair: keypair, manifest: manifest)

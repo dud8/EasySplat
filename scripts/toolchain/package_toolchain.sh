@@ -77,7 +77,8 @@ require_committed_packaging_sources() {
     scripts/toolchain/openimageio-lock.json
     scripts/toolchain/build_colmap.sh
     scripts/toolchain/build_colmap_impl.sh
-    scripts/toolchain/patches/colmap-4.1.0-easysplat.patch
+    scripts/toolchain/secure_colmap_build.py
+    scripts/toolchain/patches/colmap-4.1.1-easysplat.patch
     scripts/toolchain/build_da3_mps.sh
     scripts/toolchain/da3-model-lock.json
     scripts/toolchain/build_msplat.sh
@@ -441,9 +442,12 @@ validate_native_colmap_cli() {
   require_colmap_options matches_importer \
     database_path match_list_path match_type FeatureMatching.use_gpu \
     FeatureMatching.num_threads FeatureMatching.max_num_matches \
-    SiftMatching.cpu_brute_force_matcher
+    SiftMatching.cpu_brute_force_matcher \
+    EasySplat.require_empty_matching_results TwoViewGeometry.random_seed
   require_colmap_options local_vocab_retriever \
-    database_path output_pair_list_path query_image_list_path excluded_pair_list_path \
+    database_path output_pair_list_path request_digest query_stride \
+    query_image_list_path excluded_pair_list_path \
+    image_group_list_path image_group_list_digest \
     num_images returned_neighbor_count minimum_frame_separation num_visual_words \
     max_features_per_image max_training_descriptors num_iterations num_rounds \
     num_checks num_threads
@@ -463,6 +467,13 @@ validate_native_colmap_cli() {
   require_colmap_options image_undistorter \
     image_path input_path output_path output_type copy_policy max_image_size
   require_colmap_options model_converter input_path output_path output_type
+}
+
+validate_native_colmap_semantics() {
+  EASYSPLAT_NATIVE_COLMAP_BIN="$BIN/colmap" \
+  EASYSPLAT_NATIVE_COLMAP_DYLD_LIBRARY_PATH="$LIB" \
+    python3 "$ROOT/scripts/toolchain/tests/test_native_colmap_retriever.py" \
+      NativeRetrieverTests NativeMatchesImporterTests
 }
 
 find_macho_files() {
@@ -563,6 +574,7 @@ if support["library_sha256"].get("lib/libomp.dylib") != sha(libomp):
 PY
 
 validate_native_colmap_cli
+validate_native_colmap_semantics
 
 "$MSPLAT_VALIDATOR" --source "$MSPLAT_INSTALL/msplat"
 mkdir -p "$OUT/msplat"

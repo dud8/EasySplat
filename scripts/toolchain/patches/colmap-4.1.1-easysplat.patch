@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 3c65ec6..555a495 100644
+index da2f3797..0ac9253c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -322,7 +322,9 @@ COLMAP_ADD_SOURCE_DIR(src/colmap/util UTIL_SRCS *.h *.cc)
@@ -27,7 +27,7 @@ index 3c65ec6..555a495 100644
  if(LSD_ENABLED)
      list(APPEND COLMAP_EXPORT_LIBS
 diff --git a/cmake/FindDependencies.cmake b/cmake/FindDependencies.cmake
-index 5ae2b9f..0d86700 100644
+index e0cae43b..a03ab6f9 100644
 --- a/cmake/FindDependencies.cmake
 +++ b/cmake/FindDependencies.cmake
 @@ -25,8 +25,6 @@ find_package(Eigen3 ${COLMAP_FIND_TYPE})
@@ -36,20 +36,20 @@ index 5ae2b9f..0d86700 100644
  
 -find_package(Metis ${COLMAP_FIND_TYPE})
 -
- find_package(Glog ${COLMAP_FIND_TYPE})
- if(DEFINED glog_VERSION_MAJOR)
-   # Older versions of glog don't export version variables.
-@@ -47,8 +45,6 @@ find_package(Glew ${COLMAP_FIND_TYPE})
+ find_package(SQLite3 ${COLMAP_FIND_TYPE})
+ # Older CMake versions define SQLite::SQLite3 instead of SQLite3::SQLite3.
+ if(NOT TARGET SQLite3::SQLite3 AND TARGET SQLite::SQLite3)
+@@ -40,8 +38,6 @@ find_package(Glew ${COLMAP_FIND_TYPE})
  
  find_package(Git)
  
 -find_package(CHOLMOD REQUIRED)
 -
- find_package(Ceres ${COLMAP_FIND_TYPE})
- if(NOT TARGET Ceres::ceres)
-     # Older Ceres versions don't come with an imported interface target.
+ # Ceres is found before Glog on purpose. Some distributions (e.g. Fedora) ship a
+ # Ceres whose bundled FindGlog.cmake unconditionally calls add_library(glog::glog)
+ # in module mode. If we created the glog::glog target first, that call collides
 diff --git a/src/colmap/controllers/CMakeLists.txt b/src/colmap/controllers/CMakeLists.txt
-index d40864e..9eeff84 100644
+index d40864ee..9eeff840 100644
 --- a/src/colmap/controllers/CMakeLists.txt
 +++ b/src/colmap/controllers/CMakeLists.txt
 @@ -33,21 +33,17 @@ set(FOLDER_NAME "controllers")
@@ -121,10 +121,129 @@ index d40864e..9eeff84 100644
      NAME reconstruction_clustering_test
      SRCS reconstruction_clustering_test.cc
 diff --git a/src/colmap/controllers/feature_extraction.cc b/src/colmap/controllers/feature_extraction.cc
-index e298ada..928de1b 100644
+index e298ada3..ccdd2b69 100644
 --- a/src/colmap/controllers/feature_extraction.cc
 +++ b/src/colmap/controllers/feature_extraction.cc
-@@ -460,13 +460,6 @@ class FeatureExtractorController : public Thread {
+@@ -37,6 +37,7 @@
+ #include "colmap/util/opengl_utils.h"
+ #include "colmap/util/timer.h"
+ 
++#include <filesystem>
+ #include <numeric>
+ 
+ namespace colmap {
+@@ -83,8 +84,29 @@ void MaskFeatures(const Bitmap& mask,
+   descriptors->data.conservativeResize(out_index, descriptors->data.cols());
+ }
+ 
++bool IsPristineDatabasePath(const std::filesystem::path& path) {
++  std::error_code error;
++  const std::filesystem::file_status status =
++      std::filesystem::symlink_status(path, error);
++  if (error == std::errc::no_such_file_or_directory) {
++    return true;
++  }
++  if (error) {
++    return false;
++  }
++  if (!std::filesystem::exists(status)) {
++    return true;
++  }
++  if (!std::filesystem::is_regular_file(status)) {
++    return false;
++  }
++  const uintmax_t size = std::filesystem::file_size(path, error);
++  return !error && size == 0;
++}
++
+ struct ImageData {
+   ImageReader::Status status = ImageReader::Status::FAILURE;
++  image_t requested_database_id = kInvalidImageId;
+ 
+   Rig rig;
+   Camera camera;
+@@ -246,10 +268,12 @@ class FeatureWriterThread : public Thread {
+  public:
+   FeatureWriterThread(FeatureExtractorType extractor_type,
+                       size_t num_images,
++                      bool use_stable_database_ids,
+                       Database* database,
+                       JobQueue<ImageData>* input_queue)
+       : extractor_type_str_(FeatureExtractorTypeToString(extractor_type)),
+         num_images_(num_images),
++        use_stable_database_ids_(use_stable_database_ids),
+         database_(database),
+         input_queue_(input_queue) {}
+ 
+@@ -300,7 +324,15 @@ class FeatureWriterThread : public Thread {
+         DatabaseTransaction database_transaction(database_);
+ 
+         if (image_data.image.ImageId() == kInvalidImageId) {
+-          image_data.image.SetImageId(database_->WriteImage(image_data.image));
++          if (use_stable_database_ids_) {
++            THROW_CHECK_NE(image_data.requested_database_id, kInvalidImageId);
++            image_data.image.SetImageId(image_data.requested_database_id);
++            THROW_CHECK_EQ(
++                database_->WriteImage(image_data.image, /*use_image_id=*/true),
++                image_data.requested_database_id);
++          } else {
++            image_data.image.SetImageId(database_->WriteImage(image_data.image));
++          }
+ 
+           if (image_data.pose_prior.HasPosition() ||
+               image_data.pose_prior.HasGravity()) {
+@@ -319,14 +351,31 @@ class FeatureWriterThread : public Thread {
+                   image_data.pose_prior.gravity.z());
+             }
+             image_data.pose_prior.corr_data_id = image_data.image.DataId();
+-            image_data.pose_prior.pose_prior_id =
+-                database_->WritePosePrior(image_data.pose_prior);
++            if (use_stable_database_ids_) {
++              image_data.pose_prior.pose_prior_id =
++                  static_cast<pose_prior_t>(image_data.requested_database_id);
++              THROW_CHECK_EQ(
++                  database_->WritePosePrior(image_data.pose_prior,
++                                            /*use_pose_prior_id=*/true),
++                  image_data.pose_prior.pose_prior_id);
++            } else {
++              image_data.pose_prior.pose_prior_id =
++                  database_->WritePosePrior(image_data.pose_prior);
++            }
+           }
+ 
+           Frame frame;
++          if (use_stable_database_ids_) {
++            frame.SetFrameId(
++                static_cast<frame_t>(image_data.requested_database_id));
++          }
+           frame.SetRigId(image_data.rig.RigId());
+           frame.AddDataId(image_data.image.DataId());
+-          database_->WriteFrame(frame);
++          const frame_t frame_id = database_->WriteFrame(
++              frame, /*use_frame_id=*/use_stable_database_ids_);
++          if (use_stable_database_ids_) {
++            THROW_CHECK_EQ(frame_id, frame.FrameId());
++          }
+         }
+ 
+         if (!database_->ExistsKeypoints(image_data.image.ImageId())) {
+@@ -346,6 +395,7 @@ class FeatureWriterThread : public Thread {
+ 
+   const std::string extractor_type_str_;
+   const size_t num_images_;
++  const bool use_stable_database_ids_;
+   Database* database_;
+   JobQueue<ImageData>* input_queue_;
+ };
+@@ -358,6 +408,7 @@ class FeatureExtractorController : public Thread {
+                              const FeatureExtractionOptions& extraction_options)
+       : reader_options_(reader_options),
+         extraction_options_(extraction_options),
++        database_path_was_pristine_(IsPristineDatabasePath(database_path)),
+         database_(Database::Open(database_path)),
+         image_reader_(reader_options_, database_.get()) {
+     THROW_CHECK(reader_options_.Check());
+@@ -460,13 +511,6 @@ class FeatureExtractorController : public Thread {
            num_extractors = num_threads;
            worker_extraction_options.num_threads = 1;
            break;
@@ -138,8 +257,482 @@ index e298ada..928de1b 100644
          default:
            LOG(FATAL_THROW) << "Unknown feature extractor type: "
                             << FeatureExtractorTypeToString(
+@@ -485,6 +529,16 @@ class FeatureExtractorController : public Thread {
+ 
+     writer_ = std::make_unique<FeatureWriterThread>(extraction_options_.type,
+                                                     image_reader_.NumImages(),
++                                                    database_path_was_pristine_ &&
++                                                        database_->NumRigs() == 0 &&
++                                                        database_->NumCameras() == 0 &&
++                                                        database_->NumImages() == 0 &&
++                                                        database_->NumFrames() == 0 &&
++                                                        database_->NumPosePriors() == 0 &&
++                                                        database_->NumKeypoints() == 0 &&
++                                                        database_->NumDescriptors() == 0 &&
++                                                        database_->NumMatchedImagePairs() == 0 &&
++                                                        database_->NumVerifiedImagePairs() == 0,
+                                                     database_.get(),
+                                                     writer_queue_.get());
+   }
+@@ -521,6 +575,10 @@ class FeatureExtractorController : public Thread {
+       }
+ 
+       ImageData image_data;
++      const size_t reader_index = image_reader_.NextIndex();
++      THROW_CHECK_LT(reader_index, kMaxNumImages - 1);
++      image_data.requested_database_id =
++          static_cast<image_t>(reader_index + 1);
+       image_data.bitmap = std::make_unique<Bitmap>();
+       Bitmap mask;
+       image_data.status = image_reader_.Next(&image_data.rig,
+@@ -565,6 +623,7 @@ class FeatureExtractorController : public Thread {
+ 
+   const ImageReaderOptions reader_options_;
+   const FeatureExtractionOptions extraction_options_;
++  const bool database_path_was_pristine_;
+ 
+   std::shared_ptr<Database> database_;
+   ImageReader image_reader_;
+diff --git a/src/colmap/controllers/feature_matching.cc b/src/colmap/controllers/feature_matching.cc
+index faed9e8c..8d2d4fa8 100644
+--- a/src/colmap/controllers/feature_matching.cc
++++ b/src/colmap/controllers/feature_matching.cc
+@@ -38,11 +38,104 @@
+ #include "colmap/util/misc.h"
+ #include "colmap/util/timer.h"
+ 
++#include <atomic>
++#include <cerrno>
++#include <charconv>
+ #include <fstream>
+ 
++#include <fcntl.h>
++#include <unistd.h>
++
+ namespace colmap {
+ namespace {
+ 
++class MatchListStream {
++ public:
++  MatchListStream(const std::filesystem::path& path, bool strict)
++      : strict_(strict) {
++    if (strict_) {
++      descriptor_ =
++          open(path.string().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    } else {
++      stream_.open(path);
++    }
++  }
++
++  ~MatchListStream() {
++    if (descriptor_ >= 0) {
++      close(descriptor_);
++    }
++  }
++
++  bool is_open() const {
++    return strict_ ? descriptor_ >= 0 : stream_.is_open();
++  }
++
++  bool ReadLine(std::string* line) {
++    if (!strict_) {
++      return static_cast<bool>(std::getline(stream_, *line));
++    }
++    while (true) {
++      const size_t newline = buffer_.find('\n');
++      if (newline != std::string::npos) {
++        *line = buffer_.substr(0, newline);
++        buffer_.erase(0, newline + 1);
++        return true;
++      }
++      if (reached_eof_) {
++        if (buffer_.empty()) {
++          return false;
++        }
++        *line = std::move(buffer_);
++        buffer_.clear();
++        return true;
++      }
++      char chunk[4096];
++      ssize_t count;
++      do {
++        count = read(descriptor_, chunk, sizeof(chunk));
++      } while (count < 0 && errno == EINTR);
++      if (count < 0) {
++        read_error_ = true;
++        return false;
++      }
++      if (count == 0) {
++        reached_eof_ = true;
++        continue;
++      }
++      buffer_.append(chunk, static_cast<size_t>(count));
++      if (buffer_.size() > 4096 && buffer_.find('\n') == std::string::npos) {
++        read_error_ = true;
++        return false;
++      }
++    }
++  }
++
++  bool bad() const { return strict_ ? read_error_ : stream_.bad(); }
++
++ private:
++  const bool strict_;
++  int descriptor_ = -1;
++  std::ifstream stream_;
++  std::string buffer_;
++  bool reached_eof_ = false;
++  bool read_error_ = false;
++};
++
++bool ParsePoint2DIndex(const std::string& token, point2D_t* index) {
++  if (token.empty()) {
++    return false;
++  }
++  point2D_t parsed = 0;
++  const auto result =
++      std::from_chars(token.data(), token.data() + token.size(), parsed);
++  if (result.ec != std::errc() || result.ptr != token.data() + token.size()) {
++    return false;
++  }
++  *index = parsed;
++  return true;
++}
++
+ void RigVerification(const std::shared_ptr<Database>& database,
+                      const std::shared_ptr<FeatureMatcherCache>& cache,
+                      const TwoViewGeometryOptions& geometry_options,
+@@ -159,8 +252,12 @@ class FeatureMatcherThread : public Thread {
+       const typename PairGeneratorType::PairingOptions& pairing_options,
+       const FeatureMatchingOptions& matching_options,
+       const TwoViewGeometryOptions& geometry_options,
+-      const std::filesystem::path& database_path) {
+-    auto database = Database::Open(database_path);
++      const std::filesystem::path& database_path,
++      std::shared_ptr<Database> database = nullptr,
++      std::shared_ptr<std::atomic<bool>> completion_success = nullptr) {
++    if (database == nullptr) {
++      database = Database::Open(database_path);
++    }
+     auto cache = std::make_shared<FeatureMatcherCache>(
+         pairing_options.CacheSize(), database);
+     return std::make_unique<FeatureMatcherThread>(
+@@ -170,7 +267,8 @@ class FeatureMatcherThread : public Thread {
+         cache,
+         [pairing_options, cache]() {
+           return std::make_unique<PairGeneratorType>(pairing_options, cache);
+-        });
++        },
++        std::move(completion_success));
+   }
+ 
+   using PairGeneratorFactory = std::function<std::unique_ptr<PairGenerator>()>;
+@@ -179,13 +277,15 @@ class FeatureMatcherThread : public Thread {
+                        const TwoViewGeometryOptions& geometry_options,
+                        std::shared_ptr<Database> database,
+                        std::shared_ptr<FeatureMatcherCache> cache,
+-                       PairGeneratorFactory pair_generator_factory)
++                       PairGeneratorFactory pair_generator_factory,
++                       std::shared_ptr<std::atomic<bool>> completion_success)
+       : matching_options_(matching_options),
+         geometry_options_(geometry_options),
+         database_(std::move(database)),
+         cache_(std::move(cache)),
+         pair_generator_factory_(std::move(pair_generator_factory)),
+-        matcher_(matching_options, geometry_options, cache_) {
++        matcher_(matching_options, geometry_options, cache_),
++        completion_success_(std::move(completion_success)) {
+     THROW_CHECK(matching_options.Check());
+     THROW_CHECK(geometry_options.Check());
+   }
+@@ -198,11 +298,17 @@ class FeatureMatcherThread : public Thread {
+     run_timer.Start();
+ 
+     if (!matcher_.Setup()) {
++      SignalInvalidSetup();
+       return;
+     }
++    SignalValidSetup();
+ 
+     std::unique_ptr<PairGenerator> pair_generator =
+         THROW_CHECK_NOTNULL(pair_generator_factory_());
++    if (!pair_generator->IsValid()) {
++      LOG(ERROR) << "Image pair list was rejected.";
++      return;
++    }
+ 
+     while (!pair_generator->HasFinished()) {
+       if (IsStopped()) {
+@@ -231,6 +337,10 @@ class FeatureMatcherThread : public Thread {
+           database_, cache_, geometry_options_, matching_options_.num_threads);
+       run_timer.PrintMinutes();
+     }
++
++    if (completion_success_ != nullptr) {
++      completion_success_->store(true);
++    }
+   }
+ 
+   const FeatureMatchingOptions matching_options_;
+@@ -239,6 +349,7 @@ class FeatureMatcherThread : public Thread {
+   const std::shared_ptr<FeatureMatcherCache> cache_;
+   const PairGeneratorFactory pair_generator_factory_;
+   FeatureMatcherController matcher_;
++  const std::shared_ptr<std::atomic<bool>> completion_success_;
+ };
+ 
+ class GeometricVerifierThread : public Thread {
+@@ -375,25 +486,35 @@ std::unique_ptr<Thread> CreateImagePairsFeatureMatcher(
+     const ImportedPairingOptions& pairing_options,
+     const FeatureMatchingOptions& matching_options,
+     const TwoViewGeometryOptions& geometry_options,
+-    const std::filesystem::path& database_path) {
++    const std::filesystem::path& database_path,
++    std::shared_ptr<Database> startup_database,
++    std::shared_ptr<std::atomic<bool>> completion_success) {
+   return FeatureMatcherThread::Create<ImportedPairGenerator>(
+-      pairing_options, matching_options, geometry_options, database_path);
++      pairing_options,
++      matching_options,
++      geometry_options,
++      database_path,
++      std::move(startup_database),
++      std::move(completion_success));
+ }
+ 
+ namespace {
+ 
+ class FeaturePairsFeatureMatcher : public Thread {
+  public:
+-  FeaturePairsFeatureMatcher(const FeaturePairsMatchingOptions& pairing_options,
+-                             const FeatureMatchingOptions& matching_options,
+-                             const TwoViewGeometryOptions& geometry_options,
+-                             const std::filesystem::path& database_path)
++  FeaturePairsFeatureMatcher(
++      const FeaturePairsMatchingOptions& pairing_options,
++      const FeatureMatchingOptions& matching_options,
++      const TwoViewGeometryOptions& geometry_options,
++      std::shared_ptr<Database> database,
++      std::shared_ptr<std::atomic<bool>> completion_success)
+       : options_(pairing_options),
+         matching_options_(matching_options),
+         geometry_options_(geometry_options),
+-        database_(Database::Open(database_path)),
++        database_(std::move(database)),
+         cache_(std::make_shared<FeatureMatcherCache>(/*cache_size=*/100,
+-                                                     database_)) {
++                                                     database_)),
++        completion_success_(std::move(completion_success)) {
+     THROW_CHECK(pairing_options.Check());
+     THROW_CHECK(matching_options.Check());
+     THROW_CHECK(geometry_options.Check());
+@@ -412,11 +533,17 @@ class FeaturePairsFeatureMatcher : public Thread {
+       image_name_to_image.emplace(image.Name(), &image);
+     }
+ 
+-    std::ifstream file(options_.match_list_path);
+-    THROW_CHECK_FILE_OPEN(file, options_.match_list_path);
++    MatchListStream match_list_stream(options_.match_list_path,
++                                      options_.fail_on_invalid_input);
++    if (!match_list_stream.is_open()) {
++      LOG(ERROR) << "Could not open match list: " << options_.match_list_path;
++      SignalInvalidSetup();
++      return;
++    }
++    SignalValidSetup();
+ 
+     std::string line;
+-    while (std::getline(file, line)) {
++    while (match_list_stream.ReadLine(&line)) {
+       if (IsStopped()) {
+         run_timer.PrintMinutes();
+         return;
+@@ -427,32 +554,37 @@ class FeaturePairsFeatureMatcher : public Thread {
+         continue;
+       }
+ 
+-      std::istringstream line_stream(line);
++      std::istringstream image_pair_stream(line);
+ 
+       std::string image_name1, image_name2;
+-      try {
+-        line_stream >> image_name1 >> image_name2;
+-      } catch (...) {
++      std::string extra;
++      if (!(image_pair_stream >> image_name1 >> image_name2) ||
++          (options_.fail_on_invalid_input &&
++           (image_pair_stream >> extra || image_name1 == image_name2))) {
+         LOG(ERROR) << "Could not read image pair.";
+-        break;
++        return;
+       }
+ 
+       LOG(INFO) << StringPrintf(
+           "%s - %s", image_name1.c_str(), image_name2.c_str());
+ 
+       if (image_name_to_image.count(image_name1) == 0) {
+-        LOG(INFO) << StringPrintf("SKIP: Image %s not found in database.",
+-                                  image_name1.c_str());
+-        break;
++        LOG(ERROR) << StringPrintf("Image %s not found in database.",
++                                   image_name1.c_str());
++        return;
+       }
+       if (image_name_to_image.count(image_name2) == 0) {
+-        LOG(INFO) << StringPrintf("SKIP: Image %s not found in database.",
+-                                  image_name2.c_str());
+-        break;
++        LOG(ERROR) << StringPrintf("Image %s not found in database.",
++                                   image_name2.c_str());
++        return;
+       }
+ 
+       const Image& image1 = *image_name_to_image[image_name1];
+       const Image& image2 = *image_name_to_image[image_name2];
++      const size_t num_keypoints1 =
++          cache_->GetKeypoints(image1.ImageId())->size();
++      const size_t num_keypoints2 =
++          cache_->GetKeypoints(image2.ImageId())->size();
+ 
+       bool skip_pair = false;
+       if (database_->ExistsTwoViewGeometry(image1.ImageId(),
+@@ -462,26 +594,42 @@ class FeaturePairsFeatureMatcher : public Thread {
+       }
+ 
+       FeatureMatches matches;
+-      while (std::getline(file, line)) {
++      while (match_list_stream.ReadLine(&line)) {
+         StringTrim(&line);
+ 
+         if (line.empty()) {
+           break;
+         }
+ 
+-        std::istringstream line_stream(line);
++        std::istringstream match_line_stream(line);
+ 
+         FeatureMatch match;
+-        try {
+-          line_stream >> match.point2D_idx1 >> match.point2D_idx2;
+-        } catch (...) {
++        if (options_.fail_on_invalid_input) {
++          std::string first_index;
++          std::string second_index;
++          if (!(match_line_stream >> first_index >> second_index) ||
++              match_line_stream >> extra ||
++              !ParsePoint2DIndex(first_index, &match.point2D_idx1) ||
++              !ParsePoint2DIndex(second_index, &match.point2D_idx2) ||
++              match.point2D_idx1 >= num_keypoints1 ||
++              match.point2D_idx2 >= num_keypoints2) {
++            LOG(ERROR) << "Cannot read exact feature matches.";
++            return;
++          }
++        } else if (!(match_line_stream >> match.point2D_idx1 >>
++                     match.point2D_idx2)) {
+           LOG(ERROR) << "Cannot read feature matches.";
+-          break;
++          return;
+         }
+ 
+         matches.push_back(match);
+       }
+ 
++      if (match_list_stream.bad()) {
++        LOG(ERROR) << "Could not finish reading match list.";
++        return;
++      }
++
+       if (skip_pair) {
+         continue;
+       }
+@@ -519,6 +667,15 @@ class FeaturePairsFeatureMatcher : public Thread {
+           image1.ImageId(), image2.ImageId(), two_view_geometry);
+     }
+ 
++    if (match_list_stream.bad()) {
++      LOG(ERROR) << "Could not finish reading match list.";
++      return;
++    }
++
++    if (completion_success_ != nullptr) {
++      completion_success_->store(true);
++    }
++
+     run_timer.PrintMinutes();
+   }
+ 
+@@ -527,6 +684,7 @@ class FeaturePairsFeatureMatcher : public Thread {
+   const TwoViewGeometryOptions geometry_options_;
+   const std::shared_ptr<Database> database_;
+   const std::shared_ptr<FeatureMatcherCache> cache_;
++  const std::shared_ptr<std::atomic<bool>> completion_success_;
+ };
+ 
+ }  // namespace
+@@ -535,9 +693,18 @@ std::unique_ptr<Thread> CreateFeaturePairsFeatureMatcher(
+     const FeaturePairsMatchingOptions& pairing_options,
+     const FeatureMatchingOptions& matching_options,
+     const TwoViewGeometryOptions& geometry_options,
+-    const std::filesystem::path& database_path) {
++    const std::filesystem::path& database_path,
++    std::shared_ptr<Database> database,
++    std::shared_ptr<std::atomic<bool>> completion_success) {
++  if (database == nullptr) {
++    database = Database::Open(database_path);
++  }
+   return std::make_unique<FeaturePairsFeatureMatcher>(
+-      pairing_options, matching_options, geometry_options, database_path);
++      pairing_options,
++      matching_options,
++      geometry_options,
++      std::move(database),
++      std::move(completion_success));
+ }
+ 
+ std::unique_ptr<Thread> CreateGeometricVerifier(
+diff --git a/src/colmap/controllers/feature_matching.h b/src/colmap/controllers/feature_matching.h
+index 6beffd39..07b8418b 100644
+--- a/src/colmap/controllers/feature_matching.h
++++ b/src/colmap/controllers/feature_matching.h
+@@ -34,11 +34,14 @@
+ #include "colmap/feature/matcher.h"
+ #include "colmap/util/threading.h"
+ 
++#include <atomic>
+ #include <memory>
+ #include <string>
+ 
+ namespace colmap {
+ 
++class Database;
++
+ // Exhaustively match images by processing each block in the exhaustive match
+ // matrix in one batch:
+ //
+@@ -130,7 +133,9 @@ std::unique_ptr<Thread> CreateImagePairsFeatureMatcher(
+     const ImportedPairingOptions& pairing_options,
+     const FeatureMatchingOptions& matching_options,
+     const TwoViewGeometryOptions& geometry_options,
+-    const std::filesystem::path& database_path);
++    const std::filesystem::path& database_path,
++    std::shared_ptr<Database> startup_database = nullptr,
++    std::shared_ptr<std::atomic<bool>> completion_success = nullptr);
+ 
+ // Import feature matches from a text file.
+ //
+@@ -151,7 +156,9 @@ std::unique_ptr<Thread> CreateFeaturePairsFeatureMatcher(
+     const FeaturePairsMatchingOptions& pairing_options,
+     const FeatureMatchingOptions& matching_options,
+     const TwoViewGeometryOptions& geometry_options,
+-    const std::filesystem::path& database_path);
++    const std::filesystem::path& database_path,
++    std::shared_ptr<Database> startup_database = nullptr,
++    std::shared_ptr<std::atomic<bool>> completion_success = nullptr);
+ 
+ // Options for CreateGeometricVerifier
+ struct GeometricVerifierOptions {
 diff --git a/src/colmap/controllers/option_manager.cc b/src/colmap/controllers/option_manager.cc
-index ddabf55..b685464 100644
+index ddabf55e..b685464f 100644
 --- a/src/colmap/controllers/option_manager.cc
 +++ b/src/colmap/controllers/option_manager.cc
 @@ -29,7 +29,6 @@
@@ -364,7 +957,7 @@ index ddabf55..b685464 100644
      for (const std::string& line :
           ReadTextFileLines(mapper_constant_rig_list_path_)) {
 diff --git a/src/colmap/controllers/option_manager.h b/src/colmap/controllers/option_manager.h
-index f337a40..0e52b59 100644
+index f337a40b..0e52b593 100644
 --- a/src/colmap/controllers/option_manager.h
 +++ b/src/colmap/controllers/option_manager.h
 @@ -49,7 +49,6 @@ struct ImportedPairingOptions;
@@ -408,7 +1001,7 @@ index f337a40..0e52b59 100644
    bool added_reconstruction_clusterer_options_ = false;
  #if defined(COLMAP_MVS_ENABLED)
 diff --git a/src/colmap/controllers/option_manager_test.cc b/src/colmap/controllers/option_manager_test.cc
-index 74418f5..e82a5e0 100644
+index 74418f5f..e82a5e00 100644
 --- a/src/colmap/controllers/option_manager_test.cc
 +++ b/src/colmap/controllers/option_manager_test.cc
 @@ -128,7 +128,6 @@ TEST(OptionManager, WriteAndRead) {
@@ -427,8 +1020,166 @@ index 74418f5..e82a5e0 100644
  
    EXPECT_TRUE(options_read.Read(config_path));
  
+diff --git a/src/colmap/controllers/pairing.cc b/src/colmap/controllers/pairing.cc
+index b599e6ec..99fd4594 100644
+--- a/src/colmap/controllers/pairing.cc
++++ b/src/colmap/controllers/pairing.cc
+@@ -50,9 +50,20 @@ namespace {
+ 
+ std::vector<std::pair<image_t, image_t>> ReadImagePairsText(
+     const std::filesystem::path& path,
+-    const std::unordered_map<std::string, image_t>& image_name_to_image_id) {
++    const std::unordered_map<std::string, image_t>& image_name_to_image_id,
++    const bool fail_on_invalid_pair,
++    bool* valid) {
++  THROW_CHECK_NOTNULL(valid);
++  *valid = true;
+   std::ifstream file(path);
+-  THROW_CHECK_FILE_OPEN(file, path);
++  if (!file.is_open()) {
++    if (fail_on_invalid_pair) {
++      LOG(ERROR) << "Could not open image pair list: " << path;
++      *valid = false;
++      return {};
++    }
++    THROW_CHECK_FILE_OPEN(file, path);
++  }
+ 
+   std::string line;
+   std::vector<std::pair<image_t, image_t>> image_pairs;
+@@ -64,33 +75,60 @@ std::vector<std::pair<image_t, image_t>> ReadImagePairsText(
+       continue;
+     }
+ 
+-    std::stringstream line_stream(line);
+-
+     std::string image_name1;
+     std::string image_name2;
+-
+-    std::getline(line_stream, image_name1, ' ');
+-    StringTrim(&image_name1);
+-    std::getline(line_stream, image_name2, ' ');
+-    StringTrim(&image_name2);
++    if (fail_on_invalid_pair) {
++      std::istringstream line_stream(line);
++      std::string unexpected;
++      if (!(line_stream >> image_name1 >> image_name2) ||
++          (line_stream >> unexpected)) {
++        LOG(ERROR) << "Invalid image pair line: " << line;
++        *valid = false;
++        continue;
++      }
++    } else {
++      std::stringstream line_stream(line);
++      std::getline(line_stream, image_name1, ' ');
++      StringTrim(&image_name1);
++      std::getline(line_stream, image_name2, ' ');
++      StringTrim(&image_name2);
++    }
+ 
+     if (image_name_to_image_id.count(image_name1) == 0) {
+       LOG(ERROR) << "Image " << image_name1 << " does not exist.";
++      if (fail_on_invalid_pair) {
++        *valid = false;
++      }
+       continue;
+     }
+     if (image_name_to_image_id.count(image_name2) == 0) {
+       LOG(ERROR) << "Image " << image_name2 << " does not exist.";
++      if (fail_on_invalid_pair) {
++        *valid = false;
++      }
+       continue;
+     }
+ 
+     const image_t image_id1 = image_name_to_image_id.at(image_name1);
+     const image_t image_id2 = image_name_to_image_id.at(image_name2);
++    if (fail_on_invalid_pair && image_id1 == image_id2) {
++      LOG(ERROR) << "Image pair names the same image twice: " << image_name1;
++      *valid = false;
++      continue;
++    }
+     const image_pair_t image_pair = ImagePairToPairId(image_id1, image_id2);
+     const bool image_pair_exists = image_pairs_set.insert(image_pair).second;
+     if (image_pair_exists) {
+       image_pairs.emplace_back(image_id1, image_id2);
+     }
+   }
++  if (file.bad()) {
++    LOG(ERROR) << "Could not finish reading image pair list: " << path;
++    *valid = false;
++  }
++  if (!*valid) {
++    image_pairs.clear();
++  }
+   return image_pairs;
+ }
+ 
+@@ -827,8 +865,10 @@ ImportedPairGenerator::ImportedPairGenerator(
+     const auto& image = cache->GetImage(image_id);
+     image_name_to_image_id.emplace(image.Name(), image_id);
+   }
+-  image_pairs_ =
+-      ReadImagePairsText(options_.match_list_path, image_name_to_image_id);
++  image_pairs_ = ReadImagePairsText(options_.match_list_path,
++                                    image_name_to_image_id,
++                                    options_.fail_on_invalid_pair,
++                                    &valid_);
+   block_image_pairs_.reserve(options_.block_size);
+ }
+ 
+diff --git a/src/colmap/controllers/pairing.h b/src/colmap/controllers/pairing.h
+index 5b119eb6..67e260b7 100644
+--- a/src/colmap/controllers/pairing.h
++++ b/src/colmap/controllers/pairing.h
+@@ -204,6 +204,10 @@ struct ImportedPairingOptions {
+   // Path to the file with the matches.
+   std::filesystem::path match_list_path = "";
+ 
++  // Reject the entire list when any non-comment line is malformed, names an
++  // unknown image, or names the same image twice.
++  bool fail_on_invalid_pair = false;
++
+   bool Check() const;
+ 
+   inline size_t CacheSize() const { return block_size; }
+@@ -216,6 +220,10 @@ struct FeaturePairsMatchingOptions {
+   // Path to the file with the matches.
+   std::filesystem::path match_list_path = "";
+ 
++  // Reject malformed blocks or I/O failures instead of accepting a partial
++  // import. EasySplat enables this for its atomic empty-database contract.
++  bool fail_on_invalid_input = false;
++
+   bool Check() const;
+ };
+ 
+@@ -234,6 +242,8 @@ class PairGenerator {
+  public:
+   virtual ~PairGenerator() = default;
+ 
++  virtual bool IsValid() const { return true; }
++
+   virtual void Reset() = 0;
+ 
+   virtual bool HasFinished() const = 0;
+@@ -411,11 +421,14 @@ class ImportedPairGenerator : public PairGenerator {
+ 
+   std::vector<std::pair<image_t, image_t>> Next() override;
+ 
++  bool IsValid() const override { return valid_; }
++
+  private:
+   const ImportedPairingOptions options_;
+   std::vector<std::pair<image_t, image_t>> image_pairs_;
+   std::vector<std::pair<image_t, image_t>> block_image_pairs_;
+   size_t pair_idx_ = 0;
++  bool valid_ = true;
+ };
+ 
+ class ExistingMatchedPairGenerator : public PairGenerator {
 diff --git a/src/colmap/controllers/undistorters.cc b/src/colmap/controllers/undistorters.cc
-index e0d6880..7582110 100644
+index 9ef20aa1..b17a08f2 100644
 --- a/src/colmap/controllers/undistorters.cc
 +++ b/src/colmap/controllers/undistorters.cc
 @@ -89,61 +89,6 @@ void WriteProjectionMatrix(const std::filesystem::path& path,
@@ -555,7 +1306,7 @@ index e0d6880..7582110 100644
    run_timer.PrintMinutes();
  }
  
-@@ -276,39 +197,6 @@ bool COLMAPUndistorter::Undistort(const image_t image_id) const {
+@@ -278,39 +199,6 @@ bool COLMAPUndistorter::Undistort(const image_t image_id) const {
    return undistorted_bitmap.Write(output_image_path);
  }
  
@@ -595,7 +1346,7 @@ index e0d6880..7582110 100644
  PMVSUndistorter::PMVSUndistorter(const Options& options,
                                   const UndistortCameraOptions& camera_options,
                                   const Reconstruction& reconstruction,
-@@ -374,10 +262,6 @@ void PMVSUndistorter::Run() {
+@@ -376,10 +264,6 @@ void PMVSUndistorter::Run() {
    LOG(INFO) << "Writing scripts...";
    WritePMVSScript();
    WriteCMVSPMVSScript();
@@ -606,7 +1357,7 @@ index e0d6880..7582110 100644
  
    run_timer.PrintMinutes();
  }
-@@ -480,49 +364,6 @@ void PMVSUndistorter::WriteCMVSPMVSScript() const {
+@@ -482,49 +366,6 @@ void PMVSUndistorter::WriteCMVSPMVSScript() const {
    file << "done\n";
  }
  
@@ -657,7 +1408,7 @@ index e0d6880..7582110 100644
    const auto path = output_path_ / "pmvs" / "option-all";
    std::ofstream file(path, std::ios::trunc);
 diff --git a/src/colmap/controllers/undistorters.h b/src/colmap/controllers/undistorters.h
-index ebddb12..1da1c68 100644
+index ebddb12d..1da1c680 100644
 --- a/src/colmap/controllers/undistorters.h
 +++ b/src/colmap/controllers/undistorters.h
 @@ -47,10 +47,6 @@ class COLMAPUndistorter : public BaseController {
@@ -691,7 +1442,7 @@ index ebddb12..1da1c68 100644
    const Options options_;
    const UndistortCameraOptions camera_options_;
 diff --git a/src/colmap/estimators/CMakeLists.txt b/src/colmap/estimators/CMakeLists.txt
-index 4c1c11d..1aa978d 100644
+index 4c1c11d7..1aa978df 100644
 --- a/src/colmap/estimators/CMakeLists.txt
 +++ b/src/colmap/estimators/CMakeLists.txt
 @@ -42,8 +42,6 @@ set(ESTIMATORS_SRCS
@@ -717,7 +1468,7 @@ index 4c1c11d..1aa978d 100644
      NAME gravity_refinement_test
      SRCS gravity_refinement_test.cc
 diff --git a/src/colmap/exe/CMakeLists.txt b/src/colmap/exe/CMakeLists.txt
-index 6eeb70e..8d8e1c2 100644
+index 6eeb70e6..8d8e1c29 100644
 --- a/src/colmap/exe/CMakeLists.txt
 +++ b/src/colmap/exe/CMakeLists.txt
 @@ -79,17 +79,12 @@ COLMAP_ADD_LIBRARY(
@@ -740,7 +1491,7 @@ index 6eeb70e..8d8e1c2 100644
  COLMAP_ADD_EXECUTABLE(
      NAME colmap_main
 diff --git a/src/colmap/exe/colmap.cc b/src/colmap/exe/colmap.cc
-index 6179d7b..15213ef 100644
+index 6179d7ba..15213ef7 100644
 --- a/src/colmap/exe/colmap.cc
 +++ b/src/colmap/exe/colmap.cc
 @@ -27,16 +27,11 @@
@@ -859,8 +1610,304 @@ index 6179d7b..15213ef 100644
  
    if (argc == 1) {
      ShowHelp(commands);
+diff --git a/src/colmap/exe/feature.cc b/src/colmap/exe/feature.cc
+index 08f9e3fe..b1304e0f 100644
+--- a/src/colmap/exe/feature.cc
++++ b/src/colmap/exe/feature.cc
+@@ -35,14 +35,161 @@
+ #include "colmap/controllers/option_manager.h"
+ #include "colmap/exe/gui.h"
+ #include "colmap/feature/sift.h"
++#include "colmap/scene/database.h"
++#include "colmap/scene/database_sqlite.h"
+ #include "colmap/sensor/models.h"
+ #include "colmap/util/file.h"
+ #include "colmap/util/misc.h"
+ #include "colmap/util/opengl_utils.h"
+ #include "colmap/util/threading.h"
+ 
++#include <atomic>
++#include <cerrno>
++#include <cstring>
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
+ namespace colmap {
+ 
++namespace {
++
++class DatabaseFileIdentity {
++ public:
++  explicit DatabaseFileIdentity(const std::filesystem::path& path)
++      : path_(path) {
++    descriptor_ =
++        open(path.string().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++    if (descriptor_ < 0) {
++      const int error = errno;
++      LOG(ERROR) << "EasySplat matches_importer requires a regular database "
++                    "file that is not a symbolic link: "
++                 << std::strerror(error);
++      return;
++    }
++    struct stat status;
++    if (fstat(descriptor_, &status) != 0) {
++      const int error = errno;
++      LOG(ERROR) << "EasySplat matches_importer could not bind the database "
++                    "file identity: "
++                 << std::strerror(error);
++      return;
++    }
++    if (!S_ISREG(status.st_mode)) {
++      LOG(ERROR) << "EasySplat matches_importer database path is not a regular "
++                    "file.";
++      return;
++    }
++    if (status.st_nlink != 1) {
++      LOG(ERROR) << "EasySplat matches_importer requires a database file with "
++                    "exactly one hard link.";
++      return;
++    }
++    device_ = status.st_dev;
++    inode_ = status.st_ino;
++    valid_ = true;
++  }
++
++  ~DatabaseFileIdentity() {
++    if (descriptor_ >= 0) {
++      close(descriptor_);
++    }
++  }
++
++  bool IsValid() const { return valid_; }
++
++  int descriptor() const { return descriptor_; }
++
++  bool MatchesPath() const {
++    if (!valid_) {
++      return false;
++    }
++    struct stat held_status;
++    struct stat path_status;
++    if (fstat(descriptor_, &held_status) != 0 ||
++        lstat(path_.string().c_str(), &path_status) != 0 ||
++        !S_ISREG(held_status.st_mode) || !S_ISREG(path_status.st_mode) ||
++        held_status.st_nlink != 1 || path_status.st_nlink != 1 ||
++        held_status.st_dev != device_ || held_status.st_ino != inode_ ||
++        path_status.st_dev != device_ || path_status.st_ino != inode_) {
++      LOG(ERROR) << "EasySplat matches_importer database path changed while "
++                    "the job owned it.";
++      return false;
++    }
++    return true;
++  }
++
++ private:
++  const std::filesystem::path path_;
++  int descriptor_ = -1;
++  dev_t device_ = 0;
++  ino_t inode_ = 0;
++  bool valid_ = false;
++};
++
++class ImporterDatabaseTransaction {
++ public:
++  explicit ImporterDatabaseTransaction(Database& database)
++      : database_(database) {
++    database_.BeginImmediateTransaction();
++    active_ = true;
++  }
++
++  ~ImporterDatabaseTransaction() { Rollback(); }
++
++  bool Commit() {
++    if (!active_) {
++      return true;
++    }
++    try {
++      database_.EndTransaction();
++      active_ = false;
++      return true;
++    } catch (const std::exception& error) {
++      LOG(ERROR) << "EasySplat matches_importer could not commit its database "
++                    "transaction: "
++                 << error.what();
++      return false;
++    }
++  }
++
++  bool Rollback() noexcept {
++    if (!active_) {
++      return true;
++    }
++    active_ = false;
++    try {
++      database_.RollbackTransaction();
++      return true;
++    } catch (const std::exception& error) {
++      LOG(ERROR) << "EasySplat matches_importer could not roll back its "
++                    "database transaction: "
++                 << error.what();
++      return false;
++    }
++  }
++
++ private:
++  Database& database_;
++  bool active_ = false;
++};
++
++bool MatchingResultsAreEmpty(const Database& database) {
++  const size_t raw_pair_count = database.NumMatchedImagePairs();
++  const size_t verified_pair_count = database.NumVerifiedImagePairs();
++  if (raw_pair_count == 0 && verified_pair_count == 0) {
++    return true;
++  }
++  LOG(ERROR) << "EasySplat matches_importer requires both matching result "
++                "tables to be empty, but found "
++             << raw_pair_count << " matches row(s) and " << verified_pair_count
++             << " two_view_geometries row(s).";
++  return false;
++}
++
++}  // namespace
++
+ bool VerifyCameraParams(const std::string& camera_model,
+                         const std::string& params) {
+   if (!ExistsCameraModelWithName(camera_model)) {
+@@ -227,17 +374,57 @@ int RunExhaustiveMatcher(int argc, char** argv) {
+ int RunMatchesImporter(int argc, char** argv) {
+   std::filesystem::path match_list_path;
+   std::string match_type = "pairs";
++  bool require_empty_matching_results = false;
+ 
+   OptionManager options;
+   options.AddDatabaseOptions();
+   options.AddRequiredOption("match_list_path", &match_list_path);
+   options.AddDefaultOption(
+       "match_type", &match_type, "{'pairs', 'raw', 'inliers'}");
++  options.AddDefaultOption("EasySplat.require_empty_matching_results",
++                           &require_empty_matching_results);
+   options.AddFeatureMatchingOptions();
+   options.AddTwoViewGeometryOptions();
+   if (!options.Parse(argc, argv)) {
+     return EXIT_FAILURE;
+   }
++  if (match_type != "pairs" && match_type != "raw" && match_type != "inliers") {
++    LOG(ERROR) << "Invalid `match_type`";
++    return EXIT_FAILURE;
++  }
++
++  std::unique_ptr<DatabaseFileIdentity> database_identity;
++  std::shared_ptr<Database> startup_database;
++  std::unique_ptr<ImporterDatabaseTransaction> importer_transaction;
++  if (require_empty_matching_results) {
++    database_identity =
++        std::make_unique<DatabaseFileIdentity>(*options.database_path);
++    if (!database_identity->IsValid()) {
++      return EXIT_FAILURE;
++    }
++    try {
++      if (!database_identity->MatchesPath()) {
++        return EXIT_FAILURE;
++      }
++      startup_database = OpenSqliteDatabaseBoundToDescriptor(
++          *options.database_path, database_identity->descriptor());
++      if (!database_identity->MatchesPath() ||
++          !startup_database->MainFileMatchesPath(
++              database_identity->descriptor())) {
++        return EXIT_FAILURE;
++      }
++      importer_transaction =
++          std::make_unique<ImporterDatabaseTransaction>(*startup_database);
++    } catch (const std::exception& error) {
++      LOG(ERROR) << "EasySplat matches_importer could not acquire exclusive "
++                    "database ownership: "
++                 << error.what();
++      return EXIT_FAILURE;
++    }
++    if (!MatchingResultsAreEmpty(*startup_database)) {
++      return EXIT_FAILURE;
++    }
++  }
+ 
+   std::unique_ptr<QApplication> app;
+   if (options.feature_matching->RequiresOpenGL()) {
+@@ -245,33 +432,67 @@ int RunMatchesImporter(int argc, char** argv) {
+   }
+ 
+   std::unique_ptr<Thread> matcher;
++  std::shared_ptr<std::atomic<bool>> matching_completed;
++  if (require_empty_matching_results) {
++    matching_completed = std::make_shared<std::atomic<bool>>(false);
++  }
+   if (match_type == "pairs") {
+     ImportedPairingOptions pairing_options;
+     pairing_options.match_list_path = match_list_path;
++    if (require_empty_matching_results) {
++      pairing_options.fail_on_invalid_pair = true;
++    }
+     matcher = CreateImagePairsFeatureMatcher(pairing_options,
+                                              *options.feature_matching,
+                                              *options.two_view_geometry,
+-                                             *options.database_path);
++                                             *options.database_path,
++                                             startup_database,
++                                             matching_completed);
+   } else if (match_type == "raw" || match_type == "inliers") {
+     FeaturePairsMatchingOptions pairing_options;
+     pairing_options.match_list_path = match_list_path;
+     pairing_options.verify_matches = match_type == "raw";
++    pairing_options.fail_on_invalid_input = require_empty_matching_results;
+     matcher = CreateFeaturePairsFeatureMatcher(pairing_options,
+                                                *options.feature_matching,
+                                                *options.two_view_geometry,
+-                                               *options.database_path);
+-  } else {
+-    LOG(ERROR) << "Invalid `match_type`";
++                                               *options.database_path,
++                                               startup_database,
++                                               matching_completed);
++  }
++  if (matcher == nullptr) {
+     return EXIT_FAILURE;
+   }
+ 
++  bool setup_is_valid = true;
+   if (app != nullptr) {
+     RunThreadWithOpenGLContext(matcher.get());
++    if (require_empty_matching_results) {
++      setup_is_valid = matcher->CheckValidSetup();
++    }
+   } else {
+     matcher->Start();
++    if (require_empty_matching_results) {
++      setup_is_valid = matcher->CheckValidSetup();
++    }
+     matcher->Wait();
+   }
+ 
++  if (require_empty_matching_results &&
++      (!setup_is_valid || !matching_completed->load())) {
++    if (setup_is_valid) {
++      LOG(ERROR) << "EasySplat matches_importer did not complete cleanly.";
++    }
++    return EXIT_FAILURE;
++  }
++  if (require_empty_matching_results) {
++    if (!database_identity->MatchesPath() ||
++        !startup_database->MainFileMatchesPath(
++            database_identity->descriptor()) ||
++        !importer_transaction->Commit()) {
++      return EXIT_FAILURE;
++    }
++  }
+   return EXIT_SUCCESS;
+ }
+ 
 diff --git a/src/colmap/exe/image.cc b/src/colmap/exe/image.cc
-index 22bc4da..60779d5 100644
+index 22bc4da7..60779d55 100644
 --- a/src/colmap/exe/image.cc
 +++ b/src/colmap/exe/image.cc
 @@ -340,8 +340,7 @@ int RunImageUndistorter(int argc, char** argv) {
@@ -940,7 +1987,7 @@ index 22bc4da..60779d5 100644
    return EXIT_SUCCESS;
  }
 diff --git a/src/colmap/exe/sfm.cc b/src/colmap/exe/sfm.cc
-index 7dc8274..0c55b31 100644
+index 67e460cc..acc61b26 100644
 --- a/src/colmap/exe/sfm.cc
 +++ b/src/colmap/exe/sfm.cc
 @@ -29,12 +29,8 @@
@@ -1222,7 +2269,7 @@ index 7dc8274..0c55b31 100644
    ViewGraphCalibrationOptions calibration_options;
  
 diff --git a/src/colmap/exe/sfm.h b/src/colmap/exe/sfm.h
-index 7740241..99250a6 100644
+index 77402411..99250a62 100644
 --- a/src/colmap/exe/sfm.h
 +++ b/src/colmap/exe/sfm.h
 @@ -29,7 +29,6 @@
@@ -1258,7 +2305,7 @@ index 7740241..99250a6 100644
  
  }  // namespace colmap
 diff --git a/src/colmap/feature/CMakeLists.txt b/src/colmap/feature/CMakeLists.txt
-index 56b4445..648dc4a 100644
+index 56b44452..648dc4a1 100644
 --- a/src/colmap/feature/CMakeLists.txt
 +++ b/src/colmap/feature/CMakeLists.txt
 @@ -48,12 +48,9 @@ COLMAP_ADD_TEST(
@@ -1302,7 +2349,7 @@ index 56b4445..648dc4a 100644
      NAME extractor_test
      SRCS extractor_test.cc
 diff --git a/src/colmap/feature/extractor.cc b/src/colmap/feature/extractor.cc
-index f6326c3..d9b350e 100644
+index f6326c3e..d9b350e7 100644
 --- a/src/colmap/feature/extractor.cc
 +++ b/src/colmap/feature/extractor.cc
 @@ -29,7 +29,6 @@
@@ -1395,7 +2442,7 @@ index f6326c3..d9b350e 100644
        ThrowUnknownFeatureExtractorType(options.type);
    }
 diff --git a/src/colmap/feature/extractor.h b/src/colmap/feature/extractor.h
-index dc1a503..a958ecd 100644
+index dc1a5032..a958ecd4 100644
 --- a/src/colmap/feature/extractor.h
 +++ b/src/colmap/feature/extractor.h
 @@ -38,13 +38,11 @@
@@ -1413,7 +2460,7 @@ index dc1a503..a958ecd 100644
    FeatureExtractionTypeOptions(const FeatureExtractionTypeOptions& other);
    FeatureExtractionTypeOptions& operator=(
 diff --git a/src/colmap/feature/matcher.cc b/src/colmap/feature/matcher.cc
-index 6b6d63b..d5e0c72 100644
+index 6b6d63b9..d5e0c72d 100644
 --- a/src/colmap/feature/matcher.cc
 +++ b/src/colmap/feature/matcher.cc
 @@ -29,8 +29,6 @@
@@ -1492,7 +2539,7 @@ index 6b6d63b..d5e0c72 100644
        ThrowUnknownFeatureMatcherType(options.type);
    }
 diff --git a/src/colmap/feature/matcher.h b/src/colmap/feature/matcher.h
-index 2e22a37..42e51be 100644
+index 2e22a37e..42e51bea 100644
 --- a/src/colmap/feature/matcher.h
 +++ b/src/colmap/feature/matcher.h
 @@ -41,13 +41,11 @@
@@ -1510,7 +2557,7 @@ index 2e22a37..42e51be 100644
    FeatureMatchingTypeOptions(const FeatureMatchingTypeOptions& other);
    FeatureMatchingTypeOptions& operator=(
 diff --git a/src/colmap/feature/sift.cc b/src/colmap/feature/sift.cc
-index 4554cb8..aec74ea 100644
+index 4554cb89..aec74ea3 100644
 --- a/src/colmap/feature/sift.cc
 +++ b/src/colmap/feature/sift.cc
 @@ -84,7 +84,6 @@ bool SiftExtractionOptions::Check() const {
@@ -1533,7 +2580,7 @@ index 4554cb8..aec74ea 100644
  #ifdef COLMAP_GPU_ENABLED
        LOG(INFO) << "Creating SIFT GPU feature matcher";
 diff --git a/src/colmap/feature/sift.h b/src/colmap/feature/sift.h
-index c39d5c5..a2a170f 100644
+index c39d5c59..a2a170f3 100644
 --- a/src/colmap/feature/sift.h
 +++ b/src/colmap/feature/sift.h
 @@ -32,8 +32,6 @@
@@ -1561,7 +2608,7 @@ index c39d5c5..a2a170f 100644
  };
  
 diff --git a/src/colmap/feature/types.cc b/src/colmap/feature/types.cc
-index a2938a1..9297fe0 100644
+index a2938a1d..9297fe04 100644
 --- a/src/colmap/feature/types.cc
 +++ b/src/colmap/feature/types.cc
 @@ -158,24 +158,12 @@ FeatureDescriptors FeatureDescriptors::FromFloat(
@@ -1614,7 +2661,7 @@ index a2938a1..9297fe0 100644
        LOG(FATAL_THROW) << "Unsupported feature type: "
                         << FeatureExtractorTypeToString(byte_desc.type);
 diff --git a/src/colmap/feature/types.h b/src/colmap/feature/types.h
-index ae3800b..5adfb1e 100644
+index ae3800bf..5adfb1e2 100644
 --- a/src/colmap/feature/types.h
 +++ b/src/colmap/feature/types.h
 @@ -39,15 +39,11 @@
@@ -1636,7 +2683,7 @@ index ae3800b..5adfb1e 100644
  struct FeatureKeypoint {
    FeatureKeypoint();
 diff --git a/src/colmap/math/CMakeLists.txt b/src/colmap/math/CMakeLists.txt
-index 4f026ed..6f007e0 100644
+index 4f026ede..6f007e00 100644
 --- a/src/colmap/math/CMakeLists.txt
 +++ b/src/colmap/math/CMakeLists.txt
 @@ -34,7 +34,6 @@ COLMAP_ADD_LIBRARY(
@@ -1668,7 +2715,7 @@ index 4f026ed..6f007e0 100644
      NAME math_test
      SRCS math_test.cc
 diff --git a/src/colmap/optim/CMakeLists.txt b/src/colmap/optim/CMakeLists.txt
-index 0c4a156..73a6cde 100644
+index 0c4a1561..73a6cde5 100644
 --- a/src/colmap/optim/CMakeLists.txt
 +++ b/src/colmap/optim/CMakeLists.txt
 @@ -34,17 +34,14 @@ COLMAP_ADD_LIBRARY(
@@ -1714,7 +2761,7 @@ index 0c4a156..73a6cde 100644
      NAME sprt_test
      SRCS sprt_test.cc
 diff --git a/src/colmap/retrieval/resources.cc b/src/colmap/retrieval/resources.cc
-index 85227fb..efcb169 100644
+index 85227fb7..efcb1692 100644
 --- a/src/colmap/retrieval/resources.cc
 +++ b/src/colmap/retrieval/resources.cc
 @@ -38,10 +38,6 @@ const std::filesystem::path& GetVocabTreeUriForFeatureType(
@@ -1729,7 +2776,7 @@ index 85227fb..efcb169 100644
        LOG(FATAL_THROW)
            << "No default vocabulary tree available for feature type: "
 diff --git a/src/colmap/retrieval/resources.h b/src/colmap/retrieval/resources.h
-index 10b2934..1eabbee 100644
+index 10b29342..1eabbeee 100644
 --- a/src/colmap/retrieval/resources.h
 +++ b/src/colmap/retrieval/resources.h
 @@ -41,20 +41,8 @@ inline const std::filesystem::path kDefaultSiftVocabTreeUri =
@@ -1753,8 +2800,146 @@ index 10b2934..1eabbee 100644
  #endif
  
  const std::filesystem::path& GetVocabTreeUriForFeatureType(
+diff --git a/src/colmap/retrieval/visual_index.cc b/src/colmap/retrieval/visual_index.cc
+index caf5c629..06a8da9e 100644
+--- a/src/colmap/retrieval/visual_index.cc
++++ b/src/colmap/retrieval/visual_index.cc
+@@ -36,6 +36,7 @@
+ #include "colmap/util/logging.h"
+ #include "colmap/util/threading.h"
+ 
++#include <algorithm>
+ #include <fstream>
+ 
+ #include <Eigen/Core>
+@@ -187,6 +188,9 @@ class FaissVisualIndex : public VisualIndex {
+     }
+ 
+     THROW_CHECK_EQ(descriptors.data.rows(), keypoints.size());
++    if (image_scores->empty()) {
++      return;
++    }
+ 
+     // Extract top-ranked images to verify.
+     std::unordered_set<int> image_ids;
+@@ -303,13 +307,19 @@ class FaissVisualIndex : public VisualIndex {
+       std::unordered_map<int, typename FibonacciHeapType::handle_type>
+           db_heap_handles;
+ 
++      const auto BetterMatch = [](const auto& lhs, const auto& rhs) {
++        if (lhs.first != rhs.first) {
++          return lhs.first > rhs.first;
++        }
++        if (lhs.second.first->feature_idx != rhs.second.first->feature_idx) {
++          return lhs.second.first->feature_idx < rhs.second.first->feature_idx;
++        }
++        return lhs.second.second->feature_idx < rhs.second.second->feature_idx;
++      };
++
+       for (auto& match_data : query_matches) {
+         std::sort(
+-            match_data.second.begin(),
+-            match_data.second.end(),
+-            std::greater<
+-                std::pair<float,
+-                          std::pair<const EntryType*, const EntryType*>>>());
++            match_data.second.begin(), match_data.second.end(), BetterMatch);
+ 
+         query_heap_handles[match_data.first] = query_heap.push(std::make_pair(
+             -static_cast<int>(match_data.second.size()), match_data.first));
+@@ -317,11 +327,7 @@ class FaissVisualIndex : public VisualIndex {
+ 
+       for (auto& match_data : db_matches) {
+         std::sort(
+-            match_data.second.begin(),
+-            match_data.second.end(),
+-            std::greater<
+-                std::pair<float,
+-                          std::pair<const EntryType*, const EntryType*>>>());
++            match_data.second.begin(), match_data.second.end(), BetterMatch);
+ 
+         db_heap_handles[match_data.first] = db_heap.push(std::make_pair(
+             -static_cast<int>(match_data.second.size()), match_data.first));
+@@ -412,7 +418,10 @@ class FaissVisualIndex : public VisualIndex {
+         image_scores->size(), options.num_images_after_verification);
+ 
+     auto SortFunc = [](const ImageScore& score1, const ImageScore& score2) {
+-      return score1.score > score2.score;
++      if (score1.score != score2.score) {
++        return score1.score > score2.score;
++      }
++      return score1.image_id < score2.image_id;
+     };
+ 
+     // NOLINTNEXTLINE(bugprone-branch-clone)
+@@ -580,8 +589,19 @@ class FaissVisualIndex : public VisualIndex {
+                             options.num_threads);
+     inverted_index_.Query(descriptors, *word_ids, image_scores);
+ 
++    image_scores->erase(
++        std::remove_if(image_scores->begin(),
++                       image_scores->end(),
++                       [&options](const ImageScore& image_score) {
++                         return options.IsImageExcluded(image_score.image_id);
++                       }),
++        image_scores->end());
++
+     auto SortFunc = [](const ImageScore& score1, const ImageScore& score2) {
+-      return score1.score > score2.score;
++      if (score1.score != score2.score) {
++        return score1.score > score2.score;
++      }
++      return score1.image_id < score2.image_id;
+     };
+ 
+     const size_t num_images =
+diff --git a/src/colmap/retrieval/visual_index.h b/src/colmap/retrieval/visual_index.h
+index 7539d6cc..68a1d422 100644
+--- a/src/colmap/retrieval/visual_index.h
++++ b/src/colmap/retrieval/visual_index.h
+@@ -35,6 +35,8 @@
+ 
+ #include <filesystem>
+ #include <memory>
++#include <unordered_set>
++#include <vector>
+ 
+ #include <Eigen/Core>
+ 
+@@ -67,6 +69,31 @@ class VisualIndex {
+     // The maximum number of most similar images to retrieve.
+     int max_num_images = -1;
+ 
++    // Image identifiers omitted before ranking is truncated or spatially
++    // verified.
++    std::unordered_set<int> excluded_image_ids;
++
++    // Optional dense image-id-to-group table borrowed for the query lifetime.
++    // Group -1 disables group filtering.
++    const std::vector<int>* image_group_by_id = nullptr;
++    int excluded_image_group = -1;
++
++    // Optional half-open dense image identifier range to omit.
++    int excluded_image_id_begin = 0;
++    int excluded_image_id_end = 0;
++
++    bool IsImageExcluded(int image_id) const {
++      if (excluded_image_ids.count(image_id) > 0 ||
++          (image_id >= excluded_image_id_begin &&
++           image_id < excluded_image_id_end)) {
++        return true;
++      }
++      return image_group_by_id != nullptr && excluded_image_group >= 0 &&
++             image_id >= 0 &&
++             static_cast<size_t>(image_id) < image_group_by_id->size() &&
++             (*image_group_by_id)[image_id] == excluded_image_group;
++    }
++
+     // The number of nearest neighbor visual words that each feature descriptor
+     // is assigned to.
+     int num_neighbors = 5;
 diff --git a/src/colmap/scene/CMakeLists.txt b/src/colmap/scene/CMakeLists.txt
-index 1f6d1d0..9cfaa7c 100644
+index 1f6d1d0b..9cfaa7ce 100644
 --- a/src/colmap/scene/CMakeLists.txt
 +++ b/src/colmap/scene/CMakeLists.txt
 @@ -65,7 +65,6 @@ COLMAP_ADD_LIBRARY(
@@ -1777,8 +2962,194 @@ index 1f6d1d0..9cfaa7c 100644
  COLMAP_ADD_TEST(
      NAME synthetic_test
      SRCS synthetic_test.cc
+diff --git a/src/colmap/scene/database.cc b/src/colmap/scene/database.cc
+index 1c50838d..26bcd6c2 100644
+--- a/src/colmap/scene/database.cc
++++ b/src/colmap/scene/database.cc
+@@ -33,6 +33,7 @@
+ #include "colmap/scene/database_sqlite.h"
+ 
+ #include <numeric>
++#include <stdexcept>
+ 
+ namespace colmap {
+ 
+@@ -44,6 +45,18 @@ void Database::Register(Factory factory) {
+ 
+ Database::~Database() = default;
+ 
++bool Database::MainFileMatchesPath(int) const { return false; }
++
++void Database::BeginImmediateTransaction() const {
++  throw std::runtime_error(
++      "The database implementation does not support immediate transactions.");
++}
++
++void Database::RollbackTransaction() const {
++  throw std::runtime_error(
++      "The database implementation does not support transaction rollback.");
++}
++
+ std::shared_ptr<Database> Database::Open(const std::filesystem::path& path) {
+   for (auto it = factories_.rbegin(); it != factories_.rend(); ++it) {
+     try {
+diff --git a/src/colmap/scene/database.h b/src/colmap/scene/database.h
+index 0da400bc..f257cb38 100644
+--- a/src/colmap/scene/database.h
++++ b/src/colmap/scene/database.h
+@@ -84,6 +84,10 @@ class Database {
+   // Explicitly close the database before destruction.
+   virtual void Close() = 0;
+ 
++  // Verify that the active main database handle still names the same regular
++  // file as a caller-held descriptor. Non-SQLite implementations fail closed.
++  virtual bool MainFileMatchesPath(int descriptor) const;
++
+   // Check if entry already exists in database. For image pairs, the order of
+   // `image_id1` and `image_id2` does not matter.
+   virtual bool ExistsRig(rig_t rig_id) const = 0;
+@@ -320,7 +324,9 @@ class Database {
+   // queries results in faster transaction time due to reduced locking of the
+   // database, etc.
+   virtual void BeginTransaction() const = 0;
++  virtual void BeginImmediateTransaction() const;
+   virtual void EndTransaction() const = 0;
++  virtual void RollbackTransaction() const;
+ 
+  private:
+   friend class DatabaseTransaction;
+diff --git a/src/colmap/scene/database_sqlite.cc b/src/colmap/scene/database_sqlite.cc
+index 4d369234..e10f8112 100644
+--- a/src/colmap/scene/database_sqlite.cc
++++ b/src/colmap/scene/database_sqlite.cc
+@@ -33,6 +33,8 @@
+ #include "colmap/util/version.h"
+ 
+ #include <sqlite3.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ namespace colmap {
+ namespace {
+@@ -492,6 +494,11 @@ class SqliteDatabase : public Database {
+   // for compatibility with SQLite. On POSIX platforms, the path is assumed to
+   // be UTF-8.
+   static std::shared_ptr<Database> Open(const std::filesystem::path& path) {
++    return Open(path, /*bound_descriptor=*/-1);
++  }
++
++  static std::shared_ptr<Database> Open(const std::filesystem::path& path,
++                                        int bound_descriptor) {
+     auto database = std::make_shared<SqliteDatabase>(path);
+ 
+     // SQLITE_OPEN_NOMUTEX specifies that the connection should not have a
+@@ -499,13 +506,22 @@ class SqliteDatabase : public Database {
+     // Modifications to the database will still be serialized, but multiple
+     // connections can read concurrently.
+     try {
+-      SQLITE3_CALL(sqlite3_open_v2(
+-          PlatformToUTF8(path.string()).c_str(),
+-          &database->database_,
+-          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX,
+-          nullptr));
++      int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX;
++      if (bound_descriptor < 0) {
++        flags |= SQLITE_OPEN_CREATE;
++      }
++      SQLITE3_CALL(sqlite3_open_v2(PlatformToUTF8(path.string()).c_str(),
++                                   &database->database_,
++                                   flags,
++                                   nullptr));
++      if (bound_descriptor >= 0 &&
++          !database->MainFileMatchesPath(bound_descriptor)) {
++        throw std::runtime_error(
++            "SQLite main file does not match the bound database descriptor.");
++      }
+     } catch (...) {
+       SQLITE3_CALL(sqlite3_close_v2(database->database_));
++      database->database_ = nullptr;
+       throw;
+     }
+ 
+@@ -532,6 +548,33 @@ class SqliteDatabase : public Database {
+     return database;
+   }
+ 
++  bool MainFileMatchesPath(int descriptor) const override {
++    if (database_ == nullptr || descriptor < 0) {
++      return false;
++    }
++    struct stat held_status;
++    if (fstat(descriptor, &held_status) != 0 || !S_ISREG(held_status.st_mode) ||
++        held_status.st_nlink != 1) {
++      return false;
++    }
++    const char* sqlite_path = sqlite3_db_filename(database_, "main");
++    if (sqlite_path == nullptr || sqlite_path[0] == '\0') {
++      return false;
++    }
++    struct stat sqlite_status;
++    if (stat(sqlite_path, &sqlite_status) != 0 ||
++        !S_ISREG(sqlite_status.st_mode) || sqlite_status.st_nlink != 1 ||
++        sqlite_status.st_dev != held_status.st_dev ||
++        sqlite_status.st_ino != held_status.st_ino) {
++      return false;
++    }
++    int moved = 1;
++    return sqlite3_file_control(
++               database_, "main", SQLITE_FCNTL_HAS_MOVED, &moved) ==
++               SQLITE_OK &&
++           moved == 0;
++  }
++
+   void CloseImpl() {
+     if (database_ != nullptr) {
+       FinalizeSQLStatements();
+@@ -1643,10 +1686,20 @@ class SqliteDatabase : public Database {
+     SQLITE3_EXEC(THROW_CHECK_NOTNULL(database_), "BEGIN TRANSACTION", nullptr);
+   }
+ 
++  void BeginImmediateTransaction() const override {
++    SQLITE3_EXEC(
++        THROW_CHECK_NOTNULL(database_), "BEGIN IMMEDIATE TRANSACTION", nullptr);
++  }
++
+   void EndTransaction() const override {
+     SQLITE3_EXEC(THROW_CHECK_NOTNULL(database_), "END TRANSACTION", nullptr);
+   }
+ 
++  void RollbackTransaction() const override {
++    SQLITE3_EXEC(
++        THROW_CHECK_NOTNULL(database_), "ROLLBACK TRANSACTION", nullptr);
++  }
++
+   void PrepareSQLStatements() {
+     sql_stmts_.clear();
+ 
+@@ -2516,4 +2569,9 @@ std::shared_ptr<Database> OpenSqliteDatabase(
+   return SqliteDatabase::Open(path);
+ }
+ 
++std::shared_ptr<Database> OpenSqliteDatabaseBoundToDescriptor(
++    const std::filesystem::path& path, int descriptor) {
++  return SqliteDatabase::Open(path, descriptor);
++}
++
+ }  // namespace colmap
+diff --git a/src/colmap/scene/database_sqlite.h b/src/colmap/scene/database_sqlite.h
+index b17053c9..298b5593 100644
+--- a/src/colmap/scene/database_sqlite.h
++++ b/src/colmap/scene/database_sqlite.h
+@@ -42,4 +42,7 @@ constexpr inline char kInMemorySqliteDatabasePath[] = ":memory:";
+ 
+ std::shared_ptr<Database> OpenSqliteDatabase(const std::filesystem::path& path);
+ 
++std::shared_ptr<Database> OpenSqliteDatabaseBoundToDescriptor(
++    const std::filesystem::path& path, int descriptor);
++
+ }  // namespace colmap
 diff --git a/src/colmap/sfm/CMakeLists.txt b/src/colmap/sfm/CMakeLists.txt
-index b1a9ada..bae81c8 100644
+index b1a9adaf..bae81c86 100644
 --- a/src/colmap/sfm/CMakeLists.txt
 +++ b/src/colmap/sfm/CMakeLists.txt
 @@ -33,7 +33,6 @@ set(FOLDER_NAME "sfm")
@@ -1801,8 +3172,285 @@ index b1a9ada..bae81c8 100644
  COLMAP_ADD_TEST(
      NAME incremental_triangulator_test
      SRCS incremental_triangulator_test.cc
+diff --git a/src/colmap/sfm/incremental_mapper_impl.cc b/src/colmap/sfm/incremental_mapper_impl.cc
+index 62b54c32..d3aa68ec 100644
+--- a/src/colmap/sfm/incremental_mapper_impl.cc
++++ b/src/colmap/sfm/incremental_mapper_impl.cc
+@@ -54,7 +54,10 @@ inline bool CompareImageInfo(const InitImageInfo& a, const InitImageInfo& b) {
+   if (a.prior_focal_length != b.prior_focal_length) {
+     return a.prior_focal_length > b.prior_focal_length;
+   }
+-  return a.num_correspondences > b.num_correspondences;
++  if (a.num_correspondences != b.num_correspondences) {
++    return a.num_correspondences > b.num_correspondences;
++  }
++  return a.image_id < b.image_id;
+ }
+ 
+ std::vector<image_t> ExtractSortedImageIds(
+@@ -73,7 +76,10 @@ void SortAndAppendNextImages(std::vector<std::pair<image_t, float>> image_ranks,
+             image_ranks.end(),
+             [](const std::pair<image_t, float>& image1,
+                const std::pair<image_t, float>& image2) {
+-              return image1.second > image2.second;
++              if (image1.second != image2.second) {
++                return image1.second > image2.second;
++              }
++              return image1.first < image2.first;
+             });
+ 
+   sorted_images_ids->reserve(sorted_images_ids->size() + image_ranks.size());
+@@ -82,6 +88,17 @@ void SortAndAppendNextImages(std::vector<std::pair<image_t, float>> image_ranks,
+   }
+ }
+ 
++void CompareExchangeBestSuccessTask(std::atomic<size_t>& best_success_task,
++                                    const size_t candidate_task) {
++  size_t observed = best_success_task.load(std::memory_order_relaxed);
++  while (candidate_task < observed &&
++         !best_success_task.compare_exchange_weak(observed,
++                                                  candidate_task,
++                                                  std::memory_order_relaxed,
++                                                  std::memory_order_relaxed)) {
++  }
++}
++
+ float RankNextImageMaxVisiblePointsNum(
+     const image_t image_id, const class ObservationManager& obs_manager) {
+   return static_cast<float>(obs_manager.NumVisiblePoints3D(image_id));
+@@ -228,22 +245,30 @@ bool IncrementalMapperImpl::FindInitialImagePair(
+     image_t image_id1 = kInvalidImageId;
+     image_t image_id2 = kInvalidImageId;
+     Rigid3d cam2_from_cam1;
++    std::vector<image_pair_t> attempted_pair_ids;
+   };
+ 
+   ThreadPool thread_pool(options.num_threads);
+   std::vector<std::shared_future<InitInfo>> init_infos;
+   init_infos.reserve(image_ids1.size());
+ 
+-  std::mutex init_image_pairs_mutex;
+-  std::atomic_bool stop = false;
++  std::unordered_map<image_t, size_t> task_index_by_image_id;
++  task_index_by_image_id.reserve(image_ids1.size());
++  for (size_t task_index = 0; task_index < image_ids1.size(); ++task_index) {
++    task_index_by_image_id.emplace(image_ids1[task_index], task_index);
++  }
++  const std::unordered_set<image_pair_t> existing_init_image_pairs =
++      init_image_pairs;
++  std::atomic<size_t> best_success_task(image_ids1.size());
+ 
+   // Try to find good initial pair.
+-  for (const image_t image_id1 : image_ids1) {
+-    init_infos.push_back(thread_pool.AddTask([&, image_id1]() -> InitInfo {
+-      if (stop.load()) {
++  for (size_t task_index = 0; task_index < image_ids1.size(); ++task_index) {
++    init_infos.push_back(thread_pool.AddTask([&, task_index]() -> InitInfo {
++      if (task_index > best_success_task.load(std::memory_order_relaxed)) {
+         return {};
+       }
+ 
++      const image_t image_id1 = image_ids1[task_index];
+       const std::vector<image_t> image_ids2 =
+           IncrementalMapperImpl::FindSecondInitialImage(options,
+                                                         image_id1,
+@@ -251,23 +276,25 @@ bool IncrementalMapperImpl::FindInitialImagePair(
+                                                         reconstruction,
+                                                         num_registrations);
+ 
++      InitInfo init_info;
++      init_info.image_id1 = image_id1;
++      init_info.attempted_pair_ids.reserve(image_ids2.size());
+       for (const image_t image_id2 : image_ids2) {
+-        if (stop.load()) {
+-          return {};
++        if (task_index > best_success_task.load(std::memory_order_relaxed)) {
++          return init_info;
+         }
+ 
+         const image_pair_t pair_id = ImagePairToPairId(image_id1, image_id2);
+-
+-        // Try every pair only once.
+-        {
+-          std::lock_guard<std::mutex> lock_guard(init_image_pairs_mutex);
+-          if (!init_image_pairs.emplace(pair_id).second) {
+-            continue;
+-          }
++        if (existing_init_image_pairs.count(pair_id) > 0) {
++          continue;
++        }
++        const auto owner = task_index_by_image_id.find(image_id2);
++        if (owner != task_index_by_image_id.end() &&
++            owner->second < task_index) {
++          continue;
+         }
+ 
+-        InitInfo init_info;
+-        init_info.image_id1 = image_id1;
++        init_info.attempted_pair_ids.push_back(pair_id);
+         init_info.image_id2 = image_id2;
+         if (IncrementalMapperImpl::EstimateInitialTwoViewGeometry(
+                 options,
+@@ -275,13 +302,13 @@ bool IncrementalMapperImpl::FindInitialImagePair(
+                 init_info.image_id1,
+                 init_info.image_id2,
+                 init_info.cam2_from_cam1)) {
+-          stop.store(true);
+           init_info.success = true;
++          CompareExchangeBestSuccessTask(best_success_task, task_index);
+           return init_info;
+         }
+       }
+ 
+-      return {};
++      return init_info;
+     }));
+   }
+ 
+@@ -290,6 +317,8 @@ bool IncrementalMapperImpl::FindInitialImagePair(
+   // as the single-threaded version.
+   for (auto& init_info_future : init_infos) {
+     const InitInfo init_info = init_info_future.get();
++    init_image_pairs.insert(init_info.attempted_pair_ids.begin(),
++                            init_info.attempted_pair_ids.end());
+     if (init_info.success) {
+       image_id1 = init_info.image_id1;
+       image_id2 = init_info.image_id2;
+@@ -415,7 +444,10 @@ std::vector<image_t> IncrementalMapperImpl::FindLocalBundle(
+             overlapping_images.end(),
+             [](const std::pair<image_t, size_t>& image1,
+                const std::pair<image_t, size_t>& image2) {
+-              return image1.second > image2.second;
++              if (image1.second != image2.second) {
++                return image1.second > image2.second;
++              }
++              return image1.first < image2.first;
+             });
+ 
+   // The local bundle is composed of the given image and its most connected
+diff --git a/src/colmap/sfm/incremental_mapper_test.cc b/src/colmap/sfm/incremental_mapper_test.cc
+index b0bf1459..66fbf358 100644
+--- a/src/colmap/sfm/incremental_mapper_test.cc
++++ b/src/colmap/sfm/incremental_mapper_test.cc
+@@ -28,6 +28,7 @@
+ // POSSIBILITY OF SUCH DAMAGE.
+ 
+ #include "colmap/sfm/incremental_mapper.h"
++#include "colmap/sfm/incremental_mapper_impl.h"
+ 
+ #include "colmap/scene/database_cache.h"
+ #include "colmap/scene/database_sqlite.h"
+@@ -370,6 +371,108 @@ TEST_F(IncrementalMapperTest, ResetInitializationStats) {
+   EXPECT_NE(image_id4, kInvalidImageId);
+ }
+ 
++TEST_F(IncrementalMapperTest,
++       FindInitialImagePairDeterministicAcrossThreadCounts) {
++  struct SearchResult {
++    bool success = false;
++    image_t image_id1 = kInvalidImageId;
++    image_t image_id2 = kInvalidImageId;
++    Rigid3d cam2_from_cam1;
++    std::unordered_set<image_pair_t> attempted_pairs;
++  };
++
++  const std::unordered_map<image_t, size_t> no_initialization_trials;
++  const std::unordered_map<image_t, size_t> no_registrations;
++  const auto search = [&](const int num_threads,
++                          std::unordered_set<image_pair_t> attempted_pairs) {
++    IncrementalMapper::Options options = options_;
++    options.num_threads = num_threads;
++    SearchResult result;
++    result.attempted_pairs = std::move(attempted_pairs);
++    result.success = IncrementalMapperImpl::FindInitialImagePair(
++        options,
++        *cache_,
++        *reconstruction_,
++        no_initialization_trials,
++        no_registrations,
++        result.attempted_pairs,
++        result.image_id1,
++        result.image_id2,
++        result.cam2_from_cam1);
++    return result;
++  };
++
++  const CorrespondenceGraph& correspondence_graph =
++      *cache_->CorrespondenceGraph();
++  const std::vector<image_t> ranked_image_ids =
++      IncrementalMapperImpl::FindFirstInitialImage(options_,
++                                                   correspondence_graph,
++                                                   *reconstruction_,
++                                                   no_initialization_trials,
++                                                   no_registrations);
++  ASSERT_GE(ranked_image_ids.size(), 3);
++
++  // Treat every candidate owned by the highest-ranked image as a previously
++  // failed attempt. The next search must therefore reach a later-ranked task.
++  std::unordered_set<image_pair_t> failed_prefix;
++  for (const image_t image_id2 :
++       IncrementalMapperImpl::FindSecondInitialImage(options_,
++                                                     ranked_image_ids.front(),
++                                                     correspondence_graph,
++                                                     *reconstruction_,
++                                                     no_registrations)) {
++    failed_prefix.insert(
++        ImagePairToPairId(ranked_image_ids.front(), image_id2));
++  }
++  ASSERT_FALSE(failed_prefix.empty());
++
++  const SearchResult expected = search(/*num_threads=*/1, failed_prefix);
++  ASSERT_TRUE(expected.success);
++  EXPECT_NE(expected.image_id1, ranked_image_ids.front());
++  EXPECT_GT(expected.attempted_pairs.size(), failed_prefix.size());
++
++  for (const int num_threads : {1, 2, 4, -1}) {
++    for (size_t iteration = 0; iteration < 10; ++iteration) {
++      SCOPED_TRACE(::testing::Message()
++                   << "num_threads=" << num_threads
++                   << ", iteration=" << iteration);
++      const SearchResult actual = search(num_threads, failed_prefix);
++      ASSERT_TRUE(actual.success);
++      EXPECT_EQ(actual.image_id1, expected.image_id1);
++      EXPECT_EQ(actual.image_id2, expected.image_id2);
++      EXPECT_TRUE(actual.cam2_from_cam1.rotation().coeffs().isApprox(
++          expected.cam2_from_cam1.rotation().coeffs(), 1e-15));
++      EXPECT_TRUE(actual.cam2_from_cam1.translation().isApprox(
++          expected.cam2_from_cam1.translation(), 1e-15));
++      EXPECT_EQ(actual.attempted_pairs, expected.attempted_pairs);
++    }
++  }
++
++  // Pre-attempting every eligible pair must fail without mutating the set,
++  // independent of worker count.
++  std::unordered_set<image_pair_t> all_candidate_pairs;
++  for (const image_t image_id1 : ranked_image_ids) {
++    for (const image_t image_id2 :
++         IncrementalMapperImpl::FindSecondInitialImage(options_,
++                                                       image_id1,
++                                                       correspondence_graph,
++                                                       *reconstruction_,
++                                                       no_registrations)) {
++      all_candidate_pairs.insert(ImagePairToPairId(image_id1, image_id2));
++    }
++  }
++  ASSERT_FALSE(all_candidate_pairs.empty());
++
++  for (const int num_threads : {1, 2, 4, -1}) {
++    SCOPED_TRACE(::testing::Message() << "num_threads=" << num_threads);
++    const SearchResult exhausted = search(num_threads, all_candidate_pairs);
++    EXPECT_FALSE(exhausted.success);
++    EXPECT_EQ(exhausted.image_id1, kInvalidImageId);
++    EXPECT_EQ(exhausted.image_id2, kInvalidImageId);
++    EXPECT_EQ(exhausted.attempted_pairs, all_candidate_pairs);
++  }
++}
++
+ // Frame filtering is disabled before the 20-frame mapper threshold.
+ TEST_F(IncrementalMapperTest, FilterFramesNoOpBelowMinFrames) {
+   BeginWithSynthesizedReconstruction();
 diff --git a/src/thirdparty/CMakeLists.txt b/src/thirdparty/CMakeLists.txt
-index 12fa2d6..3b75697 100644
+index 48eb5297..e4cb94fd 100644
 --- a/src/thirdparty/CMakeLists.txt
 +++ b/src/thirdparty/CMakeLists.txt
 @@ -24,7 +24,9 @@ set(CLANG_TIDY_EXE "")

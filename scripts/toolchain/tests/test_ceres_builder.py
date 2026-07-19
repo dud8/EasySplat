@@ -6,7 +6,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import fcntl
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -21,6 +23,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[3]
 BUILDER = ROOT / "scripts/toolchain/build_ceres.sh"
 IMPLEMENTATION = ROOT / "scripts/toolchain/build_ceres_impl.sh"
+CONTROL_FREEZER = ROOT / "scripts/toolchain/freeze_build_controls.py"
 LOCK = ROOT / "scripts/toolchain/ceres-lock.json"
 EXTRACTOR = ROOT / "scripts/toolchain/safe_extract_source.py"
 PROMOTER = ROOT / "scripts/toolchain/atomic_swap_install.py"
@@ -40,6 +43,10 @@ EXPECTED = {
         "license": "MPL-2.0",
     },
 }
+CONTROL_FREEZER_BEGIN = "# EASYSPLAT_CONTROL_FREEZER_BEGIN"
+CONTROL_FREEZER_END = "# EASYSPLAT_CONTROL_FREEZER_END"
+FREEZER_BOOTSTRAP_BEGIN = "# EASYSPLAT_FREEZER_BOOTSTRAP_BEGIN"
+FREEZER_BOOTSTRAP_END = "# EASYSPLAT_FREEZER_BOOTSTRAP_END"
 
 
 def load_module(name: str, path: Path):
@@ -81,6 +88,358 @@ def tree_digest(root: Path, *, exclude_receipt: bool = True) -> str:
             digest.update(value.encode())
             digest.update(b"\0")
     return digest.hexdigest()
+
+
+def extract_shell_function(source: str, name: str) -> str:
+    marker = f"{name}() {{"
+    start = source.index(marker)
+    following = re.search(
+        r"^[A-Za-z_][A-Za-z0-9_]*\(\) \{",
+        source[start + len(marker) :],
+        re.MULTILINE,
+    )
+    end = len(source) if following is None else start + len(marker) + following.start()
+    return source[start:end].rstrip()
+
+
+def run_build_lock_acquisition(
+    work: Path,
+    *,
+    lockf: Path = Path("/usr/bin/lockf"),
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    source = IMPLEMENTATION.read_text(encoding="utf-8")
+    functions = []
+    if "validate_build_lock() {" in source:
+        functions.append(extract_shell_function(source, "validate_build_lock"))
+    functions.append(extract_shell_function(source, "acquire_build_lock"))
+    harness = work.parent / "lock-harness.sh"
+    harness.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        'WORK="$1"\n'
+        'BUILD_LOCK="$WORK/.build.lock"\n'
+        'LOCKF_BIN="$2"\n'
+        'PYTHON_BIN=""\n'
+        "LOCK_OWNED=0\n"
+        'die() { printf "%s\\n" "$*" >&2; exit 1; }\n\n'
+        + "\n\n".join(functions)
+        + "\n\nacquire_build_lock\n",
+        encoding="utf-8",
+    )
+    harness.chmod(0o700)
+    process_environment = os.environ.copy()
+    if environment is not None:
+        process_environment.update(environment)
+    return subprocess.run(
+        [str(harness), str(work), str(lockf)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=process_environment,
+    )
+
+
+def load_control_freezer():
+    source = CONTROL_FREEZER.read_text(encoding="utf-8")
+    if CONTROL_FREEZER_BEGIN not in source or CONTROL_FREEZER_END not in source:
+        raise AssertionError("shared control freezer has no testable boundary")
+    payload = source.split(CONTROL_FREEZER_BEGIN, 1)[1].split(CONTROL_FREEZER_END, 1)[0]
+    namespace: dict[str, object] = {}
+    exec(compile(payload, str(CONTROL_FREEZER), "exec"), namespace)
+    return namespace["freeze_control_file"], namespace["ControlFreezeError"]
+
+
+def load_freezer_bootstrap():
+    source = BUILDER.read_text(encoding="utf-8")
+    if FREEZER_BOOTSTRAP_BEGIN not in source or FREEZER_BOOTSTRAP_END not in source:
+        raise AssertionError(
+            "dependency wrapper has no frozen-helper bootstrap boundary"
+        )
+    payload = source.split(FREEZER_BOOTSTRAP_BEGIN, 1)[1].split(
+        FREEZER_BOOTSTRAP_END, 1
+    )[0]
+    namespace: dict[str, object] = {}
+    exec(compile(payload, str(BUILDER), "exec"), namespace)
+    return namespace["freeze_freezer_file"], namespace["FreezerBootstrapError"]
+
+
+class ControlByteAttestationTests(unittest.TestCase):
+    def test_shared_freezer_is_anonymous_and_immune_to_name_replacement(self) -> None:
+        freeze, _ = load_freezer_bootstrap()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            helper = root / "freezer.sh"
+            output = root / "output"
+            original = b'#!/bin/bash\nprintf "%s\\n" original >"$1"\n'
+            helper.write_bytes(original)
+            descriptor, digest = freeze(helper)
+            try:
+                helper.write_text(
+                    '#!/bin/bash\nprintf "%s\\n" replacement >"$1"\n',
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    ["/bin/bash", f"/dev/fd/{descriptor}", str(output)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    pass_fds=(descriptor,),
+                )
+                metadata = os.fstat(descriptor)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_text(encoding="utf-8"), "original\n")
+                self.assertEqual(digest, hashlib.sha256(original).hexdigest())
+                self.assertEqual(metadata.st_nlink, 0)
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o400)
+                self.assertEqual(
+                    fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE,
+                    os.O_RDONLY,
+                )
+            finally:
+                os.close(descriptor)
+
+    def test_shared_freezer_bootstrap_rejects_links_and_name_replacement(self) -> None:
+        freeze, error = load_freezer_bootstrap()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            victim = root / "victim"
+            victim.write_text("preserve\n", encoding="utf-8")
+            symlink = root / "symlink"
+            symlink.symlink_to(victim)
+            hardlink = root / "hardlink"
+            os.link(victim, hardlink)
+            for candidate in (symlink, hardlink):
+                with self.subTest(candidate=candidate.name):
+                    with self.assertRaises(error):
+                        freeze(candidate)
+                    self.assertEqual(victim.read_text(encoding="utf-8"), "preserve\n")
+            group_writable = root / "group-writable"
+            group_writable.write_text("unsafe\n", encoding="utf-8")
+            group_writable.chmod(0o660)
+            with self.assertRaises(error):
+                freeze(group_writable)
+            source = root / "source"
+            source.write_text("original\n", encoding="utf-8")
+            displaced = root / "displaced"
+
+            def replace_name() -> None:
+                source.replace(displaced)
+                source.write_text("replacement\n", encoding="utf-8")
+
+            with self.assertRaises(error):
+                freeze(source, after_open=replace_name)
+            self.assertEqual(displaced.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(source.read_text(encoding="utf-8"), "replacement\n")
+
+    def test_implementation_replacement_cannot_change_executed_bytes(self) -> None:
+        freeze, _ = load_control_freezer()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            implementation = root / "implementation.sh"
+            output = root / "output"
+            original = b'#!/bin/bash\nprintf "%s\\n" original >"$1"\n'
+            implementation.write_bytes(original)
+            descriptor, digest = freeze(implementation)
+            try:
+                implementation.write_text(
+                    '#!/bin/bash\nprintf "%s\\n" replacement >"$1"\n',
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        "--noprofile",
+                        "--norc",
+                        f"/dev/fd/{descriptor}",
+                        str(output),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    pass_fds=(descriptor,),
+                )
+                metadata = os.fstat(descriptor)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(output.read_text(encoding="utf-8"), "original\n")
+                self.assertEqual(digest, hashlib.sha256(original).hexdigest())
+                self.assertEqual(metadata.st_nlink, 0)
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o400)
+                self.assertEqual(
+                    fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDONLY
+                )
+            finally:
+                os.close(descriptor)
+
+    def test_promoter_replacement_cannot_change_cleanup_or_promotion_bytes(
+        self,
+    ) -> None:
+        freeze, _ = load_control_freezer()
+        implementation_source = IMPLEMENTATION.read_text(encoding="utf-8")
+        self.assertIn("run_promoter() {", implementation_source)
+        runner = extract_shell_function(implementation_source, "run_promoter")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            promoter = root / "promoter.py"
+            output = root / "operations"
+            promoter.write_text(
+                "from pathlib import Path\nimport sys\n"
+                "with Path(sys.argv[2]).open('a', encoding='utf-8') as handle:\n"
+                "    handle.write(f'original:{sys.argv[1]}\\n')\n",
+                encoding="utf-8",
+            )
+            descriptor, digest = freeze(promoter)
+            try:
+                promoter.write_text(
+                    "from pathlib import Path\nimport sys\n"
+                    "Path(sys.argv[2]).write_text('replacement\\n', encoding='utf-8')\n",
+                    encoding="utf-8",
+                )
+                harness = root / "promoter-harness.sh"
+                harness.write_text(
+                    "#!/bin/bash\nset -euo pipefail\n"
+                    'FROZEN_PROMOTER_FD="$1"\nFROZEN_PROMOTER_SHA256="$2"\n'
+                    + runner
+                    + '\nrun_promoter cleanup "$3"\nrun_promoter promote "$3"\n',
+                    encoding="utf-8",
+                )
+                harness.chmod(0o700)
+                result = subprocess.run(
+                    [str(harness), str(descriptor), digest, str(output)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    pass_fds=(descriptor,),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    output.read_text(encoding="utf-8"),
+                    "original:cleanup\noriginal:promote\n",
+                )
+            finally:
+                os.close(descriptor)
+
+    def test_control_freezer_rejects_links_and_mid_read_replacement(self) -> None:
+        freeze, error = load_control_freezer()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            victim = root / "victim"
+            victim.write_text("preserve\n", encoding="utf-8")
+            symlink = root / "symlink"
+            symlink.symlink_to(victim)
+            hardlink = root / "hardlink"
+            os.link(victim, hardlink)
+            for candidate in (symlink, hardlink):
+                with self.subTest(candidate=candidate.name):
+                    with self.assertRaises(error):
+                        freeze(candidate)
+                    self.assertEqual(victim.read_text(encoding="utf-8"), "preserve\n")
+            source = root / "source"
+            source.write_text("original\n", encoding="utf-8")
+            displaced = root / "displaced"
+
+            def replace_name() -> None:
+                source.replace(displaced)
+                source.write_text("replacement\n", encoding="utf-8")
+
+            with self.assertRaises(error):
+                freeze(source, after_open=replace_name)
+            self.assertEqual(displaced.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(source.read_text(encoding="utf-8"), "replacement\n")
+
+    def test_receipt_contract_uses_frozen_executed_digests(self) -> None:
+        wrapper = BUILDER.read_text(encoding="utf-8")
+        implementation = IMPLEMENTATION.read_text(encoding="utf-8")
+        for field in (
+            "EASYSPLAT_FROZEN_FREEZER_SHA256",
+            "EASYSPLAT_FROZEN_WRAPPER_SHA256",
+            "EASYSPLAT_FROZEN_IMPLEMENTATION_SHA256",
+            "EASYSPLAT_FROZEN_PROMOTER_SHA256",
+        ):
+            self.assertIn(field, wrapper)
+            self.assertIn(field, implementation)
+        self.assertIn('"/dev/fd/$FROZEN_IMPLEMENTATION_FD"', wrapper)
+        self.assertIn('"builder_sha256": wrapper_sha256', implementation)
+        self.assertIn('"control_freezer_sha256": freezer_sha256', implementation)
+        self.assertIn(
+            '"builder_implementation_sha256": implementation_sha256', implementation
+        )
+        self.assertIn('"promoter_sha256": promoter_sha256', implementation)
+        for stale in (
+            '"builder_sha256": file_sha256(wrapper)',
+            '"builder_implementation_sha256": file_sha256(implementation)',
+            '"promoter_sha256": file_sha256(promoter)',
+        ):
+            self.assertNotIn(stale, implementation)
+
+
+class BuildLockSafetyTests(unittest.TestCase):
+    def test_regular_lock_is_acquired_without_changing_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            work.mkdir()
+            lock_path = work / ".build.lock"
+            lock_path.write_text("existing\n", encoding="utf-8")
+
+            result = run_build_lock_acquisition(work)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(lock_path.read_text(encoding="utf-8"), "existing\n")
+
+    def test_symlink_lock_is_rejected_without_truncating_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            work.mkdir()
+            target = root / "target"
+            target.write_text("keep me\n", encoding="utf-8")
+            (work / ".build.lock").symlink_to(target)
+
+            result = run_build_lock_acquisition(work)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "keep me\n")
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_hardlinked_lock_is_rejected_without_truncating_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            work.mkdir()
+            target = root / "target"
+            target.write_text("keep me\n", encoding="utf-8")
+            os.link(target, work / ".build.lock")
+
+            result = run_build_lock_acquisition(work)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "keep me\n")
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_lock_name_replacement_after_open_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work = root / "work"
+            work.mkdir()
+            lock_path = work / ".build.lock"
+            lock_path.write_text("original\n", encoding="utf-8")
+            hostile_lockf = root / "hostile-lockf.sh"
+            hostile_lockf.write_text(
+                "#!/bin/bash\n"
+                "set -euo pipefail\n"
+                'mv "$TEST_LOCK_PATH" "$TEST_LOCK_PATH.opened"\n'
+                'printf "%s\\n" replacement >"$TEST_LOCK_PATH"\n'
+                'exec /usr/bin/lockf "$@"\n',
+                encoding="utf-8",
+            )
+            hostile_lockf.chmod(0o700)
+
+            result = run_build_lock_acquisition(
+                work,
+                lockf=hostile_lockf,
+                environment={"TEST_LOCK_PATH": str(lock_path)},
+            )
+
+            self.assertNotEqual(result.returncode, 0)
 
 
 class SourceContractTests(unittest.TestCase):
@@ -126,6 +485,8 @@ class SourceContractTests(unittest.TestCase):
             tools.mkdir()
             copied = script_dir / BUILDER.name
             shutil.copy2(BUILDER, copied)
+            shutil.copy2(CONTROL_FREEZER, script_dir / CONTROL_FREEZER.name)
+            shutil.copy2(PROMOTER, script_dir / PROMOTER.name)
             output = root / "environment.json"
             stub = script_dir / IMPLEMENTATION.name
             stub.write_text(
@@ -245,8 +606,15 @@ class SourceContractTests(unittest.TestCase):
             "validate_install_tree",
             "validate_receipt",
             "--validate-only",
-            "prior Ceres install restored",
+            "previous Ceres state restored",
+            "STAGE_CLEANUP_ALLOWED=0",
+            "run_promoter() {",
+            "run_promoter --recover",
+            "run_promoter --commit",
+            "FROZEN_PROMOTER_FD",
+            "FROZEN_PROMOTER_SHA256",
             "install_tree_sha256",
+            "control_freezer_sha256",
             "builder_sha256",
             "builder_implementation_sha256",
             "source_lock_sha256",
@@ -254,11 +622,33 @@ class SourceContractTests(unittest.TestCase):
             "promoter_sha256",
         ):
             self.assertIn(contract, source)
-        validation_before = source.index('validate_install_tree "$STAGE"')
-        promotion = source.index('"$PYTHON_BIN" "$PROMOTER" "$STAGE" "$INSTALL"')
-        validation_after = source.index('validate_install_tree "$INSTALL"')
-        self.assertLess(validation_before, promotion)
-        self.assertLess(promotion, validation_after)
+        implementation = IMPLEMENTATION.read_text(encoding="utf-8")
+        main_body = implementation.rsplit("main() {", 1)[1].rsplit(
+            '\n}\n\nmain "$@"', 1
+        )[0]
+        promotion_body = implementation.split("promote_install() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertLess(
+            main_body.index('validate_install_tree "$STAGE"'),
+            main_body.index("promote_install"),
+        )
+        self.assertLess(
+            promotion_body.index('run_promoter "$STAGE" "$INSTALL" "$tree_receipt"'),
+            promotion_body.index('validate_install_tree "$INSTALL"'),
+        )
+
+    def test_cleanup_remains_available_until_tree_receipt_succeeds(self) -> None:
+        implementation = IMPLEMENTATION.read_text(encoding="utf-8")
+        promotion = implementation.split("promote_install() {", 1)[1].split("\n}", 1)[0]
+        receipt = promotion.index('tree_receipt="$(')
+        disable_cleanup = promotion.index("STAGE_CLEANUP_ALLOWED=0")
+        begin_promotion = promotion.index(
+            'run_promoter "$STAGE" "$INSTALL" "$tree_receipt"'
+        )
+
+        self.assertLess(receipt, disable_cleanup)
+        self.assertLess(disable_cleanup, begin_promotion)
 
     def test_receipt_identity_is_independent_of_the_build_account(self) -> None:
         source = self.source()
@@ -267,8 +657,8 @@ class SourceContractTests(unittest.TestCase):
             source,
         )
         self.assertNotRegex(source, r'"normalized_owner_(?:uid|gid)"\s*:')
-        self.assertEqual(source.count("metadata.st_uid"), 2)
-        self.assertEqual(source.count("metadata.st_gid"), 2)
+        self.assertEqual(source.count("metadata.st_uid"), 4)
+        self.assertEqual(source.count("metadata.st_gid"), 4)
 
     def test_output_and_relocation_gates_are_executable_contracts(self) -> None:
         source = self.source()
@@ -349,19 +739,23 @@ class AtomicPromotionTests(unittest.TestCase):
             install.mkdir()
             (stage / "value").write_text("new", encoding="utf-8")
             (install / "value").write_text("old", encoding="utf-8")
-            original_sync = self.promoter.sync_directory
+            original_sync = self.promoter._sync_bound_parent
+            sync_count = 0
 
-            def failing_sync(path: Path) -> None:
-                if path.resolve() == root.resolve():
+            def failing_sync(descriptor: int) -> None:
+                nonlocal sync_count
+                sync_count += 1
+                if sync_count == 1:
                     raise OSError("fixture sync failure")
-                original_sync(path)
+                original_sync(descriptor)
 
-            self.promoter.sync_directory = failing_sync
+            self.promoter._sync_bound_parent = failing_sync
             try:
                 with self.assertRaisesRegex(OSError, "fixture sync failure"):
                     self.promoter.promote(stage, install)
             finally:
-                self.promoter.sync_directory = original_sync
+                self.promoter._sync_bound_parent = original_sync
+            self.assertGreaterEqual(sync_count, 2)
             self.assertEqual((install / "value").read_text(encoding="utf-8"), "old")
             self.assertEqual((stage / "value").read_text(encoding="utf-8"), "new")
 
@@ -434,6 +828,7 @@ class ArtifactTests(unittest.TestCase):
             ],
         )
         for key in (
+            "control_freezer_sha256",
             "builder_sha256",
             "builder_implementation_sha256",
             "source_lock_sha256",

@@ -3,6 +3,15 @@
 BOOTSTRAP_CMAKE_BIN="${EASYSPLAT_BOOTSTRAP_CMAKE:-}"
 BOOTSTRAP_NINJA_BIN="${EASYSPLAT_BOOTSTRAP_NINJA:-}"
 BOOTSTRAP_RG_BIN="${EASYSPLAT_BOOTSTRAP_RG:-}"
+FROZEN_ROOT="${EASYSPLAT_FROZEN_ROOT:-}"
+FROZEN_FREEZER_FD="${EASYSPLAT_FROZEN_FREEZER_FD:-}"
+FROZEN_FREEZER_SHA256="${EASYSPLAT_FROZEN_FREEZER_SHA256:-}"
+FROZEN_WRAPPER_FD="${EASYSPLAT_FROZEN_WRAPPER_FD:-}"
+FROZEN_WRAPPER_SHA256="${EASYSPLAT_FROZEN_WRAPPER_SHA256:-}"
+FROZEN_IMPLEMENTATION_FD="${EASYSPLAT_FROZEN_IMPLEMENTATION_FD:-}"
+FROZEN_IMPLEMENTATION_SHA256="${EASYSPLAT_FROZEN_IMPLEMENTATION_SHA256:-}"
+FROZEN_PROMOTER_FD="${EASYSPLAT_FROZEN_PROMOTER_FD:-}"
+FROZEN_PROMOTER_SHA256="${EASYSPLAT_FROZEN_PROMOTER_SHA256:-}"
 
 INHERITED_FUNCTIONS="$(builtin declare -F)"
 if [ -n "$INHERITED_FUNCTIONS" ]; then
@@ -21,7 +30,7 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 set -euo pipefail
 umask 022
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT="$FROZEN_ROOT"
 WORK="$ROOT/Toolchains/build/colmap-support"
 DOWNLOADS="$WORK/downloads"
 SOURCES="$WORK/sources"
@@ -33,14 +42,14 @@ BUILD_LOCK="$WORK/.build.lock"
 BUILD_HOME="$WORK/home"
 BUILD_TMP="$WORK/tmp"
 LOCK="$ROOT/scripts/toolchain/colmap-support-lock.json"
-WRAPPER="$ROOT/scripts/toolchain/build_colmap_support.sh"
-IMPLEMENTATION="$ROOT/scripts/toolchain/build_colmap_support_impl.sh"
 EXTRACTOR="$ROOT/scripts/toolchain/safe_extract_source.py"
-PROMOTER="$ROOT/scripts/toolchain/atomic_swap_install.py"
 TESTS="$ROOT/scripts/toolchain/tests/test_colmap_support_builder.py"
 DEPLOYMENT_TARGET="15.0"
 NORMALIZED_MTIME_EPOCH="946684800"
 LOCK_OWNED=0
+INSTALL_STAGE_OWNED=0
+INSTALL_STAGE_DEVICE=""
+INSTALL_STAGE_INODE=""
 
 AR_BIN=""
 CLANG_BIN=""
@@ -79,40 +88,256 @@ sha256() {
   "$SHASUM_BIN" -a 256 "$1" | /usr/bin/awk '{print $1}'
 }
 
+validate_frozen_control_inputs() {
+  /usr/bin/python3 - \
+    "$FROZEN_FREEZER_FD" "$FROZEN_FREEZER_SHA256" \
+    "$FROZEN_WRAPPER_FD" "$FROZEN_WRAPPER_SHA256" \
+    "$FROZEN_IMPLEMENTATION_FD" "$FROZEN_IMPLEMENTATION_SHA256" \
+    "$FROZEN_PROMOTER_FD" "$FROZEN_PROMOTER_SHA256" <<'PY'
+import fcntl
+import hashlib
+import os
+import stat
+import sys
+
+arguments = sys.argv[1:]
+if len(arguments) != 8:
+    raise SystemExit("frozen control descriptor arguments are incomplete")
+for label, offset in (
+    ("control freezer", 0),
+    ("wrapper", 2),
+    ("implementation", 4),
+    ("promoter", 6),
+):
+    try:
+        descriptor = int(arguments[offset])
+    except ValueError as error:
+        raise SystemExit(f"invalid frozen {label} descriptor") from error
+    expected = arguments[offset + 1]
+    if descriptor < 100:
+        raise SystemExit(f"unsafe frozen {label} descriptor number")
+    if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+        raise SystemExit(f"invalid frozen {label} digest")
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 0
+        or metadata.st_uid != os.getuid()
+        or metadata.st_gid != os.getgid()
+        or metadata.st_size <= 0
+        or stat.S_IMODE(metadata.st_mode) != 0o400
+        or (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDONLY
+    ):
+        raise SystemExit(f"unsafe frozen {label} descriptor")
+    payload = b"".join(
+        os.pread(descriptor, min(1024 * 1024, metadata.st_size - offset), offset)
+        for offset in range(0, metadata.st_size, 1024 * 1024)
+    )
+    if len(payload) != metadata.st_size or hashlib.sha256(payload).hexdigest() != expected:
+        raise SystemExit(f"frozen {label} payload digest mismatch")
+PY
+}
+
+run_promoter() {
+  /usr/bin/python3 -I -S - "$FROZEN_PROMOTER_FD" "$FROZEN_PROMOTER_SHA256" "$@" <<'PY'
+import fcntl
+import hashlib
+import os
+import stat
+import sys
+
+descriptor = int(sys.argv[1])
+expected = sys.argv[2]
+arguments = sys.argv[3:]
+metadata = os.fstat(descriptor)
+if (
+    descriptor < 100
+    or not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_nlink != 0
+    or metadata.st_uid != os.getuid()
+    or metadata.st_gid != os.getgid()
+    or metadata.st_size <= 0
+    or stat.S_IMODE(metadata.st_mode) != 0o400
+    or (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDONLY
+):
+    raise SystemExit("unsafe frozen promoter descriptor")
+payload = b"".join(
+    os.pread(descriptor, min(1024 * 1024, metadata.st_size - offset), offset)
+    for offset in range(0, metadata.st_size, 1024 * 1024)
+)
+if len(payload) != metadata.st_size or hashlib.sha256(payload).hexdigest() != expected:
+    raise SystemExit("frozen promoter payload digest mismatch")
+script = f"/dev/fd/{descriptor}"
+sys.argv = [script, *arguments]
+namespace = {
+    "__name__": "__main__",
+    "__file__": script,
+    "__package__": None,
+    "__cached__": None,
+}
+exec(compile(payload, script, "exec"), namespace)
+PY
+}
+
 resolve_xcode_tool() {
   DEVELOPER_DIR="$XCODE_DEVELOPER_DIR" "$XCRUN_BIN" --find "$1"
 }
 
+STAGE_CLEANUP_ALLOWED=1
+
 cleanup() {
   local status=$?
+  local install_cleanup_status=0
   trap - EXIT
-  rm -rf "$STAGE"
+  if [ "$STAGE_CLEANUP_ALLOWED" = "1" ] && [ "$INSTALL_STAGE_OWNED" = "1" ]; then
+    if [ -n "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ]; then
+      run_promoter \
+        --remove-owned-tree \
+        "$STAGE" \
+        "$INSTALL_STAGE_DEVICE" \
+        "$INSTALL_STAGE_INODE" \
+        --allow-symlinks || install_cleanup_status=$?
+    else
+      install_cleanup_status=1
+    fi
+    if [ "$install_cleanup_status" -ne 0 ]; then
+      printf '%s\n' \
+        "COLMAP support build cleanup preserved an unverified staged install: $STAGE" >&2
+    fi
+  fi
   if [ "$LOCK_OWNED" = "1" ]; then
     exec 9>&-
   fi
+  if [ "$status" -eq 0 ] && [ "$install_cleanup_status" -ne 0 ]; then
+    status="$install_cleanup_status"
+  fi
   exit "$status"
+}
+
+create_owned_install_stage() {
+  local identity
+  identity="$(
+    run_promoter --create-owned-tree "$STAGE"
+  )" || die "could not create and bind COLMAP support install stage"
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || \
+    die "COLMAP support install stage identity is malformed"
+  INSTALL_STAGE_DEVICE="${identity%%:*}"
+  INSTALL_STAGE_INODE="${identity#*:}"
+  INSTALL_STAGE_OWNED=1
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-acquire_build_lock() {
-  mkdir -p "$WORK"
-  exec 9>"$BUILD_LOCK"
-  "$LOCKF_BIN" -s -t 0 9 || die "another COLMAP support build is running"
-  LOCK_OWNED=1
+validate_build_lock() {
+  /usr/bin/python3 - "$WORK" "$BUILD_LOCK" 9 <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+work, path, descriptor_raw = sys.argv[1:]
+descriptor = int(descriptor_raw)
+name = os.path.basename(path)
+
+
+def reject() -> None:
+    raise SystemExit("unsafe build lock")
+
+
+if not name or name in {".", ".."} or os.path.dirname(path) != work:
+    reject()
+directory = -1
+named_descriptor = -1
+try:
+    directory = os.open(
+        work,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    directory_status = os.fstat(directory)
+    work_status = os.stat(work, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(directory_status.st_mode)
+        or directory_status.st_uid != os.getuid()
+        or directory_status.st_gid != os.getgid()
+        or (directory_status.st_dev, directory_status.st_ino)
+        != (work_status.st_dev, work_status.st_ino)
+    ):
+        reject()
+    named_descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory,
+    )
+    opened = os.fstat(descriptor)
+    named_opened = os.fstat(named_descriptor)
+    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or opened.st_gid != os.getgid()
+        or (fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDWR
+        or (opened.st_dev, opened.st_ino)
+        != (named_opened.st_dev, named_opened.st_ino)
+        or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+    ):
+        reject()
+    os.fchmod(descriptor, 0o600)
+    opened_after = os.fstat(descriptor)
+    named_after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    directory_after = os.fstat(directory)
+    work_after = os.stat(work, follow_symlinks=False)
+    if (
+        (opened.st_dev, opened.st_ino)
+        != (opened_after.st_dev, opened_after.st_ino)
+        or (opened.st_dev, opened.st_ino)
+        != (named_after.st_dev, named_after.st_ino)
+        or opened_after.st_nlink != 1
+        or stat.S_IMODE(opened_after.st_mode) != 0o600
+        or (directory_status.st_dev, directory_status.st_ino)
+        != (directory_after.st_dev, directory_after.st_ino)
+        or (directory_status.st_dev, directory_status.st_ino)
+        != (work_after.st_dev, work_after.st_ino)
+    ):
+        reject()
+except OSError:
+    reject()
+finally:
+    if named_descriptor >= 0:
+        os.close(named_descriptor)
+    if directory >= 0:
+        os.close(directory)
+PY
 }
 
-remove_stale_workdirs() {
-  local path
+acquire_build_lock() {
+  mkdir -p "$WORK"
+  exec 9<>"$BUILD_LOCK"
+  validate_build_lock || die "COLMAP support build lock is unsafe"
+  "$LOCKF_BIN" -s -t 0 9 || die "another COLMAP support build is running"
+  LOCK_OWNED=1
+  validate_build_lock || die "COLMAP support build lock changed during acquisition"
+}
+
+recover_stale_promotions() {
+  local journal path
+  for journal in "$WORK"/install.stage.*.promotion-state; do
+    [ -e "$journal" ] || [ -L "$journal" ] || continue
+    run_promoter --recover "$journal" || \
+      die "could not recover interrupted COLMAP support promotion: $journal"
+  done
   for path in "$WORK"/install.stage.*; do
     [ -e "$path" ] || [ -L "$path" ] || continue
-    [ "$path" = "$STAGE" ] && continue
-    rm -rf "$path"
+    case "$path" in
+      *.promotion-state) continue ;;
+    esac
+    die "ambiguous staged install requires recovery: $path"
   done
 }
 
 preflight() {
+  validate_frozen_control_inputs || die "frozen build controls are invalid"
   [ "$(uname -m)" = "arm64" ] || die "must run natively on Apple Silicon arm64"
   [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" != "1" ] || \
     die "Rosetta is unsupported"
@@ -120,11 +345,7 @@ preflight() {
     *[[:space:]]*) die "checkout path contains whitespace; move the source checkout before building" ;;
   esac
   [ -s "$LOCK" ] || die "colmap-support-lock.json is missing"
-  [ -x "$WRAPPER" ] || die "hermetic build wrapper is missing or not executable"
-  [ -f "$IMPLEMENTATION" ] && [ ! -L "$IMPLEMENTATION" ] || \
-    die "hermetic build implementation is missing or unsafe"
   [ -x "$EXTRACTOR" ] || die "safe source extractor is missing or not executable"
-  [ -x "$PROMOTER" ] || die "atomic install promoter is missing or not executable"
   [ -f "$TESTS" ] || die "COLMAP support artifact tests are missing"
   for command in \
     /usr/bin/codesign \
@@ -747,7 +968,8 @@ PY
 
 stage_receipt() {
   "$PYTHON_BIN" - \
-    "$LOCK" "$STAGE" "$WRAPPER" "$IMPLEMENTATION" "$EXTRACTOR" "$PROMOTER" \
+    "$LOCK" "$STAGE" "$FROZEN_FREEZER_SHA256" "$FROZEN_WRAPPER_SHA256" \
+    "$FROZEN_IMPLEMENTATION_SHA256" "$EXTRACTOR" "$FROZEN_PROMOTER_SHA256" \
     "$AR_BIN" "$CLANG_BIN" "$CLANGXX_BIN" "$CMAKE_BIN" "$CODESIGN_BIN" \
     "$CURL_BIN" "$INSTALL_NAME_TOOL_BIN" "$LD_BIN" "$LIPO_BIN" "$LOCKF_BIN" \
     "$NINJA_BIN" "$OTOOL_BIN" "$PYTHON_BIN" "$RANLIB_BIN" "$RG_BIN" \
@@ -764,10 +986,11 @@ from pathlib import Path
 (
     lock_raw,
     root_raw,
-    builder_raw,
-    implementation_raw,
+    freezer_sha256,
+    wrapper_sha256,
+    implementation_sha256,
     extractor_raw,
-    promoter_raw,
+    promoter_sha256,
     ar_raw,
     clang_raw,
     clangxx_raw,
@@ -794,10 +1017,7 @@ from pathlib import Path
 ) = sys.argv[1:]
 lock_path = Path(lock_raw)
 root = Path(root_raw)
-builder = Path(builder_raw)
-implementation = Path(implementation_raw)
 extractor = Path(extractor_raw)
-promoter = Path(promoter_raw)
 cmake = Path(cmake_raw)
 ninja = Path(ninja_raw)
 ripgrep = Path(ripgrep_raw)
@@ -907,11 +1127,12 @@ payload = {
     "source_date_epoch": 0,
     "normalized_mtime_epoch": normalized_mtime_epoch,
     "ownership_policy": "invoking-build-user-and-primary-group",
-    "builder_sha256": file_sha256(builder),
-    "builder_implementation_sha256": file_sha256(implementation),
+    "control_freezer_sha256": freezer_sha256,
+    "builder_sha256": wrapper_sha256,
+    "builder_implementation_sha256": implementation_sha256,
     "source_lock_sha256": file_sha256(lock_path),
     "extractor_sha256": file_sha256(extractor),
-    "promoter_sha256": file_sha256(promoter),
+    "promoter_sha256": promoter_sha256,
     "build_tools": {
         "clang": command_version([clang_raw, "--version"]).split(" | ", 1)[0],
         "cmake": command_version([str(cmake), "--version"]).split(" | ", 1)[0],
@@ -969,8 +1190,10 @@ PY
 
 validate_receipt() {
   "$PYTHON_BIN" - \
-    "$STAGE" "$WRAPPER" "$IMPLEMENTATION" "$LOCK" \
-    "$EXTRACTOR" "$PROMOTER" "$NORMALIZED_MTIME_EPOCH" <<'PY'
+    "$STAGE" "$FROZEN_FREEZER_SHA256" "$FROZEN_WRAPPER_SHA256" \
+    "$FROZEN_IMPLEMENTATION_SHA256" \
+    "$LOCK" "$EXTRACTOR" "$FROZEN_PROMOTER_SHA256" \
+    "$NORMALIZED_MTIME_EPOCH" <<'PY'
 import hashlib
 import json
 import os
@@ -979,12 +1202,13 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-builder = Path(sys.argv[2])
-implementation = Path(sys.argv[3])
-source_lock = Path(sys.argv[4])
-extractor = Path(sys.argv[5])
-promoter = Path(sys.argv[6])
-normalized_mtime_epoch = int(sys.argv[7])
+freezer_sha256 = sys.argv[2]
+wrapper_sha256 = sys.argv[3]
+implementation_sha256 = sys.argv[4]
+source_lock = Path(sys.argv[5])
+extractor = Path(sys.argv[6])
+promoter_sha256 = sys.argv[7]
+normalized_mtime_epoch = int(sys.argv[8])
 receipt = json.loads((root / "build_info.json").read_text(encoding="utf-8"))
 
 
@@ -996,14 +1220,20 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-expected_inputs = {
-    "builder_sha256": builder,
-    "builder_implementation_sha256": implementation,
+expected_digests = {
+    "control_freezer_sha256": freezer_sha256,
+    "builder_sha256": wrapper_sha256,
+    "builder_implementation_sha256": implementation_sha256,
+    "promoter_sha256": promoter_sha256,
+}
+for field, expected in expected_digests.items():
+    if receipt.get(field) != expected:
+        raise SystemExit(f"{field} does not match the executed build input")
+expected_paths = {
     "source_lock_sha256": source_lock,
     "extractor_sha256": extractor,
-    "promoter_sha256": promoter,
 }
-for field, path in expected_inputs.items():
+for field, path in expected_paths.items():
     if receipt.get(field) != file_sha256(path):
         raise SystemExit(f"{field} does not match the current build input")
 for relative, expected in receipt["library_sha256"].items():
@@ -1071,15 +1301,27 @@ verify_artifacts() {
 }
 
 promote_install() {
-  "$PYTHON_BIN" "$PROMOTER" "$STAGE" "$INSTALL" || \
-    die "could not atomically promote COLMAP support prefix"
+  local journal="$STAGE.promotion-state" tree_receipt
+  tree_receipt="$(run_promoter --tree-receipt \
+    "$STAGE" "$INSTALL_STAGE_DEVICE" "$INSTALL_STAGE_INODE")" || \
+    die "could not bind the validated COLMAP support tree"
+  STAGE_CLEANUP_ALLOWED=0
+  run_promoter "$STAGE" "$INSTALL" "$tree_receipt" || \
+    die "could not atomically promote COLMAP support prefix; recovery state preserved"
+  run_promoter --commit "$journal" || \
+    die "could not finalize COLMAP support promotion; recovery state preserved"
 }
+
+if [ "$#" -ne 0 ]; then
+  die "usage: build_colmap_support.sh"
+fi
 
 preflight
 acquire_build_lock
-remove_stale_workdirs
-rm -rf "$STAGE" "$BUILDS" "$LOGS" "$BUILD_HOME" "$BUILD_TMP"
-mkdir -p "$DOWNLOADS" "$SOURCES" "$BUILDS" "$LOGS" "$STAGE" "$BUILD_HOME" "$BUILD_TMP"
+recover_stale_promotions
+rm -rf "$BUILDS" "$LOGS" "$BUILD_HOME" "$BUILD_TMP"
+mkdir -p "$DOWNLOADS" "$SOURCES" "$BUILDS" "$LOGS" "$BUILD_HOME" "$BUILD_TMP"
+create_owned_install_stage
 sanitize_environment
 build_boost
 build_gflags

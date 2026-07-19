@@ -13,6 +13,8 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
+import urllib.parse
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
@@ -93,6 +95,30 @@ CLASSIFIER_LICENSES = {
     "Mozilla Public License 2.0 (MPL 2.0)": "MPL-2.0",
     "Python Software Foundation License": "Python-2.0",
 }
+MAX_DISTRIBUTION_SIGNING_RECEIPT_BYTES = 1024 * 1024
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+DISTRIBUTION_SIGNING_SOURCE_INPUTS = {
+    "Tools/NativeColmap/local_vocab_retriever.cc",
+    "Tools/NativeColmap/local_vocab_retriever.h",
+    "scripts/release/finalize_signed_toolchain.py",
+    "scripts/release/notarize_artifact.sh",
+    "scripts/release/sign_macos_distribution.py",
+    "scripts/toolchain/atomic_swap_install.py",
+    "scripts/toolchain/build_colmap.sh",
+    "scripts/toolchain/build_colmap_impl.sh",
+    "scripts/toolchain/secure_colmap_build.py",
+    "scripts/toolchain/create_reproducible_zip.py",
+    "scripts/toolchain/generate_supply_chain_manifest.py",
+    "scripts/toolchain/package_toolchain.sh",
+    "scripts/toolchain/patches/colmap-4.1.1-easysplat.patch",
+    "scripts/toolchain/validate_da3_payload.py",
+    "scripts/toolchain/validate_native_msplat.sh",
+    "scripts/toolchain/colmap-support-lock.json",
+    "scripts/toolchain/ceres-lock.json",
+    "scripts/toolchain/openimageio-lock.json",
+    "scripts/toolchain/da3-model-lock.json",
+}
+PYTHON_STANDALONE_SITE_PACKAGES_FILES = {"README.txt"}
 
 
 def fail(message: str) -> NoReturn:
@@ -246,7 +272,7 @@ def validate_macos_15_compatibility(path: Path) -> None:
         parts = tuple(int(part) for part in value.split("."))
         padded = parts + (0,) * (3 - len(parts))
         if padded > (15, 0, 0):
-            fail(f"{path} requires macOS {value}; public beta minimum is macOS 15.0")
+            fail(f"{path} requires macOS {value}; EasySplat supports macOS 15.0+")
 
 
 def validate_arm64_only(path: Path) -> None:
@@ -413,6 +439,50 @@ def normalize_license(value: Any) -> str:
     return normalized
 
 
+def validate_public_https_url(value: Any, *, label: str) -> str:
+    if not isinstance(value, str):
+        fail(f"{label} URL is not a string")
+    if (
+        any(ord(character) <= 0x20 or ord(character) >= 0x7F for character in value)
+        or "\\" in value
+    ):
+        fail(f"{label} URL contains unsafe characters")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+    except ValueError:
+        fail(f"{label} URL is malformed")
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        fail(f"{label} must be a public HTTPS URL without credentials, query, or fragment")
+    return value
+
+
+def validate_component_urls(components: dict[str, dict[str, Any]]) -> None:
+    for component_id, component in components.items():
+        validate_public_https_url(component.get("source"), label=f"{component_id} source")
+        if "artifact" in component:
+            validate_public_https_url(
+                component.get("artifact"), label=f"{component_id} artifact"
+            )
+        source_artifacts = component.get("sourceArtifacts", [])
+        if not isinstance(source_artifacts, list):
+            fail(f"{component_id} sourceArtifacts is not an array")
+        for index, row in enumerate(source_artifacts):
+            if not isinstance(row, dict):
+                fail(f"{component_id} source artifact is not an object")
+            validate_public_https_url(
+                row.get("url"), label=f"{component_id} source artifact {index}"
+            )
+
+
 def metadata_license(metadata: email.message.Message) -> str:
     expression = metadata.get("License-Expression", "").strip()
     if expression:
@@ -440,6 +510,8 @@ def metadata_license(metadata: email.message.Message) -> str:
 
 
 def component_build_command(component_id: str, component: dict[str, Any]) -> str:
+    if component_id == "easysplat-distribution-signing":
+        return "./scripts/release/finalize_signed_toolchain.py"
     if component_id == "colmap" or component_id.startswith("colmap:"):
         return "./scripts/toolchain/build_colmap.sh"
     if component_id == "colmap-support" or component_id.startswith(
@@ -483,6 +555,74 @@ def distribution_metadata_paths(python_root: Path) -> list[Path]:
     )
 
 
+def normalized_distribution_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def locked_python_distributions(
+    lock_path: Path,
+) -> dict[str, tuple[str, frozenset[str]]]:
+    try:
+        raw = lock_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        fail(f"unable to read Python requirements lock: {exc}")
+    logical = raw.replace("\\\n", " ")
+    locked: dict[str, tuple[str, frozenset[str]]] = {}
+    for line in logical.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.match(r"^([A-Za-z0-9_.-]+)==([^\s;]+)", stripped)
+        hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})(?:\s|$)", stripped)
+        if match is None or not hashes:
+            fail(f"Python requirements lock has an unreviewed row: {stripped[:120]}")
+        slug = normalized_distribution_name(match.group(1))
+        if slug in locked:
+            fail(f"Python requirements lock contains a duplicate package: {slug}")
+        locked[slug] = (match.group(2), frozenset(hashes))
+    if not locked:
+        fail("Python requirements lock contains no hashed packages")
+    return locked
+
+
+def reported_python_distributions(
+    report: dict[str, Any],
+) -> dict[str, tuple[str, str, str]]:
+    installed: dict[str, tuple[str, str, str]] = {}
+    rows = report.get("install")
+    if not isinstance(rows, list):
+        fail("pip install report has no install array")
+    for entry in rows:
+        if not isinstance(entry, dict):
+            fail("pip install report contains a non-object entry")
+        metadata = entry.get("metadata", {})
+        download = entry.get("download_info", {})
+        archive_info = download.get("archive_info", {}) if isinstance(download, dict) else {}
+        hashes = archive_info.get("hashes", {}) if isinstance(archive_info, dict) else {}
+        name = str(metadata.get("name") or "") if isinstance(metadata, dict) else ""
+        version = str(metadata.get("version") or "") if isinstance(metadata, dict) else ""
+        source_url = str(download.get("url") or "") if isinstance(download, dict) else ""
+        artifact_hash = str(hashes.get("sha256") or "") if isinstance(hashes, dict) else ""
+        if not artifact_hash:
+            raw_hash = str(archive_info.get("hash") or "") if isinstance(archive_info, dict) else ""
+            if raw_hash.startswith("sha256="):
+                artifact_hash = raw_hash.removeprefix("sha256=")
+        if (
+            not name
+            or not version
+            or not source_url.startswith("https://")
+            or not SHA256_PATTERN.fullmatch(artifact_hash)
+        ):
+            fail(
+                f"pip install report contains incomplete artifact provenance for {name or '<unknown>'}"
+            )
+        slug = normalized_distribution_name(name)
+        if slug in installed:
+            fail(f"pip install report contains duplicate distribution: {name}")
+        installed[slug] = (version, source_url, artifact_hash)
+    return installed
+
+
 def validate_record_member(
     path: Path,
     encoded_hash: str,
@@ -496,7 +636,7 @@ def validate_record_member(
     except (OSError, ValueError) as exc:
         fail(f"Python RECORD member escapes the runtime: {distribution}: {path}: {exc}")
     if not (path.exists() or path.is_symlink()):
-        if path.suffix == ".pyc":
+        if path.suffix == ".pyc" and not encoded_hash and not encoded_size:
             return False
         fail(f"Python RECORD member is missing: {distribution}: {path}")
     source = materialized_source(path, python_root)
@@ -537,7 +677,7 @@ def validate_supplemental_license_receipts(
     root: Path,
     *,
     reviewed: dict[str, dict[str, str]] = REVIEWED_SUPPLEMENTAL_LICENSES,
-) -> None:
+) -> dict[Path, str]:
     manifest_path = (
         root / "da3_mps" / "licenses" / "python-package-upstream-notices.json"
     )
@@ -560,6 +700,7 @@ def validate_supplemental_license_receipts(
             "supplemental Python license manifest package set does not match the reviewed closure"
         )
 
+    ownership: dict[Path, str] = {}
     for package, expected in reviewed.items():
         notice = by_package[package]
         expected_keys = set(expected) | {"installedPath"}
@@ -598,6 +739,10 @@ def validate_supplemental_license_receipts(
             fail(f"supplemental Python license escapes the toolchain: {path}: {exc}")
         if sha256(path) != expected["artifactSha256"]:
             fail(f"supplemental Python license artifact hash mismatch: {package}")
+        ownership[path.resolve(strict=True)] = (
+            f"python:{normalized_distribution_name(package)}"
+        )
+    return ownership
 
 
 def distribution_license_sources(
@@ -658,48 +803,48 @@ def distribution_license_sources(
 
 def python_components(
     root: Path,
+    *,
+    supplemental_ownership: dict[Path, str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[Path, str]]:
     python_root = root / "da3_mps" / "python"
     python_license_root = reset_python_license_receipts(root)
     report_path = root / "da3_mps" / "licenses" / "python-packages-install-report.json"
     report = load_json(report_path)
-    installed_artifacts: dict[str, tuple[str, str, str]] = {}
-    for entry in report.get("install", []):
-        metadata = entry.get("metadata", {})
-        name = str(metadata.get("name") or "").strip()
-        version = str(metadata.get("version") or "").strip()
-        download = entry.get("download_info", {})
-        source_url = str(download.get("url") or "")
-        archive_info = download.get("archive_info", {})
-        hashes = archive_info.get("hashes", {})
-        artifact_hash = str(hashes.get("sha256") or "")
-        if not artifact_hash:
-            raw_hash = str(archive_info.get("hash") or "")
-            if raw_hash.startswith("sha256="):
-                artifact_hash = raw_hash.removeprefix("sha256=")
-        if (
-            not name
-            or not version
-            or not source_url.startswith("https://")
-            or not re.fullmatch(r"[0-9a-f]{64}", artifact_hash)
-        ):
-            fail(
-                f"pip install report contains incomplete artifact provenance for {name or '<unknown>'}"
-            )
-        slug = re.sub(r"[-_.]+", "-", name).lower()
-        if slug in installed_artifacts:
-            fail(f"pip install report contains duplicate distribution: {name}")
-        installed_artifacts[slug] = (version, source_url, artifact_hash)
+    installed_artifacts = reported_python_distributions(report)
+    lock_path = root / "da3_mps" / "licenses" / "python-packages-requirements.txt"
+    locked = locked_python_distributions(lock_path)
+    metadata_paths = distribution_metadata_paths(python_root)
+    metadata_versions: dict[str, str] = {}
+    for metadata_path in metadata_paths:
+        metadata = email.message_from_bytes(metadata_path.read_bytes())
+        name = metadata.get("Name", "").strip()
+        version = metadata.get("Version", "").strip()
+        slug = normalized_distribution_name(name)
+        if not name or not version or slug in metadata_versions:
+            fail(f"installed Python dist-info metadata is incomplete or duplicated: {metadata_path}")
+        metadata_versions[slug] = version
+    locked_versions = {slug: row[0] for slug, row in locked.items()}
+    report_versions = {slug: artifact[0] for slug, artifact in installed_artifacts.items()}
+    if locked_versions != report_versions or locked_versions != metadata_versions:
+        fail(
+            "Python requirements lock, pip report, and installed dist-info set must match exactly"
+        )
+    for slug, (_version, _source_url, artifact_hash) in installed_artifacts.items():
+        if artifact_hash not in locked[slug][1]:
+            fail(f"pip report artifact hash is not allowed by the lock: {slug}")
 
+    supplemental_ownership = supplemental_ownership or {}
     components: dict[str, dict[str, Any]] = {}
     ownership: dict[Path, str] = {}
-    for metadata_path in distribution_metadata_paths(python_root):
+    record_ownership: dict[Path, str] = {}
+    site_package_roots: set[Path] = set()
+    for metadata_path in metadata_paths:
         metadata = email.message_from_bytes(metadata_path.read_bytes())
         name = metadata.get("Name", "").strip()
         version = metadata.get("Version", "").strip()
         if not name or not version:
             fail(f"incomplete Python package metadata: {metadata_path}")
-        slug = re.sub(r"[-_.]+", "-", name).lower()
+        slug = normalized_distribution_name(name)
         component_id = f"python:{slug}"
         if component_id in components:
             fail(f"duplicate Python distribution metadata for {name}")
@@ -739,7 +884,7 @@ def python_components(
             dependency = re.split(r"[ (;<>=!~]", requirement, maxsplit=1)[0]
             if dependency:
                 dependencies.append(
-                    f"python:{re.sub(r'[-_.]+', '-', dependency).lower()}"
+                    f"python:{normalized_distribution_name(dependency)}"
                 )
         components[component_id] = {
             "id": component_id,
@@ -763,12 +908,13 @@ def python_components(
                 )
             components[component_id]["artifact"] = artifact_url
             components[component_id]["artifactSha256"] = artifact_hash
-        elif slug != "pip":
+        else:
             fail(
                 f"installed Python distribution has no hashed pip report entry: {name}"
             )
 
         site_packages = metadata_path.parent.parent
+        site_package_roots.add(site_packages)
         record = metadata_path.parent / "RECORD"
         if not record.is_file():
             fail(f"Python distribution has no RECORD: {name}")
@@ -776,9 +922,45 @@ def python_components(
             for row in csv.reader(stream):
                 if not row:
                     continue
-                candidate = (site_packages / row[0]).resolve(strict=False)
-                encoded_hash = row[1] if len(row) > 1 else ""
-                encoded_size = row[2] if len(row) > 2 else ""
+                if len(row) != 3:
+                    fail(f"Python RECORD row must have exactly three columns: {name}")
+                raw_member = row[0]
+                pure_member = PurePosixPath(raw_member)
+                if (
+                    not raw_member
+                    or "\\" in raw_member
+                    or "\x00" in raw_member
+                    or unicodedata.normalize("NFC", raw_member) != raw_member
+                    or any(
+                        unicodedata.category(character) in {"Cc", "Cs"}
+                        for character in raw_member
+                    )
+                    or pure_member.is_absolute()
+                    or pure_member.as_posix() != raw_member
+                    or any(part in {"", "."} for part in pure_member.parts)
+                ):
+                    fail(f"Python RECORD member path is unsafe or non-normalized: {name}")
+                candidate = site_packages.joinpath(*pure_member.parts).resolve(
+                    strict=False
+                )
+                encoded_hash = row[1]
+                encoded_size = row[2]
+                is_record_self = candidate == record.resolve(strict=True)
+                is_stripped_bytecode = (
+                    candidate.suffix == ".pyc"
+                    and not candidate.exists()
+                    and not candidate.is_symlink()
+                )
+                if is_record_self:
+                    if encoded_hash or encoded_size:
+                        fail(f"Python RECORD self row must have empty hash and size: {name}")
+                elif is_stripped_bytecode:
+                    if encoded_hash or encoded_size:
+                        fail(
+                            f"missing Python bytecode has a retained hash or size: {name}: {row[0]}"
+                        )
+                elif not encoded_hash or not encoded_size:
+                    fail(f"Python RECORD member lacks a hash or size: {name}: {row[0]}")
                 if validate_record_member(
                     candidate,
                     encoded_hash,
@@ -786,6 +968,11 @@ def python_components(
                     python_root=python_root,
                     distribution=name,
                 ):
+                    if candidate in record_ownership:
+                        fail(
+                            f"Python RECORD member has multiple owners: {candidate}"
+                        )
+                    record_ownership[candidate] = component_id
                     ownership[candidate] = component_id
         for path in metadata_path.parent.rglob("*"):
             if path.is_file() or path.is_symlink():
@@ -794,6 +981,21 @@ def python_components(
         fail(
             f"pip install report packages are missing from the runtime: {sorted(installed_artifacts)}"
         )
+    for site_packages in site_package_roots:
+        for path in site_packages.rglob("*"):
+            if not (path.is_file() or path.is_symlink()):
+                continue
+            resolved = path.resolve(strict=False)
+            if resolved not in record_ownership:
+                supplemental_owner = supplemental_ownership.get(resolved)
+                if supplemental_owner is not None:
+                    ownership[resolved] = supplemental_owner
+                    continue
+                runtime_relative = path.relative_to(site_packages).as_posix()
+                if runtime_relative in PYTHON_STANDALONE_SITE_PACKAGES_FILES:
+                    ownership[resolved] = "python-build-standalone"
+                    continue
+                fail(f"site-packages file has no exact Python RECORD owner: {path}")
     return components, ownership
 
 
@@ -857,7 +1059,29 @@ def receipt_dependency_component(
     return component
 
 
-def native_colmap_components(root: Path) -> dict[str, dict[str, Any]]:
+def signed_macho_bridge(
+    distribution_signing: dict[str, Any] | None,
+    relative_path: str,
+) -> dict[str, Any] | None:
+    if distribution_signing is None:
+        return None
+    rows = distribution_signing.get("machOFiles")
+    if not isinstance(rows, list):
+        fail("distribution-signing receipt has no Mach-O bridge array")
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, dict) and row.get("path") == relative_path
+    ]
+    if len(matches) != 1:
+        fail(f"distribution-signing receipt has no unique bridge: {relative_path}")
+    return matches[0]
+
+
+def native_colmap_components(
+    root: Path,
+    distribution_signing: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
     receipt = load_json(root / "provenance" / "colmap.json")
     executable = root / "bin" / "colmap"
     if not executable.is_file():
@@ -869,8 +1093,16 @@ def native_colmap_components(root: Path) -> dict[str, dict[str, Any]]:
     source_commit = str(receipt.get("source_commit") or "")
     if not source.startswith("https://") or not source_version or not source_commit:
         fail("native COLMAP receipt has incomplete source provenance")
-    if receipt.get("executable_sha256") != sha256(executable):
-        fail("native COLMAP receipt does not match the installed executable")
+    build_digest = receipt.get("executable_sha256")
+    installed_digest = sha256(executable)
+    if build_digest != installed_digest:
+        bridge = signed_macho_bridge(distribution_signing, "bin/colmap")
+        if (
+            bridge is None
+            or bridge.get("preSignSHA256") != build_digest
+            or bridge.get("postSignSHA256") != installed_digest
+        ):
+            fail("native COLMAP receipt does not match the installed executable")
     main_license = root / "licenses" / "COLMAP" / "COPYING.txt"
     if not main_license.is_file():
         fail("native COLMAP license is missing")
@@ -907,8 +1139,11 @@ def native_colmap_components(root: Path) -> dict[str, dict[str, Any]]:
     return components
 
 
-def aggregate_native_components(root: Path) -> dict[str, dict[str, Any]]:
-    components = native_colmap_components(root)
+def aggregate_native_components(
+    root: Path,
+    distribution_signing: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    components = native_colmap_components(root, distribution_signing)
     project_license = root / "licenses" / "EasySplat" / "LICENSE"
     if not project_license.is_file():
         fail("EasySplat license is missing")
@@ -998,10 +1233,17 @@ def builder_components(
     root: Path,
     version: str,
     python_components: dict[str, dict[str, Any]],
+    distribution_signing: dict[str, Any] | None = None,
+    *,
+    repository_root: Path | None = None,
+    repository_revision: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     msplat = load_json(root / "msplat" / "build_info.json")
     da3 = load_json(root / "da3_mps" / "build_info.json")
-    repository_revision = run("git", "rev-parse", "HEAD", cwd=root.parents[1]).strip()
+    repository_root = repository_root or Path(__file__).resolve().parents[2]
+    repository_revision = repository_revision or run(
+        "git", "rev-parse", "HEAD", cwd=repository_root
+    ).strip()
     lock_path = root / "da3_mps" / "licenses" / "python-packages-requirements.txt"
     lock_hash = str(da3.get("requirements_lock_sha256") or "")
     if (
@@ -1036,7 +1278,7 @@ def builder_components(
     if "python:opencv-python-headless" in python_components:
         fail("opencv-python-headless is forbidden from the lean release toolchain")
 
-    components = aggregate_native_components(root)
+    components = aggregate_native_components(root, distribution_signing)
     components.update({
         "msplat": {
             "id": "msplat",
@@ -1230,12 +1472,318 @@ def builder_components(
     return components
 
 
+def load_distribution_signing_receipt(
+    root: Path,
+    receipt_path: Path,
+    version: str,
+    packaged_machos: set[Path],
+    *,
+    repository_root: Path | None = None,
+    repository_commit: str | None = None,
+) -> dict[str, Any]:
+    expected_path = root / "provenance" / "distribution-signing.json"
+    try:
+        if receipt_path.resolve(strict=True) != expected_path.resolve(strict=True):
+            fail(
+                "distribution-signing receipt must be the canonical internal provenance file"
+            )
+        metadata = expected_path.lstat()
+    except OSError as exc:
+        fail(f"distribution-signing receipt is missing or unsafe: {exc}")
+    if (
+        expected_path.is_symlink()
+        or not expected_path.is_file()
+        or metadata.st_nlink != 1
+        or metadata.st_size > MAX_DISTRIBUTION_SIGNING_RECEIPT_BYTES
+    ):
+        fail("distribution-signing receipt is unsafe or exceeds 1 MiB")
+    receipt = load_json(expected_path)
+    required = {
+        "schemaVersion",
+        "kind",
+        "toolchainVersion",
+        "identityFingerprintSHA1",
+        "teamID",
+        "signedAt",
+        "sourceCommit",
+        "sourceInputs",
+        "unsignedComponentArchives",
+        "builderAttestedUnsignedRequestSHA256",
+        "builderAttestedUnsignedManifestSHA256",
+        "unsignedSupplyChainSHA256",
+        "machOFiles",
+        "recordRepairs",
+    }
+    if set(receipt) != required:
+        fail("distribution-signing receipt fields do not match schema 1")
+    if (
+        receipt.get("schemaVersion") != 1
+        or receipt.get("kind") != "easysplat-distribution-signing"
+        or receipt.get("toolchainVersion") != version
+        or not re.fullmatch(
+            r"[0-9A-F]{40}", str(receipt.get("identityFingerprintSHA1") or "")
+        )
+        or not re.fullmatch(r"[A-Z0-9]{10}", str(receipt.get("teamID") or ""))
+        or not re.fullmatch(r"[0-9a-f]{40}", str(receipt.get("sourceCommit") or ""))
+        or not SHA256_PATTERN.fullmatch(
+            str(receipt.get("unsignedSupplyChainSHA256") or "")
+        )
+        or not SHA256_PATTERN.fullmatch(
+            str(receipt.get("builderAttestedUnsignedRequestSHA256") or "")
+        )
+        or not SHA256_PATTERN.fullmatch(
+            str(receipt.get("builderAttestedUnsignedManifestSHA256") or "")
+        )
+        or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+            str(receipt.get("signedAt") or ""),
+        )
+    ):
+        fail("distribution-signing receipt identity or version fields are invalid")
+    repository_root = repository_root or Path(__file__).resolve().parents[2]
+    repository_commit = repository_commit or run(
+        "git", "rev-parse", "HEAD", cwd=repository_root
+    ).strip()
+    if receipt["sourceCommit"] != repository_commit:
+        fail("distribution-signing receipt is not bound to the current source commit")
+    source_inputs = receipt.get("sourceInputs")
+    if not isinstance(source_inputs, list) or not source_inputs:
+        fail("distribution-signing receipt has no tracked source-input closure")
+    bound_inputs: set[str] = set()
+    for row in source_inputs:
+        if not isinstance(row, dict) or set(row) != {"path", "sha256"}:
+            fail("distribution-signing source-input row is invalid")
+        relative = str(row.get("path") or "")
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or ".." in pure.parts or relative in bound_inputs:
+            fail("distribution-signing source-input path is unsafe or duplicated")
+        source = repository_root.joinpath(*pure.parts)
+        if (
+            not source.is_file()
+            or source.is_symlink()
+            or row.get("sha256") != sha256(source)
+        ):
+            fail(f"distribution-signing source input does not match tracked bytes: {relative}")
+        bound_inputs.add(relative)
+    if bound_inputs != DISTRIBUTION_SIGNING_SOURCE_INPUTS:
+        fail("distribution-signing tracked source-input closure is incomplete")
+
+    unsigned_archives = receipt.get("unsignedComponentArchives")
+    if not isinstance(unsigned_archives, list) or len(unsigned_archives) != 3:
+        fail("distribution-signing receipt has an invalid source archive closure")
+    archive_components: set[str] = set()
+    for row in unsigned_archives:
+        if not isinstance(row, dict) or set(row) != {
+            "component",
+            "name",
+            "sha256",
+            "size",
+        }:
+            fail("distribution-signing source archive row is invalid")
+        component = str(row.get("component") or "")
+        name = str(row.get("name") or "")
+        size = row.get("size")
+        if (
+            component in archive_components
+            or component not in {"core", "base", "small"}
+            or PurePosixPath(name).name != name
+            or any(ord(character) <= 0x20 or ord(character) >= 0x7F for character in name)
+            or not name.endswith(".zip")
+            or not SHA256_PATTERN.fullmatch(str(row.get("sha256") or ""))
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+            or size >= 2 * 1024 * 1024 * 1024
+        ):
+            fail("distribution-signing source archive identity is invalid")
+        archive_components.add(component)
+    if archive_components != {"core", "base", "small"}:
+        fail("distribution-signing source archive component set is incomplete")
+
+    source_manifest = root / "supply-chain" / "components.json"
+    if (
+        not source_manifest.is_file()
+        or source_manifest.is_symlink()
+        or source_manifest.stat().st_size > 16 * 1024 * 1024
+        or sha256(source_manifest) != receipt["unsignedSupplyChainSHA256"]
+    ):
+        fail("distribution-signing receipt does not bind the unsigned supply-chain manifest")
+    source_payload = load_json(source_manifest)
+    source_file_rows = source_payload.get("files")
+    if not isinstance(source_file_rows, list):
+        fail("unsigned supply-chain manifest has no file closure")
+    source_files: dict[str, dict[str, Any]] = {}
+    for row in source_file_rows:
+        if not isinstance(row, dict):
+            fail("unsigned supply-chain manifest contains a non-object file row")
+        relative = str(row.get("path") or "")
+        if relative in source_files:
+            fail("unsigned supply-chain manifest contains duplicate file rows")
+        source_files[relative] = row
+
+    raw_machos = receipt.get("machOFiles")
+    if not isinstance(raw_machos, list):
+        fail("distribution-signing receipt has no Mach-O file closure")
+    receipt_paths: set[str] = set()
+    python_record_provenance: dict[str, tuple[str, str]] = {}
+    for row in raw_machos:
+        if not isinstance(row, dict) or set(row) != {
+            "path",
+            "component",
+            "preSignSHA256",
+            "postSignSHA256",
+            "preSignProvenance",
+            "codesign",
+        }:
+            fail("distribution-signing receipt contains a non-object Mach-O row")
+        relative = str(row.get("path") or "")
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or ".." in pure.parts or relative in receipt_paths:
+            fail("distribution-signing receipt has unsafe or duplicate Mach-O paths")
+        path = root.joinpath(*pure.parts)
+        source_row = source_files.get(relative)
+        provenance = row.get("preSignProvenance")
+        if (
+            not path.is_file()
+            or path.is_symlink()
+            or path.resolve(strict=True) not in packaged_machos
+            or not SHA256_PATTERN.fullmatch(str(row.get("preSignSHA256") or ""))
+            or row.get("postSignSHA256") != sha256(path)
+            or not isinstance(provenance, list)
+            or source_row is None
+            or source_row.get("kind") != "mach-o"
+            or source_row.get("sha256") != row.get("preSignSHA256")
+            or source_row.get("component") != row.get("component")
+            or not isinstance(row.get("codesign"), dict)
+            or row["codesign"].get("teamIdentifier") != receipt["teamID"]
+            or row["codesign"].get("hardenedRuntime") is not True
+        ):
+            fail(f"distribution-signing Mach-O bridge is stale or invalid: {relative}")
+        supply_rows = [
+            item
+            for item in provenance
+            if isinstance(item, dict) and item.get("kind") == "supply-chain"
+        ]
+        if supply_rows != [
+            {
+                "kind": "supply-chain",
+                "path": "supply-chain/components.json",
+                "component": row["component"],
+                "sha256": row["preSignSHA256"],
+            }
+        ]:
+            fail(f"distribution-signing Mach-O lacks exact source provenance: {relative}")
+        record_rows = [
+            item
+            for item in provenance
+            if isinstance(item, dict) and item.get("kind") == "python-record"
+        ]
+        if len(record_rows) > 1:
+            fail(f"distribution-signing Mach-O has ambiguous RECORD provenance: {relative}")
+        if record_rows:
+            record_row = record_rows[0]
+            if set(record_row) != {"kind", "path", "member", "sha256"} or record_row.get(
+                "sha256"
+            ) != row.get("preSignSHA256"):
+                fail(f"distribution-signing Python RECORD provenance is invalid: {relative}")
+            python_record_provenance[relative] = (
+                str(record_row.get("path") or ""),
+                str(record_row.get("member") or ""),
+            )
+        for item in provenance:
+            if not isinstance(item, dict) or item.get("kind") not in {
+                "supply-chain",
+                "build-receipt",
+                "python-record",
+            }:
+                fail(f"distribution-signing Mach-O has unknown provenance: {relative}")
+        receipt_paths.add(relative)
+    actual_paths = {
+        path.relative_to(root).as_posix() for path in packaged_machos
+    }
+    if receipt_paths != actual_paths:
+        fail("distribution-signing receipt has a missing or extra Mach-O bridge")
+
+    repairs = receipt.get("recordRepairs")
+    if not isinstance(repairs, list):
+        fail("distribution-signing receipt has no RECORD repair closure")
+    repaired_paths: set[str] = set()
+    repaired_members: set[str] = set()
+    for row in repairs:
+        if not isinstance(row, dict):
+            fail("distribution-signing receipt contains a non-object RECORD repair")
+        relative = str(row.get("path") or "")
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        members = row.get("signedMembers")
+        source_record = source_files.get(relative)
+        if (
+            relative in repaired_paths
+            or not relative.endswith(".dist-info/RECORD")
+            or not path.is_file()
+            or path.is_symlink()
+            or not SHA256_PATTERN.fullmatch(str(row.get("preRepairSHA256") or ""))
+            or row.get("postRepairSHA256") != sha256(path)
+            or source_record is None
+            or source_record.get("sha256") != row.get("preRepairSHA256")
+            or not isinstance(members, list)
+            or not members
+        ):
+            fail(f"distribution-signing RECORD repair is stale or invalid: {relative}")
+        for member in members:
+            if not isinstance(member, dict) or set(member) != {
+                "path",
+                "preSignSHA256",
+                "postSignSHA256",
+            }:
+                fail(f"distribution-signing RECORD repair member is invalid: {relative}")
+            member_path = str(member.get("path") or "")
+            macho_row = next(
+                (
+                    candidate
+                    for candidate in raw_machos
+                    if isinstance(candidate, dict) and candidate.get("path") == member_path
+                ),
+                None,
+            )
+            provenance_path = python_record_provenance.get(member_path, ("", ""))[0]
+            if (
+                member_path in repaired_members
+                or macho_row is None
+                or provenance_path != relative
+                or member.get("preSignSHA256") != macho_row.get("preSignSHA256")
+                or member.get("postSignSHA256") != macho_row.get("postSignSHA256")
+            ):
+                fail(f"distribution-signing RECORD repair member is stale: {member_path}")
+            repaired_members.add(member_path)
+        repaired_paths.add(relative)
+    if repaired_members != set(python_record_provenance):
+        fail("distribution-signing RECORD repair member closure is incomplete")
+    return receipt
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--toolchain-root", type=Path, required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--distribution-signing-receipt", type=Path)
+    parser.add_argument("--reviewed-source-root", type=Path)
+    parser.add_argument("--reviewed-source-commit")
     args = parser.parse_args()
     root = args.toolchain_root.resolve()
+    if (args.reviewed_source_root is None) != (
+        args.reviewed_source_commit is None
+    ):
+        fail("reviewed source root and commit must be supplied together")
+    if args.reviewed_source_root is None:
+        repository_root = Path(__file__).resolve().parents[2]
+        repository_commit = run(
+            "git", "rev-parse", "HEAD", cwd=repository_root
+        ).strip()
+    else:
+        repository_root = args.reviewed_source_root.resolve(strict=True)
+        repository_commit = str(args.reviewed_source_commit)
+        if not re.fullmatch(r"[0-9a-f]{40}", repository_commit):
+            fail("reviewed source commit must be a full Git commit")
 
     packaged_machos: set[Path] = set()
     for candidate in root.rglob("*"):
@@ -1245,10 +1793,43 @@ def main() -> int:
             validate_arm64_only(source)
             validate_macos_15_compatibility(source)
 
-    validate_supplemental_license_receipts(root)
-    distributions, python_ownership = python_components(root)
-    components = builder_components(root, args.version, distributions)
+    distribution_signing = None
+    if args.distribution_signing_receipt is not None:
+        distribution_signing = load_distribution_signing_receipt(
+            root,
+            args.distribution_signing_receipt,
+            args.version,
+            packaged_machos,
+            repository_root=repository_root,
+            repository_commit=repository_commit,
+        )
+
+    supplemental_ownership = validate_supplemental_license_receipts(root)
+    distributions, python_ownership = python_components(
+        root, supplemental_ownership=supplemental_ownership
+    )
+    components = builder_components(
+        root,
+        args.version,
+        distributions,
+        distribution_signing,
+        repository_root=repository_root,
+        repository_revision=repository_commit,
+    )
     components.update(distributions)
+    if distribution_signing is not None:
+        components["easysplat-distribution-signing"] = {
+            "id": "easysplat-distribution-signing",
+            "name": "EasySplat distribution signing",
+            "type": "distribution-signing",
+            "version": args.version,
+            "revision": f"sha256:{sha256(root / 'provenance/distribution-signing.json')}",
+            "source": "https://github.com/dud8/EasySplat",
+            "license": "MIT",
+            "licenseFiles": ["licenses/EasySplat/LICENSE"],
+            "linkage": "distribution-process",
+            "dependencies": [],
+        }
 
     ownership: dict[str, str] = {
         "bin/colmap": "colmap",
@@ -1260,6 +1841,10 @@ def main() -> int:
         "provenance/ceres.json": "ceres",
         "provenance/openimageio.json": "openimageio",
     }
+    if distribution_signing is not None:
+        ownership["provenance/distribution-signing.json"] = (
+            "easysplat-distribution-signing"
+        )
     license_ownership: dict[str, str] = {}
     for component_id, component in components.items():
         for license_file in component.get("licenseFiles", []):
@@ -1361,6 +1946,7 @@ def main() -> int:
                     components[owner]["dependencies"].append(dependency_owner)
 
     resolve_installed_dependencies(components)
+    validate_component_urls(components)
     for component_id, component in components.items():
         component["buildCommand"] = component_build_command(component_id, component)
         required = (

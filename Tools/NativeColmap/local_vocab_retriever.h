@@ -5,6 +5,6 @@
 
 namespace colmap {
 
-int RunLocalVocabularyRetriever(int argc, char** argv);
+int RunLocalVocabularyRetriever(int argc, char **argv);
 
-}  // namespace colmap
+} // namespace colmap
