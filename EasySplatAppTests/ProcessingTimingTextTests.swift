@@ -164,34 +164,77 @@ final class ProcessingTimingTextTests: XCTestCase {
         )
     }
 
-    func testMoreMemoryRecoveryChangesOnlyTheTrainingContract() throws {
+    func testMoreMemoryRecoveryChangesOnlyTheTrainingContract() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        let projectURL = root.appendingPathComponent("Retry.easysplatproj", isDirectory: true)
-        let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let sourcePhotos = root.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let sourcePhoto = sourcePhotos.appendingPathComponent("source.png")
+        let photoBytes = try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        try photoBytes.write(to: sourcePhoto, options: [.atomic])
+
         let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
-        let input = InputSpec.photos(folder: "/tmp/photos")
+        let requestedInput = InputSpec.photos(folder: sourcePhotos.path)
         let options = RequestedRunOptions(
             detailProfile: .balanced,
             resourcePolicy: .automatic
         )
         let originalPlan = RunPlanResolver.resolve(
             requestedOptions: options,
-            input: input,
+            input: requestedInput,
             hardware: hardware,
             developmentOverrides: .none
         )
-        try ProjectMetadataStore.save(
-            ProjectMetadata(
-                title: "Retry",
-                input: input,
-                requestedRunOptions: options,
-                resolvedRunPlan: originalPlan
+        let prepared = try await PhotoInputPreflight.prepare(
+            folder: sourcePhotos,
+            stagingParent: root,
+            photoSelection: originalPlan.photoSelection,
+            inputOrdering: originalPlan.inputOrdering,
+            keyframeBudget: originalPlan.keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: 0,
+            limits: .init(
+                maximumPhotoCount: 4,
+                maximumTotalBytes: 4 * 1_024 * 1_024,
+                maximumSinglePhotoBytes: 1_024 * 1_024,
+                maximumPixelCount: 1_024 * 1_024,
+                maximumDecodedDimension: 128,
+                maximumTraversalEntryCount: 8,
+                maximumRecursionDepth: 2,
+                minimumFreeSpaceReserveBytes: 0
             ),
-            to: paths.metadataURL
+            progress: { _, _ in }
         )
+        defer { prepared.discard() }
+        XCTAssertEqual(prepared.photos.count, 1)
+
+        let projectURL = root.appendingPathComponent("Retry.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        var adoption = ProjectInputAdoption(requestedInput: requestedInput)
+        try adoption.adoptPhotos(prepared, into: paths)
+        let input = adoption.input
+        let metadata = ProjectMetadata(
+            title: "Retry",
+            input: input,
+            photoInputReceipts: try XCTUnwrap(adoption.photoInputReceipts),
+            photoSelectionReceipt: try XCTUnwrap(adoption.photoSelectionReceipt),
+            requestedRunOptions: options,
+            resolvedRunPlan: originalPlan
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try PhotoInputReceiptValidator.validateFiles(metadata: metadata, paths: paths)
         let model = AppModel(
             toolchainManager: MockToolchainManager(),
             projectBaseURL: root,

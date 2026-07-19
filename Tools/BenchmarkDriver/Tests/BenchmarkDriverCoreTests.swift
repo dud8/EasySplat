@@ -47,6 +47,22 @@ private final class MonitorResultBox: @unchecked Sendable {
     }
 }
 
+private func makeTestPowerSourceRunLoopSource() -> CFRunLoopSource? {
+    var context = CFRunLoopSourceContext(
+        version: 0,
+        info: nil,
+        retain: nil,
+        release: nil,
+        copyDescription: nil,
+        equal: nil,
+        hash: nil,
+        schedule: nil,
+        cancel: nil,
+        perform: { _ in }
+    )
+    return CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &context)
+}
+
 final class BenchmarkDriverCoreTests: XCTestCase {
     func testRenderCameraDigestMatchesSharedFloat32Vector() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
@@ -124,10 +140,12 @@ final class BenchmarkDriverCoreTests: XCTestCase {
 
         var stopByte: UInt8 = 1
         XCTAssertEqual(write(stopDescriptors[1], &stopByte, 1), 1)
-        let receipt = try HostStateMonitor.capture(
+        let receipt = try HostStateMonitor.captureForTesting(
             sampleIntervalSeconds: 0.05,
             readyFileDescriptor: readyDescriptors[1],
-            stopFileDescriptor: stopDescriptors[0]
+            stopFileDescriptor: stopDescriptors[0],
+            notificationCenter: NotificationCenter(),
+            snapshotProvider: HostSnapshotFixture().capture
         )
 
         var readyByte: UInt8 = 0
@@ -330,6 +348,7 @@ final class BenchmarkDriverCoreTests: XCTestCase {
             try PowerSourceChangeObserver.startForTesting(
                 startupTimeoutSeconds: 0.01,
                 shutdownTimeoutSeconds: 1,
+                sourceFactory: { _ in makeTestPowerSourceRunLoopSource() },
                 beforeSourceCreation: {
                     startupEntered.signal()
                     releaseStartup.wait()
@@ -351,6 +370,7 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         let observer = try PowerSourceChangeObserver.startForTesting(
             startupTimeoutSeconds: 1,
             shutdownTimeoutSeconds: 1,
+            sourceFactory: { _ in makeTestPowerSourceRunLoopSource() },
             beforeThreadExit: {
                 threadReachedExit.signal()
                 releaseThreadExit.wait()
@@ -363,6 +383,18 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         XCTAssertEqual(threadReachedExit.wait(timeout: .now()), .success)
         releaseThreadExit.signal()
         XCTAssertNoThrow(try observer.stop(timeoutSeconds: 1))
+    }
+
+    func testPowerSourceObserverRejectsUnavailableNotificationSource() throws {
+        XCTAssertThrowsError(
+            try PowerSourceChangeObserver.startForTesting(
+                startupTimeoutSeconds: 1,
+                shutdownTimeoutSeconds: 1,
+                sourceFactory: { _ in nil }
+            )
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("could not observe"))
+        }
     }
 
     func testHostStateMonitorRejectsAClosedStopDescriptor() throws {

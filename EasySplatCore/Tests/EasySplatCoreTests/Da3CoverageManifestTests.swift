@@ -63,7 +63,6 @@ final class Da3CoverageManifestTests: XCTestCase {
           "requested_device": "mps",
           "selected_device": "mps",
           "model_subdir": "DA3-BASE",
-          "fallback_model_subdir": "DA3-SMALL",
           "process_res": 504,
           "camera_type": "PINHOLE",
           "shared_camera": false,
@@ -127,6 +126,53 @@ final class Da3CoverageManifestTests: XCTestCase {
         )
 
         XCTAssertTrue(issues.contains(where: { $0.contains("required seed_refine") }))
+    }
+
+    func testValidationRejectsRequestedMPSResolvedAsCPU() {
+        let selected = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        var manifest = makeSeedManifest(
+            selectedNames: selected,
+            ordering: .continuous,
+            windows: [
+                .init(start: 0, end: 4, images: selected, indices: [0, 1, 2, 3])
+            ]
+        )
+        manifest.selectedDevice = "cpu"
+
+        let issues = manifest.validationIssues(
+            selectedImageNames: selected,
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .continuous
+        )
+
+        XCTAssertTrue(issues.contains(where: {
+            $0.contains("selected_device=cpu") && $0.contains("required mps")
+        }))
+    }
+
+    func testValidationRejectsCPUBoundManifestForMPSPlan() {
+        let selected = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        var manifest = makeSeedManifest(
+            selectedNames: selected,
+            ordering: .continuous,
+            windows: [
+                .init(start: 0, end: 4, images: selected, indices: [0, 1, 2, 3])
+            ]
+        )
+        manifest.requestedDevice = "cpu"
+        manifest.selectedDevice = "cpu"
+
+        let issues = manifest.validationIssues(
+            selectedImageNames: selected,
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .continuous
+        )
+
+        XCTAssertTrue(issues.contains(where: {
+            $0.contains("requested_device=cpu") && $0.contains("required mps")
+        }))
     }
 
     func testSeedValidationAcceptsTwoViewSingleWindowAnchors() {
@@ -415,7 +461,6 @@ final class Da3CoverageManifestTests: XCTestCase {
             ]
         )
         manifest.modelSubdirectory = "DA3-SMALL"
-        manifest.fallbackModelSubdirectory = "DA3-TINY"
         manifest.processResolution = 392
         manifest.maxPoints = 60_000
         manifest.cameraType = "SIMPLE_RADIAL"
@@ -429,15 +474,14 @@ final class Da3CoverageManifestTests: XCTestCase {
             expectedMaxPoints: 120_000,
             expectedCameraType: "PINHOLE",
             expectedSharedCamera: true,
-            expectedPrimaryModelSubdirectory: "DA3-BASE",
-            expectedFallbackModelSubdirectory: "DA3-SMALL"
+            expectedModelSubdirectory: "DA3-BASE"
         )
 
         XCTAssertTrue(issues.contains(where: { $0.contains("process_res=392") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("max_points=60000") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("camera_type=SIMPLE_RADIAL") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("shared_camera=false") }))
-        XCTAssertTrue(issues.contains(where: { $0.contains("fallback_model_subdir=DA3-TINY") }))
+        XCTAssertTrue(issues.contains(where: { $0.contains("model_subdir=DA3-SMALL") }))
     }
 
     private func makeSeedManifest(
@@ -450,7 +494,6 @@ final class Da3CoverageManifestTests: XCTestCase {
             requestedDevice: "mps",
             selectedDevice: "mps",
             modelSubdirectory: "DA3-BASE",
-            fallbackModelSubdirectory: "DA3-SMALL",
             processResolution: 504,
             cameraType: "PINHOLE",
             sharedCamera: false,

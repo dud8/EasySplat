@@ -57,8 +57,12 @@ enum GeometryModelSnapshot {
     }
 
     private static let requiredFiles = ["cameras.txt", "images.txt", "points3D.txt"]
+    private static let cancellationIntervalBytes: UInt64 = 4 * 1_024 * 1_024
 
-    static func capture(in directory: URL) throws -> Verified {
+    static func capture(
+        in directory: URL,
+        checkCancellation: () throws -> Void = {}
+    ) throws -> Verified {
         let descriptor = try openDirectory(at: directory)
         defer { Darwin.close(descriptor) }
 
@@ -66,7 +70,14 @@ enum GeometryModelSnapshot {
         guard (initial.st_mode & S_IFMT) == S_IFDIR else { throw Error.unsafeModel }
         let identity = directoryIdentity(initial)
         let files = try Dictionary(uniqueKeysWithValues: requiredFiles.map { name in
-            (name, try captureFile(named: name, in: descriptor))
+            (
+                name,
+                try captureFile(
+                    named: name,
+                    in: descriptor,
+                    checkCancellation: checkCancellation
+                )
+            )
         })
         let state = DirectoryState(identity: identity, files: files)
         guard try matches(state, directoryDescriptor: descriptor) else {
@@ -88,7 +99,11 @@ enum GeometryModelSnapshot {
         }
     }
 
-    private static func captureFile(named name: String, in directory: Int32) throws -> FileState {
+    private static func captureFile(
+        named name: String,
+        in directory: Int32,
+        checkCancellation: () throws -> Void
+    ) throws -> FileState {
         let descriptor = try openFile(named: name, in: directory)
         defer { Darwin.close(descriptor) }
         let initial = try status(of: descriptor)
@@ -96,6 +111,7 @@ enum GeometryModelSnapshot {
 
         let expectedByteCount = UInt64(initial.st_size)
         var consumed: UInt64 = 0
+        var nextCancellationCheck = cancellationIntervalBytes
         var digest = SHA256()
         var buffer = [UInt8](repeating: 0, count: 1_048_576)
         while true {
@@ -111,6 +127,10 @@ enum GeometryModelSnapshot {
             }
             digest.update(data: Data(buffer[0..<count]))
             consumed += UInt64(count)
+            if consumed >= nextCancellationCheck {
+                try checkCancellation()
+                nextCancellationCheck += cancellationIntervalBytes
+            }
         }
 
         let final = try status(of: descriptor)

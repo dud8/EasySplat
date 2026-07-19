@@ -91,6 +91,11 @@ struct VideoTrackDescriptor: Equatable, Sendable {
     }
 }
 
+struct PrimaryVideoTrackSelection {
+    let track: AVAssetTrack
+    let descriptor: VideoTrackDescriptor
+}
+
 struct FrameAnalysisDimensions: Equatable, Sendable {
     let width: Int
     let height: Int
@@ -179,6 +184,11 @@ struct FrameExtractionSource: @unchecked Sendable {
     let preferredTransform: CGAffineTransform
 
     var durationSeconds: Double { primaryTrack.durationSeconds }
+}
+
+struct ExtractedFrameOutput: Equatable, Sendable {
+    let url: URL
+    let origin: VideoFrameOrigin
 }
 
 public final class FrameExtractor {
@@ -275,6 +285,8 @@ public final class FrameExtractor {
             }
             guard bestDelta <= maximumDeltaSeconds,
                   let bestSample,
+                  let bestTime,
+                  CMTimeCompare(bestTime, targetTime) == 0,
                   let imageBuffer = CMSampleBufferGetImageBuffer(bestSample),
                   let image = FrameExtractor.makeCGImage(
                     from: imageBuffer,
@@ -303,7 +315,7 @@ public final class FrameExtractor {
                 progress(fraction * 0.45, message)
             }
         )
-        return try await extractFrames(
+        return try await extractFrameOutputs(
             from: analysis,
             targetCount: options.targetCount,
             to: outputDir,
@@ -311,7 +323,7 @@ public final class FrameExtractor {
             progress: { fraction, message in
                 progress(0.45 + fraction * 0.55, message)
             }
-        )
+        ).map(\.url)
     }
 
     func analyze(
@@ -389,6 +401,22 @@ public final class FrameExtractor {
         options: FrameExtractionOptions,
         progress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> [URL] {
+        try await extractFrameOutputs(
+            from: analysis,
+            targetCount: targetCount,
+            to: outputDir,
+            options: options,
+            progress: progress
+        ).map(\.url)
+    }
+
+    func extractFrameOutputs(
+        from analysis: FrameExtractionAnalysis,
+        targetCount: Int,
+        to outputDir: URL,
+        options: FrameExtractionOptions,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> [ExtractedFrameOutput] {
         let selected = SmartFrameSelection.selectTimeline(
             analysis.candidates,
             targetCount: max(1, targetCount),
@@ -410,7 +438,7 @@ public final class FrameExtractor {
             height: analysis.primaryTrack.height
         )
         let trackTimeRange = try await primary.track.load(.timeRange)
-        let outputURLs = try await extractSelectedFramesThroughStaging(
+        let outputs = try await extractSelectedFramesThroughStaging(
             selected,
             analysis: analysis,
             asset: asset,
@@ -421,13 +449,60 @@ public final class FrameExtractor {
             options: options,
             progress: progress
         )
-        progress(1, "Extracted \(outputURLs.count) frame(s)")
-        return outputURLs
+        progress(1, "Extracted \(outputs.count) frame(s)")
+        return outputs
     }
 
-    private static func loadPrimaryTrack(
+    func reextractRecordedFrames(
+        from videoURL: URL,
+        origins: [VideoFrameOrigin],
+        to outputDir: URL,
+        options: FrameExtractionOptions
+    ) async throws -> (source: FrameExtractionSource, outputs: [ExtractedFrameOutput]) {
+        guard !origins.isEmpty,
+              Set(origins.map(\.decodedFrameIndex)).count == origins.count else {
+            throw ExtractionError.invalidVideo
+        }
+        let source = try await inspect(videoURL)
+        let candidates = origins.map { origin in
+            TimedFrameCandidate(
+                frameIndex: origin.decodedFrameIndex,
+                timestampSeconds: origin.timestampSeconds,
+                candidate: SmartFrameCandidate(
+                    index: origin.decodedFrameIndex,
+                    sharpness: 1
+                ),
+                presentationTime: origin.presentationTime
+            )
+        }
+        let analysis = FrameExtractionAnalysis(
+            videoURL: videoURL,
+            primaryTrack: source.primaryTrack,
+            durationSeconds: source.durationSeconds,
+            preferredTransform: source.preferredTransform,
+            candidates: candidates,
+            decodedFrameCount: (origins.map(\.decodedFrameIndex).max() ?? -1) + 1,
+            hadRepairedTimestamps: origins.contains(where: \.timestampWasRepaired)
+        )
+        var exactOptions = options
+        exactOptions.targetCount = origins.count
+        exactOptions.minDistanceRatio = 0
+        let outputs = try await extractFrameOutputs(
+            from: analysis,
+            targetCount: origins.count,
+            to: outputDir,
+            options: exactOptions,
+            progress: { _, _ in }
+        )
+        guard outputs.map(\.origin) == origins else {
+            throw ExtractionError.extractionFailed
+        }
+        return (source, outputs)
+    }
+
+    static func loadPrimaryTrack(
         from tracks: [AVAssetTrack]
-    ) async throws -> (track: AVAssetTrack, descriptor: VideoTrackDescriptor) {
+    ) async throws -> PrimaryVideoTrackSelection {
         var descriptors: [VideoTrackDescriptor] = []
         descriptors.reserveCapacity(tracks.count)
         for (index, track) in tracks.enumerated() {
@@ -460,7 +535,10 @@ public final class FrameExtractor {
               descriptor.height > 0 else {
             throw ExtractionError.invalidVideo
         }
-        return (tracks[selectedIndex], descriptor)
+        return PrimaryVideoTrackSelection(
+            track: tracks[selectedIndex],
+            descriptor: descriptor
+        )
     }
 
     private func analyzeFrames(
@@ -616,7 +694,7 @@ public final class FrameExtractor {
         to outputDir: URL,
         options: FrameExtractionOptions,
         progress: @escaping @Sendable (Double, String) -> Void
-    ) async throws -> [URL] {
+    ) async throws -> [ExtractedFrameOutput] {
         let fileManager = FileManager.default
         let parent = outputDir.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -636,11 +714,11 @@ public final class FrameExtractor {
             decodedFrameCount: analysis.decodedFrameCount,
             hadRepairedTimestamps: analysis.hadRepairedTimestamps
         )
-        let stagedURLs: [URL]
+        let stagedOutputs: [ExtractedFrameOutput]
         switch strategy {
         case .sparse:
             do {
-                stagedURLs = try await extractSelectedFramesSparsely(
+                stagedOutputs = try await extractSelectedFramesSparsely(
                     selected,
                     asset: asset,
                     track: track,
@@ -664,7 +742,7 @@ public final class FrameExtractor {
                     at: staging,
                     withIntermediateDirectories: false
                 )
-                stagedURLs = try await extractSelectedFramesSequentially(
+                stagedOutputs = try await extractSelectedFramesSequentially(
                     selected,
                     asset: asset,
                     track: track,
@@ -679,7 +757,7 @@ public final class FrameExtractor {
                 )
             }
         case .sequential:
-            stagedURLs = try await extractSelectedFramesSequentially(
+            stagedOutputs = try await extractSelectedFramesSequentially(
                 selected,
                 asset: asset,
                 track: track,
@@ -693,7 +771,7 @@ public final class FrameExtractor {
         }
 
         try Task.checkCancellation()
-        guard stagedURLs.count == selected.count else {
+        guard stagedOutputs.count == selected.count else {
             throw ExtractionError.extractionFailed
         }
         let destinationExists = fileManager.fileExists(atPath: outputDir.path)
@@ -702,8 +780,11 @@ public final class FrameExtractor {
             try fileManager.removeItem(at: outputDir)
         }
         try fileManager.moveItem(at: staging, to: outputDir)
-        return stagedURLs.map {
-            outputDir.appendingPathComponent($0.lastPathComponent)
+        return stagedOutputs.map {
+            ExtractedFrameOutput(
+                url: outputDir.appendingPathComponent($0.url.lastPathComponent),
+                origin: $0.origin
+            )
         }
     }
 
@@ -717,7 +798,7 @@ public final class FrameExtractor {
         to outputDir: URL,
         options: FrameExtractionOptions,
         progress: @escaping @Sendable (Double, String) -> Void
-    ) async throws -> [URL] {
+    ) async throws -> [ExtractedFrameOutput] {
         let requestedLongEdge = Int(options.maxDimension.rounded(.down))
         let outputDimensions = requestedLongEdge > 1
             ? Self.analysisDimensions(
@@ -739,8 +820,8 @@ public final class FrameExtractor {
             }
         }
         let context = Self.makeCIContext()
-        var outputURLs: [URL] = []
-        outputURLs.reserveCapacity(selected.count)
+        var outputs: [ExtractedFrameOutput] = []
+        outputs.reserveCapacity(selected.count)
         var pendingWrites: [(image: CGImage, url: URL)] = []
         pendingWrites.reserveCapacity(Self.maximumConcurrentFrameJobs)
         var selectedIndex = 0
@@ -760,6 +841,17 @@ public final class FrameExtractor {
             guard frameIndex == target.frameIndex else {
                 frameIndex += 1
                 continue
+            }
+            if let expectedPresentationTime = target.presentationTime {
+                let actualPresentationTime = CMSampleBufferGetPresentationTimeStamp(
+                    sampleBuffer
+                )
+                guard actualPresentationTime.isValid,
+                      actualPresentationTime.isNumeric,
+                      actualPresentationTime.epoch == 0,
+                      CMTimeCompare(actualPresentationTime, expectedPresentationTime) == 0 else {
+                    throw ExtractionError.extractionFailed
+                }
             }
             guard let image = Self.makeCGImage(
                     from: imageBuffer,
@@ -783,11 +875,17 @@ public final class FrameExtractor {
                     pendingWrites,
                     format: options.outputFormat
                 )
-                outputURLs.append(contentsOf: pendingWrites.map(\.url))
-                let fraction = Double(outputURLs.count) / Double(selected.count)
+                outputs.append(contentsOf: pendingWrites.enumerated().map { offset, write in
+                    let selectedOffset = outputs.count + offset
+                    return ExtractedFrameOutput(
+                        url: write.url,
+                        origin: VideoFrameOrigin(candidate: selected[selectedOffset])
+                    )
+                })
+                let fraction = Double(outputs.count) / Double(selected.count)
                 progress(
                     fraction,
-                    "Extracting selected frames \(outputURLs.count)/\(selected.count)"
+                    "Extracting selected frames \(outputs.count)/\(selected.count)"
                 )
                 pendingWrites.removeAll(keepingCapacity: true)
             }
@@ -798,17 +896,22 @@ public final class FrameExtractor {
         try Task.checkCancellation()
         if !pendingWrites.isEmpty {
             try await Self.writeImages(pendingWrites, format: options.outputFormat)
-            outputURLs.append(contentsOf: pendingWrites.map(\.url))
-            let fraction = Double(outputURLs.count) / Double(selected.count)
+            outputs.append(contentsOf: pendingWrites.enumerated().map { offset, write in
+                ExtractedFrameOutput(
+                    url: write.url,
+                    origin: VideoFrameOrigin(candidate: selected[outputs.count + offset])
+                )
+            })
+            let fraction = Double(outputs.count) / Double(selected.count)
             progress(
                 fraction,
-                "Extracting selected frames \(outputURLs.count)/\(selected.count)"
+                "Extracting selected frames \(outputs.count)/\(selected.count)"
             )
         }
-        guard outputURLs.count == selected.count else {
+        guard outputs.count == selected.count else {
             throw ExtractionError.extractionFailed
         }
-        return outputURLs
+        return outputs
     }
 
     private func extractSelectedFramesSparsely(
@@ -825,7 +928,7 @@ public final class FrameExtractor {
         to outputDir: URL,
         options: FrameExtractionOptions,
         progress: @escaping @Sendable (Double, String) -> Void
-    ) async throws -> [URL] {
+    ) async throws -> [ExtractedFrameOutput] {
         let requestedLongEdge = Int(options.maxDimension.rounded(.down))
         let outputDimensions = requestedLongEdge > 1
             ? Self.analysisDimensions(
@@ -843,8 +946,8 @@ public final class FrameExtractor {
         let searchHalfWindow = min(0.25, max(0.05, 1.5 / effectiveFPS))
         let maximumDelta = 0.5 / effectiveFPS
         let context = Self.makeCIContext()
-        var outputURLs: [URL] = []
-        outputURLs.reserveCapacity(selected.count)
+        var outputs: [ExtractedFrameOutput] = []
+        outputs.reserveCapacity(selected.count)
 
         for batchStart in stride(
             from: 0,
@@ -911,14 +1014,20 @@ public final class FrameExtractor {
                 return (image: result.image, url: url)
             }
             try await Self.writeImages(writes, format: options.outputFormat)
-            outputURLs.append(contentsOf: writes.map(\.url))
-            let fraction = Double(outputURLs.count) / Double(selected.count)
+            outputs.append(contentsOf: writes.enumerated().map { offset, write in
+                let selectedIndex = outputs.count + offset
+                return ExtractedFrameOutput(
+                    url: write.url,
+                    origin: VideoFrameOrigin(candidate: selected[selectedIndex])
+                )
+            })
+            let fraction = Double(outputs.count) / Double(selected.count)
             progress(
                 fraction,
-                "Extracting selected frames \(outputURLs.count)/\(selected.count)"
+                "Extracting selected frames \(outputs.count)/\(selected.count)"
             )
         }
-        return outputURLs
+        return outputs
     }
 
     private static func makeSparseReaderJob(

@@ -77,7 +77,9 @@ public enum OrientationEvidenceExtractor {
 
     public static func extract(
         geometryManifestURL: URL,
+        expectedGeometryManifestSHA256: String,
         candidateImagesURL: URL,
+        expectedCandidateImagesSHA256: String,
         groundTruthPosesURL: URL,
         expectedGroundTruthPosesSHA256: String,
         orientationLabelURL: URL,
@@ -98,6 +100,9 @@ public enum OrientationEvidenceExtractor {
             label: "ground-truth poses",
             maximumBytes: maximumGroundTruthBytes
         )
+        guard expectedGeometryManifestSHA256 == sha256(manifestData) else {
+            throw invalid("The geometry-manifest digest does not match its authenticated execution.")
+        }
         guard expectedOrientationLabelSHA256 == sha256(labelData) else {
             throw invalid("The orientation-label digest does not match its pinned reference.")
         }
@@ -129,6 +134,9 @@ public enum OrientationEvidenceExtractor {
         ).normalized(label: "physical-up label")
 
         let candidate = try scanCandidateImages(candidateImagesURL)
+        guard expectedCandidateImagesSHA256 == "sha256:\(candidate.digest)" else {
+            throw invalid("The candidate images digest does not match its authenticated geometry.")
+        }
         guard candidate.digest == manifest.modelHashes["images.txt"] else {
             throw invalid("The candidate images.txt digest does not match the geometry manifest.")
         }

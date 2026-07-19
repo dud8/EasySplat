@@ -462,9 +462,14 @@ private final class HostStateNotificationCallbacks: @unchecked Sendable {
 }
 
 final class PowerSourceChangeObserver: @unchecked Sendable {
+    private typealias SourceFactory = @Sendable (
+        PowerSourceChangeObserver
+    ) -> CFRunLoopSource?
+
     private let callback: @Sendable () -> Void
     private let startupTimeoutSeconds: TimeInterval
     private let shutdownTimeoutSeconds: TimeInterval
+    private let sourceFactory: SourceFactory
     private let beforeSourceCreation: @Sendable () -> Void
     private let beforeThreadExit: @Sendable () -> Void
     private let ready = DispatchSemaphore(value: 0)
@@ -479,12 +484,14 @@ final class PowerSourceChangeObserver: @unchecked Sendable {
         callback: @escaping @Sendable () -> Void,
         startupTimeoutSeconds: TimeInterval,
         shutdownTimeoutSeconds: TimeInterval,
+        sourceFactory: @escaping SourceFactory,
         beforeSourceCreation: @escaping @Sendable () -> Void,
         beforeThreadExit: @escaping @Sendable () -> Void
     ) {
         self.callback = callback
         self.startupTimeoutSeconds = startupTimeoutSeconds
         self.shutdownTimeoutSeconds = shutdownTimeoutSeconds
+        self.sourceFactory = sourceFactory
         self.beforeSourceCreation = beforeSourceCreation
         self.beforeThreadExit = beforeThreadExit
     }
@@ -498,6 +505,7 @@ final class PowerSourceChangeObserver: @unchecked Sendable {
             callback: callback,
             startupTimeoutSeconds: 5,
             shutdownTimeoutSeconds: 5,
+            sourceFactory: makeSystemSource,
             beforeSourceCreation: {},
             beforeThreadExit: {}
         )
@@ -508,6 +516,9 @@ final class PowerSourceChangeObserver: @unchecked Sendable {
     static func startForTesting(
         startupTimeoutSeconds: TimeInterval,
         shutdownTimeoutSeconds: TimeInterval,
+        sourceFactory: @escaping @Sendable (
+            PowerSourceChangeObserver
+        ) -> CFRunLoopSource?,
         beforeSourceCreation: @escaping @Sendable () -> Void = {},
         beforeThreadExit: @escaping @Sendable () -> Void = {}
     ) throws -> PowerSourceChangeObserver {
@@ -515,6 +526,7 @@ final class PowerSourceChangeObserver: @unchecked Sendable {
             callback: {},
             startupTimeoutSeconds: startupTimeoutSeconds,
             shutdownTimeoutSeconds: shutdownTimeoutSeconds,
+            sourceFactory: sourceFactory,
             beforeSourceCreation: beforeSourceCreation,
             beforeThreadExit: beforeThreadExit
         )
@@ -544,21 +556,11 @@ final class PowerSourceChangeObserver: @unchecked Sendable {
 
     private func run() {
         beforeSourceCreation()
-        guard let unmanagedSource = IOPSCreateLimitedPowerNotification(
-            { context in
-                guard let context else { return }
-                Unmanaged<PowerSourceChangeObserver>
-                    .fromOpaque(context)
-                    .takeUnretainedValue()
-                    .callback()
-            },
-            Unmanaged.passUnretained(self).toOpaque()
-        ) else {
+        guard let source = sourceFactory(self) else {
             ready.signal()
             finish()
             return
         }
-        let source = unmanagedSource.takeRetainedValue()
         let currentRunLoop = CFRunLoopGetCurrent()
         CFRunLoopAddSource(currentRunLoop, source, .defaultMode)
         lock.lock()
@@ -576,6 +578,21 @@ final class PowerSourceChangeObserver: @unchecked Sendable {
         lock.unlock()
         beforeThreadExit()
         finish()
+    }
+
+    private static func makeSystemSource(
+        for observer: PowerSourceChangeObserver
+    ) -> CFRunLoopSource? {
+        IOPSCreateLimitedPowerNotification(
+            { context in
+                guard let context else { return }
+                Unmanaged<PowerSourceChangeObserver>
+                    .fromOpaque(context)
+                    .takeUnretainedValue()
+                    .callback()
+            },
+            Unmanaged.passUnretained(observer).toOpaque()
+        )?.takeRetainedValue()
     }
 
     private func finish() {

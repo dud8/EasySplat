@@ -20,6 +20,15 @@ struct MappedSparseModelSnapshot: Sendable {
     fileprivate let files: [String: SparseFileState]
 }
 
+struct Da3MatchingExecution: Sendable {
+    let attempts: [PairGraphAttemptEvidence]
+    let acceptedInspection: ColmapPairGraphInspection
+
+    var matchingDurationSeconds: Double {
+        attempts.reduce(0) { $0 + $1.artifact.durationSeconds }
+    }
+}
+
 enum SparseTextPublicationCheckpoint: Sendable {
     case beforeSwap
     case afterSwap
@@ -47,6 +56,89 @@ private enum SparseModelPublicationError: Error, LocalizedError {
 }
 
 extension PipelineRunner {
+    func prepareTextSparseModelForCanonicalPublication(
+        at url: URL,
+        mappingAttemptOrdinal: Int,
+        workerExecutionRecorder: GeometryWorkerExecutionRecorder
+    ) throws -> CanonicalModelPublicationArtifact {
+        let binaryNames = ["cameras.bin", "images.bin", "points3D.bin"]
+        let textNames = ["cameras.txt", "images.txt", "points3D.txt"]
+        let hasBinarySource = binaryNames.allSatisfy {
+            FileManager.default.fileExists(
+                atPath: url.appendingPathComponent($0).path
+            )
+        }
+        let sourceNames = hasBinarySource ? binaryNames : textNames
+        let sourceHashes = try Dictionary(uniqueKeysWithValues: sourceNames.map { name in
+            (name, try GeometryArtifactStore.sha256(of: url.appendingPathComponent(name)))
+        })
+        let candidateProjectRelativePath = try ProjectPaths(root: projectURL)
+            .projectRelativePath(for: url)
+        let converterInvocationCountBefore = workerExecutionRecorder
+            .modelConverterInvocationCount(
+                mappingAttemptOrdinal: mappingAttemptOrdinal
+            )
+        let successfulConverterCountBefore = workerExecutionRecorder
+            .successfulModelConverterInvocationCount(
+                mappingAttemptOrdinal: mappingAttemptOrdinal
+            )
+        let converted = try ensureTextSparseModelFiles(
+            at: url,
+            mappingAttemptOrdinal: mappingAttemptOrdinal,
+            candidateProjectRelativePath: candidateProjectRelativePath
+        )
+        let converterInvocationCountAfter = workerExecutionRecorder
+            .modelConverterInvocationCount(
+                mappingAttemptOrdinal: mappingAttemptOrdinal
+            )
+        let successfulConverterCountAfter = workerExecutionRecorder
+            .successfulModelConverterInvocationCount(
+                mappingAttemptOrdinal: mappingAttemptOrdinal
+            )
+        if hasBinarySource {
+            guard converted,
+                  converterInvocationCountAfter == converterInvocationCountBefore + 1,
+                  successfulConverterCountAfter == successfulConverterCountBefore + 1,
+                  let invocation = workerExecutionRecorder.modelConverterInvocation(
+                      mappingAttemptOrdinal: mappingAttemptOrdinal,
+                      oneBasedOrdinal: converterInvocationCountAfter
+                  ),
+                  invocation.succeeded,
+                  let workerEvidence = invocation.modelConversion,
+                  let sourceDigest = GeometryArtifactStore.modelClosureDigest(
+                      sourceHashes,
+                      expectedNames: binaryNames
+                  ),
+                  workerEvidence.sourceModelDigest == sourceDigest,
+                  workerEvidence.candidateIdentitySHA256
+                    == GeometryArtifactStore.modelCandidateIdentity(
+                        mappingAttemptOrdinal: mappingAttemptOrdinal,
+                        candidateProjectRelativePath: candidateProjectRelativePath,
+                        sourceModelDigest: sourceDigest
+                    ) else {
+                throw PipelineError.outputMissing
+            }
+            return CanonicalModelPublicationArtifact(
+                kind: .convertedFromBinary,
+                sourceModelHashes: sourceHashes,
+                conversion: CanonicalModelConversionArtifact(
+                    invocationOrdinal: converterInvocationCountAfter,
+                    workerEvidence: workerEvidence
+                )
+            )
+        }
+        guard !converted,
+              converterInvocationCountAfter == converterInvocationCountBefore,
+              successfulConverterCountAfter == successfulConverterCountBefore else {
+            throw PipelineError.outputMissing
+        }
+        return CanonicalModelPublicationArtifact(
+            kind: .directText,
+            sourceModelHashes: sourceHashes,
+            conversion: nil
+        )
+    }
+
     static func normalizedUnusableSparseModelError(_ error: Error) -> Error {
         if let pathError = error as? ProjectPathError {
             switch pathError {
@@ -405,6 +497,8 @@ extension PipelineRunner {
     @discardableResult
     func ensureTextSparseModelFiles(
         at url: URL,
+        mappingAttemptOrdinal: Int? = nil,
+        candidateProjectRelativePath: String? = nil,
         publicationCheckpoint: (SparseTextPublicationCheckpoint) throws -> Void = { _ in }
     ) throws -> Bool {
         let fm = FileManager.default
@@ -446,13 +540,32 @@ extension PipelineRunner {
             )
         }
 
+        let conversionContext: ColmapModelConversionWorkerInvocationContext?
+        switch (mappingAttemptOrdinal, candidateProjectRelativePath) {
+        case let (.some(attempt), .some(candidatePath)):
+            let paths = ProjectPaths(root: projectURL)
+            conversionContext = ColmapModelConversionWorkerInvocationContext(
+                mappingAttemptOrdinal: attempt,
+                projectRootURL: projectURL,
+                candidateProjectRelativePath: candidatePath,
+                inputProjectRelativePath: try paths.projectRelativePath(for: binaryInput),
+                outputProjectRelativePath: try paths.projectRelativePath(for: textOutput),
+                inputURL: binaryInput,
+                outputURL: textOutput
+            )
+        case (nil, nil):
+            conversionContext = nil
+        default:
+            throw PipelineError.outputMissing
+        }
         try tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
             inputPath: binaryInput,
             outputPath: textOutput,
             outputType: "TXT",
             environment: colmapUtilityEnvironment(),
-            recordGeometryWorkerExecution: true,
+            recordGeometryWorkerExecution: conversionContext != nil,
+            modelConversionContext: conversionContext,
             onLog: { _, _ in }
         )
         for name in txtFiles {
@@ -682,34 +795,124 @@ extension PipelineRunner {
     func runDa3MatchesImporterWithOneShotExactRecovery(
         database: URL,
         matchListPath: URL,
+        pairPlan: ColmapPairPlan,
+        randomSeed: UInt64,
         options: ColmapOptions,
         onLog: @escaping @Sendable (String, Bool) -> Void,
         emit: @escaping @Sendable (PipelineEvent) -> Void,
-        onExactRecovery: () throws -> Void
-    ) async throws {
+        onExactRecovery: (DescriptorMatcherRecoveryReason) throws -> Void
+    ) async throws -> Da3MatchingExecution {
+        guard !pairPlan.imageNames.isEmpty,
+              !pairPlan.pairs.isEmpty,
+              GeometryArtifactStore.isSHA256(pairPlan.sha256),
+              options.descriptorMatcher == .faiss else {
+            throw GeometryRecoveryState.ValidationError.invalidBackendFields
+        }
+        let schedule = ColmapPairSchedule(
+            imageNames: pairPlan.imageNames,
+            pairs: pairPlan.pairs
+        )
+        let clock = ContinuousClock()
+        var attempts: [PairGraphAttemptEvidence] = []
         var attemptOptions = options
+
+        func inspect(
+            completion: ColmapPairAttemptCompletion
+        ) throws -> ColmapPairGraphInspection {
+            try ColmapDatabaseDurability.seal(at: database)
+            return try ColmapPairGraphInspector(databaseURL: database).inspect(
+                schedule: schedule,
+                completion: completion
+            )
+        }
+
+        func attemptEvidence(
+            number: Int,
+            matcher: DescriptorMatcher,
+            outcome: PairMatchingAttemptOutcome,
+            exactRecoveryReason: DescriptorMatcherRecoveryReason?,
+            inspection: ColmapPairGraphInspection,
+            durationSeconds: Double
+        ) -> PairGraphAttemptEvidence {
+            PairGraphAttemptEvidence(
+                artifact: PairMatchingAttemptArtifact(
+                    attemptNumber: number,
+                    matcher: matcher,
+                    recoveryLevel: .normal,
+                    outcome: outcome,
+                    exactRecoveryReason: exactRecoveryReason,
+                    scheduledPairCount: pairPlan.pairs.count,
+                    attemptedPairCount: inspection.attemptedPairCount,
+                    rawMatchedPairCount: inspection.rawMatchedPairCount,
+                    spatiallyVerifiedPairCount:
+                        inspection.spatiallyVerifiedPairCount,
+                    durationSeconds: durationSeconds
+                ),
+                scheduledPairs: pairPlan.pairs,
+                retrieval: nil,
+                retrievalWasExecuted: false
+            )
+        }
+
+        let faissStart = clock.now
         do {
             try await tooling.colmap.runMatchesImporter(
                 colmapPath: config.toolchain.colmap,
                 database: database,
                 matchListPath: matchListPath,
                 matchType: "pairs",
+                randomSeed: randomSeed,
                 options: attemptOptions,
+                pairContext: ColmapPairWorkerInvocationContext(
+                    attemptOrdinal: 1,
+                    descriptorMatcher: .faiss,
+                    scheduledPairCount: pairPlan.pairs.count,
+                    pairListDigest: pairPlan.sha256
+                ),
                 onLog: onLog
             )
-            return
+            let duration = Self.durationInSeconds(clock.now - faissStart)
+            let accepted = try inspect(completion: .succeeded)
+            guard accepted.hasAcceptableDominantVerifiedComponent(
+                allowMinorVerifiedComponents: false
+            ) else {
+                throw ColmapPairPlanningError.disconnectedVerifiedGraph
+            }
+            attempts.append(attemptEvidence(
+                number: 1,
+                matcher: .faiss,
+                outcome: .completed,
+                exactRecoveryReason: nil,
+                inspection: accepted,
+                durationSeconds: duration
+            ))
+            return Da3MatchingExecution(
+                attempts: attempts,
+                acceptedInspection: accepted
+            )
         } catch {
             if error is CancellationError { throw error }
             try Task.checkCancellation()
             guard let reason = DescriptorMatcherRecoveryPolicy.reason(
                 for: error,
-                currentMatcher: attemptOptions.descriptorMatcher
+                currentMatcher: attemptOptions.descriptorMatcher,
+                scheduledPairCount: pairPlan.pairs.count
             ) else {
                 throw error
             }
 
+            let faissDuration = Self.durationInSeconds(clock.now - faissStart)
+            let failedInspection = try inspect(completion: .failed)
+            attempts.append(attemptEvidence(
+                number: 1,
+                matcher: .faiss,
+                outcome: .failed,
+                exactRecoveryReason: nil,
+                inspection: failedInspection,
+                durationSeconds: faissDuration
+            ))
             attemptOptions.descriptorMatcher = .exact
-            try onExactRecovery()
+            try onExactRecovery(reason)
             try ColmapDatabaseMatchStore.clearMatchingResults(at: database)
             emit(.stageLog(
                 stage: .sfmMatching,
@@ -718,13 +921,41 @@ extension PipelineRunner {
             ))
             emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
             try Task.checkCancellation()
+            let exactStart = clock.now
             try await tooling.colmap.runMatchesImporter(
                 colmapPath: config.toolchain.colmap,
                 database: database,
                 matchListPath: matchListPath,
                 matchType: "pairs",
+                randomSeed: randomSeed,
                 options: attemptOptions,
+                pairContext: ColmapPairWorkerInvocationContext(
+                    attemptOrdinal: 2,
+                    descriptorMatcher: .exact,
+                    scheduledPairCount: pairPlan.pairs.count,
+                    pairListDigest: pairPlan.sha256,
+                    exactRecoveryReason: reason
+                ),
                 onLog: onLog
+            )
+            let exactDuration = Self.durationInSeconds(clock.now - exactStart)
+            let accepted = try inspect(completion: .succeeded)
+            guard accepted.hasAcceptableDominantVerifiedComponent(
+                allowMinorVerifiedComponents: false
+            ) else {
+                throw ColmapPairPlanningError.disconnectedVerifiedGraph
+            }
+            attempts.append(attemptEvidence(
+                number: 2,
+                matcher: .exact,
+                outcome: .completed,
+                exactRecoveryReason: reason,
+                inspection: accepted,
+                durationSeconds: exactDuration
+            ))
+            return Da3MatchingExecution(
+                attempts: attempts,
+                acceptedInspection: accepted
             )
         }
     }

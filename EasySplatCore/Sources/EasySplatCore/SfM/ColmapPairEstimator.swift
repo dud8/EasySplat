@@ -9,6 +9,133 @@ enum ColmapPairPlanningError: Error, Equatable {
     case repeatedAttempt
 }
 
+struct DisconnectedVocabularyRetrievalEvidence: Error, Equatable, Sendable {
+    let evidence: PairGraphRetrievalAttemptEvidence
+}
+
+struct CaptureRetrievalConnectionFailure: Error, Equatable, Sendable {
+    let pairingPolicy: ResolvedPairingPolicy
+    let selectedViewCount: Int
+    let attempts: [RejectedVocabularyRetrievalExecutionEvidence]
+
+    enum EvidenceError: Error, Equatable, Sendable {
+        case invalidEvidence
+    }
+
+    init(
+        pairingPolicy: ResolvedPairingPolicy,
+        selectedViewCount: Int,
+        attempts: [RejectedVocabularyRetrievalExecutionEvidence]
+    ) throws {
+        guard selectedViewCount >= 2,
+              !attempts.isEmpty,
+              attempts.last?.recoveryLevel == .maximum,
+              attempts.allSatisfy({
+                  $0.pairingPolicy == pairingPolicy
+                      && $0.imageNames.count == selectedViewCount
+              }),
+              let expectedWorkerCount = attempts.first?.invocation.argvWorkerCount else {
+            throw EvidenceError.invalidEvidence
+        }
+        do {
+            try GeometryWorkerExecutionArtifact
+                .validateRejectedVocabularyRetrievalHistory(
+                    attempts,
+                    expectedWorkerCount: expectedWorkerCount
+                )
+        } catch {
+            throw EvidenceError.invalidEvidence
+        }
+        self.pairingPolicy = pairingPolicy
+        self.selectedViewCount = selectedViewCount
+        self.attempts = attempts
+    }
+}
+
+struct CaptureConnectionFailure: Error, Equatable, Sendable {
+    let pairingPolicy: ResolvedPairingPolicy
+    let selectedViewCount: Int
+    let attempt: PairMatchingAttemptArtifact
+    let connectedComponentCount: Int
+    let isolatedViewCount: Int
+    let descriptorlessViewCount: Int
+    let componentViewCounts: [Int]
+    let degreeP10: Int
+    let degreeMedian: Int
+    let degreeP90: Int
+
+    enum EvidenceError: Error, Equatable, Sendable {
+        case invalidEvidence
+    }
+
+    init(
+        pairingPolicy: ResolvedPairingPolicy,
+        selectedViewCount: Int,
+        attempt: PairMatchingAttemptArtifact,
+        connectedComponentCount: Int,
+        isolatedViewCount: Int,
+        descriptorlessViewCount: Int,
+        componentViewCounts: [Int],
+        degreeP10: Int,
+        degreeMedian: Int,
+        degreeP90: Int
+    ) throws {
+        guard selectedViewCount >= 2 else {
+            throw EvidenceError.invalidEvidence
+        }
+        let maximumPairCount = selectedViewCount
+            .multipliedReportingOverflow(by: selectedViewCount - 1)
+        var componentViewTotal = 0
+        var measuredIsolatedViewCount = 0
+        for count in componentViewCounts {
+            let addition = componentViewTotal.addingReportingOverflow(count)
+            guard count > 0, !addition.overflow else {
+                throw EvidenceError.invalidEvidence
+            }
+            componentViewTotal = addition.partialValue
+            if count == 1 { measuredIsolatedViewCount += 1 }
+        }
+        guard !maximumPairCount.overflow,
+              attempt.attemptNumber > 0,
+              attempt.outcome == .rejected,
+              attempt.scheduledPairCount >= 0,
+              attempt.scheduledPairCount <= maximumPairCount.partialValue / 2,
+              attempt.attemptedPairCount >= 0,
+              attempt.attemptedPairCount <= attempt.scheduledPairCount,
+              attempt.rawMatchedPairCount >= 0,
+              attempt.rawMatchedPairCount <= attempt.attemptedPairCount,
+              attempt.spatiallyVerifiedPairCount >= 0,
+              attempt.spatiallyVerifiedPairCount <= attempt.rawMatchedPairCount,
+              attempt.durationSeconds.isFinite,
+              attempt.durationSeconds >= 0,
+              connectedComponentCount >= 2,
+              connectedComponentCount == componentViewCounts.count,
+              connectedComponentCount <= selectedViewCount,
+              componentViewTotal == selectedViewCount,
+              isolatedViewCount == measuredIsolatedViewCount,
+              descriptorlessViewCount >= 0,
+              descriptorlessViewCount <= isolatedViewCount,
+              attempt.spatiallyVerifiedPairCount
+                >= selectedViewCount - connectedComponentCount,
+              degreeP10 >= 0,
+              degreeP10 <= degreeMedian,
+              degreeMedian <= degreeP90,
+              degreeP90 < selectedViewCount else {
+            throw EvidenceError.invalidEvidence
+        }
+        self.pairingPolicy = pairingPolicy
+        self.selectedViewCount = selectedViewCount
+        self.attempt = attempt
+        self.connectedComponentCount = connectedComponentCount
+        self.isolatedViewCount = isolatedViewCount
+        self.descriptorlessViewCount = descriptorlessViewCount
+        self.componentViewCounts = componentViewCounts.sorted(by: >)
+        self.degreeP10 = degreeP10
+        self.degreeMedian = degreeMedian
+        self.degreeP90 = degreeP90
+    }
+}
+
 enum ColmapPairRole: String, Codable, Sendable, Equatable, Hashable {
     case local
     case retrieval
@@ -31,7 +158,7 @@ struct ColmapScheduledPair: Codable, Sendable, Equatable, Hashable {
     }
 }
 
-struct ColmapPairGroup: Sendable, Equatable {
+struct ColmapPairGroup: Codable, Sendable, Equatable {
     let imageNames: [String]
     let isVideo: Bool
 }
@@ -150,7 +277,9 @@ struct ColmapPairPlan: Sendable, Equatable {
 
     func addingRetrievalPairLines(
         _ lines: [String],
-        pairingPolicy: ResolvedPairingPolicy
+        pairingPolicy: ResolvedPairingPolicy,
+        groups: [ColmapPairGroup],
+        requiresCrossClipRetrieval: Bool
     ) throws -> ColmapPairPlan {
         try Task.checkCancellation()
         let indexByName = Dictionary(uniqueKeysWithValues: imageNames.enumerated().map {
@@ -165,6 +294,21 @@ struct ColmapPairPlan: Sendable, Equatable {
         }
         let minimumSeparation = max(12, imageNames.count / 10)
         let role: ColmapPairRole = isOrdered ? .loopRevisit : .retrieval
+        let groupIndexByImageName: [String: Int]
+        if requiresCrossClipRetrieval {
+            guard (isOrdered || pairingPolicy == .segmentedMixed),
+                  groups.count > 1,
+                  groups.allSatisfy({ $0.isVideo && !$0.imageNames.isEmpty }),
+                  groups.flatMap(\.imageNames) == imageNames else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+            groupIndexByImageName = Dictionary(uniqueKeysWithValues: groups.enumerated()
+                .flatMap { groupIndex, group in
+                    group.imageNames.map { ($0, groupIndex) }
+                })
+        } else {
+            groupIndexByImageName = [:]
+        }
         var proposed = pairs
         proposed.reserveCapacity(pairs.count + lines.count)
 
@@ -178,7 +322,12 @@ struct ColmapPairPlan: Sendable, Equatable {
                 throw ColmapPairPlanningError.invalidPairPlan
             }
             if isOrdered, abs(firstIndex - secondIndex) < minimumSeparation {
-                continue
+                let connectsDifferentClips = requiresCrossClipRetrieval
+                    && groupIndexByImageName[imageNames[firstIndex]]
+                        != groupIndexByImageName[imageNames[secondIndex]]
+                if !connectsDifferentClips {
+                    continue
+                }
             }
             proposed.append(ColmapScheduledPair(
                 imageNames[min(firstIndex, secondIndex)],
@@ -272,6 +421,59 @@ struct Da3RefinementPairPlan: Equatable, Sendable {
 }
 
 struct ColmapPairEstimator {
+    static func validatedDa3RefinementPairPlan(
+        manifest: Da3CoverageManifest,
+        imageNames: [String],
+        resolvedPlan: ResolvedRunPlan
+    ) throws -> ColmapPairPlan {
+        let windowSize = max(4, resolvedPlan.chunkSize)
+        let issues = manifest.validationIssues(
+            selectedImageNames: imageNames,
+            expectedWindowSize: windowSize,
+            expectedWindowOverlap: 0,
+            expectedInputOrdering: resolvedPlan.inputOrdering,
+            expectedModelSubdirectory: resolvedPlan.modelIdentifier
+        )
+        guard issues.isEmpty,
+              let localPairs = manifest.boundedMatchPairs,
+              !localPairs.isEmpty,
+              let trustedPairLimit = Da3CoverageManifest
+                .trustedRefinementMatchPairLimit(
+                    selectedImageCount: imageNames.count,
+                    windowSize: windowSize,
+                    windowOverlap: 0,
+                    inputOrdering: resolvedPlan.inputOrdering,
+                    includesLoopClosures: false
+                ) else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        let da3Plan = try da3RefinementPairPlan(
+            imageNames: imageNames,
+            localPairs: localPairs,
+            loopPairs: [],
+            maxPairCount: trustedPairLimit
+        )
+        let scheduledPairs = try da3Plan.pairs.map { line in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count == 2 else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+            return ColmapScheduledPair(
+                String(fields[0]),
+                String(fields[1]),
+                role: .local
+            )
+        }
+        let pairPlan = try ColmapPairPlan.persisted(
+            imageNames: imageNames,
+            scheduledPairs: scheduledPairs
+        )
+        guard pairPlan.sha256 == da3Plan.sha256 else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        return pairPlan
+    }
+
     static func da3RefinementPairPlan(
         imageNames: [String],
         localPairs: [String],

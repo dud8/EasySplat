@@ -185,11 +185,11 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
         XCTAssertThrowsError(
             try renderer.readScene(
                 shouldCancel: { probe.shouldCancel },
-                using: { delegate in
+                using: { delegate, shouldStop in
                     delegate.didStartReading(withPointCount: 2)
                     delegate.didRead(points: [replacementPoint])
                     probe.didDeliverPoint()
-                    if probe.shouldCancel {
+                    if shouldStop() {
                         delegate.didFailReading(withError: CancellationError())
                         return
                     }

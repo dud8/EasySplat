@@ -3,10 +3,12 @@ import Foundation
 extension ToolchainManager {
     func validateToolchain(
         root: URL,
-        requiredCapabilities: Set<ToolchainCapability>
+        requiredCapabilities: Set<ToolchainCapability>,
+        repairExecutablePermissions: Bool = true,
+        authenticatedVersion: String? = nil
     ) throws -> ToolchainPaths {
         let colmap = root.appendingPathComponent("bin/colmap")
-        ensureExecutable(at: colmap)
+        if repairExecutablePermissions { ensureExecutable(at: colmap) }
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
 
         try requireArm64Binary(at: colmap, label: "colmap")
@@ -21,6 +23,24 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
         }
         try validateNativeColmapRoot(colmapCheck)
+
+        let matchesImporterProbe: SubprocessResult
+        do {
+            matchesImporterProbe = try runner.run(colmap.path, ["matches_importer", "-h"])
+        } catch {
+            throw ToolchainError.invalidToolchain("COLMAP matches_importer could not be launched.")
+        }
+        guard matchesImporterProbe.terminationReason == .exit,
+              matchesImporterProbe.exitCode == 0 else {
+            throw ToolchainError.invalidToolchain(
+                "COLMAP matches_importer self-check failed (exit \(matchesImporterProbe.exitCode))."
+            )
+        }
+        try requireColmapHelpTokens(
+            NativeColmapContract.matchesImporterOptions,
+            in: matchesImporterProbe,
+            subject: "COLMAP matches_importer"
+        )
 
         let mapperProbe: SubprocessResult
         do {
@@ -74,13 +94,13 @@ extension ToolchainManager {
         let da3AppSentinel = da3Root.appendingPathComponent("app/easysplat_da3_sfm/run.py")
         let da3Models = da3Root.appendingPathComponent("models", isDirectory: true)
         let da3ModelBundle = da3Models.appendingPathComponent("DA3-BASE", isDirectory: true)
-        let da3FallbackModelBundle = da3Models.appendingPathComponent("DA3-SMALL", isDirectory: true)
+        let da3SmallModelBundle = da3Models.appendingPathComponent("DA3-SMALL", isDirectory: true)
         let da3BaseModelFile = da3ModelBundle.appendingPathComponent("model.safetensors")
         let da3BaseConfigFile = da3ModelBundle.appendingPathComponent("config.json")
         let da3BaseModelInfoFile = da3ModelBundle.appendingPathComponent("easysplat_model_info.json")
-        let da3SmallModelFile = da3FallbackModelBundle.appendingPathComponent("model.safetensors")
-        let da3SmallConfigFile = da3FallbackModelBundle.appendingPathComponent("config.json")
-        let da3SmallModelInfoFile = da3FallbackModelBundle.appendingPathComponent("easysplat_model_info.json")
+        let da3SmallModelFile = da3SmallModelBundle.appendingPathComponent("model.safetensors")
+        let da3SmallConfigFile = da3SmallModelBundle.appendingPathComponent("config.json")
+        let da3SmallModelInfoFile = da3SmallModelBundle.appendingPathComponent("easysplat_model_info.json")
         let da3VendorSentinel = da3Root.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py")
         let needsBase = requiredCapabilities.contains(.da3Base)
         let needsSmall = requiredCapabilities.contains(.da3Small)
@@ -102,8 +122,16 @@ extension ToolchainManager {
                 throw ToolchainError.missingLibrary("da3_mps/vendor/depth-anything-3")
             }
 
-            ensureExecutable(at: da3SfmTool)
-            ensureExecutable(at: da3Python)
+            if repairExecutablePermissions {
+                ensureExecutable(at: da3SfmTool)
+                ensureExecutable(at: da3Python)
+            }
+            guard fileManager.isExecutableFile(atPath: da3SfmTool.path) else {
+                throw ToolchainError.missingBinary("da3_mps/bin/easysplat_da3_sfm")
+            }
+            guard fileManager.isExecutableFile(atPath: da3Python.path) else {
+                throw ToolchainError.missingBinary("da3_mps/python/bin/python3")
+            }
             try validateBuildInfo(at: da3BuildInfo, expectedToolchainName: "da3_mps")
             try requireArm64Binary(at: da3Python, label: "da3_mps python")
             let da3Check = try runner.run(da3SfmTool.path, ["--help"])
@@ -144,7 +172,7 @@ extension ToolchainManager {
             python: da3Python,
             models: da3Models,
             modelBundle: da3ModelBundle,
-            fallbackModelBundle: da3FallbackModelBundle
+            smallModelBundle: da3SmallModelBundle
         )
 
         let msplat = root.appendingPathComponent("bin/easysplat-train")
@@ -173,12 +201,16 @@ extension ToolchainManager {
             buildInfo: msplatBuildInfo,
             license: msplatLicense
         )
-        ensureExecutable(at: msplat)
+        if repairExecutablePermissions { ensureExecutable(at: msplat) }
+        guard fileManager.isExecutableFile(atPath: msplat.path) else {
+            throw ToolchainError.missingBinary("bin/easysplat-train")
+        }
         try requireArm64Binary(at: msplat, label: "easysplat-train")
         try validateMsplatSelfCheck(executable: msplat, runtimeVersion: runtimeVersion)
 
         return ToolchainPaths(
             root: root,
+            authenticatedVersion: authenticatedVersion,
             colmap: colmap,
             msplat: msplat,
             da3: da3
@@ -410,6 +442,8 @@ extension ToolchainManager {
             "row_span_culling_patch_sha256",
             "geometry_adam_fusion_patch_sha256",
             "parallel_radix_scan_patch_sha256",
+            "allocation_pressure_patch_sha256",
+            "exact_prefix_hardening_patch_sha256",
             "patch_sha256",
             "checkpoint_patch_sha256",
             "densification_memory_patch_sha256",
@@ -456,8 +490,8 @@ extension ToolchainManager {
             "source_url": "https://github.com/rayanht/msplat.git",
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
-            "overlay_sha256": "0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6",
-            "raster_test_sha256": "7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7",
+            "overlay_sha256": "fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc",
+            "raster_test_sha256": "3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934",
             "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
             "exact_raster_patch_sha256": "c34a8860ed8ae9bc92c976aaa1c3f89eec8aa9be9cab4778f074491e98860855",
             "stage_timing_patch_sha256": "e803a9e6027fb81835d3c30bccd6cec1fa7ad63315ffb6bbae0f135cc476941d",
@@ -466,6 +500,8 @@ extension ToolchainManager {
             "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
             "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
             "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
+            "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
+            "exact_prefix_hardening_patch_sha256": "99022e824c91ca57b34f60f21b29753db788290541c3c6bc52a5b496794d9683",
             "deployment_target": "macOS 15.0",
             "build_configuration": "Release",
         ]
@@ -493,6 +529,8 @@ extension ToolchainManager {
             "row_span_culling_patch_sha256",
             "geometry_adam_fusion_patch_sha256",
             "parallel_radix_scan_patch_sha256",
+            "allocation_pressure_patch_sha256",
+            "exact_prefix_hardening_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]
@@ -680,20 +718,17 @@ extension ToolchainManager {
     }
 
     func artifactLooksInstalled(name: String, root: URL) -> Bool {
-        if name == "geometry-da3-base" {
+        switch name {
+        case "macos-arm64-core":
+            return coreToolchainLooksInstalled(root: root)
+        case "geometry-da3-base":
             return da3RuntimeLooksInstalled(root: root)
                 && da3ModelLooksInstalled(named: "DA3-BASE", root: root)
-        }
-        if name == "geometry-da3-small" {
+        case "geometry-da3-small":
             return da3ModelLooksInstalled(named: "DA3-SMALL", root: root)
+        default:
+            return false
         }
-        if name.hasSuffix("-core") {
-            return coreToolchainLooksInstalled(root: root)
-        }
-        if name.hasSuffix("-models") {
-            return modelsToolchainLooksInstalled(root: root)
-        }
-        return false
     }
 
     func da3ModelLooksInstalled(named modelName: String, root: URL) -> Bool {
@@ -742,26 +777,6 @@ extension ToolchainManager {
             && msplatOK
     }
 
-    func modelsToolchainLooksInstalled(root: URL) -> Bool {
-        let da3BaseModel = root
-            .appendingPathComponent("da3_mps/models/DA3-BASE/model.safetensors")
-        let da3BaseConfig = root
-            .appendingPathComponent("da3_mps/models/DA3-BASE/config.json")
-        let da3BaseInfo = root
-            .appendingPathComponent("da3_mps/models/DA3-BASE/easysplat_model_info.json")
-        let da3SmallModel = root
-            .appendingPathComponent("da3_mps/models/DA3-SMALL/model.safetensors")
-        let da3SmallConfig = root
-            .appendingPathComponent("da3_mps/models/DA3-SMALL/config.json")
-        let da3SmallInfo = root
-            .appendingPathComponent("da3_mps/models/DA3-SMALL/easysplat_model_info.json")
-        return fileManager.fileExists(atPath: da3BaseModel.path)
-            && fileManager.fileExists(atPath: da3BaseConfig.path)
-            && fileManager.fileExists(atPath: da3BaseInfo.path)
-            && fileManager.fileExists(atPath: da3SmallModel.path)
-            && fileManager.fileExists(atPath: da3SmallConfig.path)
-            && fileManager.fileExists(atPath: da3SmallInfo.path)
-    }
 }
 
 private enum NativeColmapContract {
@@ -779,6 +794,18 @@ private enum NativeColmapContract {
     ]
 
     static let rootCommands = commands.union(["help", "version"])
+
+    static let matchesImporterOptions: Set<String> = [
+        "database_path",
+        "match_list_path",
+        "match_type",
+        "FeatureMatching.use_gpu",
+        "FeatureMatching.num_threads",
+        "FeatureMatching.max_num_matches",
+        "SiftMatching.cpu_brute_force_matcher",
+        "EasySplat.require_empty_matching_results",
+        "TwoViewGeometry.random_seed",
+    ]
 
     static let mapperOptions: Set<String> = [
         "database_path",
@@ -801,8 +828,12 @@ private enum NativeColmapContract {
     static let vocabularyOptions: Set<String> = [
         "database_path",
         "output_pair_list_path",
+        "request_digest",
+        "query_stride",
         "query_image_list_path",
         "excluded_pair_list_path",
+        "image_group_list_path",
+        "image_group_list_digest",
         "num_images",
         "returned_neighbor_count",
         "minimum_frame_separation",

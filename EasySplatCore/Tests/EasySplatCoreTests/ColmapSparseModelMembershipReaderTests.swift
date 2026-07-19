@@ -28,6 +28,27 @@ final class ColmapSparseModelMembershipReaderTests: XCTestCase {
         XCTAssertEqual(result.unionImageIDs, [1, 7])
     }
 
+    func testReadsRegisteredTrainingNamesAsOrderedSelectedSubset() throws {
+        let fixture = try makeFixture(images: [
+            (1, "first.jpg"),
+            (2, "second.jpg"),
+            (3, "third.jpg"),
+        ])
+        let model = try makeBinaryModel(
+            in: fixture.root,
+            order: 0,
+            records: [
+                BinaryImage(id: 3, name: "third.jpg"),
+                BinaryImage(id: 1, name: "first.jpg"),
+            ]
+        )
+
+        XCTAssertEqual(
+            try makeReader(fixture).registeredImageNames(in: model),
+            ["first.jpg", "third.jpg"]
+        )
+    }
+
     func testReadsTextMembershipWithNamesContainingSpacesAndValidObservationTriples() throws {
         let fixture = try makeFixture(images: [(2, "front room.jpg"), (9, "hall.jpg")])
         let model = try makeTextModel(

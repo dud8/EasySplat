@@ -18,7 +18,6 @@ struct Da3CoverageManifest: Codable, Sendable {
     var requestedDevice: String
     var selectedDevice: String
     var modelSubdirectory: String
-    var fallbackModelSubdirectory: String?
     var processResolution: Int
     var cameraType: String
     var sharedCamera: Bool
@@ -45,7 +44,6 @@ struct Da3CoverageManifest: Codable, Sendable {
         case requestedDevice = "requested_device"
         case selectedDevice = "selected_device"
         case modelSubdirectory = "model_subdir"
-        case fallbackModelSubdirectory = "fallback_model_subdir"
         case processResolution = "process_res"
         case cameraType = "camera_type"
         case sharedCamera = "shared_camera"
@@ -85,13 +83,22 @@ struct Da3CoverageManifest: Codable, Sendable {
         expectedMaxPoints: Int? = nil,
         expectedCameraType: String? = nil,
         expectedSharedCamera: Bool? = nil,
-        expectedPrimaryModelSubdirectory: String? = nil,
-        expectedFallbackModelSubdirectory: String? = nil
+        expectedModelSubdirectory: String? = nil
     ) -> [String] {
         var issues: [String] = []
         let selectedImageCount = selectedImageNames.count
         if mode != "seed_refine" {
             issues.append("mode=\(mode) did not match required seed_refine")
+        }
+        if requestedDevice != Da3SfmConfig.requiredDevice {
+            issues.append(
+                "requested_device=\(requestedDevice) did not match required \(Da3SfmConfig.requiredDevice)"
+            )
+        }
+        if selectedDevice != Da3SfmConfig.requiredDevice {
+            issues.append(
+                "selected_device=\(selectedDevice) did not match required \(Da3SfmConfig.requiredDevice)"
+            )
         }
         if totalImages != selectedImageCount {
             issues.append("total_images=\(totalImages) did not match selected frames \(selectedImageCount)")
@@ -111,21 +118,10 @@ struct Da3CoverageManifest: Codable, Sendable {
         if let expectedSharedCamera, sharedCamera != expectedSharedCamera {
             issues.append("shared_camera=\(sharedCamera) did not match expected \(expectedSharedCamera)")
         }
-        if let expectedPrimaryModelSubdirectory {
-            let allowedModels = Set([
-                expectedPrimaryModelSubdirectory,
-                expectedFallbackModelSubdirectory ?? expectedPrimaryModelSubdirectory,
-            ])
-            if !allowedModels.contains(modelSubdirectory) {
-                issues.append(
-                    "model_subdir=\(modelSubdirectory) was not the configured primary or fallback model"
-                )
-            }
-        }
-        if let expectedFallbackModelSubdirectory,
-           fallbackModelSubdirectory != expectedFallbackModelSubdirectory {
+        if let expectedModelSubdirectory,
+           modelSubdirectory != expectedModelSubdirectory {
             issues.append(
-                "fallback_model_subdir=\(fallbackModelSubdirectory ?? "missing") did not match expected \(expectedFallbackModelSubdirectory)"
+                "model_subdir=\(modelSubdirectory) did not match expected \(expectedModelSubdirectory)"
             )
         }
         if windows.isEmpty {

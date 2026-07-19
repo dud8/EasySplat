@@ -4,6 +4,16 @@ import XCTest
 
 @MainActor
 final class ToolchainManagerTests: XCTestCase {
+    func testDefaultInitializerIgnoresLocalToolchainEnvironment() async {
+        await withEnvironmentAsync([
+            "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/private/tmp/easysplat-untrusted-toolchain",
+        ]) {
+            let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
+
+            XCTAssertNil(manager.localToolchainRoot)
+        }
+    }
+
     func testUsesExplicitInstallationRoot() {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -130,6 +140,34 @@ final class ToolchainManagerTests: XCTestCase {
                     of: "  --\(option) <value>\n",
                     with: ""
                 )
+            )
+
+            let manager = ToolchainManager(runner: runner)
+            XCTAssertThrowsError(
+                try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base]),
+                "Expected missing option rejection for \(option)"
+            ) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error for \(option), got \(error)")
+                }
+                XCTAssertTrue(message.contains(option), "expected missing option \(option); got \(message)")
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsMissingRequiredMatchesImporterOptions() throws {
+        for option in NativeColmapHelpFixture.matchesImporterOptions {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+            let runner = makeValidationRunner(
+                root: root,
+                matchesImporterStdout: NativeColmapHelpFixture.matchesImporter
+                    .replacingOccurrences(
+                        of: "  --\(option) <value>\n",
+                        with: ""
+                    )
             )
 
             let manager = ToolchainManager(runner: runner)
@@ -717,7 +755,7 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    /// Public-beta toolchains are intentionally arm64-only. Universal binaries waste
+    /// EasySplat toolchains are intentionally arm64-only. Universal binaries waste
     /// download and install space and can hide an unreviewed x86 dependency closure.
     func testValidateToolchainRejectsUniversalArmPython() throws {
         let root = try TestFileBuilder.makeTempDir()
@@ -808,16 +846,32 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: legacyMsplatRoot))
     }
 
-    func testModelsToolchainLooksInstalled() throws {
+    func testArtifactInstallProbeAcceptsOnlyCurrentComponentNames() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
-
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
         let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
-        XCTAssertTrue(manager.test_modelsToolchainLooksInstalled(root: root))
 
-        try FileManager.default.removeItem(at: fixture.da3ModelFile)
-        XCTAssertFalse(manager.test_modelsToolchainLooksInstalled(root: root))
+        XCTAssertTrue(manager.test_artifactLooksInstalled(
+            name: "macos-arm64-core",
+            root: root
+        ))
+        XCTAssertTrue(manager.test_artifactLooksInstalled(
+            name: "geometry-da3-base",
+            root: root
+        ))
+        XCTAssertTrue(manager.test_artifactLooksInstalled(
+            name: "geometry-da3-small",
+            root: root
+        ))
+        XCTAssertFalse(manager.test_artifactLooksInstalled(
+            name: "future-core",
+            root: root
+        ))
+        XCTAssertFalse(manager.test_artifactLooksInstalled(
+            name: "macos-arm64-models",
+            root: root
+        ))
     }
 
     func testValidateToolchainFailsWhenDa3AppMissing() throws {
@@ -885,12 +939,12 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testValidateToolchainFailsWhenDa3FallbackModelMissing() throws {
+    func testValidateToolchainFailsWhenDa3SmallModelMissing() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(
             at: root,
-            includeDa3FallbackModel: false
+            includeDa3SmallModel: false
         )
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
@@ -1009,6 +1063,10 @@ final class ToolchainManagerTests: XCTestCase {
         mapperStdout: String = NativeColmapHelpFixture.mapper,
         mapperStderr: String = "",
         mapperTerminationReason: Process.TerminationReason = .exit,
+        matchesImporterExitCode: Int32 = 0,
+        matchesImporterStdout: String = NativeColmapHelpFixture.matchesImporter,
+        matchesImporterStderr: String = "",
+        matchesImporterTerminationReason: Process.TerminationReason = .exit,
         vocabularyExitCode: Int32 = 0,
         vocabularyStdout: String = NativeColmapHelpFixture.vocabulary,
         vocabularyStderr: String = "",
@@ -1021,6 +1079,7 @@ final class ToolchainManagerTests: XCTestCase {
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["help"], result: .init(exitCode: 0, terminationReason: colmapTerminationReason, stdout: colmapHelpStdout, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["mapper", "-h"], result: .init(exitCode: mapperExitCode, terminationReason: mapperTerminationReason, stdout: mapperStdout, stderr: mapperStderr), onRun: nil),
+            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["matches_importer", "-h"], result: .init(exitCode: matchesImporterExitCode, terminationReason: matchesImporterTerminationReason, stdout: matchesImporterStdout, stderr: matchesImporterStderr), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["local_vocab_retriever", "-h"], result: .init(exitCode: vocabularyExitCode, terminationReason: vocabularyTerminationReason, stdout: vocabularyStdout, stderr: vocabularyStderr), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("da3_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: da3PythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("da3_mps/bin/easysplat_da3_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: da3HelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -1041,6 +1100,18 @@ final class ToolchainManagerTests: XCTestCase {
 }
 
 enum NativeColmapHelpFixture {
+    static let matchesImporterOptions = [
+        "database_path",
+        "match_list_path",
+        "match_type",
+        "FeatureMatching.use_gpu",
+        "FeatureMatching.num_threads",
+        "FeatureMatching.max_num_matches",
+        "SiftMatching.cpu_brute_force_matcher",
+        "EasySplat.require_empty_matching_results",
+        "TwoViewGeometry.random_seed",
+    ]
+
     static let mapperOptions = [
         "database_path",
         "image_path",
@@ -1062,8 +1133,12 @@ enum NativeColmapHelpFixture {
     static let vocabularyOptions = [
         "database_path",
         "output_pair_list_path",
+        "request_digest",
+        "query_stride",
         "query_image_list_path",
         "excluded_pair_list_path",
+        "image_group_list_path",
+        "image_group_list_digest",
         "num_images",
         "returned_neighbor_count",
         "minimum_frame_separation",
@@ -1077,7 +1152,7 @@ enum NativeColmapHelpFixture {
     ]
 
     static let root = """
-    COLMAP 4.1.0 -- Structure-from-Motion and Multi-View Stereo
+    COLMAP 4.1.1 -- Structure-from-Motion and Multi-View Stereo
 
     Available commands:
       help
@@ -1095,10 +1170,14 @@ enum NativeColmapHelpFixture {
     """
 
     static let mapper = help(command: "mapper", options: mapperOptions)
+    static let matchesImporter = help(
+        command: "matches_importer",
+        options: matchesImporterOptions
+    )
     static let vocabulary = help(command: "local_vocab_retriever", options: vocabularyOptions)
 
     private static func help(command: String, options: [String]) -> String {
-        "COLMAP 4.1.0 \(command)\nOptions:\n" +
+        "COLMAP 4.1.1 \(command)\nOptions:\n" +
             options.sorted().map { "  --\($0) <value>" }.joined(separator: "\n") + "\n"
     }
 }

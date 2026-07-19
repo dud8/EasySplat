@@ -179,16 +179,68 @@ public struct SubprocessResult: Sendable {
 public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
     public init() {}
 
+    static func ambientSensitiveEnvironmentKeys(
+        in environment: [String: String] = RuntimeEnvironment.current
+    ) -> Set<String> {
+        let exact: Set<String> = [
+            "ALL_PROXY",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "CURL_CA_BUNDLE",
+            "GH_TOKEN",
+            "GIT_ASKPASS",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "GITHUB_TOKEN",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NETRC",
+            "NO_PROXY",
+            "REQUESTS_CA_BUNDLE",
+            "SSH_ASKPASS",
+            "SSH_AUTH_SOCK",
+            "SSL_CERT_DIR",
+            "SSL_CERT_FILE"
+        ]
+        let suffixes = [
+            "_ACCESS_KEY",
+            "_API_KEY",
+            "_CLIENT_SECRET",
+            "_CREDENTIAL",
+            "_CREDENTIALS",
+            "_PASSWD",
+            "_PASSWORD",
+            "_PRIVATE_KEY",
+            "_SECRET",
+            "_TOKEN"
+        ]
+        return Set(environment.keys.filter { key in
+            let uppercased = key.uppercased()
+            return exact.contains(uppercased)
+                || uppercased.hasPrefix("DYLD_")
+                || uppercased.hasPrefix("GIT_CONFIG_")
+                || suffixes.contains(where: { uppercased.hasSuffix($0) })
+        })
+    }
+
+    static func sanitizedAmbientEnvironment(
+        _ environment: [String: String] = RuntimeEnvironment.current
+    ) -> [String: String] {
+        environment.filter { !ambientSensitiveEnvironmentKeys(in: environment).contains($0.key) }
+    }
+
     private static func resolvedEnvironment(
         with overrides: [String: String],
         removing keys: Set<String>
     ) -> (environment: [String: String], receipt: SubprocessEnvironmentReceipt) {
         var environment = RuntimeEnvironment.current
-        for key in keys {
+        let removedKeys = ambientSensitiveEnvironmentKeys(in: environment).union(keys)
+        for key in removedKeys {
             environment.removeValue(forKey: key)
         }
         environment.merge(overrides) { _, new in new }
-        let controlledKeys = keys.union(overrides.keys)
+        let controlledKeys = removedKeys.union(overrides.keys)
         let effectiveValues = Dictionary(
             uniqueKeysWithValues: controlledKeys.compactMap { key in
                 environment[key].map { (key, $0) }
@@ -198,7 +250,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
             environment,
             SubprocessEnvironmentReceipt(
                 explicitOverrides: overrides,
-                removedKeys: keys,
+                removedKeys: removedKeys,
                 effectiveValuesForControlledKeys: effectiveValues
             )
         )
@@ -223,9 +275,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
             with: environment,
             removing: removingEnvironmentKeys
         )
-        if !environment.isEmpty || !removingEnvironmentKeys.isEmpty {
-            process.environment = environmentResolution.environment
-        }
+        process.environment = environmentResolution.environment
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -321,9 +371,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
             with: environment,
             removing: removingEnvironmentKeys
         )
-        if !environment.isEmpty || !removingEnvironmentKeys.isEmpty {
-            process.environment = environmentResolution.environment
-        }
+        process.environment = environmentResolution.environment
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()

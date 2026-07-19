@@ -8,25 +8,43 @@ public final class PipelineRunner: @unchecked Sendable {
         public var colmap: ColmapRunner
         public var msplat: MsplatRunner
         public var da3Sfm: Da3SfmRunning
+        public var trainingResourceObserver: any TrainingResourceObserving
         let checkCancellation: @Sendable () throws -> Void
         let colmapGPUSupport: (@Sendable (URL) -> Bool)?
+        let validateVideoInputs: @Sendable (ProjectMetadata, ProjectPaths) throws -> Void
+        let prepareRuntimeInputLease: @Sendable (
+            ProjectMetadata,
+            ProjectPaths,
+            ResolvedPairingPolicy?
+        ) throws -> RuntimeInputSnapshotLease
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     msplat: MsplatRunner = MsplatRunner(),
-                    da3Sfm: Da3SfmRunning = Da3SfmRunner()) {
+                    da3Sfm: Da3SfmRunning = Da3SfmRunner(),
+                    trainingResourceObserver: any TrainingResourceObserving = LiveTrainingResourceObserver()) {
             self.colmap = colmap
             self.msplat = msplat
             self.da3Sfm = da3Sfm
+            self.trainingResourceObserver = trainingResourceObserver
             self.checkCancellation = { try Task.checkCancellation() }
             self.colmapGPUSupport = nil
+            self.validateVideoInputs = { try VideoInputReceiptValidator.validateFiles(metadata: $0, paths: $1) }
+            self.prepareRuntimeInputLease = {
+                try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
+            }
         }
 
         public init(runner: SubprocessRunning) {
             self.colmap = ColmapRunner(runner: runner)
             self.msplat = MsplatRunner(runner: runner)
             self.da3Sfm = Da3SfmRunner(runner: runner)
+            self.trainingResourceObserver = LiveTrainingResourceObserver()
             self.checkCancellation = { try Task.checkCancellation() }
             self.colmapGPUSupport = nil
+            self.validateVideoInputs = { try VideoInputReceiptValidator.validateFiles(metadata: $0, paths: $1) }
+            self.prepareRuntimeInputLease = {
+                try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
+            }
         }
 
         init(
@@ -34,13 +52,27 @@ public final class PipelineRunner: @unchecked Sendable {
             checkCancellation: @escaping @Sendable () throws -> Void = {
                 try Task.checkCancellation()
             },
-            colmapGPUSupport: (@Sendable (URL) -> Bool)? = nil
+            colmapGPUSupport: (@Sendable (URL) -> Bool)? = nil,
+            trainingResourceObserver: any TrainingResourceObserving = LiveTrainingResourceObserver(),
+            validateVideoInputs: @escaping @Sendable (ProjectMetadata, ProjectPaths) throws -> Void = {
+                try VideoInputReceiptValidator.validateFiles(metadata: $0, paths: $1)
+            },
+            prepareRuntimeInputLease: @escaping @Sendable (
+                ProjectMetadata,
+                ProjectPaths,
+                ResolvedPairingPolicy?
+            ) throws -> RuntimeInputSnapshotLease = {
+                try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
+            }
         ) {
             self.colmap = ColmapRunner(runner: runner)
             self.msplat = MsplatRunner(runner: runner)
             self.da3Sfm = Da3SfmRunner(runner: runner)
+            self.trainingResourceObserver = trainingResourceObserver
             self.checkCancellation = checkCancellation
             self.colmapGPUSupport = colmapGPUSupport
+            self.validateVideoInputs = validateVideoInputs
+            self.prepareRuntimeInputLease = prepareRuntimeInputLease
         }
     }
 
@@ -49,21 +81,27 @@ public final class PipelineRunner: @unchecked Sendable {
         public var developmentOverrides: DevelopmentOverrides
         public var hardwareProfile: HardwareProfile?
         public var resolvedRunPlan: ResolvedRunPlan?
+        public var prePipelineDurationSeconds: TimeInterval
+        public var prePipelineStartedAt: Date?
 
         public init(
             toolchain: ToolchainPaths,
             developmentOverrides: DevelopmentOverrides = .none,
             hardwareProfile: HardwareProfile? = nil,
-            resolvedRunPlan: ResolvedRunPlan? = nil
+            resolvedRunPlan: ResolvedRunPlan? = nil,
+            prePipelineDurationSeconds: TimeInterval = 0,
+            prePipelineStartedAt: Date? = nil
         ) {
             self.toolchain = toolchain
             self.developmentOverrides = developmentOverrides
             self.hardwareProfile = hardwareProfile
             self.resolvedRunPlan = resolvedRunPlan
+            self.prePipelineDurationSeconds = prePipelineDurationSeconds
+            self.prePipelineStartedAt = prePipelineStartedAt
         }
     }
 
-    private let projectURL: URL
+    let projectURL: URL
     let config: PipelineConfig
     let tooling: Tooling
     let powerAssertion: PowerAssertionManaging
@@ -83,27 +121,54 @@ public final class PipelineRunner: @unchecked Sendable {
     public func run(resumeFrom lastCompletedStage: PipelineStage? = nil, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
         try await runPipeline(
             resumeFrom: lastCompletedStage,
+            freshPublicationAttestation: nil,
+            events: events
+        )
+    }
+
+    public func run(
+        resumeFrom lastCompletedStage: PipelineStage? = nil,
+        freshPublicationAttestation: FreshProjectPublicationAttestation,
+        events: @escaping @Sendable (PipelineEvent) -> Void
+    ) async throws {
+        try await runPipeline(
+            resumeFrom: lastCompletedStage,
+            freshPublicationAttestation: freshPublicationAttestation,
             events: events
         )
     }
 
     private func runPipeline(
         resumeFrom lastCompletedStage: PipelineStage?,
+        freshPublicationAttestation: FreshProjectPublicationAttestation?,
         events: @escaping @Sendable (PipelineEvent) -> Void
     ) async throws {
+        defer { freshPublicationAttestation?.discard() }
         // Keep the Mac awake while work is active. Display sleep remains available, and
         // the assertion is released on every exit — success, failure, stop, or cancellation.
         let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is processing a project")
         defer { idleSleepAssertion.release() }
 
         let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
+        let stageTiming = StageTimingTracker(
+            initialImportDurationSeconds: config.prePipelineDurationSeconds,
+            importStartedAt: config.prePipelineStartedAt
+        )
 
         // Load metadata BEFORE clearing any logs. If project.json is malformed, unreadable,
         // or from a future build, we want the user to keep the previous run's diagnostic
         // tool logs for inspection — wiping them on a no-op startup
         // failure would destroy the only evidence of why the prior attempt died.
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        try authenticateStartupVideoInputs(
+            metadata: metadata,
+            paths: paths,
+            freshPublicationAttestation: freshPublicationAttestation
+        )
+        try PhotoInputReceiptValidator.validateFiles(metadata: metadata, paths: paths)
+        // No project directory is created or repaired until the immutable video receipts
+        // have been rebound to the exact controlled bytes they describe.
+        try paths.ensureDirectories()
         let detectedHardwareProfile = config.hardwareProfile ?? .detect()
         let requestedOptions = metadata.requestedRunOptions
         try RunPlanResolver.validate(
@@ -130,18 +195,79 @@ public final class PipelineRunner: @unchecked Sendable {
         try resolvedRunPlan.validate()
         let planChangedForCurrentHardware = previousResolvedRunPlan != nil
             && previousResolvedRunPlan != resolvedRunPlan
+        let videoAnalysisRequiresRefresh = try videoFrameAnalysisRequiresRefresh(
+            metadata: metadata,
+            currentPlan: resolvedRunPlan
+        )
+        if videoAnalysisRequiresRefresh {
+            stageTiming.start(.importInput)
+        }
+        let inputLease = try prepareStartupRuntimeInputLease(
+            metadata: metadata,
+            paths: paths,
+            pairingPolicy: resolvedRunPlan.pairingPolicy,
+            freshPublicationAttestation: freshPublicationAttestation
+        )
+        defer { inputLease.discard() }
+        let photoSelectionProjection = inputLease.photoSelectionProjection
         var effectiveLastCompletedStage = RunPlanResolver.safeResumeStage(
             lastCompletedStage,
             input: metadata.input,
             previousPlan: planChangedForCurrentHardware ? previousResolvedRunPlan : resolvedRunPlan,
             currentPlan: resolvedRunPlan
         )
+        let invalidatedUnprovenBackendRecovery: Bool = {
+            guard let recovery = metadata.geometryRecovery else { return false }
+            return !recovery.isBound(to: resolvedRunPlan.geometryBackend)
+        }()
+        if invalidatedUnprovenBackendRecovery {
+            let stages = PipelineStage.allCases
+            let selectedIndex = stages.firstIndex(of: .selectFrames) ?? 0
+            if let completed = effectiveLastCompletedStage,
+               let completedIndex = stages.firstIndex(of: completed),
+               completedIndex > selectedIndex {
+                effectiveLastCompletedStage = .selectFrames
+            }
+        }
+        if videoAnalysisRequiresRefresh {
+            effectiveLastCompletedStage = .importInput
+        }
+        let refreshedVideoAnalysis = try await refreshVideoFrameAnalysisIfNeeded(
+            metadata: metadata,
+            currentPlan: resolvedRunPlan,
+            inputLease: inputLease,
+            paths: paths
+        )
+        var publishedRefreshedVideoAnalysis = false
+        defer {
+            if !publishedRefreshedVideoAnalysis {
+                refreshedVideoAnalysis?.creationLedger.rollback()
+            }
+        }
+        guard !videoAnalysisRequiresRefresh || refreshedVideoAnalysis != nil else {
+            throw RuntimeInputSnapshotError.invalidMetadata
+        }
+        if let refreshedVideoAnalysis {
+            metadata.videoInputReceipts = refreshedVideoAnalysis.receipts
+            var candidateMetadata = metadata
+            candidateMetadata.resolvedRunPlan = resolvedRunPlan
+            try VideoInputReceiptValidator.validateFiles(
+                metadata: candidateMetadata,
+                paths: paths
+            )
+        }
+        let initialColmapRuntimeClosure = try tooling.colmap.captureRuntimeClosure(
+            colmapPath: config.toolchain.colmap
+        )
         let workerExecutionRecorder = try GeometryWorkerExecutionRecorder(
             paths: paths,
             budget: resolvedRunPlan.geometryWorkerBudget,
+            runtimeClosure: initialColmapRuntimeClosure,
             resumeAfter: effectiveLastCompletedStage,
             inputHasVideos: metadata.input.hasVideos,
             resetForPlanChange: planChangedForCurrentHardware
+                || refreshedVideoAnalysis != nil
+                || invalidatedUnprovenBackendRecovery
         )
         let recoveredWorkerExecution = workerExecutionRecorder.maximumSafeResumeBoundary != nil
         if let maximumSafeBoundary = workerExecutionRecorder.maximumSafeResumeBoundary,
@@ -153,7 +279,10 @@ public final class PipelineRunner: @unchecked Sendable {
         }
         let invalidatedMatchingForPlanChange = planChangedForCurrentHardware
             && effectiveLastCompletedStage == .sfmFeatures
-        if planChangedForCurrentHardware || recoveredWorkerExecution {
+        if planChangedForCurrentHardware
+            || refreshedVideoAnalysis != nil
+            || recoveredWorkerExecution
+            || invalidatedUnprovenBackendRecovery {
             try persistResolvedPlanChange(
                 resolvedRunPlan,
                 completedBoundary: effectiveLastCompletedStage,
@@ -164,14 +293,70 @@ public final class PipelineRunner: @unchecked Sendable {
             metadata.resolvedRunPlan = resolvedRunPlan
             try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
         }
+        if let refreshedVideoAnalysis {
+            refreshedVideoAnalysis.creationLedger.commit()
+            publishedRefreshedVideoAnalysis = true
+        }
+        if let refreshedVideoAnalysis {
+            let referenced = Set(refreshedVideoAnalysis.receipts.map(\.analysisArtifactPath))
+            for removal in refreshedVideoAnalysis.supersededArtifactRemovals {
+                guard let relativePath = try? paths.projectRelativePath(for: removal.url),
+                      !referenced.contains(relativePath) else {
+                    continue
+                }
+                _ = try? VideoFrameAnalysisArtifactStore.removeExpectedRegularFile(removal)
+            }
+        }
+        if refreshedVideoAnalysis != nil {
+            _ = stageTiming.finish(.importInput)
+            if let timing = stageTiming.consumeRecord(.importInput) {
+                var timings = metadata.stageTimings ?? []
+                timings.removeAll { $0.stage == .importInput }
+                timings.append(StageTimingRecord(
+                    stage: .importInput,
+                    startedAt: timing.startedAt,
+                    durationSeconds: timing.durationSeconds
+                ))
+                metadata.stageTimings = timings
+                try ProjectMetadataStore.savePreservingUserEditableFields(
+                    metadata,
+                    to: paths.metadataURL
+                )
+            }
+        }
         try workerExecutionRecorder.commitRecoveryBaseline()
         var trainingManifestWarning: String?
-        do {
-            _ = try TrainingArtifactStore.reconcile(metadata: &metadata, paths: paths)
-        } catch {
-            trainingManifestWarning = error.localizedDescription
+        let trainingManifestExists = FileManager.default.fileExists(
+            atPath: paths.trainingManifestURL.path
+        ) || ((try? FileManager.default.destinationOfSymbolicLink(
+            atPath: paths.trainingManifestURL.path
+        )) != nil)
+        if trainingManifestExists {
+            do {
+                _ = try TrainingArtifactStore.load(
+                    from: paths.trainingManifestURL,
+                    projectPaths: paths
+                )
+            } catch {
+                trainingManifestWarning = error.localizedDescription
+            }
         }
-        if metadata.state.lastError != nil, metadata.geometryRecovery != nil {
+        let preserveTerminalPairRecovery: Bool
+        if metadata.state.lastError != nil,
+           metadata.state.stage == .sfmMatching {
+            preserveTerminalPairRecovery = try hasBoundTerminalPairRecovery(
+                paths: paths,
+                resolvedRunPlan: resolvedRunPlan
+            )
+        } else {
+            preserveTerminalPairRecovery = false
+        }
+        if preserveTerminalPairRecovery {
+            effectiveLastCompletedStage = .sfmFeatures
+        }
+        if metadata.state.lastError != nil,
+           metadata.geometryRecovery != nil,
+           !preserveTerminalPairRecovery {
             metadata.geometryRecovery = nil
             try ProjectMetadataStore.savePreservingUserEditableFields(
                 metadata,
@@ -196,11 +381,14 @@ public final class PipelineRunner: @unchecked Sendable {
         var pairRecoveryLevel: PairRecoveryLevel = .normal
         var pairAttemptMode: PairAttemptMode = .policy
         var latestPreparedPairPlan: ColmapPairPlan?
+        var latestPreparedRetrievalEvidence: PairGraphRetrievalAttemptEvidence?
         var latestCompletedPairPlan: ColmapPairPlan?
         var pairGraphAttempts: [PairGraphAttemptEvidence] = []
-        var usedLocalVocabularyRetrieval = false
+        var retrievalWasScheduled = false
         var attemptedPairConfigurations: Set<String> = []
         var acceptedPairGraphEvidence: PairGraphEvidence?
+        var acceptedDa3PairGraphEvidence: PairGraphEvidence?
+        var latestRejectedCaptureConnectionFailure: CaptureConnectionFailure?
         var matchingDurationSeconds = 0.0
         let resumeValidationMode = effectiveLastCompletedStage != nil
         let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
@@ -213,11 +401,14 @@ public final class PipelineRunner: @unchecked Sendable {
         try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
 
         if metadata.state.lastError != nil {
-            try cleanForRetry(failedStage: metadata.state.stage, paths: paths)
+            try cleanForRetry(
+                failedStage: metadata.state.stage,
+                paths: paths,
+                preservingPairGraphRecovery: preserveTerminalPairRecovery
+            )
             try paths.ensureDirectories()
         }
 
-        let stageTiming = StageTimingTracker()
         let emit: @Sendable (PipelineEvent) -> Void = { event in
             switch event {
             case .stageStarted(let stage):
@@ -268,6 +459,7 @@ public final class PipelineRunner: @unchecked Sendable {
         }
 
         var reranStageBeforeTraining = false
+        var runtimeInputReceiptDigest: String?
 
         func markStageForRerun(
             _ stage: PipelineStage,
@@ -299,6 +491,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 updatedAt: Date(),
                 progressFraction: progress,
                 message: message,
+                inputReceiptDigest: runtimeInputReceiptDigest,
                 details: details
             )
             try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
@@ -308,15 +501,13 @@ public final class PipelineRunner: @unchecked Sendable {
             let validationMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
             if stage == .sfmMapping,
                !reranStageBeforeTraining,
-               validationMetadata.geometryArtifact != nil,
+               FileManager.default.fileExists(atPath: paths.geometryManifestURL.path),
                try validateStageOutput(
                    stage,
                    paths: paths,
                    metadata: validationMetadata
                ) == .valid {
-                metadata.geometryArtifact = validationMetadata.geometryArtifact
                 metadata.geometryRecovery = nil
-                metadata.reconstruction = validationMetadata.reconstruction
                 metadata.state = PipelineState(stage: .sfmMapping, lastError: nil)
                 metadata.checkpoint = nil
                 try ProjectMetadataStore.savePreservingUserEditableFields(
@@ -333,7 +524,10 @@ public final class PipelineRunner: @unchecked Sendable {
             guard let lastCompletedStage = effectiveLastCompletedStage else { return true }
             if stage == .trainSplat,
                !reranStageBeforeTraining,
-               validationMetadata.trainingArtifact?.completionStatus == .completed {
+               (try? TrainingArtifactStore.load(
+                   from: paths.trainingManifestURL,
+                   projectPaths: paths
+               ).completionStatus) == .completed {
                 switch try validateStageOutput(stage, paths: paths, metadata: validationMetadata) {
                 case .valid:
                     return false
@@ -436,7 +630,19 @@ public final class PipelineRunner: @unchecked Sendable {
         }
 
         do {
+            try inputLease.validate()
+            let videoClipIdentities = try VideoClipIdentityResolver.resolve(
+                sourceSHA256s: inputLease.videos.map(\.sha256),
+                pairingPolicy: resolvedRunPlan.pairingPolicy
+            )
+            let processingVideos = videoClipIdentities.map {
+                inputLease.videos[$0.sourceIndex]
+            }
+            runtimeInputReceiptDigest = inputLease.receiptDigest
             if wasInterrupted, let checkpoint = metadata.checkpoint {
+                guard checkpoint.inputReceiptDigest == inputLease.receiptDigest else {
+                    throw RuntimeInputSnapshotError.invalidMetadata
+                }
                 emit(.stageLog(
                     stage: checkpoint.stage,
                     line: "Recovered interrupted run checkpoint from \(checkpoint.updatedAt.formatted(date: .abbreviated, time: .standard)); validating resume outputs.",
@@ -484,9 +690,9 @@ public final class PipelineRunner: @unchecked Sendable {
             colmapMatchOptions.maxNumMatches = resolvedRunPlan.colmapMaximumMatchCount
             var selectedFrames: [URL] = []
             var selectedFrameManifest: [SelectedFrameMapping] = []
-            var preparedPhotoFilter: ValidPhotoFilterResult?
             var resolvedFrameTargets: GlobalFrameTargets?
             var verifiedRawFrameManifest: ExtractedFrameManifest?
+            var inspectedVideoSources: [FrameExtractionSource]?
             if metadata.input.hasVideos {
                 if try shouldRunStage(.extractFrames) {
                     currentStage = .extractFrames
@@ -500,8 +706,13 @@ public final class PipelineRunner: @unchecked Sendable {
                     self.removeIfExists(paths.framesRawManifestURL)
                     try self.resetDirectory(paths.framesRawURL)
                     let extractor = FrameExtractor()
-                    let videos = metadata.input.videoFiles
-                    let importedVideos = importedVideoURLs(for: videos, paths: paths)
+                    let selectedVideoFiles = metadata.input.videoFiles
+                    guard inputLease.videos.map(\.projectRelativePath) == selectedVideoFiles else {
+                        throw PipelineError.invalidInput
+                    }
+                    let videos = processingVideos.map(\.projectRelativePath)
+                    let importedVideos = processingVideos.map(\.url)
+                    try inputLease.validate()
                     var analysisOptions = FrameExtractionOptions(
                         targetCount: targetFrames,
                         maxDimension: maxDim,
@@ -521,6 +732,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         ))
                         sources.append(try await extractor.inspect(importedVideos[index]))
                     }
+                    inspectedVideoSources = sources
                     var cumulativeDurations = [0.0]
                     cumulativeDurations.reserveCapacity(sources.count + 1)
                     for source in sources {
@@ -533,12 +745,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     guard totalVideoDuration.isFinite, totalVideoDuration > 0 else {
                         throw PipelineError.invalidInput
                     }
-                    if metadata.input.hasPhotos {
-                        let discoveredPhotos = try loadPhotos(in: paths.importedPhotosURL)
-                        preparedPhotoFilter = try filterValidUniquePhotos(discoveredPhotos)
-                    }
+                    let retainedPhotoCount = photoSelectionProjection?
+                        .canonicalReceipts.count ?? 0
                     let videoTargetFrames: Int
-                    if preparedPhotoFilter?.frames.isEmpty == false {
+                    if retainedPhotoCount > 0 {
                         videoTargetFrames = targetFrames
                     } else {
                         guard let durationTarget = Self.durationAwareVideoFrameTarget(
@@ -559,121 +769,53 @@ public final class PipelineRunner: @unchecked Sendable {
                             isError: false
                         ))
                     }
-                    let preliminaryPlan = try resolveGlobalFrameTargets(
-                        videos: sources.map {
-                            VideoFrameAllocationInput(
-                                durationSeconds: $0.durationSeconds,
-                                availableCandidateCount: videoTargetFrames
-                            )
-                        },
-                        validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
-                        targetCount: videoTargetFrames,
-                        photoSelection: resolvedRunPlan.photoSelection
+                    guard let inputReceipts = metadata.videoInputReceipts,
+                          inputReceipts.count == inputLease.videos.count else {
+                        throw PipelineError.invalidInput
+                    }
+                    let analysisPolicy = VideoFrameAnalysisPolicy(
+                        resolvedRunPlan: resolvedRunPlan
                     )
-                    let preliminaryTargets = preliminaryPlan.videoTargets
-                    let sourceAnalysisConcurrency = Self.videoSourceAnalysisConcurrency(
-                        maximumConcurrentTasks: resolvedRunPlan.geometryWorkerBudget
-                            .maximumConcurrentVideoSourceAnalysisTasks,
-                        videoSourceCount: sources.count
-                    )
-                    let sourceAnalysisConcurrencyMeter = VideoSourceAnalysisConcurrencyMeter()
-                    for file in videos {
+                    var analyses: [FrameExtractionAnalysis] = []
+                    analyses.reserveCapacity(sources.count)
+                    for (index, source) in sources.enumerated() {
                         try Task.checkCancellation()
-                        let sourceName = URL(fileURLWithPath: file).lastPathComponent
+                        let identity = videoClipIdentities[index]
+                        let receipt = inputReceipts[identity.sourceIndex]
+                        let analysisURL = try paths.resolveProjectRelativePath(
+                            receipt.analysisArtifactPath
+                        )
+                        let artifact = try VideoFrameAnalysisArtifactStore.load(
+                            from: analysisURL,
+                            receipt: receipt,
+                            expectedPolicy: analysisPolicy,
+                            expectedClipGroupID: identity.groupID,
+                            expectedSourceIndex: identity.sourceIndex,
+                            projectPaths: paths
+                        )
+                        analyses.append(try artifact.frameExtractionAnalysis(source: source))
+                        let sourceName = URL(
+                            fileURLWithPath: receipt.projectRelativePath
+                        ).lastPathComponent
                         emit(.stageLog(
                             stage: .extractFrames,
-                            line: "Analyzing \(sourceName).",
+                            line: "Using verified frame analysis for \(sourceName).",
                             isError: false
                         ))
-                    }
-                    let initialAnalysisProgress = WeightedVideoAnalysisProgress(
-                        weights: sources.map(\.durationSeconds),
-                        base: 0,
-                        span: 0.4
-                    ) { fraction in
-                        emit(.stageProgress(
-                            stage: .extractFrames,
-                            fraction: fraction,
-                            message: "Analyzing videos"
-                        ))
-                    }
-                    var analyses = try await analyzeVideoSources(
-                        sources,
-                        options: analysisOptions,
-                        targetCounts: preliminaryTargets,
-                        maximumConcurrentTasks: sourceAnalysisConcurrency,
-                        concurrencyMeter: sourceAnalysisConcurrencyMeter
-                    ) { index, fraction in
-                        initialAnalysisProgress.update(index: index, fraction: fraction)
-                    }
-                    emit(.stageProgress(
-                        stage: .extractFrames,
-                        fraction: 0.4,
-                        message: "Analyzing videos"
-                    ))
-                    let attainablePlan = try resolveGlobalFrameTargets(
-                        videos: analyses.map {
-                            VideoFrameAllocationInput(
-                                durationSeconds: $0.durationSeconds,
-                                availableCandidateCount: $0.decodedFrameCount
-                            )
-                        },
-                        validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
-                        targetCount: videoTargetFrames,
-                        photoSelection: resolvedRunPlan.photoSelection
-                    )
-                    let reanalysisIndices = analyses.indices.filter {
-                        analyses[$0].availableCandidateCount
-                            < attainablePlan.videoTargets[$0]
-                    }
-                    for index in reanalysisIndices {
-                        try Task.checkCancellation()
-                        let sourceName = URL(fileURLWithPath: videos[index]).lastPathComponent
-                        emit(.stageLog(
-                            stage: .extractFrames,
-                            line: "Analyzing \(sourceName) again after redistributing the frame budget.",
-                            isError: false
-                        ))
-                    }
-                    if !reanalysisIndices.isEmpty {
-                        let sourcesToReanalyze = reanalysisIndices.map { sources[$0] }
-                        let reanalysisTargets = reanalysisIndices.map {
-                            attainablePlan.videoTargets[$0]
-                        }
-                        let reanalysisProgress = WeightedVideoAnalysisProgress(
-                            weights: sourcesToReanalyze.map(\.durationSeconds),
-                            base: 0.4,
-                            span: 0.05
-                        ) { fraction in
-                            emit(.stageProgress(
-                                stage: .extractFrames,
-                                fraction: fraction,
-                                message: "Analyzing videos"
-                            ))
-                        }
-                        let expandedAnalyses = try await analyzeVideoSources(
-                            sourcesToReanalyze,
-                            options: analysisOptions,
-                            targetCounts: reanalysisTargets,
-                            maximumConcurrentTasks: min(
-                                sourceAnalysisConcurrency,
-                                sourcesToReanalyze.count
-                            ),
-                            concurrencyMeter: sourceAnalysisConcurrencyMeter
-                        ) { index, fraction in
-                            reanalysisProgress.update(index: index, fraction: fraction)
-                        }
-                        for (offset, sourceIndex) in reanalysisIndices.enumerated() {
-                            analyses[sourceIndex] = expandedAnalyses[offset]
-                        }
                     }
                     try workerExecutionRecorder.recordVideoSourceAnalysis(
                         videoSourceCount: sources.count,
-                        snapshot: sourceAnalysisConcurrencyMeter.snapshot()
+                        snapshot: VideoSourceAnalysisConcurrencySnapshot(
+                            startedAnalysisTaskCount: sources.count,
+                            peakInFlightAnalysisTaskCount: min(
+                                sources.count,
+                                analysisPolicy.maximumConcurrentDecoders
+                            )
+                        )
                     )
                     emit(.stageProgress(
                         stage: .extractFrames,
-                        fraction: 0.45,
+                        fraction: 0.1,
                         message: "Choosing frames"
                     ))
                     let finalPlan = try resolveGlobalFrameTargets(
@@ -683,11 +825,11 @@ public final class PipelineRunner: @unchecked Sendable {
                                 availableCandidateCount: $0.availableCandidateCount
                             )
                         },
-                        validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
+                        validPhotoCount: retainedPhotoCount,
                         targetCount: videoTargetFrames,
                         photoSelection: resolvedRunPlan.photoSelection
                     )
-                    if finalPlan.totalTargetCount < attainablePlan.totalTargetCount {
+                    if finalPlan.totalTargetCount < videoTargetFrames {
                         emit(.stageLog(
                             stage: .extractFrames,
                             line: "Using \(finalPlan.totalTargetCount) frames because only that many decoded frames produced valid analysis data.",
@@ -696,7 +838,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                     resolvedFrameTargets = finalPlan
                     let targets = finalPlan.videoTargets
-                    var extractedGroups: [[URL]] = []
+                    var extractedGroups: [[ExtractedFrameOutput]] = []
                     extractedGroups.reserveCapacity(analyses.count)
                     for (index, analysis) in analyses.enumerated() {
                         try Task.checkCancellation()
@@ -719,7 +861,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         outputOptions.targetCount = perVideoTarget
                         let progressStartDuration = cumulativeDurations[index]
                         let progressClipDuration = sources[index].durationSeconds
-                        let extracted = try await extractor.extractFrames(
+                        let extracted = try await extractor.extractFrameOutputs(
                             from: analysis,
                             targetCount: perVideoTarget,
                             to: rawDir,
@@ -727,8 +869,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             progress: { fraction, message in
                                 let completedDuration = progressStartDuration
                                     + progressClipDuration * fraction
-                                let scaled = 0.45
-                                    + 0.55 * completedDuration / totalVideoDuration
+                                let scaled = 0.1
+                                    + 0.9 * completedDuration / totalVideoDuration
                                 emit(.stageProgress(stage: .extractFrames, fraction: scaled, message: message))
                             }
                         )
@@ -740,12 +882,12 @@ public final class PipelineRunner: @unchecked Sendable {
                         ))
                         writeCheckpoint(
                             stage: .extractFrames,
-                            progress: 0.45
-                                + 0.55 * cumulativeDurations[index + 1] / totalVideoDuration,
+                            progress: 0.1
+                                + 0.9 * cumulativeDurations[index + 1] / totalVideoDuration,
                             message: "Extracted \(extracted.count) frames from \(sourceName)",
                             details: .extractFrames(ExtractFramesCheckpoint(
                                 videoIndex: index,
-                                videoName: sourceName,
+                                videoName: videoClipIdentities[index].groupID,
                                 extractedCount: extracted.count,
                                 targetCount: perVideoTarget
                             ))
@@ -754,8 +896,16 @@ public final class PipelineRunner: @unchecked Sendable {
                     verifiedRawFrameManifest = try ExtractedFrameManifestStore.persist(
                         groups: extractedGroups,
                         targetCounts: targets,
+                        sourceEvidence: processingVideos.map {
+                            ExtractedFrameSourceEvidence(
+                                projectRelativePath: $0.projectRelativePath,
+                                byteCount: $0.byteCount,
+                                sha256: $0.sha256
+                            )
+                        },
                         paths: paths
                     )
+                    try inputLease.validate()
                     emit(.stageFinished(stage: .extractFrames))
                     markStageComplete(.extractFrames)
                     try stopIfRequested(after: .extractFrames)
@@ -778,61 +928,139 @@ public final class PipelineRunner: @unchecked Sendable {
                         } else {
                             manifest = try ExtractedFrameManifestStore.loadVerified(
                                 paths: paths,
-                                expectedVideoCount: metadata.input.videoFiles.count,
+                                expectedSourceEvidence: processingVideos.map {
+                                    ExtractedFrameSourceEvidence(
+                                        projectRelativePath: $0.projectRelativePath,
+                                        byteCount: $0.byteCount,
+                                        sha256: $0.sha256
+                                    )
+                                },
                                 maximumTotalFrames: targetFrames
                             )
                         }
-                        let frameGroups = try ExtractedFrameManifestStore.frameGroups(
+                        let frameGroups = try ExtractedFrameManifestStore.frameGroupsWithEvidence(
                             from: manifest,
                             paths: paths
                         )
-                        for (index, rawFrames) in frameGroups.enumerated() {
+                        let importedVideos = processingVideos.map(\.url)
+                        try inputLease.validate()
+                        let sources: [FrameExtractionSource]
+                        if let inspectedVideoSources {
+                            sources = inspectedVideoSources
+                        } else {
+                            let extractor = FrameExtractor()
+                            var inspected: [FrameExtractionSource] = []
+                            inspected.reserveCapacity(importedVideos.count)
+                            for video in importedVideos {
+                                inspected.append(try await extractor.inspect(video))
+                            }
+                            inspectedVideoSources = inspected
+                            sources = inspected
+                        }
+                        guard frameGroups.count == importedVideos.count,
+                              sources.count == importedVideos.count else {
+                            throw PipelineError.invalidInput
+                        }
+                        for (index, rawOutputs) in frameGroups.enumerated() {
                             try Task.checkCancellation()
-                            let groupID = String(format: "video_%03d", index)
-                            groups.append(.init(id: groupID, frames: rawFrames, isVideo: true))
+                            let groupID = videoClipIdentities[index].groupID
+                            let videoSnapshot = processingVideos[index]
+                            groups.append(.init(
+                                id: groupID,
+                                frames: rawOutputs.map(\.url),
+                                isVideo: true,
+                                videoSource: SelectedVideoSource(
+                                    projectRelativePath: videoSnapshot.projectRelativePath,
+                                    sourceSHA256: videoSnapshot.sha256,
+                                    source: sources[index]
+                                ),
+                                videoOriginsByFileName: Dictionary(
+                                    uniqueKeysWithValues: rawOutputs.map {
+                                        ($0.url.lastPathComponent, $0.origin)
+                                    }
+                                )
+                            ))
                         }
                     }
 
                     if metadata.input.photosFolder != nil {
-                        let sourceFolder = paths.importedPhotosURL
-                        let photoFilter: ValidPhotoFilterResult
-                        if let preparedPhotoFilter {
-                            photoFilter = preparedPhotoFilter
-                        } else {
-                            let discoveredPhotos = try loadPhotos(in: sourceFolder)
-                            photoFilter = try filterValidUniquePhotos(discoveredPhotos)
-                        }
-                        let photoTarget: Int
-                        if metadata.input.hasVideos {
-                            let videoFrameCount = groups
-                                .filter(\.isVideo)
-                                .reduce(0) { $0 + $1.frames.count }
-                            photoTarget = resolvedFrameTargets?.photoTarget
-                                ?? min(
-                                    photoFilter.frames.count,
-                                    max(0, targetFrames - videoFrameCount)
-                                )
-                        } else {
-                            photoTarget = photoFilter.frames.count
-                        }
-                        let selectedPhotos = evenlySpacedFrames(
-                            photoFilter.frames,
-                            targetCount: photoTarget
-                        )
-                        if !selectedPhotos.isEmpty {
-                            groups.append(.init(id: "photos", frames: selectedPhotos, isVideo: false))
-                            emit(.stageLog(
-                                stage: .selectFrames,
-                                line: "Using \(selectedPhotos.count) of \(photoFilter.frames.count) valid, unique photos.",
-                                isError: false
-                            ))
-                        }
-                        if photoFilter.unreadableCount > 0 || photoFilter.duplicateCount > 0 {
-                            emit(.stageLog(
-                                stage: .selectFrames,
-                                line: "Skipped \(photoFilter.unreadableCount) unreadable and \(photoFilter.duplicateCount) duplicate photo(s).",
-                                isError: false
-                            ))
+                        if let photoSelectionProjection {
+                            let photoTarget: Int
+                            if metadata.input.hasVideos {
+                                let videoFrameCount = groups
+                                    .filter(\.isVideo)
+                                    .reduce(0) { $0 + $1.frames.count }
+                                photoTarget = resolvedFrameTargets?.photoTarget
+                                    ?? min(
+                                        photoSelectionProjection.canonicalReceipts.count,
+                                        max(0, targetFrames - videoFrameCount)
+                                    )
+                            } else {
+                                photoTarget = photoSelectionProjection.canonicalReceipts.count
+                            }
+                            let selectedReceipts = try photoSelectionProjection.project(
+                                targetCount: photoTarget
+                            )
+                            let snapshotByProjectRelativePath = Dictionary(
+                                uniqueKeysWithValues: inputLease.photos.map {
+                                    ($0.projectRelativePath, $0)
+                                }
+                            )
+                            var selectedPhotos: [URL] = []
+                            var photoBindings: [String: SelectedInputSource] = [:]
+                            selectedPhotos.reserveCapacity(selectedReceipts.count)
+                            photoBindings.reserveCapacity(selectedReceipts.count)
+                            for receipt in selectedReceipts {
+                                guard let snapshot = snapshotByProjectRelativePath[
+                                    receipt.projectRelativePath
+                                ], snapshot.sha256 == receipt.sha256,
+                                   snapshot.byteCount == receipt.byteCount else {
+                                    throw PipelineError.invalidInput
+                                }
+                                selectedPhotos.append(snapshot.url)
+                                photoBindings[snapshot.url.lastPathComponent] =
+                                    SelectedInputSource(
+                                        projectRelativePath: snapshot.projectRelativePath,
+                                        sha256: snapshot.sha256,
+                                        photoRetainedRank: receipt.retainedRank
+                                    )
+                            }
+                            if !selectedPhotos.isEmpty {
+                                let budgetProjection: FrameBudgetProjection
+                                switch photoSelectionProjection.policy {
+                                case .rankedPrefix:
+                                    budgetProjection = .rankedPrefix
+                                case .evenlySpaced:
+                                    budgetProjection = .evenlySpaced
+                                case .preserve:
+                                    budgetProjection = .preserve
+                                }
+                                groups.append(.init(
+                                    id: "photos",
+                                    frames: selectedPhotos,
+                                    isVideo: false,
+                                    budgetProjection: budgetProjection,
+                                    sourceBindingsByFileName: photoBindings
+                                ))
+                                emit(.stageLog(
+                                    stage: .selectFrames,
+                                    line: "Using \(selectedPhotos.count) of \(photoSelectionProjection.artifact.acceptedCount) valid photos.",
+                                    isError: false
+                                ))
+                            }
+                            let duplicateCount =
+                                photoSelectionProjection.artifact.exactDuplicateCount
+                                + photoSelectionProjection.artifact.companionDuplicateCount
+                            if photoSelectionProjection.artifact.unreadableCount > 0
+                                || duplicateCount > 0 {
+                                emit(.stageLog(
+                                    stage: .selectFrames,
+                                    line: "Skipped \(photoSelectionProjection.artifact.unreadableCount) unreadable and \(duplicateCount) duplicate photo(s).",
+                                    isError: false
+                                ))
+                            }
+                        } else if !metadata.input.hasVideos || !inputLease.photos.isEmpty {
+                            throw PipelineError.invalidInput
                         }
                     }
 
@@ -851,17 +1079,20 @@ public final class PipelineRunner: @unchecked Sendable {
                         ))
                     }
 
+                    try inputLease.validate()
                     let selection = try copySelected(
                         groups: budgetedGroups,
                         to: paths.framesSelectedURL,
                         manifestURL: paths.framesSelectedManifestURL,
                         maxDimension: maxDim,
+                        projectPaths: paths,
                         progress: { fraction, message in
                             emit(.stageProgress(stage: .selectFrames, fraction: fraction, message: message))
                         }
                     )
                     selectedFrames = selection.frames
                     selectedFrameManifest = selection.manifest
+                    try inputLease.validate()
                     let adjustedLowLightFrames = selection.manifest.filter {
                         ($0.lowLightExposureEV ?? 0) > 0
                     }.count
@@ -905,16 +1136,6 @@ public final class PipelineRunner: @unchecked Sendable {
                 selectedFrameManifest = (try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL)) ?? []
             }
 
-            let convertedHeic = try normalizeSelectedImagesForTooling(paths: paths)
-            if convertedHeic > 0 {
-                emit(.stageLog(
-                    stage: .selectFrames,
-                    line: "Converted \(convertedHeic) HEIC image(s) to JPEG for tool compatibility.",
-                    isError: false
-                ))
-                selectedFrames = try loadImages(in: paths.framesSelectedURL)
-                selectedFrameManifest = (try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL)) ?? selectedFrameManifest
-            }
             if selectedFrames.count < RunPlanResolver.minimumReconstructionImageCount {
                 throw PipelineError.insufficientInputImages(selectedFrames.count)
             }
@@ -922,14 +1143,31 @@ public final class PipelineRunner: @unchecked Sendable {
                 input: metadata.input,
                 cameraGrouping: resolvedRunPlan.cameraGrouping
             )
+            let selectedUniformPixelDimensions: SelectedImagePixelDimensions?
             let shareCameraAcrossSelectedFrames: Bool
             if sharedCameraRequested {
-                shareCameraAcrossSelectedFrames = try selectedImagesHaveUniformPixelDimensions(
+                selectedUniformPixelDimensions = try selectedImageUniformPixelDimensions(
                     selectedFrames
                 )
+                shareCameraAcrossSelectedFrames = selectedUniformPixelDimensions != nil
             } else {
+                selectedUniformPixelDimensions = nil
                 shareCameraAcrossSelectedFrames = false
             }
+            if resolvedRunPlan.cameraGrouping == .sameCameraAndLens,
+               !shareCameraAcrossSelectedFrames {
+                throw PipelineError.incompatibleSharedCameraDimensions
+            }
+            let featureCameraInitialization = try ColmapCameraInitializationReceipt.resolve(
+                recipe: resolvedRunPlan.cameraInitializationRecipe,
+                cameraModel: cameraModel(
+                    detailProfile: metadata.requestedRunOptions.detailProfile,
+                    capturePath: resolvedRunPlan.capturePath,
+                    lensProjection: resolvedRunPlan.lensProjection
+                ),
+                singleCamera: shareCameraAcrossSelectedFrames,
+                uniformDimensions: selectedUniformPixelDimensions
+            )
 
             let geometryMemorySampler = GeometryMemorySampler()
             geometryMemorySampler.start()
@@ -937,7 +1175,6 @@ public final class PipelineRunner: @unchecked Sendable {
 
             try Task.checkCancellation()
             let da3WindowSize = resolvedRunPlan.chunkSize
-            let backendOrder = try sfmBackendFallbackOrder(resolvedPlan: resolvedRunPlan)
             let geometryRecoveryImageNames = selectedFrames.map(\.lastPathComponent)
             let geometryRecoveryFramesDigest = try GeometryArtifactStore.selectedFramesDigest(
                 orderedImageNames: geometryRecoveryImageNames,
@@ -945,26 +1182,17 @@ public final class PipelineRunner: @unchecked Sendable {
             )
             let plannedIncrementalCadence = resolvedRunPlan.incrementalMappingCadence
 
-            func sfmBackend(for backend: GeometryRecoveryBackend) -> SfmBackend {
-                switch backend {
-                case .da3: return .da3
-                case .colmap: return .colmap
-                }
-            }
-
             let restoredGeometryRecovery: GeometryRecoveryState?
             if let recovery = metadata.geometryRecovery {
                 do {
                     try recovery.validateBinding(
                         expectedImageNames: geometryRecoveryImageNames,
                         expectedSelectedFramesDigest: geometryRecoveryFramesDigest,
+                        expectedGeometryBackend: resolvedRunPlan.geometryBackend,
                         expectedPlannedIncrementalCadence: recovery.activeBackend == .colmap
                             ? plannedIncrementalCadence
                             : nil
                     )
-                    guard backendOrder.contains(sfmBackend(for: recovery.activeBackend)) else {
-                        throw GeometryRecoveryState.ValidationError.invalidBackendFields
-                    }
                     restoredGeometryRecovery = recovery
                 } catch {
                     metadata.geometryRecovery = nil
@@ -982,25 +1210,76 @@ public final class PipelineRunner: @unchecked Sendable {
             } else {
                 restoredGeometryRecovery = nil
             }
-
-            let backendName: (SfmBackend) -> String = { backend in
-                switch backend {
-                case .da3:
-                    return "Depth Anything 3"
-                case .colmap:
-                    return "COLMAP"
-                }
-            }
-
-            var acceptedReconstructionSummary: ReconstructionSummary?
-            var mappingAttemptCount = restoredGeometryRecovery?.mappingAttemptCount ?? 0
+            var acceptedMapper: String?
+            let preservedMappingAttemptCount =
+                workerExecutionRecorder.maximumRecordedMappingAttemptOrdinal
+            var mappingAttemptCount = max(
+                restoredGeometryRecovery?.mappingAttemptCount ?? 0,
+                preservedMappingAttemptCount
+            )
             var acceptedMappingArtifact: MappingArtifact?
+            var acceptedConditioningAnalysis: GeometryConditioningAnalysis?
+            var canonicalPublicationByAttemptAndPath:
+                [String: CanonicalModelPublicationArtifact] = [:]
+            func prepareCanonicalTextCandidate(
+                at url: URL,
+                mappingAttemptOrdinal: Int
+            ) throws -> CanonicalModelPublicationArtifact {
+                let key = "\(mappingAttemptOrdinal):\(url.standardizedFileURL.path)"
+                if let existing = canonicalPublicationByAttemptAndPath[key] {
+                    return existing
+                }
+                let binaryNames = ["cameras.bin", "images.bin", "points3D.bin"]
+                let hasBinaryModel = binaryNames.allSatisfy {
+                    FileManager.default.fileExists(
+                        atPath: url.appendingPathComponent($0).path
+                    )
+                }
+                let imagesTextURL = url.appendingPathComponent("images.txt")
+                if !hasBinaryModel {
+                    _ = try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(
+                        at: imagesTextURL,
+                        checkCancellation: self.tooling.checkCancellation
+                    )
+                }
+                let publication = try self.prepareTextSparseModelForCanonicalPublication(
+                    at: url,
+                    mappingAttemptOrdinal: mappingAttemptOrdinal,
+                    workerExecutionRecorder: workerExecutionRecorder
+                )
+                if hasBinaryModel,
+                   try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(
+                       at: imagesTextURL,
+                       checkCancellation: self.tooling.checkCancellation
+                   ) {
+                    throw PipelineError.outputMissing
+                }
+                canonicalPublicationByAttemptAndPath[key] = publication
+                return publication
+            }
             var mappingFallbackReasons = restoredGeometryRecovery?.mappingFallbackReasons ?? []
+            if restoredGeometryRecovery == nil,
+               preservedMappingAttemptCount > 0 {
+                mappingFallbackReasons.append("mapping retry after failed run")
+            }
             var activeIncrementalCadence = restoredGeometryRecovery?
                 .activeIncrementalCadence ?? plannedIncrementalCadence
-            var recoveredActiveBackend = restoredGeometryRecovery.map {
-                sfmBackend(for: $0.activeBackend)
-            }
+            var activeCadenceFallbackTrigger = restoredGeometryRecovery?
+                .cadenceFallbackTrigger
+            var activeMapperGraphContext: ColmapMapperWorkerInvocationContext? = {
+                guard let recovery = restoredGeometryRecovery,
+                      let ordinal = recovery.acceptedPairAttemptOrdinal,
+                      let pairListDigest = recovery.pairListDigest,
+                      let matchingDatabaseDigest = recovery.matchingDatabaseDigest else {
+                    return nil
+                }
+                return ColmapMapperWorkerInvocationContext(
+                    pairGraphAttemptOrdinal: ordinal,
+                    pairListDigest: pairListDigest,
+                    descriptorMatcher: resolvedRunPlan.normalDescriptorMatcher,
+                    matchingDatabaseDigest: matchingDatabaseDigest
+                )
+            }()
             var resumingInterruptedMapping = restoredGeometryRecovery != nil
                 && metadata.checkpoint?.stage == .sfmMapping
                 && mappingAttemptCount > 0
@@ -1021,21 +1300,6 @@ public final class PipelineRunner: @unchecked Sendable {
                    let level = recovery.pendingPairRecoveryLevel {
                     pairRecoveryLevel = PairRecoveryLevel(level)
                 }
-                if recovery.activeBackend == .da3,
-                   recovery.da3DescriptorMatcher == .exact {
-                    colmapMatchOptions.descriptorMatcher = .exact
-                    didRetryWithExactMatcher = true
-                }
-                if recovery.activeBackend == .colmap,
-                   sparseModelFilesExist(at: paths.colmapSeedModelURL) {
-                    try prepareForClassicalFeatureExtraction(paths: paths)
-                    try paths.ensureDirectories()
-                    emit(.stageLog(
-                        stage: .sfmFeatures,
-                        line: "Finished an interrupted reconstruction-route handoff before resuming.",
-                        isError: false
-                    ))
-                }
             }
 
             func recordMappingFallback(_ reason: String) {
@@ -1044,15 +1308,12 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             func persistGeometryRecovery(
-                activeBackend: SfmBackend,
-                pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil,
-                da3DescriptorMatcher: DescriptorMatcher? = nil
+                pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil
             ) throws {
-                let recoveryBackend: GeometryRecoveryBackend
-                switch activeBackend {
-                case .da3: recoveryBackend = .da3
-                case .colmap: recoveryBackend = .colmap
-                }
+                let recoveryBackend = resolvedRunPlan.geometryBackend
+                let mapperGraphContext = recoveryBackend == .colmap
+                    ? activeMapperGraphContext
+                    : nil
                 let state = GeometryRecoveryState(
                     selectedFramesDigest: geometryRecoveryFramesDigest,
                     orderedImageNames: geometryRecoveryImageNames,
@@ -1060,7 +1321,6 @@ public final class PipelineRunner: @unchecked Sendable {
                     mappingAttemptCount: mappingAttemptCount,
                     mappingFallbackReasons: mappingFallbackReasons,
                     pendingPairRecoveryLevel: pendingPairRecoveryLevel,
-                    da3DescriptorMatcher: da3DescriptorMatcher,
                     colmapComputeMode: recoveryBackend == .colmap
                         ? (colmapMatchOptions.useGPU ? .gpu : .cpu)
                         : nil,
@@ -1069,7 +1329,15 @@ public final class PipelineRunner: @unchecked Sendable {
                         : nil,
                     activeIncrementalCadence: recoveryBackend == .colmap
                         ? activeIncrementalCadence
-                        : nil
+                        : nil,
+                    cadenceFallbackTrigger: recoveryBackend == .colmap
+                        ? activeCadenceFallbackTrigger
+                        : nil,
+                    acceptedPairAttemptOrdinal:
+                        mapperGraphContext?.pairGraphAttemptOrdinal,
+                    pairListDigest: mapperGraphContext?.pairListDigest,
+                    matchingDatabaseDigest:
+                        mapperGraphContext?.matchingDatabaseDigest
                 )
                 try state.validate()
                 metadata.geometryRecovery = state
@@ -1080,9 +1348,7 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             func beginMappingAttempt(
-                activeBackend: SfmBackend,
-                pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil,
-                da3DescriptorMatcher: DescriptorMatcher? = nil
+                pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil
             ) throws -> Int {
                 if resumingInterruptedMapping {
                     recordMappingFallback("interrupted mapping resumed")
@@ -1091,32 +1357,27 @@ public final class PipelineRunner: @unchecked Sendable {
                 guard mappingAttemptCount < GeometryRecoveryState.maximumMappingAttemptCount else {
                     throw GeometryRecoveryState.ValidationError.invalidMappingAttemptCount
                 }
+                if resolvedRunPlan.geometryBackend == .colmap,
+                   acceptedPairGraphEvidence == nil {
+                    throw PairGraphEvidenceStoreError.invalidEvidence
+                }
+                if resolvedRunPlan.geometryBackend == .da3,
+                   acceptedDa3PairGraphEvidence == nil {
+                    throw PairGraphEvidenceStoreError.invalidEvidence
+                }
                 let mappingAttemptOrdinal = try workerExecutionRecorder.beginMappingAttempt()
                 mappingAttemptCount += 1
                 try persistGeometryRecovery(
-                    activeBackend: activeBackend,
-                    pendingPairRecoveryLevel: pendingPairRecoveryLevel,
-                    da3DescriptorMatcher: da3DescriptorMatcher
+                    pendingPairRecoveryLevel: pendingPairRecoveryLevel
                 )
                 return mappingAttemptOrdinal
             }
 
-            for (index, backendPolicy) in backendOrder.enumerated() {
-                if let pendingRecoveredBackend = recoveredActiveBackend {
-                    guard backendPolicy == pendingRecoveredBackend else { continue }
-                    // Apply the persisted route exactly once; later entries remain
-                    // available as the normal fallback order for this resumed run.
-                    recoveredActiveBackend = nil
-                }
-                // Reset accepted-quality state at the start of every backend attempt so a
-                // partial failure from the previous backend cannot leak its score/summary
-                // into a later backend's successful run.
-                acceptedReconstructionSummary = nil
-                acceptedMappingArtifact = nil
-                var completedMappingThisAttempt = false
-                var acceptedDa3ModelSubdirectory: String?
-                var da3ConfigurationForAttempt: Da3SfmConfig?
-                do {
+            let backendPolicy = resolvedRunPlan.geometryBackend
+            var completedMappingThisAttempt = false
+            var acceptedDa3ModelSubdirectory: String?
+            var da3ConfigurationForAttempt: Da3SfmConfig?
+            do {
                     if backendPolicy == .da3 {
                         let fm = FileManager.default
                         let seedZero = paths.colmapSeedModelURL
@@ -1129,9 +1390,6 @@ public final class PipelineRunner: @unchecked Sendable {
                         let da3Config = Da3SfmConfig(
                             device: da3DevicePreference(),
                             modelSubdirectory: resolvedRunPlan.modelIdentifier,
-                            fallbackModelSubdirectory: resolvedRunPlan.modelIdentifier == "DA3-BASE"
-                                ? da3FallbackModelPreference()
-                                : resolvedRunPlan.modelIdentifier,
                             processResolution: resolvedRunPlan.geometryProcessResolution,
                             maxPoints: da3MaxPointsPreference(
                                 detailProfile: metadata.requestedRunOptions.detailProfile
@@ -1181,8 +1439,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 expectedMaxPoints: da3Config.maxPoints,
                                 expectedCameraType: da3Config.cameraType,
                                 expectedSharedCamera: da3Config.sharedCamera,
-                                expectedPrimaryModelSubdirectory: da3Config.modelSubdirectory,
-                                expectedFallbackModelSubdirectory: da3Config.fallbackModelSubdirectory
+                                expectedModelSubdirectory: da3Config.modelSubdirectory
                             )
                             if !issues.isEmpty {
                                 emit(.stageLog(
@@ -1204,10 +1461,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                     expectedPointCount: learnedPointCount,
                                     maximumPointCount: da3Config.maxPoints
                                 )
+                                try Self.requireDa3SeedCameraModel(
+                                    at: seedZero,
+                                    expectedCameraModel: da3Config.cameraType
+                                )
                             } catch {
                                 emit(.stageLog(
                                     stage: currentStage,
-                                    line: "DA3 learned point initializer was invalid (\(error.localizedDescription)).",
+                                    line: "DA3 seed geometry was invalid (\(error.localizedDescription)).",
                                     isError: required
                                 ))
                                 if required { throw error }
@@ -1257,7 +1518,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             emit(.stageLog(stage: .sfmFeatures, line: "SfM backend: da3-mps.", isError: false))
                             emit(.stageLog(
                                 stage: .sfmFeatures,
-                                line: "DA3 candidate: single batch, ordering=\(da3Config.inputOrdering.rawValue) model=\(da3Config.modelSubdirectory) fallback=\(da3Config.fallbackModelSubdirectory) device=\(da3Config.device) processRes=\(da3Config.processResolution) maxPoints=\(da3Config.maxPoints) sharedCamera=\(da3Config.sharedCamera) cameraType=\(da3Config.cameraType) views=\(da3Config.windowSize).",
+                                line: "DA3 candidate: single batch, ordering=\(da3Config.inputOrdering.rawValue) model=\(da3Config.modelSubdirectory) device=\(da3Config.device) processRes=\(da3Config.processResolution) maxPoints=\(da3Config.maxPoints) sharedCamera=\(da3Config.sharedCamera) cameraType=\(da3Config.cameraType) views=\(da3Config.windowSize).",
                                 isError: false
                             ))
 
@@ -1282,7 +1543,6 @@ public final class PipelineRunner: @unchecked Sendable {
                                     "windowSize": "\(da3Config.windowSize)",
                                     "windowOverlap": "\(da3Config.windowOverlap)",
                                     "model": da3Config.modelSubdirectory,
-                                    "fallbackModel": da3Config.fallbackModelSubdirectory,
                                     "manifest": da3CoverageManifest.path,
                                     "tool": self.config.toolchain.da3.sfmTool.path,
                                     "modelsDir": self.config.toolchain.da3.models.path
@@ -1331,7 +1591,77 @@ public final class PipelineRunner: @unchecked Sendable {
                             fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                         }
 
-                        if try shouldRunStage(.sfmMatching) {
+                        guard let seedManifest = try readDa3CoverageManifest(
+                            required: true
+                        ) else {
+                            throw PipelineError.outputMissing
+                        }
+                        let featureImageNames = selectedFrames.map(
+                            \.lastPathComponent
+                        )
+                        let pairPlan = try ColmapPairEstimator.validatedDa3RefinementPairPlan(
+                            manifest: seedManifest,
+                            imageNames: featureImageNames,
+                            resolvedPlan: resolvedRunPlan
+                        )
+                        let pairPlanBinding = PairGraphPlanBinding(
+                            resolvedRunPlan
+                        )
+                        let restoredDa3PairEvidence: PairGraphEvidence? = try {
+                            guard fm.fileExists(
+                                atPath: paths.pairGraphEvidenceURL.path
+                            ), fm.fileExists(
+                                atPath: paths.workerExecutionURL.path
+                            ) else {
+                                return nil
+                            }
+                            do {
+                                let evidence = try PairGraphEvidenceStore
+                                    .loadVerifiedDa3Refinement(
+                                        from: paths.pairGraphEvidenceURL,
+                                        expectedImageNames: featureImageNames,
+                                        expectedPlanBinding: pairPlanBinding,
+                                        expectedPairPlan: pairPlan,
+                                        databaseURL: paths.colmapDatabaseURL,
+                                        projectPaths: paths
+                                    )
+                                let workerExecution = try GeometryWorkerExecutionArtifactStore
+                                    .load(
+                                        from: paths.workerExecutionURL,
+                                        expectedBudget:
+                                            resolvedRunPlan.geometryWorkerBudget,
+                                        projectPaths: paths
+                                    )
+                                try PairGraphEvidenceStore
+                                    .validateDa3WorkerExecution(
+                                        evidence,
+                                        expectedPlanBinding: pairPlanBinding,
+                                        expectedPairPlan: pairPlan,
+                                        workerExecution: workerExecution
+                                    )
+                                return evidence
+                            } catch is CancellationError {
+                                throw CancellationError()
+                            } catch {
+                                emit(.stageLog(
+                                    stage: .sfmMatching,
+                                    line: "Discarded incomplete DA3 matching evidence and restarted matching from FAISS.",
+                                    isError: true
+                                ))
+                                return nil
+                            }
+                        }()
+                        if let restoredDa3PairEvidence {
+                            pendingMatchingResetMessage = nil
+                            acceptedDa3PairGraphEvidence =
+                                restoredDa3PairEvidence
+                            emit(.stageLog(
+                                stage: .sfmMatching,
+                                line: "Recovered verified DA3 image matches.",
+                                isError: false
+                            ))
+                            try stopIfRequested(after: .sfmMatching)
+                        } else if try shouldRunStage(.sfmMatching) {
                             currentStage = .sfmMatching
                             emit(.stageStarted(stage: .sfmMatching))
                             writeCheckpoint(
@@ -1353,50 +1683,112 @@ public final class PipelineRunner: @unchecked Sendable {
                                     "tool": self.config.toolchain.colmap.path
                                 ]
                             )
-                            emit(.stageProgress(stage: .sfmMatching, fraction: 0.02, message: "Extracting local features…"))
-                            try await self.tooling.colmap.runFeatureExtractor(
-                                colmapPath: self.config.toolchain.colmap,
-                                database: paths.colmapDatabaseURL,
-                                imagePath: paths.framesSelectedURL,
-                                maxImageSize: colmapMaxImageSize,
-                                cameraModel: da3Config.cameraType,
-                                singleCamera: da3Config.sharedCamera,
-                                options: da3ColmapExtractOptions,
-                                onLog: { line, isErr in
-                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                }
+                            let cameraGroupingEvidence = try Self.colmapCameraGroupingEvidence(
+                                imageNames: featureImageNames,
+                                manifest: selectedFrameManifest
                             )
+                            let cameraGroupingMode = Self.colmapCameraGroupingMode(
+                                cameraGrouping: resolvedRunPlan.cameraGrouping,
+                                evidence: cameraGroupingEvidence
+                            )
+                            let reusesFeatureEvidence = (try? ColmapFeatureEvidenceStore
+                                .loadVerified(
+                                    from: paths.colmapFeatureEvidenceURL,
+                                    expectedImageNames: featureImageNames,
+                                    expectedCameraEvidence: cameraGroupingEvidence,
+                                    expectedCameraGroupingMode: cameraGroupingMode,
+                                    expectedCameraInitializationReceipt:
+                                        featureCameraInitialization,
+                                    databaseURL: paths.colmapDatabaseURL,
+                                    projectPaths: paths
+                                )) != nil
+                            if reusesFeatureEvidence {
+                                emit(.stageProgress(
+                                    stage: .sfmMatching,
+                                    fraction: 0.40,
+                                    message: "Resuming image matching…"
+                                ))
+                            } else {
+                                try workerExecutionRecorder.invalidate(
+                                    startingAt: .sfmFeatures
+                                )
+                                for url in [
+                                    paths.colmapDatabaseURL,
+                                    URL(fileURLWithPath:
+                                        paths.colmapDatabaseURL.path + "-wal"),
+                                    URL(fileURLWithPath:
+                                        paths.colmapDatabaseURL.path + "-shm"),
+                                    URL(fileURLWithPath:
+                                        paths.colmapDatabaseURL.path + "-journal"),
+                                    paths.colmapFeatureEvidenceURL,
+                                ] {
+                                    try self.removeItemIfPresent(url)
+                                }
+                                emit(.stageProgress(
+                                    stage: .sfmMatching,
+                                    fraction: 0.02,
+                                    message: "Extracting local features…"
+                                ))
+                                try await self.tooling.colmap.runFeatureExtractor(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    database: paths.colmapDatabaseURL,
+                                    imagePath: paths.framesSelectedURL,
+                                    maxImageSize: colmapMaxImageSize,
+                                    cameraInitialization: featureCameraInitialization,
+                                    options: da3ColmapExtractOptions,
+                                    onLog: { line, isErr in
+                                        colmapToolLog.append(
+                                            stream: isErr ? "stderr" : "stdout",
+                                            line: line
+                                        )
+                                    }
+                                )
+                                try ColmapDatabaseDurability.seal(
+                                    at: paths.colmapDatabaseURL
+                                )
+                                try ColmapFeatureDatabaseIdentityVerifier.verify(
+                                    databaseURL: paths.colmapDatabaseURL,
+                                    expectedImageNames: featureImageNames
+                                )
+                                let cameraGroupingReceipt = try ColmapCameraGroupingStore
+                                    .normalize(
+                                        databaseURL: paths.colmapDatabaseURL,
+                                        selectedImages: cameraGroupingEvidence,
+                                        mode: cameraGroupingMode
+                                    )
+                                try ColmapDatabaseDurability.seal(
+                                    at: paths.colmapDatabaseURL
+                                )
+                                try ColmapFeatureEvidenceStore.save(
+                                    ColmapFeatureEvidence(
+                                        selectedFramesDigest: try GeometryArtifactStore
+                                            .selectedFramesDigest(
+                                                orderedImageNames: featureImageNames,
+                                                projectPaths: paths
+                                            ),
+                                        imageNames: featureImageNames,
+                                        featureDatabaseDigest: try ColmapDatabaseDigester
+                                            .digests(at: paths.colmapDatabaseURL).feature,
+                                        cameraGroupingReceipt: cameraGroupingReceipt,
+                                        cameraInitializationReceipt: featureCameraInitialization
+                                    ),
+                                    to: paths.colmapFeatureEvidenceURL,
+                                    projectPaths: paths
+                                )
+                            }
                             self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
-                            try resetMatchingIfNeeded()
-                            if restoredGeometryRecovery?.activeBackend == .da3,
-                               restoredGeometryRecovery?.da3DescriptorMatcher == .exact {
+                            try workerExecutionRecorder.invalidate(
+                                startingAt: .sfmMatching
+                            )
+                            try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+                            try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
+                            if pendingMatchingResetMessage != nil {
+                                try resetMatchingIfNeeded()
+                            } else {
                                 try ColmapDatabaseMatchStore.clearMatchingResults(
                                     at: paths.colmapDatabaseURL
                                 )
                             }
-
-                            let seedManifest = try readDa3CoverageManifest(required: true)
-                            guard let localPairs = seedManifest?.boundedMatchPairs,
-                                  !localPairs.isEmpty else {
-                                throw PipelineError.outputMissing
-                            }
-                            let includesLoopClosures = false
-                            let loopPairs: [String] = []
-                            guard let trustedPairLimit = Da3CoverageManifest.trustedRefinementMatchPairLimit(
-                                selectedImageCount: selectedFrames.count,
-                                windowSize: da3Config.windowSize,
-                                windowOverlap: da3Config.windowOverlap,
-                                inputOrdering: da3Config.inputOrdering,
-                                includesLoopClosures: includesLoopClosures
-                            ) else {
-                                throw PipelineError.outputMissing
-                            }
-                            let pairPlan = try ColmapPairEstimator.da3RefinementPairPlan(
-                                imageNames: selectedFrames.map(\.lastPathComponent),
-                                localPairs: localPairs,
-                                loopPairs: loopPairs,
-                                maxPairCount: trustedPairLimit
-                            )
                             let matchListURL = paths.colmapSeedURL.appendingPathComponent("match_pairs.txt")
                             try pairPlan.serializedData.write(to: matchListURL, options: .atomic)
                             let persistedPairData = try Data(contentsOf: matchListURL)
@@ -1405,32 +1797,88 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                             emit(.stageLog(
                                 stage: .sfmMatching,
-                                line: "DA3 refinement pair plan: \(pairPlan.localPairCount) local + \(pairPlan.loopPairCount) loop, sha256 \(pairPlan.sha256).",
+                                line: "DA3 refinement pair plan: \(pairPlan.localPairCount) local + \(pairPlan.loopRevisitPairCount) loop, sha256 \(pairPlan.sha256).",
                                 isError: false
                             ))
                             let matcherLog: @Sendable (String, Bool) -> Void = { line, isErr in
                                 colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                             }
-                            try await self.runDa3MatchesImporterWithOneShotExactRecovery(
+                            var effectiveDa3MatchOptions =
+                                da3ColmapMatchOptions
+                            effectiveDa3MatchOptions.descriptorMatcher = .faiss
+                            let matchingExecution = try await self
+                                .runDa3MatchesImporterWithOneShotExactRecovery(
                                 database: paths.colmapDatabaseURL,
                                 matchListPath: matchListURL,
-                                options: da3ColmapMatchOptions,
+                                pairPlan: pairPlan,
+                                randomSeed: resolvedRunPlan.runSeed,
+                                options: effectiveDa3MatchOptions,
                                 onLog: matcherLog,
                                 emit: emit,
-                                onExactRecovery: {
+                                onExactRecovery: { _ in
                                     didRetryWithExactMatcher = true
                                     colmapMatchOptions.descriptorMatcher = .exact
                                     recordMappingFallback("exact descriptor matching")
-                                    try persistGeometryRecovery(
-                                        activeBackend: .da3,
-                                        da3DescriptorMatcher: .exact
-                                    )
                                 }
                             )
+                            let da3PairEvidence = PairGraphEvidence(
+                                selectedFramesDigest: try GeometryArtifactStore
+                                    .selectedFramesDigest(
+                                        orderedImageNames: selectedFrames.map(
+                                            \.lastPathComponent
+                                        ),
+                                        projectPaths: paths
+                                    ),
+                                imageNames: selectedFrames.map(\.lastPathComponent),
+                                pairingPolicy: resolvedRunPlan.pairingPolicy,
+                                planBinding: PairGraphPlanBinding(resolvedRunPlan),
+                                attempts: matchingExecution.attempts,
+                                acceptedAttemptNumber:
+                                    matchingExecution.attempts.count,
+                                acceptedInspection:
+                                    matchingExecution.acceptedInspection,
+                                retrievalWasScheduled: false,
+                                usedLocalVocabularyRetrieval: false,
+                                matchingDurationSeconds:
+                                    matchingExecution.matchingDurationSeconds,
+                                fallbackReasons: mappingFallbackReasons
+                            )
+                            let workerExecution = try workerExecutionRecorder
+                                .validatedArtifact()
+                            try PairGraphEvidenceStore
+                                .validateDa3WorkerExecution(
+                                    da3PairEvidence,
+                                    expectedPlanBinding: pairPlanBinding,
+                                    expectedPairPlan: pairPlan,
+                                    workerExecution: workerExecution
+                                )
+                            try PairGraphEvidenceStore.saveDa3Refinement(
+                                da3PairEvidence,
+                                expectedPlanBinding: pairPlanBinding,
+                                expectedPairPlan: pairPlan,
+                                to: paths.pairGraphEvidenceURL,
+                                projectPaths: paths
+                            )
+                            let publishedEvidence = try PairGraphEvidenceStore
+                                .loadVerifiedDa3Refinement(
+                                    from: paths.pairGraphEvidenceURL,
+                                    expectedImageNames: featureImageNames,
+                                    expectedPlanBinding: pairPlanBinding,
+                                    expectedPairPlan: pairPlan,
+                                    databaseURL: paths.colmapDatabaseURL,
+                                    projectPaths: paths
+                                )
+                            try PairGraphEvidenceStore
+                                .validateDa3WorkerExecution(
+                                    publishedEvidence,
+                                    expectedPlanBinding: pairPlanBinding,
+                                    expectedPairPlan: pairPlan,
+                                    workerExecution: workerExecution
+                                )
+                            acceptedDa3PairGraphEvidence = publishedEvidence
                             let expectedPairs = pairPlan.pairs.count
-                            let processedPairs = (try? ColmapDatabaseProgressPoller(
-                                databasePath: paths.colmapDatabaseURL
-                            ).readAttemptedPairCount()) ?? 0
+                            let processedPairs = matchingExecution
+                                .acceptedInspection.attemptedPairCount
                             writeCheckpoint(
                                 stage: .sfmMatching,
                                 progress: 1.0,
@@ -1443,14 +1891,10 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageFinished(stage: .sfmMatching))
                             markStageComplete(.sfmMatching)
-                            try persistGeometryRecovery(
-                                activeBackend: .da3,
-                                da3DescriptorMatcher:
-                                    colmapMatchOptions.descriptorMatcher == .exact
-                                        ? .exact
-                                        : nil
-                            )
+                            try persistGeometryRecovery()
                             try stopIfRequested(after: .sfmMatching)
+                        } else {
+                            throw PairGraphEvidenceStoreError.invalidEvidence
                         }
 
                         if try shouldRunStage(.sfmMapping) {
@@ -1477,20 +1921,9 @@ public final class PipelineRunner: @unchecked Sendable {
                             writeCheckpoint(
                                 stage: .sfmMapping,
                                 progress: 0,
-                                message: "DA3 refinement started",
-                                details: .sfmMapping(SfmMappingCheckpoint(
-                                    mapper: "da3-refined",
-                                    sparsePath: try paths.projectRelativePath(for: sparseZero),
-                                    registeredImages: nil
-                                ))
+                                message: "DA3 refinement started"
                             )
-                            let mappingAttemptOrdinal = try beginMappingAttempt(
-                                activeBackend: .da3,
-                                da3DescriptorMatcher:
-                                    colmapMatchOptions.descriptorMatcher == .exact
-                                        ? .exact
-                                        : nil
-                            )
+                            let mappingAttemptOrdinal = try beginMappingAttempt()
                             try self.resetDirectory(paths.colmapSparseURL)
                             try self.resetDirectory(sparseZero)
                             let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
@@ -1542,7 +1975,15 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                             self.removeIfExists(sparseZero)
                             try fm.moveItem(at: baOutput, to: sparseZero)
-                            _ = try self.ensureTextSparseModelFiles(at: sparseZero)
+                            let canonicalModelPublication = try prepareCanonicalTextCandidate(
+                                at: sparseZero,
+                                mappingAttemptOrdinal: mappingAttemptOrdinal
+                            )
+                            let conditioningAnalysis = try self.validatedConditionedGeometry(
+                                modelDirectory: sparseZero,
+                                selectedFrames: selectedFrames,
+                                requireStrongObservationCoverage: true
+                            )
 
                             let membership = try ColmapSparseModelMembershipReader(
                                 databaseURL: paths.colmapDatabaseURL,
@@ -1562,6 +2003,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             ),
                                   score.registeredImages
                                     == membership.largestModelRegisteredViewCount,
+                                  conditioningAnalysis.residuals.registeredViewCount
+                                    == score.registeredImages,
                                   let residual = score.meanReprojectionError,
                                   residual.isFinite else {
                                 throw PipelineError.lowQualityReconstruction(score, mapper: "da3-refined")
@@ -1578,23 +2021,11 @@ public final class PipelineRunner: @unchecked Sendable {
                                 acceptedRefinementKind: .seededBundleAdjustment,
                                 acceptedRefinementInvocationCount: 1,
                                 incrementalCadence: nil,
+                                canonicalModelPublication: canonicalModelPublication,
                                 fallbackReason: nil
                             )
-                            acceptedReconstructionSummary = ReconstructionSummary(
-                                score: score,
-                                mapper: "da3-refined",
-                                capturedAt: Date()
-                            )
-                            writeCheckpoint(
-                                stage: .sfmMapping,
-                                progress: 1.0,
-                                message: "DA3 refinement completed",
-                                details: .sfmMapping(SfmMappingCheckpoint(
-                                    mapper: "da3-refined",
-                                    sparsePath: try paths.projectRelativePath(for: sparseZero),
-                                    registeredImages: score.registeredImages
-                                ))
-                            )
+                            acceptedMapper = "da3-refined"
+                            acceptedConditioningAnalysis = conditioningAnalysis
                             emit(.stageLog(
                                 stage: .sfmMapping,
                                 line: "DA3 aligned seed accepted after triangulation and bounded bundle adjustment.",
@@ -1607,7 +2038,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 && restoredGeometryRecovery?.pendingPairRecoveryLevel != nil
 
             func restoreAcceptedPairEvidence(_ evidence: PairGraphEvidence) throws {
-                guard evidence.pairingPolicy == resolvedRunPlan.pairingPolicy,
+                guard evidence.planBinding == PairGraphPlanBinding(resolvedRunPlan),
                       let acceptedAttempt = evidence.attempts.last else {
                     throw PairGraphEvidenceStoreError.invalidEvidence
                 }
@@ -1622,23 +2053,45 @@ public final class PipelineRunner: @unchecked Sendable {
                     throw PairGraphEvidenceStoreError.invalidEvidence
                 }
                 let acceptedPlan = try evidence.restoredPairPlan()
+                let mapperGraphContext = try evidence.mapperWorkerInvocationContext()
+                if let recovery = restoredGeometryRecovery,
+                   recovery.activeBackend == .colmap,
+                   metadata.checkpoint?.stage == .sfmMapping {
+                    try recovery.validatePairGraphBinding(
+                        acceptedPairAttemptOrdinal:
+                            mapperGraphContext.pairGraphAttemptOrdinal,
+                        pairListDigest: mapperGraphContext.pairListDigest,
+                        matchingDatabaseDigest:
+                            mapperGraphContext.matchingDatabaseDigest
+                    )
+                }
                 pairGraphAttempts = evidence.attempts
-                usedLocalVocabularyRetrieval = evidence.usedLocalVocabularyRetrieval
+                retrievalWasScheduled = evidence.retrievalWasScheduled
                 acceptedPairGraphEvidence = evidence
+                activeMapperGraphContext = mapperGraphContext
                 matchingDurationSeconds = evidence.matchingDurationSeconds
                 pairRecoveryLevel = acceptedRecoveryLevel
                 colmapMatchOptions.descriptorMatcher = acceptedAttempt.artifact.matcher
                 didRetryWithExactMatcher = acceptedAttempt.artifact.matcher == .exact
                 latestPreparedPairPlan = acceptedPlan
-                pairAttemptMode = acceptedAttempt.artifact.matcher == .exact
-                    ? .sameScheduleExact(acceptedPlan)
-                    : .policy
+                if acceptedAttempt.artifact.matcher == .exact {
+                    guard let reason = acceptedAttempt.artifact.exactRecoveryReason else {
+                        throw PairGraphEvidenceStoreError.invalidEvidence
+                    }
+                    pairAttemptMode = .sameScheduleExact(acceptedPlan, reason)
+                } else {
+                    pairAttemptMode = .policy
+                }
                 for reason in evidence.fallbackReasons {
                     recordMappingFallback(reason)
                 }
             }
 
             let selectedImageNames = selectedFrames.map(\.lastPathComponent)
+            let selectedPairGroups = try Self.colmapPairGroups(
+                imageNames: selectedImageNames,
+                manifest: selectedFrameManifest
+            )
             var selectedFramesDigestForRecovery: String?
             var resumingPersistedExactRecovery = false
             var recoveredAcceptedExactEvidence = false
@@ -1660,17 +2113,14 @@ public final class PipelineRunner: @unchecked Sendable {
             func persistedRecoveryMode(
                 for mode: PairAttemptMode
             ) -> PairGraphRecoveryMode {
-                if mode.isPolicyRecovery {
-                    return colmapMatchOptions.descriptorMatcher == .faiss
-                        ? .policy
-                        : .sameScheduleExact
-                }
-                return .sameScheduleExact
+                mode.isPolicyRecovery ? .policy : .sameScheduleExact
             }
 
             func persistPairRecoveryIntent(
                 mode: PairGraphRecoveryMode,
+                exactRecoveryReason: DescriptorMatcherRecoveryReason? = nil,
                 activePlan: ColmapPairPlan,
+                activeRetrieval: PairGraphRetrievalAttemptEvidence? = nil,
                 phase: PairGraphRecoveryPhase = .matching
             ) throws {
                 metadata.checkpoint = PipelineCheckpoint(
@@ -1678,6 +2128,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     updatedAt: Date(),
                     progressFraction: 0,
                     message: "Image matching recovery pending",
+                    inputReceiptDigest: runtimeInputReceiptDigest,
                     details: .sfmMatching(SfmMatchingCheckpoint(
                         databasePath: try paths.projectRelativePath(
                             for: paths.colmapDatabaseURL
@@ -1691,14 +2142,20 @@ public final class PipelineRunner: @unchecked Sendable {
                 let state = PairGraphRecoveryState(
                     selectedFramesDigest: try selectedFramesDigestForExactRecovery(),
                     imageNames: selectedImageNames,
+                    groups: selectedPairGroups,
                     pairingPolicy: resolvedRunPlan.pairingPolicy,
+                    planBinding: PairGraphPlanBinding(resolvedRunPlan),
                     mode: mode,
+                    exactRecoveryReason: exactRecoveryReason,
                     computeMode: colmapMatchOptions.useGPU ? .gpu : .cpu,
                     phase: phase,
                     activeRecoveryLevel: pairRecoveryLevel.artifactValue,
                     activePlan: activePlan,
+                    activeRetrieval: activeRetrieval,
                     attempts: pairGraphAttempts,
-                    usedLocalVocabularyRetrieval: usedLocalVocabularyRetrieval,
+                    retrievalWasScheduled: retrievalWasScheduled,
+                    usedLocalVocabularyRetrieval: activeRetrieval != nil
+                        || pairGraphAttempts.contains(where: \.retrievalWasExecuted),
                     matchingDurationSeconds: matchingDurationSeconds,
                     fallbackReasons: mappingFallbackReasons
                 )
@@ -1708,14 +2165,14 @@ public final class PipelineRunner: @unchecked Sendable {
                     projectPaths: paths
                 )
                 try persistGeometryRecovery(
-                    activeBackend: .colmap,
                     pendingPairRecoveryLevel: pairRecoveryLevel.artifactValue
                 )
             }
 
             func persistAttemptRecoveryIntent(
                 mode: PairAttemptMode,
-                activePlan: ColmapPairPlan
+                activePlan: ColmapPairPlan,
+                activeRetrieval: PairGraphRetrievalAttemptEvidence? = nil
             ) throws {
                 if mode.isPolicyRecovery, pairGraphAttempts.isEmpty {
                     return
@@ -1723,22 +2180,70 @@ public final class PipelineRunner: @unchecked Sendable {
                 let recoveryMode = persistedRecoveryMode(for: mode)
                 try persistPairRecoveryIntent(
                     mode: recoveryMode,
-                    activePlan: activePlan
+                    exactRecoveryReason: mode.exactRecoveryReason,
+                    activePlan: activePlan,
+                    activeRetrieval: activeRetrieval
                 )
             }
 
             func restorePendingPairRecovery(
                 _ recovered: RestoredPairGraphRecovery
             ) throws {
-                guard recovered.pairingPolicy == resolvedRunPlan.pairingPolicy else {
+                guard recovered.planBinding == PairGraphPlanBinding(resolvedRunPlan) else {
                     throw PairGraphRecoveryStoreError.invalidState
+                }
+                if recovered.phase == .matching {
+                    let groups = selectedPairGroups
+                    let recoveryLevel = PairRecoveryLevel(recovered.recoveryLevel)
+                    var expectedPlan = try Self.baseColmapPairPlan(
+                        imageNames: selectedImageNames,
+                        groups: groups,
+                        resolvedPlan: resolvedRunPlan,
+                        recoveryLevel: recoveryLevel
+                    )
+                    if let request = try Self.vocabularyRetrievalRequest(
+                        imageNames: selectedImageNames,
+                        groups: groups,
+                        resolvedPlan: resolvedRunPlan,
+                        recoveryLevel: recoveryLevel
+                    ) {
+                        guard let retrieval = recovered.activeRetrieval,
+                              retrieval.engine == resolvedRunPlan.retrievalEngine,
+                              retrieval.queryImageNames == request.queryImageNames,
+                              retrieval.queryStride == resolvedRunPlan.retrievalQueryStride,
+                              retrieval.candidateCount == request.candidateCount,
+                              retrieval.returnedNeighborCount == request.returnedNeighborCount,
+                              retrieval.minimumFrameSeparation
+                                == request.minimumFrameSeparation else {
+                            throw PairGraphRecoveryStoreError.invalidState
+                        }
+                        let lines = try Self.validatedVocabularyRetrievalEvidence(
+                            retrieval,
+                            request: request,
+                            imageNames: selectedImageNames,
+                            excluding: expectedPlan
+                        )
+                        expectedPlan = try expectedPlan.addingRetrievalPairLines(
+                            lines,
+                            pairingPolicy: resolvedRunPlan.pairingPolicy,
+                            groups: groups,
+                            requiresCrossClipRetrieval:
+                                resolvedRunPlan.requiresCrossClipRetrieval
+                        )
+                    } else if recovered.activeRetrieval != nil {
+                        throw PairGraphRecoveryStoreError.invalidState
+                    }
+                    guard expectedPlan == recovered.activePlan else {
+                        throw PairGraphRecoveryStoreError.invalidState
+                    }
                 }
                 if recovered.computeMode == .cpu {
                     colmapExtractOptions.useGPU = false
                     colmapMatchOptions.useGPU = false
                 }
                 pairGraphAttempts = recovered.attempts
-                usedLocalVocabularyRetrieval = recovered.usedLocalVocabularyRetrieval
+                latestPreparedRetrievalEvidence = recovered.activeRetrieval
+                retrievalWasScheduled = recovered.retrievalWasScheduled
                 matchingDurationSeconds = recovered.matchingDurationSeconds
                 pairRecoveryLevel = PairRecoveryLevel(recovered.recoveryLevel)
                 if recovered.phase == .preparing {
@@ -1768,10 +2273,18 @@ public final class PipelineRunner: @unchecked Sendable {
                     resumingPersistedPolicyRecovery = true
                     recoveredPolicyRecoverySidecar = true
                 case .sameScheduleExact:
+                    guard let reason = recovered.exactRecoveryReason else {
+                        throw PairGraphRecoveryStoreError.invalidState
+                    }
                     colmapMatchOptions.descriptorMatcher = .exact
                     didRetryWithExactMatcher = true
                     latestPreparedPairPlan = recovered.activePlan
-                    pairAttemptMode = .sameScheduleExact(recovered.activePlan)
+                    pairAttemptMode = .sameScheduleExact(
+                        recovered.activePlan,
+                        reason
+                    )
+                case .terminalExact:
+                    throw PairGraphRecoveryStoreError.terminalExactRecovery
                 }
                 for reason in recovered.fallbackReasons {
                     recordMappingFallback(reason)
@@ -1784,13 +2297,17 @@ public final class PipelineRunner: @unchecked Sendable {
             ) -> Bool {
                 guard recovered.phase == .matching,
                       evidence.attempts.count == recovered.attempts.count + 1,
+                      evidence.planBinding == recovered.planBinding,
                       Array(evidence.attempts.dropLast()) == recovered.attempts,
-                      evidence.usedLocalVocabularyRetrieval
-                        == recovered.usedLocalVocabularyRetrieval,
+                      evidence.retrievalWasScheduled
+                        == recovered.retrievalWasScheduled,
                       evidence.fallbackReasons == recovered.fallbackReasons,
                       let accepted = evidence.attempts.last,
+                      evidence.usedLocalVocabularyRetrieval
+                        == (accepted.retrieval != nil),
                       accepted.artifact.recoveryLevel == recovered.recoveryLevel,
                       accepted.artifact.outcome == .completed,
+                      accepted.retrieval == recovered.activeRetrieval,
                       accepted.scheduledPairs == recovered.activePlan.pairs else {
                     return false
                 }
@@ -1799,7 +2316,37 @@ public final class PipelineRunner: @unchecked Sendable {
                     return accepted.artifact.matcher == .faiss
                 case .sameScheduleExact:
                     return accepted.artifact.matcher == .exact
+                        && accepted.artifact.exactRecoveryReason
+                            == recovered.exactRecoveryReason
+                case .terminalExact:
+                    return false
                 }
+            }
+
+            func evidenceSupersedesPendingExactRecovery(
+                _ evidence: PairGraphEvidence,
+                recovered: RestoredPairGraphRecovery
+            ) -> Bool {
+                guard recovered.mode == .sameScheduleExact,
+                      recovered.phase == .matching,
+                      evidence.planBinding == recovered.planBinding,
+                      evidence.retrievalWasScheduled
+                        == recovered.retrievalWasScheduled,
+                      let accepted = evidence.attempts.last,
+                      let pending = recovered.attempts.last,
+                      accepted.artifact.matcher == .faiss,
+                      accepted.artifact.exactRecoveryReason == nil,
+                      accepted.artifact.outcome == .completed,
+                      accepted.artifact.attemptNumber
+                        == pending.artifact.attemptNumber,
+                      accepted.artifact.recoveryLevel == recovered.recoveryLevel,
+                      accepted.scheduledPairs == recovered.activePlan.pairs,
+                      accepted.retrieval == recovered.activeRetrieval,
+                      Array(evidence.attempts.dropLast())
+                        == Array(recovered.attempts.dropLast()) else {
+                    return false
+                }
+                return true
             }
 
             let recoveryFileManager = FileManager.default
@@ -1814,6 +2361,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     let recoveryState = try PairGraphRecoveryStore.loadBound(
                         from: paths.pairGraphRecoveryURL,
                         expectedImageNames: selectedImageNames,
+                        expectedGroups: selectedPairGroups,
                         projectPaths: paths
                     )
                     let recovered = try recoveryState.restoredRecovery()
@@ -1834,13 +2382,30 @@ public final class PipelineRunner: @unchecked Sendable {
                     } catch {
                         completedEvidence = nil
                     }
-                    if let completedEvidence,
-                       evidenceCompletesPendingRecovery(
-                        completedEvidence,
-                        recovered: recovered
-                       ) {
+                    if let completedEvidence {
+                        try PairGraphEvidenceStore.validateSchedule(
+                            completedEvidence,
+                            resolvedPlan: resolvedRunPlan,
+                            groups: selectedPairGroups
+                        )
+                        guard evidenceCompletesPendingRecovery(
+                            completedEvidence,
+                            recovered: recovered
+                        ) || evidenceSupersedesPendingExactRecovery(
+                            completedEvidence,
+                            recovered: recovered
+                        ) else {
+                            throw PairGraphRecoveryStoreError
+                                .conflictingCompletedEvidence
+                        }
+                        try PairGraphEvidenceStore.validateWorkerExecution(
+                            completedEvidence,
+                            workerExecution: try workerExecutionRecorder
+                                .validatedArtifact()
+                        )
+                        try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
                         try restoreAcceptedPairEvidence(completedEvidence)
-                        try persistGeometryRecovery(activeBackend: .colmap)
+                        try persistGeometryRecovery()
                         markStageComplete(.sfmMatching)
                         try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
                         recoveredAcceptedExactEvidence = true
@@ -1853,12 +2418,16 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                 } catch is CancellationError {
                     throw CancellationError()
+                } catch PairGraphRecoveryStoreError.terminalExactRecovery {
+                    throw PairGraphRecoveryStoreError.terminalExactRecovery
+                } catch PairGraphRecoveryStoreError.conflictingCompletedEvidence {
+                    throw PairGraphRecoveryStoreError.conflictingCompletedEvidence
                 } catch {
                     try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
                     try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
                     try workerExecutionRecorder.invalidate(startingAt: .sfmMatching)
                     pairGraphAttempts.removeAll(keepingCapacity: true)
-                    usedLocalVocabularyRetrieval = false
+                    retrievalWasScheduled = false
                     matchingDurationSeconds = 0
                     pairRecoveryLevel = .normal
                     pairAttemptMode = .policy
@@ -1869,7 +2438,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     colmapMatchOptions.descriptorMatcher = resolvedRunPlan.normalDescriptorMatcher
                     pendingMatchingResetMessage = "Discarded inconsistent image-matching recovery data before resuming reconstruction."
                     restartingAfterInvalidRecoveryState = true
-                    try persistGeometryRecovery(activeBackend: .colmap)
+                    try persistGeometryRecovery()
                     emit(.stageLog(
                         stage: .sfmMatching,
                         line: "Discarded inconsistent pair-graph recovery state and restarted matching from preserved features.",
@@ -1885,6 +2454,11 @@ public final class PipelineRunner: @unchecked Sendable {
                         expectedImageNames: selectedImageNames,
                         databaseURL: paths.colmapDatabaseURL,
                         projectPaths: paths
+                    )
+                    try PairGraphEvidenceStore.validateSchedule(
+                        previousEvidence,
+                        resolvedPlan: resolvedRunPlan,
+                        groups: selectedPairGroups
                     )
                     try restoreAcceptedPairEvidence(previousEvidence)
                     guard let pendingLevel = restoredGeometryRecovery?
@@ -1910,7 +2484,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
                     try workerExecutionRecorder.invalidate(startingAt: .sfmMatching)
                     pairGraphAttempts.removeAll(keepingCapacity: true)
-                    usedLocalVocabularyRetrieval = false
+                    retrievalWasScheduled = false
                     matchingDurationSeconds = 0
                     pairRecoveryLevel = .normal
                     pairAttemptMode = .policy
@@ -1924,7 +2498,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         "Discarded inconsistent image-pair recovery data before resuming reconstruction."
                     restartingAfterInvalidRecoveryState = true
                     resumingPersistedPolicyRecovery = false
-                    try persistGeometryRecovery(activeBackend: .colmap)
+                    try persistGeometryRecovery()
                     emit(.stageLog(
                         stage: .sfmMatching,
                         line: "Discarded inconsistent image-pair recovery data and restarted matching from preserved features.",
@@ -1959,7 +2533,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         "images": paths.framesSelectedURL.path,
                         "tool": self.config.toolchain.colmap.path,
                         "useGPU": colmapExtractOptions.useGPU ? "1" : "0",
-                        "featureExtractionWorkers": "\(colmapExtractOptions.extractThreads)"
+                        "featureExtractionWorkers": "\(colmapExtractOptions.extractThreads)",
+                        "cameraInitializationRecipe": featureCameraInitialization.recipe.rawValue
                     ]
                 )
                 emit(.stageLog(stage: .sfmFeatures, line: "COLMAP tool log: \(paths.colmapLogURL.lastPathComponent)", isError: false))
@@ -1990,7 +2565,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 recoveredAcceptedExactEvidence = false
                 restartingAfterInvalidRecoveryState = false
                 resumingPersistedPolicyRecovery = false
-                try persistGeometryRecovery(activeBackend: .colmap)
+                try persistGeometryRecovery()
                 emit(.stageLog(
                     stage: .sfmFeatures,
                     line: colmapExtractOptions.useGPU ? "Using GPU for COLMAP feature extraction." : "Using CPU for COLMAP feature extraction.",
@@ -2001,16 +2576,29 @@ public final class PipelineRunner: @unchecked Sendable {
                     database: paths.colmapDatabaseURL,
                     imagePath: paths.framesSelectedURL,
                     maxImageSize: colmapMaxImageSize,
-                    cameraModel: self.cameraModel(
-                        detailProfile: metadata.requestedRunOptions.detailProfile,
-                        capturePath: resolvedRunPlan.capturePath,
-                        lensProjection: resolvedRunPlan.lensProjection
-                    ),
-                    singleCamera: shareCameraAcrossSelectedFrames,
+                    cameraInitialization: featureCameraInitialization,
                     options: colmapExtractOptions,
                     onLog: onFeaturesLog
                 )
                 let featureImageNames = selectedFrames.map(\.lastPathComponent)
+                try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
+                try ColmapFeatureDatabaseIdentityVerifier.verify(
+                    databaseURL: paths.colmapDatabaseURL,
+                    expectedImageNames: featureImageNames
+                )
+                let cameraGroupingEvidence = try Self.colmapCameraGroupingEvidence(
+                    imageNames: featureImageNames,
+                    manifest: selectedFrameManifest
+                )
+                let cameraGroupingReceipt = try ColmapCameraGroupingStore.normalize(
+                    databaseURL: paths.colmapDatabaseURL,
+                    selectedImages: cameraGroupingEvidence,
+                    mode: Self.colmapCameraGroupingMode(
+                        cameraGrouping: resolvedRunPlan.cameraGrouping,
+                        evidence: cameraGroupingEvidence
+                    )
+                )
+                try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
                 let featureDatabaseDigest = try ColmapDatabaseDigester
                     .digests(at: paths.colmapDatabaseURL).feature
                 try ColmapFeatureEvidenceStore.save(
@@ -2020,7 +2608,9 @@ public final class PipelineRunner: @unchecked Sendable {
                             projectPaths: paths
                         ),
                         imageNames: featureImageNames,
-                        featureDatabaseDigest: featureDatabaseDigest
+                        featureDatabaseDigest: featureDatabaseDigest,
+                        cameraGroupingReceipt: cameraGroupingReceipt,
+                        cameraInitializationReceipt: featureCameraInitialization
                     ),
                     to: paths.colmapFeatureEvidenceURL,
                     projectPaths: paths
@@ -2032,7 +2622,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     message: "COLMAP feature extraction completed",
                     details: .sfmFeatures(SfmFeaturesCheckpoint(
                         databasePath: try paths.projectRelativePath(for: paths.colmapDatabaseURL),
-                        imageCount: selectedFrames.count
+                        imageCount: selectedFrames.count,
+                        cameraGroupingReceipt: cameraGroupingReceipt,
+                        cameraInitializationReceipt: featureCameraInitialization,
+                        featureDatabaseDigest: featureDatabaseDigest
                     ))
                 )
                 emit(.stageFinished(stage: .sfmFeatures))
@@ -2048,6 +2641,11 @@ public final class PipelineRunner: @unchecked Sendable {
                     expectedImageNames: imageNames,
                     databaseURL: paths.colmapDatabaseURL,
                     projectPaths: paths
+                )
+                try PairGraphEvidenceStore.validateSchedule(
+                    evidence,
+                    resolvedPlan: resolvedRunPlan,
+                    groups: selectedPairGroups
                 )
                 try restoreAcceptedPairEvidence(evidence)
             }
@@ -2110,16 +2708,15 @@ public final class PipelineRunner: @unchecked Sendable {
                 ))
 
                 let imageNames = selectedFrames.map(\.lastPathComponent)
-                let groups = try Self.colmapPairGroups(
-                    imageNames: imageNames,
-                    manifest: selectedFrameManifest
-                )
+                let groups = selectedPairGroups
                 let attemptNumber = pairGraphAttempts.count + 1
                 let attemptClock = ContinuousClock()
                 let attemptStart = attemptClock.now
                 latestPreparedPairPlan = nil
                 latestCompletedPairPlan = nil
                 let attemptMode = pairAttemptMode
+                var retrievalEvidence: PairGraphRetrievalAttemptEvidence?
+                var retrievalWasExecuted = false
                 var pairPlan = try attemptMode.planOverride
                     ?? Self.baseColmapPairPlan(
                         imageNames: imageNames,
@@ -2127,37 +2724,32 @@ public final class PipelineRunner: @unchecked Sendable {
                         resolvedPlan: resolvedRunPlan,
                         recoveryLevel: pairRecoveryLevel
                     )
-                func recordPlanningFailure() {
-                    let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
-                    pairGraphAttempts.append(PairGraphAttemptEvidence(
-                        artifact: PairMatchingAttemptArtifact(
-                            attemptNumber: attemptNumber,
-                            matcher: colmapMatchOptions.descriptorMatcher,
-                            recoveryLevel: pairRecoveryLevel.artifactValue,
-                            outcome: .failed,
-                            scheduledPairCount: pairPlan.pairs.count,
-                            attemptedPairCount: 0,
-                            rawMatchedPairCount: 0,
-                            spatiallyVerifiedPairCount: 0,
-                            durationSeconds: duration
-                        ),
-                        scheduledPairs: pairPlan.pairs
-                    ))
-                    matchingDurationSeconds += duration
-                }
                 if attemptMode.planOverride == nil,
-                   let request = Self.vocabularyRetrievalRequest(
+                   let request = try Self.vocabularyRetrievalRequest(
                     imageNames: imageNames,
+                    groups: groups,
                     resolvedPlan: resolvedRunPlan,
                     recoveryLevel: pairRecoveryLevel
                 ) {
                     let queryListURL = try self.writeVocabularyQueryList(
                         request.queryImageNames,
-                        attemptNumber: attemptNumber,
+                        recoveryLevel: pairRecoveryLevel.artifactValue,
                         paths: paths
                     )
+                    let imageGroupListURL: URL?
+                    if let imageGroupContract = request.imageGroupContract {
+                        imageGroupListURL = try self.writeVocabularyImageGroupList(
+                            imageGroupContract,
+                            recoveryLevel: pairRecoveryLevel.artifactValue,
+                            paths: paths
+                        )
+                    } else {
+                        imageGroupListURL = nil
+                    }
+                    let retrievalRecoveryLevel = pairRecoveryLevel
+                        .artifactValue.rawValue
                     let outputURL = paths.colmapSeedURL.appendingPathComponent(
-                        "retrieval_pairs_attempt_\(attemptNumber).txt"
+                        "retrieval_pairs_\(retrievalRecoveryLevel).txt"
                     )
                     let excludedPairListURL: URL?
                     if pairPlan.pairs.isEmpty {
@@ -2165,7 +2757,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     } else {
                         excludedPairListURL = try self.writeColmapPairList(
                             pairPlan.pairLines,
-                            fileName: "retrieval_exclusions_attempt_\(attemptNumber).txt",
+                            fileName: "retrieval_exclusions_\(retrievalRecoveryLevel).txt",
                             paths: paths
                         )
                     }
@@ -2175,17 +2767,52 @@ public final class PipelineRunner: @unchecked Sendable {
                         fraction: 0,
                         message: "Finding revisited views"
                     ))
+                    retrievalWasScheduled = true
+                    let recoveryPlan: ColmapPairPlan
+                    if let previousAttempt = pairGraphAttempts.last {
+                        recoveryPlan = try ColmapPairPlan.persisted(
+                            imageNames: imageNames,
+                            scheduledPairs: previousAttempt.scheduledPairs
+                        )
+                    } else {
+                        recoveryPlan = pairPlan
+                    }
+                    try persistPairRecoveryIntent(
+                        mode: persistedRecoveryMode(for: attemptMode),
+                        activePlan: recoveryPlan,
+                        phase: .preparing
+                    )
+                    let retrievalRequestDigest = PairGraphEvidenceStore
+                        .retrievalRequestDigest(
+                            engine: resolvedRunPlan.retrievalEngine,
+                            queryImageNames: request.queryImageNames,
+                            queryStride: resolvedRunPlan.retrievalQueryStride,
+                            candidateCount: request.candidateCount,
+                            returnedNeighborCount: request.returnedNeighborCount,
+                            minimumFrameSeparation: request.minimumFrameSeparation,
+                            candidatePolicy: request.imageGroupContract?.policy,
+                            imageGroupListDigest: request.imageGroupContract?.digest
+                        )
                     try await self.tooling.colmap.runLocalVocabularyRetriever(
                         colmapPath: self.config.toolchain.colmap,
                         database: paths.colmapDatabaseURL,
                         outputPairListPath: outputURL,
                         queryImageListPath: queryListURL,
                         excludedPairListPath: excludedPairListURL,
+                        imageGroupListPath: imageGroupListURL,
+                        imageGroupListDigest: request.imageGroupContract?.digest,
                         options: try ColmapVocabularyRetrievalOptions(
                             candidateCount: request.candidateCount,
                             returnedNeighborCount: request.returnedNeighborCount,
                             minimumFrameSeparation: request.minimumFrameSeparation,
+                            queryStride: resolvedRunPlan.retrievalQueryStride,
                             threadCount: vocabularyRetrievalWorkers
+                        ),
+                        pairContext: ColmapPairWorkerInvocationContext(
+                            attemptOrdinal: attemptNumber,
+                            descriptorMatcher: colmapMatchOptions.descriptorMatcher,
+                            retrievalRequestDigest: retrievalRequestDigest,
+                            retrievalOutputURL: outputURL
                         ),
                         environment: self.colmapWorkerEnvironment(
                             workerCount: vocabularyRetrievalWorkers
@@ -2197,34 +2824,99 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                         }
                     )
-                    usedLocalVocabularyRetrieval = true
-                    let retrievalLines = try Self.validatedVocabularyRetrievalPairLines(
-                        self.readGeneratedPairLines(from: outputURL),
-                        request: request,
-                        imageNames: imageNames,
-                        excluding: pairPlan
-                    )
-                    pairPlan = try pairPlan.addingRetrievalPairLines(
-                        retrievalLines,
-                        pairingPolicy: resolvedRunPlan.pairingPolicy
-                    )
+                    retrievalWasExecuted = true
+                    let validatedRetrieval: PairGraphRetrievalAttemptEvidence
+                    do {
+                        validatedRetrieval = try Self.validatedVocabularyRetrievalContract(
+                            self.readGeneratedPairLines(from: outputURL),
+                            engine: resolvedRunPlan.retrievalEngine,
+                            queryStride: resolvedRunPlan.retrievalQueryStride,
+                            request: request,
+                            imageNames: imageNames,
+                            excluding: pairPlan
+                        )
+                    } catch {
+                        latestPreparedPairPlan = pairPlan
+                        try workerExecutionRecorder.discardPairPreparationWithoutMatcher(
+                            attemptOrdinal: attemptNumber
+                        )
+                        throw error
+                    }
+                    let mergedPlan: ColmapPairPlan
+                    do {
+                        mergedPlan = try pairPlan.addingRetrievalPairLines(
+                            validatedRetrieval.directedPairLines,
+                            pairingPolicy: resolvedRunPlan.pairingPolicy,
+                            groups: groups,
+                            requiresCrossClipRetrieval:
+                                resolvedRunPlan.requiresCrossClipRetrieval
+                        )
+                    } catch {
+                        latestPreparedPairPlan = pairPlan
+                        try workerExecutionRecorder.discardPairPreparationWithoutMatcher(
+                            attemptOrdinal: attemptNumber
+                        )
+                        throw error
+                    }
+                    guard !mergedPlan.pairs.isEmpty, mergedPlan.isConnected else {
+                        latestPreparedPairPlan = mergedPlan
+                        try workerExecutionRecorder.rejectCompletedVocabularyRetrieval(
+                            pairAttemptOrdinal: attemptNumber,
+                            planBinding: PairGraphPlanBinding(resolvedRunPlan),
+                            recoveryLevel: pairRecoveryLevel.artifactValue,
+                            imageNames: imageNames,
+                            groups: groups,
+                            retrieval: validatedRetrieval,
+                            durationSeconds: Self.durationInSeconds(
+                                attemptClock.now - attemptStart
+                            )
+                        )
+                        throw DisconnectedVocabularyRetrievalEvidence(
+                            evidence: validatedRetrieval
+                        )
+                    }
+                    pairPlan = mergedPlan
+                    retrievalEvidence = validatedRetrieval
+                } else if attemptMode.planOverride != nil {
+                    retrievalEvidence = latestPreparedRetrievalEvidence
+                        ?? pairGraphAttempts.last?.retrieval
+                    retrievalWasExecuted = workerExecutionRecorder
+                        .hasSuccessfulVocabularyRetrieval(
+                            attemptOrdinal: attemptNumber
+                        )
                 }
                 latestPreparedPairPlan = pairPlan
+                latestPreparedRetrievalEvidence = retrievalEvidence
                 guard !pairPlan.pairs.isEmpty else {
-                    recordPlanningFailure()
+                    try workerExecutionRecorder.discardPairPreparationWithoutMatcher(
+                        attemptOrdinal: attemptNumber
+                    )
                     throw ColmapPairPlanningError.disconnectedPairSchedule
                 }
                 guard pairPlan.isConnected else {
-                    recordPlanningFailure()
+                    try workerExecutionRecorder.discardPairPreparationWithoutMatcher(
+                        attemptOrdinal: attemptNumber
+                    )
                     throw ColmapPairPlanningError.disconnectedPairSchedule
+                }
+                guard colmapMatchOptions.descriptorMatcher != .exact
+                        || DescriptorMatcherRecoveryPolicy.permitsExactRecovery(
+                            scheduledPairCount: pairPlan.pairs.count
+                        ) else {
+                    throw PairGraphRecoveryStoreError.invalidState
                 }
                 let attemptConfiguration = [
                     colmapMatchOptions.descriptorMatcher.rawValue,
                     colmapMatchOptions.useGPU ? "gpu" : "cpu",
                     pairPlan.sha256,
+                    retrievalEvidence == nil
+                        ? "without-vocabulary-receipt"
+                        : "with-vocabulary-receipt",
                 ].joined(separator: ":")
                 guard attemptedPairConfigurations.insert(attemptConfiguration).inserted else {
-                    recordPlanningFailure()
+                    try workerExecutionRecorder.discardPairPreparationWithoutMatcher(
+                        attemptOrdinal: attemptNumber
+                    )
                     throw ColmapPairPlanningError.repeatedAttempt
                 }
                 let pairListURL = try self.writeColmapPairPlan(
@@ -2232,26 +2924,105 @@ public final class PipelineRunner: @unchecked Sendable {
                     attemptNumber: attemptNumber,
                     paths: paths
                 )
+                let existingMatcherInvocations = workerExecutionRecorder
+                    .matchingInvocations(attemptOrdinal: attemptNumber)
+                var reuseCompletedExactMatcher = false
+                if colmapMatchOptions.descriptorMatcher == .exact {
+                    guard let exactReason = attemptMode.exactRecoveryReason,
+                          existingMatcherInvocations.count <= 1 else {
+                        throw PairGraphRecoveryStoreError
+                            .conflictingCompletedEvidence
+                    }
+                    if let existing = existingMatcherInvocations.first {
+                        let binding = existing.pairExecution
+                        guard existing.command == .matchesImporter,
+                              binding?.descriptorMatcher == .exact,
+                              binding?.attemptOrdinal == attemptNumber,
+                              binding?.scheduledPairCount == pairPlan.pairs.count,
+                              binding?.pairListDigest == pairPlan.sha256,
+                              binding?.exactRecoveryReason == exactReason,
+                              binding?.retrievalRequestDigest
+                                == retrievalEvidence.map(
+                                    PairGraphEvidenceStore.retrievalRequestDigest
+                                ),
+                              binding?.retrievalOutputDigest
+                                == retrievalEvidence.map(
+                                    PairGraphEvidenceStore.retrievalOutputDigest
+                                ) else {
+                            throw PairGraphRecoveryStoreError
+                                .conflictingCompletedEvidence
+                        }
+                        if existing.succeeded {
+                            reuseCompletedExactMatcher = true
+                        } else {
+                            let partialInspection = try? ColmapPairGraphInspector(
+                                databaseURL: paths.colmapDatabaseURL
+                            ).inspect(
+                                schedule: ColmapPairSchedule(
+                                    imageNames: imageNames,
+                                    pairs: pairPlan.pairs
+                                ),
+                                completion: .failed
+                            )
+                            pairGraphAttempts.append(PairGraphAttemptEvidence(
+                                artifact: PairMatchingAttemptArtifact(
+                                    attemptNumber: attemptNumber,
+                                    matcher: .exact,
+                                    recoveryLevel: pairRecoveryLevel.artifactValue,
+                                    outcome: .failed,
+                                    exactRecoveryReason: exactReason,
+                                    scheduledPairCount: pairPlan.pairs.count,
+                                    attemptedPairCount:
+                                        partialInspection?.attemptedPairCount ?? 0,
+                                    rawMatchedPairCount:
+                                        partialInspection?.rawMatchedPairCount ?? 0,
+                                    spatiallyVerifiedPairCount:
+                                        partialInspection?
+                                            .spatiallyVerifiedPairCount ?? 0,
+                                    durationSeconds: 0
+                                ),
+                                scheduledPairs: pairPlan.pairs,
+                                retrieval: retrievalEvidence,
+                                retrievalWasExecuted: false
+                            ))
+                            try persistPairRecoveryIntent(
+                                mode: .terminalExact,
+                                exactRecoveryReason: exactReason,
+                                activePlan: pairPlan,
+                                activeRetrieval: retrievalEvidence
+                            )
+                            throw PairGraphRecoveryStoreError.terminalExactRecovery
+                        }
+                    }
+                } else {
+                    try workerExecutionRecorder.discardUnacceptedMatcherInvocation(
+                        attemptOrdinal: attemptNumber
+                    )
+                }
                 if attemptMode.isPolicyRecovery,
                    colmapMatchOptions.descriptorMatcher == .faiss,
                    !pairGraphAttempts.isEmpty {
                     try persistPairRecoveryIntent(
                         mode: .policy,
-                        activePlan: pairPlan
+                        activePlan: pairPlan,
+                        activeRetrieval: retrievalEvidence
                     )
                 } else {
                     try persistAttemptRecoveryIntent(
                         mode: attemptMode,
-                        activePlan: pairPlan
+                        activePlan: pairPlan,
+                        activeRetrieval: retrievalEvidence
                     )
                 }
                 try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
-                if pendingMatchingResetMessage == nil {
-                    try ColmapDatabaseMatchStore.clearMatchingResults(
-                        at: paths.colmapDatabaseURL
-                    )
-                } else {
-                    try resetMatchingIfNeeded()
+                if !reuseCompletedExactMatcher {
+                    if pendingMatchingResetMessage == nil {
+                        try ColmapDatabaseMatchStore.clearMatchingResults(
+                            at: paths.colmapDatabaseURL
+                        )
+                    } else {
+                        try resetMatchingIfNeeded()
+                    }
                 }
                 emit(.stageLog(
                     stage: .sfmMatching,
@@ -2261,26 +3032,44 @@ public final class PipelineRunner: @unchecked Sendable {
 
                 let inspection: ColmapPairGraphInspection
                 do {
-                    try await self.runColmapMatcherAttempt(
-                        stage: .sfmMatching,
-                        paths: paths,
-                        colmapToolLog: colmapToolLog,
-                        expectedPairs: pairPlan.pairs.count,
-                        progressStart: 0,
-                        progressSpan: 1,
-                        blockMessageFallback: "Matching views",
-                        invokeMatcher: { onLog in
-                            try await self.tooling.colmap.runMatchesImporter(
-                                colmapPath: self.config.toolchain.colmap,
-                                database: paths.colmapDatabaseURL,
-                                matchListPath: pairListURL,
-                                matchType: "pairs",
-                                options: colmapMatchOptions,
-                                onLog: onLog
-                            )
-                        },
-                        emit: emit
-                    )
+                    if !reuseCompletedExactMatcher {
+                        try await self.runColmapMatcherAttempt(
+                            stage: .sfmMatching,
+                            paths: paths,
+                            colmapToolLog: colmapToolLog,
+                            expectedPairs: pairPlan.pairs.count,
+                            progressStart: 0,
+                            progressSpan: 1,
+                            blockMessageFallback: "Matching views",
+                            invokeMatcher: { onLog in
+                                try await self.tooling.colmap.runMatchesImporter(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    database: paths.colmapDatabaseURL,
+                                    matchListPath: pairListURL,
+                                    matchType: "pairs",
+                                    randomSeed: resolvedRunPlan.runSeed,
+                                    options: colmapMatchOptions,
+                                    pairContext: ColmapPairWorkerInvocationContext(
+                                        attemptOrdinal: attemptNumber,
+                                        descriptorMatcher:
+                                            colmapMatchOptions.descriptorMatcher,
+                                        scheduledPairCount: pairPlan.pairs.count,
+                                        pairListDigest: pairPlan.sha256,
+                                        exactRecoveryReason:
+                                            attemptMode.exactRecoveryReason,
+                                        retrievalRequestDigest: retrievalEvidence.map(
+                                            PairGraphEvidenceStore.retrievalRequestDigest
+                                        ),
+                                        retrievalOutputDigest: retrievalEvidence.map(
+                                            PairGraphEvidenceStore.retrievalOutputDigest
+                                        )
+                                    ),
+                                    onLog: onLog
+                                )
+                            },
+                            emit: emit
+                        )
+                    }
                     inspection = try ColmapPairGraphInspector(
                         databaseURL: paths.colmapDatabaseURL
                     ).inspect(
@@ -2291,8 +3080,20 @@ public final class PipelineRunner: @unchecked Sendable {
                         completion: .succeeded
                     )
                 } catch let matcherError {
-                    if matcherError is CancellationError { throw matcherError }
-                    try Task.checkCancellation()
+                    if matcherError is CancellationError || Task.isCancelled {
+                        let completedExact = colmapMatchOptions.descriptorMatcher
+                                == .exact
+                            && workerExecutionRecorder.matchingInvocations(
+                                attemptOrdinal: attemptNumber
+                            ).contains(where: \.succeeded)
+                        if !completedExact {
+                            try workerExecutionRecorder
+                                .discardUnacceptedMatcherInvocation(
+                                    attemptOrdinal: attemptNumber
+                                )
+                        }
+                        throw CancellationError()
+                    }
                     let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
                     let partialInspection = try? ColmapPairGraphInspector(
                         databaseURL: paths.colmapDatabaseURL
@@ -2309,25 +3110,38 @@ public final class PipelineRunner: @unchecked Sendable {
                             matcher: colmapMatchOptions.descriptorMatcher,
                             recoveryLevel: pairRecoveryLevel.artifactValue,
                             outcome: .failed,
+                            exactRecoveryReason: attemptMode.exactRecoveryReason,
                             scheduledPairCount: pairPlan.pairs.count,
                             attemptedPairCount: partialInspection?.attemptedPairCount ?? 0,
                             rawMatchedPairCount: partialInspection?.rawMatchedPairCount ?? 0,
                             spatiallyVerifiedPairCount: partialInspection?.spatiallyVerifiedPairCount ?? 0,
                             durationSeconds: duration
                         ),
-                        scheduledPairs: pairPlan.pairs
+                        scheduledPairs: pairPlan.pairs,
+                        retrieval: retrievalEvidence,
+                        retrievalWasExecuted: retrievalWasExecuted
                     ))
                     matchingDurationSeconds += duration
-                    if attemptMode.isPolicyRecovery,
-                       colmapMatchOptions.descriptorMatcher == .faiss {
+                    if colmapMatchOptions.descriptorMatcher == .exact,
+                       let exactReason = attemptMode.exactRecoveryReason {
+                        try persistPairRecoveryIntent(
+                            mode: .terminalExact,
+                            exactRecoveryReason: exactReason,
+                            activePlan: pairPlan,
+                            activeRetrieval: retrievalEvidence
+                        )
+                    } else if attemptMode.isPolicyRecovery,
+                              colmapMatchOptions.descriptorMatcher == .faiss {
                         try persistPairRecoveryIntent(
                             mode: .policy,
-                            activePlan: pairPlan
+                            activePlan: pairPlan,
+                            activeRetrieval: retrievalEvidence
                         )
                     } else {
                         try persistAttemptRecoveryIntent(
                             mode: attemptMode,
-                            activePlan: pairPlan
+                            activePlan: pairPlan,
+                            activeRetrieval: retrievalEvidence
                         )
                     }
                     throw matcherError
@@ -2341,33 +3155,61 @@ public final class PipelineRunner: @unchecked Sendable {
                     allowMinorVerifiedComponents: allowsMinorVerifiedComponents
                 )
                 let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
+                let attemptArtifact = PairMatchingAttemptArtifact(
+                    attemptNumber: attemptNumber,
+                    matcher: colmapMatchOptions.descriptorMatcher,
+                    recoveryLevel: pairRecoveryLevel.artifactValue,
+                    outcome: graphWasAccepted ? .completed : .rejected,
+                    exactRecoveryReason: attemptMode.exactRecoveryReason,
+                    scheduledPairCount: inspection.scheduledPairCount,
+                    attemptedPairCount: inspection.attemptedPairCount,
+                    rawMatchedPairCount: inspection.rawMatchedPairCount,
+                    spatiallyVerifiedPairCount: inspection.spatiallyVerifiedPairCount,
+                    durationSeconds: duration
+                )
                 pairGraphAttempts.append(PairGraphAttemptEvidence(
-                    artifact: PairMatchingAttemptArtifact(
-                        attemptNumber: attemptNumber,
-                        matcher: colmapMatchOptions.descriptorMatcher,
-                        recoveryLevel: pairRecoveryLevel.artifactValue,
-                        outcome: graphWasAccepted ? .completed : .rejected,
-                        scheduledPairCount: inspection.scheduledPairCount,
-                        attemptedPairCount: inspection.attemptedPairCount,
-                        rawMatchedPairCount: inspection.rawMatchedPairCount,
-                        spatiallyVerifiedPairCount: inspection.spatiallyVerifiedPairCount,
-                        durationSeconds: duration
-                    ),
-                    scheduledPairs: pairPlan.pairs
+                    artifact: attemptArtifact,
+                    scheduledPairs: pairPlan.pairs,
+                    retrieval: retrievalEvidence,
+                    retrievalWasExecuted: retrievalWasExecuted
                 ))
                 matchingDurationSeconds += duration
                 latestCompletedPairPlan = pairPlan
+                latestRejectedCaptureConnectionFailure = graphWasAccepted
+                    ? nil
+                    : try CaptureConnectionFailure(
+                        pairingPolicy: resolvedRunPlan.pairingPolicy,
+                        selectedViewCount: imageNames.count,
+                        attempt: attemptArtifact,
+                        connectedComponentCount: inspection.connectedComponentCount,
+                        isolatedViewCount: inspection.isolatedViewCount,
+                        descriptorlessViewCount: inspection.descriptorlessViewCount,
+                        componentViewCounts: inspection.verifiedGraph.components.map(\.count),
+                        degreeP10: inspection.degreeP10,
+                        degreeMedian: inspection.degreeMedian,
+                        degreeP90: inspection.degreeP90
+                    )
                 guard graphWasAccepted else {
-                    if attemptMode.isPolicyRecovery,
-                       colmapMatchOptions.descriptorMatcher == .faiss {
+                    if colmapMatchOptions.descriptorMatcher == .exact,
+                       let exactReason = attemptMode.exactRecoveryReason {
+                        try persistPairRecoveryIntent(
+                            mode: .terminalExact,
+                            exactRecoveryReason: exactReason,
+                            activePlan: pairPlan,
+                            activeRetrieval: retrievalEvidence
+                        )
+                    } else if attemptMode.isPolicyRecovery,
+                              colmapMatchOptions.descriptorMatcher == .faiss {
                         try persistPairRecoveryIntent(
                             mode: .policy,
-                            activePlan: pairPlan
+                            activePlan: pairPlan,
+                            activeRetrieval: retrievalEvidence
                         )
                     } else {
                         try persistAttemptRecoveryIntent(
                             mode: attemptMode,
-                            activePlan: pairPlan
+                            activePlan: pairPlan,
+                            activeRetrieval: retrievalEvidence
                         )
                     }
                     emit(.stageLog(
@@ -2415,20 +3257,25 @@ public final class PipelineRunner: @unchecked Sendable {
                     ),
                     imageNames: imageNames,
                     pairingPolicy: resolvedRunPlan.pairingPolicy,
+                    planBinding: PairGraphPlanBinding(resolvedRunPlan),
                     attempts: pairGraphAttempts,
                     acceptedAttemptNumber: attemptNumber,
                     acceptedInspection: inspection,
-                    usedLocalVocabularyRetrieval: usedLocalVocabularyRetrieval,
+                    retrievalWasScheduled: retrievalWasScheduled,
+                    usedLocalVocabularyRetrieval:
+                        pairGraphAttempts.last?.retrieval != nil,
                     matchingDurationSeconds: matchingDurationSeconds,
                     fallbackReasons: mappingFallbackReasons
                 )
+                try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
                 try PairGraphEvidenceStore.save(
                     evidence,
                     to: paths.pairGraphEvidenceURL,
                     projectPaths: paths
                 )
                 acceptedPairGraphEvidence = evidence
-                try persistGeometryRecovery(activeBackend: .colmap)
+                activeMapperGraphContext = try evidence.mapperWorkerInvocationContext()
+                try persistGeometryRecovery()
                 writeCheckpoint(
                     stage: .sfmMatching,
                     progress: 1,
@@ -2449,6 +3296,9 @@ public final class PipelineRunner: @unchecked Sendable {
 
             let retryWithCpuIfNeeded: (Error) throws -> Bool = { error in
                 guard !didRetryWithCpu else { return false }
+                guard colmapMatchOptions.descriptorMatcher == .faiss else {
+                    return false
+                }
                 guard colmapExtractOptions.useGPU || colmapMatchOptions.useGPU else { return false }
                 guard let colmapError = error as? ColmapRunnerError else { return false }
                 guard self.colmapErrorIndicatesGpuFailure(colmapError) else { return false }
@@ -2460,17 +3310,18 @@ public final class PipelineRunner: @unchecked Sendable {
                    colmapMatchOptions.descriptorMatcher == .exact {
                     try persistAttemptRecoveryIntent(
                         mode: pairAttemptMode,
-                        activePlan: activePlan
+                        activePlan: activePlan,
+                        activeRetrieval: latestPreparedRetrievalEvidence
                     )
                 } else if let activePlan = latestPreparedPairPlan,
                           !pairGraphAttempts.isEmpty {
                     try persistPairRecoveryIntent(
                         mode: .policy,
-                        activePlan: activePlan
+                        activePlan: activePlan,
+                        activeRetrieval: latestPreparedRetrievalEvidence
                     )
                 } else {
                     try persistGeometryRecovery(
-                        activeBackend: .colmap,
                         pendingPairRecoveryLevel: pairRecoveryLevel.artifactValue
                     )
                 }
@@ -2483,7 +3334,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     after: pairRecoveryLevel,
                     imageCount: selectedFrames.count,
                     pairingPolicy: resolvedRunPlan.pairingPolicy
-                ) else {
+                ), colmapMatchOptions.descriptorMatcher == .faiss else {
                     return false
                 }
                 guard let recoverySourcePlan = latestCompletedPairPlan
@@ -2493,15 +3344,15 @@ public final class PipelineRunner: @unchecked Sendable {
                 pairRecoveryLevel = next
                 pairAttemptMode = .policy
                 latestPreparedPairPlan = nil
+                latestPreparedRetrievalEvidence = nil
                 latestCompletedPairPlan = nil
                 acceptedPairGraphEvidence = nil
                 recordMappingFallback(reason)
-                let recoveryMode: PairGraphRecoveryMode =
-                    colmapMatchOptions.descriptorMatcher == .exact
-                        ? .sameScheduleExact
-                        : .policy
+                if next == .maximum, selectedFrames.count <= 250 {
+                    recordMappingFallback("exhaustive pair graph")
+                }
                 try persistPairRecoveryIntent(
-                    mode: recoveryMode,
+                    mode: .policy,
                     activePlan: recoverySourcePlan,
                     phase: .preparing
                 )
@@ -2540,15 +3391,17 @@ public final class PipelineRunner: @unchecked Sendable {
                            let sourcePlan = latestPreparedPairPlan,
                            let reason = DescriptorMatcherRecoveryPolicy.reason(
                                for: error,
-                               currentMatcher: colmapMatchOptions.descriptorMatcher
+                               currentMatcher: colmapMatchOptions.descriptorMatcher,
+                               scheduledPairCount: sourcePlan.pairs.count
                            ) {
                             didRetryWithExactMatcher = true
                             colmapMatchOptions.descriptorMatcher = .exact
-                            pairAttemptMode = .sameScheduleExact(sourcePlan)
+                            pairAttemptMode = .sameScheduleExact(sourcePlan, reason)
                             recordMappingFallback("exact descriptor matching")
                             try persistAttemptRecoveryIntent(
                                 mode: pairAttemptMode,
-                                activePlan: sourcePlan
+                                activePlan: sourcePlan,
+                                activeRetrieval: latestPreparedRetrievalEvidence
                             )
                             try self.resetDirectory(paths.colmapSparseURL)
                             acceptedPairGraphEvidence = nil
@@ -2562,6 +3415,31 @@ public final class PipelineRunner: @unchecked Sendable {
                             forceMatchingRun = true
                             continue
                         }
+                        let disconnectedRetrieval = error
+                            as? DisconnectedVocabularyRetrievalEvidence
+                        if disconnectedRetrieval != nil,
+                           try advancePairRecovery(
+                                "Image retrieval did not connect the scheduled pair graph"
+                           ) {
+                            self.emitColmapRetryDiagnostics(
+                                error,
+                                stage: .sfmMatching,
+                                emit: emit
+                            )
+                            forceSfMRun = false
+                            forceMatchingRun = true
+                            continue
+                        }
+                        if disconnectedRetrieval != nil {
+                            let workerEvidence = try workerExecutionRecorder
+                                .validatedArtifact()
+                            throw try CaptureRetrievalConnectionFailure(
+                                pairingPolicy: resolvedRunPlan.pairingPolicy,
+                                selectedViewCount: selectedFrames.count,
+                                attempts: workerEvidence
+                                    .rejectedVocabularyRetrievalInvocations
+                            )
+                        }
                         let pairPlanningError = error as? ColmapPairPlanningError
                         if pairPlanningError == .repeatedAttempt,
                            try advancePairRecovery("Image retrieval repeated the previous pair graph") {
@@ -2571,7 +3449,9 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                         if (pairPlanningError == .disconnectedPairSchedule
                                 || pairPlanningError == .disconnectedVerifiedGraph),
-                           try advancePairRecovery("Image matching did not produce a connected graph") {
+                           try advancePairRecovery(
+                                "Image matching did not produce a connected graph"
+                           ) {
                             self.emitColmapRetryDiagnostics(
                                 error,
                                 stage: .sfmMatching,
@@ -2583,26 +3463,31 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                         if !didRetryWithExactMatcher,
                            colmapMatchOptions.descriptorMatcher == .faiss,
-                           (pairPlanningError == .repeatedAttempt
-                               || (pairPlanningError == .disconnectedVerifiedGraph
-                                   && Self.nextPairRecoveryLevel(
-                                       after: pairRecoveryLevel,
-                                       imageCount: selectedFrames.count,
-                                       pairingPolicy: resolvedRunPlan.pairingPolicy
-                                   ) == nil)) {
-                            guard let sourcePlan = pairPlanningError == .disconnectedVerifiedGraph
-                                ? latestCompletedPairPlan
-                                : latestPreparedPairPlan else {
-                                throw PairGraphEvidenceStoreError.invalidEvidence
-                            }
-                            let nextMode = PairAttemptMode.sameScheduleExact(sourcePlan)
+                           pairPlanningError == .disconnectedVerifiedGraph,
+                           Self.nextPairRecoveryLevel(
+                               after: pairRecoveryLevel,
+                               imageCount: selectedFrames.count,
+                               pairingPolicy: resolvedRunPlan.pairingPolicy
+                           ) == nil,
+                           let sourcePlan = latestCompletedPairPlan,
+                           let exactReason = DescriptorMatcherRecoveryPolicy
+                            .reasonForRejectedGeometry(
+                               currentMatcher: colmapMatchOptions.descriptorMatcher,
+                               exhaustedFaissRetries: true,
+                               scheduledPairCount: sourcePlan.pairs.count
+                           ) {
+                            let nextMode = PairAttemptMode.sameScheduleExact(
+                                sourcePlan,
+                                exactReason
+                            )
                             didRetryWithExactMatcher = true
                             colmapMatchOptions.descriptorMatcher = .exact
                             pairAttemptMode = nextMode
                             recordMappingFallback("exact descriptor matching")
                             try persistAttemptRecoveryIntent(
                                 mode: nextMode,
-                                activePlan: nextMode.planOverride ?? sourcePlan
+                                activePlan: nextMode.planOverride ?? sourcePlan,
+                                activeRetrieval: latestPreparedRetrievalEvidence
                             )
                             acceptedPairGraphEvidence = nil
                             emit(.stageLog(
@@ -2613,6 +3498,10 @@ public final class PipelineRunner: @unchecked Sendable {
                             forceSfMRun = false
                             forceMatchingRun = true
                             continue
+                        }
+                        if pairPlanningError == .disconnectedVerifiedGraph,
+                           let captureFailure = latestRejectedCaptureConnectionFailure {
+                            throw captureFailure
                         }
                         throw error
                     }
@@ -2627,14 +3516,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     writeCheckpoint(
                         stage: .sfmMapping,
                         progress: 0,
-                        message: "Camera mapping started",
-                        details: .sfmMapping(SfmMappingCheckpoint(
-                            mapper: "colmap",
-                            sparsePath: try paths.projectRelativePath(
-                                for: paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-                            ),
-                            registeredImages: nil
-                        ))
+                        message: "Camera mapping started"
                     )
                     let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
                     colmapToolLog.beginSection(
@@ -2665,13 +3547,6 @@ public final class PipelineRunner: @unchecked Sendable {
                         let modelDirectories = try self.mappedSparseModelDirectories(
                             in: paths.colmapSparseURL
                         )
-                        var snapshots: [Int: MappedSparseModelSnapshot] = [:]
-                        snapshots.reserveCapacity(modelDirectories.count)
-                        for model in modelDirectories {
-                            snapshots[model.order] = try self.captureMappedSparseModel(
-                                at: model.url
-                            )
-                        }
                         let memberships = try ColmapSparseModelMembershipReader(
                             databaseURL: paths.colmapDatabaseURL,
                             selectedImageNames: selectedFrames.map(\.lastPathComponent)
@@ -2679,12 +3554,6 @@ public final class PipelineRunner: @unchecked Sendable {
                             modelDirectories: modelDirectories.map(\.url),
                             checkCancellation: self.tooling.checkCancellation
                         )
-                        for model in modelDirectories {
-                            guard let snapshot = snapshots[model.order] else {
-                                throw PipelineError.outputMissing
-                            }
-                            try self.validateMappedSparseModel(snapshot, at: model.url)
-                        }
                         let membershipByOrder = Dictionary(
                             uniqueKeysWithValues: memberships.models.map {
                                 ($0.modelOrder, $0.imageIDs)
@@ -2692,14 +3561,27 @@ public final class PipelineRunner: @unchecked Sendable {
                         )
                         var candidates: [MappedSparseModelCandidate] = []
                         candidates.reserveCapacity(modelDirectories.count)
+                        var snapshotByOrder: [Int: MappedSparseModelSnapshot] = [:]
+                        var publicationByOrder: [Int: CanonicalModelPublicationArtifact] = [:]
+                        var conditioningByOrder: [Int: GeometryConditioningAnalysis] = [:]
                         var firstAnalysisError: Error?
                         for model in modelDirectories {
                             try Task.checkCancellation()
                             do {
-                                guard let snapshot = snapshots[model.order],
-                                      let membership = membershipByOrder[model.order] else {
+                                guard let membership = membershipByOrder[model.order] else {
                                     throw PipelineError.outputMissing
                                 }
+                                let publication = try prepareCanonicalTextCandidate(
+                                    at: model.url,
+                                    mappingAttemptOrdinal: mappingAttemptOrdinal
+                                )
+                                let conditioning = try self.validatedConditionedGeometry(
+                                    modelDirectory: model.url,
+                                    selectedFrames: selectedFrames,
+                                    minimumRegisteredViewCount: membership.count,
+                                    requireStrongObservationCoverage: false
+                                )
+                                let snapshot = try self.captureMappedSparseModel(at: model.url)
                                 let report = try await self.tooling.colmap.runModelAnalyzer(
                                     colmapPath: self.config.toolchain.colmap,
                                     modelPath: model.url,
@@ -2707,6 +3589,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                 )
                                 try Task.checkCancellation()
                                 try self.validateMappedSparseModel(snapshot, at: model.url)
+                                try GeometryModelSnapshot.validate(
+                                    conditioning.modelSnapshot,
+                                    at: model.url
+                                )
                                 for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
                                     colmapToolLog.append(stream: "stdout", line: String(line))
                                 }
@@ -2714,9 +3600,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                     ReconstructionScorer.parseModelAnalyzerOutput(report),
                                     expectedTotalImages: selectedFrames.count
                                 )
-                                guard score.registeredImages == membership.count else {
+                                guard score.registeredImages == membership.count,
+                                      conditioning.residuals.registeredViewCount
+                                        == membership.count else {
                                     throw PipelineError.geometryRegisteredImagesMismatch
                                 }
+                                snapshotByOrder[model.order] = snapshot
+                                publicationByOrder[model.order] = publication
+                                conditioningByOrder[model.order] = conditioning
                                 candidates.append(MappedSparseModelCandidate(
                                     url: model.url,
                                     order: model.order,
@@ -2736,41 +3627,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         guard !candidates.isEmpty else {
                             throw firstAnalysisError ?? PipelineError.outputMissing
                         }
-                        var residualValidatedModelOrders: Set<Int> = []
-                        if candidates.count > 1 {
-                            for candidate in candidates {
-                                guard let imageIDs = membershipByOrder[candidate.order],
-                                      Self.credibleFragmentCandidate(
-                                        candidate,
-                                        imageIDs: imageIDs,
-                                        totalSelectedViewCount: selectedFrames.count
-                                      ) else {
-                                    continue
-                                }
-                                do {
-                                    _ = try self.ensureTextSparseModelFiles(at: candidate.url)
-                                    let measurement = try self.validatedGeometryMeasurement(
-                                        modelDirectory: candidate.url,
-                                        selectedFrames: selectedFrames,
-                                        minimumRegisteredViewCount: candidate.score.registeredImages,
-                                        requireStrongObservationCoverage: false
-                                    )
-                                    guard measurement.residuals.registeredViewCount
-                                            == candidate.score.registeredImages else {
-                                        throw PipelineError.geometryRegisteredImagesMismatch
-                                    }
-                                    residualValidatedModelOrders.insert(candidate.order)
-                                } catch {
-                                    if error is CancellationError { throw error }
-                                    try Task.checkCancellation()
-                                    emit(.stageLog(
-                                        stage: .sfmMapping,
-                                        line: "Ignored COLMAP model \(candidate.order) as fragmentation evidence because its measured tracks did not validate.",
-                                        isError: false
-                                    ))
-                                }
-                            }
-                        }
+                        let residualValidatedModelOrders = Set(candidates.map(\.order))
                         let rankedCandidates = Self.rankedMappedSparseModels(
                             candidates,
                             capturePath: resolvedRunPlan.capturePath
@@ -2794,13 +3651,20 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                             let modelLabel = String(selected.order)
                             do {
-                                _ = try self.ensureTextSparseModelFiles(
+                                guard let canonicalModelPublication =
+                                        publicationByOrder[selected.order],
+                                      let conditioningAnalysis =
+                                        conditioningByOrder[selected.order],
+                                      let selectedSnapshot = snapshotByOrder[selected.order] else {
+                                    throw PipelineError.outputMissing
+                                }
+                                try self.validateMappedSparseModel(
+                                    selectedSnapshot,
                                     at: selected.url
                                 )
-                                _ = try self.validatedGeometryMeasurement(
-                                    modelDirectory: selected.url,
-                                    selectedFrames: selectedFrames,
-                                    requireStrongObservationCoverage: false
+                                try GeometryModelSnapshot.validate(
+                                    conditioningAnalysis.modelSnapshot,
+                                    at: selected.url
                                 )
                                 if let fragmentation = Self.mappingFragmentationEvidence(
                                     selected: selected,
@@ -2819,21 +3683,11 @@ public final class PipelineRunner: @unchecked Sendable {
                                     ))
                                     continue
                                 }
-                                let selectedSnapshot = try self.captureMappedSparseModel(
-                                    at: selected.url
-                                )
-                                writeCheckpoint(
+                                emit(.stageProgress(
                                     stage: .sfmMapping,
-                                    progress: 0.95,
-                                    message: "Mapping score: \(ReconstructionScorer.summary(score))",
-                                    details: .sfmMapping(SfmMappingCheckpoint(
-                                        mapper: "colmap",
-                                        sparsePath: try paths.projectRelativePath(
-                                            for: selected.url
-                                        ),
-                                        registeredImages: score.registeredImages
-                                    ))
-                                )
+                                    fraction: 0.95,
+                                    message: "Validating camera solve"
+                                ))
                                 emit(.stageLog(
                                     stage: .sfmMapping,
                                     line: "Selected COLMAP model \(modelLabel) (\(score.registeredImages)/\(score.totalImages) registered views).",
@@ -2860,7 +3714,12 @@ public final class PipelineRunner: @unchecked Sendable {
                                     acceptedRefinementKind: .incrementalGlobal,
                                     acceptedRefinementInvocationCount:
                                         acceptedRefinementInvocationCount,
+                                    plannedIncrementalCadence:
+                                        plannedIncrementalCadence,
                                     incrementalCadence: cadence,
+                                    cadenceFallbackTrigger:
+                                        activeCadenceFallbackTrigger,
+                                    canonicalModelPublication: canonicalModelPublication,
                                     fallbackReason: nil
                                 )
                                 self.warnIfWeakAcceptedSolve(
@@ -2868,11 +3727,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                     mapper: "colmap",
                                     emit: emit
                                 )
-                                acceptedReconstructionSummary = ReconstructionSummary(
-                                    score: score,
-                                    mapper: "colmap",
-                                    capturedAt: Date()
-                                )
+                                acceptedMapper = "colmap"
+                                acceptedConditioningAnalysis = conditioningAnalysis
                                 return true
                             } catch {
                                 if error is CancellationError { throw error }
@@ -2942,12 +3798,18 @@ public final class PipelineRunner: @unchecked Sendable {
                         selectedMappedModelSnapshot = nil
                         selectedMappedModelTextIsCanonical = false
                         acceptedMappingArtifact = nil
-                        acceptedReconstructionSummary = nil
+                        acceptedMapper = nil
+                        acceptedConditioningAnalysis = nil
+                        mappingSucceeded = false
+                        guard let pairEvidence = acceptedPairGraphEvidence else {
+                            throw PairGraphEvidenceStoreError.invalidEvidence
+                        }
+                        let mapperContext = try pairEvidence
+                            .mapperWorkerInvocationContext()
+                        activeMapperGraphContext = mapperContext
+                        let mappingAttemptOrdinal = try beginMappingAttempt()
+                        try self.resetDirectory(paths.colmapSparseURL)
                         do {
-                            let mappingAttemptOrdinal = try beginMappingAttempt(
-                                activeBackend: .colmap
-                            )
-                            try self.resetDirectory(paths.colmapSparseURL)
                             try await self.tooling.colmap.runMapper(
                                 colmapPath: self.config.toolchain.colmap,
                                 database: paths.colmapDatabaseURL,
@@ -2968,6 +3830,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     randomSeed: resolvedRunPlan.runSeed,
                                     refineFocalLength: true
                                 ),
+                                mapperContext: mapperContext,
                                 onLog: { line, isErr in
                                     colmapToolLog.append(
                                         stream: isErr ? "stderr" : "stdout",
@@ -2976,33 +3839,104 @@ public final class PipelineRunner: @unchecked Sendable {
                                     onMappingLog(line, isErr)
                                 }
                             )
-                            mappingSucceeded = try await evaluateMappingResult(
-                                mappingAttemptOrdinal: mappingAttemptOrdinal,
-                                acceptedRefinementInvocationCount:
-                                    mappingProgress.globalRefinementInvocationCount,
-                                cadence: cadence
-                            )
                         } catch {
                             if error is CancellationError { throw error }
-                            try Task.checkCancellation()
+                            if Task.isCancelled { throw CancellationError() }
                             lastMappingError = Self.normalizedUnusableSparseModelError(error)
+                        }
+                        if lastMappingError == nil {
+                            do {
+                                mappingSucceeded = try await evaluateMappingResult(
+                                    mappingAttemptOrdinal: mappingAttemptOrdinal,
+                                    acceptedRefinementInvocationCount:
+                                        mappingProgress.globalRefinementInvocationCount,
+                                    cadence: cadence
+                                )
+                            } catch {
+                                if error is CancellationError || Task.isCancelled {
+                                    try workerExecutionRecorder.recordMapperEvaluation(
+                                        mappingAttemptOrdinal: mappingAttemptOrdinal,
+                                        evaluation: ColmapMapperEvaluationEvidence(
+                                            status: .interrupted,
+                                            fallbackTrigger: nil
+                                        )
+                                    )
+                                    throw CancellationError()
+                                }
+                                lastMappingError = Self.normalizedUnusableSparseModelError(
+                                    error
+                                )
+                            }
+                            let evaluation: ColmapMapperEvaluationEvidence
+                            if mappingSucceeded {
+                                evaluation = ColmapMapperEvaluationEvidence(
+                                    status: .accepted,
+                                    fallbackTrigger: nil
+                                )
+                            } else if lastMappingError is PipelineError {
+                                evaluation = ColmapMapperEvaluationEvidence(
+                                    status: .rejected,
+                                    fallbackTrigger:
+                                        Self.mappingCadenceFallbackTrigger(
+                                            after: lastMappingError
+                                        )
+                                )
+                            } else {
+                                evaluation = ColmapMapperEvaluationEvidence(
+                                    status: .failed,
+                                    fallbackTrigger: nil
+                                )
+                            }
+                            try workerExecutionRecorder.recordMapperEvaluation(
+                                mappingAttemptOrdinal: mappingAttemptOrdinal,
+                                evaluation: evaluation
+                            )
                         }
                         if mappingSucceeded {
                             break mappingAttemptLoop
                         }
-                        guard cadence == .orderedFast,
-                              let reason = Self.conservativeCadenceFallbackReason(
-                                after: lastMappingError
-                              ) else {
+                        guard let trigger = Self.mappingCadenceFallbackTrigger(
+                            after: lastMappingError
+                        ),
+                              let fallbackCadence = IncrementalMappingCadencePolicy
+                                .fallbackCadence(
+                                    planned: plannedIncrementalCadence,
+                                    active: cadence,
+                                    existingTrigger: activeCadenceFallbackTrigger
+                                ) else {
                             break mappingAttemptLoop
                         }
-                        activeIncrementalCadence = .conservative
-                        recordMappingFallback(reason)
-                        try persistGeometryRecovery(activeBackend: .colmap)
+                        let verifiedEvidence = try PairGraphEvidenceStore.loadVerified(
+                            from: paths.pairGraphEvidenceURL,
+                            expectedImageNames: selectedFrames.map(\.lastPathComponent),
+                            databaseURL: paths.colmapDatabaseURL,
+                            projectPaths: paths
+                        )
+                        try PairGraphEvidenceStore.validateSchedule(
+                            verifiedEvidence,
+                            resolvedPlan: resolvedRunPlan,
+                            groups: selectedPairGroups
+                        )
+                        try PairGraphEvidenceStore.validateWorkerExecution(
+                            verifiedEvidence,
+                            workerExecution: try workerExecutionRecorder
+                                .validatedArtifact()
+                        )
+                        let verifiedMapperContext = try verifiedEvidence
+                            .mapperWorkerInvocationContext()
+                        guard verifiedMapperContext == mapperContext else {
+                            throw PairGraphEvidenceStoreError.invalidEvidence
+                        }
+                        acceptedPairGraphEvidence = verifiedEvidence
+                        activeMapperGraphContext = verifiedMapperContext
+                        activeIncrementalCadence = fallbackCadence
+                        activeCadenceFallbackTrigger = trigger
+                        recordMappingFallback(trigger.diagnosticReason)
+                        try persistGeometryRecovery()
                         try self.resetDirectory(paths.colmapSparseURL)
                         emit(.stageLog(
                             stage: .sfmMapping,
-                            line: "The fast camera solve missed a geometry gate. Retrying the accepted image graph with conservative refinement.",
+                            line: "The camera solve missed a geometry gate. Retrying the same verified image graph with denser global refinement.",
                             isError: true
                         ))
                     }
@@ -3024,70 +3958,26 @@ public final class PipelineRunner: @unchecked Sendable {
                         continue sfmAttemptLoop
                     }
 
-                    if !mappingSucceeded,
-                       Self.shouldRecoverPairGraph(after: lastMappingError),
-                       !didRetryWithExactMatcher,
-                       colmapMatchOptions.descriptorMatcher == .faiss,
-                       Self.nextPairRecoveryLevel(
-                           after: pairRecoveryLevel,
-                           imageCount: selectedFrames.count,
-                           pairingPolicy: resolvedRunPlan.pairingPolicy
-                       ) == nil {
-                        guard let sourcePlan = latestPreparedPairPlan else {
-                            throw PairGraphEvidenceStoreError.invalidEvidence
-                        }
-                        suspendStageTimingForRetry(.sfmMapping)
-                        didRetryWithExactMatcher = true
-                        colmapMatchOptions.descriptorMatcher = .exact
-                        pairAttemptMode = .sameScheduleExact(sourcePlan)
-                        recordMappingFallback("exact descriptor matching")
-                        try persistAttemptRecoveryIntent(
-                            mode: pairAttemptMode,
-                            activePlan: sourcePlan
-                        )
-                        try self.resetDirectory(paths.colmapSparseURL)
-                        acceptedPairGraphEvidence = nil
-                        emit(.stageLog(
-                            stage: .sfmMatching,
-                            line: "The densest FAISS solve did not produce one acceptable camera solve. Retrying the same schedule with exact descriptor matching.",
-                            isError: true
-                        ))
-                        forceSfMRun = false
-                        forceMatchingRun = true
-                        continue sfmAttemptLoop
-                    }
-
                     guard mappingSucceeded else {
-                        if let pipelineError = lastMappingError as? PipelineError,
-                           case .fragmentedReconstruction = pipelineError {
-                            let message = failureMessages(
-                                for: pipelineError,
-                                stage: .sfmMapping
+                        let terminalError = lastMappingError
+                            ?? PipelineError.lowQualityReconstruction(
+                                .init(
+                                    registeredImages: 0,
+                                    totalImages: 0,
+                                    meanReprojectionError: nil
+                                ),
+                                mapper: nil
                             )
-                            emitFailure(
-                                stage: .sfmMapping,
-                                userMessage: message.userMessage,
-                                debugMessage: message.debugMessage
-                            )
-                            throw pipelineError
-                        }
-                        let debugMessage: String
-                        if let pipelineError = lastMappingError as? PipelineError,
-                           case let .lowQualityReconstruction(score, _) = pipelineError {
-                            let summary = ReconstructionScorer.summary(score)
-                            debugMessage = "Low-quality reconstruction. \(summary). Last attempt: colmap."
-                        } else if let colmapError = lastMappingError as? ColmapRunnerError {
-                            debugMessage = debugDescription(for: colmapError)
-                        } else {
-                            debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil))"
-                        }
-                        let userMessage = "The camera solve was unstable. Try a slower capture with more light."
+                        let message = failureMessages(
+                            for: terminalError,
+                            stage: .sfmMapping
+                        )
                         emitFailure(
                             stage: .sfmMapping,
-                            userMessage: userMessage,
-                            debugMessage: debugMessage
+                            userMessage: message.userMessage,
+                            debugMessage: message.debugMessage
                         )
-                        throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil)
+                        throw terminalError
                     }
                     guard let selectedMappedModel, let selectedMappedModelSnapshot else {
                         throw PipelineError.outputMissing
@@ -3123,17 +4013,6 @@ public final class PipelineRunner: @unchecked Sendable {
                             isError: false
                         ))
                     }
-                    let finalSparseModel = canonicalSparseModel
-                    writeCheckpoint(
-                        stage: .sfmMapping,
-                        progress: 1.0,
-                        message: "Camera mapping completed",
-                        details: .sfmMapping(SfmMappingCheckpoint(
-                            mapper: "colmap",
-                            sparsePath: try paths.projectRelativePath(for: finalSparseModel),
-                            registeredImages: nil
-                        ))
-                    )
                 }
 
                 break
@@ -3145,10 +4024,9 @@ public final class PipelineRunner: @unchecked Sendable {
             // when resume validation skipped the mapper subprocess itself.
             currentStage = .sfmMapping
             var mappingDurationText: String?
-            if acceptedReconstructionSummary != nil
-                || metadata.geometryArtifact == nil
+            if acceptedMapper != nil
                 || !FileManager.default.fileExists(atPath: paths.geometryManifestURL.path) {
-                guard let mapper = (acceptedReconstructionSummary ?? metadata.reconstruction)?.mapper else {
+                guard let mapper = acceptedMapper else {
                     throw PipelineError.geometryResidualsUnavailable(
                         "The current project has accepted geometry without solver provenance"
                     )
@@ -3165,8 +4043,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         expectedProcessResolution: da3Config.processResolution,
                         expectedCameraType: da3Config.cameraType,
                         expectedSharedCamera: da3Config.sharedCamera,
-                        expectedPrimaryModelSubdirectory: da3Config.modelSubdirectory,
-                        expectedFallbackModelSubdirectory: da3Config.fallbackModelSubdirectory
+                        expectedModelSubdirectory: da3Config.modelSubdirectory
                     )
                     guard issues.isEmpty else {
                         throw PipelineError.outputMissing
@@ -3185,8 +4062,27 @@ public final class PipelineRunner: @unchecked Sendable {
                     ? nil
                     : mappingFallbackReasons.joined(separator: "; ")
                 let measuredPairGraph: PairGraphArtifact
+                var publicationDa3PairPlan: ColmapPairPlan?
                 if mapper.lowercased().contains("da3") {
-                    measuredPairGraph = .notEvaluated()
+                    guard let pairEvidence = acceptedDa3PairGraphEvidence else {
+                        throw PairGraphEvidenceStoreError.invalidEvidence
+                    }
+                    let pairPlan = try ColmapPairEstimator.validatedDa3RefinementPairPlan(
+                        manifest: try Da3CoverageManifest.load(
+                            from: paths.da3CoverageManifestURL
+                        ),
+                        imageNames: selectedFrames.map(\.lastPathComponent),
+                        resolvedPlan: resolvedRunPlan
+                    )
+                    publicationDa3PairPlan = pairPlan
+                    measuredPairGraph = try PairGraphEvidenceStore
+                        .da3PairGraphArtifact(
+                            pairEvidence,
+                            expectedPlanBinding: PairGraphPlanBinding(
+                                resolvedRunPlan
+                            ),
+                            expectedPairPlan: pairPlan
+                        )
                 } else {
                     guard let pairEvidence = acceptedPairGraphEvidence else {
                         throw PairGraphEvidenceStoreError.invalidEvidence
@@ -3200,6 +4096,62 @@ public final class PipelineRunner: @unchecked Sendable {
                 }
                 measuredMapping.attemptCount = mappingAttemptCount
                 measuredMapping.fallbackReason = mappingFallbackReason
+                let finalColmapRuntimeClosure = try tooling.colmap.captureRuntimeClosure(
+                    colmapPath: config.toolchain.colmap
+                )
+                try workerExecutionRecorder.rebindColmapRuntimeClosure(
+                    finalColmapRuntimeClosure
+                )
+                let workerExecution = try workerExecutionRecorder.validatedArtifact()
+                if let pairEvidence = acceptedPairGraphEvidence {
+                    try PairGraphEvidenceStore.validateWorkerExecution(
+                        pairEvidence,
+                        workerExecution: workerExecution
+                    )
+                } else if let pairEvidence = acceptedDa3PairGraphEvidence,
+                          let pairPlan = publicationDa3PairPlan {
+                    try PairGraphEvidenceStore.validateDa3WorkerExecution(
+                        pairEvidence,
+                        expectedPlanBinding: PairGraphPlanBinding(
+                            resolvedRunPlan
+                        ),
+                        expectedPairPlan: pairPlan,
+                        workerExecution: workerExecution
+                    )
+                }
+                guard let acceptedConditioningAnalysis else {
+                    throw PipelineError.geometryResidualsUnavailable(
+                        "The accepted camera solve did not retain conditioning evidence"
+                    )
+                }
+                let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent(
+                    "0",
+                    isDirectory: true
+                )
+                try requireTextSparseModelFiles(at: canonicalSparseModel)
+                let normalizedImagesTxt = canonicalSparseModel.appendingPathComponent(
+                    "images.txt"
+                )
+                if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(
+                    at: normalizedImagesTxt,
+                    checkCancellation: self.tooling.checkCancellation
+                ) {
+                    emit(.stageLog(
+                        stage: .sfmMapping,
+                        line: "Normalized the published camera model before final verification.",
+                        isError: false
+                    ))
+                }
+                let publishedConditioningAnalysis = try validatedConditionedGeometry(
+                    modelDirectory: canonicalSparseModel,
+                    selectedFrames: selectedFrames,
+                    requireStrongObservationCoverage: acceptedDa3ModelSubdirectory != nil
+                )
+                try requirePublishedGeometry(
+                    publishedConditioningAnalysis,
+                    matches: acceptedConditioningAnalysis,
+                    at: canonicalSparseModel
+                )
                 try persistMeasuredGeometryArtifact(
                     metadata: &metadata,
                     paths: paths,
@@ -3208,24 +4160,30 @@ public final class PipelineRunner: @unchecked Sendable {
                     acceptedDa3ModelSubdirectory: acceptedDa3ModelSubdirectory,
                     selectedFrames: selectedFrames,
                     selectedFrameManifest: currentSelectedFrameManifest,
+                    inputSnapshots: inputLease.videos + inputLease.photos,
                     peakMemoryBytes: geometryPeakMemoryBytes,
                     pairGraph: measuredPairGraph,
                     mapping: measuredMapping,
-                    workerExecution: try workerExecutionRecorder.validatedArtifact(),
-                    acceptedReconstructionSummary: acceptedReconstructionSummary,
+                    workerExecution: workerExecution,
+                    acceptedAnalysis: publishedConditioningAnalysis,
                     currentMappingDurationSeconds: {
                         stageTiming.elapsedSeconds(.sfmMapping)
                     }
+                )
+                writeCheckpoint(
+                    stage: .sfmMapping,
+                    progress: 1.0,
+                    message: "Camera mapping completed"
                 )
             } else {
                 let artifact = try GeometryArtifactStore.load(
                     from: paths.geometryManifestURL,
                     projectPaths: paths
                 )
-                if metadata.geometryArtifact != artifact {
-                    metadata.geometryArtifact = artifact
-                    try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
-                }
+                try GeometryArtifactStore.requireRunPlanBinding(
+                    artifact,
+                    plan: resolvedRunPlan
+                )
             }
             if completedMappingThisAttempt {
                 mappingDurationText = stageTiming.finish(.sfmMapping)
@@ -3256,25 +4214,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 if Task.isCancelled {
                     throw CancellationError()
                 }
-                let isLast = index == backendOrder.count - 1
-                if isLast {
-                    throw error
-                }
-                let nextBackend = backendOrder[index + 1]
-                recordMappingFallback("\(backendPolicy.rawValue) fallback to \(nextBackend.rawValue)")
-                let debug = failureMessages(for: error, stage: .sfmFeatures).debugMessage
-                emit(.stageLog(
-                    stage: .sfmFeatures,
-                    line: "\(backendName(backendPolicy)) failed (\(debug)). Falling back to \(backendName(nextBackend)).",
-                    isError: true
-                ))
-                try cleanForRetry(failedStage: .sfmFeatures, paths: paths)
-                try paths.ensureDirectories()
-                try persistGeometryRecovery(activeBackend: nextBackend)
-                continue
+                throw error
             }
-            break
-        }
 
             try stopIfRequested(after: .sfmMapping)
             if skipTraining {
@@ -3305,9 +4246,11 @@ public final class PipelineRunner: @unchecked Sendable {
                     ))
                 )
                     try paths.ensureMutableTrainingDirectories()
-                    guard let geometryArtifact = metadata.geometryArtifact else {
-                        throw PipelineError.outputMissing
-                    }
+                    let geometryArtifact = try GeometryArtifactStore.load(
+                        from: paths.geometryManifestURL,
+                        projectPaths: paths,
+                        expectedInput: metadata.input
+                    )
                     let preparedDataset = try await prepareMsplatDataset(
                         paths: paths,
                         maxImageSize: resolvedRunPlan.maximumImageDimension,
@@ -3318,6 +4261,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     )
                     let datasetURL = preparedDataset.url
                     let datasetIdentity = preparedDataset.identity
+                    let datasetDerivation = preparedDataset.derivation
                     let outputURL = paths.msplatOutputURL
                     emit(.stageProgress(stage: .trainSplat, fraction: -1.0, message: "Training model with msplat"))
 
@@ -3335,12 +4279,12 @@ public final class PipelineRunner: @unchecked Sendable {
                     let resumeURL: URL?
                     do {
                         resumeURL = try msplatResumeURL(
-                            metadata: metadata,
                             paths: paths,
                             profile: detailProfile,
                             cameraOrderSeed: cameraOrderSeed,
                             resolvedPlan: resolvedRunPlan,
-                            datasetIdentity: datasetIdentity
+                            datasetIdentity: datasetIdentity,
+                            datasetDerivation: datasetDerivation
                         )
                     } catch let validationError as MsplatCheckpointValidationError {
                         emit(.stageLog(
@@ -3357,11 +4301,32 @@ public final class PipelineRunner: @unchecked Sendable {
                         resumeURL = nil
                     }
                     var completedTrainingResult: MsplatTrainingResult?
+                    var completedTrainingAdmission: TrainingResourceAdmission?
                     var activeResumeURL = resumeURL
                     while completedTrainingResult == nil {
+                        try paths.ensureMutableTrainingDirectories()
+                        let resourceAdmission = try TrainingMemoryBudget.admit(
+                            observing: self.tooling.trainingResourceObserver,
+                            resourcePolicy: requestedOptions.resourcePolicy
+                        )
+                        let checkpointBudget = activeResumeURL == nil
+                            ? nil
+                            : try? TrainingArtifactStore.load(
+                                from: paths.trainingManifestURL,
+                                projectPaths: paths
+                            ).memoryBudgetBytes
+                        let admittedBudget = try TrainingMemoryBudget.trainerBudget(
+                            plannedBytes: resolvedRunPlan.trainerMemoryBudgetBytes,
+                            checkpointBytes: checkpointBudget,
+                            admission: resourceAdmission
+                        )
+                        emit(.stageLog(
+                            stage: .trainSplat,
+                            line: "Training admitted \(ByteCountFormatter.string(fromByteCount: admittedBudget, countStyle: .memory)) from current unified-memory capacity.",
+                            isError: false
+                        ))
                         do {
-                            try paths.ensureMutableTrainingDirectories()
-                            completedTrainingResult = try await self.tooling.msplat.runTrain(
+                            let result = try await self.tooling.msplat.runTrain(
                                 msplatPath: msplatPath,
                                 datasetPath: datasetURL,
                                 outputPath: outputURL,
@@ -3372,7 +4337,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 seed: cameraOrderSeed,
                                 iterationLimit: resolvedRunPlan.trainerIterationLimit,
                                 plateauWindow: resolvedRunPlan.plateauWindow,
-                                memoryBudgetBytes: resolvedRunPlan.trainerMemoryBudgetBytes,
+                                memoryBudgetBytes: admittedBudget,
                                 onProgress: { progress in
                                     let fraction = Double(progress.iteration) / Double(progress.iterationLimit)
                                     emit(.stageProgress(
@@ -3388,7 +4353,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                             profile: detailProfile,
                                             cameraOrderSeed: cameraOrderSeed,
                                             resolvedPlan: resolvedRunPlan,
+                                            resourceAdmission: resourceAdmission,
                                             datasetIdentity: datasetIdentity,
+                                            datasetDerivation: datasetDerivation,
                                             paths: paths
                                         )
                                     } catch {
@@ -3422,6 +4389,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                     }
                                 }
                             )
+                            completedTrainingResult = result
+                            completedTrainingAdmission = resourceAdmission
                         } catch let rejection as MsplatResumeRejected where activeResumeURL != nil {
                             emit(.stageLog(
                                 stage: .trainSplat,
@@ -3441,7 +4410,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                 profile: detailProfile,
                                 cameraOrderSeed: cameraOrderSeed,
                                 resolvedPlan: resolvedRunPlan,
+                                resourceAdmission: resourceAdmission,
                                 datasetIdentity: datasetIdentity,
+                                datasetDerivation: datasetDerivation,
                                 paths: paths
                             )
                             metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
@@ -3451,17 +4422,40 @@ public final class PipelineRunner: @unchecked Sendable {
                     guard let trainingResult = completedTrainingResult else {
                         throw PipelineError.outputMissing
                     }
+                    guard let trainingAdmission = completedTrainingAdmission else {
+                        throw PipelineError.outputMissing
+                    }
                     guard ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid else {
                         throw PipelineError.outputMissing
                     }
-                    try persistMsplatCompletion(
+                    guard try currentMsplatDatasetDerivation(
+                        paths: paths,
+                        geometryArtifact: geometryArtifact,
+                        maxImageSize: resolvedRunPlan.maximumImageDimension
+                    ) == datasetDerivation else {
+                        throw GeometryArtifactStore.Error.artifactDigestMismatch("training dataset")
+                    }
+                    let completedArtifact = try persistMsplatCompletion(
                         trainingResult,
                         profile: detailProfile,
                         cameraOrderSeed: cameraOrderSeed,
                         resolvedPlan: resolvedRunPlan,
+                        resourceAdmission: trainingAdmission,
                         datasetIdentity: datasetIdentity,
+                        datasetDerivation: datasetDerivation,
                         paths: paths
                     )
+                    if let measuredBounds = completedArtifact.sceneBounds,
+                       !SplatSceneBoundsCalculator.matches(
+                            trainingResult.sceneBounds,
+                            measuredBounds
+                       ) {
+                        emit(.stageLog(
+                            stage: .trainSplat,
+                            line: "Trainer-reported scene bounds differed from the validated PLY; the host measurement was retained.",
+                            isError: false
+                        ))
+                    }
                     metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
                     if FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path) {
                         do {
@@ -3497,9 +4491,25 @@ public final class PipelineRunner: @unchecked Sendable {
                 guard ProjectArtifactValidator.validatePlyFile(at: ply) == .valid else {
                     throw PipelineError.outputMissing
                 }
+                let geometryArtifact = try GeometryArtifactStore.load(
+                    from: paths.geometryManifestURL,
+                    projectPaths: paths,
+                    expectedInput: metadata.input
+                )
+                let trainingArtifact = try TrainingArtifactStore.load(
+                    from: paths.trainingManifestURL,
+                    projectPaths: paths
+                )
+                guard try currentMsplatDatasetDerivation(
+                        paths: paths,
+                        geometryArtifact: geometryArtifact,
+                        maxImageSize: resolvedRunPlan.maximumImageDimension
+                      ) == trainingArtifact.datasetDerivation else {
+                    throw GeometryArtifactStore.Error.artifactDigestMismatch("training dataset")
+                }
                 let outputDirectory = try paths.resolveProjectRelativePath("Output")
                 try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-                let outputPly = try paths.resolveProjectRelativePath("Output/splat.ply")
+                let outputPly = paths.outputSplatURL
                 try SplatExport.copyIfExists(from: ply, to: outputPly)
                 guard ProjectArtifactValidator.validatePlyFile(at: outputPly) == .valid else {
                     throw PipelineError.outputMissing
@@ -3520,8 +4530,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 try stopIfRequested(after: .exportSplat)
             }
 
-            metadata.trainingArtifact = try promoteMsplatCompletionToPublicOutput(paths: paths)
-            metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+            _ = try promoteMsplatCompletionToPublicOutput(paths: paths)
             metadata.state = PipelineState(stage: .done, lastError: nil)
             metadata.lastRunStartedAt = nil
             try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
@@ -3550,6 +4559,34 @@ public final class PipelineRunner: @unchecked Sendable {
                     debugMessage: message.debugMessage
                 )
             }
+            throw error
+        }
+    }
+
+    func authenticateStartupVideoInputs(
+        metadata: ProjectMetadata,
+        paths: ProjectPaths,
+        freshPublicationAttestation: FreshProjectPublicationAttestation?
+    ) throws {
+        if let freshPublicationAttestation {
+            try freshPublicationAttestation.consume(projectURL: projectURL, metadata: metadata)
+        } else {
+            try tooling.validateVideoInputs(metadata, paths)
+        }
+    }
+
+    func prepareStartupRuntimeInputLease(
+        metadata: ProjectMetadata,
+        paths: ProjectPaths,
+        pairingPolicy: ResolvedPairingPolicy?,
+        freshPublicationAttestation: FreshProjectPublicationAttestation?
+    ) throws -> RuntimeInputSnapshotLease {
+        let lease = try tooling.prepareRuntimeInputLease(metadata, paths, pairingPolicy)
+        do {
+            try freshPublicationAttestation?.completeConsumption()
+            return lease
+        } catch {
+            lease.discard()
             throw error
         }
     }

@@ -86,6 +86,7 @@ final class ToolchainManifestTests: XCTestCase {
         XCTAssertNil(object["artifacts"])
         let components = try XCTUnwrap(object["components"] as? [[String: Any]])
         XCTAssertNotNil(components[0]["criticalFileHashes"])
+        XCTAssertNotNil(components[0]["expandedClosureSHA256"])
         XCTAssertNil(components[0]["executableHashes"])
 
         let decoder = JSONDecoder()
@@ -118,6 +119,70 @@ final class ToolchainManifestTests: XCTestCase {
                 "Schema-1 artifact set unexpectedly decoded: \(names)"
             )
         }
+    }
+
+    func testManifestRejectsMissingExpandedClosureDigest() throws {
+        let hash = String(repeating: "a", count: 64)
+        let json = """
+        {
+          "schemaVersion": 2,
+          "toolchainAPI": 2,
+          "keyID": "\(hash)",
+          "version": "2.0.0",
+          "publishedAt": "1970-01-01T00:00:00Z",
+          "appVersionRange": {"minimum":"1.0.0","maximumExclusive":"3.0.0"},
+          "components": [{
+            "name": "macos-arm64-core",
+            "capabilities": ["runtime.core"],
+            "url": "https://example.com/core.zip",
+            "sha256": "\(hash)",
+            "sizeBytes": 1,
+            "expandedSizeBytes": 1,
+            "contents": ["bin/colmap"],
+            "criticalFileHashes": {"bin/colmap":"\(hash)"},
+            "dependencies": [],
+            "requirement": "required"
+          }],
+          "signatureEd25519": ""
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        XCTAssertThrowsError(
+            try decoder.decode(ToolchainManifest.self, from: Data(json.utf8))
+        )
+    }
+
+    func testAuthenticatedManifestReaderAcceptsSignedPayloadAboveTwoMiB() throws {
+        let fixture = try oversizedSignedManifest(pathBytes: 1_200_000)
+        XCTAssertGreaterThan(fixture.data.count, 2 * 1_024 * 1_024)
+        XCTAssertLessThanOrEqual(fixture.data.count, ToolchainManifest.maximumEncodedBytes)
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("manifest.json")
+        try fixture.data.write(to: url)
+
+        let loaded = try ToolchainManifest.readAuthenticated(
+            at: url,
+            publicKeyBase64: fixture.publicKey
+        )
+
+        XCTAssertEqual(loaded.data, fixture.data)
+        XCTAssertEqual(loaded.manifest.signatureEd25519, fixture.manifest.signatureEd25519)
+    }
+
+    func testAuthenticatedManifestReaderRejectsPayloadAboveSixteenMiB() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("manifest.json")
+        try Data(repeating: 0x20, count: ToolchainManifest.maximumEncodedBytes + 1).write(to: url)
+
+        XCTAssertThrowsError(try ToolchainManifest.readAuthenticated(
+            at: url,
+            publicKeyBase64: Curve25519.Signing.PrivateKey()
+                .publicKey.rawRepresentation.base64EncodedString()
+        ))
     }
 
     func testSchemaV2SignatureBindsKeyIDAndComponentMetadata() throws {
@@ -325,6 +390,28 @@ final class ToolchainManifestTests: XCTestCase {
         }
     }
 
+    func testEqualVersionRequiresExactAuthenticatedManifestIdentity() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
+        var floor = validSchema2Manifest(publicKey: publicKey)
+        floor.signatureEd25519 = try key.signature(for: floor.canonicalData()).base64EncodedString()
+        var equivocation = floor
+        equivocation.publishedAt = floor.publishedAt.addingTimeInterval(1)
+        equivocation.signatureEd25519 = try key.signature(for: equivocation.canonicalData())
+            .base64EncodedString()
+        let manager = ToolchainManager(appVersion: "2.0.0")
+
+        XCTAssertNoThrow(try manager.test_validateImmutableVersionFloor(floor, floor: floor))
+        XCTAssertThrowsError(
+            try manager.test_validateImmutableVersionFloor(equivocation, floor: floor)
+        )
+
+        var newer = equivocation
+        newer.version = "2.0.1"
+        newer.signatureEd25519 = try key.signature(for: newer.canonicalData()).base64EncodedString()
+        XCTAssertNoThrow(try manager.test_validateImmutableVersionFloor(newer, floor: floor))
+    }
+
     func testManagerUsesSemVerPrereleasePrecedenceForAppRange() throws {
         let key = Curve25519.Signing.PrivateKey()
         let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
@@ -406,6 +493,45 @@ final class ToolchainManifestTests: XCTestCase {
             ],
             signatureEd25519: ""
         )
+    }
+
+    private func oversizedSignedManifest(
+        pathBytes: Int
+    ) throws -> (manifest: ToolchainManifest, publicKey: String, data: Data) {
+        let key = Curve25519.Signing.PrivateKey()
+        let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
+        let path = "share/" + String(repeating: "x", count: pathBytes)
+        let hash = String(repeating: "a", count: 64)
+        var manifest = ToolchainManifest(
+            schemaVersion: 2,
+            toolchainAPI: 2,
+            keyID: ToolchainManifest.keyID(publicKeyBase64: publicKey)!,
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "1.0.0", maximumExclusive: "3.0.0"),
+            components: [
+                .init(
+                    name: "macos-arm64-core",
+                    capabilities: ["runtime.core"],
+                    url: "https://example.com/core.zip",
+                    sha256: hash,
+                    sizeBytes: 1,
+                    expandedSizeBytes: 1,
+                    expandedClosureSHA256: hash,
+                    contents: [path],
+                    criticalFileHashes: [path: hash],
+                    dependencies: [],
+                    requirement: .required
+                )
+            ],
+            signatureEd25519: ""
+        )
+        manifest.signatureEd25519 = try key.signature(for: manifest.canonicalData())
+            .base64EncodedString()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        return (manifest, publicKey, try encoder.encode(manifest))
     }
 
     func testManifestSignatureVerification() throws {

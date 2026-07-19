@@ -12,6 +12,7 @@ struct ViewerCameraState: Equatable, Sendable {
     private static let minimumPitchClearance: Float = 0.001
     private static let minimumRadius: Float = 1e-12
     private static let maximumRadius = Float.greatestFiniteMagnitude / 100_000
+    private static let maximumCoordinateMagnitude = Float.greatestFiniteMagnitude / 16
     private static let minimumFOV: Float = 0.001
     private static let maximumFOV = Float.pi - minimumFOV
     private static let maximumViewportDimension: CGFloat = 1_000_000
@@ -22,6 +23,7 @@ struct ViewerCameraState: Equatable, Sendable {
     private(set) var yaw: Float
     private(set) var pitch: Float
     private(set) var distance: Float
+    private(set) var sceneCenter: SIMD3<Float>
     private(set) var sceneRadius: Float
     private(set) var openingDirection: SIMD3<Float>
     private(set) var viewportSize: CGSize
@@ -42,7 +44,7 @@ struct ViewerCameraState: Equatable, Sendable {
         distance: Float? = nil,
         interactionRevision: UInt64 = 0
     ) {
-        let safeTarget = Self.isFinite(target) ? target : .zero
+        let safeTarget = Self.isRepresentablePosition(target) ? target : .zero
         let safeRadius = Self.sanitizedRadius(sceneRadius)
         let safeViewport = Self.sanitizedViewport(viewportSize)
         let safeVerticalFOV = Self.sanitizedFOV(verticalFOV)
@@ -53,6 +55,7 @@ struct ViewerCameraState: Equatable, Sendable {
         self.target = safeTarget
         self.yaw = safeYaw
         self.pitch = safePitch
+        self.sceneCenter = safeTarget
         self.sceneRadius = safeRadius
         self.openingDirection = opening.direction
         self.viewportSize = safeViewport
@@ -85,12 +88,27 @@ struct ViewerCameraState: Equatable, Sendable {
     }
 
     var panWorldUnitsPerPixel: Float {
-        2 * distance * tan(verticalFOV / 2) / Float(viewportSize.height)
+        Self.saturatedFloat(
+            2 * Double(distance)
+                * tan(Double(verticalFOV) / 2)
+                / Double(viewportSize.height)
+        )
     }
 
     var clipPlanes: ViewerClipPlanes {
         let near = max(sceneRadius * 1e-4, distance * 1e-3)
-        let far = max(distance + 4 * sceneRadius, 8 * sceneRadius, near * 1_000)
+        let cameraToSceneCenter = Self.distance(
+            from: target,
+            offsetBy: -forwardDirection * distance,
+            to: sceneCenter
+        )
+        let far = Self.saturatedFloat(
+            max(
+                cameraToSceneCenter + 4 * Double(sceneRadius),
+                8 * Double(sceneRadius),
+                Double(near) * 1_000
+            )
+        )
         return ViewerClipPlanes(near: near, far: far)
     }
 
@@ -112,7 +130,8 @@ struct ViewerCameraState: Equatable, Sendable {
     }
 
     var cameraPosition: SIMD3<Float> {
-        target - forwardDirection * distance
+        let position = target - forwardDirection * distance
+        return Self.isFinite(position) ? position : target
     }
 
     mutating func updateViewportSize(_ size: CGSize) {
@@ -140,8 +159,10 @@ struct ViewerCameraState: Equatable, Sendable {
         let scale = panWorldUnitsPerPixel
         let translation = rightDirection * (-screenDelta.x * scale)
             + upDirection * (screenDelta.y * scale)
-        guard Self.isFinite(translation), translation != .zero else { return }
-        target += translation
+        let nextTarget = target + translation
+        guard Self.isFinite(translation), translation != .zero,
+              Self.isRepresentablePosition(nextTarget) else { return }
+        target = nextTarget
         recordInteraction()
     }
 
@@ -167,25 +188,71 @@ struct ViewerCameraState: Equatable, Sendable {
 
     mutating func fit() {
         let nextDistance = fittedDistance
-        guard target != homeTarget || distance != nextDistance else { return }
-        target = homeTarget
-        distance = nextDistance
-        recordInteraction()
+        if target != homeTarget || distance != nextDistance {
+            target = homeTarget
+            distance = nextDistance
+            recordInteraction()
+        }
+        automaticFitRevision = interactionRevision
     }
 
     mutating func reset() {
         let opening = Self.orientation(for: openingDirection)
         let nextDistance = fittedDistance
-        guard target != homeTarget
+        if target != homeTarget
             || yaw != opening.yaw
             || pitch != opening.pitch
             || distance != nextDistance
-        else { return }
-        target = homeTarget
-        yaw = opening.yaw
-        pitch = opening.pitch
-        distance = nextDistance
+        {
+            target = homeTarget
+            yaw = opening.yaw
+            pitch = opening.pitch
+            distance = nextDistance
+            recordInteraction()
+        }
+        automaticFitRevision = interactionRevision
+    }
+
+    /// Reorients the current view without discarding its target or zoom.
+    @discardableResult
+    mutating func applyViewOnlyPose(
+        target nextTarget: SIMD3<Float>,
+        forwardDirection nextForwardDirection: SIMD3<Float>,
+        openingDirection nextOpeningDirection: SIMD3<Float>
+    ) -> Bool {
+        guard Self.isRepresentablePosition(nextTarget),
+              Self.isUsableDirection(nextForwardDirection),
+              Self.isUsableDirection(nextOpeningDirection) else {
+            return false
+        }
+
+        let nextView = Self.orientation(for: nextForwardDirection)
+        let nextOpening = Self.orientation(for: nextOpeningDirection)
+        let wasAutomaticallyFitted = automaticFitRevision == interactionRevision
+
+        target = nextTarget
+        yaw = nextView.yaw
+        pitch = nextView.pitch
+        openingDirection = nextOpening.direction
         recordInteraction()
+        automaticFitRevision = wasAutomaticallyFitted ? interactionRevision : nil
+        return true
+    }
+
+    /// Returns the horizontal heading represented by this camera, including its
+    /// deterministic yaw-zero heading for a vertical opening direction.
+    static func stableHorizontalHeading(for direction: SIMD3<Float>) -> SIMD3<Float> {
+        let represented = orientation(for: direction).direction
+        let horizontal = SIMD3<Float>(represented.x, 0, represented.z)
+        let lengthSquared = simd_length_squared(horizontal)
+        guard lengthSquared.isFinite, lengthSquared > 0 else {
+            return SIMD3<Float>(0, 0, -1)
+        }
+        return horizontal / sqrt(lengthSquared)
+    }
+
+    static func canRepresentSceneBounds(center: SIMD3<Float>, radius: Float) -> Bool {
+        isRepresentablePosition(center) && isRepresentableRadius(radius)
     }
 
     /// Applies asynchronously loaded scene bounds only if no input occurred since loading began.
@@ -197,14 +264,14 @@ struct ViewerCameraState: Equatable, Sendable {
         ifInteractionRevisionMatches expectedRevision: UInt64
     ) -> Bool {
         guard interactionRevision == expectedRevision,
-              Self.isFinite(center),
-              radius.isFinite,
-              radius > 0
+              Self.isRepresentablePosition(center),
+              Self.isRepresentableRadius(radius)
         else { return false }
 
         let opening = Self.orientation(for: openingDirection ?? Self.defaultOpeningDirection)
         target = center
         homeTarget = center
+        sceneCenter = center
         sceneRadius = Self.sanitizedRadius(radius)
         self.openingDirection = opening.direction
         yaw = opening.yaw
@@ -214,17 +281,33 @@ struct ViewerCameraState: Equatable, Sendable {
         return true
     }
 
-    /// Updates scene-scale metadata after input without moving the current camera.
+    /// Re-bases an interacted placeholder view into the loaded scene's coordinate system.
     @discardableResult
     mutating func adoptBoundsPreservingView(
         center: SIMD3<Float>,
         radius: Float,
         openingDirection: SIMD3<Float>?
     ) -> Bool {
-        guard Self.isFinite(center), radius.isFinite, radius > 0 else { return false }
+        guard Self.isRepresentablePosition(center), Self.isRepresentableRadius(radius) else {
+            return false
+        }
         let opening = Self.orientation(for: openingDirection ?? Self.defaultOpeningDirection)
+        let nextRadius = Self.sanitizedRadius(radius)
+        guard let nextTarget = Self.rebasedTarget(
+            target,
+            fromCenter: sceneCenter,
+            fromRadius: sceneRadius,
+            toCenter: center,
+            toRadius: nextRadius
+        ) else { return false }
+        let relativeDistance = Double(distance) / Double(sceneRadius)
+        let scaledDistance = Self.saturatedFloat(relativeDistance * Double(nextRadius))
+
+        target = nextTarget
         homeTarget = center
-        sceneRadius = Self.sanitizedRadius(radius)
+        sceneCenter = center
+        sceneRadius = nextRadius
+        distance = Self.clampedDistance(scaledDistance, radius: nextRadius)
         self.openingDirection = opening.direction
         automaticFitRevision = nil
         return true
@@ -272,8 +355,9 @@ struct ViewerCameraState: Equatable, Sendable {
            let anchorBefore,
            let anchorAfter = targetPlanePoint(at: pointer) {
             let correction = anchorBefore - anchorAfter
-            if Self.isFinite(correction) {
-                target += correction
+            let correctedTarget = target + correction
+            if Self.isFinite(correction), Self.isRepresentablePosition(correctedTarget) {
+                target = correctedTarget
             }
         }
         recordInteraction()
@@ -309,9 +393,49 @@ struct ViewerCameraState: Equatable, Sendable {
         return max(minimum, min(maximum, value))
     }
 
+    private static func rebasedTarget(
+        _ target: SIMD3<Float>,
+        fromCenter: SIMD3<Float>,
+        fromRadius: Float,
+        toCenter: SIMD3<Float>,
+        toRadius: Float
+    ) -> SIMD3<Float>? {
+        let scale = Double(toRadius) / Double(fromRadius)
+        let components = [
+            Double(toCenter.x) + (Double(target.x) - Double(fromCenter.x)) * scale,
+            Double(toCenter.y) + (Double(target.y) - Double(fromCenter.y)) * scale,
+            Double(toCenter.z) + (Double(target.z) - Double(fromCenter.z)) * scale,
+        ]
+        guard components.allSatisfy({
+            $0.isFinite && abs($0) <= Double(maximumCoordinateMagnitude)
+        })
+        else { return nil }
+        return SIMD3<Float>(Float(components[0]), Float(components[1]), Float(components[2]))
+    }
+
+    private static func distance(
+        from target: SIMD3<Float>,
+        offsetBy offset: SIMD3<Float>,
+        to sceneCenter: SIMD3<Float>
+    ) -> Double {
+        let x = Double(target.x) + Double(offset.x) - Double(sceneCenter.x)
+        let y = Double(target.y) + Double(offset.y) - Double(sceneCenter.y)
+        let z = Double(target.z) + Double(offset.z) - Double(sceneCenter.z)
+        return hypot(hypot(x, y), z)
+    }
+
+    private static func saturatedFloat(_ value: Double) -> Float {
+        guard value.isFinite else { return .greatestFiniteMagnitude }
+        return Float(min(Double(Float.greatestFiniteMagnitude), max(0, value)))
+    }
+
     private static func sanitizedRadius(_ radius: Float) -> Float {
         guard radius.isFinite, radius > 0 else { return 1 }
         return max(minimumRadius, min(maximumRadius, radius))
+    }
+
+    private static func isRepresentableRadius(_ radius: Float) -> Bool {
+        radius.isFinite && radius >= minimumRadius && radius <= maximumRadius
     }
 
     private static func sanitizedViewport(_ size: CGSize) -> CGSize {
@@ -377,5 +501,16 @@ struct ViewerCameraState: Equatable, Sendable {
 
     private static func isFinite(_ vector: SIMD3<Float>) -> Bool {
         vector.x.isFinite && vector.y.isFinite && vector.z.isFinite
+    }
+
+    private static func isUsableDirection(_ vector: SIMD3<Float>) -> Bool {
+        guard isFinite(vector) else { return false }
+        let largestComponent = max(abs(vector.x), abs(vector.y), abs(vector.z))
+        return largestComponent.isFinite && largestComponent > 0
+    }
+
+    private static func isRepresentablePosition(_ vector: SIMD3<Float>) -> Bool {
+        isFinite(vector)
+            && max(abs(vector.x), abs(vector.y), abs(vector.z)) <= maximumCoordinateMagnitude
     }
 }

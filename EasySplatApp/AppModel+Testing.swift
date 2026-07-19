@@ -14,6 +14,10 @@ extension AppModel {
         preparedShareItem
     }
 
+    func test_inFlightShareSessionCount() -> Int {
+        inFlightShareSessions.count
+    }
+
     func test_activateShareSession() {
         activeShareSession = ShareSession(model: self)
         isShareSheetActive = true

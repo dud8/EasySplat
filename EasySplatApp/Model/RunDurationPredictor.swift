@@ -41,7 +41,9 @@ enum RunDurationPredictor {
             .filter { summary in
                 summary.input.map(InputShape.init) == inputShape
             }
-            .compactMap { $0.stageTimings.totalDurationSeconds }
+            .compactMap {
+                $0.createToViewerReadySeconds ?? $0.stageTimings.totalDurationSeconds
+            }
             .filter { $0 > 0 })
     }
 

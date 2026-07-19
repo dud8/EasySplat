@@ -2,66 +2,13 @@ import XCTest
 @testable import EasySplatApp
 
 final class WorkspacePresentationTests: XCTestCase {
-    func testProcessingFixtureRequiresTheVerifierFlagAndIsolatedHome() {
-        let home = URL(fileURLWithPath: "/tmp/easysplat-ui-harness", isDirectory: true)
-        let project = home
-            .appendingPathComponent("Documents/EasySplat Projects", isDirectory: true)
-            .appendingPathComponent("Processing Fixture.easysplatproj", isDirectory: true)
-        let environment = [
-            "HOME": home.path,
-            "EASYSPLAT_ISOLATED_UI_RUNNER": "1",
-            "EASYSPLAT_UI_VERIFIER_PROCESSING_PROJECT": project.path,
-        ]
-        let arguments = ["EasySplatApp", "--easysplat-ui-verifier-processing-fixture"]
-
+    func testWorkspaceUsesStandardDurationUnlessReduceMotionIsEnabled() {
         XCTAssertEqual(
-            AppConfig.uiVerificationProcessingProjectURL(
-                environment: environment,
-                arguments: arguments
-            ),
-            project.standardizedFileURL
+            WorkspaceView.workspaceAnimationDuration(reduceMotion: false),
+            Theme.Motion.standardWorkspaceDuration
         )
-        XCTAssertNil(AppConfig.uiVerificationProcessingProjectURL(
-            environment: environment.merging(["EASYSPLAT_ISOLATED_UI_RUNNER": "0"]) { _, new in new },
-            arguments: arguments
-        ))
-        XCTAssertNil(AppConfig.uiVerificationProcessingProjectURL(
-            environment: environment,
-            arguments: ["EasySplatApp"]
-        ))
-        XCTAssertNil(AppConfig.uiVerificationProcessingProjectURL(
-            environment: environment.merging([
-                "EASYSPLAT_UI_VERIFIER_PROCESSING_PROJECT": "/tmp/outside.easysplatproj"
-            ]) { _, new in new },
-            arguments: arguments
-        ))
-    }
-
-    @MainActor
-    func testProcessingFixtureSeedsOnlyTheActivePresentationState() {
-        let base = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let project = base.appendingPathComponent(
-            "Processing Fixture.easysplatproj",
-            isDirectory: true
-        )
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-        let model = AppModel(
-            toolchainManager: MockToolchainManager(),
-            projectBaseURL: base
-        )
-
-        model.applyUIVerificationProcessingFixture(projectURL: project, now: now)
-
-        XCTAssertEqual(model.viewState, .processing)
-        XCTAssertEqual(model.currentProjectURL, project)
-        XCTAssertEqual(model.stage, .sfmMapping)
-        XCTAssertNil(model.progress)
-        XCTAssertEqual(model.statusTitle, "Refining camera poses")
-        XCTAssertEqual(model.elapsedSincePhaseStart(now: now), 12 * 60)
-        XCTAssertEqual(model.lastPipelineEventAt, now.addingTimeInterval(-8))
-        XCTAssertTrue(model.isRunActive)
-        XCTAssertNil(model.currentTask, "The fixture must not start a pipeline or toolchain task.")
+        XCTAssertEqual(Theme.Motion.standardWorkspaceDuration, 0.16)
+        XCTAssertNil(WorkspaceView.workspaceAnimationDuration(reduceMotion: true))
     }
 
     func testProjectSelectionOnlyOpensFinishedProjects() {

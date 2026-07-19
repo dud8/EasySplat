@@ -82,15 +82,14 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
     }
 
-    func testCheckpointedArtifactPersistsAndRepairsStaleProjectMetadata() throws {
+    func testCheckpointedArtifactPersistsOnlyToSidecar() throws {
         let context = try makeContext()
         defer { context.cleanup() }
         let artifact = makeCheckpointedArtifact()
-        var metadata = context.metadata
+        let metadataBeforePersist = try Data(contentsOf: context.paths.metadataURL)
 
-        try TrainingArtifactStore.persist(artifact, metadata: &metadata, paths: context.paths)
+        try TrainingArtifactStore.persist(artifact, paths: context.paths)
 
-        XCTAssertEqual(metadata.trainingArtifact, artifact)
         XCTAssertEqual(
             try TrainingArtifactStore.load(
                 from: context.paths.trainingManifestURL,
@@ -98,17 +97,15 @@ final class TrainingArtifactStoreTests: XCTestCase {
             ),
             artifact
         )
-
-        metadata.trainingArtifact = nil
-        try ProjectMetadataStore.save(metadata, to: context.paths.metadataURL)
-        var staleMetadata = try ProjectMetadataStore.load(from: context.paths.metadataURL)
-
-        XCTAssertTrue(try TrainingArtifactStore.reconcile(metadata: &staleMetadata, paths: context.paths))
-        XCTAssertEqual(staleMetadata.trainingArtifact, artifact)
         XCTAssertEqual(
-            try ProjectMetadataStore.load(from: context.paths.metadataURL).trainingArtifact,
-            artifact
+            try Data(contentsOf: context.paths.metadataURL),
+            metadataBeforePersist
         )
+        let metadataObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: metadataBeforePersist) as? [String: Any]
+        )
+        XCTAssertNil(metadataObject["geometryArtifact"])
+        XCTAssertNil(metadataObject["trainingArtifact"])
     }
 
     func testCompletedArtifactRequiresOutputWithoutCheckpointFields() throws {
@@ -156,6 +153,33 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
     }
 
+    func testArtifactBindsItsActualBudgetToVerifiedLiveAdmission() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+
+        var tamperedAdmission = makeCheckpointedArtifact()
+        tamperedAdmission.resourceAdmission.hostCapacityBytes -= 1
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.save(
+                tamperedAdmission,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
+
+        var overcommitted = makeCheckpointedArtifact()
+        overcommitted.memoryBudgetBytes = Int64(
+            overcommitted.resourceAdmission.allowedTrainerBytes
+        ) + 1
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.save(
+                overcommitted,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
+    }
+
     func testCompletedArtifactRequiresFinitePositiveSceneBounds() throws {
         let context = try makeContext()
         defer { context.cleanup() }
@@ -188,6 +212,24 @@ final class TrainingArtifactStoreTests: XCTestCase {
                 )
             )
         }
+    }
+
+    func testCompletedArtifactRejectsSceneBoundsNotDerivedFromOutput() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        var forged = try makeCompletedArtifact(in: context)
+        forged.sceneBounds = SplatSceneBounds(
+            center: .init(x: 10_000, y: -20_000, z: 30_000),
+            radius: 1_000_000
+        )
+
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.save(
+                forged,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
     }
 
     func testCheckpointedArtifactCannotClaimFinalSceneBounds() throws {
@@ -347,7 +389,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
         let context = try makeContext()
         defer { context.cleanup() }
         var artifact = makeCheckpointedArtifact()
-        for schema in [1, 2, 3] {
+        for schema in 1..<TrainingArtifact.currentSchemaVersion {
             artifact.schemaVersion = schema
             XCTAssertThrowsError(
                 try TrainingArtifactStore.save(
@@ -361,6 +403,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
 
     func testCurrentManifestRequiresEveryRasterRecoveryField() throws {
         let fields = [
+            "datasetDerivation",
             "rasterExactFallbackElapsedSeconds",
             "rasterExactBufferGrowthCount",
             "rasterExactBufferBytesAdded",
@@ -389,7 +432,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
                     from: context.paths.trainingManifestURL,
                     projectPaths: context.paths
                 ),
-                "Decoded schema-4 manifest without required field \(field)"
+                "Decoded current training manifest without required field \(field)"
             )
         }
     }
@@ -408,11 +451,9 @@ final class TrainingArtifactStoreTests: XCTestCase {
                     projectPaths: context.paths
                 )
             )
-            var metadata = context.metadata
             XCTAssertThrowsError(
                 try TrainingArtifactStore.persist(
                     artifact,
-                    metadata: &metadata,
                     paths: context.paths
                 )
             )
@@ -439,34 +480,11 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
     }
 
-    func testProjectMetadataRejectsInvalidEmbeddedTrainingArtifact() throws {
-        let context = try makeContext()
-        defer { context.cleanup() }
-
-        var invalidSchema = makeCheckpointedArtifact()
-        invalidSchema.schemaVersion = 99
-        var metadata = context.metadata
-        metadata.trainingArtifact = invalidSchema
-        XCTAssertThrowsError(
-            try ProjectMetadataStore.save(metadata, to: context.paths.metadataURL)
-        )
-
-        var mismatchedProfile = makeCheckpointedArtifact()
-        mismatchedProfile.detailProfile = .highDetail
-        mismatchedProfile.iterationLimit = 15_000
-        mismatchedProfile.plateauWindow = 1_500
-        metadata.trainingArtifact = mismatchedProfile
-        XCTAssertThrowsError(
-            try ProjectMetadataStore.save(metadata, to: context.paths.metadataURL)
-        )
-    }
-
     func testCompletedArtifactBindsPromotedPublicPlyBytes() throws {
         let context = try makeContext()
         defer { context.cleanup() }
         let artifact = try makeCompletedArtifact(in: context)
-        var metadata = context.metadata
-        try TrainingArtifactStore.persist(artifact, metadata: &metadata, paths: context.paths)
+        try TrainingArtifactStore.persist(artifact, paths: context.paths)
 
         let publicOutput = context.paths.outputURL.appendingPathComponent("splat.ply")
         try FileManager.default.copyItem(at: context.paths.msplatOutputURL, to: publicOutput)
@@ -474,14 +492,8 @@ final class TrainingArtifactStoreTests: XCTestCase {
         promotedArtifact.outputPath = "Output/splat.ply"
         try TrainingArtifactStore.persist(
             promotedArtifact,
-            metadata: &metadata,
             paths: context.paths
         )
-        metadata.outputs = OutputSpec(
-            splatPlyPath: "Output/splat.ply",
-            colmapModelPath: "SfM/colmap/sparse/0"
-        )
-        try ProjectMetadataStore.save(metadata, to: context.paths.metadataURL)
 
         let original = try String(contentsOf: publicOutput, encoding: .utf8)
         let replaced = original.replacingOccurrences(
@@ -492,12 +504,10 @@ final class TrainingArtifactStoreTests: XCTestCase {
         try replaced.write(to: publicOutput, atomically: true, encoding: .utf8)
         XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: publicOutput), .valid)
 
-        let loaded = try ProjectMetadataStore.load(from: context.paths.metadataURL)
-        let loadedArtifact = try XCTUnwrap(loaded.trainingArtifact)
         XCTAssertThrowsError(
-            try TrainingArtifactStore.validateCompletedOutput(
-                loadedArtifact,
-                at: publicOutput
+            try TrainingArtifactStore.load(
+                from: context.paths.trainingManifestURL,
+                projectPaths: context.paths
             )
         )
     }
@@ -505,14 +515,13 @@ final class TrainingArtifactStoreTests: XCTestCase {
     func testCompletionForDifferentDatasetPreservesPriorArtifactAndPublicOutput() throws {
         let context = try makeContext()
         defer { context.cleanup() }
-        var metadata = context.metadata
+        let metadata = context.metadata
         var priorArtifact = try makeCompletedArtifact(in: context)
         let publicOutput = context.paths.outputURL.appendingPathComponent("splat.ply")
         try FileManager.default.copyItem(at: context.paths.msplatOutputURL, to: publicOutput)
         priorArtifact.outputPath = "Output/splat.ply"
         try TrainingArtifactStore.persist(
             priorArtifact,
-            metadata: &metadata,
             paths: context.paths
         )
         let priorPublicBytes = try Data(contentsOf: publicOutput)
@@ -584,13 +593,14 @@ final class TrainingArtifactStoreTests: XCTestCase {
                     profile: .balanced,
                     cameraOrderSeed: plan.runSeed,
                     resolvedPlan: plan,
+                    resourceAdmission: makeTestTrainingResourceAdmission(),
                     datasetIdentity: datasetIdentity,
+                    datasetDerivation: makeMsplatDatasetDerivation(
+                        inputDigest: datasetIdentity.inputDigest,
+                        geometryDigest: datasetIdentity.geometryDigest
+                    ),
                     paths: context.paths
                 )
-            )
-            XCTAssertEqual(
-                try ProjectMetadataStore.load(from: context.paths.metadataURL).trainingArtifact,
-                priorArtifact
             )
             XCTAssertEqual(
                 try TrainingArtifactStore.load(
@@ -601,6 +611,85 @@ final class TrainingArtifactStoreTests: XCTestCase {
             )
             XCTAssertEqual(try Data(contentsOf: publicOutput), priorPublicBytes)
         }
+    }
+
+    func testCompletionPersistsBoundsMeasuredFromTrainerOutput() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        try TestFileBuilder.writeMinimalPly(at: context.paths.msplatOutputURL)
+        let requestedOptions = RequestedRunOptions(
+            capturePath: .orbit,
+            detailProfile: .balanced
+        )
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: requestedOptions,
+            input: context.metadata.input,
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        let datasetIdentity = MsplatDatasetIdentity(
+            inputDigest: String(repeating: "b", count: 64),
+            geometryDigest: String(repeating: "c", count: 64)
+        )
+        let outputBytes = Int64(
+            try XCTUnwrap(
+                context.paths.msplatOutputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            )
+        )
+        let result = MsplatTrainingResult(
+            profile: .balanced,
+            iterationLimit: plan.trainerIterationLimit,
+            plateauWindow: plan.plateauWindow,
+            completedIteration: plan.trainerIterationLimit,
+            stopReason: .iterationLimit,
+            gaussianCount: 1,
+            elapsedSeconds: 2,
+            peakMemoryBytes: 2_147_483_648,
+            memoryBudgetBytes: plan.trainerMemoryBudgetBytes,
+            rasterFallbackCount: 0,
+            rasterExactFallbackElapsedSeconds: 0,
+            rasterExactBufferGrowthCount: 0,
+            rasterExactBufferBytesAdded: 0,
+            rasterReplayElapsedSeconds: 0,
+            rasterPeakExactIntersectionCapacity: 0,
+            droppedIntersectionCount: 0,
+            sceneBounds: SplatSceneBounds(
+                center: .init(x: 10_000, y: -20_000, z: 30_000),
+                radius: 1_000_000
+            ),
+            outputBytes: outputBytes,
+            inputDigest: datasetIdentity.inputDigest,
+            geometryDigest: datasetIdentity.geometryDigest,
+            trainerBuildDigest: String(repeating: "a", count: 64),
+            latestCheckpoint: nil
+        )
+        let runner = PipelineRunner(
+            projectURL: context.root,
+            config: .init(toolchain: TestToolchains.toolchainPaths(root: context.root))
+        )
+
+        let artifact = try runner.persistMsplatCompletion(
+            result,
+            profile: .balanced,
+            cameraOrderSeed: plan.runSeed,
+            resolvedPlan: plan,
+            resourceAdmission: makeTestTrainingResourceAdmission(),
+            datasetIdentity: datasetIdentity,
+            datasetDerivation: makeMsplatDatasetDerivation(
+                inputDigest: datasetIdentity.inputDigest,
+                geometryDigest: datasetIdentity.geometryDigest
+            ),
+            paths: context.paths
+        )
+
+        XCTAssertEqual(
+            artifact.sceneBounds,
+            try SplatSceneBoundsCalculator.compute(
+                at: context.paths.msplatOutputURL,
+                maximumSampleCount: RobustSplatBounds.maximumFallbackSampleCount
+            )
+        )
+        XCTAssertNotEqual(artifact.sceneBounds, result.sceneBounds)
     }
 
     func testCheckpointedArtifactRequiresExactCheckpointNamespaceAndNoOutput() throws {
@@ -634,7 +723,6 @@ final class TrainingArtifactStoreTests: XCTestCase {
         var metadata = context.metadata
         try TrainingArtifactStore.persist(
             makeCheckpointedArtifact(),
-            metadata: &metadata,
             paths: context.paths
         )
 
@@ -643,9 +731,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
             paths: context.paths
         )
 
-        XCTAssertNil(metadata.trainingArtifact)
         XCTAssertFalse(FileManager.default.fileExists(atPath: context.paths.trainingManifestURL.path))
-        XCTAssertNil(try ProjectMetadataStore.load(from: context.paths.metadataURL).trainingArtifact)
     }
 
     func testLoadRejectsOversizedAndEscapingManifestFiles() throws {
@@ -692,7 +778,6 @@ final class TrainingArtifactStoreTests: XCTestCase {
         var metadata = context.metadata
         try TrainingArtifactStore.persist(
             makeCheckpointedArtifact(),
-            metadata: &metadata,
             paths: context.paths
         )
         // Simulate a project being tampered with after its secured directory layout
@@ -712,7 +797,6 @@ final class TrainingArtifactStoreTests: XCTestCase {
             FileManager.default.fileExists(atPath: context.paths.msplatCheckpointURL.path)
         )
         XCTAssertEqual(try Data(contentsOf: sentinel), Data("keep".utf8))
-        XCTAssertNil(metadata.trainingArtifact)
     }
 
     func testDiscardRemovesReservedManifestSymlinkWithoutTouchingTarget() throws {
@@ -721,7 +805,6 @@ final class TrainingArtifactStoreTests: XCTestCase {
         var metadata = context.metadata
         try TrainingArtifactStore.persist(
             makeCheckpointedArtifact(),
-            metadata: &metadata,
             paths: context.paths
         )
         try FileManager.default.removeItem(at: context.paths.trainingManifestURL)
@@ -741,7 +824,6 @@ final class TrainingArtifactStoreTests: XCTestCase {
             paths: context.paths
         )
 
-        XCTAssertNil(metadata.trainingArtifact)
         XCTAssertNil(
             try? FileManager.default.destinationOfSymbolicLink(
                 atPath: context.paths.trainingManifestURL.path
@@ -756,7 +838,6 @@ final class TrainingArtifactStoreTests: XCTestCase {
         var metadata = context.metadata
         try TrainingArtifactStore.persist(
             try makeCompletedArtifact(in: context),
-            metadata: &metadata,
             paths: context.paths
         )
         let publicOutput = context.paths.outputURL.appendingPathComponent("splat.ply")
@@ -780,8 +861,6 @@ final class TrainingArtifactStoreTests: XCTestCase {
             paths: context.paths
         )
 
-        XCTAssertNil(metadata.trainingArtifact)
-        XCTAssertNil(try ProjectMetadataStore.load(from: context.paths.metadataURL).trainingArtifact)
         XCTAssertNil(
             try? FileManager.default.destinationOfSymbolicLink(
                 atPath: context.paths.trainingURL.path
@@ -796,10 +875,20 @@ final class TrainingArtifactStoreTests: XCTestCase {
             .appendingPathComponent("Artifact.easysplatproj", isDirectory: true)
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
-        let metadata = ProjectMetadata(
-            title: "Artifact",
-            input: .photos(folder: "/tmp/photos"),
-            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+        let controlledMetadata = try TestFileBuilder.bindingControlledPhotoInput(
+            to: ProjectMetadata(
+                title: "Artifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            paths: paths
+        )
+        let metadata = try TestFileBuilder.bindContinuousPhotoSelectionFixture(
+            to: controlledMetadata,
+            paths: paths
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         return ArtifactStoreTestContext(root: root, paths: paths, metadata: metadata)
@@ -812,6 +901,10 @@ final class TrainingArtifactStoreTests: XCTestCase {
             trainerBuildDigest: String(repeating: "a", count: 64),
             inputDigest: String(repeating: "b", count: 64),
             geometryDigest: String(repeating: "c", count: 64),
+            datasetDerivation: makeMsplatDatasetDerivation(
+                inputDigest: String(repeating: "b", count: 64),
+                geometryDigest: String(repeating: "c", count: 64)
+            ),
             detailProfile: .balanced,
             iterationLimit: 7_000,
             plateauWindow: 800,
@@ -824,6 +917,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
             elapsedSeconds: nil,
             peakMemoryBytes: 2_147_483_648,
             memoryBudgetBytes: 8_589_934_592,
+            resourceAdmission: makeTestTrainingResourceAdmission(),
             rasterFallbackCount: 0,
             rasterExactFallbackElapsedSeconds: 0,
             rasterExactBufferGrowthCount: 0,
@@ -852,9 +946,11 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
         artifact.gaussianCount = 1
         artifact.elapsedSeconds = 12.5
-        artifact.sceneBounds = SplatSceneBounds(
-            center: .init(x: 0.25, y: -0.5, z: 1.5),
-            radius: 3.75
+        artifact.sceneBounds = try XCTUnwrap(
+            SplatSceneBoundsCalculator.compute(
+                at: context.paths.msplatOutputURL,
+                maximumSampleCount: RobustSplatBounds.maximumFallbackSampleCount
+            )
         )
         artifact.completionStatus = .completed
         return artifact

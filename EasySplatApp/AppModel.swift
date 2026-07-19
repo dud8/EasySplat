@@ -29,6 +29,22 @@ enum RunValidationRecovery: Equatable {
     }
 }
 
+struct ProjectPublicationCheckpointHook: Sendable {
+    static let none = ProjectPublicationCheckpointHook()
+
+    private let handler: ProjectPublicationTransaction.CheckpointHandler
+
+    init(
+        _ handler: @escaping ProjectPublicationTransaction.CheckpointHandler = { _ in }
+    ) {
+        self.handler = handler
+    }
+
+    func handle(_ checkpoint: ProjectPublicationTransaction.Checkpoint) throws {
+        try handler(checkpoint)
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     typealias FinishedOutputValidator = @Sendable (URL) -> URL?
@@ -54,8 +70,8 @@ final class AppModel: ObservableObject {
     @Published var validationRecovery: RunValidationRecovery? = nil
     @Published var failureRetryAllowed = true
     @Published var outputPlyURL: URL? = nil
-    @Published var currentReconstruction: ReconstructionSummary? = nil
     @Published var currentStageTimings: [StageTimingRecord] = []
+    @Published var currentCreateToViewerReadySeconds: TimeInterval? = nil
     @Published var currentOutputPlyInfo: OutputPlyInfo? = nil
     @Published var currentRunOptions: RequestedRunOptions? = nil
     @Published var currentInput: InputSpec? = nil
@@ -76,16 +92,20 @@ final class AppModel: ObservableObject {
     @Published var shareStatusIsError: Bool = false
     @Published var isShareSheetActive: Bool = false
     @Published var isShareReady: Bool = false
+    @Published var isPreparingShare: Bool = false
 
     let toolchainManager: ToolchainManaging
     let hardwareProfile: HardwareProfile
     let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
     let powerAssertion: PowerAssertionManaging
     let finishedOutputValidator: FinishedOutputValidator
+    let videoInputPreflight: VideoInputPreflight
+    let projectPublicationCheckpointHook: ProjectPublicationCheckpointHook
     let projectBaseURL: URL?
     let projectTrashHandler: (URL) throws -> Void
     var currentTask: Task<Void, Never>?
     var currentTaskToken: UUID?
+    var pendingResultViewerTiming: PendingResultViewerTiming?
     var lastProgressLogAt: Date = .distantPast
     var lastProgressLogMessage: String = ""
     var lastProgressLogStage: PipelineStage? = nil
@@ -111,8 +131,11 @@ final class AppModel: ObservableObject {
     }
     var forcedExitTask: Task<Void, Never>?
     var activeShareSession: ShareSession?
+    var inFlightShareSessions: [UUID: ShareSession] = [:]
+    var latestShareOperationID: UUID?
     var preparedShareItem: PreparedShareItem?
     var sharePreparationToken: UUID?
+    var sharePreparationTask: Task<Void, Never>?
     static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
 
     enum StopAction {
@@ -237,9 +260,11 @@ final class AppModel: ObservableObject {
         toolchainManager: ToolchainManaging = AppModel.makeDefaultToolchainManager(),
         projectBaseURL: URL? = nil,
         hardwareProfile: HardwareProfile? = nil,
+        videoInputPreflight: VideoInputPreflight = VideoInputPreflight(),
         pipelineRunnerFactory: @escaping (URL, PipelineRunner.PipelineConfig) -> PipelineRunning = { projectURL, config in
             PipelineRunner(projectURL: projectURL, config: config)
         },
+        projectPublicationCheckpointHook: ProjectPublicationCheckpointHook = .none,
         powerAssertion: PowerAssertionManaging = SystemPowerAssertion(),
         projectTrashHandler: @escaping (URL) throws -> Void = { url in
             var resultingURL: NSURL?
@@ -256,6 +281,8 @@ final class AppModel: ObservableObject {
         self.projectBaseURL = projectBaseURL
         self.hardwareProfile = hardwareProfile ?? .detect()
         self.finishedOutputValidator = finishedOutputValidator
+        self.videoInputPreflight = videoInputPreflight
+        self.projectPublicationCheckpointHook = projectPublicationCheckpointHook
         self.projectTrashHandler = projectTrashHandler
         self.pipelineRunnerFactory = pipelineRunnerFactory
         self.powerAssertion = powerAssertion
@@ -270,31 +297,28 @@ final class AppModel: ObservableObject {
 
     static func makeDefaultToolchainManager(
         bundledBootstrap: ToolchainBootstrap? = AppConfig.bundledToolchainBootstrap,
-        factory: (ToolchainBootstrap?) -> ToolchainManaging = { bundledBootstrap in
+        sourcePolicy: ToolchainSourcePolicy = AppModel.defaultToolchainSourcePolicy(),
+        developmentOverrides: DevelopmentOverrides = AppConfig.currentDevelopmentOverrides,
+        factory: (ToolchainBootstrap?, ToolchainSourcePolicy, URL?) -> ToolchainManaging = {
+            bundledBootstrap,
+            sourcePolicy,
+            localToolchainRoot in
             ToolchainManager(
                 appVersion: EasySplatReleaseIdentity.version(),
+                localToolchainRoot: localToolchainRoot,
                 allowInsecureLoopbackHTTP: AppConfig.allowInsecureLoopbackToolchainHTTP,
-                bundledBootstrap: bundledBootstrap
+                bundledBootstrap: bundledBootstrap,
+                sourcePolicy: sourcePolicy
             )
         }
     ) -> ToolchainManaging {
-        factory(bundledBootstrap)
+        factory(bundledBootstrap, sourcePolicy, developmentOverrides.localToolchainRoot)
     }
 
-    func applyUIVerificationProcessingFixture(
-        projectURL: URL,
-        now: Date = Date()
-    ) {
-        reset()
-        currentProjectURL = projectURL.standardizedFileURL
-        viewState = .processing
-        stage = .sfmMapping
-        progress = nil
-        statusTitle = "Refining camera poses"
-        statusDetail = "Fusing selected camera estimates.\nRefinement pass 2 of 3."
-        stageStartedAt = now.addingTimeInterval(-95)
-        phaseStartedAt = now.addingTimeInterval(-12 * 60)
-        lastPipelineEventAt = now.addingTimeInterval(-8)
-        isRunActive = true
+    static func defaultToolchainSourcePolicy(
+        releaseVerificationConfiguration: AppConfig.ReleaseVerificationConfiguration?
+            = AppConfig.releaseVerificationConfiguration
+    ) -> ToolchainSourcePolicy {
+        releaseVerificationConfiguration == nil ? .automatic : .bundledBootstrapOnly
     }
 }

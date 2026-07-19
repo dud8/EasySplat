@@ -1,7 +1,7 @@
 import Foundation
 import CoreMedia
 
-struct SmartFrameCandidate: Sendable {
+struct SmartFrameCandidate: Equatable, Sendable {
     var index: Int
     var sharpness: Double
     var brightness: Double
@@ -26,7 +26,7 @@ struct SmartFrameCandidate: Sendable {
     }
 }
 
-struct TimedFrameCandidate: Sendable {
+struct TimedFrameCandidate: Equatable, Sendable {
     var frameIndex: Int
     var timestampSeconds: Double
     var candidate: SmartFrameCandidate

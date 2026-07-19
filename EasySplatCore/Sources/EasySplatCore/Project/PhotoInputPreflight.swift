@@ -23,9 +23,18 @@ public struct PhotoInputPreflight: Equatable, Sendable {
 
     static let supportedExtensions: Set<String> = ["jpg", "jpeg", "png", "heic", "heif"]
 
+    struct AcceptedPhoto: Equatable, Sendable {
+        let url: URL
+        let sha256: String
+    }
+
     struct Inspection: Sendable {
         let summary: PhotoInputPreflight
-        let validPhotos: [URL]
+        let acceptedPhotos: [AcceptedPhoto]
+
+        var validPhotos: [URL] {
+            acceptedPhotos.map(\.url)
+        }
     }
 
     public static func inspect(folder: URL) throws -> PhotoInputPreflight {
@@ -89,11 +98,11 @@ public struct PhotoInputPreflight: Equatable, Sendable {
     }
 
     static func inspect(_ photos: [URL]) throws -> Inspection {
-        var validPhotos: [URL] = []
+        var acceptedPhotos: [AcceptedPhoto] = []
         var seenDigests = Set<String>()
         var unreadableCount = 0
         var duplicateCount = 0
-        validPhotos.reserveCapacity(photos.count)
+        acceptedPhotos.reserveCapacity(photos.count)
 
         for photo in photos {
             try Task.checkCancellation()
@@ -105,17 +114,17 @@ public struct PhotoInputPreflight: Equatable, Sendable {
                 duplicateCount += 1
                 continue
             }
-            validPhotos.append(photo)
+            acceptedPhotos.append(AcceptedPhoto(url: photo, sha256: digest))
         }
 
         return Inspection(
             summary: PhotoInputPreflight(
                 discoveredPhotoCount: photos.count,
-                validPhotoCount: validPhotos.count,
+                validPhotoCount: acceptedPhotos.count,
                 unreadablePhotoCount: unreadableCount,
                 duplicatePhotoCount: duplicateCount
             ),
-            validPhotos: validPhotos
+            acceptedPhotos: acceptedPhotos
         )
     }
 

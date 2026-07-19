@@ -1,3 +1,5 @@
+import CryptoKit
+import Darwin
 import Foundation
 
 extension ToolchainManager {
@@ -187,12 +189,14 @@ extension ToolchainManager {
                   component.sizeBytes < Self.maximumReleaseComponentDownloadBytes,
                   component.expandedSizeBytes > 0,
                   component.expandedSizeBytes <= 16 * 1_024 * 1_024 * 1_024,
+                  component.expandedClosureSHA256 == component.expandedClosureSHA256.lowercased(),
+                  isLowercaseSHA256(component.expandedClosureSHA256),
                   component.sha256 == component.sha256.lowercased(),
                   isLowercaseSHA256(component.sha256),
                   !component.contents.isEmpty,
                   Set(component.contents).count == component.contents.count,
                   requiredCriticalFiles.isSubset(of: declaredCriticalFiles),
-                  declaredCriticalFiles.isSubset(of: declaredContents),
+                  declaredCriticalFiles == declaredContents,
                   requiredCriticalFiles.isSubset(of: declaredContents) else {
                 throw ToolchainError.invalidManifest
             }
@@ -275,6 +279,580 @@ extension ToolchainManager {
         return receipt
     }
 
+    /// Revalidates an exact installed root and returns provenance derived only
+    /// from its authenticated manifest and on-disk closure.
+    public func validatedInstallationEvidence(
+        root: URL,
+        publicKeyBase64: String,
+        request: ToolchainCapabilityRequest,
+        matching expectedManifest: ToolchainManifest? = nil
+    ) throws -> ToolchainInstallationEvidence {
+        try validateVersionedToolchainRoot(root)
+        let state = try validatedReusableInstallState(
+            root: root,
+            publicKeyBase64: publicKeyBase64,
+            matching: expectedManifest
+        )
+        guard let manifest = state.signedManifest else {
+            throw ToolchainError.invalidToolchain("Cached toolchain has no signed component receipt.")
+        }
+        try validateVersionedToolchainRoot(root, expectedVersion: manifest.version)
+        let requestedComponents = try manifest.resolvedComponents(
+            requesting: request.manifestCapabilities
+        )
+        guard requestedComponents.allSatisfy({
+            state.installedArtifacts[$0.name]?.lowercased() == $0.sha256.lowercased()
+        }) else {
+            throw ToolchainError.invalidToolchain("Cached toolchain receipt is incomplete.")
+        }
+
+        let installedNames = Set(state.installedArtifacts.keys)
+        let installedComponents = manifest.components.filter { installedNames.contains($0.name) }
+        guard installedComponents.count == installedNames.count else {
+            throw ToolchainError.invalidToolchain("Cached toolchain receipt contains unknown components.")
+        }
+        let expectedFiles = try validateInstalledTree(
+            root: root,
+            installedComponents: installedComponents
+        )
+        var signedCriticalHashes: [String: String] = [:]
+        for component in installedComponents {
+            for (path, digest) in component.criticalFileHashes {
+                if let existing = signedCriticalHashes[path], existing != digest {
+                    throw ToolchainError.invalidManifest
+                }
+                signedCriticalHashes[path] = digest
+            }
+        }
+        let closure = try installedClosureEvidence(
+            root: root,
+            files: expectedFiles,
+            signedCriticalHashes: signedCriticalHashes
+        )
+        guard let signature = Data(base64Encoded: manifest.signatureEd25519) else {
+            throw ToolchainError.signatureFailed
+        }
+
+        let signedArtifacts = Dictionary(
+            uniqueKeysWithValues: installedComponents.map { ($0.name, $0.sha256.lowercased()) }
+        )
+        let signedCapabilities = Set(installedComponents.flatMap(\.capabilities)).sorted()
+        let signedComponents = installedComponents.map {
+            ToolchainInstallationEvidence.SignedComponent(
+                name: $0.name,
+                archiveSHA256: $0.sha256.lowercased(),
+                expandedClosureSHA256: $0.expandedClosureSHA256.lowercased(),
+                capabilities: $0.capabilities.sorted(),
+                declaredContents: $0.contents.sorted()
+            )
+        }
+        return ToolchainInstallationEvidence(
+            toolchainVersion: manifest.version,
+            keyID: manifest.keyID.lowercased(),
+            canonicalManifestSHA256: sha256Hex(data: try manifest.canonicalData()),
+            signatureSHA256: sha256Hex(data: signature),
+            closureSHA256: closure.contentSHA256,
+            installationIdentitySHA256: closure.identitySHA256,
+            installedArtifacts: signedArtifacts,
+            installedCapabilities: signedCapabilities,
+            installedCriticalFileSHA256: signedCriticalHashes,
+            nativeTrainerBuildDigest: try nativeTrainerBuildDigest(
+                root: root,
+                signedFileHashes: signedCriticalHashes
+            ),
+            signedComponents: signedComponents,
+            provenanceRecords: try parsedProvenanceRecords(
+                root: root,
+                files: expectedFiles,
+                signedHashes: signedCriticalHashes
+            )
+        )
+    }
+
+    private func parsedProvenanceRecords(
+        root: URL,
+        files: Set<String>,
+        signedHashes: [String: String]
+    ) throws -> [ToolchainInstallationEvidence.ProvenanceRecord] {
+        let paths = files.filter { path in
+            path.hasSuffix("/build_info.json")
+                || path.hasSuffix("/easysplat_model_info.json")
+                || (path.hasPrefix("provenance/") && path.hasSuffix(".json"))
+                || path == "supply-chain/components.json"
+        }.sorted()
+        return try paths.map { path in
+            guard let signedHash = signedHashes[path] else {
+                throw ToolchainError.invalidManifest
+            }
+            let maximumBytes = path == "supply-chain/components.json"
+                ? ToolchainManifest.maximumInstallStateEnvelopeBytes
+                : 1_048_576
+            let data = try BoundedFileReader.readRegularFile(
+                at: root.appendingPathComponent(path, isDirectory: false),
+                maximumBytes: maximumBytes
+            )
+            guard sha256Hex(data: data) == signedHash,
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  JSONSerialization.isValidJSONObject(object),
+                  let dictionary = object as? [String: Any] else {
+                throw ToolchainError.invalidToolchain(
+                    "Signed toolchain provenance is invalid: \(path)."
+                )
+            }
+            let canonical = try JSONSerialization.data(
+                withJSONObject: dictionary,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            )
+            var stringFields: [String: String] = [:]
+            for (key, value) in dictionary {
+                if let string = value as? String {
+                    stringFields[key] = string
+                } else if let number = value as? NSNumber {
+                    stringFields[key] = number.stringValue
+                }
+            }
+            return ToolchainInstallationEvidence.ProvenanceRecord(
+                path: path,
+                fileSHA256: signedHash,
+                canonicalJSONSHA256: sha256Hex(data: canonical),
+                stringFields: stringFields
+            )
+        }
+    }
+
+    func nativeTrainerBuildDigest(
+        root: URL,
+        signedFileHashes: [String: String]
+    ) throws -> String {
+        var hasher = SHA256()
+        hasher.update(data: Data("EasySplat file digest v1".utf8))
+        for name in ["easysplat-train", "default.metallib"] {
+            let relativePath = "bin/\(name)"
+            guard let expectedSHA256 = signedFileHashes[relativePath] else {
+                throw ToolchainError.invalidManifest
+            }
+            try appendStableRegularFile(
+                root: root,
+                relativePath: relativePath,
+                relativeName: name,
+                expectedSHA256: expectedSHA256,
+                to: &hasher
+            )
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func appendStableRegularFile(
+        root: URL,
+        relativePath: String,
+        relativeName: String,
+        expectedSHA256: String,
+        to hasher: inout SHA256
+    ) throws {
+        let parts = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty }) else {
+            throw ToolchainError.invalidManifest
+        }
+        let rootDescriptor = Darwin.open(
+            root.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard rootDescriptor >= 0 else {
+            throw ToolchainError.invalidToolchain("Toolchain root could not be opened safely.")
+        }
+        var descriptors = [rootDescriptor]
+        defer { descriptors.reversed().forEach { Darwin.close($0) } }
+        var parent = rootDescriptor
+        for part in parts.dropLast() {
+            let next = String(part).withCString {
+                Darwin.openat(parent, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            guard next >= 0 else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain path contains an unsafe intermediate directory: \(relativePath)."
+                )
+            }
+            descriptors.append(next)
+            parent = next
+        }
+        let descriptor = String(parts.last!).withCString {
+            Darwin.openat(parent, $0, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain file could not be opened safely: \(relativePath)."
+            )
+        }
+        descriptors.append(descriptor)
+        let url = root.appendingPathComponent(relativePath, isDirectory: false)
+        var initial = stat()
+        guard fstat(descriptor, &initial) == 0,
+              (initial.st_mode & S_IFMT) == S_IFREG,
+              initial.st_nlink == 1,
+              initial.st_size >= 0 else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain file is not an ordinary single-link file: \(url.lastPathComponent)."
+            )
+        }
+        var nameLength = UInt64(relativeName.utf8.count).bigEndian
+        withUnsafeBytes(of: &nameLength) { hasher.update(bufferPointer: $0) }
+        hasher.update(data: Data(relativeName.utf8))
+        var byteCount = UInt64(initial.st_size).bigEndian
+        withUnsafeBytes(of: &byteCount) { hasher.update(bufferPointer: $0) }
+        var fileHasher = SHA256()
+        var bytesRead: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1_024 * 1_024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(descriptor, $0.baseAddress, $0.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain file could not be read safely: \(url.lastPathComponent)."
+                )
+            }
+            if count == 0 { break }
+            hasher.update(data: Data(buffer[0..<count]))
+            fileHasher.update(data: Data(buffer[0..<count]))
+            bytesRead += Int64(count)
+        }
+        var final = stat()
+        var finalPath = stat()
+        let actualSHA256 = fileHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard fstat(descriptor, &final) == 0,
+              bytesRead == Int64(initial.st_size),
+              sameFileIdentity(initial, final),
+              lstat(url.path, &finalPath) == 0,
+              sameFileIdentity(initial, finalPath),
+              actualSHA256 == expectedSHA256 else {
+            throw ToolchainError.invalidToolchain(
+                "Native trainer file changed or did not match its signed hash: \(relativePath)."
+            )
+        }
+    }
+
+    func regularFileEvidence(
+        root: URL,
+        relativePath: String,
+        maximumBytes: UInt64 = UInt64.max
+    ) throws -> (sha256: String, size: Int64, mode: UInt16, identity: String) {
+        try validateArchiveEntries([relativePath])
+        let parts = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty }) else {
+            throw ToolchainError.invalidManifest
+        }
+        let rootDescriptor = Darwin.open(
+            root.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard rootDescriptor >= 0 else {
+            throw ToolchainError.invalidToolchain("Toolchain root could not be opened safely.")
+        }
+        var descriptors = [rootDescriptor]
+        defer { descriptors.reversed().forEach { Darwin.close($0) } }
+        var parent = rootDescriptor
+        for part in parts.dropLast() {
+            let descriptor = String(part).withCString {
+                Darwin.openat(parent, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            guard descriptor >= 0 else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain path contains an unsafe intermediate directory: \(relativePath)."
+                )
+            }
+            descriptors.append(descriptor)
+            parent = descriptor
+        }
+        let leaf = String(parts.last!)
+        let descriptor = leaf.withCString {
+            Darwin.openat(parent, $0, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain file could not be opened safely: \(relativePath)."
+            )
+        }
+        descriptors.append(descriptor)
+        return try regularFileEvidence(
+            descriptor: descriptor,
+            finalPath: root.appendingPathComponent(relativePath, isDirectory: false),
+            maximumBytes: maximumBytes
+        )
+    }
+
+    private func regularFileEvidence(
+        descriptor: Int32,
+        finalPath url: URL,
+        maximumBytes: UInt64
+    ) throws -> (sha256: String, size: Int64, mode: UInt16, identity: String) {
+
+        var initial = stat()
+        guard fstat(descriptor, &initial) == 0,
+              (initial.st_mode & S_IFMT) == S_IFREG,
+              initial.st_nlink == 1,
+              initial.st_size >= 0,
+              UInt64(initial.st_size) <= maximumBytes else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain file is not an ordinary single-link file: \(url.lastPathComponent)."
+            )
+        }
+
+        var hasher = SHA256()
+        var bytesRead: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain file could not be read safely: \(url.lastPathComponent)."
+                )
+            }
+            if count == 0 { break }
+            hasher.update(data: Data(buffer[0..<count]))
+            bytesRead += Int64(count)
+            guard bytesRead >= 0, UInt64(bytesRead) <= maximumBytes else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain file exceeds its signed expanded-size bound: \(url.lastPathComponent)."
+                )
+            }
+        }
+
+        var final = stat()
+        var finalPath = stat()
+        guard fstat(descriptor, &final) == 0,
+              sameFileIdentity(initial, final),
+              bytesRead == Int64(initial.st_size),
+              lstat(url.path, &finalPath) == 0,
+              sameFileIdentity(initial, finalPath) else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain file changed while it was being attested: \(url.lastPathComponent)."
+            )
+        }
+        return (
+            hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            Int64(initial.st_size),
+            UInt16(initial.st_mode & 0o7777),
+            [
+                String(initial.st_dev), String(initial.st_ino), String(initial.st_nlink),
+                String(initial.st_mode), String(initial.st_size),
+                String(initial.st_mtimespec.tv_sec), String(initial.st_mtimespec.tv_nsec),
+                String(initial.st_ctimespec.tv_sec), String(initial.st_ctimespec.tv_nsec),
+            ].joined(separator: ":")
+        )
+    }
+
+    private func sameFileIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
+        lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+            && lhs.st_nlink == rhs.st_nlink
+            && lhs.st_mode == rhs.st_mode
+            && lhs.st_size == rhs.st_size
+            && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec
+            && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+            && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec
+            && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+    }
+
+    private func installedClosureEvidence(
+        root: URL,
+        files: Set<String>,
+        signedCriticalHashes: [String: String]
+    ) throws -> (contentSHA256: String, identitySHA256: String) {
+        guard Set(signedCriticalHashes.keys).isSubset(of: files) else {
+            throw ToolchainError.invalidManifest
+        }
+        var closureHasher = SHA256()
+        var identityHasher = SHA256()
+        for path in files.sorted() {
+            let evidence = try regularFileEvidence(root: root, relativePath: path)
+            if let expectedDigest = signedCriticalHashes[path],
+               evidence.sha256 != expectedDigest {
+                throw ToolchainError.invalidToolchain(
+                    "Critical toolchain hash mismatch: \(path)."
+                )
+            }
+            closureHasher.update(data: Data(path.utf8))
+            closureHasher.update(data: Data([0]))
+            closureHasher.update(data: Data(String(evidence.mode).utf8))
+            closureHasher.update(data: Data([0]))
+            closureHasher.update(data: Data(String(evidence.size).utf8))
+            closureHasher.update(data: Data([0]))
+            closureHasher.update(data: Data(evidence.sha256.utf8))
+            closureHasher.update(data: Data([10]))
+            identityHasher.update(data: Data(path.utf8))
+            identityHasher.update(data: Data([0]))
+            identityHasher.update(data: Data(evidence.identity.utf8))
+            identityHasher.update(data: Data([10]))
+        }
+        return (
+            closureHasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            identityHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        )
+    }
+
+    func regularFileEvidence(
+        at url: URL,
+        maximumBytes: UInt64 = UInt64.max
+    ) throws -> (sha256: String, size: Int64, mode: UInt16, identity: String) {
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain file could not be opened safely: \(url.lastPathComponent)."
+            )
+        }
+        defer { Darwin.close(descriptor) }
+
+        var initial = stat()
+        guard fstat(descriptor, &initial) == 0,
+              (initial.st_mode & S_IFMT) == S_IFREG,
+              initial.st_nlink == 1,
+              initial.st_size >= 0,
+              UInt64(initial.st_size) <= maximumBytes else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain file is not an ordinary single-link file: \(url.lastPathComponent)."
+            )
+        }
+
+        var hasher = SHA256()
+        var bytesRead: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain file could not be read safely: \(url.lastPathComponent)."
+                )
+            }
+            if count == 0 { break }
+            hasher.update(data: Data(buffer[0..<count]))
+            bytesRead += Int64(count)
+            guard bytesRead >= 0, UInt64(bytesRead) <= maximumBytes else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain file exceeds its signed expanded-size bound: \(url.lastPathComponent)."
+                )
+            }
+        }
+
+        var final = stat()
+        var finalPath = stat()
+        guard fstat(descriptor, &final) == 0,
+              final.st_dev == initial.st_dev,
+              final.st_ino == initial.st_ino,
+              final.st_nlink == initial.st_nlink,
+              final.st_mode == initial.st_mode,
+              final.st_size == initial.st_size,
+              final.st_mtimespec.tv_sec == initial.st_mtimespec.tv_sec,
+              final.st_mtimespec.tv_nsec == initial.st_mtimespec.tv_nsec,
+              final.st_ctimespec.tv_sec == initial.st_ctimespec.tv_sec,
+              final.st_ctimespec.tv_nsec == initial.st_ctimespec.tv_nsec,
+              bytesRead == Int64(initial.st_size),
+              lstat(url.path, &finalPath) == 0,
+              finalPath.st_dev == initial.st_dev,
+              finalPath.st_ino == initial.st_ino,
+              finalPath.st_nlink == initial.st_nlink,
+              finalPath.st_mode == initial.st_mode,
+              finalPath.st_size == initial.st_size,
+              finalPath.st_mtimespec.tv_sec == initial.st_mtimespec.tv_sec,
+              finalPath.st_mtimespec.tv_nsec == initial.st_mtimespec.tv_nsec,
+              finalPath.st_ctimespec.tv_sec == initial.st_ctimespec.tv_sec,
+              finalPath.st_ctimespec.tv_nsec == initial.st_ctimespec.tv_nsec else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain file changed while it was being attested: \(url.lastPathComponent)."
+            )
+        }
+        return (
+            hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            Int64(initial.st_size),
+            UInt16(initial.st_mode & 0o7777),
+            [
+                String(initial.st_dev),
+                String(initial.st_ino),
+                String(initial.st_nlink),
+                String(initial.st_mode),
+                String(initial.st_size),
+                String(initial.st_mtimespec.tv_sec),
+                String(initial.st_mtimespec.tv_nsec),
+                String(initial.st_ctimespec.tv_sec),
+                String(initial.st_ctimespec.tv_nsec),
+            ].joined(separator: ":")
+        )
+    }
+
+    private func sha256Hex(data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    @discardableResult
+    func validateExpandedClosure(
+        _ component: ToolchainManifest.Component,
+        root: URL
+    ) throws -> String {
+        guard Set(component.criticalFileHashes.keys) == Set(component.contents) else {
+            throw ToolchainError.invalidManifest
+        }
+        let closure = try expandedClosureEvidence(
+            paths: component.contents,
+            root: root,
+            maximumBytes: component.expandedSizeBytes
+        )
+        guard closure.sizeBytes == component.expandedSizeBytes,
+              closure.fileHashes == component.criticalFileHashes,
+              closure.sha256 == component.expandedClosureSHA256 else {
+            throw ToolchainError.invalidToolchain(
+                "Expanded toolchain closure digest mismatch: \(component.name)."
+            )
+        }
+        return closure.sha256
+    }
+
+    func expandedClosureEvidence(
+        paths: [String],
+        root: URL,
+        maximumBytes: UInt64
+    ) throws -> (sha256: String, sizeBytes: UInt64, fileHashes: [String: String]) {
+        var hasher = SHA256()
+        hasher.update(data: Data("EasySplat expanded component closure v1\n".utf8))
+        var totalBytes: UInt64 = 0
+        var fileHashes: [String: String] = [:]
+        for path in paths.sorted() {
+            let evidence = try regularFileEvidence(
+                root: root,
+                relativePath: path,
+                maximumBytes: maximumBytes - totalBytes
+            )
+            let size = UInt64(evidence.size)
+            let sum = totalBytes.addingReportingOverflow(size)
+            guard !sum.overflow, sum.partialValue <= maximumBytes,
+                  evidence.mode == 0o644 || evidence.mode == 0o755 else {
+                throw ToolchainError.invalidToolchain(
+                    "Expanded toolchain closure mismatch: \(path)."
+                )
+            }
+            totalBytes = sum.partialValue
+            fileHashes[path] = evidence.sha256
+            hasher.update(data: Data(path.utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(String(evidence.mode).utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(String(size).utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(evidence.sha256.utf8))
+            hasher.update(data: Data([10]))
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return (digest, totalBytes, fileHashes)
+    }
+
     func validatedReusableInstallState(
         root: URL,
         publicKeyBase64: String,
@@ -291,9 +869,13 @@ extension ToolchainManager {
             throw ToolchainError.signatureFailed
         }
         try validateSchema2Manifest(receipt, publicKeyBase64: publicKeyBase64)
-        if let expectedManifest,
-           receipt.signatureEd25519 != expectedManifest.signatureEd25519 {
-            throw ToolchainError.invalidToolchain("Cached toolchain receipt does not match the current manifest.")
+        if let expectedManifest {
+            guard receipt.signatureEd25519 == expectedManifest.signatureEd25519,
+                  try receipt.canonicalData() == expectedManifest.canonicalData() else {
+                throw ToolchainError.invalidToolchain(
+                    "Cached toolchain receipt does not match the current manifest."
+                )
+            }
         }
 
         let byName = Dictionary(uniqueKeysWithValues: receipt.components.map { ($0.name, $0) })
@@ -310,6 +892,7 @@ extension ToolchainManager {
                 throw ToolchainError.invalidToolchain("Cached toolchain component is incomplete: \(component.name).")
             }
             try validateCriticalFileHashes(component.criticalFileHashes, root: root)
+            try validateExpandedClosure(component, root: root)
             installedComponents.append(component)
         }
         guard installedComponents.contains(where: { $0.name == "macos-arm64-core" }) else {
@@ -562,8 +1145,10 @@ extension ToolchainManager {
 
     func validateExactArchiveContents(_ entries: [String], component: ToolchainManifest.Component) throws {
         guard !entries.isEmpty else { return }
-        let files = Set(entries.filter { !$0.hasSuffix("/") })
-        guard files == Set(component.contents), files.count == component.contents.count else {
+        let files = Set(entries)
+        guard files == Set(component.contents),
+              files.count == component.contents.count,
+              entries.count == files.count else {
             throw ToolchainError.invalidToolchain(
                 "Component '\(component.name)' archive contents do not match its signed manifest."
             )

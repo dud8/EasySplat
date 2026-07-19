@@ -36,6 +36,61 @@ final class PipelineLoggerTests: XCTestCase {
         )
     }
 
+    func testStageTimingIncludesPreparationBeforePipelineImportStarts() throws {
+        let preparationStartedAt = Date().addingTimeInterval(-2.5)
+        let tracker = StageTimingTracker(
+            initialImportDurationSeconds: 2.5,
+            importStartedAt: preparationStartedAt
+        )
+
+        Thread.sleep(forTimeInterval: 0.04)
+        tracker.start(.importInput)
+        Thread.sleep(forTimeInterval: 0.005)
+        XCTAssertNotNil(tracker.finish(.importInput))
+        let record = try XCTUnwrap(tracker.consumeRecord(.importInput))
+        let observedWallDuration = Date().timeIntervalSince(preparationStartedAt)
+
+        XCTAssertEqual(record.startedAt, preparationStartedAt)
+        XCTAssertGreaterThanOrEqual(
+            record.durationSeconds,
+            observedWallDuration - 0.01
+        )
+    }
+
+    func testExplicitPreparationDurationIsNotInflatedByWallClockSkew() throws {
+        let skewedStartedAt = Date().addingTimeInterval(-3_600)
+        let tracker = StageTimingTracker(
+            initialImportDurationSeconds: 0.02,
+            importStartedAt: skewedStartedAt
+        )
+
+        Thread.sleep(forTimeInterval: 0.005)
+        tracker.start(.importInput)
+        Thread.sleep(forTimeInterval: 0.005)
+        XCTAssertNotNil(tracker.finish(.importInput))
+        let record = try XCTUnwrap(tracker.consumeRecord(.importInput))
+
+        XCTAssertEqual(record.startedAt, skewedStartedAt)
+        XCTAssertGreaterThanOrEqual(record.durationSeconds, 0.025)
+        XCTAssertLessThan(record.durationSeconds, 1)
+    }
+
+    func testExplicitZeroPreparationDurationDoesNotFallBackToWallClock() throws {
+        let skewedStartedAt = Date().addingTimeInterval(-3_600)
+        let tracker = StageTimingTracker(
+            initialImportDurationSeconds: 0,
+            importStartedAt: skewedStartedAt
+        )
+
+        tracker.start(.importInput)
+        XCTAssertNotNil(tracker.finish(.importInput))
+        let record = try XCTUnwrap(tracker.consumeRecord(.importInput))
+
+        XCTAssertEqual(record.startedAt, skewedStartedAt)
+        XCTAssertGreaterThanOrEqual(record.durationSeconds, 0)
+        XCTAssertLessThan(record.durationSeconds, 1)
+    }
+
     func testProgressDeduplication() throws {
         let dir = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }

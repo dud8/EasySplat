@@ -1,20 +1,27 @@
 import AppKit
 import Darwin
 import EasySplatCore
+import EasySplatReleaseVerifierCore
 import SwiftUI
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     let model: AppModel
     private var mainWindow: NSWindow?
+    private let releaseVerificationConfiguration: AppConfig.ReleaseVerificationConfiguration?
 
     override init() {
         model = AppModel()
+        releaseVerificationConfiguration = AppConfig.releaseVerificationConfiguration
         super.init()
     }
 
-    init(model: AppModel) {
+    init(
+        model: AppModel,
+        releaseVerificationConfiguration: AppConfig.ReleaseVerificationConfiguration? = nil
+    ) {
         self.model = model
+        self.releaseVerificationConfiguration = releaseVerificationConfiguration
         super.init()
     }
 
@@ -25,14 +32,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Task.detached(priority: .utility) {
+            _ = ShareSnapshotStorage.reclaimStaleSnapshots()
+        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if let configuration = AppConfig.releaseVerificationConfiguration {
+            if let configuration = releaseVerificationConfiguration {
                 Task { @MainActor in
                     do {
-                        try await model.prepareBundledToolchainForReleaseVerification(
-                            photoFolder: configuration.photoFolderURL,
-                            successMarkerURL: configuration.successMarkerURL
+                        guard let executableURL = Bundle.main.executableURL else {
+                            throw ReleaseVerificationRunError.invalidExecutable
+                        }
+                        try await model.runBundledPipelineForReleaseVerification(
+                            inputManifestURL: configuration.inputManifestURL,
+                            inputRootURL: configuration.inputRootURL,
+                            successMarkerURL: configuration.successMarkerURL,
+                            verificationToken: configuration.verificationToken,
+                            appVersion: EasySplatReleaseIdentity.version(),
+                            executableURL: executableURL
                         )
                     } catch {
                         FileHandle.standardError.write(
@@ -67,6 +84,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDidResignActive(_ notification: Notification) {
         model.flushPendingNotesSave()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model.cancelSharing()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

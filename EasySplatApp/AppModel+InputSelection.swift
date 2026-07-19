@@ -1,8 +1,34 @@
+import Darwin
 import EasySplatCore
 import Foundation
 import UniformTypeIdentifiers
 
 extension AppModel {
+    private static let supportedVideoExtensions: Set<String> = [
+        "3gp", "avi", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "qt",
+    ]
+
+    private enum SelectedInputKind: Hashable {
+        case regularFile
+        case directory
+        case unsupported
+    }
+
+    private struct SelectedInputIdentity: Hashable {
+        enum Storage: Hashable {
+            case fileSystem(device: UInt64, inode: UInt64)
+            case resolvedPath(String)
+        }
+
+        let kind: SelectedInputKind
+        let storage: Storage
+    }
+
+    private struct ClassifiedInput {
+        let kind: SelectedInputKind
+        let identity: SelectedInputIdentity?
+    }
+
     func startWithVideo(url: URL) {
         clearPendingInputs()
         addInputs(urls: [url])
@@ -14,39 +40,63 @@ extension AppModel {
     }
 
     func addInputs(urls: [URL]) {
+        var videoIdentities = Set(
+            pendingVideoURLs.compactMap { url -> SelectedInputIdentity? in
+                let input = Self.classifyInput(url)
+                return input.kind == .regularFile ? input.identity : nil
+            }
+        )
+        var folderIdentities: Set<SelectedInputIdentity> = []
+        if let pendingPhotosFolderURL {
+            let input = Self.classifyInput(pendingPhotosFolderURL)
+            if input.kind == .directory, let identity = input.identity {
+                folderIdentities.insert(identity)
+            }
+        }
+
         var newVideos: [URL] = []
-        var newFolders: [URL] = []
-        var seenFolderPaths: Set<String> = []
         var ignoredFiles: [URL] = []
+        var selectedFolder = pendingPhotosFolderURL
+        var selectedFolderWasAdded = false
+        var additionalFolderCount = 0
         for url in urls {
-            if url.hasDirectoryPath {
-                let path = url.standardizedFileURL.path
-                if seenFolderPaths.insert(path).inserted {
-                    newFolders.append(url)
+            let input = Self.classifyInput(url)
+            switch input.kind {
+            case .directory:
+                guard let identity = input.identity,
+                      folderIdentities.insert(identity).inserted else {
+                    continue
                 }
-            } else if let type = UTType(filenameExtension: url.pathExtension),
-                      type.conforms(to: .movie) || type.conforms(to: .video) {
+                if selectedFolder == nil {
+                    selectedFolder = url
+                    selectedFolderWasAdded = true
+                } else {
+                    additionalFolderCount += 1
+                }
+            case .regularFile:
+                guard Self.isSupportedVideo(url),
+                      let identity = input.identity,
+                      videoIdentities.insert(identity).inserted else {
+                    if !Self.isSupportedVideo(url) {
+                        ignoredFiles.append(url)
+                    }
+                    continue
+                }
                 newVideos.append(url)
-            } else {
+            case .unsupported:
                 ignoredFiles.append(url)
             }
         }
 
         if !newVideos.isEmpty {
-            let existing = Set(pendingVideoURLs.map(\.path))
-            let merged = pendingVideoURLs + newVideos.filter { !existing.contains($0.path) }
-            pendingVideoURLs = merged
+            pendingVideoURLs.append(contentsOf: newVideos)
         }
-        let newFolder = newFolders.first
-        if let newFolder {
-            pendingPhotosFolderURL = newFolder
-        }
+        pendingPhotosFolderURL = selectedFolder
 
         var warnings: [String] = []
         if !ignoredFiles.isEmpty {
             warnings.append("Ignored \(ignoredFiles.count) file(s). Supported: video files and a photo folder.")
         }
-        let additionalFolderCount = max(0, newFolders.count - 1)
         if additionalFolderCount > 0 {
             let noun = additionalFolderCount == 1 ? "folder" : "folders"
             warnings.append(
@@ -58,12 +108,87 @@ extension AppModel {
            let input = buildInputSpec(),
            !RunPlanResolver.supports(inputOrdering: .continuous, input: input) {
             requestedRunOptions.inputOrdering = .automatic
-            warnings.append("Continuous sequence works with one video. Input Order was reset to Automatic.")
+            warnings.append("Continuous sequence can't combine videos and photos. Input Order was reset to Automatic.")
         }
         selectionWarning = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
-        if let newFolder {
-            schedulePhotoFolderCount(for: newFolder)
+        if selectedFolderWasAdded, let selectedFolder {
+            schedulePhotoFolderCount(for: selectedFolder)
         }
+    }
+
+    private static func classifyInput(_ url: URL) -> ClassifiedInput {
+        var linkStatus = stat()
+        let linkResult: Int32 = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.lstat(path, &linkStatus)
+        }
+
+        if linkResult == 0 {
+            let linkKind = linkStatus.st_mode & S_IFMT
+            if linkKind == S_IFLNK {
+                let resolvedURL = url.standardizedFileURL.resolvingSymlinksInPath()
+                var targetStatus = stat()
+                let targetResult: Int32 = resolvedURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+                    guard let path else { return -1 }
+                    return Darwin.lstat(path, &targetStatus)
+                }
+                guard targetResult == 0 else {
+                    return ClassifiedInput(kind: .unsupported, identity: nil)
+                }
+                return classifiedInput(from: targetStatus)
+            }
+            return classifiedInput(from: linkStatus)
+        }
+
+        let kind: SelectedInputKind
+        if url.hasDirectoryPath {
+            kind = .directory
+        } else if isSupportedVideo(url) {
+            kind = .regularFile
+        } else {
+            kind = .unsupported
+        }
+        guard kind != .unsupported else {
+            return ClassifiedInput(kind: .unsupported, identity: nil)
+        }
+        let resolvedPath = url.standardizedFileURL.resolvingSymlinksInPath().path
+        return ClassifiedInput(
+            kind: kind,
+            identity: SelectedInputIdentity(kind: kind, storage: .resolvedPath(resolvedPath))
+        )
+    }
+
+    private static func classifiedInput(from status: stat) -> ClassifiedInput {
+        let fileType = status.st_mode & S_IFMT
+        let kind: SelectedInputKind
+        if fileType == S_IFREG {
+            kind = .regularFile
+        } else if fileType == S_IFDIR {
+            kind = .directory
+        } else {
+            return ClassifiedInput(kind: .unsupported, identity: nil)
+        }
+        return ClassifiedInput(
+            kind: kind,
+            identity: SelectedInputIdentity(
+                kind: kind,
+                storage: .fileSystem(
+                    device: UInt64(status.st_dev),
+                    inode: UInt64(status.st_ino)
+                )
+            )
+        )
+    }
+
+    private static func isSupportedVideo(_ url: URL) -> Bool {
+        let pathExtension = url.pathExtension.lowercased()
+        if supportedVideoExtensions.contains(pathExtension) {
+            return true
+        }
+        guard let type = UTType(filenameExtension: pathExtension) else {
+            return false
+        }
+        return type.conforms(to: .movie) || type.conforms(to: .video)
     }
 
     /// Recommended floor used by the pre-flight check. Phrased as a quality
@@ -78,7 +203,6 @@ extension AppModel {
         maximumVisitedEntries: Int = 4_096
     ) -> Int? {
         guard maximumVisitedEntries > 0, !Task.isCancelled else { return nil }
-        let allowedExtensions: Set<String> = ["jpg", "jpeg", "png", "heic", "heif"]
         let fm = FileManager.default
         var isDirectory: ObjCBool = false
         guard fm.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -104,7 +228,8 @@ extension AppModel {
                 enumerator.skipDescendants()
                 continue
             }
-            if allowedExtensions.contains(url.pathExtension.lowercased()) {
+            if let declaredType = UTType(filenameExtension: url.pathExtension),
+               declaredType.conforms(to: .image) {
                 count += 1
                 if count >= minimumRecommendedPhotos {
                     return count

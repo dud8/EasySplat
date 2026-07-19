@@ -1,17 +1,12 @@
 import Foundation
 
-public enum GeometryRecoveryBackend: String, Codable, Sendable, Equatable {
-    case da3
-    case colmap
-}
-
 public enum GeometryRecoveryComputeMode: String, Codable, Sendable, Equatable {
     case gpu
     case cpu
 }
 
 public struct GeometryRecoveryState: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 4
+    public static let currentSchemaVersion = 8
     public static let maximumMappingAttemptCount = 10_000
 
     public enum ValidationError: Swift.Error, LocalizedError, Equatable {
@@ -46,26 +41,32 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
     public var schemaVersion: Int
     public var selectedFramesDigest: String
     public var orderedImageNames: [String]
-    public var activeBackend: GeometryRecoveryBackend
+    public var activeBackend: SfmBackend
     public var mappingAttemptCount: Int
     public var mappingFallbackReasons: [String]
     public var pendingPairRecoveryLevel: PairGraphRecoveryLevel?
-    public var da3DescriptorMatcher: DescriptorMatcher?
     public var colmapComputeMode: GeometryRecoveryComputeMode?
     public var plannedIncrementalCadence: IncrementalMappingCadenceArtifact?
     public var activeIncrementalCadence: IncrementalMappingCadenceArtifact?
+    public var cadenceFallbackTrigger: MappingCadenceFallbackTrigger?
+    public var acceptedPairAttemptOrdinal: Int?
+    public var pairListDigest: String?
+    public var matchingDatabaseDigest: String?
 
     public init(
         selectedFramesDigest: String,
         orderedImageNames: [String],
-        activeBackend: GeometryRecoveryBackend,
+        activeBackend: SfmBackend,
         mappingAttemptCount: Int,
         mappingFallbackReasons: [String],
         pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil,
-        da3DescriptorMatcher: DescriptorMatcher? = nil,
         colmapComputeMode: GeometryRecoveryComputeMode? = nil,
         plannedIncrementalCadence: IncrementalMappingCadenceArtifact? = nil,
-        activeIncrementalCadence: IncrementalMappingCadenceArtifact? = nil
+        activeIncrementalCadence: IncrementalMappingCadenceArtifact? = nil,
+        cadenceFallbackTrigger: MappingCadenceFallbackTrigger? = nil,
+        acceptedPairAttemptOrdinal: Int? = nil,
+        pairListDigest: String? = nil,
+        matchingDatabaseDigest: String? = nil
     ) {
         schemaVersion = Self.currentSchemaVersion
         self.selectedFramesDigest = selectedFramesDigest
@@ -74,10 +75,13 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
         self.mappingAttemptCount = mappingAttemptCount
         self.mappingFallbackReasons = mappingFallbackReasons
         self.pendingPairRecoveryLevel = pendingPairRecoveryLevel
-        self.da3DescriptorMatcher = da3DescriptorMatcher
         self.colmapComputeMode = colmapComputeMode
         self.plannedIncrementalCadence = plannedIncrementalCadence
         self.activeIncrementalCadence = activeIncrementalCadence
+        self.cadenceFallbackTrigger = cadenceFallbackTrigger
+        self.acceptedPairAttemptOrdinal = acceptedPairAttemptOrdinal
+        self.pairListDigest = pairListDigest
+        self.matchingDatabaseDigest = matchingDatabaseDigest
     }
 
     public func validate() throws {
@@ -118,39 +122,84 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
         switch activeBackend {
         case .da3:
             guard pendingPairRecoveryLevel == nil,
-                  da3DescriptorMatcher == nil || da3DescriptorMatcher == .exact,
                   colmapComputeMode == nil,
                   plannedIncrementalCadence == nil,
-                  activeIncrementalCadence == nil else {
+                  activeIncrementalCadence == nil,
+                  cadenceFallbackTrigger == nil,
+                  acceptedPairAttemptOrdinal == nil,
+                  pairListDigest == nil,
+                  matchingDatabaseDigest == nil else {
                 throw ValidationError.invalidBackendFields
             }
         case .colmap:
-            guard da3DescriptorMatcher == nil,
-                  colmapComputeMode != nil,
+            guard colmapComputeMode != nil,
                   let plannedIncrementalCadence,
                   let activeIncrementalCadence,
                   plannedIncrementalCadence.isValid,
                   activeIncrementalCadence.isValid,
-                  activeIncrementalCadence == plannedIncrementalCadence
-                    || (
-                        plannedIncrementalCadence == .orderedFast
-                            && activeIncrementalCadence == .conservative
-                    ) else {
+                  IncrementalMappingCadencePolicy.validates(
+                    planned: plannedIncrementalCadence,
+                    accepted: activeIncrementalCadence,
+                    trigger: cadenceFallbackTrigger
+                  ) else {
                 throw ValidationError.invalidBackendFields
             }
+            let graphFields = [
+                acceptedPairAttemptOrdinal != nil,
+                pairListDigest != nil,
+                matchingDatabaseDigest != nil,
+            ]
+            guard graphFields.allSatisfy({ $0 }) || graphFields.allSatisfy({ !$0 }) else {
+                throw ValidationError.invalidBackendFields
+            }
+            if let acceptedPairAttemptOrdinal,
+               let pairListDigest,
+               let matchingDatabaseDigest {
+                guard acceptedPairAttemptOrdinal > 0,
+                      Self.isSHA256(pairListDigest),
+                      Self.isSHA256(matchingDatabaseDigest) else {
+                    throw ValidationError.invalidBackendFields
+                }
+            } else if cadenceFallbackTrigger != nil {
+                throw ValidationError.invalidBackendFields
+            }
+        }
+    }
+
+    public func validatePairGraphBinding(
+        acceptedPairAttemptOrdinal expectedOrdinal: Int,
+        pairListDigest expectedPairListDigest: String,
+        matchingDatabaseDigest expectedMatchingDatabaseDigest: String
+    ) throws {
+        try validate()
+        guard acceptedPairAttemptOrdinal == expectedOrdinal,
+              pairListDigest == expectedPairListDigest,
+              matchingDatabaseDigest == expectedMatchingDatabaseDigest else {
+            throw ValidationError.bindingMismatch
         }
     }
 
     public func validateBinding(
         expectedImageNames: [String],
         expectedSelectedFramesDigest: String,
+        expectedGeometryBackend: SfmBackend,
         expectedPlannedIncrementalCadence: IncrementalMappingCadenceArtifact?
     ) throws {
         try validate()
         guard orderedImageNames == expectedImageNames,
               selectedFramesDigest == expectedSelectedFramesDigest,
+              isBound(to: expectedGeometryBackend),
               plannedIncrementalCadence == expectedPlannedIncrementalCadence else {
             throw ValidationError.bindingMismatch
+        }
+    }
+
+    func isBound(to geometryBackend: SfmBackend) -> Bool {
+        switch (activeBackend, geometryBackend) {
+        case (.da3, .da3), (.colmap, .colmap):
+            return true
+        case (.da3, .colmap), (.colmap, .da3):
+            return false
         }
     }
 

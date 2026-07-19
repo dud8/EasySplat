@@ -3,17 +3,20 @@ import Foundation
 /// Resolved paths for a validated EasySplat toolchain installation.
 public struct ToolchainPaths: Sendable {
     public var root: URL
+    public var authenticatedVersion: String?
     public var colmap: URL
     public var msplat: URL
     public var da3: Da3Toolchain
 
     public init(
         root: URL,
+        authenticatedVersion: String? = nil,
         colmap: URL,
         msplat: URL,
         da3: Da3Toolchain
     ) {
         self.root = root
+        self.authenticatedVersion = authenticatedVersion
         self.colmap = colmap
         self.msplat = msplat
         self.da3 = da3
@@ -27,15 +30,15 @@ public struct Da3Toolchain: Sendable {
     public var python: URL
     public var models: URL
     public var modelBundle: URL
-    public var fallbackModelBundle: URL
+    public var smallModelBundle: URL
 
-    public init(root: URL, sfmTool: URL, python: URL, models: URL, modelBundle: URL, fallbackModelBundle: URL) {
+    public init(root: URL, sfmTool: URL, python: URL, models: URL, modelBundle: URL, smallModelBundle: URL) {
         self.root = root
         self.sfmTool = sfmTool
         self.python = python
         self.models = models
         self.modelBundle = modelBundle
-        self.fallbackModelBundle = fallbackModelBundle
+        self.smallModelBundle = smallModelBundle
     }
 }
 
@@ -47,6 +50,95 @@ public struct ToolchainBootstrap: Sendable, Equatable {
     public init(manifestURL: URL, coreArchiveURL: URL) {
         self.manifestURL = manifestURL
         self.coreArchiveURL = coreArchiveURL
+    }
+}
+
+/// Authenticated evidence for one exact installed toolchain closure.
+///
+/// Component names, archive hashes, and capabilities are derived from the
+/// signed manifest after the installed tree and receipt have been revalidated.
+/// No caller-supplied receipt fields are reflected directly.
+public struct ToolchainInstallationEvidence: Sendable, Equatable {
+    public struct SignedComponent: Sendable, Equatable {
+        public let name: String
+        public let archiveSHA256: String
+        public let expandedClosureSHA256: String
+        public let capabilities: [String]
+        public let declaredContents: [String]
+
+        public init(
+            name: String,
+            archiveSHA256: String,
+            expandedClosureSHA256: String,
+            capabilities: [String],
+            declaredContents: [String]
+        ) {
+            self.name = name
+            self.archiveSHA256 = archiveSHA256
+            self.expandedClosureSHA256 = expandedClosureSHA256
+            self.capabilities = capabilities
+            self.declaredContents = declaredContents
+        }
+    }
+
+    public struct ProvenanceRecord: Sendable, Equatable {
+        public let path: String
+        public let fileSHA256: String
+        public let canonicalJSONSHA256: String
+        public let stringFields: [String: String]
+
+        public init(
+            path: String,
+            fileSHA256: String,
+            canonicalJSONSHA256: String,
+            stringFields: [String: String]
+        ) {
+            self.path = path
+            self.fileSHA256 = fileSHA256
+            self.canonicalJSONSHA256 = canonicalJSONSHA256
+            self.stringFields = stringFields
+        }
+    }
+
+    public let toolchainVersion: String
+    public let keyID: String
+    public let canonicalManifestSHA256: String
+    public let signatureSHA256: String
+    public let closureSHA256: String
+    public let installationIdentitySHA256: String
+    public let installedArtifacts: [String: String]
+    public let installedCapabilities: [String]
+    public let installedCriticalFileSHA256: [String: String]
+    public let nativeTrainerBuildDigest: String
+    public let signedComponents: [SignedComponent]
+    public let provenanceRecords: [ProvenanceRecord]
+
+    public init(
+        toolchainVersion: String,
+        keyID: String,
+        canonicalManifestSHA256: String,
+        signatureSHA256: String,
+        closureSHA256: String,
+        installationIdentitySHA256: String,
+        installedArtifacts: [String: String],
+        installedCapabilities: [String],
+        installedCriticalFileSHA256: [String: String],
+        nativeTrainerBuildDigest: String,
+        signedComponents: [SignedComponent] = [],
+        provenanceRecords: [ProvenanceRecord] = []
+    ) {
+        self.toolchainVersion = toolchainVersion
+        self.keyID = keyID
+        self.canonicalManifestSHA256 = canonicalManifestSHA256
+        self.signatureSHA256 = signatureSHA256
+        self.closureSHA256 = closureSHA256
+        self.installationIdentitySHA256 = installationIdentitySHA256
+        self.installedArtifacts = installedArtifacts
+        self.installedCapabilities = installedCapabilities
+        self.installedCriticalFileSHA256 = installedCriticalFileSHA256
+        self.nativeTrainerBuildDigest = nativeTrainerBuildDigest
+        self.signedComponents = signedComponents
+        self.provenanceRecords = provenanceRecords
     }
 }
 
@@ -83,6 +175,13 @@ public struct ToolchainCapabilityRequest: Sendable, Equatable {
 
 }
 
+/// Restricts where the toolchain resolver may obtain an installation.
+public enum ToolchainSourcePolicy: Sendable, Equatable {
+    case automatic
+    case bundledBootstrapOnly
+    case cachedOnly
+}
+
 /// Downloads, verifies, installs, and validates toolchains for the app.
 public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     struct ToolchainInstallState: Codable, Sendable {
@@ -102,21 +201,6 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             self.installedCapabilities = installedCapabilities
             self.signedManifest = signedManifest
         }
-
-        private enum CodingKeys: String, CodingKey {
-            case schemaVersion
-            case installedArtifacts
-            case installedCapabilities
-            case signedManifest
-        }
-
-        init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
-            installedArtifacts = try container.decodeIfPresent([String: String].self, forKey: .installedArtifacts) ?? [:]
-            installedCapabilities = try container.decodeIfPresent([String].self, forKey: .installedCapabilities) ?? []
-            signedManifest = try container.decodeIfPresent(ToolchainManifest.self, forKey: .signedManifest)
-        }
     }
 
     /// Errors that can occur while resolving or validating a toolchain install.
@@ -126,6 +210,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         case artifactNotFound
         case downloadFailed
         case manifestHTTPFailure(statusCode: Int, resourceURL: URL)
+        case artifactHTTPFailure(statusCode: Int, resourceURL: URL)
         case manifestTooLarge(maximumBytes: Int)
         case hashMismatch
         case unzipFailed
@@ -149,6 +234,8 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
                 return "Failed to download the toolchain."
             case .manifestHTTPFailure(let statusCode, let resourceURL):
                 return "Toolchain manifest request failed with HTTP \(statusCode): \(resourceURL.absoluteString)"
+            case .artifactHTTPFailure(let statusCode, let resourceURL):
+                return "Toolchain component request failed with HTTP \(statusCode): \(resourceURL.absoluteString)"
             case .manifestTooLarge(let maximumBytes):
                 return "Toolchain manifest exceeds the \(maximumBytes)-byte download limit."
             case .hashMismatch:
@@ -181,23 +268,36 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     let installationRoot: URL?
     let allowInsecureLoopbackHTTP: Bool
     let bundledBootstrap: ToolchainBootstrap?
+    let sourcePolicy: ToolchainSourcePolicy
 
     public init(
         runner: SubprocessRunning = SubprocessRunner(),
-        urlSession: URLSession = .shared,
+        urlSession: URLSession? = nil,
         appVersion: String = EasySplatReleaseIdentity.version(),
-        localToolchainRoot: URL? = DevelopmentOverrides.fromProcessEnvironment().localToolchainRoot,
+        localToolchainRoot: URL? = nil,
         installationRoot: URL? = nil,
         allowInsecureLoopbackHTTP: Bool = false,
-        bundledBootstrap: ToolchainBootstrap? = nil
+        bundledBootstrap: ToolchainBootstrap? = nil,
+        sourcePolicy: ToolchainSourcePolicy = .automatic
     ) {
         self.runner = runner
-        self.urlSession = urlSession
+        self.urlSession = urlSession ?? Self.makeDefaultURLSession()
         self.appVersion = appVersion
         self.localToolchainRoot = localToolchainRoot
         self.installationRoot = installationRoot
         self.allowInsecureLoopbackHTTP = allowInsecureLoopbackHTTP
         self.bundledBootstrap = bundledBootstrap
+        self.sourcePolicy = sourcePolicy
+    }
+
+    private static func makeDefaultURLSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: configuration)
     }
 
     public func toolchainRoot() -> URL {
@@ -224,6 +324,53 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         guard !request.capabilities.isEmpty else {
             throw ToolchainError.invalidManifest
         }
+        if sourcePolicy == .bundledBootstrapOnly {
+            guard localToolchainOverrideURL() == nil,
+                  let validatedBootstrap = try validateBundledBootstrap(
+                      bundledBootstrap,
+                      publicKeyBase64: publicKeyBase64
+                  ) else {
+                throw ToolchainError.invalidManifest
+            }
+            guard bundledCoreCanSatisfy(request, bootstrap: validatedBootstrap) else {
+                throw ToolchainError.artifactNotFound
+            }
+            onProgress(-1.0, "Checking bundled tools")
+            let installed = try await installBundledBootstrap(
+                validatedBootstrap,
+                publicKeyBase64: publicKeyBase64,
+                request: request,
+                onProgress: onProgress
+            )
+            onProgress(1.0, "Tools ready (bundled)")
+            return installed
+        }
+        if sourcePolicy == .cachedOnly {
+            guard bundledBootstrap == nil, localToolchainOverrideURL() == nil else {
+                throw ToolchainError.invalidManifest
+            }
+            onProgress(-1.0, "Checking installed tools")
+            onProgress(-1.0, "Trying cached tools")
+            do {
+                guard let cached = try loadBestCachedToolchain(
+                    publicKeyBase64: publicKeyBase64,
+                    request: request,
+                    minimumVersion: nil,
+                    readOnly: true
+                ) else {
+                    throw ToolchainError.invalidToolchain("No verified cached toolchain satisfies this run.")
+                }
+                onProgress(1.0, "Tools ready (offline cached)")
+                return cached
+            } catch let error as ToolchainError {
+                throw error
+            } catch {
+                throw ToolchainError.invalidToolchain(
+                    "Cached tools could not be verified. \(error.localizedDescription)"
+                )
+            }
+        }
+
         if let localRoot = localToolchainOverrideURL() {
             onProgress(-1.0, "Checking installed tools")
             onProgress(-1.0, "Validating tools")
@@ -245,37 +392,14 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         do {
             manifest = try await downloadManifest(url: manifestURL)
         } catch {
-            if shouldAttemptOfflineFallback(forManifestError: error) {
-                onProgress(-1.0, "Trying cached tools")
-                do {
-                    if let cached = try loadBestCachedToolchain(
-                        publicKeyBase64: publicKeyBase64,
-                        request: request,
-                        minimumVersion: validatedBootstrap?.manifest.version
-                    ) {
-                        onProgress(1.0, "Tools ready (offline cached)")
-                        return cached
-                    }
-                } catch {
-                    let canUseBundledCore = validatedBootstrap.map {
-                        bundledCoreCanSatisfy(request, bootstrap: $0)
-                    } ?? false
-                    if !canUseBundledCore {
-                        throw ToolchainError.invalidToolchain(
-                            "The download failed, and cached tools could not be verified. \(error.localizedDescription)"
-                        )
-                    }
-                }
-                if let validatedBootstrap,
-                   bundledCoreCanSatisfy(request, bootstrap: validatedBootstrap) {
-                    let installed = try await installBundledBootstrap(
-                        validatedBootstrap,
-                        request: request,
-                        onProgress: onProgress
-                    )
-                    onProgress(1.0, "Tools ready (bundled)")
-                    return installed
-                }
+            if shouldAttemptOfflineFallback(forManifestError: error),
+               let offline = try await resolveAuthenticatedOfflineToolchain(
+                publicKeyBase64: publicKeyBase64,
+                request: request,
+                bootstrap: validatedBootstrap,
+                onProgress: onProgress
+               ) {
+                return offline
             }
             throw error
         }
@@ -297,65 +421,109 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         guard !components.isEmpty else { throw ToolchainError.artifactNotFound }
 
         let versionedRoot = try versionedToolchainRoot(for: manifest.version)
-        try recoverInterruptedInstalls(
-            at: versionedRoot.deletingLastPathComponent(),
-            publicKeyBase64: publicKeyBase64
-        )
-        if fileManager.fileExists(atPath: versionedRoot.path) {
-            onProgress(-1.0, "Validating tools")
-            if let receipt = try? validateSignedReceipt(
-                root: versionedRoot,
-                publicKeyBase64: publicKeyBase64,
-                request: request
-            ),
-               receipt.signatureEd25519 == manifest.signatureEd25519,
-               let toolchain = try? validateToolchain(
-                root: versionedRoot,
-                requiredCapabilities: request.capabilities
-               ) {
-                onProgress(1.0, "Tools ready (cached)")
-                return toolchain
-            }
+        guard let versionIdentity = semanticVersionIdentity(from: manifest.version) else {
+            throw ToolchainError.invalidManifest
         }
-
-        let reusableState = try? validatedReusableInstallState(
-            root: versionedRoot,
-            publicKeyBase64: publicKeyBase64,
-            matching: manifest
-        )
-        let reusableNames = Set(reusableState.map { Array($0.installedArtifacts.keys) } ?? [])
-        let requestedNames = Set(components.map(\.name))
-        let retainedNames = reusableNames.union(requestedNames)
-        let retainedComponents = manifest.components.filter { retainedNames.contains($0.name) }
-        let missingComponents = retainedComponents.filter { !reusableNames.contains($0.name) }
-        let retainedCapabilities = Set(retainedComponents.flatMap(\.capabilities))
-        let validationCapabilities = Set(retainedCapabilities.compactMap(ToolchainCapability.init(rawValue:)))
-
-        let seedFromExistingRoot = reusableState == nil ? nil : versionedRoot
-        try preflightDiskSpace(
-            for: missingComponents,
-            at: versionedRoot,
-            seedFromExistingRoot: seedFromExistingRoot
-        )
-        let toolchain = try await installToolchainAtomically(
-            versionedRoot: versionedRoot,
-            requiredCapabilities: validationCapabilities,
-            seedFromExistingRoot: seedFromExistingRoot,
-            onProgress: onProgress
-        ) { stagingRoot in
-            var state = reusableState ?? ToolchainInstallState()
-            state.schemaVersion = ToolchainManifest.currentSchemaVersion
-            state.installedCapabilities = retainedCapabilities.sorted()
-            state.signedManifest = manifest
-            for component in retainedComponents {
-                try await ensureArtifact(
-                    component,
-                    root: stagingRoot,
-                    state: &state,
-                    onProgress: onProgress
+        let toolchain: ToolchainPaths
+        do {
+            toolchain = try await withInstallLock(for: versionedRoot) {
+                let container = versionedRoot.deletingLastPathComponent()
+                try validateAuthenticatedPublicationIdentity(
+                    manifest,
+                    in: container,
+                    publicKeyBase64: publicKeyBase64
                 )
+                try recoverInterruptedInstallLocked(
+                    at: container,
+                    identity: versionIdentity,
+                    publicKeyBase64: publicKeyBase64
+                )
+                try validateAuthenticatedPublicationIdentity(
+                    manifest,
+                    in: container,
+                    publicKeyBase64: publicKeyBase64
+                )
+
+                if fileManager.fileExists(atPath: versionedRoot.path) {
+                    onProgress(-1.0, "Validating tools")
+                    if let receipt = try? validateSignedReceipt(
+                        root: versionedRoot,
+                        publicKeyBase64: publicKeyBase64,
+                        request: request
+                    ),
+                       receipt.signatureEd25519 == manifest.signatureEd25519,
+                       let cached = try? validateToolchain(
+                        root: versionedRoot,
+                        requiredCapabilities: request.capabilities,
+                        repairExecutablePermissions: false,
+                        authenticatedVersion: receipt.version
+                       ) {
+                        onProgress(1.0, "Tools ready (cached)")
+                        return cached
+                    }
+                }
+
+                let reusableState = try? validatedReusableInstallState(
+                    root: versionedRoot,
+                    publicKeyBase64: publicKeyBase64,
+                    matching: manifest
+                )
+                let reusableNames = Set(
+                    reusableState.map { Array($0.installedArtifacts.keys) } ?? []
+                )
+                let requestedNames = Set(components.map(\.name))
+                let retainedNames = reusableNames.union(requestedNames)
+                let retainedComponents = manifest.components.filter {
+                    retainedNames.contains($0.name)
+                }
+                let missingComponents = retainedComponents.filter {
+                    !reusableNames.contains($0.name)
+                }
+                let retainedCapabilities = Set(retainedComponents.flatMap(\.capabilities))
+                let validationCapabilities = Set(
+                    retainedCapabilities.compactMap(ToolchainCapability.init(rawValue:))
+                )
+                let seedFromExistingRoot = reusableState == nil ? nil : versionedRoot
+                try preflightDiskSpace(
+                    for: missingComponents,
+                    at: versionedRoot,
+                    seedFromExistingRoot: seedFromExistingRoot
+                )
+                return try await installToolchainAtomicallyLocked(
+                    versionedRoot: versionedRoot,
+                    requiredCapabilities: validationCapabilities,
+                    authenticatedManifest: manifest,
+                    seedFromExistingRoot: seedFromExistingRoot,
+                    onProgress: onProgress
+                ) { stagingRoot in
+                    var state = reusableState ?? ToolchainInstallState()
+                    state.schemaVersion = ToolchainManifest.currentSchemaVersion
+                    state.installedCapabilities = retainedCapabilities.sorted()
+                    state.signedManifest = manifest
+                    for component in retainedComponents {
+                        try await ensureArtifact(
+                            component,
+                            root: stagingRoot,
+                            state: &state,
+                            onProgress: onProgress
+                        )
+                    }
+                    try saveInstallState(state, root: stagingRoot)
+                }
             }
-            try saveInstallState(state, root: stagingRoot)
+        } catch {
+            guard shouldAttemptOfflineFallback(forComponentTransferError: error) else {
+                throw error
+            }
+            if let offline = try await resolveAuthenticatedOfflineToolchain(
+                publicKeyBase64: publicKeyBase64,
+                request: request,
+                bootstrap: validatedBootstrap,
+                onProgress: onProgress
+            ) {
+                return offline
+            }
+            throw error
         }
         pruneSchema2Toolchains(keeping: manifest.version, publicKeyBase64: publicKeyBase64)
         onProgress(1.0, "Tools ready")

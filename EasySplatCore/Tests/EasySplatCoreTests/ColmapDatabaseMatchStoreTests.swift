@@ -5,6 +5,78 @@ import XCTest
 @testable import EasySplatCore
 
 final class ColmapDatabaseMatchStoreTests: XCTestCase {
+    func testRequireMatchingResultsEmptyAcceptsEmptyTables() throws {
+        let fixture = try makeMatchingDatabase(rawRows: 0, verifiedRows: 0)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertNoThrow(
+            try ColmapDatabaseMatchStore.requireMatchingResultsEmpty(
+                at: fixture.database
+            )
+        )
+    }
+
+    func testRequireMatchingResultsEmptyRejectsRawRows() throws {
+        let fixture = try makeMatchingDatabase(rawRows: 2, verifiedRows: 0)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertThrowsError(
+            try ColmapDatabaseMatchStore.requireMatchingResultsEmpty(
+                at: fixture.database
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ColmapDatabaseMatchStoreError,
+                .matchingResultsNotEmpty(rawMatchCount: 2, verifiedMatchCount: 0)
+            )
+        }
+    }
+
+    func testRequireMatchingResultsEmptyRejectsVerifiedRows() throws {
+        let fixture = try makeMatchingDatabase(rawRows: 0, verifiedRows: 3)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertThrowsError(
+            try ColmapDatabaseMatchStore.requireMatchingResultsEmpty(
+                at: fixture.database
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ColmapDatabaseMatchStoreError,
+                .matchingResultsNotEmpty(rawMatchCount: 0, verifiedMatchCount: 3)
+            )
+        }
+    }
+
+    func testRequireMatchingResultsEmptyRejectsBothKindsOfRows() throws {
+        let fixture = try makeMatchingDatabase(rawRows: 4, verifiedRows: 5)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertThrowsError(
+            try ColmapDatabaseMatchStore.requireMatchingResultsEmpty(
+                at: fixture.database
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ColmapDatabaseMatchStoreError,
+                .matchingResultsNotEmpty(rawMatchCount: 4, verifiedMatchCount: 5)
+            )
+        }
+    }
+
+    func testRequireMatchingResultsEmptyRejectsHardLink() throws {
+        let fixture = try makeMatchingDatabase(rawRows: 0, verifiedRows: 0)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let hardLink = fixture.root.appendingPathComponent("linked.db")
+        try FileManager.default.linkItem(at: fixture.database, to: hardLink)
+
+        XCTAssertThrowsError(
+            try ColmapDatabaseMatchStore.requireMatchingResultsEmpty(at: hardLink)
+        ) { error in
+            XCTAssertEqual(error as? ColmapDatabaseMatchStoreError, .unsafeDatabaseFile)
+        }
+    }
+
     func testClearMatchingResultsRejectsHardLinkWithoutTouchingExternalDatabase() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -208,6 +280,37 @@ final class ColmapDatabaseMatchStoreTests: XCTestCase {
                 ]
             )
         }
+    }
+
+    private func makeMatchingDatabase(
+        rawRows: Int,
+        verifiedRows: Int
+    ) throws -> (root: URL, database: URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let databaseURL = root.appendingPathComponent("database.db")
+        var database: OpaquePointer?
+        guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK,
+              let database else {
+            throw NSError(domain: "ColmapDatabaseMatchStoreTests", code: 3)
+        }
+        defer { sqlite3_close(database) }
+        try execute(
+            "CREATE TABLE matches(pair_id INTEGER PRIMARY KEY);"
+                + " CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY);",
+            in: database
+        )
+        for pairIndex in 0..<rawRows {
+            try execute("INSERT INTO matches VALUES (\(pairIndex + 1));", in: database)
+        }
+        for pairIndex in 0..<verifiedRows {
+            try execute(
+                "INSERT INTO two_view_geometries VALUES (\(pairIndex + 1));",
+                in: database
+            )
+        }
+        return (root, databaseURL)
     }
 
     private func count(_ table: String, in database: OpaquePointer) throws -> Int {

@@ -7,7 +7,11 @@ enum Theme {
     static let accent = Color.blue
 
     enum Motion {
-        static let workspace = Animation.easeInOut(duration: 0.16)
+        static let standardWorkspaceDuration: TimeInterval = 0.16
+
+        static func workspace(duration: TimeInterval) -> Animation {
+            .easeInOut(duration: duration)
+        }
     }
 
     enum Spacing {

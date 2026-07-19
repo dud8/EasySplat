@@ -16,7 +16,24 @@ public struct ProjectPaths: Sendable {
     public var originalsURL: URL { root.appendingPathComponent("Originals", isDirectory: true) }
     public var importedPhotosURL: URL { originalsURL.appendingPathComponent("Photos", isDirectory: true) }
     public var framesRawURL: URL { root.appendingPathComponent("Frames/raw", isDirectory: true) }
+    public func videoFrameAnalysisURL(index: Int) -> URL {
+        root.appendingPathComponent(
+            String(format: "Frames/video-analysis-%04d.json", index)
+        )
+    }
+    func videoFrameAnalysisURL(index: Int, artifactSHA256: String) -> URL {
+        root.appendingPathComponent(
+            String(
+                format: "Frames/video-analysis-%04d-%@.json",
+                index,
+                artifactSHA256
+            )
+        )
+    }
     public var framesRawManifestURL: URL { root.appendingPathComponent("Frames/raw_manifest.json") }
+    public var photoSelectionArtifactURL: URL {
+        root.appendingPathComponent("Frames/photo_selection.json")
+    }
     public var framesSelectedURL: URL { root.appendingPathComponent("Frames/selected", isDirectory: true) }
     public var framesSelectedManifestURL: URL { root.appendingPathComponent("Frames/selected_manifest.json") }
     public var colmapDatabaseURL: URL { root.appendingPathComponent("SfM/colmap/database.db") }
@@ -29,6 +46,9 @@ public struct ProjectPaths: Sendable {
         colmapSeedURL.appendingPathComponent("refinement/0", isDirectory: true)
     }
     public var colmapSparseURL: URL { root.appendingPathComponent("SfM/colmap/sparse", isDirectory: true) }
+    public var colmapSparseModelURL: URL {
+        colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+    }
     public var pairGraphEvidenceURL: URL { root.appendingPathComponent("SfM/pair_graph_evidence.json") }
     public var pairGraphRecoveryURL: URL { root.appendingPathComponent("SfM/pair_graph_recovery.json") }
     public var workerExecutionURL: URL { root.appendingPathComponent("SfM/worker_execution.json") }
@@ -40,6 +60,7 @@ public struct ProjectPaths: Sendable {
     }
     public var msplatOutputURL: URL { trainingURL.appendingPathComponent("msplat/splat.ply") }
     public var outputURL: URL { root.appendingPathComponent("Output", isDirectory: true) }
+    public var outputSplatURL: URL { outputURL.appendingPathComponent("splat.ply") }
     public var logsURL: URL { root.appendingPathComponent("Logs", isDirectory: true) }
     public var pipelineLogURL: URL { logsURL.appendingPathComponent("pipeline.log") }
     public var eventsLogURL: URL { logsURL.appendingPathComponent("events.jsonl") }
@@ -66,6 +87,11 @@ public struct ProjectPaths: Sendable {
             try ensurePlainDirectory(relativePath)
         }
         try ensureMutableTrainingDirectories()
+    }
+
+    func ensureVideoFrameAnalysisDirectory() throws {
+        try validateRootDirectory()
+        try ensurePlainDirectory("Frames")
     }
 
     /// Revalidates each directory that the native trainer can mutate. Call this again

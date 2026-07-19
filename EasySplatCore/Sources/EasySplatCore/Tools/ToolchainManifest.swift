@@ -5,6 +5,13 @@ import Foundation
 public struct ToolchainManifest: Codable, Sendable {
     public static let currentSchemaVersion = 2
     public static let currentToolchainAPI = 2
+    public static let maximumEncodedBytes = 8 * 1_024 * 1_024
+    public static let maximumInstallStateEnvelopeBytes = 16 * 1_024 * 1_024
+
+    public enum AuthenticationError: Error {
+        case invalidEncoding
+        case invalidSignature
+    }
 
     public enum ComponentRequirement: String, Codable, Sendable {
         case required
@@ -28,6 +35,7 @@ public struct ToolchainManifest: Codable, Sendable {
         public var sha256: String
         public var sizeBytes: UInt64
         public var expandedSizeBytes: UInt64
+        public var expandedClosureSHA256: String
         public var contents: [String]
         public var criticalFileHashes: [String: String]
         public var dependencies: [String]
@@ -40,6 +48,7 @@ public struct ToolchainManifest: Codable, Sendable {
             sha256: String,
             sizeBytes: UInt64,
             expandedSizeBytes: UInt64? = nil,
+            expandedClosureSHA256: String = String(repeating: "0", count: 64),
             contents: [String],
             criticalFileHashes: [String: String],
             dependencies: [String],
@@ -51,6 +60,7 @@ public struct ToolchainManifest: Codable, Sendable {
             self.sha256 = sha256
             self.sizeBytes = sizeBytes
             self.expandedSizeBytes = expandedSizeBytes ?? sizeBytes
+            self.expandedClosureSHA256 = expandedClosureSHA256
             self.contents = contents
             self.criticalFileHashes = criticalFileHashes
             self.dependencies = dependencies
@@ -136,6 +146,26 @@ public struct ToolchainManifest: Codable, Sendable {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
         return try encoder.encode(copy)
+    }
+
+    public static func readAuthenticated(
+        at url: URL,
+        publicKeyBase64: String
+    ) throws -> (manifest: ToolchainManifest, data: Data) {
+        let data = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: maximumEncodedBytes
+        )
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let manifest = try? decoder.decode(ToolchainManifest.self, from: data) else {
+            throw AuthenticationError.invalidEncoding
+        }
+        guard manifest.hasMatchingKeyID(publicKeyBase64: publicKeyBase64),
+              manifest.verifying(publicKeyBase64: publicKeyBase64) else {
+            throw AuthenticationError.invalidSignature
+        }
+        return (manifest, data)
     }
 
     /// Resolves direct providers plus their transitive component dependencies.

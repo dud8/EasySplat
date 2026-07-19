@@ -1,5 +1,6 @@
 import CoreGraphics
 import CoreImage
+import CryptoKit
 import Darwin
 import Foundation
 import ImageIO
@@ -30,6 +31,12 @@ struct GlobalFrameTargets: Equatable, Sendable {
 struct IndexedFrameAnalysis: Sendable {
     let index: Int
     let analysis: FrameExtractionAnalysis
+}
+
+struct RefreshedVideoFrameAnalysis: Sendable {
+    let receipts: [VideoInputReceipt]
+    let supersededArtifactRemovals: [VideoFrameAnalysisArtifactRemovalToken]
+    let creationLedger: VideoFrameAnalysisArtifactCreationLedger
 }
 
 struct VideoSourceAnalysisConcurrencySnapshot: Sendable, Equatable {
@@ -124,6 +131,171 @@ extension PipelineRunner {
     ) -> Int {
         guard videoSourceCount > 0 else { return 0 }
         return min(videoSourceCount, max(1, maximumConcurrentTasks))
+    }
+
+    func videoFrameAnalysisRequiresRefresh(
+        metadata: ProjectMetadata,
+        currentPlan: ResolvedRunPlan
+    ) throws -> Bool {
+        guard metadata.input.hasVideos,
+              let receipts = metadata.videoInputReceipts,
+              !receipts.isEmpty else {
+            return false
+        }
+        let policy = VideoFrameAnalysisPolicy(resolvedRunPlan: currentPlan)
+        let identities = try VideoClipIdentityResolver.resolve(
+            sourceSHA256s: receipts.map(\.sha256),
+            pairingPolicy: currentPlan.pairingPolicy
+        )
+        let identityBySourceIndex = Dictionary(
+            uniqueKeysWithValues: identities.map { ($0.sourceIndex, $0) }
+        )
+        return receipts.enumerated().contains { index, receipt in
+            receipt.analysisPolicySHA256 != policy.sha256
+                || receipt.clipGroupID != identityBySourceIndex[index]?.groupID
+        }
+    }
+
+    func refreshVideoFrameAnalysisIfNeeded(
+        metadata: ProjectMetadata,
+        currentPlan: ResolvedRunPlan,
+        inputLease: RuntimeInputSnapshotLease,
+        paths: ProjectPaths
+    ) async throws -> RefreshedVideoFrameAnalysis? {
+        guard metadata.input.hasVideos,
+              let receipts = metadata.videoInputReceipts,
+              receipts.count == inputLease.videos.count,
+              !receipts.isEmpty else {
+            return nil
+        }
+        let policy = VideoFrameAnalysisPolicy(resolvedRunPlan: currentPlan)
+        let identities = try VideoClipIdentityResolver.resolve(
+            sourceSHA256s: receipts.map(\.sha256),
+            pairingPolicy: currentPlan.pairingPolicy
+        )
+        let identityBySourceIndex = Dictionary(
+            uniqueKeysWithValues: identities.map { ($0.sourceIndex, $0) }
+        )
+        guard try videoFrameAnalysisRequiresRefresh(
+            metadata: metadata,
+            currentPlan: currentPlan
+        ) else { return nil }
+
+        try Task.checkCancellation()
+        try inputLease.validate()
+        let snapshotsByIndex = Dictionary(
+            uniqueKeysWithValues: inputLease.videos.map { ($0.index, $0) }
+        )
+        guard snapshotsByIndex.count == receipts.count else {
+            throw RuntimeInputSnapshotError.invalidMetadata
+        }
+        let extractor = FrameExtractor()
+        var sources: [FrameExtractionSource] = []
+        sources.reserveCapacity(receipts.count)
+        for index in receipts.indices {
+            try Task.checkCancellation()
+            guard let snapshot = snapshotsByIndex[index],
+                  snapshot.projectRelativePath == receipts[index].projectRelativePath,
+                  snapshot.byteCount == receipts[index].byteCount,
+                  snapshot.sha256 == receipts[index].sha256 else {
+                throw RuntimeInputSnapshotError.invalidMetadata
+            }
+            sources.append(try await extractor.inspect(snapshot.url))
+        }
+        let concurrencyMeter = VideoSourceAnalysisConcurrencyMeter()
+        let analyses = try await analyzeVideoSources(
+            sources,
+            options: policy.extractionOptions,
+            targetCounts: [Int](
+                repeating: policy.targetFrameCeiling,
+                count: sources.count
+            ),
+            maximumConcurrentTasks: policy.maximumConcurrentDecoders,
+            concurrencyMeter: concurrencyMeter,
+            progress: { _, _ in }
+        )
+        try inputLease.validate()
+
+        let creationLedger = VideoFrameAnalysisArtifactCreationLedger()
+        var handedOffCreationLedger = false
+        defer {
+            if !handedOffCreationLedger {
+                creationLedger.rollback()
+            }
+        }
+        var refreshedReceipts: [VideoInputReceipt] = []
+        refreshedReceipts.reserveCapacity(receipts.count)
+        var supersededRemovals: [VideoFrameAnalysisArtifactRemovalToken] = []
+        supersededRemovals.reserveCapacity(receipts.count)
+        for index in receipts.indices {
+            try Task.checkCancellation()
+            let receipt = receipts[index]
+            guard let identity = identityBySourceIndex[index] else {
+                throw RuntimeInputSnapshotError.invalidMetadata
+            }
+            let analysis = analyses[index]
+            let artifact = VideoFrameAnalysisArtifact(
+                receipt: receipt,
+                sourceIndex: index,
+                clipGroupID: identity.groupID,
+                policy: policy,
+                analysis: analysis
+            )
+            let saved = try VideoFrameAnalysisArtifactStore.saveRegenerated(
+                artifact,
+                projectPaths: paths
+            )
+            creationLedger.record(saved.cleanupToken)
+            let newRelativePath = try paths.projectRelativePath(for: saved.url)
+            guard newRelativePath != receipt.analysisArtifactPath else {
+                throw VideoFrameAnalysisArtifactStoreError.unsafePath
+            }
+            refreshedReceipts.append(VideoInputReceipt(
+                projectRelativePath: receipt.projectRelativePath,
+                safeDisplayName: receipt.safeDisplayName,
+                byteCount: receipt.byteCount,
+                sha256: receipt.sha256,
+                trackID: analysis.primaryTrack.trackID,
+                pixelWidth: analysis.primaryTrack.width,
+                pixelHeight: analysis.primaryTrack.height,
+                durationSeconds: analysis.durationSeconds,
+                nominalFrameRate: analysis.primaryTrack.nominalFrameRate,
+                isHDR: analysis.primaryTrack.isHDR,
+                decodedFrameCount: analysis.decodedFrameCount,
+                transformA: analysis.preferredTransform.a,
+                transformB: analysis.preferredTransform.b,
+                transformC: analysis.preferredTransform.c,
+                transformD: analysis.preferredTransform.d,
+                transformTX: analysis.preferredTransform.tx,
+                transformTY: analysis.preferredTransform.ty,
+                clipGroupID: identity.groupID,
+                analysisPolicySHA256: policy.sha256,
+                analysisArtifactPath: newRelativePath,
+                analysisArtifactByteCount: saved.evidence.byteCount,
+                analysisArtifactSHA256: saved.evidence.sha256
+            ))
+            supersededRemovals.append(
+                try VideoFrameAnalysisArtifactStore.makeRemovalToken(
+                    at: paths.resolveProjectRelativePath(receipt.analysisArtifactPath),
+                    expectedEvidence: VideoFrameAnalysisArtifactFileEvidence(
+                        byteCount: receipt.analysisArtifactByteCount,
+                        sha256: receipt.analysisArtifactSHA256
+                    ),
+                    sourceIndex: index,
+                    projectPaths: paths
+                )
+            )
+        }
+        // This is the transaction boundary: until the atomic metadata save publishes
+        // these receipts, the ledger owns and rolls back only files this attempt created.
+        try tooling.checkCancellation()
+        try inputLease.validate()
+        handedOffCreationLedger = true
+        return RefreshedVideoFrameAnalysis(
+            receipts: refreshedReceipts,
+            supersededArtifactRemovals: supersededRemovals,
+            creationLedger: creationLedger
+        )
     }
 
     static func durationAwareVideoFrameTarget(
@@ -224,31 +396,189 @@ extension PipelineRunner {
     // MiB allows more than one KiB per entry at the 3,000-frame release boundary.
     private static let maximumSelectedFrameManifestBytes = 4 * 1_024 * 1_024
 
+    enum FrameBudgetProjection: Equatable, Sendable {
+        case evenlySpaced
+        case rankedPrefix
+        case preserve
+    }
+
     struct SelectedFrameGroup: Sendable {
         let id: String
         let frames: [URL]
         let isVideo: Bool
+        let budgetProjection: FrameBudgetProjection
+        let videoSource: SelectedVideoSource?
+        let videoOriginsByFileName: [String: VideoFrameOrigin]
+        let sourceBindingsByFileName: [String: SelectedInputSource]
+
+        init(
+            id: String,
+            frames: [URL],
+            isVideo: Bool,
+            budgetProjection: FrameBudgetProjection = .evenlySpaced,
+            videoSource: SelectedVideoSource? = nil,
+            videoOriginsByFileName: [String: VideoFrameOrigin] = [:],
+            sourceBindingsByFileName: [String: SelectedInputSource] = [:]
+        ) {
+            self.id = id
+            self.frames = frames
+            self.isVideo = isVideo
+            self.budgetProjection = budgetProjection
+            self.videoSource = videoSource
+            self.videoOriginsByFileName = videoOriginsByFileName
+            self.sourceBindingsByFileName = sourceBindingsByFileName
+        }
     }
 
-    struct SelectedFrameMapping: Codable, Sendable {
+    struct SelectedInputSource: Equatable, Sendable {
+        let projectRelativePath: String
+        let sha256: String
+        let photoRetainedRank: Int?
+
+        init(
+            projectRelativePath: String,
+            sha256: String,
+            photoRetainedRank: Int? = nil
+        ) {
+            self.projectRelativePath = projectRelativePath
+            self.sha256 = sha256
+            self.photoRetainedRank = photoRetainedRank
+        }
+    }
+
+    struct SelectedVideoSource: Codable, Equatable, Sendable {
+        let projectRelativePath: String
+        let sourceSHA256: String
+        let trackID: Int32
+        let pixelWidth: Int
+        let pixelHeight: Int
+        let nominalFrameRate: Double
+        let transformA: Double
+        let transformB: Double
+        let transformC: Double
+        let transformD: Double
+        let transformTX: Double
+        let transformTY: Double
+
+        init(
+            projectRelativePath: String,
+            sourceSHA256: String,
+            source: FrameExtractionSource
+        ) {
+            self.projectRelativePath = projectRelativePath
+            self.sourceSHA256 = sourceSHA256
+            trackID = source.primaryTrack.trackID
+            pixelWidth = source.primaryTrack.width
+            pixelHeight = source.primaryTrack.height
+            nominalFrameRate = source.primaryTrack.nominalFrameRate
+            transformA = source.preferredTransform.a
+            transformB = source.preferredTransform.b
+            transformC = source.preferredTransform.c
+            transformD = source.preferredTransform.d
+            transformTX = source.preferredTransform.tx
+            transformTY = source.preferredTransform.ty
+        }
+
+        var affineTransform: CGAffineTransform {
+            CGAffineTransform(
+                a: transformA,
+                b: transformB,
+                c: transformC,
+                d: transformD,
+                tx: transformTX,
+                ty: transformTY
+            )
+        }
+
+        var isValidEvidence: Bool {
+            let sourceComponents = projectRelativePath.split(separator: "/")
+            return sourceComponents.count == 2
+                && sourceComponents[0] == "Originals"
+                && sourceSHA256.count == 64
+                && sourceSHA256 == sourceSHA256.lowercased()
+                && sourceSHA256.allSatisfy(\.isHexDigit)
+                && trackID > 0
+                && pixelWidth > 0
+                && pixelHeight > 0
+                && nominalFrameRate.isFinite
+                && nominalFrameRate >= 0
+                && [
+                    transformA,
+                    transformB,
+                    transformC,
+                    transformD,
+                    transformTX,
+                    transformTY,
+                ].allSatisfy(\.isFinite)
+        }
+    }
+
+    struct SelectedFrameNormalization: Codable, Equatable, Sendable {
+        let sourcePixelWidth: Int
+        let sourcePixelHeight: Int
+        let sourceOrientation: Int
+        let maximumPixelDimension: Int
+        let outputPixelWidth: Int
+        let outputPixelHeight: Int
+        let outputFormat: String
+        let transcoded: Bool
+    }
+
+    struct SelectedFrameMapping: Codable, Equatable, Sendable {
+        static let currentSchemaVersion = 3
+
+        let schemaVersion: Int
         let outputFileName: String
         let groupId: String
         let isVideo: Bool
         let timestampSeconds: Double?
         let lowLightExposureEV: Double?
+        let sourceProjectRelativePath: String?
+        let sourceSHA256: String?
+        let photoRetainedRank: Int?
+        let selectedSHA256: String?
+        let selectedPixelSHA256: String?
+        let normalization: SelectedFrameNormalization?
+        let videoSource: SelectedVideoSource?
+        let videoOrigin: VideoFrameOrigin?
 
         init(
+            schemaVersion: Int = currentSchemaVersion,
             outputFileName: String,
             groupId: String,
             isVideo: Bool,
             timestampSeconds: Double? = nil,
-            lowLightExposureEV: Double? = nil
+            lowLightExposureEV: Double? = nil,
+            sourceProjectRelativePath: String? = nil,
+            sourceSHA256: String? = nil,
+            photoRetainedRank: Int? = nil,
+            selectedSHA256: String? = nil,
+            selectedPixelSHA256: String? = nil,
+            normalization: SelectedFrameNormalization? = nil,
+            videoSource: SelectedVideoSource? = nil,
+            videoOrigin: VideoFrameOrigin? = nil
         ) {
+            self.schemaVersion = schemaVersion
             self.outputFileName = outputFileName
             self.groupId = groupId
             self.isVideo = isVideo
             self.timestampSeconds = timestampSeconds
             self.lowLightExposureEV = lowLightExposureEV
+            self.sourceProjectRelativePath = sourceProjectRelativePath
+            self.sourceSHA256 = sourceSHA256
+            self.photoRetainedRank = photoRetainedRank
+            self.selectedSHA256 = selectedSHA256
+            self.selectedPixelSHA256 = selectedPixelSHA256
+            self.normalization = normalization
+            self.videoSource = videoSource
+            self.videoOrigin = videoOrigin
+        }
+
+        var hasValidPhotoRetainedRankLineage: Bool {
+            if isVideo {
+                return photoRetainedRank == nil
+            }
+            return photoRetainedRank.map { $0 >= 0 } == true
         }
     }
 
@@ -261,29 +591,29 @@ extension PipelineRunner {
         return ext == "heic" || ext == "heif"
     }
 
-    func selectedImagesHaveUniformPixelDimensions(_ images: [URL]) throws -> Bool {
-        var expectedDimensions: (width: Int, height: Int)?
-        for image in images {
-            guard let source = CGImageSourceCreateWithURL(image as CFURL, nil),
-                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
-                    as? [CFString: Any],
-                  let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
-                  let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
-                  width > 0,
-                  height > 0 else {
-                throw PipelineError.imageTranscodeFailed(
-                    "Failed to inspect selected image: \(image.lastPathComponent)"
-                )
-            }
-            let dimensions = (width: width, height: height)
-            if let expectedDimensions,
-               expectedDimensions.width != dimensions.width
-                || expectedDimensions.height != dimensions.height {
-                return false
-            }
-            expectedDimensions = dimensions
+    func selectedFrameOutputExtension(for source: URL) -> String {
+        switch source.pathExtension.lowercased() {
+        case "", "heic", "heif", "jpeg":
+            return "jpg"
+        case let ext:
+            return ext
         }
-        return expectedDimensions != nil
+    }
+
+    func selectedImagesHaveUniformPixelDimensions(_ images: [URL]) throws -> Bool {
+        try selectedImageUniformPixelDimensions(images) != nil
+    }
+
+    func selectedImageUniformPixelDimensions(
+        _ images: [URL]
+    ) throws -> SelectedImagePixelDimensions? {
+        do {
+            return try SelectedImageCameraGroupingPolicy.uniformPixelDimensions(images)
+        } catch SelectedImageCameraGroupingPolicy.Error.unreadableImage(let name) {
+            throw PipelineError.imageTranscodeFailed(
+                "Failed to inspect selected image: \(name)"
+            )
+        }
     }
 
     func transcodeHeicToJpeg(source: URL, destination: URL) throws {
@@ -319,88 +649,12 @@ extension PipelineRunner {
         }
     }
 
-    // Earlier versions copied HEIC photos into Selected/ directly. Geometry tools expect
-    // JPEG or PNG, so resumed projects transcode those files in place.
-    func normalizeSelectedImagesForTooling(paths: ProjectPaths) throws -> Int {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: paths.framesSelectedURL.path) else { return 0 }
-
-        let files = try fm.contentsOfDirectory(at: paths.framesSelectedURL, includingPropertiesForKeys: nil)
-            .filter { !$0.hasDirectoryPath }
-
-        var renamed: [String: String] = [:]
-        var converted = 0
-        for file in files where isHeicImage(file) {
-            let newName = file.deletingPathExtension().lastPathComponent + ".jpg"
-            let dest = paths.framesSelectedURL.appendingPathComponent(newName)
-
-            if !fm.fileExists(atPath: dest.path) {
-                try transcodeHeicToJpeg(source: file, destination: dest)
-            }
-            // Ensure downstream tools don't see a mix of formats with duplicate basenames.
-            try? fm.removeItem(at: file)
-            renamed[file.lastPathComponent] = newName
-            converted += 1
-        }
-
-        if converted > 0,
-           fm.fileExists(atPath: paths.framesSelectedManifestURL.path),
-           let manifest = try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL) {
-            let updated = manifest.map { entry in
-                guard let newName = renamed[entry.outputFileName] else { return entry }
-                return SelectedFrameMapping(
-                    outputFileName: newName,
-                    groupId: entry.groupId,
-                    isVideo: entry.isVideo,
-                    timestampSeconds: entry.timestampSeconds,
-                    lowLightExposureEV: entry.lowLightExposureEV
-                )
-            }
-            try saveSelectedFrameManifest(updated, to: paths.framesSelectedManifestURL)
-        }
-
-        return converted
-    }
-
-    func downsampleSelectedFrames(to targetCount: Int, paths: ProjectPaths) throws -> [URL]? {
-        guard targetCount > 0 else { return nil }
-        let existing = try loadImages(in: paths.framesSelectedURL)
-        guard existing.count > targetCount else { return nil }
-        let reduced = evenlySpacedFrames(existing, targetCount: targetCount)
-
-        let tempSelected = paths.framesSelectedURL.deletingLastPathComponent()
-            .appendingPathComponent("selected_retry", isDirectory: true)
-        try resetDirectory(tempSelected)
-        let newSelection = try copySelected(reduced, to: tempSelected)
-        removeIfExists(paths.framesSelectedURL)
-        try FileManager.default.moveItem(at: tempSelected, to: paths.framesSelectedURL)
-        if FileManager.default.fileExists(atPath: paths.framesSelectedManifestURL.path),
-           let manifest = try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL) {
-            let manifestByFile = Dictionary(manifest.map { ($0.outputFileName, $0) }, uniquingKeysWith: { first, _ in first })
-            var updated: [SelectedFrameMapping] = []
-            updated.reserveCapacity(newSelection.count)
-            for (index, original) in reduced.enumerated() where index < newSelection.count {
-                let oldName = original.lastPathComponent
-                guard let entry = manifestByFile[oldName] else { continue }
-                let newName = newSelection[index].lastPathComponent
-                updated.append(SelectedFrameMapping(
-                    outputFileName: newName,
-                    groupId: entry.groupId,
-                    isVideo: entry.isVideo,
-                    timestampSeconds: entry.timestampSeconds,
-                    lowLightExposureEV: entry.lowLightExposureEV
-                ))
-            }
-            try? saveSelectedFrameManifest(updated, to: paths.framesSelectedManifestURL)
-        }
-        return try loadImages(in: paths.framesSelectedURL)
-    }
-
     func copySelected(
         groups: [SelectedFrameGroup],
         to directory: URL,
         manifestURL: URL,
         maxDimension: CGFloat,
+        projectPaths: ProjectPaths? = nil,
         progress: ((Double, String) -> Void)? = nil
     ) throws -> (frames: [URL], manifest: [SelectedFrameMapping]) {
         let fm = FileManager.default
@@ -413,19 +667,53 @@ extension PipelineRunner {
         for group in groups {
             for frame in group.frames {
                 try Task.checkCancellation()
-                let sourceExt = frame.pathExtension.lowercased()
-                let destExt: String = {
-                    if sourceExt.isEmpty { return "jpg" }
-                    if sourceExt == "heic" || sourceExt == "heif" { return "jpg" }
-                    return sourceExt
-                }()
+                if group.isVideo, projectPaths != nil {
+                    let origin = group.videoOriginsByFileName[frame.lastPathComponent]
+                    guard group.videoSource != nil,
+                          origin?.isValidEvidence == true else {
+                        throw PipelineError.invalidInput
+                    }
+                }
+                let destExt = selectedFrameOutputExtension(for: frame)
                 let dest = directory.appendingPathComponent(String(format: "frame_%06d.%@", index, destExt))
                 if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
-                let lowLightExposureEV = try copySelectedFrame(
+                let normalization = try copySelectedFrame(
                     source: frame,
                     destination: dest,
                     maxDimension: maxDimension,
                     context: &lowLightContext
+                )
+                let sourceProjectRelativePath: String?
+                let sourceSHA256: String?
+                let photoRetainedRank: Int?
+                if projectPaths != nil {
+                    if group.isVideo {
+                        guard let videoSource = group.videoSource else {
+                            throw PipelineError.invalidInput
+                        }
+                        sourceProjectRelativePath = videoSource.projectRelativePath
+                        sourceSHA256 = videoSource.sourceSHA256
+                        photoRetainedRank = nil
+                    } else {
+                        guard let source = group.sourceBindingsByFileName[
+                            frame.lastPathComponent
+                        ],
+                              let retainedRank = source.photoRetainedRank,
+                              retainedRank >= 0 else {
+                            throw PipelineError.invalidInput
+                        }
+                        sourceProjectRelativePath = source.projectRelativePath
+                        sourceSHA256 = source.sha256
+                        photoRetainedRank = retainedRank
+                    }
+                } else {
+                    sourceProjectRelativePath = nil
+                    sourceSHA256 = nil
+                    photoRetainedRank = nil
+                }
+                let selectedIdentity = try Self.selectedFrameContentIdentity(
+                    at: dest,
+                    maximumPixelDimension: normalization.evidence.maximumPixelDimension
                 )
                 output.append(dest)
                 manifest.append(SelectedFrameMapping(
@@ -433,9 +721,17 @@ extension PipelineRunner {
                     groupId: group.id,
                     isVideo: group.isVideo,
                     timestampSeconds: group.isVideo
-                        ? FrameExtractor.timestampSeconds(from: frame.lastPathComponent)
+                        ? group.videoOriginsByFileName[frame.lastPathComponent]?.timestampSeconds
                         : nil,
-                    lowLightExposureEV: lowLightExposureEV
+                    lowLightExposureEV: normalization.lowLightExposureEV,
+                    sourceProjectRelativePath: sourceProjectRelativePath,
+                    sourceSHA256: sourceSHA256,
+                    photoRetainedRank: photoRetainedRank,
+                    selectedSHA256: selectedIdentity.sha256,
+                    selectedPixelSHA256: selectedIdentity.pixelSHA256,
+                    normalization: normalization.evidence,
+                    videoSource: group.videoSource,
+                    videoOrigin: group.videoOriginsByFileName[frame.lastPathComponent]
                 ))
                 index += 1
                 copied += 1
@@ -449,15 +745,48 @@ extension PipelineRunner {
         return (output, manifest)
     }
 
+    private struct SelectedFrameNormalizationResult {
+        let lowLightExposureEV: Double?
+        let evidence: SelectedFrameNormalization
+    }
+
+    static let maximumSelectedFrameDecodeDimension = 4_096
+    private static let maximumSelectedFrameEncodedBytes: UInt64 = 512 * 1_024 * 1_024
+
+    struct SelectedFrameContentIdentity: Equatable, Sendable {
+        let byteCount: UInt64
+        let sha256: String
+        let pixelSHA256: String
+    }
+
+    static func selectedFrameRequiresTranscode(
+        exposureEV: Double,
+        sourceExtension: String,
+        orientation: Int,
+        largestDimension: Int,
+        boundedDimension: Int,
+        requiresSDRBridge: Bool
+    ) -> Bool {
+        exposureEV > 0
+            || ["heic", "heif"].contains(sourceExtension.lowercased())
+            || orientation != 1
+            || largestDimension > boundedDimension
+            || requiresSDRBridge
+    }
+
     private func copySelectedFrame(
         source: URL,
         destination: URL,
         maxDimension: CGFloat,
         context: inout CIContext?
-    ) throws -> Double? {
+    ) throws -> SelectedFrameNormalizationResult {
         let exposureEV = (try? FrameScoring.scoreFrame(at: source).lowLightExposureEV) ?? 0
         guard let sourceRef = CGImageSourceCreateWithURL(source as CFURL, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(sourceRef, 0, nil) as? [CFString: Any],
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                  sourceRef,
+                  CGImageSourceGetPrimaryImageIndex(sourceRef),
+                  nil
+              ) as? [CFString: Any],
               let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
               let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
               width > 0,
@@ -468,39 +797,411 @@ extension PipelineRunner {
         }
         let largestDimension = max(width, height)
         let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
-        let boundedDimension: Int
+        let resolvedMaximumDimension: Int
         if maxDimension.isFinite, maxDimension > 0 {
-            let clampedDimension = min(CGFloat(largestDimension), maxDimension.rounded(.down))
-            boundedDimension = max(1, Int(clampedDimension))
+            resolvedMaximumDimension = maxDimension >= CGFloat(Int.max)
+                ? Int.max
+                : max(1, Int(maxDimension.rounded(.down)))
         } else {
-            boundedDimension = largestDimension
+            resolvedMaximumDimension = largestDimension
         }
-        let needsTranscode = exposureEV > 0
-            || isHeicImage(source)
-            || orientation != 1
-            || largestDimension > boundedDimension
+        let boundedDimension = min(largestDimension, resolvedMaximumDimension)
+        let needsTranscode = Self.selectedFrameRequiresTranscode(
+            exposureEV: exposureEV,
+            sourceExtension: source.pathExtension,
+            orientation: orientation,
+            largestDimension: largestDimension,
+            boundedDimension: boundedDimension,
+            requiresSDRBridge: SDRImageDecoder.bridgeReason(
+                source: sourceRef,
+                properties: properties
+            ) != nil
+        )
         guard needsTranscode else {
             try FileManager.default.copyItem(at: source, to: destination)
-            return nil
+            return SelectedFrameNormalizationResult(
+                lowLightExposureEV: nil,
+                evidence: SelectedFrameNormalization(
+                    sourcePixelWidth: width,
+                    sourcePixelHeight: height,
+                    sourceOrientation: orientation,
+                    maximumPixelDimension: resolvedMaximumDimension,
+                    outputPixelWidth: width,
+                    outputPixelHeight: height,
+                    outputFormat: destination.pathExtension.lowercased(),
+                    transcoded: false
+                )
+            )
         }
 
-        try Task.checkCancellation()
-        guard let image = CGImageSourceCreateThumbnailAtIndex(
-                sourceRef,
-                0,
+        let outputDimensions = try Self.transcodeSelectedFrame(
+            source: source,
+            sourceRef: sourceRef,
+            properties: properties,
+            destination: destination,
+            boundedDimension: boundedDimension,
+            exposureEV: exposureEV,
+            context: &context
+        )
+        return SelectedFrameNormalizationResult(
+            lowLightExposureEV: exposureEV > 0 ? exposureEV : nil,
+            evidence: SelectedFrameNormalization(
+                sourcePixelWidth: width,
+                sourcePixelHeight: height,
+                sourceOrientation: orientation,
+                maximumPixelDimension: resolvedMaximumDimension,
+                outputPixelWidth: outputDimensions.width,
+                outputPixelHeight: outputDimensions.height,
+                outputFormat: destination.pathExtension.lowercased(),
+                transcoded: true
+            )
+        )
+    }
+
+    static func reproduceSelectedFrame(
+        source: URL,
+        destination: URL,
+        normalization: SelectedFrameNormalization,
+        exposureEV: Double?
+    ) throws {
+        guard let sourceRef = CGImageSourceCreateWithURL(source as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                  sourceRef,
+                  CGImageSourceGetPrimaryImageIndex(sourceRef),
+                  nil
+              ) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width == normalization.sourcePixelWidth,
+              height == normalization.sourcePixelHeight,
+              ((properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1)
+                == normalization.sourceOrientation,
+              normalization.maximumPixelDimension > 0,
+              normalization.outputPixelWidth > 0,
+              normalization.outputPixelHeight > 0,
+              normalization.outputFormat == destination.pathExtension.lowercased(),
+              exposureEV.map({ $0.isFinite && $0 > 0 }) ?? true else {
+            throw PipelineError.imageTranscodeFailed(
+                "Selected-frame normalization evidence does not match its source."
+            )
+        }
+        let boundedDimension = min(
+            max(width, height),
+            normalization.maximumPixelDimension
+        )
+        let mustTranscode = Self.selectedFrameRequiresTranscode(
+            exposureEV: exposureEV ?? 0,
+            sourceExtension: source.pathExtension,
+            orientation: normalization.sourceOrientation,
+            largestDimension: max(width, height),
+            boundedDimension: boundedDimension,
+            requiresSDRBridge: SDRImageDecoder.bridgeReason(
+                source: sourceRef,
+                properties: properties
+            ) != nil
+        )
+        guard mustTranscode == normalization.transcoded else {
+            throw PipelineError.imageTranscodeFailed(
+                "Selected-frame normalization mode does not match its source."
+            )
+        }
+        if !mustTranscode {
+            guard width == normalization.outputPixelWidth,
+                  height == normalization.outputPixelHeight else {
+                throw PipelineError.imageTranscodeFailed(
+                    "Selected-frame output dimensions changed during verification."
+                )
+            }
+            try FileManager.default.copyItem(at: source, to: destination)
+        } else {
+            var context: CIContext?
+            let dimensions = try transcodeSelectedFrame(
+                source: source,
+                sourceRef: sourceRef,
+                properties: properties,
+                destination: destination,
+                boundedDimension: boundedDimension,
+                exposureEV: exposureEV ?? 0,
+                context: &context
+            )
+            guard dimensions.width == normalization.outputPixelWidth,
+                  dimensions.height == normalization.outputPixelHeight else {
+                throw PipelineError.imageTranscodeFailed(
+                    "Selected-frame output dimensions changed during verification."
+                )
+            }
+        }
+    }
+
+    static func selectedFrameContentIdentity(
+        at url: URL,
+        maximumBytes: UInt64 = maximumSelectedFrameEncodedBytes,
+        maximumPixelDimension: Int = maximumSelectedFrameDecodeDimension
+    ) throws -> SelectedFrameContentIdentity {
+        try selectedFrameContentIdentity(
+            at: url,
+            maximumBytes: maximumBytes,
+            maximumPixelDimension: maximumPixelDimension,
+            afterByteHash: {}
+        )
+    }
+
+#if DEBUG
+    static func test_selectedFrameContentIdentity(
+        at url: URL,
+        maximumPixelDimension: Int,
+        afterByteHash: () throws -> Void
+    ) throws -> SelectedFrameContentIdentity {
+        try selectedFrameContentIdentity(
+            at: url,
+            maximumBytes: maximumSelectedFrameEncodedBytes,
+            maximumPixelDimension: maximumPixelDimension,
+            afterByteHash: afterByteHash
+        )
+    }
+#endif
+
+    static func selectedFramePixelSHA256(
+        at url: URL,
+        maximumPixelDimension: Int = maximumSelectedFrameDecodeDimension
+    ) throws -> String {
+        try selectedFrameContentIdentity(
+            at: url,
+            maximumPixelDimension: maximumPixelDimension
+        ).pixelSHA256
+    }
+
+    private static func selectedFrameContentIdentity(
+        at url: URL,
+        maximumBytes: UInt64,
+        maximumPixelDimension: Int,
+        afterByteHash: () throws -> Void
+    ) throws -> SelectedFrameContentIdentity {
+        guard maximumBytes > 0,
+              maximumPixelDimension > 0,
+              maximumPixelDimension <= maximumSelectedFrameDecodeDimension else {
+            throw PipelineError.imageTranscodeFailed(
+                "Selected image decode limits are invalid: \(url.lastPathComponent)"
+            )
+        }
+        let parentURL = url.deletingLastPathComponent()
+        let parent = Darwin.open(
+            parentURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard parent >= 0 else {
+            throw PipelineError.imageTranscodeFailed(
+                "Failed to open selected image directory: \(url.lastPathComponent)"
+            )
+        }
+        defer { Darwin.close(parent) }
+        let descriptor = url.lastPathComponent.withCString {
+            Darwin.openat(parent, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            throw PipelineError.imageTranscodeFailed(
+                "Failed to open selected image: \(url.lastPathComponent)"
+            )
+        }
+        defer { Darwin.close(descriptor) }
+
+        var initialFile = stat()
+        var initialPath = stat()
+        var initialParent = stat()
+        var initialParentPath = stat()
+        let openedPath = url.lastPathComponent.withCString {
+            Darwin.fstatat(parent, $0, &initialPath, AT_SYMLINK_NOFOLLOW)
+        }
+        guard fstat(descriptor, &initialFile) == 0,
+              openedPath == 0,
+              fstat(parent, &initialParent) == 0,
+              lstat(parentURL.path, &initialParentPath) == 0,
+              selectedFrameFileStatusMatches(initialFile, initialPath),
+              selectedFrameFileStatusMatches(initialParent, initialParentPath),
+              (initialFile.st_mode & S_IFMT) == S_IFREG,
+              initialFile.st_nlink == 1,
+              initialFile.st_size > 0,
+              UInt64(initialFile.st_size) <= maximumBytes,
+              (initialParent.st_mode & S_IFMT) == S_IFDIR else {
+            throw PipelineError.imageTranscodeFailed(
+                "Selected image is not a stable regular file: \(url.lastPathComponent)"
+            )
+        }
+
+        var byteHasher = SHA256()
+        var offset: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1_048_576)
+        while offset < Int64(initialFile.st_size) {
+            let requested = min(buffer.count, Int(Int64(initialFile.st_size) - offset))
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.pread(descriptor, bytes.baseAddress, requested, off_t(offset))
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else {
+                throw PipelineError.imageTranscodeFailed(
+                    "Selected image changed while hashing: \(url.lastPathComponent)"
+                )
+            }
+            byteHasher.update(data: Data(buffer[0..<count]))
+            offset += Int64(count)
+        }
+        try afterByteHash()
+
+        guard lseek(descriptor, 0, SEEK_SET) == 0,
+              let source = CGImageSourceCreateWithURL(
+                URL(fileURLWithPath: "/dev/fd/\(descriptor)") as CFURL,
+                nil
+              ) else {
+            throw PipelineError.imageTranscodeFailed(
+                "Failed to inspect selected image pixels: \(url.lastPathComponent)"
+            )
+        }
+        let pixelSHA256 = try selectedFramePixelSHA256(
+            source: source,
+            label: url.lastPathComponent,
+            maximumPixelDimension: maximumPixelDimension
+        )
+
+        var finalFile = stat()
+        var finalPath = stat()
+        var finalParent = stat()
+        var finalParentPath = stat()
+        let finalPathStatus = url.lastPathComponent.withCString {
+            Darwin.fstatat(parent, $0, &finalPath, AT_SYMLINK_NOFOLLOW)
+        }
+        guard fstat(descriptor, &finalFile) == 0,
+              finalPathStatus == 0,
+              fstat(parent, &finalParent) == 0,
+              lstat(parentURL.path, &finalParentPath) == 0,
+              selectedFrameFileStatusMatches(initialFile, finalFile),
+              selectedFrameFileStatusMatches(initialFile, finalPath),
+              selectedFrameFileStatusMatches(initialParent, finalParent),
+              selectedFrameFileStatusMatches(initialParent, finalParentPath),
+              offset == Int64(initialFile.st_size) else {
+            throw PipelineError.imageTranscodeFailed(
+                "Selected image changed while reading: \(url.lastPathComponent)"
+            )
+        }
+        return SelectedFrameContentIdentity(
+            byteCount: UInt64(initialFile.st_size),
+            sha256: byteHasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            pixelSHA256: pixelSHA256
+        )
+    }
+
+    private static func selectedFramePixelSHA256(
+        source: CGImageSource,
+        label: String,
+        maximumPixelDimension: Int
+    ) throws -> String {
+        let primaryIndex = CGImageSourceGetPrimaryImageIndex(source)
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(
+                source,
+                primaryIndex,
+                nil
+              ) as? [CFString: Any],
+              let declaredWidth = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let declaredHeight = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              declaredWidth > 0,
+              declaredHeight > 0,
+              declaredWidth <= maximumPixelDimension,
+              declaredHeight <= maximumPixelDimension,
+              let image = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                primaryIndex,
                 [
                     kCGImageSourceCreateThumbnailFromImageAlways: true,
-                    kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceThumbnailMaxPixelSize: boundedDimension,
-                    kCGImageSourceShouldCache: false,
+                    kCGImageSourceCreateThumbnailWithTransform: false,
+                    kCGImageSourceThumbnailMaxPixelSize: maximumPixelDimension,
+                    kCGImageSourceShouldCacheImmediately: true,
                 ] as CFDictionary
-              ) else {
+              ),
+              image.width > 0,
+              image.height > 0,
+              image.width == declaredWidth,
+              image.height == declaredHeight,
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            throw PipelineError.imageTranscodeFailed(
+                "Failed to decode selected image pixels: \(label)"
+            )
+        }
+        let (bytesPerRow, rowOverflow) = image.width.multipliedReportingOverflow(by: 4)
+        let (pixelBytes, imageOverflow) = bytesPerRow.multipliedReportingOverflow(
+            by: image.height
+        )
+        let maximumPixelBytes = maximumSelectedFrameDecodeDimension
+            * maximumSelectedFrameDecodeDimension * 4
+        guard !rowOverflow,
+              !imageOverflow,
+              pixelBytes > 0,
+              pixelBytes <= maximumPixelBytes else {
+            throw PipelineError.imageTranscodeFailed(
+                "Selected image dimensions are too large: \(label)"
+            )
+        }
+        var pixels = [UInt8](repeating: 0, count: pixelBytes)
+        guard let context = CGContext(
+            data: &pixels,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                | CGBitmapInfo.byteOrder32Big.rawValue
+        ) else {
+            throw PipelineError.imageTranscodeFailed(
+                "Failed to normalize selected image pixels: \(label)"
+            )
+        }
+        context.interpolationQuality = .none
+        context.draw(
+            image,
+            in: CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        )
+        var hasher = SHA256()
+        var width = UInt64(image.width).bigEndian
+        var height = UInt64(image.height).bigEndian
+        withUnsafeBytes(of: &width) { hasher.update(bufferPointer: $0) }
+        withUnsafeBytes(of: &height) { hasher.update(bufferPointer: $0) }
+        hasher.update(data: Data(pixels))
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func selectedFrameFileStatusMatches(_ lhs: stat, _ rhs: stat) -> Bool {
+        lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+            && lhs.st_mode == rhs.st_mode
+            && lhs.st_nlink == rhs.st_nlink
+            && lhs.st_uid == rhs.st_uid
+            && lhs.st_gid == rhs.st_gid
+            && lhs.st_size == rhs.st_size
+            && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec
+            && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+            && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec
+            && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+    }
+
+    private static func transcodeSelectedFrame(
+        source: URL,
+        sourceRef: CGImageSource,
+        properties: [CFString: Any],
+        destination: URL,
+        boundedDimension: Int,
+        exposureEV: Double,
+        context: inout CIContext?
+    ) throws -> (width: Int, height: Int) {
+        try Task.checkCancellation()
+        guard let image = SDRImageDecoder.createOrientedThumbnail(
+            source: sourceRef,
+            properties: properties,
+            maximumPixelDimension: boundedDimension
+        ) else {
             throw PipelineError.imageTranscodeFailed(
                 "Failed to decode selected image: \(source.lastPathComponent)"
             )
         }
         try Task.checkCancellation()
-
         let outputImage: CGImage
         if exposureEV > 0 {
             let input = CIImage(cgImage: image)
@@ -508,9 +1209,23 @@ extension PipelineRunner {
                 "CIExposureAdjust",
                 parameters: [kCIInputEVKey: exposureEV]
             )
-            let renderingContext = context ?? CIContext(options: [.cacheIntermediates: false])
+            let linearColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+                ?? CGColorSpaceCreateDeviceRGB()
+            let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+                ?? CGColorSpaceCreateDeviceRGB()
+            let renderingContext = context ?? CIContext(options: [
+                .cacheIntermediates: false,
+                .workingColorSpace: linearColorSpace,
+                .outputColorSpace: outputColorSpace,
+            ])
+            let adjustedImage: CGImage?
+            if let rendered = renderingContext.createCGImage(adjusted, from: input.extent) {
+                adjustedImage = rendered
+            } else {
+                adjustedImage = softwareExposureAdjustedImage(image, exposureEV: exposureEV)
+            }
             context = renderingContext
-            guard let adjustedImage = renderingContext.createCGImage(adjusted, from: input.extent) else {
+            guard let adjustedImage else {
                 throw PipelineError.imageTranscodeFailed(
                     "Failed to adjust low-light image: \(source.lastPathComponent)"
                 )
@@ -519,7 +1234,6 @@ extension PipelineRunner {
         } else {
             outputImage = image
         }
-
         let outputType: UTType = destination.pathExtension.lowercased() == "png" ? .png : .jpeg
         guard let destinationRef = CGImageDestinationCreateWithURL(
             destination as CFURL,
@@ -541,10 +1255,80 @@ extension PipelineRunner {
                 "Failed to write selected image: \(destination.lastPathComponent)"
             )
         }
-        return exposureEV > 0 ? exposureEV : nil
+        return (outputImage.width, outputImage.height)
     }
 
-    private func safeCameraMetadata(from properties: [CFString: Any]) -> [CFString: Any] {
+    static func softwareExposureAdjustedImage(
+        _ image: CGImage,
+        exposureEV: Double
+    ) -> CGImage? {
+        guard exposureEV.isFinite,
+              image.width > 0,
+              image.height > 0 else {
+            return nil
+        }
+        let (pixelCount, pixelCountOverflow) = image.width.multipliedReportingOverflow(
+            by: image.height
+        )
+        let (byteCount, byteCountOverflow) = pixelCount.multipliedReportingOverflow(by: 4)
+        guard !pixelCountOverflow,
+              !byteCountOverflow,
+              byteCount > 0,
+              let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) else {
+            return nil
+        }
+
+        let multiplier = exp2(exposureEV)
+        guard multiplier.isFinite, multiplier > 0 else { return nil }
+        // CGContext supplies premultiplied sRGB bytes. Apply exposure to the
+        // unpremultiplied linear-light value, then encode and premultiply again.
+        var channelLookup = [UInt8](repeating: 0, count: 256 * 256)
+        for alphaByte in 1...255 {
+            let alpha = Double(alphaByte) / 255
+            for channelByte in 0...255 {
+                let encoded = min(1, Double(channelByte) / 255 / alpha)
+                let linear = encoded <= 0.04045
+                    ? encoded / 12.92
+                    : pow((encoded + 0.055) / 1.055, 2.4)
+                let adjustedLinear = min(1, linear * multiplier)
+                let adjustedEncoded = adjustedLinear <= 0.0031308
+                    ? adjustedLinear * 12.92
+                    : 1.055 * pow(adjustedLinear, 1 / 2.4) - 0.055
+                let premultiplied = min(255, max(0, adjustedEncoded * alpha * 255))
+                channelLookup[alphaByte * 256 + channelByte] = UInt8(premultiplied.rounded())
+            }
+        }
+        var pixels = [UInt8](repeating: 0, count: byteCount)
+        return pixels.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress,
+                  let context = CGContext(
+                    data: baseAddress,
+                    width: image.width,
+                    height: image.height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: image.width * 4,
+                    space: colorSpace,
+                    bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                        | CGImageAlphaInfo.premultipliedLast.rawValue
+                  ) else {
+                return nil
+            }
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+            let pixelBytes = bytes.bindMemory(to: UInt8.self)
+            for offset in stride(from: 0, to: byteCount, by: 4) {
+                let alpha = Int(pixelBytes[offset + 3])
+                for channel in 0..<3 {
+                    pixelBytes[offset + channel] = channelLookup[
+                        alpha * 256 + Int(pixelBytes[offset + channel])
+                    ]
+                }
+            }
+            return context.makeImage()
+        }
+    }
+
+    private static func safeCameraMetadata(from properties: [CFString: Any]) -> [CFString: Any] {
         var output: [CFString: Any] = [kCGImagePropertyOrientation: 1]
 
         if let sourceTIFF = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
@@ -580,7 +1364,7 @@ extension PipelineRunner {
         return output
     }
 
-    private func boundedMetadataString(_ value: Any?) -> String? {
+    private static func boundedMetadataString(_ value: Any?) -> String? {
         guard let value = value as? String else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.utf8.count <= 256, !trimmed.contains("\0") else {
@@ -601,40 +1385,26 @@ extension PipelineRunner {
             at: url,
             maximumBytes: Self.maximumSelectedFrameManifestBytes
         )
-        return try JSONDecoder().decode([SelectedFrameMapping].self, from: data)
+        return try loadSelectedFrameManifest(data: data)
     }
 
-    func importedVideoURLs(for videoFiles: [String], paths: ProjectPaths) -> [URL] {
-        var usedNames = Set<String>()
-        return videoFiles.map { file in
-            let source = URL(fileURLWithPath: file)
-            let name = uniqueImportedVideoName(for: source, usedNames: &usedNames)
-            return paths.originalsURL.appendingPathComponent(name)
+    func loadSelectedFrameManifest(data: Data) throws -> [SelectedFrameMapping] {
+        guard !data.isEmpty,
+              data.count <= Self.maximumSelectedFrameManifestBytes else {
+            throw PipelineError.invalidInput
         }
+        let manifest = try JSONDecoder().decode([SelectedFrameMapping].self, from: data)
+        guard manifest.allSatisfy({
+            $0.schemaVersion == SelectedFrameMapping.currentSchemaVersion
+                && $0.hasValidPhotoRetainedRankLineage
+        }) else {
+            throw PipelineError.invalidInput
+        }
+        return manifest
     }
 
-    private func uniqueImportedVideoName(for source: URL, usedNames: inout Set<String>) -> String {
-        let filename = source.lastPathComponent
-        if usedNames.insert(filename.lowercased()).inserted {
-            return filename
-        }
-
-        let nsName = filename as NSString
-        let stem = nsName.deletingPathExtension
-        let ext = nsName.pathExtension
-        var suffix = 2
-        while true {
-            let candidate: String
-            if ext.isEmpty {
-                candidate = "\(stem)-\(suffix)"
-            } else {
-                candidate = "\(stem)-\(suffix).\(ext)"
-            }
-            if usedNames.insert(candidate.lowercased()).inserted {
-                return candidate
-            }
-            suffix += 1
-        }
+    func importedVideoURLs(for videoFiles: [String], paths: ProjectPaths) throws -> [URL] {
+        try videoFiles.map { try paths.resolveProjectRelativePath($0) }
     }
 
     func importInputs(
@@ -644,9 +1414,9 @@ extension PipelineRunner {
     ) throws {
         var tasks: [(label: String, action: () throws -> Void)] = []
 
-        let importedVideos = importedVideoURLs(for: metadata.input.videoFiles, paths: paths)
+        let importedVideos = try importedVideoURLs(for: metadata.input.videoFiles, paths: paths)
         for (file, dest) in zip(metadata.input.videoFiles, importedVideos) {
-            let source = URL(fileURLWithPath: file)
+            let source = try paths.resolveProjectRelativePath(file)
             tasks.append((label: dest.lastPathComponent, action: {
                 if try self.importedVideoNeedsCopy(dest) {
                     try self.copyFileAtomically(from: source, to: dest)
@@ -654,20 +1424,10 @@ extension PipelineRunner {
             }))
         }
 
-        if let photosFolder = metadata.input.photosFolder {
-            let sourceFolder = URL(fileURLWithPath: photosFolder)
-            let dest = paths.importedPhotosURL
-            tasks.append((label: "Photos: \(sourceFolder.lastPathComponent)", action: {
-                let photos = try PhotoInputPreflight.discoveredPhotos(in: sourceFolder)
-                let inspection = try PhotoInputPreflight.inspect(photos)
-                guard !inspection.validPhotos.isEmpty || metadata.input.hasVideos else {
-                    throw PipelineError.invalidInput
-                }
-                let entries = self.importedPhotoEntries(for: inspection.validPhotos)
-                if try self.importedPhotoFolderNeedsCopy(entries: entries, destination: dest) {
-                    try self.copyValidPhotosAtomically(entries, to: dest)
-                }
-            }))
+        if metadata.input.photosFolder != nil {
+            // Photo admission already decoded, selected, and atomically adopted the
+            // controlled files. Import must never reopen the external source folder.
+            try PhotoInputReceiptValidator.validateFiles(metadata: metadata, paths: paths)
         }
 
         guard !tasks.isEmpty else { return }
@@ -688,12 +1448,7 @@ extension PipelineRunner {
         var output: [URL] = []
         for (index, url) in frames.enumerated() {
             try Task.checkCancellation()
-            let sourceExt = url.pathExtension.lowercased()
-            let destExt: String = {
-                if sourceExt.isEmpty { return "jpg" }
-                if sourceExt == "heic" || sourceExt == "heif" { return "jpg" }
-                return sourceExt
-            }()
+            let destExt = selectedFrameOutputExtension(for: url)
             let dest = directory.appendingPathComponent(String(format: "frame_%06d.%@", index, destExt))
             if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
             if isHeicImage(url) {
@@ -1092,24 +1847,6 @@ extension PipelineRunner {
         return try PhotoInputPreflight.discoveredPhotos(in: directory)
     }
 
-    struct ValidPhotoFilterResult: Sendable {
-        let frames: [URL]
-        let unreadableCount: Int
-        let duplicateCount: Int
-    }
-
-    /// Rejects files that merely have an image extension and exact byte-for-byte duplicates.
-    /// Selection policy runs only after this validity boundary, including "Use all valid photos."
-    func filterValidUniquePhotos(_ photos: [URL]) throws -> ValidPhotoFilterResult {
-        let inspection = try PhotoInputPreflight.inspect(photos)
-
-        return ValidPhotoFilterResult(
-            frames: inspection.validPhotos,
-            unreadableCount: inspection.summary.unreadablePhotoCount,
-            duplicateCount: inspection.summary.duplicatePhotoCount
-        )
-    }
-
     func applyFrameBudget(
         to groups: [SelectedFrameGroup],
         targetCount: Int,
@@ -1121,12 +1858,31 @@ extension PipelineRunner {
             targetCount: targetCount,
             photoSelection: photoSelection
         )
-        return zip(groups, targets).compactMap { group, count in
+        return try zip(groups, targets).compactMap { group, count in
             guard count > 0 else { return nil }
+            let frames: [URL]
+            switch group.budgetProjection {
+            case .evenlySpaced:
+                frames = evenlySpacedFrames(group.frames, targetCount: count)
+            case .rankedPrefix:
+                frames = Array(group.frames.prefix(count))
+            case .preserve:
+                guard count == group.frames.count else {
+                    throw PipelineError.photoSelectionExceedsBudget(
+                        selected: group.frames.count,
+                        maximum: count
+                    )
+                }
+                frames = group.frames
+            }
             return SelectedFrameGroup(
                 id: group.id,
-                frames: evenlySpacedFrames(group.frames, targetCount: count),
-                isVideo: group.isVideo
+                frames: frames,
+                isVideo: group.isVideo,
+                budgetProjection: group.budgetProjection,
+                videoSource: group.videoSource,
+                videoOriginsByFileName: group.videoOriginsByFileName,
+                sourceBindingsByFileName: group.sourceBindingsByFileName
             )
         }
     }
@@ -1245,12 +2001,19 @@ extension PipelineRunner {
     }
 
     func evenlySpacedFrames(_ frames: [URL], targetCount: Int) -> [URL] {
-        guard targetCount > 0, !frames.isEmpty else { return [] }
-        guard frames.count > targetCount else { return frames }
-        guard targetCount > 1 else { return [frames[frames.count / 2]] }
-        let step = Double(frames.count - 1) / Double(targetCount - 1)
+        evenlySpacedItems(frames, targetCount: targetCount)
+    }
+
+    private func evenlySpacedItems<Element>(
+        _ items: [Element],
+        targetCount: Int
+    ) -> [Element] {
+        guard targetCount > 0, !items.isEmpty else { return [] }
+        guard items.count > targetCount else { return items }
+        guard targetCount > 1 else { return [items[items.count / 2]] }
+        let step = Double(items.count - 1) / Double(targetCount - 1)
         return (0..<targetCount).map { index in
-            frames[Int((Double(index) * step).rounded())]
+            items[Int((Double(index) * step).rounded())]
         }
     }
 
@@ -1386,6 +2149,10 @@ extension PipelineRunner {
             updatedAt: Date(),
             progressFraction: progress,
             message: message,
+            inputReceiptDigest: try? RuntimeInputSnapshotLease.receiptDigest(
+                metadata: metadata,
+                pairingPolicy: metadata.resolvedRunPlan?.pairingPolicy
+            ),
             details: details
         )
         // Use the notes-preserving save so a checkpoint written mid-run cannot clobber a note
@@ -1421,19 +2188,11 @@ extension PipelineRunner {
         capturePath: CapturePath,
         lensProjection: LensProjection = .automatic
     ) -> String {
-        switch lensProjection {
-        case .fisheye:
-            return "OPENCV_FISHEYE"
-        case .perspective:
-            return detailProfile == .highDetail ? "OPENCV" : "SIMPLE_RADIAL"
-        case .automatic:
-            break
-        }
-        if detailProfile == .highDetail,
-           capturePath == .walkthrough || capturePath == .largeArea {
-            return "OPENCV"
-        }
-        return "SIMPLE_RADIAL"
+        ResolvedCameraModelPolicy.model(
+            detailProfile: detailProfile,
+            capturePath: capturePath,
+            lensProjection: lensProjection
+        )
     }
 
     func shouldUseSequential(

@@ -70,7 +70,9 @@ final class ColmapPairEstimatorTests: XCTestCase {
                 "frame_000.jpg frame_012.jpg",
                 "frame_099.jpg frame_000.jpg",
             ],
-            pairingPolicy: .orderedContinuous
+            pairingPolicy: .orderedContinuous,
+            groups: [ColmapPairGroup(imageNames: names, isVideo: true)],
+            requiresCrossClipRetrieval: false
         )
 
         XCTAssertEqual(result.pairs.count, temporal.pairs.count + 2)
@@ -101,7 +103,9 @@ final class ColmapPairEstimatorTests: XCTestCase {
 
         let retrieved = try empty.addingRetrievalPairLines(
             ["photo_c.jpg photo_a.jpg", "photo_a.jpg photo_c.jpg"],
-            pairingPolicy: .unorderedRetrieval
+            pairingPolicy: .unorderedRetrieval,
+            groups: [ColmapPairGroup(imageNames: names, isVideo: false)],
+            requiresCrossClipRetrieval: false
         )
         XCTAssertEqual(retrieved.pairLines, ["photo_a.jpg photo_c.jpg"])
         XCTAssertEqual(retrieved.retrievalPairCount, 1)
@@ -164,7 +168,12 @@ final class ColmapPairEstimatorTests: XCTestCase {
 
         let joined = try segmented.addingRetrievalPairLines(
             ["a1.jpg b0.jpg"],
-            pairingPolicy: .segmentedMixed
+            pairingPolicy: .segmentedMixed,
+            groups: [
+                ColmapPairGroup(imageNames: Array(names[0...1]), isVideo: true),
+                ColmapPairGroup(imageNames: Array(names[2...3]), isVideo: true),
+            ],
+            requiresCrossClipRetrieval: false
         )
         XCTAssertTrue(joined.isConnected)
     }

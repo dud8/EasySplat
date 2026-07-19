@@ -5,6 +5,158 @@ import MetalKit
 import SplatIO
 
 public class SplatRenderer {
+    private final class SceneReadAbortState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var aborted = false
+
+        var shouldAbort: Bool {
+            lock.withLock { aborted }
+        }
+
+        func abort() {
+            lock.withLock {
+                aborted = true
+            }
+        }
+    }
+
+    enum InitializationError: LocalizedError, Sendable, Equatable {
+        case shaderLibraryUnavailable(String)
+        case missingShaderFunction(String)
+        case renderPipelineUnavailable(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .shaderLibraryUnavailable(let reason):
+                "The viewer shader library could not be loaded: \(reason)"
+            case .missingShaderFunction(let name):
+                "The viewer shader library is missing \(name)."
+            case .renderPipelineUnavailable(let reason):
+                "The viewer render pipeline could not be created: \(reason)"
+            }
+        }
+    }
+
+    public enum ViewerMemoryAdmissionError: LocalizedError, Sendable, Equatable {
+        case invalidBudget(Int)
+        case invalidSplatCapacity(Int)
+        case arithmeticOverflow(pointCount: Int)
+        case budgetExceeded(pointCount: Int, requiredBytes: Int, budgetBytes: Int)
+        case permanentCapacityExceeded(
+            pointCount: Int,
+            requiredBytes: Int,
+            maximumRecoverableBytes: Int
+        )
+
+        public var errorDescription: String? {
+            switch self {
+            case .invalidBudget(let bytes):
+                return "The viewer memory budget is invalid (\(bytes) bytes)."
+            case .invalidSplatCapacity(let pointCount):
+                return "The viewer splat capacity is invalid (\(pointCount) splats)."
+            case .arithmeticOverflow(let pointCount):
+                return "The splat count is too large to calculate a safe viewer working set (\(pointCount))."
+            case .budgetExceeded(let pointCount, let requiredBytes, let budgetBytes):
+                let required = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: requiredBytes),
+                    countStyle: .memory
+                )
+                let available = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: budgetBytes),
+                    countStyle: .memory
+                )
+                return "This splat needs about \(required) to open, but \(available) is available to the viewer (\(pointCount) splats)."
+            case .permanentCapacityExceeded(
+                let pointCount,
+                let requiredBytes,
+                let maximumRecoverableBytes
+            ):
+                let required = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: requiredBytes),
+                    countStyle: .memory
+                )
+                let maximum = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: maximumRecoverableBytes),
+                    countStyle: .memory
+                )
+                return "This splat needs about \(required) to open, beyond this Mac’s viewer capacity of \(maximum) (\(pointCount) splats)."
+            }
+        }
+    }
+
+    public enum ViewerMemoryModel {
+        /// PLY decoding, command buffers, the drawable, and framework bookkeeping are not
+        /// proportional to point count, so retain a fixed margin in every admission decision.
+        public static let fixedReserveBytes = 64 * 1_024 * 1_024
+
+        /// During a full-SH camera sort, all of these allocations coexist: encoded geometry,
+        /// 16 packed SH RGB triplets, the published and replacement index buffers, and two CPU
+        /// index/depth arrays. The async scalar sort captures the reusable array, then mutates a
+        /// local copy, so Swift copy-on-write keeps both backing stores live while sorting. The
+        /// production reader admits against this worst-case representation before it knows whether
+        /// a PLY uses SH0 or SH3.
+        public static let bytesPerFullSphericalHarmonicSplat =
+            MemoryLayout<Splat>.stride
+            + SHDegree.payloadCount * MemoryLayout<PackedHalf3>.stride
+            + 2 * MemoryLayout<IndexType>.stride
+            + 2 * MemoryLayout<SplatIndexAndDepth>.stride
+
+        public static func requiredBytes(forPointCount pointCount: Int) throws -> Int {
+            guard pointCount >= 0 else {
+                throw ViewerMemoryAdmissionError.arithmeticOverflow(pointCount: pointCount)
+            }
+            let variable = pointCount.multipliedReportingOverflow(
+                by: bytesPerFullSphericalHarmonicSplat
+            )
+            guard !variable.overflow else {
+                throw ViewerMemoryAdmissionError.arithmeticOverflow(pointCount: pointCount)
+            }
+            let total = fixedReserveBytes.addingReportingOverflow(variable.partialValue)
+            guard !total.overflow else {
+                throw ViewerMemoryAdmissionError.arithmeticOverflow(pointCount: pointCount)
+            }
+            return total.partialValue
+        }
+
+        public static func admit(pointCount: Int, budgetBytes: Int) throws {
+            guard budgetBytes >= 0 else {
+                throw ViewerMemoryAdmissionError.invalidBudget(budgetBytes)
+            }
+            let requiredBytes = try requiredBytes(forPointCount: pointCount)
+            guard requiredBytes <= budgetBytes else {
+                throw ViewerMemoryAdmissionError.budgetExceeded(
+                    pointCount: pointCount,
+                    requiredBytes: requiredBytes,
+                    budgetBytes: budgetBytes
+                )
+            }
+        }
+    }
+
+    public static func isRetryableLoadError(_ error: Swift.Error) -> Bool {
+        if error is CancellationError {
+            return false
+        }
+        if let memoryError = error as? ViewerMemoryAdmissionError {
+            switch memoryError {
+            case .budgetExceeded:
+                return true
+            case .invalidBudget,
+                 .invalidSplatCapacity,
+                 .arithmeticOverflow,
+                 .permanentCapacityExceeded:
+                return false
+            }
+        }
+        if error is ReadError
+            || error is SplatEncodingError
+            || error is SplatRenderEncodingValidationError
+            || error is InitializationError {
+            return false
+        }
+        return SplatPLYSceneReader.isRetryableReadError(error)
+    }
+
     private enum ReadError: LocalizedError {
         case incomplete
         case callbackWithoutActiveRead
@@ -181,6 +333,7 @@ public class SplatRenderer {
     public var onSortStart: (() -> Void)?
     public var onSortComplete: ((TimeInterval) -> Void)?
     public var onSortFailure: ((SortFailure) -> Void)?
+    public var onSortSuccess: (() -> Void)?
     var onSortSnapshotCapturedForTesting: ((MTLBuffer) -> Void)?
     var onSortWorkerBufferBoundForTesting: ((MTLBuffer) -> Void)?
 
@@ -226,7 +379,10 @@ public class SplatRenderer {
     var orderAndDepthTempSort: [SplatIndexAndDepth] = []
 
     private let maximumSplatCount: Int?
+    private let maximumWorkingSetBytes: Int?
+    private let maximumRecoverableWorkingSetBytes: Int
     private var readFailure: Error?
+    private var readAbortState: SceneReadAbortState?
     private var pendingSplatBuffer: MetalBuffer<Splat>?
     private var pendingSphericalHarmonicCoefficientBuffer: MetalBuffer<PackedHalf3>?
     private var pendingSphericalHarmonicDegree: SHDegree = .sh0
@@ -238,7 +394,9 @@ public class SplatRenderer {
                             stencilFormat: MTLPixelFormat,
                             sampleCount: Int,
                             maxViewCount: Int,
-                            maxSimultaneousRenders: Int) throws {
+                            maxSimultaneousRenders: Int,
+                            maximumWorkingSetBytes: Int? = nil,
+                            maximumRecoverableWorkingSetBytes: Int? = nil) throws {
         try self.init(
             device: device,
             colorFormat: colorFormat,
@@ -247,7 +405,9 @@ public class SplatRenderer {
             sampleCount: sampleCount,
             maxViewCount: maxViewCount,
             maxSimultaneousRenders: maxSimultaneousRenders,
-            maximumSplatCount: nil
+            maximumSplatCount: nil,
+            maximumWorkingSetBytes: maximumWorkingSetBytes,
+            maximumRecoverableWorkingSetBytes: maximumRecoverableWorkingSetBytes
         )
     }
 
@@ -258,10 +418,39 @@ public class SplatRenderer {
          sampleCount: Int,
          maxViewCount: Int,
          maxSimultaneousRenders: Int,
-         maximumSplatCount: Int?) throws {
+         maximumSplatCount: Int?,
+         maximumWorkingSetBytes: Int? = nil,
+         maximumRecoverableWorkingSetBytes: Int? = nil) throws {
         self.maxViewCount = min(maxViewCount, Constants.maxViewCount)
         self.maxSimultaneousRenders = maxSimultaneousRenders
-        self.maximumSplatCount = maximumSplatCount
+        if let maximumSplatCount, maximumSplatCount <= 0 {
+            throw ViewerMemoryAdmissionError.invalidSplatCapacity(maximumSplatCount)
+        }
+        if let maximumWorkingSetBytes, maximumWorkingSetBytes < 0 {
+            throw ViewerMemoryAdmissionError.invalidBudget(maximumWorkingSetBytes)
+        }
+        if let maximumRecoverableWorkingSetBytes, maximumRecoverableWorkingSetBytes < 0 {
+            throw ViewerMemoryAdmissionError.invalidBudget(maximumRecoverableWorkingSetBytes)
+        }
+        self.maximumWorkingSetBytes = maximumWorkingSetBytes
+        let devicePointCapacity = min(
+            MetalBuffer<Splat>.maxCapacity(for: device),
+            MetalBuffer<PackedHalf3>.maxCapacity(for: device) / SHDegree.payloadCount,
+            MetalBuffer<IndexType>.maxCapacity(for: device)
+        )
+        let pointCapacity = min(maximumSplatCount ?? devicePointCapacity, devicePointCapacity)
+        self.maximumSplatCount = pointCapacity
+        let bufferBoundWorkingSetBytes = try ViewerMemoryModel.requiredBytes(
+            forPointCount: pointCapacity
+        )
+        self.maximumRecoverableWorkingSetBytes = min(
+            maximumRecoverableWorkingSetBytes ?? bufferBoundWorkingSetBytes,
+            bufferBoundWorkingSetBytes
+        )
+        if let maximumWorkingSetBytes,
+           maximumWorkingSetBytes > self.maximumRecoverableWorkingSetBytes {
+            throw ViewerMemoryAdmissionError.invalidBudget(maximumWorkingSetBytes)
+        }
 
         let dynamicUniformBuffersSize = UniformsArray.alignedSize * maxSimultaneousRenders
         self.dynamicUniformBuffers = device.makeBuffer(length: dynamicUniformBuffersSize,
@@ -269,7 +458,7 @@ public class SplatRenderer {
         self.dynamicUniformBuffers.label = "Uniform Buffers"
         self.uniforms = UnsafeMutableRawPointer(dynamicUniformBuffers.contents()).bindMemory(to: UniformsArray.self, capacity: 1)
 
-        self.splatBuffer = try MetalBuffer(device: device, maximumCapacity: maximumSplatCount)
+        self.splatBuffer = try MetalBuffer(device: device, maximumCapacity: pointCapacity)
         self.sphericalHarmonicCoefficientBuffer = nil
         self.emptySphericalHarmonicCoefficientBuffer = try MetalBuffer(device: device)
         self.orderBuffer = try MetalBuffer(device: device)
@@ -323,20 +512,25 @@ public class SplatRenderer {
         from url: URL,
         shouldCancel: @escaping @Sendable () -> Bool
     ) throws {
-        try readScene(shouldCancel: shouldCancel) { delegate in
+        try readScene(shouldCancel: shouldCancel) { delegate, shouldStop in
             SplatPLYSceneReader(
                 url,
                 validatesRenderEncoding: false
-            ).read(to: delegate, shouldCancel: shouldCancel)
+            ).read(to: delegate, shouldCancel: shouldStop)
         }
     }
 
     func readScene(
         shouldCancel: @escaping @Sendable () -> Bool,
-        using read: (_ delegate: SplatSceneReaderDelegate) -> Void
+        using read: (
+            _ delegate: SplatSceneReaderDelegate,
+            _ shouldStop: @escaping @Sendable () -> Bool
+        ) -> Void
     ) throws {
         readFailure = nil
         readFinished = false
+        let readAbortState = SceneReadAbortState()
+        self.readAbortState = readAbortState
         let pendingSplatBuffer = try MetalBuffer<Splat>(
             device: splatBuffer.device,
             maximumCapacity: maximumSplatCount
@@ -350,9 +544,13 @@ public class SplatRenderer {
             self.pendingSphericalHarmonicDegree = .sh0
             self.readFailure = nil
             self.readFinished = false
+            self.readAbortState = nil
         }
 
-        read(self)
+        let shouldStop: @Sendable () -> Bool = {
+            shouldCancel() || readAbortState.shouldAbort
+        }
+        read(self, shouldStop)
         if let readFailure {
             throw readFailure
         }
@@ -386,19 +584,29 @@ public class SplatRenderer {
         let library: MTLLibrary
         do {
             library = try device.makeDefaultLibrary(bundle: Bundle.module)
-        } catch {
+        } catch let bundledLibraryError {
             // SwiftPM does not always build a default .metallib for `.metal` files included as
             // resources, which causes `makeDefaultLibrary(bundle:)` to fail at runtime.
             // Fall back to compiling from the packaged shader source.
             guard let shaderURL = Bundle.module.url(forResource: "Shaders", withExtension: "metal") else {
-                throw error
+                throw InitializationError.shaderLibraryUnavailable(
+                    bundledLibraryError.localizedDescription
+                )
             }
-            let source = try String(contentsOf: shaderURL, encoding: .utf8)
-            library = try device.makeLibrary(source: source, options: nil)
+            do {
+                let source = try String(contentsOf: shaderURL, encoding: .utf8)
+                library = try device.makeLibrary(source: source, options: nil)
+            } catch {
+                throw InitializationError.shaderLibraryUnavailable(error.localizedDescription)
+            }
         }
 
-        let vertexFunction = library.makeFunction(name: "splatVertexShader")
-        let fragmentFunction = library.makeFunction(name: "splatFragmentShader")
+        guard let vertexFunction = library.makeFunction(name: "splatVertexShader") else {
+            throw InitializationError.missingShaderFunction("splatVertexShader")
+        }
+        guard let fragmentFunction = library.makeFunction(name: "splatFragmentShader") else {
+            throw InitializationError.missingShaderFunction("splatFragmentShader")
+        }
 
         let pipelineDescriptor = MTLRenderPipelineDescriptor()
         pipelineDescriptor.label = "RenderPipeline"
@@ -430,7 +638,11 @@ public class SplatRenderer {
 
         pipelineDescriptor.maxVertexAmplificationCount = maxViewCount
 
-        return try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        do {
+            return try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        } catch {
+            throw InitializationError.renderPipelineUnavailable(error.localizedDescription)
+        }
     }
 
     public func ensureAdditionalCapacity(_ pointCount: Int) throws {
@@ -783,6 +995,8 @@ public class SplatRenderer {
 
         if isCurrentGeneration, let failure {
             recordSortFailure(failure)
+        } else if isCurrentGeneration, publishedOrder != nil {
+            onSortSuccess?()
         }
         onSortComplete?(-context.startedAt.timeIntervalSinceNow)
     }
@@ -913,6 +1127,22 @@ extension SplatRenderer: SplatSceneReaderDelegate {
             return
         }
         do {
+            let requiredBytes = try ViewerMemoryModel.requiredBytes(
+                forPointCount: Int(pointCount)
+            )
+            guard requiredBytes <= maximumRecoverableWorkingSetBytes else {
+                throw ViewerMemoryAdmissionError.permanentCapacityExceeded(
+                    pointCount: Int(pointCount),
+                    requiredBytes: requiredBytes,
+                    maximumRecoverableBytes: maximumRecoverableWorkingSetBytes
+                )
+            }
+            if let maximumWorkingSetBytes {
+                try ViewerMemoryModel.admit(
+                    pointCount: Int(pointCount),
+                    budgetBytes: maximumWorkingSetBytes
+                )
+            }
             try pendingSplatBuffer.ensureCapacity(Int(pointCount))
         } catch {
             recordReadFailure(error)
@@ -967,6 +1197,7 @@ extension SplatRenderer: SplatSceneReaderDelegate {
     private func recordReadFailure(_ error: Error) {
         guard readFailure == nil else { return }
         readFailure = error
+        readAbortState?.abort()
         Self.log.error("Failed to read points: \(error.localizedDescription)")
     }
 }

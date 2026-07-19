@@ -11,6 +11,8 @@ enum ColmapSQLiteDatabaseHandleError: Error, Equatable {
 final class ColmapSQLiteDatabaseHandle {
     let database: OpaquePointer
 
+    private var isClosed = false
+
     private let sourceParentURL: URL
     private let sourceParentIdentity: FileIdentity
     private let canonicalParentURL: URL
@@ -43,7 +45,19 @@ final class ColmapSQLiteDatabaseHandle {
     }
 
     deinit {
-        sqlite3_close(database)
+        if !isClosed {
+            sqlite3_close(database)
+        }
+    }
+
+    @discardableResult
+    func close() -> Int32 {
+        guard !isClosed else { return SQLITE_OK }
+        let result = sqlite3_close(database)
+        if result == SQLITE_OK {
+            isClosed = true
+        }
+        return result
     }
 
     static func open(at sourceURL: URL, flags: Int32) throws -> ColmapSQLiteDatabaseHandle {

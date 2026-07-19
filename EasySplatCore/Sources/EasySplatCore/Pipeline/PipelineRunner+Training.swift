@@ -1,34 +1,171 @@
 import Foundation
 
+private struct SelectedTrainingFrameBinding: Equatable {
+    let byteCount: UInt64
+    let sha256: String
+    let pixelSHA256: String
+}
+
+private struct SelectedTrainingFrameSnapshot: Equatable {
+    let digest: String
+    let bindingsByName: [String: SelectedTrainingFrameBinding]
+}
+
 extension PipelineRunner {
     func prepareMsplatDataset(
         paths: ProjectPaths,
         maxImageSize: Int,
         geometryArtifact: GeometryArtifact,
         progress: (Double, String) -> Void
-    ) async throws -> (url: URL, identity: MsplatDatasetIdentity) {
+    ) async throws -> PreparedMsplatDataset {
+        let selectedFrameSnapshot = try selectedTrainingFrameSnapshot(
+            paths: paths,
+            geometryArtifact: geometryArtifact,
+            maximumImageDimension: maxImageSize
+        )
+        let sourceGeometryManifestSHA256 = try GeometryArtifactStore.manifestDigest(
+            matching: geometryArtifact,
+            at: paths.geometryManifestURL
+        )
         let (sourceSparse, sourceSnapshot) = try verifiedGeometrySource(
             geometryArtifact,
             paths: paths
         )
+        let canonicalRegisteredImageNames = try ColmapResidualAnalyzer.analyze(
+            modelDirectory: sourceSparse
+        ).registeredImageNames
+        let preparationKind: MsplatDatasetPreparationKind
+        let prepared: (
+            url: URL,
+            identity: MsplatDatasetIdentity,
+            registeredImageNames: [String]
+        )
         if try MsplatCameraCompatibility.requiresUndistortion(modelDirectory: sourceSparse) {
-            return try await prepareUndistortedMsplatDataset(
+            preparationKind = .undistorted
+            prepared = try await prepareUndistortedMsplatDataset(
                 paths: paths,
                 sourceSparse: sourceSparse,
                 sourceSnapshot: sourceSnapshot,
                 maxImageSize: maxImageSize,
                 geometryArtifact: geometryArtifact,
+                sourceGeometryManifestSHA256: sourceGeometryManifestSHA256,
+                selectedFrameSnapshot: selectedFrameSnapshot,
+                progress: progress
+            )
+        } else {
+            preparationKind = .direct
+            prepared = try prepareDirectMsplatDataset(
+                paths: paths,
+                sourceSparse: sourceSparse,
+                sourceSnapshot: sourceSnapshot,
+                maxImageSize: maxImageSize,
+                geometryArtifact: geometryArtifact,
+                sourceGeometryManifestSHA256: sourceGeometryManifestSHA256,
+                selectedFrameSnapshot: selectedFrameSnapshot,
                 progress: progress
             )
         }
-
-        return try prepareDirectMsplatDataset(
-            paths: paths,
-            sourceSparse: sourceSparse,
-            sourceSnapshot: sourceSnapshot,
+        guard try GeometryArtifactStore.manifestDigest(
+            matching: geometryArtifact,
+            at: paths.geometryManifestURL
+        ) == sourceGeometryManifestSHA256,
+              prepared.registeredImageNames.count == canonicalRegisteredImageNames.count,
+              Set(prepared.registeredImageNames) == Set(canonicalRegisteredImageNames) else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch("geometry manifest")
+        }
+        let derivation = makeMsplatDatasetDerivation(
             geometryArtifact: geometryArtifact,
-            progress: progress
+            sourceGeometryManifestSHA256: sourceGeometryManifestSHA256,
+            preparationKind: preparationKind,
+            maxImageSize: maxImageSize,
+            registeredImageNames: prepared.registeredImageNames,
+            datasetIdentity: prepared.identity
         )
+        return PreparedMsplatDataset(
+            url: prepared.url,
+            identity: prepared.identity,
+            derivation: derivation
+        )
+    }
+
+    private func selectedTrainingFrameSnapshot(
+        paths: ProjectPaths,
+        geometryArtifact: GeometryArtifact,
+        maximumImageDimension: Int
+    ) throws -> SelectedTrainingFrameSnapshot {
+        let maximumFrameBytes: UInt64 = 512 * 1_024 * 1_024
+        let maximumAggregateBytes: UInt64 = 64 * 1_024 * 1_024 * 1_024
+        guard maximumImageDimension > 0,
+              !geometryArtifact.orderedImageNames.isEmpty,
+              geometryArtifact.orderedImageNames.count <= 3_000 else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch("selected frames")
+        }
+        let initialDigest = try GeometryArtifactStore.selectedFramesDigest(
+            orderedImageNames: geometryArtifact.orderedImageNames,
+            projectPaths: paths
+        )
+        guard initialDigest == geometryArtifact.selectedFramesDigest else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch("selected frames")
+        }
+
+        var aggregateBytes: UInt64 = 0
+        var bindings: [String: SelectedTrainingFrameBinding] = [:]
+        bindings.reserveCapacity(geometryArtifact.orderedImageNames.count)
+        for name in geometryArtifact.orderedImageNames {
+            try Task.checkCancellation()
+            let image = try paths.resolveProjectRelativePath("Frames/selected/\(name)")
+            let identity = try Self.selectedFrameContentIdentity(
+                at: image,
+                maximumBytes: maximumFrameBytes,
+                maximumPixelDimension: maximumImageDimension
+            )
+            guard identity.byteCount <= maximumAggregateBytes - aggregateBytes else {
+                throw GeometryArtifactStore.Error.artifactDigestMismatch("selected frames")
+            }
+            aggregateBytes += identity.byteCount
+            bindings[name] = SelectedTrainingFrameBinding(
+                byteCount: identity.byteCount,
+                sha256: identity.sha256,
+                pixelSHA256: identity.pixelSHA256
+            )
+        }
+        guard try GeometryArtifactStore.selectedFramesDigest(
+            orderedImageNames: geometryArtifact.orderedImageNames,
+            projectPaths: paths
+        ) == initialDigest else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch("selected frames")
+        }
+        return SelectedTrainingFrameSnapshot(
+            digest: initialDigest,
+            bindingsByName: bindings
+        )
+    }
+
+    private func validateDirectMsplatImages(
+        in dataset: URL,
+        registeredImageNames: [String],
+        selectedFrameSnapshot: SelectedTrainingFrameSnapshot,
+        maximumImageDimension: Int
+    ) throws {
+        let maximumFrameBytes: UInt64 = 512 * 1_024 * 1_024
+        let images = dataset.appendingPathComponent("images", isDirectory: true)
+        for name in registeredImageNames {
+            try Task.checkCancellation()
+            guard let source = selectedFrameSnapshot.bindingsByName[name] else {
+                throw GeometryArtifactStore.Error.artifactDigestMismatch("selected frames")
+            }
+            let retained = images.appendingPathComponent(name)
+            let identity = try Self.selectedFrameContentIdentity(
+                at: retained,
+                maximumBytes: maximumFrameBytes,
+                maximumPixelDimension: maximumImageDimension
+            )
+            guard identity.byteCount == source.byteCount,
+                  identity.sha256 == source.sha256,
+                  identity.pixelSHA256 == source.pixelSHA256 else {
+                throw GeometryArtifactStore.Error.artifactDigestMismatch("training images")
+            }
+        }
     }
 
     private func verifiedGeometrySource(
@@ -58,8 +195,14 @@ extension PipelineRunner {
         sourceSnapshot: GeometryModelSnapshot.Verified,
         maxImageSize: Int,
         geometryArtifact: GeometryArtifact,
+        sourceGeometryManifestSHA256: String,
+        selectedFrameSnapshot: SelectedTrainingFrameSnapshot,
         progress: (Double, String) -> Void
-    ) async throws -> (url: URL, identity: MsplatDatasetIdentity) {
+    ) async throws -> (
+        url: URL,
+        identity: MsplatDatasetIdentity,
+        registeredImageNames: [String]
+    ) {
         let fm = FileManager.default
         try requireTextSparseModelFiles(at: sourceSparse)
 
@@ -115,15 +258,12 @@ extension PipelineRunner {
             at: workspaceImages,
             to: candidate.appendingPathComponent("images", isDirectory: true)
         )
-        for file in try fm.contentsOfDirectory(
-            at: workspaceSparse,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) {
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
             try Task.checkCancellation()
-            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
-            try fm.moveItem(at: file, to: candidateSparse.appendingPathComponent(file.lastPathComponent))
+            try fm.moveItem(
+                at: workspaceSparse.appendingPathComponent(name),
+                to: candidateSparse.appendingPathComponent(name)
+            )
         }
         try requireBinarySparseModelFiles(at: candidateSparse)
         if let learnedPointInitializer = geometryArtifact.learnedPointInitializer {
@@ -134,6 +274,22 @@ extension PipelineRunner {
                 into: candidateSparse.appendingPathComponent("points3D.txt")
             )
             _ = try regenerateBinarySparseModelFiles(at: candidateSparse)
+        }
+        for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+            let file = candidateSparse.appendingPathComponent(name)
+            if fm.fileExists(atPath: file.path) {
+                try fm.removeItem(at: file)
+            }
+        }
+        let registeredImageNames = try registeredMsplatImageNames(
+            paths: paths,
+            sparseDirectory: candidateSparse,
+            geometryArtifact: geometryArtifact
+        )
+        guard registeredImageNames.count == geometryArtifact.registeredViewCount,
+              correctedImages.map(\.lastPathComponent).sorted()
+                == registeredImageNames.sorted() else {
+            throw PipelineError.outputMissing
         }
         try Task.checkCancellation()
         try MsplatOrientationOverlay.write(
@@ -147,10 +303,17 @@ extension PipelineRunner {
             candidate,
             paths: paths,
             sourceSparse: sourceSparse,
-            sourceSnapshot: sourceSnapshot
+            sourceSnapshot: sourceSnapshot,
+            geometryArtifact: geometryArtifact,
+            sourceGeometryManifestSHA256: sourceGeometryManifestSHA256,
+            selectedFrameSnapshot: selectedFrameSnapshot,
+            maximumImageDimension: maxImageSize,
+            preparationKind: .undistorted,
+            registeredImageNames: registeredImageNames,
+            expectedIdentity: identity
         )
         progress(1.0, "Corrected lens images are ready")
-        return (dataset, identity)
+        return (dataset, identity, registeredImageNames)
     }
 
     private func mergeLearnedPointInitializer(
@@ -174,6 +337,82 @@ extension PipelineRunner {
         )
     }
 
+    func currentMsplatDatasetDerivation(
+        paths: ProjectPaths,
+        geometryArtifact: GeometryArtifact,
+        maxImageSize: Int
+    ) throws -> MsplatDatasetDerivationArtifact {
+        let selectedFrameSnapshot = try selectedTrainingFrameSnapshot(
+            paths: paths,
+            geometryArtifact: geometryArtifact,
+            maximumImageDimension: maxImageSize
+        )
+        let sourceSparse = try paths.resolveProjectRelativePath(
+            geometryArtifact.sourceModelPath
+        )
+        let preparationKind: MsplatDatasetPreparationKind = try
+            MsplatCameraCompatibility.requiresUndistortion(modelDirectory: sourceSparse)
+                ? .undistorted
+                : .direct
+        let dataset = paths.trainingURL.appendingPathComponent(
+            "msplat_dataset",
+            isDirectory: true
+        )
+        let images = dataset.appendingPathComponent("images", isDirectory: true)
+        let sparse = dataset.appendingPathComponent("sparse/0", isDirectory: true)
+        let registeredImageNames = try registeredMsplatImageNames(
+            paths: paths,
+            sparseDirectory: sparse,
+            geometryArtifact: geometryArtifact
+        )
+        guard registeredImageNames.count == geometryArtifact.registeredViewCount,
+              try FileManager.default.contentsOfDirectory(atPath: images.path).sorted()
+                == registeredImageNames.sorted() else {
+            throw PipelineError.outputMissing
+        }
+        if preparationKind == .direct {
+            try validateDirectMsplatImages(
+                in: dataset,
+                registeredImageNames: registeredImageNames,
+                selectedFrameSnapshot: selectedFrameSnapshot,
+                maximumImageDimension: maxImageSize
+            )
+        }
+        let identity = try msplatDatasetIdentity(at: dataset)
+        return makeMsplatDatasetDerivation(
+            geometryArtifact: geometryArtifact,
+            sourceGeometryManifestSHA256: try GeometryArtifactStore.manifestDigest(
+                matching: geometryArtifact,
+                at: paths.geometryManifestURL
+            ),
+            preparationKind: preparationKind,
+            maxImageSize: maxImageSize,
+            registeredImageNames: registeredImageNames,
+            datasetIdentity: identity
+        )
+    }
+
+    private func makeMsplatDatasetDerivation(
+        geometryArtifact: GeometryArtifact,
+        sourceGeometryManifestSHA256: String,
+        preparationKind: MsplatDatasetPreparationKind,
+        maxImageSize: Int,
+        registeredImageNames: [String],
+        datasetIdentity: MsplatDatasetIdentity
+    ) -> MsplatDatasetDerivationArtifact {
+        MsplatDatasetDerivationArtifact(
+            sourceGeometryManifestSHA256: sourceGeometryManifestSHA256,
+            sourceSelectedFramesDigest: geometryArtifact.selectedFramesDigest,
+            preparationKind: preparationKind,
+            maximumImageDimension: maxImageSize,
+            toolchainVersion: geometryArtifact.provenance.toolchainVersion,
+            colmapProvenance: geometryArtifact.provenance.solver,
+            registeredImageNames: registeredImageNames,
+            datasetInputDigest: datasetIdentity.inputDigest,
+            datasetGeometryDigest: datasetIdentity.geometryDigest
+        )
+    }
+
     func msplatDatasetIdentity(at datasetURL: URL) throws -> MsplatDatasetIdentity {
         let images = datasetURL.appendingPathComponent("images", isDirectory: true)
         let sparse = datasetURL.appendingPathComponent("sparse/0", isDirectory: true)
@@ -187,9 +426,16 @@ extension PipelineRunner {
         paths: ProjectPaths,
         sourceSparse: URL,
         sourceSnapshot: GeometryModelSnapshot.Verified,
+        maxImageSize: Int,
         geometryArtifact: GeometryArtifact,
+        sourceGeometryManifestSHA256: String,
+        selectedFrameSnapshot: SelectedTrainingFrameSnapshot,
         progress: (Double, String) -> Void
-    ) throws -> (url: URL, identity: MsplatDatasetIdentity) {
+    ) throws -> (
+        url: URL,
+        identity: MsplatDatasetIdentity,
+        registeredImageNames: [String]
+    ) {
         let fm = FileManager.default
         let stagingRoot = paths.trainingURL.appendingPathComponent(
             ".msplat-prepare-\(UUID().uuidString)",
@@ -253,6 +499,25 @@ extension PipelineRunner {
         }
         _ = try regenerateBinarySparseModelFiles(at: sparse)
         try requireBinarySparseModelFiles(at: sparse)
+        for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+            try fm.removeItem(at: sparse.appendingPathComponent(name))
+        }
+        let registeredImageNames = try registeredMsplatImageNames(
+            paths: paths,
+            sparseDirectory: sparse,
+            geometryArtifact: geometryArtifact
+        )
+        guard registeredImageNames.count == geometryArtifact.registeredViewCount else {
+            throw PipelineError.outputMissing
+        }
+        let registeredSet = Set(registeredImageNames)
+        for image in imageFiles where !registeredSet.contains(image.lastPathComponent) {
+            try fm.removeItem(at: images.appendingPathComponent(image.lastPathComponent))
+        }
+        guard try fm.contentsOfDirectory(atPath: images.path).sorted()
+                == registeredImageNames.sorted() else {
+            throw PipelineError.outputMissing
+        }
         progress(0.99, "Preparing msplat dataset (sparse): conversion complete.")
         try MsplatOrientationOverlay.write(
             geometryArtifact.canonicalOrientation,
@@ -264,17 +529,45 @@ extension PipelineRunner {
             candidate,
             paths: paths,
             sourceSparse: sourceSparse,
-            sourceSnapshot: sourceSnapshot
+            sourceSnapshot: sourceSnapshot,
+            geometryArtifact: geometryArtifact,
+            sourceGeometryManifestSHA256: sourceGeometryManifestSHA256,
+            selectedFrameSnapshot: selectedFrameSnapshot,
+            maximumImageDimension: maxImageSize,
+            preparationKind: .direct,
+            registeredImageNames: registeredImageNames,
+            expectedIdentity: identity
         )
         progress(1.0, "Preparing msplat dataset: ready.")
-        return (dataset, identity)
+        return (dataset, identity, registeredImageNames)
+    }
+
+    private func registeredMsplatImageNames(
+        paths: ProjectPaths,
+        sparseDirectory: URL,
+        geometryArtifact: GeometryArtifact
+    ) throws -> [String] {
+        try ColmapSparseModelMembershipReader(
+            databaseURL: paths.colmapDatabaseURL,
+            selectedImageNames: geometryArtifact.orderedImageNames
+        ).registeredImageNames(
+            in: sparseDirectory,
+            checkCancellation: { try Task.checkCancellation() }
+        )
     }
 
     private func publishMsplatDatasetCandidate(
         _ candidate: URL,
         paths: ProjectPaths,
         sourceSparse: URL,
-        sourceSnapshot: GeometryModelSnapshot.Verified
+        sourceSnapshot: GeometryModelSnapshot.Verified,
+        geometryArtifact: GeometryArtifact,
+        sourceGeometryManifestSHA256: String,
+        selectedFrameSnapshot: SelectedTrainingFrameSnapshot,
+        maximumImageDimension: Int,
+        preparationKind: MsplatDatasetPreparationKind,
+        registeredImageNames: [String],
+        expectedIdentity: MsplatDatasetIdentity
     ) throws -> URL {
         let fm = FileManager.default
         let dataset = paths.trainingURL.appendingPathComponent("msplat_dataset", isDirectory: true)
@@ -283,12 +576,38 @@ extension PipelineRunner {
             isDirectory: true
         )
         try GeometryModelSnapshot.validate(sourceSnapshot, at: sourceSparse)
+        guard try GeometryArtifactStore.manifestDigest(
+            matching: geometryArtifact,
+            at: paths.geometryManifestURL
+        ) == sourceGeometryManifestSHA256 else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch("geometry manifest")
+        }
+        func validatePublishedInputs(at datasetURL: URL) throws {
+            guard try selectedTrainingFrameSnapshot(
+                paths: paths,
+                geometryArtifact: geometryArtifact,
+                maximumImageDimension: maximumImageDimension
+            ) == selectedFrameSnapshot,
+            try msplatDatasetIdentity(at: datasetURL) == expectedIdentity else {
+                throw GeometryArtifactStore.Error.artifactDigestMismatch("selected frames")
+            }
+            if preparationKind == .direct {
+                try validateDirectMsplatImages(
+                    in: datasetURL,
+                    registeredImageNames: registeredImageNames,
+                    selectedFrameSnapshot: selectedFrameSnapshot,
+                    maximumImageDimension: maximumImageDimension
+                )
+            }
+        }
+        try validatePublishedInputs(at: candidate)
         try removeItemIfPresent(backup)
         if entryExists(at: dataset) {
             try fm.moveItem(at: dataset, to: backup)
         }
         do {
             try fm.moveItem(at: candidate, to: dataset)
+            try validatePublishedInputs(at: dataset)
             try removeItemIfPresent(backup)
             return dataset
         } catch {
@@ -390,19 +709,26 @@ extension PipelineRunner {
     }
 
     func msplatResumeURL(
-        metadata: ProjectMetadata,
         paths: ProjectPaths,
         profile: DetailProfile,
         cameraOrderSeed: UInt64,
         resolvedPlan: ResolvedRunPlan,
-        datasetIdentity: MsplatDatasetIdentity
+        datasetIdentity: MsplatDatasetIdentity,
+        datasetDerivation: MsplatDatasetDerivationArtifact
     ) throws -> URL? {
-        guard let artifact = metadata.trainingArtifact else { return nil }
+        guard FileManager.default.fileExists(atPath: paths.trainingManifestURL.path) else {
+            return nil
+        }
+        let artifact = try TrainingArtifactStore.load(
+            from: paths.trainingManifestURL,
+            projectPaths: paths
+        )
         guard artifact.completionStatus == .checkpointed,
               artifact.detailProfile == profile,
               artifact.iterationLimit == resolvedPlan.trainerIterationLimit,
               artifact.plateauWindow == resolvedPlan.plateauWindow,
-              artifact.memoryBudgetBytes == resolvedPlan.trainerMemoryBudgetBytes,
+              artifact.memoryBudgetBytes > 0,
+              artifact.memoryBudgetBytes <= resolvedPlan.trainerMemoryBudgetBytes,
               artifact.cameraOrderSeed == cameraOrderSeed,
               artifact.checkpointPath == "Training/checkpoints/msplat" else {
             throw MsplatCheckpointValidationError(
@@ -411,7 +737,8 @@ extension PipelineRunner {
         }
         do {
             guard artifact.inputDigest == datasetIdentity.inputDigest,
-                  artifact.geometryDigest == datasetIdentity.geometryDigest else {
+                  artifact.geometryDigest == datasetIdentity.geometryDigest,
+                  artifact.datasetDerivation == datasetDerivation else {
                 throw MsplatCheckpointValidationError(
                     "saved training state does not match the current input or geometry"
                 )
@@ -436,12 +763,21 @@ extension PipelineRunner {
         profile: DetailProfile,
         cameraOrderSeed: UInt64,
         resolvedPlan: ResolvedRunPlan,
+        resourceAdmission: TrainingResourceAdmission,
         datasetIdentity: MsplatDatasetIdentity,
+        datasetDerivation: MsplatDatasetDerivationArtifact,
         paths: ProjectPaths
     ) throws -> TrainingArtifact {
         guard receipt.inputDigest == datasetIdentity.inputDigest,
               receipt.geometryDigest == datasetIdentity.geometryDigest,
-              receipt.memoryBudgetBytes == resolvedPlan.trainerMemoryBudgetBytes,
+              datasetDerivation.datasetInputDigest == datasetIdentity.inputDigest,
+              datasetDerivation.datasetGeometryDigest == datasetIdentity.geometryDigest,
+              receipt.memoryBudgetBytes > 0,
+              receipt.memoryBudgetBytes <= resolvedPlan.trainerMemoryBudgetBytes,
+              UInt64(exactly: receipt.memoryBudgetBytes).map({
+                  $0 <= resourceAdmission.allowedTrainerBytes
+              }) == true,
+              TrainingMemoryBudget.isValid(resourceAdmission),
               receipt.droppedIntersectionCount == 0 else {
             throw MsplatCheckpointValidationError(
                 "native checkpoint identity does not match the prepared dataset"
@@ -453,6 +789,7 @@ extension PipelineRunner {
             trainerBuildDigest: receipt.trainerBuildDigest,
             inputDigest: receipt.inputDigest,
             geometryDigest: receipt.geometryDigest,
+            datasetDerivation: datasetDerivation,
             detailProfile: profile,
             iterationLimit: resolvedPlan.trainerIterationLimit,
             plateauWindow: resolvedPlan.plateauWindow,
@@ -465,6 +802,7 @@ extension PipelineRunner {
             elapsedSeconds: nil,
             peakMemoryBytes: receipt.peakMemoryBytes,
             memoryBudgetBytes: receipt.memoryBudgetBytes,
+            resourceAdmission: resourceAdmission,
             rasterFallbackCount: receipt.rasterFallbackCount,
             rasterExactFallbackElapsedSeconds: receipt.rasterExactFallbackElapsedSeconds,
             rasterExactBufferGrowthCount: receipt.rasterExactBufferGrowthCount,
@@ -474,8 +812,7 @@ extension PipelineRunner {
             droppedIntersectionCount: receipt.droppedIntersectionCount,
             completionStatus: .checkpointed
         )
-        var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-        try TrainingArtifactStore.persist(artifact, metadata: &currentMetadata, paths: paths)
+        try TrainingArtifactStore.persist(artifact, paths: paths)
         return artifact
     }
 
@@ -485,20 +822,32 @@ extension PipelineRunner {
         profile: DetailProfile,
         cameraOrderSeed: UInt64,
         resolvedPlan: ResolvedRunPlan,
+        resourceAdmission: TrainingResourceAdmission,
         datasetIdentity: MsplatDatasetIdentity,
+        datasetDerivation: MsplatDatasetDerivationArtifact,
         paths: ProjectPaths
     ) throws -> TrainingArtifact {
         guard result.inputDigest == datasetIdentity.inputDigest,
-              result.geometryDigest == datasetIdentity.geometryDigest else {
+              result.geometryDigest == datasetIdentity.geometryDigest,
+              datasetDerivation.datasetInputDigest == datasetIdentity.inputDigest,
+              datasetDerivation.datasetGeometryDigest == datasetIdentity.geometryDigest else {
             throw PipelineError.outputMissing
         }
         let outputURL = paths.msplatOutputURL
-        guard result.memoryBudgetBytes == resolvedPlan.trainerMemoryBudgetBytes,
+        let outputEvidence: ValidatedPlyArtifactEvidence
+        do {
+            outputEvidence = try ProjectArtifactValidator.validatedPlyEvidence(at: outputURL)
+        } catch {
+            throw PipelineError.outputMissing
+        }
+        guard result.memoryBudgetBytes > 0,
+              result.memoryBudgetBytes <= resolvedPlan.trainerMemoryBudgetBytes,
+              UInt64(exactly: result.memoryBudgetBytes).map({
+                  $0 <= resourceAdmission.allowedTrainerBytes
+              }) == true,
+              TrainingMemoryBudget.isValid(resourceAdmission),
               result.droppedIntersectionCount == 0,
-              ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid,
-              let header = ProjectArtifactValidator.readPlyHeader(at: outputURL),
-              header.vertexCount == result.gaussianCount,
-              let size = try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+              outputEvidence.vertexCount == result.gaussianCount else {
             throw PipelineError.outputMissing
         }
         let artifact = TrainingArtifact(
@@ -507,6 +856,7 @@ extension PipelineRunner {
             trainerBuildDigest: result.trainerBuildDigest,
             inputDigest: result.inputDigest,
             geometryDigest: result.geometryDigest,
+            datasetDerivation: datasetDerivation,
             detailProfile: profile,
             iterationLimit: result.iterationLimit,
             plateauWindow: result.plateauWindow,
@@ -515,12 +865,13 @@ extension PipelineRunner {
             checkpointPath: nil,
             checkpointDigest: nil,
             outputPath: "Training/msplat/splat.ply",
-            outputSHA256: try GeometryArtifactStore.sha256(of: outputURL),
-            outputBytes: Int64(size),
+            outputSHA256: outputEvidence.sha256,
+            outputBytes: Int64(outputEvidence.byteCount),
             gaussianCount: result.gaussianCount,
             elapsedSeconds: result.elapsedSeconds,
             peakMemoryBytes: result.peakMemoryBytes,
             memoryBudgetBytes: result.memoryBudgetBytes,
+            resourceAdmission: resourceAdmission,
             rasterFallbackCount: result.rasterFallbackCount,
             rasterExactFallbackElapsedSeconds: result.rasterExactFallbackElapsedSeconds,
             rasterExactBufferGrowthCount: result.rasterExactBufferGrowthCount,
@@ -528,11 +879,10 @@ extension PipelineRunner {
             rasterReplayElapsedSeconds: result.rasterReplayElapsedSeconds,
             rasterPeakExactIntersectionCapacity: result.rasterPeakExactIntersectionCapacity,
             droppedIntersectionCount: result.droppedIntersectionCount,
-            sceneBounds: result.sceneBounds,
+            sceneBounds: outputEvidence.sceneBounds,
             completionStatus: .completed
         )
-        var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-        try TrainingArtifactStore.persist(artifact, metadata: &currentMetadata, paths: paths)
+        try TrainingArtifactStore.persist(artifact, paths: paths)
         return artifact
     }
 
@@ -540,9 +890,10 @@ extension PipelineRunner {
     /// private output remains available until the run is durably marked done, so a
     /// crash during export can still resume without retraining.
     func promoteMsplatCompletionToPublicOutput(paths: ProjectPaths) throws -> TrainingArtifact {
-        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-        guard var artifact = metadata.trainingArtifact,
-              artifact.completionStatus == .completed else {
+        guard var artifact = try? TrainingArtifactStore.load(
+            from: paths.trainingManifestURL,
+            projectPaths: paths
+        ), artifact.completionStatus == .completed else {
             throw PipelineError.outputMissing
         }
         if artifact.outputPath == "Output/splat.ply" {
@@ -557,22 +908,22 @@ extension PipelineRunner {
         }
 
         artifact.outputPath = "Output/splat.ply"
-        try TrainingArtifactStore.persist(artifact, metadata: &metadata, paths: paths)
+        try TrainingArtifactStore.persist(artifact, paths: paths)
         return artifact
     }
 
-    /// Finished projects retain accepted geometry, the training manifest, and one
-    /// authenticated public PLY. The copied image dataset and trainer-private PLY are
-    /// rebuildable payloads, not user artifacts.
+    /// Finished projects retain the exact dataset consumed by the trainer so release
+    /// verification can independently recompute its input and geometry identities.
+    /// Only the trainer-private duplicate PLY is disposable after public output is
+    /// durably authenticated.
     func removeDisposableCompletedTrainingPayload(paths: ProjectPaths) throws {
         let fileManager = FileManager.default
-        let disposableURLs = [
-            try paths.resolveProjectRelativePath("Training/msplat_dataset"),
-            try paths.resolveProjectRelativePath("Training/msplat/splat.ply"),
-        ]
-        for url in disposableURLs where fileManager.fileExists(atPath: url.path)
-            || (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil {
-            try fileManager.removeItem(at: url)
+        let disposableOutput = try paths.resolveProjectRelativePath(
+            "Training/msplat/splat.ply"
+        )
+        if fileManager.fileExists(atPath: disposableOutput.path)
+            || (try? fileManager.destinationOfSymbolicLink(atPath: disposableOutput.path)) != nil {
+            try fileManager.removeItem(at: disposableOutput)
         }
     }
 }

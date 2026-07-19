@@ -8,6 +8,9 @@ struct WorkspaceView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let animationDuration = Self.workspaceAnimationDuration(
+            reduceMotion: reduceMotion
+        )
         ZStack {
             switch model.viewState {
             case .home:
@@ -22,7 +25,17 @@ struct WorkspaceView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .animation(reduceMotion ? nil : Theme.Motion.workspace, value: model.viewState)
+        .animation(
+            animationDuration.map { Theme.Motion.workspace(duration: $0) },
+            value: model.viewState
+        )
         .background(Theme.background)
+    }
+
+    nonisolated static func workspaceAnimationDuration(
+        reduceMotion: Bool
+    ) -> TimeInterval? {
+        guard !reduceMotion else { return nil }
+        return Theme.Motion.standardWorkspaceDuration
     }
 }

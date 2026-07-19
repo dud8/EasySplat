@@ -4,18 +4,17 @@ import Foundation
 public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
-    /// The one project format this beta reads and writes.
-    public static let supportedFormatVersion: Int = 17
+    /// The current project format EasySplat reads and writes.
+    public static let supportedFormatVersion: Int = 31
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
         case invalidArtifactPath(field: String, path: String)
         case invalidArtifactNamespace(field: String, path: String)
-        case unsupportedGeometryArtifactSchema(Int)
         case invalidTrainingMemoryRetryBudget(Int64)
         case invalidGeometryRecovery(String)
         case invalidResolvedRunPlan
-        case invalidWorkerExecution
+        case unexpectedFields
 
         public var errorDescription: String? {
             switch self {
@@ -25,16 +24,14 @@ public enum ProjectMetadataStore {
                 return "Project metadata contains an invalid project-relative artifact path for \(field): \(path)"
             case .invalidArtifactNamespace(let field, let path):
                 return "Project metadata stores \(field) outside its allowed project directory: \(path)"
-            case .unsupportedGeometryArtifactSchema(let schema):
-                return "Project metadata contains unsupported geometry artifact schema \(schema)."
             case .invalidTrainingMemoryRetryBudget(let bytes):
                 return "Project metadata contains an invalid training memory retry budget: \(bytes) bytes."
             case .invalidGeometryRecovery(let reason):
                 return "Project metadata contains invalid geometry recovery state: \(reason)"
             case .invalidResolvedRunPlan:
                 return "Project metadata contains an invalid resolved run plan."
-            case .invalidWorkerExecution:
-                return "Project metadata worker evidence does not match its resolved run plan."
+            case .unexpectedFields:
+                return "Project metadata contains fields outside the current project format."
             }
         }
     }
@@ -90,7 +87,6 @@ public enum ProjectMetadataStore {
         try fileLocks.withLock(for: url) {
             var metadata = try loadWithoutLock(from: url)
             try mutation(&metadata)
-            normalizeViewerPreferences(in: &metadata)
             try saveWithoutLock(metadata, to: url)
             return metadata
         }
@@ -105,6 +101,14 @@ public enum ProjectMetadataStore {
             metadata.geometryRecovery = nil
         }
         try validateArtifactPaths(in: metadata, metadataURL: url)
+        try VideoInputReceiptValidator.validateMetadata(
+            metadata,
+            paths: ProjectPaths(root: url.deletingLastPathComponent())
+        )
+        try PhotoInputReceiptValidator.validateMetadata(
+            metadata,
+            paths: ProjectPaths(root: url.deletingLastPathComponent())
+        )
         return metadata
     }
 
@@ -114,19 +118,50 @@ public enum ProjectMetadataStore {
             at: url,
             maximumBytes: maximumMetadataBytes
         )
+        return try decodePayload(data)
+    }
+
+    /// Decodes and validates one already authenticated metadata byte snapshot.
+    /// Publication uses this to ensure semantic checks and its file manifest bind
+    /// the exact same `project.json` contents.
+    static func decodeValidatedMetadataSnapshot(
+        _ data: Data,
+        metadataURL: URL
+    ) throws -> ProjectMetadata {
+        guard data.count <= maximumMetadataBytes else {
+            throw SaveError.metadataTooLarge(maximumBytes: maximumMetadataBytes)
+        }
+        try ProjectPaths(root: metadataURL.deletingLastPathComponent()).validateRootDirectory()
+        var metadata = try decodePayload(data)
+        if let recovery = metadata.geometryRecovery,
+           (try? recovery.validate()) == nil {
+            metadata.geometryRecovery = nil
+        }
+        try validateArtifactPaths(in: metadata, metadataURL: metadataURL)
+        let paths = ProjectPaths(root: metadataURL.deletingLastPathComponent())
+        try VideoInputReceiptValidator.validateMetadata(metadata, paths: paths)
+        try PhotoInputReceiptValidator.validateMetadata(metadata, paths: paths)
+        return metadata
+    }
+
+    private static func decodePayload(_ data: Data) throws -> ProjectMetadata {
         // Read the schema envelope before the strict payload so unsupported projects fail
         // clearly without partially interpreting another format.
         let envelope = try JSONDecoder().decode(FormatVersionEnvelope.self, from: data)
         guard envelope.formatVersion == supportedFormatVersion else {
             throw LoadError.unsupportedFormatVersion(envelope.formatVersion)
         }
+        let fieldEnvelope = try JSONDecoder().decode(FieldEnvelope.self, from: data)
+        let allowedFields = Set(ProjectMetadata.CodingKeys.allCases.map(\.rawValue))
+        guard fieldEnvelope.fields.isSubset(of: allowedFields) else {
+            throw LoadError.unexpectedFields
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        var metadata = try decoder.decode(ProjectMetadata.self, from: data)
+        let metadata = try decoder.decode(ProjectMetadata.self, from: data)
         guard metadata.formatVersion == supportedFormatVersion else {
             throw SaveError.invalidFormatVersion(metadata.formatVersion)
         }
-        normalizeViewerPreferences(in: &metadata)
         return metadata
     }
 
@@ -136,14 +171,43 @@ public enum ProjectMetadataStore {
         let formatVersion: Int
     }
 
+    private struct FieldEnvelope: Decodable {
+        let fields: Set<String>
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: FieldKey.self)
+            fields = Set(container.allKeys.map(\.stringValue))
+        }
+    }
+
+    private struct FieldKey: CodingKey {
+        let stringValue: String
+        let intValue: Int? = nil
+
+        init?(stringValue: String) {
+            self.stringValue = stringValue
+        }
+
+        init?(intValue: Int) {
+            return nil
+        }
+    }
+
     private static func saveWithoutLock(_ metadata: ProjectMetadata, to url: URL) throws {
         try ProjectPaths(root: url.deletingLastPathComponent()).validateRootDirectory()
-        var persistedMetadata = metadata
+        let persistedMetadata = metadata
         guard persistedMetadata.formatVersion == supportedFormatVersion else {
             throw SaveError.invalidFormatVersion(persistedMetadata.formatVersion)
         }
-        normalizeViewerPreferences(in: &persistedMetadata)
         try validateArtifactPaths(in: persistedMetadata, metadataURL: url)
+        try VideoInputReceiptValidator.validateMetadata(
+            persistedMetadata,
+            paths: ProjectPaths(root: url.deletingLastPathComponent())
+        )
+        try PhotoInputReceiptValidator.validateMetadata(
+            persistedMetadata,
+            paths: ProjectPaths(root: url.deletingLastPathComponent())
+        )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
@@ -152,13 +216,6 @@ public enum ProjectMetadataStore {
             throw SaveError.metadataTooLarge(maximumBytes: maximumMetadataBytes)
         }
         try data.write(to: url, options: [.atomic])
-    }
-
-    private static func normalizeViewerPreferences(in metadata: inout ProjectMetadata) {
-        guard metadata.geometryArtifact?.allowsViewOnlyUprightFlip == true else {
-            metadata.viewerPreferences.isUprightFlipActive = false
-            return
-        }
     }
 
     private static func validateArtifactPaths(
@@ -176,26 +233,12 @@ public enum ProjectMetadataStore {
             } catch {
                 throw LoadError.invalidResolvedRunPlan
             }
-        }
-        if let artifact = metadata.geometryArtifact,
-           artifact.schemaVersion != GeometryArtifact.currentSchemaVersion {
-            throw LoadError.unsupportedGeometryArtifactSchema(artifact.schemaVersion)
-        }
-        if let artifact = metadata.geometryArtifact {
-            guard let expectedBudget = metadata.resolvedRunPlan?.geometryWorkerBudget else {
-                throw LoadError.invalidWorkerExecution
-            }
-            do {
-                try artifact.workerExecution.validateForPublishedGeometry(
-                    expectedBudget: expectedBudget,
-                    context: GeometryWorkerExecutionPublicationContext(
-                        mapping: artifact.mapping,
-                        pairGraph: artifact.pairGraph,
-                        input: metadata.input
-                    )
-                )
-            } catch {
-                throw LoadError.invalidWorkerExecution
+            let requiresCrossClipRetrieval = RunPlanResolver.requiresCrossClipRetrieval(
+                requestedInputOrdering: metadata.requestedRunOptions.inputOrdering,
+                input: metadata.input
+            )
+            guard plan.requiresCrossClipRetrieval == requiresCrossClipRetrieval else {
+                throw LoadError.invalidResolvedRunPlan
             }
         }
         if let recovery = metadata.geometryRecovery {
@@ -206,22 +249,6 @@ public enum ProjectMetadataStore {
             }
         }
         var artifactPaths: [(field: String, path: String)] = []
-        if let path = metadata.geometryArtifact?.sourceModelPath {
-            artifactPaths.append(("geometryArtifact.sourceModelPath", path))
-        }
-        if let path = metadata.geometryArtifact?.learnedPointInitializer?.path {
-            artifactPaths.append(("geometryArtifact.learnedPointInitializer.path", path))
-        }
-        if let path = metadata.trainingArtifact?.checkpointPath {
-            artifactPaths.append(("trainingArtifact.checkpointPath", path))
-        }
-        if let path = metadata.trainingArtifact?.outputPath {
-            artifactPaths.append(("trainingArtifact.outputPath", path))
-        }
-        if let outputs = metadata.outputs {
-            artifactPaths.append(("outputs.splatPlyPath", outputs.splatPlyPath))
-            artifactPaths.append(("outputs.colmapModelPath", outputs.colmapModelPath))
-        }
         if let details = metadata.checkpoint?.details {
             switch details {
             case .extractFrames:
@@ -234,8 +261,6 @@ public enum ProjectMetadataStore {
                 artifactPaths.append(("checkpoint.sfmFeatures.databasePath", checkpoint.databasePath))
             case .sfmMatching(let checkpoint):
                 artifactPaths.append(("checkpoint.sfmMatching.databasePath", checkpoint.databasePath))
-            case .sfmMapping(let checkpoint):
-                artifactPaths.append(("checkpoint.sfmMapping.sparsePath", checkpoint.sparsePath))
             case .trainSplat:
                 break
             case .exportSplat(let checkpoint):
@@ -264,32 +289,12 @@ public enum ProjectMetadataStore {
             }
         }
 
-        if let trainingArtifact = metadata.trainingArtifact {
-            try TrainingArtifactStore.validateManifest(
-                trainingArtifact,
-                projectPaths: paths
-            )
-            guard trainingArtifact.detailProfile == metadata.effectiveDetailProfile else {
-                throw TrainingArtifactStoreError.invalidManifest
-            }
-        }
     }
 
     private static func pathUsesAllowedNamespace(field: String, path: String) -> Bool {
         switch field {
-        case "geometryArtifact.sourceModelPath":
-            return path == "SfM/colmap/sparse/0"
-        case "geometryArtifact.learnedPointInitializer.path":
-            return path == "SfM/colmap/seed/0/learned_points3D.txt"
-        case "trainingArtifact.checkpointPath":
-            return path == "Training/checkpoints/msplat"
-                || path.hasPrefix("Training/checkpoints/msplat/")
-        case "trainingArtifact.outputPath":
-            return path == "Output/splat.ply" || path.hasPrefix("Training/")
-        case "outputs.splatPlyPath", "checkpoint.exportSplat.outputPath":
+        case "checkpoint.exportSplat.outputPath":
             return path.hasPrefix("Output/")
-        case "outputs.colmapModelPath", "checkpoint.sfmMapping.sparsePath":
-            return path.hasPrefix("SfM/")
         case "checkpoint.selectFrames.manifestPath":
             return path.hasPrefix("Frames/")
         case "checkpoint.sfmFeatures.databasePath", "checkpoint.sfmMatching.databasePath":

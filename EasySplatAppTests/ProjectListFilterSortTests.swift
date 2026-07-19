@@ -24,6 +24,7 @@ final class ProjectListFilterSortTests: XCTestCase {
             isInterrupted: false,
             checkpointUpdatedAt: nil,
             stageTimings: stageTimings,
+            createToViewerReadySeconds: nil,
             input: nil,
             requestedRunOptions: nil,
             lastOpenedAt: lastOpenedAt,

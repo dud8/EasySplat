@@ -11,6 +11,7 @@ struct ProjectSummary: Identifiable, Sendable {
     let isInterrupted: Bool
     let checkpointUpdatedAt: Date?
     let stageTimings: [StageTimingRecord]
+    let createToViewerReadySeconds: TimeInterval?
     let input: InputSpec?
     let requestedRunOptions: RequestedRunOptions?
     let lastOpenedAt: Date?

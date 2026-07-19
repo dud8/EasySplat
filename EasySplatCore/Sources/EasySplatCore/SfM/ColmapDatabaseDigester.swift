@@ -30,18 +30,29 @@ enum ColmapDatabaseDigesterError: Error, LocalizedError, Equatable {
 enum ColmapDatabaseDigester {
     private struct Table {
         let name: String
-        let orderingColumn: String
+        let orderingColumns: [String]
     }
 
     private static let featureTables = [
-        Table(name: "cameras", orderingColumn: "camera_id"),
-        Table(name: "images", orderingColumn: "image_id"),
-        Table(name: "keypoints", orderingColumn: "image_id"),
-        Table(name: "descriptors", orderingColumn: "image_id"),
+        Table(name: "cameras", orderingColumns: ["camera_id"]),
+        Table(name: "rigs", orderingColumns: ["rig_id"]),
+        Table(
+            name: "rig_sensors",
+            orderingColumns: ["rig_id", "sensor_id", "sensor_type"]
+        ),
+        Table(name: "frames", orderingColumns: ["frame_id"]),
+        Table(
+            name: "frame_data",
+            orderingColumns: ["frame_id", "data_id", "sensor_id", "sensor_type"]
+        ),
+        Table(name: "images", orderingColumns: ["image_id"]),
+        Table(name: "pose_priors", orderingColumns: ["pose_prior_id"]),
+        Table(name: "keypoints", orderingColumns: ["image_id"]),
+        Table(name: "descriptors", orderingColumns: ["image_id"]),
     ]
     private static let matchingTables = [
-        Table(name: "matches", orderingColumn: "pair_id"),
-        Table(name: "two_view_geometries", orderingColumn: "pair_id"),
+        Table(name: "matches", orderingColumns: ["pair_id"]),
+        Table(name: "two_view_geometries", orderingColumns: ["pair_id"]),
     ]
 
     static func digests(at databaseURL: URL) throws -> ColmapDatabaseDigests {
@@ -125,7 +136,7 @@ enum ColmapDatabaseDigester {
         in database: OpaquePointer
     ) throws -> String {
         var hasher = SHA256()
-        update("EasySplat COLMAP logical database digest v1", hasher: &hasher)
+        update("EasySplat COLMAP logical database digest v2", hasher: &hasher)
         for table in tables {
             try Task.checkCancellation()
             let columns = try readColumns(for: table, in: database)
@@ -136,7 +147,10 @@ enum ColmapDatabaseDigester {
             }
 
             var statement: OpaquePointer?
-            let sql = "SELECT * FROM \(table.name) ORDER BY \(table.orderingColumn);"
+            let orderingSQL = table.orderingColumns
+                .map { "\"\($0)\"" }
+                .joined(separator: ", ")
+            let sql = "SELECT * FROM \"\(table.name)\" ORDER BY \(orderingSQL);"
             let prepareResult = sqlite3_prepare_v2(database, sql, -1, &statement, nil)
             guard prepareResult == SQLITE_OK, let statement else {
                 throw ColmapDatabaseDigesterError.operationFailed(
@@ -219,7 +233,8 @@ enum ColmapDatabaseDigester {
             columns.append(name)
         }
         guard !columns.isEmpty,
-              columns.contains(table.orderingColumn) else {
+              !table.orderingColumns.isEmpty,
+              table.orderingColumns.allSatisfy(columns.contains) else {
             throw ColmapDatabaseDigesterError.invalidTable(table.name)
         }
         return columns

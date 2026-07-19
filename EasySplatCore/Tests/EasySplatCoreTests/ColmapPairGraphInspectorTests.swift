@@ -306,6 +306,12 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         XCTAssertEqual(result.secondLargestBiconnectedBlockViewCount, 2)
         XCTAssertEqual(result.featureDatabaseDigest.count, 64)
         XCTAssertEqual(result.matchingDatabaseDigest.count, 64)
+        XCTAssertEqual(result.attemptedPairs, schedule.pairs)
+        XCTAssertEqual(result.rawMatchedPairs, [
+            ColmapScheduledPair(imageName(2), imageName(7), role: .local),
+            ColmapScheduledPair(imageName(7), imageName(11), role: .retrieval),
+            ColmapScheduledPair(imageName(2), imageName(20), role: .retrieval),
+        ])
         XCTAssertEqual(result.verifiedGraph.verifiedPairs, [
             ColmapScheduledPair(imageName(2), imageName(7), role: .local),
             ColmapScheduledPair(imageName(7), imageName(11), role: .retrieval),
@@ -1232,10 +1238,21 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         defer { sqlite3_close(database) }
 
         try execute(database, "CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY);")
+        try execute(database, "CREATE TABLE rigs(rig_id INTEGER PRIMARY KEY);")
+        try execute(
+            database,
+            "CREATE TABLE rig_sensors(rig_id INTEGER, sensor_id INTEGER, sensor_type INTEGER);"
+        )
+        try execute(database, "CREATE TABLE frames(frame_id INTEGER PRIMARY KEY);")
+        try execute(
+            database,
+            "CREATE TABLE frame_data(frame_id INTEGER, data_id INTEGER, sensor_id INTEGER, sensor_type INTEGER);"
+        )
         try execute(
             database,
             "CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT, camera_id INTEGER);"
         )
+        try execute(database, "CREATE TABLE pose_priors(pose_prior_id INTEGER PRIMARY KEY);")
         try execute(
             database,
             "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER, cols INTEGER, data BLOB);"

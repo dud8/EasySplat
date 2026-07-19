@@ -20,14 +20,11 @@ final class ShareToolbarNSButton: NSButton {
     }
 
     override func performClick(_ sender: Any?) {
-        guard isEnabled else { return }
-        onActivate?(self)
+        _ = beginActivation()
     }
 
     override func accessibilityPerformPress() -> Bool {
-        guard isEnabled else { return false }
-        onActivate?(self)
-        return true
+        beginActivation()
     }
 
     override func keyDown(with event: NSEvent) {
@@ -39,7 +36,17 @@ final class ShareToolbarNSButton: NSButton {
     }
 
     @objc private func activateShare(_ sender: NSButton) {
-        onActivate?(self)
+        _ = beginActivation()
+    }
+
+    private func beginActivation() -> Bool {
+        guard isEnabled, let onActivate else { return false }
+        // NSSharingServicePicker enters menu tracking before SwiftUI can apply
+        // the model's busy state. Latch the native control immediately so a
+        // second mouse or accessibility press cannot start another request.
+        isEnabled = false
+        onActivate(self)
+        return true
     }
 
     private func configure() {

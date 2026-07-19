@@ -14,9 +14,9 @@ struct ToolchainFixture {
     let da3ModelBundle: URL
     let da3ModelFile: URL
     let da3ConfigFile: URL
-    let da3FallbackModelBundle: URL
-    let da3FallbackModelFile: URL
-    let da3FallbackConfigFile: URL
+    let da3SmallModelBundle: URL
+    let da3SmallModelFile: URL
+    let da3SmallConfigFile: URL
     let da3VendorSentinel: URL
 }
 
@@ -24,7 +24,7 @@ enum ToolchainFixtureBuilder {
     static func createToolchain(
         at root: URL,
         includeDa3Model: Bool = true,
-        includeDa3FallbackModel: Bool = true,
+        includeDa3SmallModel: Bool = true,
         includeDa3AppSentinel: Bool = true,
         includeDa3VendorSentinel: Bool = true,
         includeMsplat: Bool = true
@@ -58,8 +58,8 @@ enum ToolchainFixtureBuilder {
         try """
         {
           "toolchain_name": "colmap",
-          "source_version": "4.1.0",
-          "source_commit": "fa8e3b3ff591552855f8ad2806723c80f963f69c",
+          "source_version": "4.1.1",
+          "source_commit": "a0d785fba74b2664f31edc4a29026a8b27c00f67",
           "executable_sha256": "\(colmapExecutableSHA256)"
         }
         """.write(to: colmapProvenance, atomically: true, encoding: .utf8)
@@ -105,8 +105,8 @@ enum ToolchainFixtureBuilder {
                 "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
                 "source_version": "1.1.3",
                 "source_tree_sha256": String(repeating: "a", count: 64),
-                "overlay_sha256": "0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6",
-                "raster_test_sha256": "7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7",
+                "overlay_sha256": "fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc",
+                "raster_test_sha256": "3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934",
                 "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
                 "checkpoint_patch_sha256": String(repeating: "d", count: 64),
                 "numeric_stability_patch_sha256": String(repeating: "e", count: 64),
@@ -118,6 +118,8 @@ enum ToolchainFixtureBuilder {
                 "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
                 "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
                 "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
+                "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
+                "exact_prefix_hardening_patch_sha256": "99022e824c91ca57b34f60f21b29753db788290541c3c6bc52a5b496794d9683",
                 "dependencies": [
                     "nlohmann_json_v3.11.3_sha256": "04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069",
                     "nanoflann_v1.5.5_sha256": "57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc",
@@ -158,17 +160,17 @@ enum ToolchainFixtureBuilder {
         let da3ModelFile = da3ModelBundle.appendingPathComponent("model.safetensors")
         let da3ConfigFile = da3ModelBundle.appendingPathComponent("config.json")
         let da3ModelInfoFile = da3ModelBundle.appendingPathComponent("easysplat_model_info.json")
-        let da3FallbackModelBundle = da3Models.appendingPathComponent("DA3-SMALL", isDirectory: true)
-        let da3FallbackModelFile = da3FallbackModelBundle.appendingPathComponent("model.safetensors")
-        let da3FallbackConfigFile = da3FallbackModelBundle.appendingPathComponent("config.json")
-        let da3FallbackModelInfoFile = da3FallbackModelBundle.appendingPathComponent("easysplat_model_info.json")
+        let da3SmallModelBundle = da3Models.appendingPathComponent("DA3-SMALL", isDirectory: true)
+        let da3SmallModelFile = da3SmallModelBundle.appendingPathComponent("model.safetensors")
+        let da3SmallConfigFile = da3SmallModelBundle.appendingPathComponent("config.json")
+        let da3SmallModelInfoFile = da3SmallModelBundle.appendingPathComponent("easysplat_model_info.json")
         let da3VendorSentinel = da3Root.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py")
 
         try fm.createDirectory(at: da3SfmTool.deletingLastPathComponent(), withIntermediateDirectories: true)
         try fm.createDirectory(at: da3Python.deletingLastPathComponent(), withIntermediateDirectories: true)
         try fm.createDirectory(at: da3AppSentinel.deletingLastPathComponent(), withIntermediateDirectories: true)
         try fm.createDirectory(at: da3ModelBundle, withIntermediateDirectories: true)
-        try fm.createDirectory(at: da3FallbackModelBundle, withIntermediateDirectories: true)
+        try fm.createDirectory(at: da3SmallModelBundle, withIntermediateDirectories: true)
         try fm.createDirectory(at: da3VendorSentinel.deletingLastPathComponent(), withIntermediateDirectories: true)
         try writeExecutable(da3SfmTool, script: "#!/usr/bin/env bash\nexit 0\n")
         try writeExecutable(da3Python, script: "#!/usr/bin/env bash\necho python\n")
@@ -199,12 +201,12 @@ enum ToolchainFixtureBuilder {
                 encoding: .utf8
             )
         }
-        if includeDa3FallbackModel {
-            fm.createFile(atPath: da3FallbackModelFile.path, contents: Data([0x00]))
-            try "{}\n".write(to: da3FallbackConfigFile, atomically: true, encoding: .utf8)
-            try #"{"repo_id":"depth-anything/DA3-SMALL","requested_revision":"fixture-revision","resolved_sha":"89abcdef0123456789abcdef0123456789abcdef","license":"apache-2.0"}"#.write(to: da3FallbackModelInfoFile, atomically: true, encoding: .utf8)
+        if includeDa3SmallModel {
+            fm.createFile(atPath: da3SmallModelFile.path, contents: Data([0x00]))
+            try "{}\n".write(to: da3SmallConfigFile, atomically: true, encoding: .utf8)
+            try #"{"repo_id":"depth-anything/DA3-SMALL","requested_revision":"fixture-revision","resolved_sha":"89abcdef0123456789abcdef0123456789abcdef","license":"apache-2.0"}"#.write(to: da3SmallModelInfoFile, atomically: true, encoding: .utf8)
             try "Apache License 2.0\n".write(
-                to: da3FallbackModelBundle.appendingPathComponent("LICENSE"),
+                to: da3SmallModelBundle.appendingPathComponent("LICENSE"),
                 atomically: true,
                 encoding: .utf8
             )
@@ -225,9 +227,9 @@ enum ToolchainFixtureBuilder {
             da3ModelBundle: da3ModelBundle,
             da3ModelFile: da3ModelFile,
             da3ConfigFile: da3ConfigFile,
-            da3FallbackModelBundle: da3FallbackModelBundle,
-            da3FallbackModelFile: da3FallbackModelFile,
-            da3FallbackConfigFile: da3FallbackConfigFile,
+            da3SmallModelBundle: da3SmallModelBundle,
+            da3SmallModelFile: da3SmallModelFile,
+            da3SmallConfigFile: da3SmallConfigFile,
             da3VendorSentinel: da3VendorSentinel
         )
     }
@@ -239,7 +241,7 @@ enum ToolchainFixtureBuilder {
             python: fixture.da3Python,
             models: fixture.da3Models,
             modelBundle: fixture.da3ModelBundle,
-            fallbackModelBundle: fixture.da3FallbackModelBundle
+            smallModelBundle: fixture.da3SmallModelBundle
         )
         return ToolchainPaths(
             root: fixture.root,

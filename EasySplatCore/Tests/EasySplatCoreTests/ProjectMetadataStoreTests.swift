@@ -37,61 +37,169 @@ final class ProjectMetadataStoreTests: XCTestCase {
         }
     }
 
-    func testSaveAndLoadRejectMalformedEmbeddedWorkerExecution() throws {
+    func testCrossClipRetrievalDerivationRoundTripsAndRejectsContradictions() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("project.json")
-        var geometry = makeGeometryArtifact()
-        geometry.workerExecution.matchingInvocations[0].argvWorkerCount =
-            geometry.workerExecution.resolvedBudget.coupledMatchingWorkers - 1
-        let metadata = ProjectMetadata(
-            title: "Invalid worker evidence",
-            input: .photos(folder: "/tmp/photos"),
-            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
-            geometryArtifact: geometry
-        )
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let cases: [(name: String, ordering: InputOrdering, includesPhotos: Bool, expected: Bool)] = [
+            ("automatic", .automatic, false, true),
+            ("continuous", .continuous, false, true),
+            ("unordered", .unordered, false, false),
+            ("mixed", .automatic, true, false),
+        ]
 
-        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
-            guard case ProjectMetadataStore.LoadError.invalidWorkerExecution = error else {
-                return XCTFail("Expected invalid worker evidence, got \(error)")
+        for testCase in cases {
+            let projectRoot = root.appendingPathComponent(
+                "\(testCase.name).easysplatproj",
+                isDirectory: true
+            )
+            let paths = ProjectPaths(root: projectRoot)
+            var first = try TestFileBuilder.writeControlledVideoReceipt(
+                paths: paths,
+                index: 0,
+                bytes: Data("first-\(testCase.name)".utf8),
+                safeDisplayName: "First.mov"
+            )
+            var second = try TestFileBuilder.writeControlledVideoReceipt(
+                paths: paths,
+                index: 1,
+                bytes: Data("second-\(testCase.name)".utf8),
+                safeDisplayName: "Second.mov"
+            )
+            let photo = testCase.includesPhotos
+                ? try TestFileBuilder.writeControlledPhotoReceipt(paths: paths)
+                : nil
+            let videoPaths = [
+                first.receipt.projectRelativePath,
+                second.receipt.projectRelativePath,
+            ]
+            let input: InputSpec = if testCase.includesPhotos {
+                .mixed(videos: videoPaths, photosFolder: "Originals/Photos")
+            } else {
+                .video(files: videoPaths)
             }
-        }
+            let options = RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced,
+                inputOrdering: testCase.ordering
+            )
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: options,
+                input: input,
+                hardware: hardware,
+                developmentOverrides: .none
+            )
+            let clipGroupIDs = try Dictionary(uniqueKeysWithValues:
+                VideoClipIdentityResolver.resolve(
+                    sourceSHA256s: [first.receipt.sha256, second.receipt.sha256],
+                    pairingPolicy: plan.pairingPolicy
+                ).map { ($0.sourceIndex, $0.groupID) }
+            )
+            first = try TestFileBuilder.writeControlledVideoReceipt(
+                paths: paths,
+                index: 0,
+                bytes: Data("first-\(testCase.name)".utf8),
+                safeDisplayName: "First.mov",
+                clipGroupID: try XCTUnwrap(clipGroupIDs[0])
+            )
+            second = try TestFileBuilder.writeControlledVideoReceipt(
+                paths: paths,
+                index: 1,
+                bytes: Data("second-\(testCase.name)".utf8),
+                safeDisplayName: "Second.mov",
+                clipGroupID: try XCTUnwrap(clipGroupIDs[1])
+            )
+            XCTAssertEqual(
+                plan.requiresCrossClipRetrieval,
+                testCase.expected,
+                testCase.name
+            )
+            let metadata = ProjectMetadata(
+                title: "Cross-clip \(testCase.name)",
+                input: input,
+                videoInputReceipts: [first.receipt, second.receipt],
+                photoInputReceipts: photo.map { [$0.receipt] },
+                photoSelectionReceipt: photo.map { _ in
+                    TestFileBuilder.structuralPhotoSelectionReceipt()
+                },
+                requestedRunOptions: options,
+                resolvedRunPlan: plan
+            )
 
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(metadata).write(to: url, options: .atomic)
-        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
-            guard case ProjectMetadataStore.LoadError.invalidWorkerExecution = error else {
-                return XCTFail("Expected invalid worker evidence, got \(error)")
+            try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            XCTAssertEqual(
+                try ProjectMetadataStore.load(from: paths.metadataURL)
+                    .resolvedRunPlan?.requiresCrossClipRetrieval,
+                testCase.expected,
+                testCase.name
+            )
+
+            var contradictory = metadata
+            contradictory.resolvedRunPlan?.requiresCrossClipRetrieval.toggle()
+            XCTAssertThrowsError(
+                try ProjectMetadataStore.save(contradictory, to: paths.metadataURL),
+                testCase.name
+            ) { error in
+                guard case ProjectMetadataStore.LoadError.invalidResolvedRunPlan = error else {
+                    return XCTFail("Expected invalid resolved plan for \(testCase.name), got \(error)")
+                }
             }
         }
     }
 
-    func testSaveAndLoadRejectEmbeddedAcceptedMappingAttemptSubstitution() throws {
+    func testSaveAndLoadRejectDerivedCrossClipRetrievalRequirementMismatch() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("project.json")
-        var geometry = makeGeometryArtifact()
-        geometry.mapping.acceptedMappingAttemptOrdinal = 2
+        let paths = ProjectPaths(root: root)
+        let first = try TestFileBuilder.writeControlledVideoReceipt(
+            paths: paths,
+            index: 0,
+            bytes: Data("first-video".utf8),
+            safeDisplayName: "First.mov"
+        )
+        let second = try TestFileBuilder.writeControlledVideoReceipt(
+            paths: paths,
+            index: 1,
+            bytes: Data("second-video".utf8),
+            safeDisplayName: "Second.mov"
+        )
+        let input = InputSpec.video(files: [
+            first.receipt.projectRelativePath,
+            second.receipt.projectRelativePath,
+        ])
+        let options = RequestedRunOptions(
+            capturePath: .orbit,
+            detailProfile: .balanced,
+            inputOrdering: .continuous
+        )
+        var plan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: input,
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        XCTAssertTrue(plan.requiresCrossClipRetrieval)
+        plan.requiresCrossClipRetrieval = false
         let metadata = ProjectMetadata(
-            title: "Substituted mapping attempt",
-            input: .photos(folder: "/tmp/photos"),
-            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
-            geometryArtifact: geometry
+            title: "Cross-clip geometry binding",
+            input: input,
+            videoInputReceipts: [first.receipt, second.receipt],
+            requestedRunOptions: options,
+            resolvedRunPlan: plan
         )
 
-        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
-            guard case ProjectMetadataStore.LoadError.invalidWorkerExecution = error else {
-                return XCTFail("Expected invalid worker evidence, got \(error)")
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: paths.metadataURL)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidResolvedRunPlan = error else {
+                return XCTFail("Expected derived cross-clip plan mismatch, got \(error)")
             }
         }
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(metadata).write(to: url, options: .atomic)
-        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
-            guard case ProjectMetadataStore.LoadError.invalidWorkerExecution = error else {
-                return XCTFail("Expected invalid worker evidence, got \(error)")
+        try encoder.encode(metadata).write(to: paths.metadataURL, options: .atomic)
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: paths.metadataURL)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidResolvedRunPlan = error else {
+                return XCTFail("Expected derived cross-clip plan mismatch, got \(error)")
             }
         }
     }
@@ -111,12 +219,12 @@ final class ProjectMetadataStoreTests: XCTestCase {
             mappingAttemptCount: 1,
             mappingFallbackReasons: ["interrupted mapping resumed"],
             colmapComputeMode: .cpu,
-            plannedIncrementalCadence: .conservative,
-            activeIncrementalCadence: .conservative
+            plannedIncrementalCadence: .balancedGlobal,
+            activeIncrementalCadence: .balancedGlobal
         )
         let metadata = ProjectMetadata(
             title: "Recovering geometry",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             geometryRecovery: recovery
         )
 
@@ -143,32 +251,25 @@ final class ProjectMetadataStoreTests: XCTestCase {
         )
     }
 
-    func testRoundTripPreservesPermittedUprightFlipWithoutChangingGeometryArtifact() throws {
+    func testRoundTripPreservesViewerPreferenceWithoutEmbeddingGeometry() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
-        let geometry = makeAxisAlignedSignUnverifiedGeometryArtifact()
-        let geometryBytes = try JSONEncoder().encode(geometry)
-        XCTAssertNil(String(data: geometryBytes, encoding: .utf8)?.range(
-            of: "isViewOnlyFlipActive"
-        ))
         let metadata = ProjectMetadata(
             title: "Ambiguous upright",
-            input: .photos(folder: "/tmp/photos"),
-            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
-            geometryArtifact: geometry
+            input: .video(files: []),
+            viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
         )
 
         try ProjectMetadataStore.save(metadata, to: url)
-        _ = try ProjectMetadataStore.update(at: url) { metadata in
-            metadata.viewerPreferences.isUprightFlipActive = true
-        }
         let loaded = try ProjectMetadataStore.load(from: url)
 
         XCTAssertTrue(loaded.viewerPreferences.isUprightFlipActive)
-        XCTAssertEqual(loaded.geometryArtifact, geometry)
-        XCTAssertEqual(loaded.geometryArtifact?.modelHashes, geometry.modelHashes)
-        XCTAssertEqual(loaded.geometryArtifact?.provenance, geometry.provenance)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        )
+        XCTAssertNil(object["geometryArtifact"])
+        XCTAssertNil(object["trainingArtifact"])
 
         let updated = try ProjectMetadataStore.update(at: url) { metadata in
             metadata.notes = "Keep the view flipped"
@@ -180,106 +281,14 @@ final class ProjectMetadataStoreTests: XCTestCase {
         )
     }
 
-    func testSaveNormalizesUprightFlipWhenOrientationCannotBeFlipped() throws {
-        for (name, geometry) in [
-            ("unresolved", makeGeometryArtifact()),
-            ("verified", makeVerifiedGeometryArtifact()),
-        ] {
-            let root = try TestFileBuilder.makeTempDir()
-            defer { try? FileManager.default.removeItem(at: root) }
-            let url = root.appendingPathComponent("project.json")
-            let metadata = ProjectMetadata(
-                title: name,
-                input: .photos(folder: "/tmp/photos"),
-                resolvedRunPlan: makeResolvedRunPlan(for: geometry),
-                geometryArtifact: geometry,
-                viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
-            )
-
-            try ProjectMetadataStore.save(metadata, to: url)
-
-            XCTAssertFalse(
-                try ProjectMetadataStore.load(from: url)
-                    .viewerPreferences.isUprightFlipActive,
-                "\(name) projects cannot persist the view-only flip."
-            )
-        }
-    }
-
-    func testLoadNormalizesForgedUprightFlipWhenOrientationIsUnresolved() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("project.json")
-        let geometry = makeGeometryArtifact()
-        let metadata = ProjectMetadata(
-            title: "Forged preference",
-            input: .photos(folder: "/tmp/photos"),
-            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
-            geometryArtifact: geometry,
-            viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
-        )
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(metadata).write(to: url)
-
-        XCTAssertFalse(
-            try ProjectMetadataStore.load(from: url)
-                .viewerPreferences.isUprightFlipActive
-        )
-    }
-
-    func testLoadNormalizesForgedUprightFlipWhenSignUnverifiedArtifactIsMalformed() throws {
-        let mutations: [(String, (inout GeometryArtifact) -> Void)] = [
-            ("missing method", { $0.canonicalOrientation.method = nil }),
-            ("missing quaternion", {
-                $0.canonicalOrientation.sourceToCanonicalQuaternionWXYZ = nil
-            }),
-            ("non-unit quaternion", {
-                $0.canonicalOrientation.sourceToCanonicalQuaternionWXYZ = CanonicalQuaternionWXYZ(
-                    w: 2,
-                    x: 0,
-                    y: 0,
-                    z: 0
-                )
-            }),
-            ("invalid evidence", { $0.canonicalOrientation.evidence?.supportCount = 0 }),
-            ("missing opening direction", {
-                $0.canonicalOrientation.canonicalOpeningViewDirection = nil
-            }),
-        ]
-
-        for (name, mutate) in mutations {
-            let root = try TestFileBuilder.makeTempDir()
-            defer { try? FileManager.default.removeItem(at: root) }
-            let url = root.appendingPathComponent("project.json")
-            var geometry = makeAxisAlignedSignUnverifiedGeometryArtifact()
-            mutate(&geometry)
-            let metadata = ProjectMetadata(
-                title: name,
-                input: .photos(folder: "/tmp/photos"),
-                resolvedRunPlan: makeResolvedRunPlan(for: geometry),
-                geometryArtifact: geometry,
-                viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
-            )
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            try encoder.encode(metadata).write(to: url)
-
-            XCTAssertFalse(
-                try ProjectMetadataStore.load(from: url)
-                    .viewerPreferences.isUprightFlipActive,
-                "\(name) must not enable the view-only upright flip."
-            )
-        }
-    }
-
     func testRoundTripMetadata() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("project.json")
+        let paths = ProjectPaths(root: root)
+        let url = paths.metadataURL
+        let (_, receipt) = try TestFileBuilder.writeControlledVideoReceipt(paths: paths)
 
         let state = PipelineState(stage: .sfmMatching, lastError: "boom")
-        let output = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
         let checkpoint = PipelineCheckpoint(
             stage: .trainSplat,
             updatedAt: Date(timeIntervalSince1970: 123460),
@@ -292,10 +301,10 @@ final class ProjectMetadataStoreTests: XCTestCase {
             id: UUID(),
             createdAt: Date(timeIntervalSince1970: 123456),
             title: "Test",
-            input: .mixed(videos: ["/tmp/a.mov"], photosFolder: "/tmp/photos"),
+            input: .video(files: [receipt.projectRelativePath]),
+            videoInputReceipts: [receipt],
             requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .highDetail),
             state: state,
-            outputs: output,
             checkpoint: checkpoint,
             lastRunStartedAt: Date(timeIntervalSince1970: 123499)
         )
@@ -310,8 +319,6 @@ final class ProjectMetadataStoreTests: XCTestCase {
         XCTAssertEqual(loaded.requestedRunOptions, metadata.requestedRunOptions)
         XCTAssertEqual(loaded.state.stage, metadata.state.stage)
         XCTAssertEqual(loaded.state.lastError, metadata.state.lastError)
-        XCTAssertEqual(loaded.outputs?.splatPlyPath, metadata.outputs?.splatPlyPath)
-        XCTAssertEqual(loaded.outputs?.colmapModelPath, metadata.outputs?.colmapModelPath)
         XCTAssertEqual(loaded.checkpoint?.stage, metadata.checkpoint?.stage)
         XCTAssertEqual(loaded.checkpoint?.message, metadata.checkpoint?.message)
         XCTAssertEqual(loaded.lastRunStartedAt, Date(timeIntervalSince1970: 123499))
@@ -383,6 +390,69 @@ final class ProjectMetadataStoreTests: XCTestCase {
         }
     }
 
+    func testLoadRejectsRetiredFormat30FieldsAndMappingCheckpointPayload() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let metadata = ProjectMetadata(
+            title: "Current only",
+            input: .video(files: [])
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let baseline = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(metadata))
+                as? [String: Any]
+        )
+
+        for (field, value) in [
+            (
+                "outputs",
+                [
+                    "splatPlyPath": "Output/splat.ply",
+                    "colmapModelPath": "SfM/colmap/sparse/0",
+                ] as [String: Any]
+            ),
+            (
+                "reconstruction",
+                [
+                    "mapper": "colmap",
+                    "capturedAt": "2026-07-21T00:00:00Z",
+                    "registeredImages": 3,
+                    "totalImages": 3,
+                ] as [String: Any]
+            ),
+        ] {
+            var payload = baseline
+            payload[field] = value
+            try JSONSerialization.data(withJSONObject: payload).write(to: url)
+
+            XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+                guard case ProjectMetadataStore.LoadError.unexpectedFields = error else {
+                    return XCTFail("Expected retired \(field) rejection, got \(error)")
+                }
+            }
+        }
+
+        var mappingPayload = baseline
+        mappingPayload["checkpoint"] = [
+            "stage": "sfmMapping",
+            "updatedAt": "2026-07-21T00:00:00Z",
+            "details": [
+                "sfmMapping": [
+                    "_0": [
+                        "mapper": "colmap",
+                        "sparsePath": "SfM/colmap/sparse/0",
+                        "registeredImages": 3,
+                    ],
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: mappingPayload).write(to: url)
+
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url))
+    }
+
     func testSaveRejectsNonCurrentFormatVersion() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -390,7 +460,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let metadata = ProjectMetadata(
             formatVersion: ProjectMetadataStore.supportedFormatVersion - 1,
             title: "Wrong schema",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
@@ -409,7 +479,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let url = root.appendingPathComponent("project.json")
         let metadata = ProjectMetadata(
             title: "Invalid memory retry",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             trainingMemoryRetryBudgetBytes: 0
         )
 
@@ -421,118 +491,27 @@ final class ProjectMetadataStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
-    func testLoadRejectsTrainingArtifactMissingCurrentResumeBinding() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("project.json")
-        let incompleteCurrentFormat = """
-        {
-          "createdAt":"1970-01-01T00:00:00Z",
-          "formatVersion":\(ProjectMetadataStore.supportedFormatVersion),
-          "id":"00000000-0000-0000-0000-000000000003",
-          "input":{"photos":{"folder":"/tmp/photos"}},
-          "outputs":{"colmapModelPath":"SfM/colmap/sparse/0","splatPlyPath":"Output/splat.ply"},
-          "requestedRunOptions":{
-            "cameraGrouping":"automatic",
-            "capturePath":"orbit",
-            "detailProfile":"balanced",
-            "inputOrdering":"automatic",
-            "lensProjection":"automatic",
-            "photoSelection":"automatic",
-            "resourcePolicy":"automatic"
-          },
-          "state":{"lastError":null,"stage":"done"},
-          "title":"Incomplete current project",
-          "viewerPreferences":{"isUprightFlipActive":false},
-          "trainingArtifact":{
-            "completionStatus":"completed",
-            "completedIteration":7000,
-            "detailProfile":"balanced",
-            "cameraOrderSeed":42,
-            "elapsedSeconds":12.5,
-            "gaussianCount":1250,
-            "geometryDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "iterationLimit":7000,
-            "inputDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "outputPath":"Training/msplat/splat.ply",
-            "peakMemoryBytes":2147483648,
-            "plateauWindow":800,
-            "runtimeVersion":"native-metal-cli-v1",
-            "schemaVersion":1,
-            "trainerVersion":"1.1.3 (git 106499b)"
-          }
-        }
-        """
-        try incompleteCurrentFormat.write(to: url, atomically: true, encoding: .utf8)
-
-        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
-            guard case DecodingError.keyNotFound = error else {
-                return XCTFail("Expected keyNotFound, got \(error)")
-            }
-        }
-    }
-
-    func testMetadataReadsAndNoteUpdatesDoNotOpenCompletedTrainingOutput() throws {
+    func testMetadataReadsAndNoteUpdatesDoNotRequireArtifactSidecars() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
-        let missingOutput = "Training/msplat/splat.ply"
-        let artifact = TrainingArtifact(
-            trainerVersion: "1.1.3",
-            runtimeVersion: "native-metal-cli-v2",
-            trainerBuildDigest: String(repeating: "a", count: 64),
-            inputDigest: String(repeating: "b", count: 64),
-            geometryDigest: String(repeating: "c", count: 64),
-            detailProfile: .balanced,
-            iterationLimit: 7_000,
-            plateauWindow: 800,
-            cameraOrderSeed: 42,
-            completedIteration: 7_000,
-            checkpointPath: nil,
-            checkpointDigest: nil,
-            outputPath: missingOutput,
-            outputSHA256: String(repeating: "d", count: 64),
-            outputBytes: 1_024,
-            gaussianCount: 100,
-            elapsedSeconds: 10,
-            peakMemoryBytes: 1_024,
-            memoryBudgetBytes: 8_589_934_592,
-            rasterFallbackCount: 0,
-            rasterExactFallbackElapsedSeconds: 0,
-            rasterExactBufferGrowthCount: 0,
-            rasterExactBufferBytesAdded: 0,
-            rasterReplayElapsedSeconds: 0,
-            rasterPeakExactIntersectionCapacity: 0,
-            droppedIntersectionCount: 0,
-            sceneBounds: SplatSceneBounds(
-                center: .init(x: 0, y: 0, z: 0),
-                radius: 1
-            ),
-            completionStatus: .completed
-        )
         let metadata = ProjectMetadata(
-            title: "Missing output",
-            input: .photos(folder: "/tmp/photos"),
+            title: "Metadata only",
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
-            trainingArtifact: artifact,
-            state: PipelineState(stage: .done, lastError: nil),
-            outputs: OutputSpec(
-                splatPlyPath: "Output/splat.ply",
-                colmapModelPath: "SfM/colmap/sparse/0"
-            )
+            state: PipelineState(stage: .done, lastError: nil)
         )
 
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-        XCTAssertEqual(try ProjectMetadataStore.load(from: paths.metadataURL).trainingArtifact, artifact)
+        XCTAssertNoThrow(try ProjectMetadataStore.load(from: paths.metadataURL))
         let updated = try ProjectMetadataStore.update(at: paths.metadataURL) { metadata in
             metadata.notes = "Keep this project visible"
         }
 
         XCTAssertEqual(updated.notes, "Keep this project visible")
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: try paths.resolveProjectRelativePath(missingOutput).path
-        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.trainingManifestURL.path))
     }
 
     func testRoundTripPreservesNotes() throws {
@@ -541,7 +520,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let url = root.appendingPathComponent("project.json")
         let metadata = ProjectMetadata(
             title: "With Notes",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             notes: "First test in afternoon light"
         )
@@ -556,7 +535,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let url = root.appendingPathComponent("project.json")
         let pipelineSnapshot = ProjectMetadata(
             title: "Race",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             state: PipelineState(stage: .importInput, lastError: nil),
             notes: nil
@@ -564,7 +543,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         try ProjectMetadataStore.save(
             ProjectMetadata(
                 title: "Client-facing name",
-                input: .photos(folder: "/tmp/photos"),
+                input: .video(files: []),
                 requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
                 notes: "newer note from user"
             ),
@@ -587,7 +566,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let url = root.appendingPathComponent("project.json")
         let stalePipelineMetadata = ProjectMetadata(
             title: "Stale pipeline title",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         let futureData = Data("""
@@ -613,7 +592,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let url = root.appendingPathComponent("project.json")
         let metadata = ProjectMetadata(
             title: "First write",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
@@ -631,7 +610,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         try ProjectMetadataStore.save(
             ProjectMetadata(
                 title: "Outside",
-                input: .photos(folder: "/tmp/photos"),
+                input: .video(files: []),
                 requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
             ),
             to: outsideMetadataURL
@@ -652,7 +631,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             try ProjectMetadataStore.save(
                 ProjectMetadata(
                     title: "Should not land outside",
-                    input: .photos(folder: "/tmp/photos"),
+                    input: .video(files: []),
                     requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
                 ),
                 to: linkedMetadataURL
@@ -665,13 +644,10 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
-        let geometry = makeAxisAlignedSignUnverifiedGeometryArtifact()
         let initial = ProjectMetadata(
             title: "Original",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
-            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
-            geometryArtifact: geometry,
             state: PipelineState(stage: .importInput, lastError: nil),
             notes: "old note"
         )
@@ -742,7 +718,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let url = root.appendingPathComponent("project.json")
         let initial = ProjectMetadata(
             title: "Readable",
-            input: .photos(folder: "/tmp/photos"),
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             notes: "keep me"
         )
@@ -770,7 +746,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         try ProjectMetadataStore.save(
             ProjectMetadata(
                 title: "Outside",
-                input: .photos(folder: "/tmp/photos"),
+                input: .video(files: []),
                 requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
             ),
             to: outside
@@ -783,35 +759,6 @@ final class ProjectMetadataStoreTests: XCTestCase {
         XCTAssertThrowsError(try ProjectMetadataStore.load(from: metadataURL))
     }
 
-    func testRoundTripPreservesReconstructionSummary() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("project.json")
-
-        let captured = Date(timeIntervalSince1970: 1_700_000_000)
-        let summary = ReconstructionSummary(
-            mapper: "da3-refined",
-            capturedAt: captured,
-            registeredImages: 27,
-            totalImages: 30,
-            meanReprojectionError: 0.85,
-            pointCount: 14_231,
-            observationCount: 56_789,
-            meanTrackLength: 4.0
-        )
-        let metadata = ProjectMetadata(
-            title: "With Summary",
-            input: .photos(folder: "/tmp/photos"),
-            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
-            reconstruction: summary
-        )
-
-        try ProjectMetadataStore.save(metadata, to: url)
-        let loaded = try ProjectMetadataStore.load(from: url)
-
-        XCTAssertEqual(loaded.reconstruction, summary)
-        XCTAssertEqual(loaded.reconstruction?.registeredFraction ?? -1, 27.0 / 30.0, accuracy: 1e-9)
-    }
 }
 
 private final class LockedErrors: @unchecked Sendable {
@@ -833,16 +780,6 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
 
-        let reconstruction = ReconstructionSummary(
-            mapper: "point_triangulator+bundle_adjuster",
-            capturedAt: Date(timeIntervalSince1970: 1_700_000_500),
-            registeredImages: 28,
-            totalImages: 30,
-            meanReprojectionError: 0.81,
-            pointCount: 18_245,
-            observationCount: 71_022,
-            meanTrackLength: 3.9
-        )
         let stageTimings: [StageTimingRecord] = [
             .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 1_700_000_100), durationSeconds: 45),
             .init(stage: .sfmMapping, startedAt: Date(timeIntervalSince1970: 1_700_000_200), durationSeconds: 120),
@@ -853,14 +790,13 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
             id: UUID(uuidString: "33333333-3333-3333-3333-333333333333")!,
             createdAt: Date(timeIntervalSince1970: 1_699_999_000),
             title: "Full schema",
-            input: .mixed(videos: ["/tmp/a.mov"], photosFolder: "/tmp/photos"),
+            input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .highDetail),
             state: PipelineState(stage: .done, lastError: nil),
-            outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0"),
             checkpoint: nil,
             lastRunStartedAt: nil,
-            reconstruction: reconstruction,
             stageTimings: stageTimings,
+            createToViewerReadySeconds: 812.75,
             notes: "captured under window light",
             lastFailureAt: Date(timeIntervalSince1970: 1_699_999_500)
         )
@@ -868,109 +804,14 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: url)
         let loaded = try ProjectMetadataStore.load(from: url)
 
-        XCTAssertEqual(loaded.reconstruction, reconstruction)
         XCTAssertEqual(loaded.stageTimings, stageTimings)
+        XCTAssertEqual(loaded.createToViewerReadySeconds, 812.75)
         XCTAssertEqual(loaded.state.stage, .done)
         XCTAssertEqual(loaded.requestedRunOptions.capturePath, .walkthrough)
         XCTAssertEqual(loaded.requestedRunOptions.detailProfile, .highDetail)
-        XCTAssertEqual(loaded.input.videoFiles, ["/tmp/a.mov"])
-        XCTAssertEqual(loaded.input.photosFolder, "/tmp/photos")
+        XCTAssertEqual(loaded.input.videoFiles, [])
+        XCTAssertNil(loaded.input.photosFolder)
         XCTAssertEqual(loaded.notes, "captured under window light")
         XCTAssertEqual(loaded.lastFailureAt, Date(timeIntervalSince1970: 1_699_999_500))
     }
-}
-
-final class ReconstructionSummaryTests: XCTestCase {
-    func testRegisteredFractionGuardsAgainstZeroTotal() {
-        let summary = ReconstructionSummary(
-            mapper: "colmap",
-            capturedAt: Date(timeIntervalSince1970: 0),
-            registeredImages: 10,
-            totalImages: 0
-        )
-        XCTAssertEqual(summary.registeredFraction, 0)
-    }
-
-    func testInitFromReconstructionScoreCarriesAllFields() {
-        let score = ReconstructionScore(
-            registeredImages: 18,
-            totalImages: 20,
-            meanReprojectionError: 0.72,
-            pointCount: 5_000,
-            observationCount: 25_000,
-            meanTrackLength: 5.0
-        )
-        let captured = Date(timeIntervalSince1970: 1_700_000_000)
-        let summary = ReconstructionSummary(score: score, mapper: "colmap", capturedAt: captured)
-
-        XCTAssertEqual(summary.mapper, "colmap")
-        XCTAssertEqual(summary.capturedAt, captured)
-        XCTAssertEqual(summary.registeredImages, 18)
-        XCTAssertEqual(summary.totalImages, 20)
-        XCTAssertEqual(summary.meanReprojectionError, 0.72)
-        XCTAssertEqual(summary.pointCount, 5_000)
-        XCTAssertEqual(summary.observationCount, 25_000)
-        XCTAssertEqual(summary.meanTrackLength, 5.0)
-    }
-}
-
-private func makeAxisAlignedSignUnverifiedGeometryArtifact() -> GeometryArtifact {
-    var geometry = makeGeometryArtifact()
-    geometry.registeredViewCount = 8
-    geometry.totalViewCount = 8
-    geometry.orderedImageNames = (0..<8).map { String(format: "frame_%06d.jpg", $0) }
-    geometry.orderedImageTimestamps = (0..<8).map { Double($0) }
-    geometry.canonicalOrientation = CanonicalOrientationArtifact(
-        status: .axisAlignedSignUnverified,
-        method: .cameraRightNullspace,
-        sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ(
-            w: 1,
-            x: 0,
-            y: 0,
-            z: 0
-        ),
-        evidence: CanonicalOrientationEvidence(
-            supportCount: 8,
-            eigenvalue0: 0.001,
-            eigenvalue1: 0.1,
-            eigenvalue2: 0.899,
-            eigengap: 100,
-            medianResidualDegrees: 1,
-            p90ResidualDegrees: 2,
-            medianAbsoluteImageUpAgreement: 0.1,
-            signAgreement: 0.5,
-            bootstrapP95VariationDegrees: 1,
-            trajectoryPlaneAgreementDegrees: nil
-        ),
-        canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
-    )
-    return geometry
-}
-
-private func makeVerifiedGeometryArtifact() -> GeometryArtifact {
-    var geometry = makeAxisAlignedSignUnverifiedGeometryArtifact()
-    geometry.canonicalOrientation.status = .verified
-    geometry.canonicalOrientation.evidence?.medianAbsoluteImageUpAgreement = 0.8
-    geometry.canonicalOrientation.evidence?.signAgreement = 0.9
-    return geometry
-}
-
-private func makeResolvedRunPlan(
-    for geometry: GeometryArtifact
-) -> ResolvedRunPlan {
-    var plan = RunPlanResolver.resolve(
-        requestedOptions: RequestedRunOptions(
-            capturePath: .orbit,
-            detailProfile: .balanced
-        ),
-        input: .photos(folder: "/tmp/photos"),
-        hardware: HardwareProfile(
-            memoryGB: 48,
-            cpuCount: 16,
-            gpuWorkingSetGB: 36
-        ),
-        developmentOverrides: .none
-    )
-    plan.geometryWorkerBudget = geometry.workerExecution.resolvedBudget
-    return plan
 }

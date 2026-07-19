@@ -58,6 +58,7 @@ extension ToolchainManager {
 
     func installBundledBootstrap(
         _ bootstrap: ValidatedBootstrap,
+        publicKeyBase64: String,
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
@@ -65,26 +66,48 @@ extension ToolchainManager {
             throw ToolchainError.artifactNotFound
         }
         let versionedRoot = try versionedToolchainRoot(for: bootstrap.manifest.version)
-        try preflightBundledDiskSpace(for: bootstrap.core, at: versionedRoot)
-        return try await installToolchainAtomically(
-            versionedRoot: versionedRoot,
-            requiredCapabilities: request.capabilities,
-            onProgress: onProgress
-        ) { stagingRoot in
-            try installVerifiedArchive(
-                bootstrap.core,
-                archiveURL: bootstrap.archiveURL,
-                root: stagingRoot,
-                forceArchiveInspection: true,
+        guard let versionIdentity = semanticVersionIdentity(from: bootstrap.manifest.version) else {
+            throw ToolchainError.invalidManifest
+        }
+        return try await withInstallLock(for: versionedRoot) {
+            let container = versionedRoot.deletingLastPathComponent()
+            try validateAuthenticatedPublicationIdentity(
+                bootstrap.manifest,
+                in: container,
+                publicKeyBase64: publicKeyBase64
+            )
+            try recoverInterruptedInstallLocked(
+                at: container,
+                identity: versionIdentity,
+                publicKeyBase64: publicKeyBase64
+            )
+            try validateAuthenticatedPublicationIdentity(
+                bootstrap.manifest,
+                in: container,
+                publicKeyBase64: publicKeyBase64
+            )
+            try preflightBundledDiskSpace(for: bootstrap.core, at: versionedRoot)
+            return try await installToolchainAtomicallyLocked(
+                versionedRoot: versionedRoot,
+                requiredCapabilities: request.capabilities,
+                authenticatedManifest: bootstrap.manifest,
                 onProgress: onProgress
-            )
-            let state = ToolchainInstallState(
-                schemaVersion: ToolchainManifest.currentSchemaVersion,
-                installedArtifacts: [bootstrap.core.name: bootstrap.core.sha256],
-                installedCapabilities: bootstrap.core.capabilities.sorted(),
-                signedManifest: bootstrap.manifest
-            )
-            try saveInstallState(state, root: stagingRoot)
+            ) { stagingRoot in
+                try installVerifiedArchive(
+                    bootstrap.core,
+                    archiveURL: bootstrap.archiveURL,
+                    root: stagingRoot,
+                    forceArchiveInspection: true,
+                    onProgress: onProgress
+                )
+                let state = ToolchainInstallState(
+                    schemaVersion: ToolchainManifest.currentSchemaVersion,
+                    installedArtifacts: [bootstrap.core.name: bootstrap.core.sha256],
+                    installedCapabilities: bootstrap.core.capabilities.sorted(),
+                    signedManifest: bootstrap.manifest
+                )
+                try saveInstallState(state, root: stagingRoot)
+            }
         }
     }
 
@@ -105,6 +128,31 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain(
                 "Downloaded toolchain \(manifest.version) is older than the authenticated bundled version \(bootstrap.manifest.version)."
             )
+        }
+        try validateImmutableVersionFloor(manifest, floor: bootstrap.manifest)
+    }
+
+    func validateImmutableVersionFloor(
+        _ candidate: ToolchainManifest,
+        floor: ToolchainManifest
+    ) throws {
+        guard let candidateVersion = semanticVersionComponents(from: candidate.version),
+              let floorVersion = semanticVersionComponents(from: floor.version) else {
+            throw ToolchainError.invalidManifest
+        }
+        let comparison = compareSemanticVersions(candidateVersion, floorVersion)
+        guard comparison != .orderedAscending else {
+            throw ToolchainError.invalidToolchain(
+                "Toolchain \(candidate.version) is older than authenticated floor \(floor.version)."
+            )
+        }
+        if comparison == .orderedSame {
+            guard candidate.signatureEd25519 == floor.signatureEd25519,
+                  try candidate.canonicalData() == floor.canonicalData() else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain version \(candidate.version) conflicts with its authenticated immutable manifest."
+                )
+            }
         }
     }
 }

@@ -15,7 +15,7 @@ public enum ProjectDiagnosticBundle {
     /// Schema version embedded in the machine-readable JSON block. Bump
     /// when adding/removing/renaming top-level keys so downstream tools can
     /// detect a format change.
-    public static let machineReadableSchemaVersion = 12
+    public static let machineReadableSchemaVersion = 19
 
     /// Scrub a user-visible technical payload before it reaches a clipboard,
     /// save panel, or share surface. Project identity is included when the
@@ -56,13 +56,24 @@ public enum ProjectDiagnosticBundle {
         tailByteLimit: Int = defaultTailByteLimit
     ) -> String? {
         let paths = ProjectPaths(root: projectURL)
-        guard let metadata = try? ProjectMetadataStore.load(from: paths.metadataURL) else {
+        let snapshot = try? ProjectArtifactSnapshotStore.load(projectURL: projectURL)
+        guard let metadata = snapshot?.metadata
+                ?? (try? ProjectMetadataStore.load(from: paths.metadataURL)) else {
             return nil
         }
+        // A corrupt or torn sidecar is exactly when diagnostics matter most.
+        // Keep artifact facts absent unless the combined snapshot authenticated
+        // them; metadata and bounded logs remain safe to report.
+        let geometry = snapshot?.geometryArtifact
+        let training = snapshot?.trainingArtifact
         let pathSanitizer = HomePathSanitizer(
             sensitiveValues: [metadata.title, metadata.id.uuidString, projectURL.lastPathComponent]
         )
         let pairMatchingRecovery = validatedPairMatchingRecovery(
+            metadata: metadata,
+            paths: paths
+        )
+        let rejectedVocabularyRetrievals = validatedRejectedVocabularyRetrievals(
             metadata: metadata,
             paths: paths
         )
@@ -83,6 +94,7 @@ public enum ProjectDiagnosticBundle {
         }
         if let reconstructionSection = reconstructionSection(
             metadata: metadata,
+            geometry: geometry,
             sanitizer: pathSanitizer
         ) {
             sections.append(reconstructionSection)
@@ -92,14 +104,19 @@ public enum ProjectDiagnosticBundle {
         }
         if let stateSection = stateSection(
             metadata: metadata,
+            training: training,
             pairMatchingRecovery: pairMatchingRecovery,
+            rejectedVocabularyRetrievals: rejectedVocabularyRetrievals,
             sanitizer: pathSanitizer
         ) {
             sections.append(stateSection)
         }
         if let machineSection = machineReadableSection(
             metadata: metadata,
+            geometry: geometry,
+            training: training,
             pairMatchingRecovery: pairMatchingRecovery,
+            rejectedVocabularyRetrievals: rejectedVocabularyRetrievals,
             sanitizer: pathSanitizer
         ) {
             sections.append(machineSection)
@@ -163,81 +180,100 @@ public enum ProjectDiagnosticBundle {
 
     private static func reconstructionSection(
         metadata: ProjectMetadata,
+        geometry: GeometryArtifact?,
         sanitizer: HomePathSanitizer
     ) -> String? {
-        let mapping = metadata.geometryArtifact?.mapping
-        guard metadata.reconstruction != nil || mapping != nil else { return nil }
+        guard let geometry else { return nil }
+        let mapping = geometry.mapping
         var lines: [String] = ["## Reconstruction"]
-        if let reconstruction = metadata.reconstruction {
-            lines.append("Mapper: \(reconstruction.mapper)")
-            lines.append("Captured: \(iso8601(reconstruction.capturedAt))")
-            lines.append("Registered: \(reconstruction.registeredImages) / \(reconstruction.totalImages)")
-            if let reproj = reconstruction.meanReprojectionError {
-                lines.append("Mean reprojection error: \(String(format: "%.3f px", reproj))")
-            }
-            if let points = reconstruction.pointCount {
-                lines.append("Points: \(points)")
-            }
-            if let observations = reconstruction.observationCount {
-                lines.append("Observations: \(observations)")
-            }
-            if let track = reconstruction.meanTrackLength {
-                lines.append("Mean track length: \(String(format: "%.2f", track))")
-            }
+        lines.append("Solver: \(geometry.solverVersion)")
+        lines.append("Registered: \(geometry.registeredViewCount) / \(geometry.totalViewCount)")
+        lines.append("Points: \(geometry.pointCount)")
+        lines.append("Observations: \(geometry.observationCount)")
+        lines.append(
+            "Median residual: \(String(format: "%.3f px", geometry.medianPixelResidual))"
+        )
+        lines.append(
+            "P90 residual: \(String(format: "%.3f px", geometry.p90PixelResidual))"
+        )
+        if let grouping = geometry.cameraGroupingReceipt {
+            lines.append(
+                "Camera grouping: \(grouping.mode.rawValue) · \(geometry.totalViewCount) images · "
+                    + "\(grouping.cameraCountBefore) → \(grouping.cameraCountAfter) cameras"
+            )
         }
-        if let mapping {
+        lines.append(
+            "Models: \(mapping.modelCount) "
+                + "(largest \(mapping.largestModelRegisteredViewCount), "
+                + "second \(mapping.secondLargestModelRegisteredViewCount))"
+        )
+        lines.append("Union registered: \(mapping.unionRegisteredViewCount)")
+        lines.append("Mapping attempts: \(mapping.attemptCount)")
+        lines.append(
+            "Accepted mapping attempt: \(mapping.acceptedMappingAttemptOrdinal)"
+        )
+        let invocationLabel = mapping.acceptedRefinementInvocationCount == 1
+            ? "invocation"
+            : "invocations"
+        let refinementName = switch mapping.acceptedRefinementKind {
+        case .incrementalGlobal: "Incremental global"
+        case .seededBundleAdjustment: "Seeded bundle adjustment"
+        }
+        lines.append(
+            "Accepted refinement: \(refinementName) "
+                + "(\(mapping.acceptedRefinementInvocationCount) \(invocationLabel))"
+        )
+        if let plannedCadence = mapping.plannedIncrementalCadence,
+           plannedCadence != mapping.incrementalCadence {
             lines.append(
-                "Models: \(mapping.modelCount) "
-                    + "(largest \(mapping.largestModelRegisteredViewCount), "
-                    + "second \(mapping.secondLargestModelRegisteredViewCount))"
+                "Bundle adjustment plan: local \(plannedCadence.localMaxRefinements), "
+                    + "global \(String(format: "%.1f", plannedCadence.globalFramesRatio))× frames / "
+                    + "\(String(format: "%.1f", plannedCadence.globalPointsRatio))× points, "
+                    + "up to \(plannedCadence.globalMaxRefinements) refinements"
             )
-            lines.append("Union registered: \(mapping.unionRegisteredViewCount)")
-            lines.append("Mapping attempts: \(mapping.attemptCount)")
+        }
+        if let cadence = mapping.incrementalCadence {
+            let label = mapping.plannedIncrementalCadence == cadence
+                ? "Bundle adjustment"
+                : "Bundle adjustment accepted"
             lines.append(
-                "Accepted mapping attempt: \(mapping.acceptedMappingAttemptOrdinal)"
+                "\(label): local \(cadence.localMaxRefinements), "
+                    + "global \(String(format: "%.1f", cadence.globalFramesRatio))× frames / "
+                    + "\(String(format: "%.1f", cadence.globalPointsRatio))× points, "
+                    + "up to \(cadence.globalMaxRefinements) refinements"
             )
-            let invocationLabel = mapping.acceptedRefinementInvocationCount == 1
-                ? "invocation"
-                : "invocations"
-            let refinementName = switch mapping.acceptedRefinementKind {
-            case .incrementalGlobal: "Incremental global"
-            case .seededBundleAdjustment: "Seeded bundle adjustment"
-            }
-            lines.append(
-                "Accepted refinement: \(refinementName) "
-                    + "(\(mapping.acceptedRefinementInvocationCount) \(invocationLabel))"
-            )
-            if let cadence = mapping.incrementalCadence {
-                lines.append(
-                    "Bundle adjustment: local \(cadence.localMaxRefinements), "
-                        + "global \(String(format: "%.1f", cadence.globalFramesRatio))× frames / "
-                        + "\(String(format: "%.1f", cadence.globalPointsRatio))× points, "
-                        + "up to \(cadence.globalMaxRefinements) refinements"
-                )
-            }
-            if let fallbackReason = mapping.fallbackReason {
-                lines.append("Mapping fallback: \(sanitizer.sanitize(fallbackReason))")
-            }
+        }
+        if let trigger = mapping.cadenceFallbackTrigger {
+            lines.append("Bundle adjustment retry trigger: \(trigger.rawValue)")
+        }
+        if let fallbackReason = mapping.fallbackReason {
+            lines.append("Mapping fallback: \(sanitizer.sanitize(fallbackReason))")
         }
         return lines.joined(separator: "\n")
     }
 
     private static func stageTimingSection(metadata: ProjectMetadata) -> String? {
-        guard let timings = metadata.stageTimings, !timings.isEmpty else { return nil }
+        let timings = metadata.stageTimings ?? []
+        guard metadata.createToViewerReadySeconds != nil || !timings.isEmpty else { return nil }
         var lines: [String] = ["## Stage Timings"]
+        if let total = metadata.createToViewerReadySeconds {
+            lines.append("Create-to-viewer-ready: \(Int(total.rounded()))s")
+        }
         for record in timings.sorted(by: { $0.startedAt < $1.startedAt }) {
             let seconds = Int(record.durationSeconds.rounded())
             lines.append("- \(record.stage.rawValue): \(seconds)s")
         }
         if let total = timings.totalDurationSeconds {
-            lines.append("Total: \(Int(total.rounded()))s")
+            lines.append("Stage total: \(Int(total.rounded()))s")
         }
         return lines.joined(separator: "\n")
     }
 
     private static func stateSection(
         metadata: ProjectMetadata,
+        training: TrainingArtifact?,
         pairMatchingRecovery: PairGraphRecoveryState?,
+        rejectedVocabularyRetrievals: [RejectedVocabularyRetrievalExecutionEvidence],
         sanitizer: HomePathSanitizer
     ) -> String? {
         var lines: [String] = ["## Pipeline State"]
@@ -266,12 +302,22 @@ public enum ProjectDiagnosticBundle {
             if let level = recovery.pendingPairRecoveryLevel {
                 lines.append("Pending pair recovery: \(level.rawValue)")
             }
-            if let matcher = recovery.da3DescriptorMatcher {
-                lines.append("Recovery matcher: \(matcher.rawValue)")
+            if let trigger = recovery.cadenceFallbackTrigger {
+                lines.append("Recovery cadence retry: \(trigger.rawValue)")
+            }
+            if let pairAttempt = recovery.acceptedPairAttemptOrdinal {
+                lines.append("Recovery pair attempt: \(pairAttempt)")
             }
             for reason in recovery.mappingFallbackReasons {
                 lines.append("Recovery reason: \(sanitizer.sanitize(reason))")
             }
+        }
+        if let trainingResource = trainingResourceEvidence(training: training) {
+            lines.append(
+                "Training memory: \(trainingResource.memoryBudgetBytes) bytes budgeted of "
+                    + "\(trainingResource.admission.allowedTrainerBytes) bytes admitted; "
+                    + "\(trainingResource.peakMemoryBytes) bytes peak"
+            )
         }
         if let pairMatchingRecovery {
             lines.append("Matching attempts: \(pairMatchingRecovery.attempts.count)")
@@ -291,6 +337,23 @@ public enum ProjectDiagnosticBundle {
                 )
             }
         }
+        if !rejectedVocabularyRetrievals.isEmpty {
+            lines.append(
+                "Rejected retrieval attempts: \(rejectedVocabularyRetrievals.count)"
+            )
+            for attempt in rejectedVocabularyRetrievals {
+                let noNeighborCount = attempt.retrieval.queryOutcomes.count {
+                    $0.status == .noRankedNeighbors
+                }
+                lines.append(
+                    "Retrieval rejection \(attempt.retrievalAttemptOrdinal): "
+                        + "\(attempt.recoveryLevel.rawValue) · "
+                        + "\(attempt.retrieval.queryOutcomes.count) queries · "
+                        + "\(noNeighborCount) without ranked neighbors · "
+                        + String(format: "%.2fs", attempt.durationSeconds)
+                )
+            }
+        }
         if lines.count == 1 { return nil }
         return lines.joined(separator: "\n")
     }
@@ -301,14 +364,19 @@ public enum ProjectDiagnosticBundle {
     /// identifiers regardless of `includeNotes`.
     private static func machineReadableSection(
         metadata: ProjectMetadata,
+        geometry: GeometryArtifact?,
+        training: TrainingArtifact?,
         pairMatchingRecovery: PairGraphRecoveryState?,
+        rejectedVocabularyRetrievals: [RejectedVocabularyRetrievalExecutionEvidence],
         sanitizer: HomePathSanitizer
     ) -> String? {
-        guard metadata.reconstruction != nil
-            || metadata.geometryArtifact?.mapping != nil
+        guard geometry != nil
             || metadata.geometryRecovery != nil
+            || training != nil
             || (metadata.stageTimings?.isEmpty == false)
-            || metadata.lastFailureAt != nil else {
+            || metadata.createToViewerReadySeconds != nil
+            || metadata.lastFailureAt != nil
+            || !rejectedVocabularyRetrievals.isEmpty else {
             return nil
         }
         struct DiagnosticMapping: Encodable {
@@ -320,7 +388,9 @@ public enum ProjectDiagnosticBundle {
             var acceptedMappingAttemptOrdinal: Int
             var acceptedRefinementKind: String
             var acceptedRefinementInvocationCount: Int
+            var plannedIncrementalCadence: IncrementalMappingCadenceArtifact?
             var incrementalCadence: IncrementalMappingCadenceArtifact?
+            var cadenceFallbackTrigger: String?
             var fallbackReason: String?
 
             init(_ mapping: MappingArtifact) {
@@ -332,8 +402,31 @@ public enum ProjectDiagnosticBundle {
                 acceptedMappingAttemptOrdinal = mapping.acceptedMappingAttemptOrdinal
                 acceptedRefinementKind = mapping.acceptedRefinementKind.rawValue
                 acceptedRefinementInvocationCount = mapping.acceptedRefinementInvocationCount
+                plannedIncrementalCadence = mapping.plannedIncrementalCadence
                 incrementalCadence = mapping.incrementalCadence
+                cadenceFallbackTrigger = mapping.cadenceFallbackTrigger?.rawValue
                 fallbackReason = mapping.fallbackReason
+            }
+        }
+        struct DiagnosticReconstruction: Encodable {
+            var solverVersion: String
+            var registeredViewCount: Int
+            var totalViewCount: Int
+            var pointCount: Int
+            var observationCount: Int
+            var medianPixelResidual: Double
+            var p90PixelResidual: Double
+            var residualProvenance: String
+
+            init(_ geometry: GeometryArtifact) {
+                solverVersion = geometry.solverVersion
+                registeredViewCount = geometry.registeredViewCount
+                totalViewCount = geometry.totalViewCount
+                pointCount = geometry.pointCount
+                observationCount = geometry.observationCount
+                medianPixelResidual = geometry.medianPixelResidual
+                p90PixelResidual = geometry.p90PixelResidual
+                residualProvenance = geometry.residualProvenance
             }
         }
         struct DiagnosticGeometryRecovery: Encodable {
@@ -341,20 +434,26 @@ public enum ProjectDiagnosticBundle {
             var mappingAttemptCount: Int
             var mappingFallbackReasons: [String]
             var pendingPairRecoveryLevel: String?
-            var da3DescriptorMatcher: String?
             var colmapComputeMode: String?
             var plannedIncrementalCadence: IncrementalMappingCadenceArtifact?
             var activeIncrementalCadence: IncrementalMappingCadenceArtifact?
+            var cadenceFallbackTrigger: String?
+            var acceptedPairAttemptOrdinal: Int?
+            var pairListDigest: String?
+            var matchingDatabaseDigest: String?
 
             init(_ recovery: GeometryRecoveryState) {
                 activeBackend = recovery.activeBackend.rawValue
                 mappingAttemptCount = recovery.mappingAttemptCount
                 mappingFallbackReasons = recovery.mappingFallbackReasons
                 pendingPairRecoveryLevel = recovery.pendingPairRecoveryLevel?.rawValue
-                da3DescriptorMatcher = recovery.da3DescriptorMatcher?.rawValue
                 colmapComputeMode = recovery.colmapComputeMode?.rawValue
                 plannedIncrementalCadence = recovery.plannedIncrementalCadence
                 activeIncrementalCadence = recovery.activeIncrementalCadence
+                cadenceFallbackTrigger = recovery.cadenceFallbackTrigger?.rawValue
+                acceptedPairAttemptOrdinal = recovery.acceptedPairAttemptOrdinal
+                pairListDigest = recovery.pairListDigest
+                matchingDatabaseDigest = recovery.matchingDatabaseDigest
             }
         }
         struct DiagnosticPairMatchingRecovery: Encodable {
@@ -366,28 +465,73 @@ public enum ProjectDiagnosticBundle {
                 matchingDurationSeconds = recovery.matchingDurationSeconds
             }
         }
+        struct DiagnosticRejectedVocabularyRetrieval: Encodable {
+            var retrievalAttemptOrdinal: Int
+            var pairAttemptOrdinal: Int
+            var pairingPolicy: String
+            var recoveryLevel: String
+            var selectedViewCount: Int
+            var queryCount: Int
+            var noRankedNeighborQueryCount: Int
+            var candidateCount: Int
+            var returnedNeighborCount: Int
+            var durationSeconds: Double
+            var retrievalRequestDigest: String
+            var retrievalOutputDigest: String
+
+            init(_ evidence: RejectedVocabularyRetrievalExecutionEvidence) {
+                retrievalAttemptOrdinal = evidence.retrievalAttemptOrdinal
+                pairAttemptOrdinal = evidence.invocation.pairExecution?.attemptOrdinal ?? 0
+                pairingPolicy = evidence.pairingPolicy.rawValue
+                recoveryLevel = evidence.recoveryLevel.rawValue
+                selectedViewCount = evidence.imageNames.count
+                queryCount = evidence.retrieval.queryOutcomes.count
+                noRankedNeighborQueryCount = evidence.retrieval.queryOutcomes.count {
+                    $0.status == .noRankedNeighbors
+                }
+                candidateCount = evidence.retrieval.candidateCount
+                returnedNeighborCount = evidence.retrieval.returnedNeighborCount
+                durationSeconds = evidence.durationSeconds
+                retrievalRequestDigest = evidence.invocation.pairExecution?
+                    .retrievalRequestDigest ?? ""
+                retrievalOutputDigest = evidence.invocation.pairExecution?
+                    .retrievalOutputDigest ?? ""
+            }
+        }
         struct Payload: Encodable {
             var schemaVersion: Int
             var requestedRunOptions: RequestedRunOptions
             var resolvedGeometryExecutionBudget: GeometryWorkerBudget?
-            var reconstruction: ReconstructionSummary?
+            var reconstruction: DiagnosticReconstruction?
+            var cameraGrouping: ColmapCameraGroupingReceipt?
             var mapping: DiagnosticMapping?
             var geometryRecovery: DiagnosticGeometryRecovery?
             var pairMatchingRecovery: DiagnosticPairMatchingRecovery?
+            var rejectedVocabularyRetrievalAttempts: [
+                DiagnosticRejectedVocabularyRetrieval
+            ]
+            var trainingResource: TrainingResourceDiagnosticEvidence?
             var stageTimings: [StageTimingRecord]?
+            var createToViewerReadySeconds: Double?
             var lastFailureAt: Date?
         }
         let payload = Payload(
             schemaVersion: ProjectDiagnosticBundle.machineReadableSchemaVersion,
             requestedRunOptions: metadata.requestedRunOptions,
             resolvedGeometryExecutionBudget: metadata.resolvedRunPlan?.geometryWorkerBudget,
-            reconstruction: metadata.reconstruction,
-            mapping: metadata.geometryArtifact.map { DiagnosticMapping($0.mapping) },
+            reconstruction: geometry.map(DiagnosticReconstruction.init),
+            cameraGrouping: geometry?.cameraGroupingReceipt,
+            mapping: geometry.map { DiagnosticMapping($0.mapping) },
             geometryRecovery: metadata.geometryRecovery.map(DiagnosticGeometryRecovery.init),
             pairMatchingRecovery: pairMatchingRecovery.map(
                 DiagnosticPairMatchingRecovery.init
             ),
+            rejectedVocabularyRetrievalAttempts: rejectedVocabularyRetrievals.map(
+                DiagnosticRejectedVocabularyRetrieval.init
+            ),
+            trainingResource: trainingResourceEvidence(training: training),
             stageTimings: metadata.stageTimings,
+            createToViewerReadySeconds: metadata.createToViewerReadySeconds,
             lastFailureAt: metadata.lastFailureAt
         )
         let encoder = JSONEncoder()
@@ -418,6 +562,53 @@ public enum ProjectDiagnosticBundle {
             return nil
         }
         return state
+    }
+
+    private static func validatedRejectedVocabularyRetrievals(
+        metadata: ProjectMetadata,
+        paths: ProjectPaths
+    ) -> [RejectedVocabularyRetrievalExecutionEvidence] {
+        guard let plan = metadata.resolvedRunPlan,
+              let artifact = try? GeometryWorkerExecutionArtifactStore.load(
+                from: paths.workerExecutionURL,
+                expectedBudget: plan.geometryWorkerBudget,
+                projectPaths: paths
+              ),
+              artifact.rejectedVocabularyRetrievalInvocations.allSatisfy({
+                  $0.pairingPolicy == plan.pairingPolicy
+                      && $0.planBinding == PairGraphPlanBinding(plan)
+              }) else {
+            return []
+        }
+        if let recovery = metadata.geometryRecovery,
+           !artifact.rejectedVocabularyRetrievalInvocations.allSatisfy({
+               $0.imageNames == recovery.orderedImageNames
+           }) {
+            return []
+        }
+        return artifact.rejectedVocabularyRetrievalInvocations
+    }
+
+    private static func trainingResourceEvidence(
+        training: TrainingArtifact?
+    ) -> TrainingResourceDiagnosticEvidence? {
+        guard let training,
+              TrainingMemoryBudget.isValid(training.resourceAdmission),
+              let memoryBudgetBytes = UInt64(exactly: training.memoryBudgetBytes),
+              memoryBudgetBytes > 0,
+              memoryBudgetBytes <= training.resourceAdmission.allowedTrainerBytes,
+              let peakMemoryBytes = UInt64(exactly: training.peakMemoryBytes),
+              let growthCount = UInt64(exactly: training.rasterExactBufferGrowthCount),
+              let bytesAdded = UInt64(exactly: training.rasterExactBufferBytesAdded) else {
+            return nil
+        }
+        return TrainingResourceDiagnosticEvidence(
+            admission: training.resourceAdmission,
+            memoryBudgetBytes: memoryBudgetBytes,
+            peakMemoryBytes: peakMemoryBytes,
+            rasterExactBufferGrowthCount: growthCount,
+            rasterExactBufferBytesAdded: bytesAdded
+        )
     }
 
     private static func logTailSection(

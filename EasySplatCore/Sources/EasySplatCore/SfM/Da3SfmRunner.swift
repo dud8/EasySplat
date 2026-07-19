@@ -2,9 +2,10 @@ import Foundation
 
 /// Runtime options for invoking the Depth Anything 3 SfM bridge.
 public struct Da3SfmConfig: Sendable {
+    public static let requiredDevice = "mps"
+
     public var device: String
     public var modelSubdirectory: String
-    public var fallbackModelSubdirectory: String
     public var processResolution: Int
     public var maxPoints: Int
     public var cameraType: String
@@ -17,7 +18,6 @@ public struct Da3SfmConfig: Sendable {
     public init(
         device: String = "mps",
         modelSubdirectory: String = "DA3-BASE",
-        fallbackModelSubdirectory: String = "DA3-SMALL",
         processResolution: Int = 504,
         maxPoints: Int = 120_000,
         cameraType: String = "PINHOLE",
@@ -29,7 +29,6 @@ public struct Da3SfmConfig: Sendable {
     ) {
         self.device = device
         self.modelSubdirectory = modelSubdirectory
-        self.fallbackModelSubdirectory = fallbackModelSubdirectory
         self.processResolution = processResolution
         self.maxPoints = maxPoints
         self.cameraType = cameraType
@@ -55,6 +54,7 @@ public protocol Da3SfmRunning: Sendable {
 public enum Da3SfmError: Error {
     case missingTool
     case missingModels
+    case unsupportedDevice(String)
     case commandFailed(String)
 }
 
@@ -73,6 +73,9 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
         config: Da3SfmConfig,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
+        guard config.device == Da3SfmConfig.requiredDevice else {
+            throw Da3SfmError.unsupportedDevice(config.device)
+        }
         let fm = FileManager.default
         guard fm.fileExists(atPath: toolchain.sfmTool.path) else {
             throw Da3SfmError.missingTool
@@ -86,7 +89,6 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
             "--models-dir", toolchain.models.path,
             "--device", config.device,
             "--model-subdir", config.modelSubdirectory,
-            "--fallback-model-subdir", config.fallbackModelSubdirectory,
             "--process-res", "\(config.processResolution)",
             "--max-points", "\(config.maxPoints)",
             "--camera-type", config.cameraType,
@@ -102,7 +104,7 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
             args.append(contentsOf: ["--manifest-out", coverageManifestPath.path])
         }
 
-        var environment = RuntimeEnvironment.current
+        var environment = SubprocessRunner.sanitizedAmbientEnvironment()
         for key in ["PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONSTARTUP", "PYTHONINSPECT"] {
             environment.removeValue(forKey: key)
         }
@@ -122,7 +124,7 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
         environment["DO_NOT_TRACK"] = "1"
         environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
         environment["TOKENIZERS_PARALLELISM"] = "false"
-        environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
 
         let pythonBin = toolchain.python.deletingLastPathComponent().path
         if let existingPath = environment["PATH"] {

@@ -1,13 +1,15 @@
 import Foundation
 import Darwin
 
-enum DescriptorMatcherRecoveryReason: String, Sendable, Equatable {
+public enum DescriptorMatcherRecoveryReason: String, Codable, Sendable, Equatable {
     case faissCrash
     case faissUnsupportedOperation
     case faissGeometryRejectedAfterRetries
 }
 
 enum DescriptorMatcherRecoveryPolicy {
+    static let maximumExactRecoveryPairCount = 256
+
     private static let fatalComputeSignals: Set<Int32> = [
         SIGILL,
         SIGABRT,
@@ -20,9 +22,11 @@ enum DescriptorMatcherRecoveryPolicy {
 
     static func reason(
         for error: Error,
-        currentMatcher: DescriptorMatcher
+        currentMatcher: DescriptorMatcher,
+        scheduledPairCount: Int
     ) -> DescriptorMatcherRecoveryReason? {
         guard currentMatcher == .faiss,
+              permitsExactRecovery(scheduledPairCount: scheduledPairCount),
               case let ColmapRunnerError.failed(command, exitCode, terminationReason, stdoutTail, stderrTail) = error,
               matchingCommands.contains(command) else {
             return nil
@@ -50,11 +54,18 @@ enum DescriptorMatcherRecoveryPolicy {
 
     static func reasonForRejectedGeometry(
         currentMatcher: DescriptorMatcher,
-        exhaustedFaissRetries: Bool
+        exhaustedFaissRetries: Bool,
+        scheduledPairCount: Int
     ) -> DescriptorMatcherRecoveryReason? {
-        guard currentMatcher == .faiss, exhaustedFaissRetries else {
+        guard currentMatcher == .faiss,
+              exhaustedFaissRetries,
+              permitsExactRecovery(scheduledPairCount: scheduledPairCount) else {
             return nil
         }
         return .faissGeometryRejectedAfterRetries
+    }
+
+    static func permitsExactRecovery(scheduledPairCount: Int) -> Bool {
+        (1...maximumExactRecoveryPairCount).contains(scheduledPairCount)
     }
 }

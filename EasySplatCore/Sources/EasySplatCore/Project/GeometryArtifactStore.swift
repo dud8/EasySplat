@@ -21,12 +21,16 @@ enum GeometryArtifactStore {
         case measuredResidualMismatch
         case manifestTooLarge
         case invalidLearnedInitializer
+        case invalidCameraGrouping
         case learnedInitializerDigestMismatch
         case invalidPairGraph
         case invalidMapping
         case invalidCanonicalOrientation
+        case invalidConditioning
+        case conditioningMismatch
         case invalidTimings
         case invalidWorkerExecution
+        case invalidRunPlanBinding
 
         var errorDescription: String? {
             switch self {
@@ -52,6 +56,8 @@ enum GeometryArtifactStore {
                 return "Geometry artifact exceeds the supported size."
             case .invalidLearnedInitializer:
                 return "Geometry artifact has an invalid learned point initializer."
+            case .invalidCameraGrouping:
+                return "Geometry artifact camera grouping is incomplete or inconsistent."
             case .learnedInitializerDigestMismatch:
                 return "Learned point initialization no longer matches accepted geometry."
             case .invalidPairGraph:
@@ -60,15 +66,25 @@ enum GeometryArtifactStore {
                 return "Geometry artifact mapping evidence is incomplete or inconsistent."
             case .invalidCanonicalOrientation:
                 return "Geometry artifact orientation evidence is incomplete or inconsistent."
+            case .invalidConditioning:
+                return "Geometry artifact conditioning evidence is incomplete or inconsistent."
+            case .conditioningMismatch:
+                return "Geometry artifact conditioning evidence does not match its source model."
             case .invalidTimings:
                 return "Geometry artifact timing evidence is incomplete or invalid."
             case .invalidWorkerExecution:
                 return "Geometry artifact worker execution evidence is incomplete or invalid."
+            case .invalidRunPlanBinding:
+                return "Geometry artifact does not match its resolved run plan."
             }
         }
     }
 
-    static func load(from url: URL, projectPaths: ProjectPaths) throws -> GeometryArtifact {
+    static func load(
+        from url: URL,
+        projectPaths: ProjectPaths,
+        expectedInput: InputSpec? = nil
+    ) throws -> GeometryArtifact {
         let data = try BoundedFileReader.readRegularFile(
             at: url,
             maximumBytes: maximumManifestBytes
@@ -78,8 +94,49 @@ enum GeometryArtifactStore {
             throw Error.invalidSchema(envelope.schemaVersion)
         }
         let artifact = try JSONDecoder().decode(GeometryArtifact.self, from: data)
-        let input = try projectInputIfPresent(projectPaths: projectPaths)
-        try validate(artifact, projectPaths: projectPaths, input: input)
+        let input = try expectedInput ?? projectInputIfPresent(projectPaths: projectPaths)
+        let analysis = try validatedAnalysis(
+            artifact,
+            projectPaths: projectPaths,
+            input: input
+        )
+        let stableData = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: maximumManifestBytes
+        )
+        guard stableData == data else {
+            throw Error.artifactDigestMismatch("geometry manifest")
+        }
+        let sourceModel = try projectPaths.resolveProjectRelativePath(artifact.sourceModelPath)
+        do {
+            try GeometryModelSnapshot.validate(analysis.modelSnapshot, at: sourceModel)
+        } catch {
+            throw Error.modelHashMismatch("source snapshot")
+        }
+        return artifact
+    }
+
+    static func loadManifest(
+        from url: URL,
+        projectPaths: ProjectPaths
+    ) throws -> GeometryArtifact {
+        let data = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: maximumManifestBytes
+        )
+        let envelope = try JSONDecoder().decode(SchemaVersionEnvelope.self, from: data)
+        guard envelope.schemaVersion == GeometryArtifact.currentSchemaVersion else {
+            throw Error.invalidSchema(envelope.schemaVersion)
+        }
+        let artifact = try JSONDecoder().decode(GeometryArtifact.self, from: data)
+        _ = try projectPaths.resolveProjectRelativePath(artifact.sourceModelPath)
+        let stableData = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: maximumManifestBytes
+        )
+        guard stableData == data else {
+            throw Error.artifactDigestMismatch("geometry manifest")
+        }
         return artifact
     }
 
@@ -87,62 +144,83 @@ enum GeometryArtifactStore {
         let schemaVersion: Int
     }
 
+    static func manifestDigest(
+        matching expectedArtifact: GeometryArtifact,
+        at url: URL
+    ) throws -> String {
+        let data = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: maximumManifestBytes
+        )
+        let envelope = try JSONDecoder().decode(SchemaVersionEnvelope.self, from: data)
+        guard envelope.schemaVersion == GeometryArtifact.currentSchemaVersion else {
+            throw Error.invalidSchema(envelope.schemaVersion)
+        }
+        let persistedArtifact = try JSONDecoder().decode(GeometryArtifact.self, from: data)
+        guard persistedArtifact == expectedArtifact else {
+            throw Error.artifactDigestMismatch("geometry manifest")
+        }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     static func persist(
         _ artifact: GeometryArtifact,
         metadata: inout ProjectMetadata,
         paths: ProjectPaths,
         measuredResiduals: ColmapResidualAnalyzer.Result? = nil,
-        verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil
+        verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil,
+        measuredAnalysis: GeometryConditioningAnalysis? = nil
     ) throws {
-        guard metadata.resolvedRunPlan?.geometryWorkerBudget
-                == artifact.workerExecution.resolvedBudget else {
-            throw Error.invalidWorkerExecution
+        guard let resolvedRunPlan = metadata.resolvedRunPlan else {
+            throw Error.invalidRunPlanBinding
         }
-        try validate(
+        try requireRunPlanBinding(artifact, plan: resolvedRunPlan)
+        let analysis = try validatedAnalysis(
             artifact,
             projectPaths: paths,
             measuredResiduals: measuredResiduals,
             verifiedSourceSnapshot: verifiedSourceSnapshot,
+            measuredAnalysis: measuredAnalysis,
             input: metadata.input
         )
+        let sourceModel = try paths.resolveProjectRelativePath(artifact.sourceModelPath)
+        do {
+            try GeometryModelSnapshot.validate(analysis.modelSnapshot, at: sourceModel)
+        } catch {
+            throw Error.modelHashMismatch("source snapshot")
+        }
+        if let verifiedSourceSnapshot {
+            do {
+                try GeometryModelSnapshot.validate(
+                    verifiedSourceSnapshot,
+                    at: sourceModel
+                )
+            } catch {
+                throw Error.modelHashMismatch("source snapshot")
+            }
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(artifact)
         guard data.count <= maximumManifestBytes else { throw Error.manifestTooLarge }
-        let previousManifest: Data?
-        do {
-            previousManifest = try BoundedFileReader.readRegularFile(
-                at: paths.geometryManifestURL,
-                maximumBytes: maximumManifestBytes
-            )
-        } catch where BoundedFileReader.isMissingFileError(error) {
-            previousManifest = nil
-        }
+        try prepareManifestDestinationForAtomicReplacement(paths.geometryManifestURL)
         try data.write(to: paths.geometryManifestURL, options: [.atomic])
+        _ = try load(from: paths.geometryManifestURL, projectPaths: paths, expectedInput: metadata.input)
+    }
 
-        let previousArtifact = metadata.geometryArtifact
-        do {
-            if let verifiedSourceSnapshot {
-                let sourceModel = try paths.resolveProjectRelativePath(artifact.sourceModelPath)
-                do {
-                    try GeometryModelSnapshot.validate(
-                        verifiedSourceSnapshot,
-                        at: sourceModel
-                    )
-                } catch {
-                    throw Error.modelHashMismatch("source snapshot")
-                }
-            }
-            metadata.geometryArtifact = artifact
-            try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
-        } catch {
-            metadata.geometryArtifact = previousArtifact
-            if let previousManifest {
-                try? previousManifest.write(to: paths.geometryManifestURL, options: [.atomic])
-            } else {
-                try? FileManager.default.removeItem(at: paths.geometryManifestURL)
-            }
-            throw error
+    private static func prepareManifestDestinationForAtomicReplacement(_ url: URL) throws {
+        let fileManager = FileManager.default
+        let isSymlink = (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
+        guard fileManager.fileExists(atPath: url.path) || isSymlink else { return }
+
+        let attributes = try? fileManager.attributesOfItem(atPath: url.path)
+        let isRegular = attributes?[.type] as? FileAttributeType == .typeRegular
+        let linkCount = (attributes?[.referenceCount] as? NSNumber)?.intValue
+        guard !isSymlink, isRegular, linkCount == 1 else {
+            // This is an app-owned reserved path. Remove only the directory entry;
+            // never follow a link or let a non-file block later recovery.
+            try? fileManager.removeItem(at: url)
+            throw Error.artifactDigestMismatch("geometry manifest destination")
         }
     }
 
@@ -153,6 +231,76 @@ enum GeometryArtifactStore {
         verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil,
         input: InputSpec? = nil
     ) throws {
+        _ = try validatedAnalysis(
+            artifact,
+            projectPaths: projectPaths,
+            measuredResiduals: measuredResiduals,
+            verifiedSourceSnapshot: verifiedSourceSnapshot,
+            input: input
+        )
+    }
+
+    static func requireRunPlanBinding(
+        _ artifact: GeometryArtifact,
+        plan: ResolvedRunPlan
+    ) throws {
+        do {
+            try plan.validate()
+        } catch {
+            throw Error.invalidRunPlanBinding
+        }
+
+        let provenanceMatchesRoute: Bool
+        switch plan.geometryBackend {
+        case .colmap:
+            provenanceMatchesRoute = artifact.provenance.runtime == nil
+                && artifact.provenance.model == nil
+                && artifact.modelVersion == "none"
+        case .da3:
+            if let runtime = artifact.provenance.runtime,
+               let model = artifact.provenance.model {
+                provenanceMatchesRoute = runtime.identifier == "da3_mps"
+                    && model.identifier == plan.modelIdentifier
+                    && artifact.modelVersion == "\(model.identifier)@\(model.revision)"
+            } else {
+                provenanceMatchesRoute = false
+            }
+        }
+
+        guard artifact.cameraGrouping == plan.cameraGrouping,
+              artifact.cameraInitializationReceipt.recipe
+                == plan.cameraInitializationRecipe,
+              artifact.workerExecution.resolvedBudget == plan.geometryWorkerBudget,
+              provenanceMatchesRoute,
+              artifact.pairGraph.measurement.map({
+                  $0.pairingPolicy == plan.pairingPolicy
+              }) ?? true else {
+            throw Error.invalidRunPlanBinding
+        }
+
+        if artifact.mapping.acceptedRefinementKind == .incrementalGlobal {
+            guard let cadence = artifact.mapping.plannedIncrementalCadence,
+                  cadence.localMaxRefinements == plan.baLocalMaxRefinements,
+                  cadence.globalFramesRatio == plan.baGlobalFramesRatio,
+                  cadence.globalPointsRatio == plan.baGlobalPointsRatio,
+                  cadence.globalMaxRefinements == plan.baGlobalMaxRefinements,
+                  cadence.localMaxNumIterations == plan.baLocalMaxNumIterations,
+                  cadence.localFunctionTolerance == plan.baLocalFunctionTolerance,
+                  cadence.globalFunctionTolerance == plan.baGlobalFunctionTolerance,
+                  cadence.localImageCount == plan.baLocalImageCount else {
+                throw Error.invalidRunPlanBinding
+            }
+        }
+    }
+
+    private static func validatedAnalysis(
+        _ artifact: GeometryArtifact,
+        projectPaths: ProjectPaths,
+        measuredResiduals: ColmapResidualAnalyzer.Result? = nil,
+        verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil,
+        measuredAnalysis: GeometryConditioningAnalysis? = nil,
+        input: InputSpec? = nil
+    ) throws -> GeometryConditioningAnalysis {
         guard artifact.schemaVersion == GeometryArtifact.currentSchemaVersion else {
             throw Error.invalidSchema(artifact.schemaVersion)
         }
@@ -180,6 +328,9 @@ enum GeometryArtifactStore {
               !provenance.toolchainVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               provenance.solver.identifier == "colmap",
               validComponent(provenance.solver),
+              artifact.workerExecution.colmapRuntimeClosure.isValid,
+              provenance.solver.payloadSHA256
+                == artifact.workerExecution.colmapRuntimeClosure.closureSHA256,
               (provenance.runtime == nil) == (provenance.model == nil) else {
             throw Error.invalidProvenance
         }
@@ -198,6 +349,42 @@ enum GeometryArtifactStore {
               artifact.handedness == "right-handed",
               artifact.scaleType == "arbitrary-sim3" else {
             throw Error.invalidCanonicalOrientation
+        }
+        guard let cameraGroupingReceipt = artifact.cameraGroupingReceipt,
+              cameraGroupingReceipt.isValid(
+                  selectedImageCount: artifact.totalViewCount
+              ),
+              let featureDatabaseDigest = artifact.featureDatabaseDigest,
+              isSHA256(featureDatabaseDigest) else {
+            throw Error.invalidCameraGrouping
+        }
+        guard artifact.cameraInitializationReceipt.isValid else {
+            throw Error.invalidCameraGrouping
+        }
+        guard artifact.cameraInitializationReceipt.cameraModel == artifact.cameraModel,
+              artifact.cameraInitializationReceipt.singleCamera
+                == (cameraGroupingReceipt.mode == .allSelectedImagesShared) else {
+            throw Error.invalidCameraGrouping
+        }
+        if artifact.cameraInitializationReceipt.recipe
+            == .sharedOpenCVFisheyeEquidistantDiagonal150V1 {
+            guard cameraGroupingReceipt.mode == .allSelectedImagesShared,
+                  artifact.cameraInitializationReceipt.cameraModel == "OPENCV_FISHEYE",
+                  artifact.cameraModel == "OPENCV_FISHEYE" else {
+                throw Error.invalidCameraGrouping
+            }
+        }
+        switch artifact.cameraGrouping {
+        case .sameCameraAndLens:
+            guard cameraGroupingReceipt.mode == .allSelectedImagesShared else {
+                throw Error.invalidCameraGrouping
+            }
+        case .mixedCamerasOrLenses:
+            guard cameraGroupingReceipt.mode != .allSelectedImagesShared else {
+                throw Error.invalidCameraGrouping
+            }
+        case .automatic:
+            break
         }
         guard artifact.sourceModelPath == "SfM/colmap/sparse/0",
               let sourceModel = try? projectPaths.resolveProjectRelativePath(
@@ -238,7 +425,7 @@ enum GeometryArtifactStore {
         guard isSHA256(artifact.inputDigest) else { throw Error.invalidDigest("input") }
         guard isSHA256(artifact.selectedFramesDigest) else { throw Error.invalidDigest("selected frames") }
         guard artifact.residualProvenance == "colmap-text-tracks-v1",
-              artifact.trackCount > 0,
+              artifact.observationCount > 0,
               artifact.pointCount > 0,
               artifact.totalViewCount > 0,
               artifact.registeredViewCount > 0,
@@ -271,17 +458,23 @@ enum GeometryArtifactStore {
               }) else {
             throw Error.invalidTimings
         }
+        let hasLearnedProvenance = provenance.runtime != nil
+            && provenance.model != nil
         try validatePairGraph(
             artifact.pairGraph,
             totalViewCount: artifact.totalViewCount,
-            registeredViewCount: artifact.registeredViewCount
+            registeredViewCount: artifact.registeredViewCount,
+            hasLearnedProvenance: hasLearnedProvenance
         )
         try validateMapping(
             artifact.mapping,
             totalViewCount: artifact.totalViewCount,
             registeredViewCount: artifact.registeredViewCount,
             pairGraphStatus: artifact.pairGraph.status,
-            hasLearnedProvenance: provenance.runtime != nil && provenance.model != nil
+            hasLearnedProvenance: hasLearnedProvenance,
+            canonicalModelHashes: artifact.modelHashes,
+            canonicalModelURL: sourceModel,
+            projectPaths: projectPaths
         )
         do {
             try artifact.workerExecution.validateForPublishedGeometry(
@@ -296,6 +489,20 @@ enum GeometryArtifactStore {
         } catch {
             throw Error.invalidWorkerExecution
         }
+        if let input {
+            guard cameraGroupingReceipt.groupedVideoSourceCount == input.videoFiles.count else {
+                throw Error.invalidCameraGrouping
+            }
+        }
+        if let conversion = artifact.mapping.canonicalModelPublication.conversion {
+            guard conversion.workerEvidence.executableComponentPath == "bin/colmap",
+                  conversion.workerEvidence.executableSHA256
+                    == artifact.workerExecution.colmapRuntimeClosure.sha256(
+                        for: "bin/colmap"
+                    ) else {
+                throw Error.invalidWorkerExecution
+            }
+        }
         try validateCanonicalOrientation(
             artifact.canonicalOrientation,
             registeredViewCount: artifact.registeredViewCount
@@ -304,6 +511,13 @@ enum GeometryArtifactStore {
               artifact.modelHashes.values.allSatisfy(isSHA256) else {
             throw Error.invalidDigest("model")
         }
+        try validateConditioning(
+            artifact.conditioning,
+            registeredViewCount: artifact.registeredViewCount,
+            pointCount: artifact.pointCount,
+            observationCount: artifact.observationCount,
+            modelHashes: artifact.modelHashes
+        )
         if let verifiedSourceSnapshot {
             for name in ["cameras.txt", "images.txt", "points3D.txt"] {
                 guard verifiedSourceSnapshot.modelHashes[name]
@@ -333,8 +547,45 @@ enum GeometryArtifactStore {
             throw Error.artifactDigestMismatch("selected frames")
         }
 
-        let measured = try measuredResiduals
-            ?? ColmapResidualAnalyzer.analyze(modelDirectory: sourceModel)
+        let analysis: GeometryConditioningAnalysis
+        if let measuredAnalysis {
+            for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+                guard measuredAnalysis.modelSnapshot.modelHashes[name]
+                        == artifact.modelHashes[name] else {
+                    throw Error.modelHashMismatch(name)
+                }
+            }
+            do {
+                try GeometryModelSnapshot.validate(
+                    measuredAnalysis.modelSnapshot,
+                    at: sourceModel
+                )
+            } catch {
+                throw Error.modelHashMismatch("source snapshot")
+            }
+            analysis = measuredAnalysis
+        } else {
+            do {
+                analysis = try ColmapResidualAnalyzer.analyzeConditioning(
+                    modelDirectory: sourceModel,
+                    maximumRayPairEvaluations: artifact.conditioning.maximumRayPairEvaluations,
+                    checkCancellation: { try Task.checkCancellation() }
+                )
+            } catch is GeometryConditioningFailure {
+                throw Error.conditioningMismatch
+            } catch is GeometryModelSnapshot.Error {
+                throw Error.modelHashMismatch("source snapshot")
+            }
+        }
+        let measured = analysis.residuals
+        for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+            guard analysis.modelSnapshot.modelHashes[name] == artifact.modelHashes[name] else {
+                throw Error.modelHashMismatch(name)
+            }
+        }
+        if let measuredResiduals, measuredResiduals != measured {
+            throw Error.measuredResidualMismatch
+        }
         let stronglyMeasuredViewCount = measured.observationCountByImage.values.filter {
             $0 >= minimumLearnedObservationsPerView
         }.count
@@ -342,6 +593,7 @@ enum GeometryArtifactStore {
             || Double(stronglyMeasuredViewCount) / Double(artifact.totalViewCount)
                 >= ReconstructionScorer.minimumRegisteredViewFraction
         guard measured.provenance == artifact.residualProvenance,
+              measured.cameraModel == artifact.cameraModel,
               measured.registeredViewCount == artifact.registeredViewCount,
               Set(measured.registeredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
               Set(measured.measuredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
@@ -349,17 +601,239 @@ enum GeometryArtifactStore {
                   >= ReconstructionScorer.minimumRegisteredViewFraction,
               learnedSupportIsValid,
               measured.pointCount == artifact.pointCount,
-              measured.observationCount == artifact.trackCount,
+              measured.observationCount == artifact.observationCount,
               approximatelyEqual(measured.medianPixelResidual, artifact.medianPixelResidual),
               approximatelyEqual(measured.p90PixelResidual, artifact.p90PixelResidual) else {
             throw Error.measuredResidualMismatch
         }
+        guard analysis.measurement == artifact.conditioning.measurement else {
+            throw Error.conditioningMismatch
+        }
+        if let verifiedSourceSnapshot {
+            do {
+                try GeometryModelSnapshot.validate(verifiedSourceSnapshot, at: sourceModel)
+            } catch {
+                throw Error.modelHashMismatch("source snapshot")
+            }
+        }
+        do {
+            try GeometryModelSnapshot.validate(analysis.modelSnapshot, at: sourceModel)
+        } catch {
+            throw Error.modelHashMismatch("source snapshot")
+        }
+        return analysis
+    }
+
+    private static func validateConditioning(
+        _ artifact: GeometryConditioningArtifact,
+        registeredViewCount: Int,
+        pointCount: Int,
+        observationCount: Int,
+        modelHashes: [String: String]
+    ) throws {
+        let measurement = artifact.measurement
+        guard let registeredCameraPairCount = unorderedPairCount(registeredViewCount),
+              let effectiveCameraPairCount = unorderedPairCount(
+                  measurement.effectiveCameraCenterCount
+              ) else {
+            throw Error.invalidConditioning
+        }
+        let expectedCameraPairEvaluationCount: Int
+        if measurement.largestCameraCenterClusterSize == 1 {
+            expectedCameraPairEvaluationCount = registeredCameraPairCount
+        } else {
+            let (combined, overflow) = registeredCameraPairCount.addingReportingOverflow(
+                effectiveCameraPairCount
+            )
+            guard !overflow else { throw Error.invalidConditioning }
+            expectedCameraPairEvaluationCount = combined
+        }
+        let cameraCenterClusteringIsConsistent =
+            (measurement.largestCameraCenterClusterSize == 1
+                && measurement.effectiveCameraCenterCount == registeredViewCount)
+            || (measurement.largestCameraCenterClusterSize > 1
+                && measurement.effectiveCameraCenterCount < registeredViewCount)
+        let (totalPairEvaluationCount, pairCountOverflow) =
+            measurement.cameraPairEvaluationCount.addingReportingOverflow(
+                measurement.rayPairEvaluationCount
+            )
+        guard
+              artifact.schemaVersion == GeometryConditioningArtifact.currentSchemaVersion,
+              artifact.measurementProvenance == GeometryConditioningMeasurement.provenance,
+              artifact.acceptancePolicy
+                == GeometryConditioningArtifact.currentAcceptancePolicy,
+              artifact.maximumRayPairEvaluations
+                == GeometryConditioningArtifact.defaultMaximumRayPairEvaluations,
+              isSHA256(artifact.sourceModelClosureSHA256),
+              artifact.sourceModelClosureSHA256 == modelClosureDigest(
+                  modelHashes,
+                  expectedNames: ["cameras.txt", "images.txt", "points3D.txt"]
+              ),
+              measurement.registeredViewCount == registeredViewCount,
+              measurement.pointCount == pointCount,
+              measurement.observationCount == observationCount,
+              measurement.positiveDepthObservationCount == observationCount,
+              measurement.stronglyMeasuredViewCount >= 0,
+              measurement.stronglyMeasuredViewCount <= registeredViewCount,
+              measurement.stronglyMeasuredViewCount >= Int(ceil(
+                  Double(registeredViewCount)
+                    * ReconstructionScorer.minimumRegisteredViewFraction
+              )),
+              validOrderedStatistics(
+                  minimum: measurement.perViewObservationMinimum,
+                  p10: measurement.perViewObservationP10,
+                  median: measurement.perViewObservationMedian,
+                  p90: measurement.perViewObservationP90,
+                  lowerBound: 0,
+                  upperBound: observationCount
+              ),
+              validOrderedStatistics(
+                  minimum: measurement.distinctTrackLengthMinimum,
+                  p10: measurement.distinctTrackLengthP10,
+                  median: measurement.distinctTrackLengthMedian,
+                  p90: measurement.distinctTrackLengthP90,
+                  lowerBound: 2,
+                  upperBound: registeredViewCount
+              ),
+              validNestedCounts(
+                  leastSelective: measurement.pointsAtLeast1Point5Degrees,
+                  middle: measurement.pointsAtLeast2Degrees,
+                  mostSelective: measurement.pointsAtLeast3Degrees,
+                  total: pointCount
+              ),
+              validNestedCounts(
+                  leastSelective: measurement.observationsAtLeast1Point5Degrees,
+                  middle: measurement.observationsAtLeast2Degrees,
+                  mostSelective: measurement.observationsAtLeast3Degrees,
+                  total: observationCount
+              ),
+              measurement.effectiveCameraCenterCount >= min(3, registeredViewCount),
+              measurement.effectiveCameraCenterCount <= registeredViewCount,
+              measurement.largestCameraCenterClusterSize > 0,
+              measurement.largestCameraCenterClusterSize <= registeredViewCount,
+              cameraCenterClusteringIsConsistent,
+              measurement.cameraCenterMergeToleranceToMedianDepthRatio == 1e-5,
+              measurement.numericallyConditionedPointCount
+                >= pointCount / 2 + pointCount % 2,
+              measurement.numericallyConditionedPointCount <= pointCount,
+              measurement.numericallyConditionedObservationCount > 0,
+              measurement.numericallyConditionedObservationCount <= observationCount,
+              measurement.adaptiveParallaxThresholdMedianDegrees.isFinite,
+              measurement.adaptiveParallaxThresholdP90Degrees.isFinite,
+              measurement.adaptiveParallaxThresholdMedianDegrees >= 0.05 - 1e-12,
+              measurement.adaptiveParallaxThresholdP90Degrees
+                >= measurement.adaptiveParallaxThresholdMedianDegrees,
+              measurement.medianObservedDepth.isFinite,
+              measurement.medianObservedDepth > 0,
+              measurement.cameraBaselineToMedianDepthRatio.isFinite,
+              measurement.cameraBaselineToMedianDepthRatio
+                > measurement.cameraCenterMergeToleranceToMedianDepthRatio,
+              validNormalizedEigenvalues(measurement.cameraCenterEigenvalues),
+              validNormalizedEigenvalues(measurement.pointEigenvalues),
+              measurement.pointEigenvalues[1] >= 1e-8,
+              measurement.cameraPairEvaluationCount
+                == expectedCameraPairEvaluationCount,
+              measurement.rayPairEvaluationCount > 0,
+              !pairCountOverflow,
+              totalPairEvaluationCount <= artifact.maximumRayPairEvaluations else {
+            throw Error.invalidConditioning
+        }
+    }
+
+    private static func validOrderedStatistics(
+        minimum: Int,
+        p10: Int,
+        median: Double,
+        p90: Int,
+        lowerBound: Int,
+        upperBound: Int
+    ) -> Bool {
+        median.isFinite
+            && minimum >= lowerBound
+            && minimum <= p10
+            && Double(p10) <= median
+            && median <= Double(p90)
+            && p90 <= upperBound
+    }
+
+    private static func validNestedCounts(
+        leastSelective: Int,
+        middle: Int,
+        mostSelective: Int,
+        total: Int
+    ) -> Bool {
+        mostSelective >= 0
+            && mostSelective <= middle
+            && middle <= leastSelective
+            && leastSelective <= total
+    }
+
+    private static func validNormalizedEigenvalues(_ values: [Double]) -> Bool {
+        values.count == 3
+            && values.allSatisfy { $0.isFinite && $0 >= 0 && $0 <= 1 }
+            && values[0] <= values[1]
+            && values[1] <= values[2]
+            && abs(values.reduce(0, +) - 1) <= 1e-9
+    }
+
+    private static func unorderedPairCount(_ count: Int) -> Int? {
+        guard count >= 0 else { return nil }
+        let (product, overflow) = count.multipliedReportingOverflow(by: count - 1)
+        guard !overflow else { return nil }
+        return product / 2
     }
 
     static func isSHA256(_ value: String) -> Bool {
         value.count == 64 && value.unicodeScalars.allSatisfy {
             ($0.value >= 48 && $0.value <= 57) || ($0.value >= 97 && $0.value <= 102)
         }
+    }
+
+    static func modelClosureDigest(
+        _ hashes: [String: String],
+        expectedNames: [String]
+    ) -> String? {
+        let names = expectedNames.sorted()
+        guard Set(hashes.keys) == Set(names),
+              hashes.values.allSatisfy(isSHA256) else {
+            return nil
+        }
+        var hasher = SHA256()
+        let domain = Data("easysplat-model-closure-v1".utf8)
+        update(UInt64(domain.count), in: &hasher)
+        hasher.update(data: domain)
+        for name in names {
+            guard let digest = hashes[name] else { return nil }
+            let nameData = Data(name.utf8)
+            let digestData = Data(digest.utf8)
+            update(UInt64(nameData.count), in: &hasher)
+            hasher.update(data: nameData)
+            update(UInt64(digestData.count), in: &hasher)
+            hasher.update(data: digestData)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func modelCandidateIdentity(
+        mappingAttemptOrdinal: Int,
+        candidateProjectRelativePath: String,
+        sourceModelDigest: String
+    ) -> String? {
+        guard mappingAttemptOrdinal > 0,
+              !candidateProjectRelativePath.isEmpty,
+              isSHA256(sourceModelDigest) else {
+            return nil
+        }
+        var hasher = SHA256()
+        let domain = Data("easysplat-model-candidate-v1".utf8)
+        update(UInt64(domain.count), in: &hasher)
+        hasher.update(data: domain)
+        update(UInt64(mappingAttemptOrdinal), in: &hasher)
+        let pathData = Data(candidateProjectRelativePath.utf8)
+        update(UInt64(pathData.count), in: &hasher)
+        hasher.update(data: pathData)
+        hasher.update(data: Data(sourceModelDigest.utf8))
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private static func validComponent(_ component: GeometryComponentProvenance) -> Bool {
@@ -372,16 +846,47 @@ enum GeometryArtifactStore {
     private static func validatePairGraph(
         _ artifact: PairGraphArtifact,
         totalViewCount: Int,
-        registeredViewCount: Int
+        registeredViewCount: Int,
+        hasLearnedProvenance: Bool
     ) throws {
         switch artifact.status {
         case .notEvaluated:
             guard artifact.measurement == nil,
+                  !artifact.requiresCrossClipRetrieval,
+                  !artifact.retrievalWasScheduled,
                   !artifact.usedLocalVocabularyRetrieval else {
                 throw Error.invalidPairGraph
             }
         case .measured:
             guard let measurement = artifact.measurement else {
+                throw Error.invalidPairGraph
+            }
+            let retrievalWasRequired = hasLearnedProvenance
+                ? false
+                : PairGraphRetrievalScheduling.isRequired(
+                    pairingPolicy: measurement.pairingPolicy,
+                    selectedFrameCount: totalViewCount,
+                    requiresCrossClipRetrieval:
+                        artifact.requiresCrossClipRetrieval
+                )
+            let crossClipPolicyIsCoherent: Bool
+            switch measurement.pairingPolicy {
+            case .orderedContinuous,
+                 .orderedOrbit,
+                 .orderedWalkthrough,
+                 .orderedLargeArea,
+                 .segmentedMixed:
+                crossClipPolicyIsCoherent = true
+            case .unorderedRetrieval:
+                crossClipPolicyIsCoherent = !artifact.requiresCrossClipRetrieval
+            }
+            guard crossClipPolicyIsCoherent,
+                  !hasLearnedProvenance
+                    || (!artifact.requiresCrossClipRetrieval
+                        && !artifact.usedLocalVocabularyRetrieval),
+                  artifact.retrievalWasScheduled == retrievalWasRequired,
+                  !artifact.usedLocalVocabularyRetrieval
+                    || artifact.retrievalWasScheduled else {
                 throw Error.invalidPairGraph
             }
             let descriptorlessViewCount = measurement.descriptorlessViewCount
@@ -469,7 +974,9 @@ enum GeometryArtifactStore {
             guard Set(attemptNumbers).count == attemptNumbers.count,
                   attemptNumbers.sorted() == Array(1...attemptNumbers.count),
                   measurement.matcherAttempts.allSatisfy({ attempt in
-                      attempt.scheduledPairCount >= 0
+                      (attempt.matcher == .exact)
+                          == (attempt.exactRecoveryReason != nil)
+                          && attempt.scheduledPairCount >= 0
                           && attempt.attemptedPairCount >= 0
                           && attempt.attemptedPairCount <= attempt.scheduledPairCount
                           && attempt.rawMatchedPairCount >= 0
@@ -520,8 +1027,7 @@ enum GeometryArtifactStore {
         totalViewCount: Int
     ) throws {
         guard let first = attempts.first,
-              first.matcher == .faiss,
-              first.recoveryLevel == .normal else {
+              first.matcher == .faiss else {
             throw Error.invalidPairGraph
         }
         for index in attempts.indices.dropFirst() {
@@ -530,12 +1036,13 @@ enum GeometryArtifactStore {
             let previousLevel = pairRecoveryLevelIndex(previous.recoveryLevel)
             let level = pairRecoveryLevelIndex(attempt.recoveryLevel)
             guard level >= previousLevel,
-                  level - previousLevel <= 1 else {
+                  level - previousLevel <= 2 else {
                 throw Error.invalidPairGraph
             }
             if level == previousLevel {
                 if attempt.matcher == previous.matcher {
-                    guard previous.outcome != .completed,
+                    guard attempt.matcher == .faiss,
+                          previous.outcome != .completed,
                           attempt.scheduledPairCount
                             == previous.scheduledPairCount else {
                         throw Error.invalidPairGraph
@@ -546,14 +1053,18 @@ enum GeometryArtifactStore {
                           previous.scheduledPairCount == attempt.scheduledPairCount,
                           PairGraphEvidenceStore.permitsExactMatcherTransition(
                               after: previous,
+                              reason: attempt.exactRecoveryReason,
                               imageCount: totalViewCount,
                               pairingPolicy: pairingPolicy
                           ) else {
                         throw Error.invalidPairGraph
                     }
                 }
-            } else if attempt.matcher != previous.matcher {
-                throw Error.invalidPairGraph
+            } else {
+                guard attempt.matcher == .faiss,
+                      previous.matcher == .faiss else {
+                    throw Error.invalidPairGraph
+                }
             }
         }
     }
@@ -583,7 +1094,10 @@ enum GeometryArtifactStore {
         totalViewCount: Int,
         registeredViewCount: Int,
         pairGraphStatus: PairGraphMeasurementStatus,
-        hasLearnedProvenance: Bool
+        hasLearnedProvenance: Bool,
+        canonicalModelHashes: [String: String],
+        canonicalModelURL: URL,
+        projectPaths: ProjectPaths
     ) throws {
         let fallbackIsValid = artifact.fallbackReason.map { reason in
             let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -602,10 +1116,60 @@ enum GeometryArtifactStore {
               artifact.unionRegisteredViewCount <= totalViewCount,
               artifact.attemptCount >= 1,
               artifact.acceptedMappingAttemptOrdinal >= 1,
+              artifact.acceptedMappingAttemptOrdinal <= artifact.attemptCount,
               artifact.acceptedRefinementInvocationCount >= 0,
               fallbackIsValid,
               artifact.attemptCount == 1 || artifact.fallbackReason != nil else {
             throw Error.invalidMapping
+        }
+
+        let publication = artifact.canonicalModelPublication
+        let sourceNames = Set(publication.sourceModelHashes.keys)
+        guard publication.sourceModelHashes.values.allSatisfy(isSHA256) else {
+            throw Error.invalidMapping
+        }
+        switch publication.kind {
+        case .convertedFromBinary:
+            guard sourceNames == ["cameras.bin", "images.bin", "points3D.bin"],
+                  let conversion = publication.conversion,
+                  conversion.invocationOrdinal > 0,
+                  let sourceDigest = modelClosureDigest(
+                      publication.sourceModelHashes,
+                      expectedNames: ["cameras.bin", "images.bin", "points3D.bin"]
+                  ),
+                  conversion.workerEvidence.sourceModelDigest == sourceDigest,
+                  conversion.workerEvidence.convertedModelDigest
+                    == modelClosureDigest(
+                        canonicalModelHashes,
+                        expectedNames: ["cameras.txt", "images.txt", "points3D.txt"]
+                    ),
+                  conversion.workerEvidence.candidateIdentitySHA256
+                    == modelCandidateIdentity(
+                        mappingAttemptOrdinal: artifact.acceptedMappingAttemptOrdinal,
+                        candidateProjectRelativePath:
+                            conversion.workerEvidence.candidateProjectRelativePath,
+                        sourceModelDigest: sourceDigest
+                    ),
+                  validConversionPaths(
+                      conversion.workerEvidence,
+                      projectPaths: projectPaths
+                  ) else {
+                throw Error.invalidMapping
+            }
+            for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+                let binary = canonicalModelURL.appendingPathComponent(name)
+                guard let expected = publication.sourceModelHashes[name],
+                      let digest = try? sha256(of: binary),
+                      digest == expected else {
+                    throw Error.invalidMapping
+                }
+            }
+        case .directText, .resumedCanonicalText:
+            guard sourceNames == ["cameras.txt", "images.txt", "points3D.txt"],
+                  publication.sourceModelHashes == canonicalModelHashes,
+                  publication.conversion == nil else {
+                throw Error.invalidMapping
+            }
         }
 
         if artifact.modelCount == 1 {
@@ -639,19 +1203,62 @@ enum GeometryArtifactStore {
         case .incrementalGlobal:
             guard !hasLearnedProvenance,
                   pairGraphStatus == .measured,
+                  let plannedCadence = artifact.plannedIncrementalCadence,
                   let cadence = artifact.incrementalCadence,
-                  cadence.isValid else {
+                  plannedCadence.isValid,
+                  cadence.isValid,
+                  IncrementalMappingCadencePolicy.validates(
+                    planned: plannedCadence,
+                    accepted: cadence,
+                    trigger: artifact.cadenceFallbackTrigger
+                  ) else {
                 throw Error.invalidMapping
             }
         case .seededBundleAdjustment:
             guard hasLearnedProvenance,
-                  pairGraphStatus == .notEvaluated,
+                  pairGraphStatus == .measured,
                   artifact.modelCount == 1,
                   artifact.acceptedRefinementInvocationCount == 1,
-                  artifact.incrementalCadence == nil else {
+                  artifact.plannedIncrementalCadence == nil,
+                  artifact.incrementalCadence == nil,
+                  artifact.cadenceFallbackTrigger == nil else {
                 throw Error.invalidMapping
             }
         }
+    }
+
+    private static func validConversionPaths(
+        _ evidence: ColmapModelConversionWorkerEvidence,
+        projectPaths: ProjectPaths
+    ) -> Bool {
+        let sparsePrefix = "SfM/colmap/sparse/"
+        let candidateSuffix = evidence.candidateProjectRelativePath
+            .dropFirst(sparsePrefix.count)
+        guard evidence.candidateProjectRelativePath.hasPrefix(sparsePrefix),
+              !candidateSuffix.isEmpty,
+              candidateSuffix.allSatisfy(\.isNumber),
+              evidence.inputProjectRelativePath.hasPrefix(
+                  sparsePrefix + ".text-model-"
+              ),
+              evidence.inputProjectRelativePath.hasSuffix("/binary"),
+              evidence.outputProjectRelativePath.hasPrefix(
+                  sparsePrefix + ".text-model-"
+              ),
+              evidence.outputProjectRelativePath.hasSuffix("/text"),
+              evidence.inputProjectRelativePath.dropLast("binary".count)
+                == evidence.outputProjectRelativePath.dropLast("text".count),
+              (try? projectPaths.resolveProjectRelativePath(
+                  evidence.candidateProjectRelativePath
+              )) != nil,
+              (try? projectPaths.resolveProjectRelativePath(
+                  evidence.inputProjectRelativePath
+              )) != nil,
+              (try? projectPaths.resolveProjectRelativePath(
+                  evidence.outputProjectRelativePath
+              )) != nil else {
+            return false
+        }
+        return true
     }
 
     private static func validateCanonicalOrientation(
@@ -817,6 +1424,36 @@ enum GeometryArtifactStore {
         return try digest(files: files, relativeTo: projectPaths.originalsURL, preserveOrder: false)
     }
 
+    static func inputDigest(
+        snapshots: [RuntimeInputSnapshotLease.Snapshot]
+    ) throws -> String {
+        guard !snapshots.isEmpty,
+              Set(snapshots.map(\.projectRelativePath)).count == snapshots.count,
+              snapshots.allSatisfy({
+                  $0.projectRelativePath.hasPrefix("Originals/")
+                      && $0.projectRelativePath.count > "Originals/".count
+              }) else {
+            throw Error.artifactDigestMismatch("digest input")
+        }
+        let ordered = snapshots.sorted {
+            $0.projectRelativePath < $1.projectRelativePath
+        }
+        var hasher = SHA256()
+        hasher.update(data: Data("EasySplat geometry digest v2".utf8))
+        for snapshot in ordered {
+            let relativePath = String(
+                snapshot.projectRelativePath.dropFirst("Originals/".count)
+            )
+            update(UInt64(relativePath.utf8.count), in: &hasher)
+            hasher.update(data: Data(relativePath.utf8))
+            try hashRegularFileContents(at: snapshot.url, into: &hasher) {
+                fileSize, hasher in
+                update(fileSize, in: &hasher)
+            }
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     static func selectedFramesDigest(
         orderedImageNames: [String],
         projectPaths: ProjectPaths
@@ -902,15 +1539,20 @@ enum GeometryArtifactStore {
         abs(lhs - rhs) <= 1e-9
     }
 
-    static func sha256(of file: URL) throws -> String {
+    static func sha256(of file: URL, maximumBytes: UInt64? = nil) throws -> String {
         var hasher = SHA256()
-        try hashRegularFileContents(at: file, into: &hasher)
+        try hashRegularFileContents(
+            at: file,
+            into: &hasher,
+            maximumBytes: maximumBytes
+        )
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     private static func hashRegularFileContents(
         at file: URL,
         into hasher: inout SHA256,
+        maximumBytes: UInt64? = nil,
         beforeContents: (UInt64, inout SHA256) -> Void = { _, _ in }
     ) throws {
         let descriptor: Int32
@@ -939,7 +1581,8 @@ enum GeometryArtifactStore {
         let initial = try descriptorStatus()
         guard (initial.st_mode & S_IFMT) == S_IFREG,
               initial.st_nlink == 1,
-              initial.st_size >= 0 else {
+              initial.st_size >= 0,
+              maximumBytes.map({ UInt64(initial.st_size) <= $0 }) ?? true else {
             throw CocoaError(.fileReadUnsupportedScheme)
         }
         let expectedByteCount = UInt64(initial.st_size)

@@ -32,6 +32,7 @@ struct SplatViewerView: View {
             MetalKitSceneView(
                 splatURL: splatURL,
                 reloadToken: reloadToken,
+                loadAttemptRevision: controller.loadAttemptRevision,
                 controller: controller,
                 sceneConfiguration: sceneConfiguration,
                 onLoadStateChanged: onLoadStateChanged
@@ -44,6 +45,7 @@ struct SplatViewerView: View {
             }
             .controlSize(toolbarControlSize)
             .buttonStyle(.bordered)
+            .tint(.primary)
             .padding(toolbarPadding)
             .background(.ultraThinMaterial)
             .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
@@ -85,17 +87,43 @@ struct SplatViewerView: View {
 
             if showsLoadErrors, let error = controller.errorMessage {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Couldn’t load splat")
+                    Text(controller.loadErrorTitle)
                         .font(.headline)
                     Text(error)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if controller.canRetryLoad {
+                        Button("Retry") {
+                            controller.retryFailedLoad()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityLabel("Retry loading splat")
+                    }
                 }
                 .padding(12)
                 .background(.ultraThinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .topTrailing)
+            }
+
+            if let sortFailure = controller.sortFailureMessage {
+                HStack(spacing: 8) {
+                    Text("Transparency order needs updating.")
+                        .font(.caption)
+                        .help(sortFailure)
+                    Button("Retry") { controller.retrySortOrdering() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .accessibilityLabel("Retry transparency order")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
+                .padding(12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             }
         }
         .onChange(of: resetCameraToken) { _, _ in

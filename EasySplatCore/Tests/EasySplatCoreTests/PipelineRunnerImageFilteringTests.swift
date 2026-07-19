@@ -1,4 +1,5 @@
 #if canImport(XCTest)
+import Darwin
 import Foundation
 import XCTest
 @testable import EasySplatCore
@@ -117,42 +118,51 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(photos.map(\.lastPathComponent), ["photo.heif"])
     }
 
-    func testImportInputsKeepsDuplicateVideoBasenamesSeparate() throws {
-        let sourceRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: sourceRoot) }
-
-        let firstDir = sourceRoot.appendingPathComponent("a", isDirectory: true)
-        let secondDir = sourceRoot.appendingPathComponent("b", isDirectory: true)
-        try FileManager.default.createDirectory(at: firstDir, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: secondDir, withIntermediateDirectories: true)
-        let firstVideo = firstDir.appendingPathComponent("clip.mov")
-        let secondVideo = secondDir.appendingPathComponent("clip.mov")
-        try Data("first".utf8).write(to: firstVideo)
-        try Data("second".utf8).write(to: secondVideo)
-
+    func testImportInputsUsesControlledVideosWithoutASecondCopy() throws {
         let projectURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
         let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
+        let (firstVideo, firstReceipt) = try TestFileBuilder.writeControlledVideoReceipt(
+            paths: paths,
+            index: 0,
+            bytes: Data("first".utf8),
+            safeDisplayName: "clip.mov"
+        )
+        let (secondVideo, secondReceipt) = try TestFileBuilder.writeControlledVideoReceipt(
+            paths: paths,
+            index: 1,
+            bytes: Data("second".utf8),
+            safeDisplayName: "clip.mov"
+        )
+        var firstBefore = stat()
+        var secondBefore = stat()
+        XCTAssertEqual(lstat(firstVideo.path, &firstBefore), 0)
+        XCTAssertEqual(lstat(secondVideo.path, &secondBefore), 0)
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         let runner = PipelineRunner(projectURL: projectURL, config: config)
         let metadata = ProjectMetadata(
             title: "Videos",
-            input: .video(files: [firstVideo.path, secondVideo.path]),
+            input: .video(files: [
+                firstReceipt.projectRelativePath,
+                secondReceipt.projectRelativePath,
+            ]),
+            videoInputReceipts: [firstReceipt, secondReceipt],
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
         try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
 
-        let imported = try FileManager.default.contentsOfDirectory(at: paths.originalsURL, includingPropertiesForKeys: nil)
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        XCTAssertEqual(imported.map(\.lastPathComponent), ["clip-2.mov", "clip.mov"])
-        XCTAssertEqual(try String(contentsOf: paths.originalsURL.appendingPathComponent("clip.mov"), encoding: .utf8), "first")
-        XCTAssertEqual(try String(contentsOf: paths.originalsURL.appendingPathComponent("clip-2.mov"), encoding: .utf8), "second")
+        var firstAfter = stat()
+        var secondAfter = stat()
+        XCTAssertEqual(lstat(firstVideo.path, &firstAfter), 0)
+        XCTAssertEqual(lstat(secondVideo.path, &secondAfter), 0)
+        XCTAssertEqual(firstAfter.st_ino, firstBefore.st_ino)
+        XCTAssertEqual(secondAfter.st_ino, secondBefore.st_ino)
+        XCTAssertEqual(try Data(contentsOf: firstVideo), Data("first".utf8))
+        XCTAssertEqual(try Data(contentsOf: secondVideo), Data("second".utf8))
     }
 
     func testLoadPhotosSkipsGeneratedProjectDirectoriesAtProjectRoot() throws {
@@ -203,29 +213,30 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(Set(photos.map(\.lastPathComponent)), Set(["root.jpg", "inner.jpg"]))
     }
 
-    func testImportInputsReplacesZeroByteImportedVideo() throws {
+    func testReceiptValidationRejectsEmptyControlledVideoBeforeImport() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
-        let source = root.appendingPathComponent("clip.mov")
-        try Data("fresh-video".utf8).write(to: source)
         let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
-        TestFileBuilder.createFile(at: paths.originalsURL.appendingPathComponent("clip.mov"))
-        let runner = try makeRunner(projectURL: projectURL)
+        let (video, receipt) = try TestFileBuilder.writeControlledVideoReceipt(paths: paths)
+        try Data().write(to: video, options: [.atomic])
         let metadata = ProjectMetadata(
             title: "Video",
-            input: .video(files: [source.path]),
+            input: .video(files: [receipt.projectRelativePath]),
+            videoInputReceipts: [receipt],
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
 
-        try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
-
-        let imported = paths.originalsURL.appendingPathComponent("clip.mov")
-        XCTAssertEqual(try String(contentsOf: imported, encoding: .utf8), "fresh-video")
+        XCTAssertThrowsError(try VideoInputReceiptValidator.validateFiles(
+            metadata: metadata,
+            paths: paths
+        )) { error in
+            XCTAssertEqual(error as? VideoInputReceiptValidationError, .sizeMismatch(index: 0))
+        }
+        XCTAssertEqual(try Data(contentsOf: video), Data())
     }
 
-    func testImportInputsReplacesPartialPhotoFolderWhenSourceStillExists() throws {
+    func testImportInputsRejectsExternalPhotoPathWithoutRepairingPartialFolder() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
@@ -245,27 +256,39 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
 
-        try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
-
-        XCTAssertEqual(try runner.loadPhotosForTesting(in: imported).count, 2)
+        XCTAssertThrowsError(try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }) {
+            XCTAssertEqual($0 as? PhotoInputReceiptValidationError, .invalidPhotoRoot)
+        }
+        XCTAssertEqual(try runner.loadPhotosForTesting(in: imported).count, 1)
     }
 
     func testMixedImportAllowsAnAllInvalidPhotoFolderWhenVideoRemains() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
-        let video = root.appendingPathComponent("walkthrough.mov")
-        try Data("video".utf8).write(to: video)
         let photos = root.appendingPathComponent("Photos", isDirectory: true)
         try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
         try Data("not an image".utf8).write(to: photos.appendingPathComponent("broken.jpg"))
 
         let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
+        let (_, receipt) = try TestFileBuilder.writeControlledVideoReceipt(
+            paths: paths,
+            bytes: Data("video".utf8),
+            safeDisplayName: "walkthrough.mov"
+        )
+        try FileManager.default.createDirectory(
+            at: paths.importedPhotosURL,
+            withIntermediateDirectories: true
+        )
         let runner = try makeRunner(projectURL: projectURL)
         let metadata = ProjectMetadata(
             title: "Mixed",
-            input: .mixed(videos: [video.path], photosFolder: photos.path),
+            input: .mixed(
+                videos: [receipt.projectRelativePath],
+                photosFolder: "Originals/Photos"
+            ),
+            videoInputReceipts: [receipt],
+            photoInputReceipts: [],
             requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
         )
 
@@ -278,43 +301,63 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         )
     }
 
-    func testImportInputsCopiesOnlyValidUniquePhotosWithStableCollisionNames() throws {
+    func testImportInputsUsesControlledPhotosWithoutASecondCopy() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
-        let source = root.appendingPathComponent("Photos", isDirectory: true)
-        let nested = source.appendingPathComponent("Nested", isDirectory: true)
-        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
-
-        let first = source.appendingPathComponent("capture.jpg")
-        let sameBasename = nested.appendingPathComponent("capture.jpg")
-        let duplicate = source.appendingPathComponent("duplicate.jpg")
-        try writeImage(url: first, size: 16, value: 20)
-        try writeImage(url: sameBasename, size: 16, value: 180)
-        try FileManager.default.copyItem(at: first, to: duplicate)
-        try Data("not an image".utf8).write(to: source.appendingPathComponent("corrupt.png"))
-        try Data("client notes".utf8).write(to: source.appendingPathComponent("notes.txt"))
-
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
+        try FileManager.default.createDirectory(at: paths.importedPhotosURL, withIntermediateDirectories: true)
+        let first = paths.importedPhotosURL.appendingPathComponent("photo-0000.jpg")
+        let second = paths.importedPhotosURL.appendingPathComponent("photo-0001.jpg")
+        try writeImage(url: first, size: 16, value: 20)
+        try writeImage(url: second, size: 16, value: 180)
+        XCTAssertEqual(chmod(first.path, 0o600), 0)
+        XCTAssertEqual(chmod(second.path, 0o600), 0)
+        let photos = [first, second]
+        var before = [stat(), stat()]
+        XCTAssertEqual(lstat(first.path, &before[0]), 0)
+        XCTAssertEqual(lstat(second.path, &before[1]), 0)
+        let receipts = try photos.enumerated().map { index, photo in
+            let attributes = try FileManager.default.attributesOfItem(atPath: photo.path)
+            let sha256 = try GeometryArtifactStore.sha256(of: photo)
+            return PhotoInputReceipt(
+                projectRelativePath: "Originals/Photos/\(photo.lastPathComponent)",
+                safeDisplayName: "capture-\(index).jpg",
+                byteCount: try XCTUnwrap(attributes[.size] as? NSNumber).int64Value,
+                sha256: sha256,
+                pixelWidth: 16,
+                pixelHeight: 16,
+                orientation: 1,
+                typeIdentifier: "public.jpeg",
+                analysisEvidence: TestFileBuilder.photoAnalysisEvidence(
+                    sourceSHA256: sha256,
+                    seed: UInt8(truncatingIfNeeded: index)
+                ),
+                retainedRank: index
+            )
+        }
         let runner = try makeRunner(projectURL: projectURL)
-        let metadata = ProjectMetadata(
+        let metadata = try TestFileBuilder.bindContinuousPhotoSelectionFixture(
+            to: ProjectMetadata(
             title: "Photos",
-            input: .photos(folder: source.path),
+            input: .photos(folder: "Originals/Photos"),
+            photoInputReceipts: receipts,
             requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            ),
+            paths: paths
         )
 
         try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
 
-        let imported = paths.originalsURL.appendingPathComponent("Photos", isDirectory: true)
-        let contents = try FileManager.default.contentsOfDirectory(
-            at: imported,
-            includingPropertiesForKeys: nil
-        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
-        XCTAssertEqual(contents.map(\.lastPathComponent), ["capture-2.jpg", "capture.jpg"])
-        XCTAssertFalse(contents.contains { $0.lastPathComponent == "notes.txt" })
-        XCTAssertFalse(contents.contains { $0.lastPathComponent == "corrupt.png" })
-        XCTAssertFalse(contents.contains { $0.lastPathComponent == "duplicate.jpg" })
+        var after = [stat(), stat()]
+        XCTAssertEqual(lstat(first.path, &after[0]), 0)
+        XCTAssertEqual(lstat(second.path, &after[1]), 0)
+        XCTAssertEqual(after.map(\.st_ino), before.map(\.st_ino))
+        XCTAssertEqual(
+            try runner.loadPhotosForTesting(in: paths.importedPhotosURL).map(\.lastPathComponent),
+            photos.map(\.lastPathComponent)
+        )
     }
 
     func testCancelledAtomicVideoCopyLeavesExistingDestinationUntouched() async throws {
@@ -496,6 +539,78 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(budgeted.first?.id, "photos")
     }
 
+    func testRankedPhotoBudgetUsesExactPrefixInsteadOfEvenSpacing() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let ranked = (0..<9).map {
+            root.appendingPathComponent("rank-\($0).jpg")
+        }
+
+        let budgeted = try runner.test_applyFrameBudget(
+            to: [.init(
+                id: "photos",
+                frames: ranked,
+                isVideo: false,
+                budgetProjection: .rankedPrefix
+            )],
+            targetCount: 3
+        )
+
+        XCTAssertEqual(budgeted.first?.frames, Array(ranked.prefix(3)))
+        XCTAssertEqual(budgeted.first?.budgetProjection, .rankedPrefix)
+    }
+
+    func testContinuousPhotoBudgetKeepsEndpointRoundedSpacing() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let ordered = (0..<9).map {
+            root.appendingPathComponent("ordered-\($0).jpg")
+        }
+
+        let budgeted = try runner.test_applyFrameBudget(
+            to: [.init(
+                id: "photos",
+                frames: ordered,
+                isVideo: false,
+                budgetProjection: .evenlySpaced
+            )],
+            targetCount: 3
+        )
+
+        XCTAssertEqual(
+            budgeted.first?.frames,
+            [ordered[0], ordered[4], ordered[8]]
+        )
+    }
+
+    func testPreservedPhotoBudgetFailsClosedWhenAllocationShrinksIt() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let photos = (0..<5).map {
+            root.appendingPathComponent("photo-\($0).jpg")
+        }
+
+        XCTAssertThrowsError(try runner.test_applyFrameBudget(
+            to: [.init(
+                id: "photos",
+                frames: photos,
+                isVideo: false,
+                budgetProjection: .preserve
+            )],
+            targetCount: 3
+        )) { error in
+            guard case let .photoSelectionExceedsBudget(selected, maximum)? =
+                    error as? PipelineRunner.PipelineError else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(selected, 5)
+            XCTAssertEqual(maximum, 3)
+        }
+    }
+
     func testFrameBudgetAppliesAcrossMixedInputs() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -547,25 +662,10 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertNotNil(budgeted.first { $0.id == "photos" })
     }
 
-    func testUseAllValidPhotosRejectsCorruptDuplicatesAndUnsafeCounts() throws {
+    func testUseAllValidPhotosRejectsUnsafeCounts() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = try makeRunner(projectURL: root)
-        let first = root.appendingPathComponent("first.jpg")
-        let duplicate = root.appendingPathComponent("duplicate.jpg")
-        let second = root.appendingPathComponent("second.jpg")
-        let corrupt = root.appendingPathComponent("corrupt.jpg")
-        try writeImage(url: first, size: 16, value: 40)
-        try FileManager.default.copyItem(at: first, to: duplicate)
-        try writeImage(url: second, size: 16, value: 180)
-        try Data("not an image".utf8).write(to: corrupt)
-
-        let filtered = try runner.test_filterValidUniquePhotos([first, duplicate, second, corrupt])
-
-        XCTAssertEqual(filtered.frames.map(\.lastPathComponent), ["first.jpg", "second.jpg"])
-        XCTAssertEqual(filtered.unreadableCount, 1)
-        XCTAssertEqual(filtered.duplicateCount, 1)
-
         let repeatedValidPhotos = (0..<140).map { index in
             root.appendingPathComponent(String(format: "valid_%03d.jpg", index))
         }

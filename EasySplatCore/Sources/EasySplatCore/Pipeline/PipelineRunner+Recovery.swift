@@ -2,6 +2,12 @@ import Foundation
 import ImageIO
 import SQLite3
 
+enum CaptureFailureType: String, Sendable, Equatable {
+    case disconnectedInput = "disconnected_input"
+    case insufficientOverlap = "insufficient_overlap"
+    case multipleScenes = "multiple_scenes"
+}
+
 extension PipelineRunner {
     enum ClassicalFeaturePreparationError: Error, LocalizedError, Equatable {
         case databaseStillPresent
@@ -21,9 +27,12 @@ extension PipelineRunner {
         case geometryRegisteredImagesMismatch
         case geometryResidualsUnavailable(String)
         case geometryResidualsTooHigh(median: Double, p90: Double)
+        case geometryConditioningRejected(GeometryConditioningFailure)
         case geometryProvenanceUnavailable(String)
+        case geometryCameraModelMismatch(expected: String, actual: [String])
         case videoFrameBudgetTooSmall(required: Int, available: Int)
         case photoSelectionExceedsBudget(selected: Int, maximum: Int)
+        case incompatibleSharedCameraDimensions
         case imageTranscodeFailed(String)
         case outputMissing
     }
@@ -32,6 +41,54 @@ extension PipelineRunner {
         case valid
         case missing
         case corrupt(reason: String)
+    }
+
+    static func captureFailureType(for error: Error) -> CaptureFailureType? {
+        if error is CaptureRetrievalConnectionFailure
+            || error is CaptureConnectionFailure {
+            return .disconnectedInput
+        }
+        if let pairError = error as? ColmapPairPlanningError {
+            switch pairError {
+            case .disconnectedPairSchedule, .disconnectedVerifiedGraph:
+                return .disconnectedInput
+            case .invalidPairPlan, .pairLimitExceeded, .repeatedAttempt:
+                return nil
+            }
+        }
+        guard let pipelineError = error as? PipelineError else { return nil }
+        switch pipelineError {
+        case .fragmentedReconstruction:
+            return .multipleScenes
+        case .geometryConditioningRejected(let failure):
+            switch failure {
+            case .insufficientViewSupport,
+                 .collapsedCameraTrajectory,
+                 .insufficientParallax,
+                 .degeneratePointDistribution:
+                return .insufficientOverlap
+            case .insufficientDistinctTrackViews,
+                 .rayPairWorkLimitExceeded:
+                return nil
+            }
+        case .lowQualityReconstruction,
+             .geometryCoverageTooLow,
+             .geometryResidualCoverageTooLow,
+             .geometryResidualsTooHigh:
+            return .insufficientOverlap
+        case .invalidInput,
+             .insufficientInputImages,
+             .geometryRegisteredImagesMismatch,
+             .geometryResidualsUnavailable,
+             .geometryProvenanceUnavailable,
+             .geometryCameraModelMismatch,
+             .videoFrameBudgetTooSmall,
+             .photoSelectionExceedsBudget,
+             .incompatibleSharedCameraDimensions,
+             .imageTranscodeFailed,
+             .outputMissing:
+            return nil
+        }
     }
 
     struct ColmapSparseTextStats: Sendable {
@@ -159,7 +216,49 @@ extension PipelineRunner {
         try resetDirectory(paths.colmapSparseURL)
     }
 
-    func cleanForRetry(failedStage: PipelineStage, paths: ProjectPaths) throws {
+    func hasBoundTerminalPairRecovery(
+        paths: ProjectPaths,
+        resolvedRunPlan: ResolvedRunPlan
+    ) throws -> Bool {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: paths.pairGraphRecoveryURL.path),
+              fileManager.fileExists(atPath: paths.framesSelectedManifestURL.path),
+              fileManager.fileExists(atPath: paths.framesSelectedURL.path) else {
+            return false
+        }
+        do {
+            let manifest = try loadSelectedFrameManifest(
+                from: paths.framesSelectedManifestURL
+            )
+            let imageNames = try loadImages(in: paths.framesSelectedURL)
+                .map(\.lastPathComponent)
+            guard imageNames == manifest.map(\.outputFileName) else {
+                return false
+            }
+            let groups = try Self.colmapPairGroups(
+                imageNames: imageNames,
+                manifest: manifest
+            )
+            let recovered = try PairGraphRecoveryStore.loadBound(
+                from: paths.pairGraphRecoveryURL,
+                expectedImageNames: imageNames,
+                expectedGroups: groups,
+                projectPaths: paths
+            ).restoredRecovery()
+            return recovered.mode == .terminalExact
+                && recovered.planBinding == PairGraphPlanBinding(resolvedRunPlan)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return false
+        }
+    }
+
+    func cleanForRetry(
+        failedStage: PipelineStage,
+        paths: ProjectPaths,
+        preservingPairGraphRecovery: Bool = false
+    ) throws {
         func removeAcceptedGeometryAndTraining() throws {
             try self.removeItemIfPresent(
                 paths.colmapRefinementSeedModelURL.deletingLastPathComponent()
@@ -212,7 +311,9 @@ extension PipelineRunner {
                 )
             }
             try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
-            try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
+            if !preservingPairGraphRecovery {
+                try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
+            }
             try removeAcceptedGeometryAndTraining()
         case .sfmMapping:
             try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
@@ -238,9 +339,6 @@ extension PipelineRunner {
         try removeItemIfPresent(paths.geometryManifestURL)
         try removeItemIfPresent(paths.trainingURL)
 
-        metadata.geometryArtifact = nil
-        metadata.reconstruction = nil
-        metadata.trainingArtifact = nil
         metadata.checkpoint = nil
         let rerunIndex = PipelineStage.allCases.firstIndex(of: stage) ?? 0
         metadata.stageTimings = metadata.stageTimings?.filter { timing in
@@ -303,12 +401,9 @@ extension PipelineRunner {
         if boundaryIndex < mappingIndex {
             try removeInvalidatedItem(paths.colmapSparseURL)
             try removeInvalidatedItem(paths.geometryManifestURL)
-            metadata.geometryArtifact = nil
-            metadata.reconstruction = nil
         }
         if boundaryIndex < trainingIndex {
             try removeInvalidatedItem(paths.trainingURL)
-            metadata.trainingArtifact = nil
         }
 
         metadata.stageTimings = metadata.stageTimings?.filter { timing in
@@ -367,10 +462,49 @@ extension PipelineRunner {
                     "The camera solve was not stable enough. Try a slower capture with more overlap.",
                     String(format: "Measured pixel residuals exceeded the gate: median %.3f px, p90 %.3f px.", median, p90)
                 )
+            case let .geometryConditioningRejected(failure):
+                let debugMessage = "Geometry conditioning rejected the solve: \(failure.localizedDescription)"
+                switch failure {
+                case .insufficientViewSupport:
+                    return (
+                        "Not enough views contained reliable shared detail. Try again with more overlap.",
+                        debugMessage
+                    )
+                case .collapsedCameraTrajectory:
+                    return (
+                        "The capture did not move through enough space. Move around or through the scene as you record.",
+                        debugMessage
+                    )
+                case .insufficientParallax:
+                    return (
+                        "The views were too similar to recover stable depth. Move around or through the scene as you record.",
+                        debugMessage
+                    )
+                case .degeneratePointDistribution:
+                    return (
+                        "The capture did not contain enough three-dimensional detail. Try more viewpoints with shared detail.",
+                        debugMessage
+                    )
+                case .insufficientDistinctTrackViews:
+                    return (
+                        "The camera solve contained inconsistent track data.",
+                        debugMessage
+                    )
+                case .rayPairWorkLimitExceeded:
+                    return (
+                        "This reconstruction exceeded the safe geometry-verification limit.",
+                        debugMessage
+                    )
+                }
             case let .geometryProvenanceUnavailable(reason):
                 return (
                     "The installed reconstruction tools could not be verified. Reinstall the required tools.",
                     "Geometry provenance was unavailable: \(reason)"
+                )
+            case let .geometryCameraModelMismatch(expected, actual):
+                return (
+                    "The reconstruction returned an incompatible camera model.",
+                    "Expected DA3 camera model \(expected), received \(actual.joined(separator: ", "))."
                 )
             case let .videoFrameBudgetTooSmall(required, available):
                 return (
@@ -381,6 +515,11 @@ extension PipelineRunner {
                 return (
                     "Use all valid photos exceeds this Mac's safe plan. Choose Automatic selection.",
                     "Use all valid photos requested \(selected) photos; the resolved safe limit is \(maximum)."
+                )
+            case .incompatibleSharedCameraDimensions:
+                return (
+                    "These images do not share one pixel size. Choose Automatic or Mixed cameras or lenses.",
+                    "Same camera and lens was requested, but the selected images have different pixel dimensions."
                 )
             case let .imageTranscodeFailed(message):
                 return ("Failed to convert photos for processing. Try exporting as JPEG/PNG.", message)
@@ -400,6 +539,31 @@ extension PipelineRunner {
                 "The spatially verified pair graph remained disconnected after matching."
             )
         }
+        if let failure = error as? CaptureRetrievalConnectionFailure {
+            let attempts = failure.attempts.map { attempt in
+                let noNeighborCount = attempt.retrieval.queryOutcomes.count {
+                    $0.status == .noRankedNeighbors
+                }
+                return "retrieval attempt \(attempt.retrievalAttemptOrdinal): "
+                    + "recovery \(attempt.recoveryLevel.rawValue); "
+                    + "\(attempt.retrieval.candidateCount) candidates; "
+                    + "\(attempt.retrieval.returnedNeighborCount) requested neighbors; "
+                    + "\(attempt.retrieval.queryOutcomes.count) queries; "
+                    + "\(noNeighborCount) without ranked neighbors; "
+                    + String(format: "%.2fs", attempt.durationSeconds)
+            }.joined(separator: " | ")
+            return (
+                "EasySplat found separate parts of the capture. Add views between the gaps with clear shared detail, and keep the scene still.",
+                "Capture connection failed before matching after all retrieval recovery attempts: policy \(failure.pairingPolicy.rawValue); \(failure.selectedViewCount) selected views; \(attempts)."
+            )
+        }
+        if let failure = error as? CaptureConnectionFailure {
+            let attempt = failure.attempt
+            return (
+                "EasySplat found separate parts of the capture. Add views between the gaps with clear shared detail, and keep the scene still.",
+                "Capture connection failed after all recovery attempts: policy \(failure.pairingPolicy.rawValue); \(failure.selectedViewCount) selected views; attempt \(attempt.attemptNumber); matcher \(attempt.matcher.rawValue); recovery \(attempt.recoveryLevel.rawValue); scheduled \(attempt.scheduledPairCount); attempted \(attempt.attemptedPairCount); raw matched \(attempt.rawMatchedPairCount); verified \(attempt.spatiallyVerifiedPairCount); \(failure.connectedComponentCount) components; \(failure.isolatedViewCount) isolated; \(failure.descriptorlessViewCount) descriptorless; component sizes \(failure.componentViewCounts); degree p10/median/p90 \(failure.degreeP10)/\(failure.degreeMedian)/\(failure.degreeP90)."
+            )
+        }
         if let memoryError = error as? MsplatRasterMemoryBudgetExceeded {
             return (
                 "Training needs more memory than this run allows.",
@@ -411,6 +575,34 @@ extension PipelineRunner {
                 "This scene exceeded Metal's size limit for one training buffer.",
                 "Exact raster allocation required \(resourceError.requiredBytes) bytes at iteration \(resourceError.iteration); Metal maximum \(resourceError.maximumBufferBytes) bytes."
             )
+        }
+        if let allocationError = error as? MsplatMetalAllocationUnavailable {
+            let intersections = allocationError.intersectionCount.map {
+                "; \($0) intersections"
+            } ?? ""
+            return (
+                "Training could not reserve unified memory. Close other demanding apps, then try again.",
+                "Metal allocation failed at iteration \(allocationError.iteration): requested \(allocationError.requestedBytes) bytes; currently allocated \(allocationError.currentAllocatedBytes) bytes; required \(allocationError.requiredBytes) bytes; budget \(allocationError.budgetBytes) bytes; recommended working set \(allocationError.recommendedWorkingSetBytes) bytes; maximum buffer \(allocationError.maximumBufferBytes) bytes\(intersections)."
+            )
+        }
+        if let admissionError = error as? TrainingResourceAdmissionError {
+            switch admissionError {
+            case .invalidObservation:
+                return (
+                    "Current memory availability could not be verified. Try again.",
+                    "Live trainer admission rejected contradictory or invalid memory evidence."
+                )
+            case .staleObservation:
+                return (
+                    "Memory availability changed before training could start. Try again.",
+                    "Live trainer admission evidence was older than the five-second launch boundary or came from a different boot."
+                )
+            case let .insufficientAvailableMemory(requiredBytes, availableBytes):
+                return (
+                    "Training needs more free unified memory. Close other demanding apps, then try again.",
+                    "Live trainer admission required \(requiredBytes) bytes; available \(availableBytes) bytes."
+                )
+            }
         }
         if let subprocessFailure = error as? SubprocessFailure {
             return ("Processing failed. Check details for more info.", subprocessFailure.debugDescription)
@@ -425,6 +617,23 @@ extension PipelineRunner {
             }
         }
         return ("Processing failed. Check details for more info.", String(reflecting: error))
+    }
+
+    static func requireDa3SeedCameraModel(
+        at modelDirectory: URL,
+        expectedCameraModel: String
+    ) throws {
+        let cameraModels = try ColmapResidualAnalyzer.cameraModels(
+            modelDirectory: modelDirectory
+        )
+        let actualModels = Set(cameraModels.values)
+        guard !actualModels.isEmpty,
+              actualModels == [expectedCameraModel] else {
+            throw PipelineError.geometryCameraModelMismatch(
+                expected: expectedCameraModel,
+                actual: actualModels.sorted()
+            )
+        }
     }
 
     func debugDescription(for error: ColmapRunnerError) -> String {
@@ -505,14 +714,32 @@ extension PipelineRunner {
         }
     }
 
-    func validateStageOutput(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) throws -> StageOutputStatus {
+    func validateStageOutput(
+        _ stage: PipelineStage,
+        paths: ProjectPaths,
+        metadata: ProjectMetadata
+    ) throws -> StageOutputStatus {
+        try validateStageOutput(
+            stage,
+            paths: paths,
+            metadata: metadata,
+            selectedFrameSourceSHA256: { try GeometryArtifactStore.sha256(of: $0) }
+        )
+    }
+
+    func validateStageOutput(
+        _ stage: PipelineStage,
+        paths: ProjectPaths,
+        metadata: ProjectMetadata,
+        selectedFrameSourceSHA256: (URL) throws -> String
+    ) throws -> StageOutputStatus {
         let fm = FileManager.default
         switch stage {
         case .importInput:
             if metadata.input.videoFiles.isEmpty && metadata.input.photosFolder == nil {
                 return .missing
             }
-            let importedVideos = importedVideoURLs(for: metadata.input.videoFiles, paths: paths)
+            let importedVideos = try importedVideoURLs(for: metadata.input.videoFiles, paths: paths)
             for dest in importedVideos {
                 let name = dest.lastPathComponent
                 guard fm.fileExists(atPath: dest.path) else { return .missing }
@@ -536,13 +763,28 @@ extension PipelineRunner {
             let currentIndex = PipelineStage.allCases.firstIndex(of: metadata.state.stage) ?? 0
             let selectIndex = PipelineStage.allCases.firstIndex(of: .selectFrames) ?? 2
             if currentIndex >= selectIndex,
-               try validateStageOutput(.selectFrames, paths: paths, metadata: metadata) == .valid {
+               try validateStageOutput(
+                    .selectFrames,
+                    paths: paths,
+                    metadata: metadata,
+                    selectedFrameSourceSHA256: selectedFrameSourceSHA256
+               ) == .valid {
                 return .valid
             }
             do {
+                guard let receipts = metadata.videoInputReceipts,
+                      receipts.count == metadata.input.videoFiles.count else {
+                    return .corrupt(reason: "raw frame manifest has no input receipts")
+                }
+                let processingReceipts = try Self.videoReceiptsInProcessingOrder(
+                    receipts,
+                    pairingPolicy: metadata.resolvedRunPlan?.pairingPolicy
+                )
                 _ = try ExtractedFrameManifestStore.loadVerified(
                     paths: paths,
-                    expectedVideoCount: metadata.input.videoFiles.count,
+                    expectedSourceEvidence: processingReceipts.map(
+                        ExtractedFrameSourceEvidence.init(receipt:)
+                    ),
                     maximumTotalFrames: metadata.resolvedRunPlan?.keyframeBudget ?? 3_000
                 )
             } catch ExtractedFrameManifestError.missingManifest {
@@ -569,8 +811,11 @@ extension PipelineRunner {
             } catch {
                 return .corrupt(reason: "selected frame manifest is invalid JSON")
             }
-            if manifest.isEmpty {
-                return .corrupt(reason: "selected frame manifest is empty")
+            if manifest.count < RunPlanResolver.minimumReconstructionImageCount {
+                return .corrupt(
+                    reason: "selected frame manifest has fewer than "
+                        + "\(RunPlanResolver.minimumReconstructionImageCount) frames"
+                )
             }
             let files = try loadImages(in: paths.framesSelectedURL)
             if files.count != manifest.count {
@@ -579,8 +824,140 @@ extension PipelineRunner {
             let imageNames = files.map(\.lastPathComponent)
             guard Set(imageNames).count == imageNames.count,
                   Set(manifest.map(\.outputFileName)).count == manifest.count,
-                  Set(imageNames) == Set(manifest.map(\.outputFileName)) else {
+                  imageNames == manifest.map(\.outputFileName) else {
                 return .corrupt(reason: "selected frame manifest does not match the selected files")
+            }
+            guard let plan = metadata.resolvedRunPlan else {
+                return .corrupt(reason: "selected frame manifest has no resolved run plan")
+            }
+            let photoSelectionProjection: PhotoSelectionProjection?
+            do {
+                photoSelectionProjection = try PhotoSelectionProjection.loadVerified(
+                    metadata: metadata,
+                    paths: paths
+                )
+            } catch {
+                return .corrupt(reason: "photo selection evidence is missing or invalid")
+            }
+            let receiptPairs = (metadata.videoInputReceipts ?? []).map {
+                ($0.projectRelativePath, $0.sha256)
+            } + (metadata.photoInputReceipts ?? []).map {
+                ($0.projectRelativePath, $0.sha256)
+            }
+            guard receiptPairs.count
+                    == (metadata.videoInputReceipts?.count ?? 0)
+                        + (metadata.photoInputReceipts?.count ?? 0),
+                  Set(receiptPairs.map(\.0)).count == receiptPairs.count else {
+                return .corrupt(reason: "selected frame receipts are invalid")
+            }
+            let receiptDigests = Dictionary(uniqueKeysWithValues: receiptPairs)
+            let photoReceiptRanks = Dictionary(uniqueKeysWithValues:
+                (metadata.photoInputReceipts ?? []).map {
+                    ($0.projectRelativePath, $0.retainedRank)
+                }
+            )
+            let expectedVideoGroups: [String: String]
+            do {
+                let videoReceipts = metadata.videoInputReceipts ?? []
+                let identities = try VideoClipIdentityResolver.resolve(
+                    sourceSHA256s: videoReceipts.map(\.sha256),
+                    pairingPolicy: plan.pairingPolicy
+                )
+                expectedVideoGroups = Dictionary(uniqueKeysWithValues: identities.map {
+                    let receipt = videoReceipts[$0.sourceIndex]
+                    return (receipt.projectRelativePath, $0.groupID)
+                })
+            } catch {
+                return .corrupt(reason: "selected video groups cannot be resolved")
+            }
+            var selectedPhotoLineage: [(path: String, retainedRank: Int)] = []
+            var sourceSHA256ByPath: [String: String] = [:]
+            for (index, entry) in manifest.enumerated() {
+                let expectedPrefix = String(format: "frame_%06d.", index)
+                guard entry.schemaVersion == SelectedFrameMapping.currentSchemaVersion,
+                      entry.outputFileName.hasPrefix(expectedPrefix),
+                      let sourcePath = entry.sourceProjectRelativePath,
+                      sourcePath.hasPrefix("Originals/"),
+                      let sourceSHA256 = entry.sourceSHA256,
+                      GeometryArtifactStore.isSHA256(sourceSHA256),
+                      receiptDigests[sourcePath] == sourceSHA256,
+                      let selectedSHA256 = entry.selectedSHA256,
+                      GeometryArtifactStore.isSHA256(selectedSHA256),
+                      let selectedPixelSHA256 = entry.selectedPixelSHA256,
+                      GeometryArtifactStore.isSHA256(selectedPixelSHA256),
+                      let normalization = entry.normalization,
+                      normalization.maximumPixelDimension == plan.maximumImageDimension else {
+                    return .corrupt(reason: "selected frame manifest has incomplete lineage")
+                }
+                let source: URL
+                do {
+                    source = try paths.resolveProjectRelativePath(sourcePath)
+                } catch {
+                    return .corrupt(reason: "selected frame source path is unsafe")
+                }
+                let selected = paths.framesSelectedURL.appendingPathComponent(
+                    entry.outputFileName
+                )
+                guard let selectedIdentity = try? Self.selectedFrameContentIdentity(
+                    at: selected,
+                    maximumPixelDimension: plan.maximumImageDimension
+                ) else {
+                    return .corrupt(reason: "selected frame lineage digest changed")
+                }
+                let observedSourceSHA256: String
+                if let cached = sourceSHA256ByPath[sourcePath] {
+                    observedSourceSHA256 = cached
+                } else {
+                    guard let calculated = try? selectedFrameSourceSHA256(source) else {
+                        return .corrupt(reason: "selected frame lineage digest changed")
+                    }
+                    sourceSHA256ByPath[sourcePath] = calculated
+                    observedSourceSHA256 = calculated
+                }
+                guard observedSourceSHA256 == sourceSHA256,
+                      selectedIdentity.sha256 == selectedSHA256,
+                      selectedIdentity.pixelSHA256 == selectedPixelSHA256 else {
+                    return .corrupt(reason: "selected frame lineage digest changed")
+                }
+                if entry.isVideo {
+                    guard entry.photoRetainedRank == nil,
+                          entry.videoSource?.projectRelativePath == sourcePath,
+                          entry.videoSource?.sourceSHA256 == sourceSHA256,
+                          entry.videoSource?.isValidEvidence == true,
+                          entry.videoOrigin?.isValidEvidence == true,
+                          entry.timestampSeconds == entry.videoOrigin?.timestampSeconds,
+                          expectedVideoGroups[sourcePath] == entry.groupId else {
+                        return .corrupt(reason: "selected video sample lineage is invalid")
+                    }
+                } else {
+                    guard let retainedRank = entry.photoRetainedRank,
+                          retainedRank >= 0,
+                          photoReceiptRanks[sourcePath] == retainedRank,
+                          entry.groupId == "photos",
+                          entry.videoSource == nil,
+                          entry.videoOrigin == nil,
+                          entry.timestampSeconds == nil else {
+                        return .corrupt(reason: "selected photo lineage contains video evidence")
+                    }
+                    selectedPhotoLineage.append((sourcePath, retainedRank))
+                }
+            }
+            let expectedPhotoLineage: [(path: String, retainedRank: Int)]
+            do {
+                expectedPhotoLineage = try photoSelectionProjection?
+                    .project(targetCount: selectedPhotoLineage.count)
+                    .map { ($0.projectRelativePath, $0.retainedRank) } ?? []
+            } catch {
+                return .corrupt(reason: "selected photo count does not match its projection")
+            }
+            guard selectedPhotoLineage.elementsEqual(
+                expectedPhotoLineage,
+                by: { observed, expected in
+                    observed.path == expected.path
+                        && observed.retainedRank == expected.retainedRank
+                }
+            ) else {
+                return .corrupt(reason: "selected photos do not match their projection")
             }
             do {
                 _ = try Self.colmapPairGroups(
@@ -607,17 +984,72 @@ extension PipelineRunner {
                 requireMatches: false
             )
             guard databaseStatus == .valid else { return databaseStatus }
-            return try validateClassicalFeatureEvidence(paths: paths)
+            guard let resolvedRunPlan = metadata.resolvedRunPlan else {
+                return .corrupt(reason: "the resolved reconstruction plan is missing")
+            }
+            let checkpointReceipt: ColmapCameraGroupingReceipt?
+            let checkpointInitializationReceipt: ColmapCameraInitializationReceipt?
+            let checkpointFeatureDigest: String?
+            if metadata.checkpoint?.stage == .sfmFeatures {
+                guard case let .sfmFeatures(featureCheckpoint)? = metadata.checkpoint?.details,
+                      let receipt = featureCheckpoint.cameraGroupingReceipt,
+                      let initializationReceipt = featureCheckpoint.cameraInitializationReceipt,
+                      let featureDigest = featureCheckpoint.featureDatabaseDigest else {
+                    return .corrupt(reason: "the camera grouping checkpoint is missing")
+                }
+                checkpointReceipt = receipt
+                checkpointInitializationReceipt = initializationReceipt
+                checkpointFeatureDigest = featureDigest
+            } else {
+                checkpointReceipt = nil
+                checkpointInitializationReceipt = nil
+                checkpointFeatureDigest = nil
+            }
+            return try validateClassicalFeatureEvidence(
+                paths: paths,
+                resolvedRunPlan: resolvedRunPlan,
+                detailProfile: metadata.requestedRunOptions.detailProfile,
+                checkpointReceipt: checkpointReceipt,
+                checkpointInitializationReceipt: checkpointInitializationReceipt,
+                checkpointFeatureDigest: checkpointFeatureDigest
+            )
         case .sfmMatching:
             let databaseStatus = validateColmapDatabaseOutput(
                 paths: paths,
                 requireMatches: true
             )
             guard databaseStatus == .valid else { return databaseStatus }
-            if metadata.resolvedRunPlan?.routeIdentifier == SfmBackend.da3.rawValue {
-                return .valid
+            guard let resolvedRunPlan = metadata.resolvedRunPlan else {
+                return .corrupt(reason: "the resolved reconstruction plan is missing")
             }
-            return try validateClassicalMatchingEvidence(paths: paths)
+            if resolvedRunPlan.geometryBackend == .da3 {
+                let featureStatus = try validateClassicalFeatureEvidence(
+                    paths: paths,
+                    resolvedRunPlan: resolvedRunPlan,
+                    detailProfile: metadata.requestedRunOptions.detailProfile,
+                    checkpointReceipt: nil,
+                    checkpointInitializationReceipt: nil,
+                    checkpointFeatureDigest: nil
+                )
+                guard featureStatus == .valid else { return featureStatus }
+                return try validateDa3MatchingEvidence(
+                    paths: paths,
+                    resolvedRunPlan: resolvedRunPlan
+                )
+            }
+            let featureStatus = try validateClassicalFeatureEvidence(
+                paths: paths,
+                resolvedRunPlan: resolvedRunPlan,
+                detailProfile: metadata.requestedRunOptions.detailProfile,
+                checkpointReceipt: nil,
+                checkpointInitializationReceipt: nil,
+                checkpointFeatureDigest: nil
+            )
+            guard featureStatus == .valid else { return featureStatus }
+            return try validateClassicalMatchingEvidence(
+                paths: paths,
+                resolvedRunPlan: resolvedRunPlan
+            )
         case .sfmMapping:
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
             guard sparseModelFilesExist(at: sparseZero) else { return .missing }
@@ -656,24 +1088,29 @@ extension PipelineRunner {
                     return .corrupt(reason: "images.bin appears truncated")
                 }
             }
-            guard let metadataArtifact = metadata.geometryArtifact else {
-                return .missing
-            }
             do {
-                let storedArtifact = try GeometryArtifactStore.load(
+                _ = try GeometryArtifactStore.load(
                     from: paths.geometryManifestURL,
-                    projectPaths: paths
+                    projectPaths: paths,
+                    expectedInput: metadata.input
                 )
-                guard storedArtifact == metadataArtifact else {
-                    return .corrupt(reason: "geometry manifest does not match project metadata")
-                }
             } catch {
                 return .corrupt(reason: error.localizedDescription)
             }
             return .valid
         case .trainSplat:
-            if let artifact = metadata.trainingArtifact {
-                switch artifact.completionStatus {
+            let artifact: TrainingArtifact
+            do {
+                artifact = try TrainingArtifactStore.load(
+                    from: paths.trainingManifestURL,
+                    projectPaths: paths
+                )
+            } catch where BoundedFileReader.isMissingFileError(error) {
+                return .missing
+            } catch {
+                return .corrupt(reason: error.localizedDescription)
+            }
+            switch artifact.completionStatus {
                 case .checkpointed:
                     return .missing
                 case .completed:
@@ -691,9 +1128,10 @@ extension PipelineRunner {
                         )
                     }
                     if let plan = metadata.resolvedRunPlan {
-                        guard artifact.iterationLimit == plan.trainerIterationLimit,
-                              artifact.plateauWindow == plan.plateauWindow,
-                              artifact.memoryBudgetBytes == plan.trainerMemoryBudgetBytes else {
+                        guard artifact.matchesResolvedTrainingPlan(
+                            plan,
+                            resourcePolicy: metadata.requestedRunOptions.resourcePolicy
+                        ) else {
                             return .corrupt(
                                 reason: "completed training manifest does not match the resolved training plan"
                             )
@@ -712,11 +1150,26 @@ extension PipelineRunner {
                     }
                     guard outputStatus == .valid else { return outputStatus }
                     do {
-                        let identity = try currentMsplatDatasetIdentity(paths: paths)
-                        guard artifact.inputDigest == identity.inputDigest,
-                              artifact.geometryDigest == identity.geometryDigest else {
+                        guard let plan = metadata.resolvedRunPlan else {
                             return .corrupt(
-                                reason: "completed training manifest does not match current input or geometry"
+                                reason: "completed training has no current geometry or run plan"
+                            )
+                        }
+                        let geometryArtifact = try GeometryArtifactStore.load(
+                            from: paths.geometryManifestURL,
+                            projectPaths: paths,
+                            expectedInput: metadata.input
+                        )
+                        let derivation = try currentMsplatDatasetDerivation(
+                            paths: paths,
+                            geometryArtifact: geometryArtifact,
+                            maxImageSize: plan.maximumImageDimension
+                        )
+                        guard artifact.inputDigest == derivation.datasetInputDigest,
+                              artifact.geometryDigest == derivation.datasetGeometryDigest,
+                              artifact.datasetDerivation == derivation else {
+                            return .corrupt(
+                                reason: "completed training manifest does not match current input, geometry, or derivation"
                             )
                         }
                     } catch {
@@ -725,22 +1178,37 @@ extension PipelineRunner {
                         )
                     }
                     return .valid
-                }
             }
-            return .missing
         case .exportSplat, .done:
-            let output: URL
-            if let persisted = metadata.outputs?.splatPlyPath {
-                do {
-                    output = try paths.resolveProjectRelativePath(persisted)
-                } catch {
-                    return .corrupt(reason: error.localizedDescription)
-                }
-            } else {
-                output = paths.outputURL.appendingPathComponent("splat.ply")
+            let trainingArtifact: TrainingArtifact
+            do {
+                trainingArtifact = try TrainingArtifactStore.load(
+                    from: paths.trainingManifestURL,
+                    projectPaths: paths
+                )
+            } catch where BoundedFileReader.isMissingFileError(error) {
+                return .missing
+            } catch {
+                return .corrupt(reason: error.localizedDescription)
             }
-            return validatePlyFile(at: output)
+            guard trainingArtifact.completionStatus == .completed,
+                  trainingArtifact.outputPath == "Output/splat.ply" else {
+                return .missing
+            }
+            return validatePlyFile(at: paths.outputSplatURL)
         }
+    }
+
+    private static func videoReceiptsInProcessingOrder(
+        _ receipts: [VideoInputReceipt],
+        pairingPolicy: ResolvedPairingPolicy?
+    ) throws -> [VideoInputReceipt] {
+        guard let pairingPolicy else { return receipts }
+        let identities = try VideoClipIdentityResolver.resolve(
+            sourceSHA256s: receipts.map(\.sha256),
+            pairingPolicy: pairingPolicy
+        )
+        return identities.map { receipts[$0.sourceIndex] }
     }
 
     private static func canDecodeSelectedFrame(_ url: URL) -> Bool {
@@ -1028,7 +1496,10 @@ extension PipelineRunner {
         return .valid
     }
 
-    func validateClassicalMatchingEvidence(paths: ProjectPaths) throws -> StageOutputStatus {
+    func validateClassicalMatchingEvidence(
+        paths: ProjectPaths,
+        resolvedRunPlan: ResolvedRunPlan
+    ) throws -> StageOutputStatus {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: paths.pairGraphEvidenceURL.path),
               fileManager.fileExists(atPath: paths.framesSelectedManifestURL.path),
@@ -1059,11 +1530,22 @@ extension PipelineRunner {
         }
 
         do {
-            _ = try PairGraphEvidenceStore.loadVerified(
+            let evidence = try PairGraphEvidenceStore.loadVerified(
                 from: paths.pairGraphEvidenceURL,
                 expectedImageNames: selectedNames,
                 databaseURL: paths.colmapDatabaseURL,
                 projectPaths: paths
+            )
+            guard evidence.planBinding == PairGraphPlanBinding(resolvedRunPlan) else {
+                return .corrupt(reason: "image-pair evidence uses an obsolete camera initialization")
+            }
+            try PairGraphEvidenceStore.validateSchedule(
+                evidence,
+                resolvedPlan: resolvedRunPlan,
+                groups: try Self.colmapPairGroups(
+                    imageNames: selectedNames,
+                    manifest: manifest
+                )
             )
             return .valid
         } catch is CancellationError {
@@ -1073,7 +1555,77 @@ extension PipelineRunner {
         }
     }
 
-    func validateClassicalFeatureEvidence(paths: ProjectPaths) throws -> StageOutputStatus {
+    func validateDa3MatchingEvidence(
+        paths: ProjectPaths,
+        resolvedRunPlan: ResolvedRunPlan
+    ) throws -> StageOutputStatus {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: paths.pairGraphEvidenceURL.path),
+              fileManager.fileExists(atPath: paths.da3CoverageManifestURL.path),
+              fileManager.fileExists(atPath: paths.framesSelectedManifestURL.path),
+              fileManager.fileExists(atPath: paths.framesSelectedURL.path),
+              fileManager.fileExists(atPath: paths.workerExecutionURL.path) else {
+            return .missing
+        }
+        do {
+            let manifest = try loadSelectedFrameManifest(
+                from: paths.framesSelectedManifestURL
+            )
+            let selectedFiles = try loadImages(in: paths.framesSelectedURL)
+            let manifestNames = manifest.map(\.outputFileName)
+            let selectedNames = selectedFiles.map(\.lastPathComponent)
+            guard !manifestNames.isEmpty,
+                  Set(manifestNames).count == manifestNames.count,
+                  selectedNames.count == manifestNames.count,
+                  Set(selectedNames) == Set(manifestNames) else {
+                return .corrupt(
+                    reason: "selected frame evidence does not match the manifest"
+                )
+            }
+            let da3Manifest = try Da3CoverageManifest.load(
+                from: paths.da3CoverageManifestURL
+            )
+            let pairPlan = try ColmapPairEstimator.validatedDa3RefinementPairPlan(
+                manifest: da3Manifest,
+                imageNames: selectedNames,
+                resolvedPlan: resolvedRunPlan
+            )
+            let planBinding = PairGraphPlanBinding(resolvedRunPlan)
+            let evidence = try PairGraphEvidenceStore.loadVerifiedDa3Refinement(
+                from: paths.pairGraphEvidenceURL,
+                expectedImageNames: selectedNames,
+                expectedPlanBinding: planBinding,
+                expectedPairPlan: pairPlan,
+                databaseURL: paths.colmapDatabaseURL,
+                projectPaths: paths
+            )
+            let workerExecution = try GeometryWorkerExecutionArtifactStore.load(
+                from: paths.workerExecutionURL,
+                expectedBudget: resolvedRunPlan.geometryWorkerBudget,
+                projectPaths: paths
+            )
+            try PairGraphEvidenceStore.validateDa3WorkerExecution(
+                evidence,
+                expectedPlanBinding: planBinding,
+                expectedPairPlan: pairPlan,
+                workerExecution: workerExecution
+            )
+            return .valid
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return .corrupt(reason: error.localizedDescription)
+        }
+    }
+
+    func validateClassicalFeatureEvidence(
+        paths: ProjectPaths,
+        resolvedRunPlan: ResolvedRunPlan,
+        detailProfile: DetailProfile,
+        checkpointReceipt: ColmapCameraGroupingReceipt?,
+        checkpointInitializationReceipt: ColmapCameraInitializationReceipt?,
+        checkpointFeatureDigest: String?
+    ) throws -> StageOutputStatus {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: paths.colmapFeatureEvidenceURL.path),
               fileManager.fileExists(atPath: paths.framesSelectedManifestURL.path),
@@ -1095,12 +1647,40 @@ extension PipelineRunner {
                     reason: "selected frame evidence does not match the manifest"
                 )
             }
-            _ = try ColmapFeatureEvidenceStore.loadVerified(
+            let cameraEvidence = try Self.colmapCameraGroupingEvidence(
+                imageNames: selectedNames,
+                manifest: manifest
+            )
+            let expectedCameraInitialization = try ColmapCameraInitializationReceipt.resolve(
+                plan: resolvedRunPlan,
+                detailProfile: detailProfile,
+                selectedImages: selectedFiles
+            )
+            let evidence = try ColmapFeatureEvidenceStore.loadVerified(
                 from: paths.colmapFeatureEvidenceURL,
                 expectedImageNames: selectedNames,
+                expectedCameraEvidence: cameraEvidence,
+                expectedCameraGroupingMode: Self.colmapCameraGroupingMode(
+                    cameraGrouping: resolvedRunPlan.cameraGrouping,
+                    evidence: cameraEvidence
+                ),
+                expectedCameraInitializationReceipt: expectedCameraInitialization,
                 databaseURL: paths.colmapDatabaseURL,
                 projectPaths: paths
             )
+            guard checkpointReceipt.map({
+                evidence.cameraGroupingReceipt == $0
+            }) ?? true,
+                  checkpointInitializationReceipt.map({
+                      evidence.cameraInitializationReceipt == $0
+                  }) ?? true,
+                  checkpointFeatureDigest.map({
+                      evidence.featureDatabaseDigest == $0
+                  }) ?? true else {
+                return .corrupt(
+                    reason: "the camera grouping checkpoint does not match feature evidence"
+                )
+            }
             return .valid
         } catch is CancellationError {
             throw CancellationError()

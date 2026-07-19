@@ -5,6 +5,124 @@ import XCTest
 @testable import MetalSplatter
 
 final class SplatRendererLoadTests: XCTestCase {
+    func testViewerLoadRetryabilityDistinguishesLivePressureFromPermanentCapacity() {
+        XCTAssertFalse(
+            SplatRenderer.isRetryableLoadError(
+                SplatRenderer.ViewerMemoryAdmissionError.invalidBudget(-1)
+            )
+        )
+        XCTAssertFalse(
+            SplatRenderer.isRetryableLoadError(
+                SplatRenderer.ViewerMemoryAdmissionError.invalidSplatCapacity(0)
+            )
+        )
+        XCTAssertFalse(
+            SplatRenderer.isRetryableLoadError(
+                SplatRenderer.ViewerMemoryAdmissionError.arithmeticOverflow(pointCount: Int.max)
+            )
+        )
+        XCTAssertTrue(
+            SplatRenderer.isRetryableLoadError(
+                SplatRenderer.ViewerMemoryAdmissionError.budgetExceeded(
+                    pointCount: 100,
+                    requiredBytes: 1_000,
+                    budgetBytes: 500
+                )
+            )
+        )
+        XCTAssertFalse(
+            SplatRenderer.isRetryableLoadError(
+                SplatRenderer.ViewerMemoryAdmissionError.permanentCapacityExceeded(
+                    pointCount: 100,
+                    requiredBytes: 1_000,
+                    maximumRecoverableBytes: 750
+                )
+            )
+        )
+    }
+
+    func testRendererInitializationFailuresNeverOfferADeadRetry() {
+        let failures: [SplatRenderer.InitializationError] = [
+            .shaderLibraryUnavailable("Shaders.metallib is missing"),
+            .missingShaderFunction("splatVertexShader"),
+            .renderPipelineUnavailable("unsupported pixel format"),
+        ]
+
+        for failure in failures {
+            XCTAssertFalse(SplatRenderer.isRetryableLoadError(failure))
+        }
+    }
+
+    func testFullSphericalHarmonicWorkingSetModelAccountsForEveryProductionSortAllocation() throws {
+        let geometryBytes = MemoryLayout<SplatRenderer.Splat>.stride
+        let sphericalHarmonicBytes = 16 * MemoryLayout<SplatRenderer.PackedHalf3>.stride
+        let orderBytes = 2 * MemoryLayout<SplatRenderer.IndexType>.stride
+        let cpuSortBytes = 2 * MemoryLayout<SplatRenderer.SplatIndexAndDepth>.stride
+        let bytesPerSplat = geometryBytes + sphericalHarmonicBytes + orderBytes + cpuSortBytes
+        XCTAssertEqual(
+            SplatRenderer.ViewerMemoryModel.bytesPerFullSphericalHarmonicSplat,
+            bytesPerSplat
+        )
+        XCTAssertEqual(
+            try SplatRenderer.ViewerMemoryModel.requiredBytes(forPointCount: 2),
+            SplatRenderer.ViewerMemoryModel.fixedReserveBytes
+                + 2 * SplatRenderer.ViewerMemoryModel.bytesPerFullSphericalHarmonicSplat
+        )
+    }
+
+    func testFullSphericalHarmonicWorkingSetModelRejectsOverflow() {
+        XCTAssertThrowsError(
+            try SplatRenderer.ViewerMemoryModel.requiredBytes(forPointCount: Int.max)
+        ) { error in
+            XCTAssertTrue(error is SplatRenderer.ViewerMemoryAdmissionError)
+        }
+    }
+
+    func testFullSphericalHarmonicWorkingSetModelRejectsFixedReserveOverflow() {
+        let largestPointCountBeforeReserve =
+            (Int.max - SplatRenderer.ViewerMemoryModel.fixedReserveBytes)
+            / SplatRenderer.ViewerMemoryModel.bytesPerFullSphericalHarmonicSplat
+
+        XCTAssertThrowsError(
+            try SplatRenderer.ViewerMemoryModel.requiredBytes(
+                forPointCount: largestPointCountBeforeReserve + 1
+            )
+        ) { error in
+            guard case let SplatRenderer.ViewerMemoryAdmissionError.arithmeticOverflow(pointCount) = error else {
+                return XCTFail("Expected fixed-reserve addition overflow")
+            }
+            XCTAssertEqual(pointCount, largestPointCountBeforeReserve + 1)
+        }
+    }
+
+    func testFullSphericalHarmonicWorkingSetAdmissionIsInclusiveAtTheBudgetBoundary() throws {
+        let required = try SplatRenderer.ViewerMemoryModel.requiredBytes(forPointCount: 4_000_000)
+
+        XCTAssertNoThrow(
+            try SplatRenderer.ViewerMemoryModel.admit(
+                pointCount: 4_000_000,
+                budgetBytes: required
+            )
+        )
+        XCTAssertThrowsError(
+            try SplatRenderer.ViewerMemoryModel.admit(
+                pointCount: 4_000_000,
+                budgetBytes: required - 1
+            )
+        ) { error in
+            guard case let SplatRenderer.ViewerMemoryAdmissionError.budgetExceeded(
+                pointCount,
+                requiredBytes,
+                budgetBytes
+            ) = error else {
+                return XCTFail("Expected a typed viewer-memory budget failure")
+            }
+            XCTAssertEqual(pointCount, 4_000_000)
+            XCTAssertEqual(requiredBytes, required)
+            XCTAssertEqual(budgetBytes, required - 1)
+        }
+    }
+
     func testAddPropagatesCapacityFailure() throws {
         let renderer = try makeRenderer(maximumSplatCount: 1)
         let point = makePoint()
@@ -24,8 +142,68 @@ final class SplatRendererLoadTests: XCTestCase {
             """
         )
 
-        XCTAssertThrowsError(try renderer.readPLY(from: url))
+        XCTAssertThrowsError(try renderer.readPLY(from: url)) { error in
+            guard case let SplatRenderer.ViewerMemoryAdmissionError.permanentCapacityExceeded(
+                pointCount,
+                requiredBytes,
+                maximumRecoverableBytes
+            ) = error else {
+                return XCTFail("Expected deterministic renderer-capacity rejection")
+            }
+            XCTAssertEqual(pointCount, 2)
+            XCTAssertGreaterThan(requiredBytes, maximumRecoverableBytes)
+            XCTAssertFalse(SplatRenderer.isRetryableLoadError(error))
+        }
         XCTAssertEqual(renderer.splatCount, 0)
+    }
+
+    func testHeaderAdmissionFailureStopsBodyDeliveryAndPreservesTypedError() throws {
+        let renderer = try makeRenderer(maximumSplatCount: 1)
+        var deliveredBodyCount = 0
+
+        XCTAssertThrowsError(
+            try renderer.readScene(shouldCancel: { false }) { delegate, shouldStop in
+                delegate.didStartReading(withPointCount: 2)
+                XCTAssertTrue(shouldStop())
+                if !shouldStop() {
+                    deliveredBodyCount += 1
+                    delegate.didRead(points: [makePoint()])
+                }
+                delegate.didFailReading(withError: CancellationError())
+            }
+        ) { error in
+            guard case let SplatRenderer.ViewerMemoryAdmissionError.permanentCapacityExceeded(
+                pointCount,
+                requiredBytes,
+                maximumRecoverableBytes
+            ) = error else {
+                return XCTFail("Expected the original renderer-capacity rejection")
+            }
+            XCTAssertEqual(pointCount, 2)
+            XCTAssertGreaterThan(requiredBytes, maximumRecoverableBytes)
+        }
+        XCTAssertEqual(deliveredBodyCount, 0)
+        XCTAssertEqual(renderer.splatCount, 0)
+    }
+
+    func testRendererRejectsNonpositiveExplicitCapacity() throws {
+        for pointCount in [-1, 0] {
+            XCTAssertThrowsError(try makeRenderer(maximumSplatCount: pointCount)) { error in
+                XCTAssertEqual(
+                    error as? SplatRenderer.ViewerMemoryAdmissionError,
+                    .invalidSplatCapacity(pointCount)
+                )
+                XCTAssertFalse(SplatRenderer.isRetryableLoadError(error))
+            }
+        }
+    }
+
+    func testExplicitCapacityAboveDeviceLimitIsClampedBeforeFullSHAllocation() throws {
+        let renderer = try makeRenderer(maximumSplatCount: Int.max)
+        let url = try makeSphericalHarmonicPLY(restValue: "0")
+
+        XCTAssertNoThrow(try renderer.readPLY(from: url))
+        XCTAssertEqual(renderer.splatCount, 1)
     }
 
     func testReadPLYDoesNotPublishPointsFromMalformedFile() throws {
@@ -40,7 +218,9 @@ final class SplatRendererLoadTests: XCTestCase {
             """
         )
 
-        XCTAssertThrowsError(try renderer.readPLY(from: url))
+        XCTAssertThrowsError(try renderer.readPLY(from: url)) { error in
+            XCTAssertFalse(SplatRenderer.isRetryableLoadError(error))
+        }
         XCTAssertEqual(renderer.splatCount, originalCount)
     }
 
@@ -61,6 +241,7 @@ final class SplatRendererLoadTests: XCTestCase {
             )
         ) { error in
             XCTAssertTrue(error is CancellationError)
+            XCTAssertFalse(SplatRenderer.isRetryableLoadError(error))
         }
         XCTAssertTrue(probe.wasChecked)
         XCTAssertEqual(renderer.splatCount, originalCount)
@@ -99,7 +280,9 @@ final class SplatRendererLoadTests: XCTestCase {
         let originalOrder = bufferIdentity(renderer.orderBuffer.buffer)
         let url = try makeSphericalHarmonicPLY(restValue: "70000")
 
-        XCTAssertThrowsError(try renderer.readPLY(from: url))
+        XCTAssertThrowsError(try renderer.readPLY(from: url)) { error in
+            XCTAssertFalse(SplatRenderer.isRetryableLoadError(error))
+        }
 
         XCTAssertEqual(renderer.splatCount, 1)
         XCTAssertEqual(bufferIdentity(renderer.splatBuffer.buffer), originalSplats)

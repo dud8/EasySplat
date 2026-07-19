@@ -2,24 +2,30 @@ import Foundation
 
 #if DEBUG
 struct TestSelectedFrameMapping: Codable, Sendable {
+    let schemaVersion: Int
     let outputFileName: String
     let groupId: String
     let isVideo: Bool
     let timestampSeconds: Double?
     let lowLightExposureEV: Double?
+    let photoRetainedRank: Int?
 
     init(
+        schemaVersion: Int = PipelineRunner.SelectedFrameMapping.currentSchemaVersion,
         outputFileName: String,
         groupId: String,
         isVideo: Bool,
         timestampSeconds: Double? = nil,
-        lowLightExposureEV: Double? = nil
+        lowLightExposureEV: Double? = nil,
+        photoRetainedRank: Int? = nil
     ) {
+        self.schemaVersion = schemaVersion
         self.outputFileName = outputFileName
         self.groupId = groupId
         self.isVideo = isVideo
         self.timestampSeconds = timestampSeconds
         self.lowLightExposureEV = lowLightExposureEV
+        self.photoRetainedRank = photoRetainedRank
     }
 }
 
@@ -77,10 +83,6 @@ extension PipelineRunner {
         evenlySpacedFrames(frames, targetCount: targetCount)
     }
 
-    func test_downsampleSelectedFrames(to targetCount: Int, paths: ProjectPaths) throws -> [URL]? {
-        try downsampleSelectedFrames(to: targetCount, paths: paths)
-    }
-
     func test_applyFrameBudget(to groups: [SelectedFrameGroup], targetCount: Int) throws -> [SelectedFrameGroup] {
         try applyFrameBudget(to: groups, targetCount: targetCount)
     }
@@ -101,7 +103,7 @@ extension PipelineRunner {
         groups: [SelectedFrameGroup],
         to directory: URL,
         manifestURL: URL,
-        maxDimension: CGFloat = .greatestFiniteMagnitude
+        maxDimension: CGFloat = CGFloat(PipelineRunner.maximumSelectedFrameDecodeDimension)
     ) throws -> [TestSelectedFrameMapping] {
         let result = try copySelected(
             groups: groups,
@@ -115,20 +117,10 @@ extension PipelineRunner {
                 groupId: $0.groupId,
                 isVideo: $0.isVideo,
                 timestampSeconds: $0.timestampSeconds,
-                lowLightExposureEV: $0.lowLightExposureEV
+                lowLightExposureEV: $0.lowLightExposureEV,
+                photoRetainedRank: $0.photoRetainedRank
             )
         }
-    }
-
-    func test_filterValidUniquePhotos(
-        _ photos: [URL]
-    ) throws -> (frames: [URL], unreadableCount: Int, duplicateCount: Int) {
-        let result = try filterValidUniquePhotos(photos)
-        return (result.frames, result.unreadableCount, result.duplicateCount)
-    }
-
-    func test_normalizeSelectedImagesForTooling(paths: ProjectPaths) throws -> Int {
-        try normalizeSelectedImagesForTooling(paths: paths)
     }
 
     func test_selectedImagesHaveUniformPixelDimensions(_ images: [URL]) throws -> Bool {
@@ -211,22 +203,6 @@ extension PipelineRunner {
             completedBoundary: completedBoundary,
             metadata: &metadata,
             paths: paths
-        )
-    }
-
-    func test_runDa3MatchesImporterWithOneShotExactRecovery(
-        database: URL,
-        matchListPath: URL,
-        options: ColmapOptions,
-        onExactRecovery: () throws -> Void
-    ) async throws {
-        try await runDa3MatchesImporterWithOneShotExactRecovery(
-            database: database,
-            matchListPath: matchListPath,
-            options: options,
-            onLog: { _, _ in },
-            emit: { _ in },
-            onExactRecovery: onExactRecovery
         )
     }
 

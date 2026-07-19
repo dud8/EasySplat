@@ -50,6 +50,38 @@ final class PhotoInputPreflightTests: XCTestCase {
         XCTAssertEqual(result.duplicatePhotoCount, 1)
     }
 
+    func testInspectionRetainsAuthenticatedDigestWithEachAcceptedPhoto() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = root.appendingPathComponent("first.jpg")
+        let second = root.appendingPathComponent("second.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: first,
+            size: 16,
+            value: 80,
+            utType: .jpeg
+        ))
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: second,
+            size: 16,
+            value: 160,
+            utType: .jpeg
+        ))
+
+        let inspection = try PhotoInputPreflight.inspect(
+            PhotoInputPreflight.discoveredPhotos(in: root)
+        )
+
+        XCTAssertEqual(
+            inspection.acceptedPhotos.map { $0.url.standardizedFileURL.resolvingSymlinksInPath() },
+            [first, second].map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+        )
+        XCTAssertEqual(
+            inspection.acceptedPhotos.map(\.sha256),
+            try [first, second].map { try XCTUnwrap(PhotoInputPreflight.sha256Digest(of: $0)) }
+        )
+    }
+
     func testInspectionSkipsHiddenFilesAndProjectOutputFolders() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

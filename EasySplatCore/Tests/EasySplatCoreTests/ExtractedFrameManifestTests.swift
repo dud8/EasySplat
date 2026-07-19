@@ -56,6 +56,53 @@ final class ExtractedFrameManifestTests: XCTestCase {
         ))
     }
 
+    func testVerificationRejectsChangedOriginalReceiptEvidence() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let groups = try makeGroups(paths: paths, counts: [1])
+        let source = ExtractedFrameSourceEvidence(
+            projectRelativePath: "Originals/video-0000.mov",
+            byteCount: 123,
+            sha256: String(repeating: "a", count: 64)
+        )
+        _ = try ExtractedFrameManifestStore.persist(
+            groups: groups.map { files in
+                files.enumerated().map { index, file in
+                    ExtractedFrameOutput(
+                        url: file,
+                        origin: VideoFrameOrigin(
+                            decodedFrameIndex: index,
+                            timestampSeconds: Double(index),
+                            presentationTimeValue: nil,
+                            presentationTimeTimescale: nil,
+                            timestampWasRepaired: true
+                        )
+                    )
+                }
+            },
+            targetCounts: [1],
+            sourceEvidence: [source],
+            paths: paths
+        )
+
+        XCTAssertNoThrow(try ExtractedFrameManifestStore.loadVerified(
+            paths: paths,
+            expectedSourceEvidence: [source],
+            maximumTotalFrames: 1
+        ))
+        XCTAssertThrowsError(try ExtractedFrameManifestStore.loadVerified(
+            paths: paths,
+            expectedSourceEvidence: [ExtractedFrameSourceEvidence(
+                projectRelativePath: source.projectRelativePath,
+                byteCount: source.byteCount,
+                sha256: String(repeating: "b", count: 64)
+            )],
+            maximumTotalFrames: 1
+        ))
+    }
+
     func testVerificationRejectsExtraEntries() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

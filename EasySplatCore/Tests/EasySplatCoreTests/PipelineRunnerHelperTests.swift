@@ -1,4 +1,5 @@
 import Darwin
+import CoreImage
 import ImageIO
 import SQLite3
 import UniformTypeIdentifiers
@@ -140,6 +141,74 @@ final class PipelineRunnerHelperTests: XCTestCase {
             )?.order,
             1
         )
+    }
+
+    func testValidatedConditionedGeometryPreservesTheTypedConditioningFailure() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        let imageNames = (0..<8).map { String(format: "frame_%06d.jpg", $0) }
+        try writeConditioningModel(
+            at: model,
+            imageNames: imageNames,
+            cameraCenters: Array(repeating: 0, count: imageNames.count)
+        )
+
+        XCTAssertThrowsError(try makeRunner(projectURL: root).validatedConditionedGeometry(
+            modelDirectory: model,
+            selectedFrames: imageNames.map { root.appendingPathComponent($0) },
+            requireStrongObservationCoverage: false
+        )) { error in
+            guard case .geometryConditioningRejected(let failure) =
+                    error as? PipelineRunner.PipelineError,
+                  case .collapsedCameraTrajectory = failure else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testPublishedGeometryRejectsMutationAfterCandidateAcceptance() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("candidate", isDirectory: true)
+        let published = root.appendingPathComponent("published", isDirectory: true)
+        let imageNames = (0..<8).map { String(format: "frame_%06d.jpg", $0) }
+        try writeConditioningModel(
+            at: source,
+            imageNames: imageNames,
+            cameraCenters: (0..<imageNames.count).map(Double.init)
+        )
+        let runner = makeRunner(projectURL: root)
+        let selectedFrames = imageNames.map { root.appendingPathComponent($0) }
+        let accepted = try runner.validatedConditionedGeometry(
+            modelDirectory: source,
+            selectedFrames: selectedFrames,
+            requireStrongObservationCoverage: false
+        )
+        try FileManager.default.moveItem(at: source, to: published)
+        let pointsURL = published.appendingPathComponent("points3D.txt")
+        try (String(contentsOf: pointsURL, encoding: .utf8) + "# changed\n").write(
+            to: pointsURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        let remeasured = try runner.validatedConditionedGeometry(
+            modelDirectory: published,
+            selectedFrames: selectedFrames,
+            requireStrongObservationCoverage: false
+        )
+
+        XCTAssertThrowsError(try runner.requirePublishedGeometry(
+            remeasured,
+            matches: accepted,
+            at: published
+        )) { error in
+            guard case .geometryResidualsUnavailable(let reason) =
+                    error as? PipelineRunner.PipelineError else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(reason.contains("changed after acceptance"))
+        }
     }
 
     func testMappingFragmentationRetriesOnlyForMoreThanTwoCredibleOmittedViews() {
@@ -545,42 +614,6 @@ final class PipelineRunnerHelperTests: XCTestCase {
         ))
     }
 
-    func testDownsampleSelectedFramesUpdatesManifest() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-
-        for index in 0..<4 {
-            let url = paths.framesSelectedURL.appendingPathComponent(String(format: "frame_%06d.jpg", index))
-            XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(url: url, size: 16, value: UInt8(index * 40), utType: .jpeg))
-        }
-
-        let manifest = (0..<4).map { index in
-            TestSelectedFrameMapping(
-                outputFileName: String(format: "frame_%06d.jpg", index),
-                groupId: "video_000",
-                isVideo: true
-            )
-        }
-        let data = try JSONEncoder().encode(manifest)
-        try data.write(to: paths.framesSelectedManifestURL, options: [.atomic])
-
-        let runner = makeRunner(projectURL: root)
-        let reduced = try runner.test_downsampleSelectedFrames(to: 2, paths: paths)
-        XCTAssertEqual(reduced?.count, 2)
-
-        let contents = try FileManager.default.contentsOfDirectory(at: paths.framesSelectedURL, includingPropertiesForKeys: nil)
-        XCTAssertEqual(contents.count, 2)
-
-        let updatedData = try Data(contentsOf: paths.framesSelectedManifestURL)
-        let updated = try JSONDecoder().decode([TestSelectedFrameMapping].self, from: updatedData)
-        XCTAssertEqual(updated.count, 2)
-        for entry in updated {
-            XCTAssertTrue(FileManager.default.fileExists(atPath: paths.framesSelectedURL.appendingPathComponent(entry.outputFileName).path))
-        }
-    }
-
     func testLoadSelectedFrameManifestRejectsSymlinkedFile() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -596,6 +629,155 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let runner = makeRunner(projectURL: root)
 
         XCTAssertThrowsError(try runner.loadSelectedFrameManifest(from: manifestURL))
+    }
+
+    func testLoadSelectedFrameManifestRejectsMissingCurrentSchema() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manifestURL = root.appendingPathComponent("selected_frames.json")
+        try Data(
+            """
+            [{"groupId":"photos","isVideo":false,"outputFileName":"frame_000000.jpg"}]
+            """.utf8
+        ).write(to: manifestURL)
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertThrowsError(try runner.loadSelectedFrameManifest(from: manifestURL))
+    }
+
+    func testLoadSelectedFrameManifestRejectsPhotoWithoutRetainedRank() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manifestURL = root.appendingPathComponent("selected_frames.json")
+        try Data(
+            """
+            [{
+              "schemaVersion": 3,
+              "groupId": "photos",
+              "isVideo": false,
+              "outputFileName": "frame_000000.jpg"
+            }]
+            """.utf8
+        ).write(to: manifestURL)
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertThrowsError(try runner.loadSelectedFrameManifest(from: manifestURL))
+    }
+
+    func testLoadSelectedFrameManifestRejectsVideoWithPhotoRetainedRank() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manifestURL = root.appendingPathComponent("selected_frames.json")
+        try Data(
+            """
+            [{
+              "schemaVersion": 3,
+              "groupId": "video_000",
+              "isVideo": true,
+              "outputFileName": "frame_000000.jpg",
+              "photoRetainedRank": 0
+            }]
+            """.utf8
+        ).write(to: manifestURL)
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertThrowsError(try runner.loadSelectedFrameManifest(from: manifestURL))
+    }
+
+    func testLoadSelectedFrameManifestFromDataUsesCapturedBytes() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let captured = try JSONEncoder().encode([
+            TestSelectedFrameMapping(
+                outputFileName: "captured.jpg",
+                groupId: "video_000",
+                isVideo: true
+            ),
+        ])
+        let manifestURL = root.appendingPathComponent("selected_frames.json")
+        let replacement = try JSONEncoder().encode([
+            TestSelectedFrameMapping(
+                outputFileName: "replacement.jpg",
+                groupId: "video_000",
+                isVideo: true
+            ),
+        ])
+        try replacement.write(to: manifestURL)
+
+        let loaded = try runner.loadSelectedFrameManifest(data: captured)
+
+        XCTAssertEqual(loaded.map(\.outputFileName), ["captured.jpg"])
+        XCTAssertEqual(
+            try Data(contentsOf: manifestURL),
+            replacement
+        )
+    }
+
+    func testLoadSelectedFrameManifestFromDataRejectsInvalidByteEnvelope() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertThrowsError(try runner.loadSelectedFrameManifest(data: Data()))
+        XCTAssertThrowsError(try runner.loadSelectedFrameManifest(data: Data("not-json".utf8)))
+        XCTAssertThrowsError(try runner.loadSelectedFrameManifest(
+            data: Data(repeating: 0x20, count: 4 * 1_024 * 1_024 + 1)
+        ))
+    }
+
+    func testLoadSelectedFrameManifestFromDataRequiresCurrentSchemaAndRankLineage() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let oldSchema = try JSONEncoder().encode([
+            TestSelectedFrameMapping(
+                schemaVersion: PipelineRunner.SelectedFrameMapping.currentSchemaVersion - 1,
+                outputFileName: "photo.jpg",
+                groupId: "photos",
+                isVideo: false,
+                photoRetainedRank: 0
+            ),
+        ])
+        let missingPhotoRank = Data(
+            """
+            [{
+              "schemaVersion": 3,
+              "groupId": "photos",
+              "isVideo": false,
+              "outputFileName": "photo.jpg"
+            }]
+            """.utf8
+        )
+
+        XCTAssertThrowsError(try runner.loadSelectedFrameManifest(data: oldSchema))
+        XCTAssertThrowsError(try runner.loadSelectedFrameManifest(data: missingPhotoRank))
+    }
+
+    func testSelectedVideoSourceAcceptsAuthenticatedUnknownNominalFrameRate() throws {
+        let source = try JSONDecoder().decode(
+            PipelineRunner.SelectedVideoSource.self,
+            from: Data(
+                """
+                {
+                  "nominalFrameRate": 0,
+                  "pixelHeight": 1080,
+                  "pixelWidth": 1920,
+                  "projectRelativePath": "Originals/video-0000.mov",
+                  "sourceSHA256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "trackID": 1,
+                  "transformA": 1,
+                  "transformB": 0,
+                  "transformC": 0,
+                  "transformD": 1,
+                  "transformTX": 0,
+                  "transformTY": 0
+                }
+                """.utf8
+            )
+        )
+
+        XCTAssertTrue(source.isValidEvidence)
     }
 
     func testLoadSelectedFrameManifestRejectsFileLargerThanFourMiB() throws {
@@ -615,32 +797,6 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertThrowsError(try runner.loadSelectedFrameManifest(from: manifestURL))
     }
 
-    func testNormalizeSelectedImagesForToolingNoHeic() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-
-        let url = paths.framesSelectedURL.appendingPathComponent("frame_000000.jpg")
-        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(url: url, size: 16, value: 10, utType: .jpeg))
-
-        let manifest = [TestSelectedFrameMapping(
-            outputFileName: "frame_000000.jpg",
-            groupId: "photos",
-            isVideo: false
-        )]
-        let data = try JSONEncoder().encode(manifest)
-        try data.write(to: paths.framesSelectedManifestURL, options: [.atomic])
-
-        let runner = makeRunner(projectURL: root)
-        let converted = try runner.test_normalizeSelectedImagesForTooling(paths: paths)
-        XCTAssertEqual(converted, 0)
-
-        let updatedData = try Data(contentsOf: paths.framesSelectedManifestURL)
-        let updated = try JSONDecoder().decode([TestSelectedFrameMapping].self, from: updatedData)
-        XCTAssertEqual(updated.first?.outputFileName, "frame_000000.jpg")
-    }
-
     func testCopySelectedCarriesVideoTimestampIntoManifest() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -652,7 +808,20 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let runner = makeRunner(projectURL: root)
 
         let manifest = try runner.test_copySelected(
-            groups: [.init(id: "video_000", frames: [source], isVideo: true)],
+            groups: [.init(
+                id: "video_000",
+                frames: [source],
+                isVideo: true,
+                videoOriginsByFileName: [
+                    source.lastPathComponent: VideoFrameOrigin(
+                        decodedFrameIndex: 7,
+                        timestampSeconds: 12.345678,
+                        presentationTimeValue: 12_345_678,
+                        presentationTimeTimescale: 1_000_000,
+                        timestampWasRepaired: false
+                    ),
+                ]
+            )],
             to: selected,
             manifestURL: manifestURL
         )
@@ -689,6 +858,70 @@ final class PipelineRunnerHelperTests: XCTestCase {
             sourceScore.lowLightExposureEV,
             accuracy: 0.01
         )
+    }
+
+    func testSoftwareExposureAdjustmentUsesLinearSRGBLight() throws {
+        let source = try makeRGBAImage(
+            width: 3,
+            height: 1,
+            pixels: [
+                32, 32, 32, 255,
+                64, 64, 64, 255,
+                128, 128, 128, 255,
+            ]
+        )
+
+        let adjusted = try XCTUnwrap(
+            PipelineRunner.softwareExposureAdjustedImage(source, exposureEV: 1)
+        )
+
+        XCTAssertEqual(
+            try rgbaPixels(in: adjusted),
+            [
+                47, 47, 47, 255,
+                90, 90, 90, 255,
+                176, 176, 176, 255,
+            ]
+        )
+    }
+
+    func testSoftwareExposureAdjustmentMatchesCoreImageWhenRendererIsAvailable() throws {
+        let source = try makeRGBAImage(
+            width: 4,
+            height: 1,
+            pixels: [
+                16, 24, 32, 255,
+                48, 64, 80, 255,
+                96, 128, 160, 255,
+                32, 64, 96, 128,
+            ]
+        )
+        let input = CIImage(cgImage: source)
+        let adjusted = input.applyingFilter(
+            "CIExposureAdjust",
+            parameters: [kCIInputEVKey: 0.75]
+        )
+        let linearColorSpace = CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
+        let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
+        let context = CIContext(options: [
+            .cacheIntermediates: false,
+            .workingColorSpace: linearColorSpace,
+            .outputColorSpace: outputColorSpace,
+        ])
+        guard let coreImageResult = context.createCGImage(adjusted, from: input.extent) else {
+            throw XCTSkip("Core Image rendering is unavailable on this test host.")
+        }
+        let softwareResult = try XCTUnwrap(
+            PipelineRunner.softwareExposureAdjustedImage(source, exposureEV: 0.75)
+        )
+        let expected = try rgbaPixels(in: coreImageResult)
+        let actual = try rgbaPixels(in: softwareResult)
+        XCTAssertEqual(actual.count, expected.count)
+        for (actualByte, expectedByte) in zip(actual, expected) {
+            XCTAssertLessThanOrEqual(abs(Int(actualByte) - Int(expectedByte)), 1)
+        }
     }
 
     func testCopySelectedBoundsLargePhotoToResolvedDimension() throws {
@@ -788,35 +1021,60 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertGreaterThan(sideMeans.left, sideMeans.right + 0.25)
     }
 
-    func testNormalizeSelectedImagesForToolingHeic() throws {
+    func testSelectedFrameNormalizationRequiresSDRBridgeWithoutResizeOrRotation() {
+        XCTAssertTrue(PipelineRunner.selectedFrameRequiresTranscode(
+            exposureEV: 0,
+            sourceExtension: "jpg",
+            orientation: 1,
+            largestDimension: 1_600,
+            boundedDimension: 1_600,
+            requiresSDRBridge: true
+        ))
+        XCTAssertFalse(PipelineRunner.selectedFrameRequiresTranscode(
+            exposureEV: 0,
+            sourceExtension: "jpg",
+            orientation: 1,
+            largestDimension: 1_600,
+            boundedDimension: 1_600,
+            requiresSDRBridge: false
+        ))
+    }
+
+    func testSelectedFramePixelDigestRejectsImageAboveDefaultDecodeBudget() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
+        let image = root.appendingPathComponent("too-wide.jpg")
+        try writeOrientedJPEG(
+            to: image,
+            width: PipelineRunner.maximumSelectedFrameDecodeDimension + 1,
+            height: 1,
+            orientation: 1
+        )
 
-        let heicURL = paths.framesSelectedURL.appendingPathComponent("frame_000000.heic")
-        let success = try TestFileBuilder.writeGrayscaleImage(url: heicURL, size: 16, value: 10, utType: .heic)
-        if !success {
-            throw XCTSkip("HEIC encoding unavailable")
-        }
+        XCTAssertThrowsError(
+            try PipelineRunner.selectedFramePixelSHA256(at: image)
+        )
+    }
 
-        let manifest = [TestSelectedFrameMapping(
-            outputFileName: "frame_000000.heic",
-            groupId: "photos",
-            isVideo: false
-        )]
-        let data = try JSONEncoder().encode(manifest)
-        try data.write(to: paths.framesSelectedManifestURL, options: [.atomic])
+    func testSelectedFrameIdentityRejectsSwapAndRestoreBetweenByteAndPixelReads() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let selected = root.appendingPathComponent("selected.jpg")
+        let replacement = root.appendingPathComponent("replacement.jpg")
+        let held = root.appendingPathComponent("held.jpg")
+        try writeOrientedJPEG(to: selected, width: 32, height: 24, orientation: 1)
+        try writeOrientedJPEG(to: replacement, width: 24, height: 32, orientation: 1)
 
-        let runner = makeRunner(projectURL: root)
-        let converted = try runner.test_normalizeSelectedImagesForTooling(paths: paths)
-        XCTAssertEqual(converted, 1)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: heicURL.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.framesSelectedURL.appendingPathComponent("frame_000000.jpg").path))
-
-        let updatedData = try Data(contentsOf: paths.framesSelectedManifestURL)
-        let updated = try JSONDecoder().decode([TestSelectedFrameMapping].self, from: updatedData)
-        XCTAssertEqual(updated.first?.outputFileName, "frame_000000.jpg")
+        XCTAssertThrowsError(try PipelineRunner.test_selectedFrameContentIdentity(
+            at: selected,
+            maximumPixelDimension: 64,
+            afterByteHash: {
+                try FileManager.default.moveItem(at: selected, to: held)
+                try FileManager.default.moveItem(at: replacement, to: selected)
+                try FileManager.default.moveItem(at: selected, to: replacement)
+                try FileManager.default.moveItem(at: held, to: selected)
+            }
+        ))
     }
 
     private func writeOrientedJPEG(
@@ -1013,9 +1271,12 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
 
         XCTAssertTrue(try runner.regenerateBinarySparseModelFiles(at: model))
-        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+        for name in ["cameras.bin", "points3D.bin"] {
             XCTAssertEqual(try Data(contentsOf: model.appendingPathComponent(name)), Data([1, 2, 3]))
         }
+        let images = try Data(contentsOf: model.appendingPathComponent("images.bin"))
+        XCTAssertNotEqual(images, Data("stale".utf8))
+        XCTAssertNotNil(images.range(of: Data("frame.jpg".utf8)))
     }
 
     func testEnsureTextSparseModelDerivesTextFromBinaryWhenBothFamiliesExist() throws {
@@ -1052,6 +1313,12 @@ final class PipelineRunnerHelperTests: XCTestCase {
                 )
             }
             try self.writeSparseTextModel(at: output, cameraModel: "PINHOLE")
+            try Data("# Number of rigs: 0\n".utf8).write(
+                to: output.appendingPathComponent("rigs.txt")
+            )
+            try Data("# Number of frames: 0\n".utf8).write(
+                to: output.appendingPathComponent("frames.txt")
+            )
         }])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
         var originalDirectory = stat()
@@ -1068,6 +1335,12 @@ final class PipelineRunnerHelperTests: XCTestCase {
                 encoding: .utf8
             ).contains(" PINHOLE ")
         )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: model.appendingPathComponent("rigs.txt").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: model.appendingPathComponent("frames.txt").path
+        ))
         XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["model_converter"])
     }
 
@@ -1216,6 +1489,10 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
+        try writeImageMappingDatabase(
+            at: paths.colmapDatabaseURL,
+            rows: [(1, "frame.jpg", 1)]
+        )
         XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
             url: paths.framesSelectedURL.appendingPathComponent("frame.jpg"),
             size: 8,
@@ -1233,7 +1510,18 @@ final class PipelineRunnerHelperTests: XCTestCase {
             pointCount: 2
         )
         let subprocess = MockSubprocessRunner(scripts: [
-            modelConverterScript { try self.writeBinaryModel(to: $0) },
+            modelConverterScript { args in
+                let input = URL(fileURLWithPath: try XCTUnwrap(
+                    self.argumentValue("--input_path", args)
+                ))
+                let points = try String(
+                    contentsOf: input.appendingPathComponent("points3D.txt"),
+                    encoding: .utf8
+                )
+                XCTAssertTrue(points.contains("2 1.0 0.0 2.0 10 20 30 -1.0"))
+                XCTAssertTrue(points.contains("3 2.0 0.0 2.0 10 20 30 -1.0"))
+                try self.writeBinaryModel(to: args)
+            },
         ])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
         let previousSparse = paths.trainingURL.appendingPathComponent(
@@ -1246,6 +1534,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
         let halfTurn = CanonicalQuaternionWXYZ(w: 0, x: 1, y: 0, z: 0)
         let geometryArtifact = try trainingGeometryArtifact(
+            paths: paths,
             sourceSparse: sourceSparse,
             learnedPointInitializer: initializer,
             canonicalOrientation: testOrientation(
@@ -1253,6 +1542,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
                 quaternion: halfTurn
             )
         )
+        try writeGeometryManifestFixture(geometryArtifact, paths: paths)
 
         var progressValues: [Double] = []
         let preparedDataset = try await runner.prepareMsplatDataset(
@@ -1263,12 +1553,17 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
         let dataset = preparedDataset.url
 
-        let points = try String(
-            contentsOf: dataset.appendingPathComponent("sparse/0/points3D.txt"),
-            encoding: .utf8
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(
+                atPath: dataset.appendingPathComponent("sparse/0").path
+            ).sorted(),
+            [
+                "cameras.bin",
+                "easysplat_orientation.json",
+                "images.bin",
+                "points3D.bin",
+            ]
         )
-        XCTAssertTrue(points.contains("2 1.0 0.0 2.0 10 20 30 -1.0"))
-        XCTAssertTrue(points.contains("3 2.0 0.0 2.0 10 20 30 -1.0"))
         XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["model_converter"])
         XCTAssertEqual(
             try orientationQuaternion(in: dataset),
@@ -1276,6 +1571,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
         XCTAssertEqual(preparedDataset.identity.inputDigest.count, 64)
         XCTAssertEqual(preparedDataset.identity.geometryDigest.count, 64)
+        XCTAssertEqual(preparedDataset.derivation.preparationKind, .direct)
+        XCTAssertEqual(preparedDataset.derivation.registeredImageNames, ["frame.jpg"])
         XCTAssertEqual(progressValues.last, 1)
         XCTAssertEqual(progressValues, progressValues.sorted())
         XCTAssertFalse(
@@ -1289,6 +1586,51 @@ final class PipelineRunnerHelperTests: XCTestCase {
             )
         )
         XCTAssertEqual(try sparseTextModelBytes(at: sourceSparse), sourceModelBytes)
+
+        var replayPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(detailProfile: .fast),
+            input: .photos(folder: root.path),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: DevelopmentOverrides(benchmarkSeed: 42)
+        )
+        replayPlan.maximumImageDimension = 1_024
+        func replayTooling() -> PipelineRunner.Tooling {
+            PipelineRunner.Tooling(runner: MockSubprocessRunner(scripts: [
+                modelConverterScript { try self.writeBinaryModel(to: $0) },
+            ]))
+        }
+        try await ProjectArtifactValidator.test_reproduceRetainedTrainingDataset(
+            projectURL: root,
+            geometryArtifact: geometryArtifact,
+            expectedDerivation: preparedDataset.derivation,
+            expectedIdentity: preparedDataset.identity,
+            resolvedRunPlan: replayPlan,
+            colmapURL: URL(fileURLWithPath: "/mock/colmap"),
+            tooling: replayTooling()
+        )
+
+        let retainedSparse = dataset.appendingPathComponent("sparse/0", isDirectory: true)
+        try Data("coherently forged converter output".utf8).write(
+            to: retainedSparse.appendingPathComponent("cameras.bin"),
+            options: .atomic
+        )
+        let forgedIdentity = try MsplatDatasetIdentity.compute(
+            imageDirectory: dataset.appendingPathComponent("images", isDirectory: true),
+            sparseDirectory: retainedSparse
+        )
+        var forgedDerivation = preparedDataset.derivation
+        forgedDerivation.datasetGeometryDigest = forgedIdentity.geometryDigest
+        await XCTAssertThrowsErrorAsync {
+            try await ProjectArtifactValidator.test_reproduceRetainedTrainingDataset(
+                projectURL: root,
+                geometryArtifact: geometryArtifact,
+                expectedDerivation: forgedDerivation,
+                expectedIdentity: forgedIdentity,
+                resolvedRunPlan: replayPlan,
+                colmapURL: URL(fileURLWithPath: "/mock/colmap"),
+                tooling: replayTooling()
+            )
+        }
     }
 
     func testPrepareMsplatDatasetUndistortsFisheyeBeforeTraining() async throws {
@@ -1296,6 +1638,10 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
+        try writeImageMappingDatabase(
+            at: paths.colmapDatabaseURL,
+            rows: [(1, "frame.jpg", 1)]
+        )
         let selectedImage = paths.framesSelectedURL.appendingPathComponent("frame.jpg")
         XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
             url: selectedImage,
@@ -1328,21 +1674,33 @@ final class PipelineRunnerHelperTests: XCTestCase {
                     XCTAssertNotEqual(input.standardizedFileURL, sourceSparse.standardizedFileURL)
                     XCTAssertEqual(try self.sparseTextModelBytes(at: input), sourceModelBytes)
                     for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-                        XCTAssertEqual(
-                            try Data(contentsOf: input.appendingPathComponent(name)),
-                            Data([1, 2, 3])
+                        XCTAssertFalse(
+                            try Data(contentsOf: input.appendingPathComponent(name)).isEmpty
                         )
                     }
                     let outputPath = try XCTUnwrap(self.argumentValue("--output_path", args))
                     let output = URL(fileURLWithPath: outputPath)
+                    let imagePath = URL(fileURLWithPath: try XCTUnwrap(
+                        self.argumentValue("--image_path", args)
+                    ))
                     let images = output.appendingPathComponent("images", isDirectory: true)
                     let sparse = output.appendingPathComponent("sparse", isDirectory: true)
                     try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
                     try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
-                    try FileManager.default.copyItem(at: selectedImage, to: images.appendingPathComponent("frame.jpg"))
-                    for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-                        try Data([1, 2, 3]).write(to: sparse.appendingPathComponent(name))
-                    }
+                    try FileManager.default.copyItem(
+                        at: imagePath.appendingPathComponent("frame.jpg"),
+                        to: images.appendingPathComponent("frame.jpg")
+                    )
+                    try self.writeBinaryModelFiles(
+                        to: sparse,
+                        imageNames: ["frame.jpg"]
+                    )
+                    try Data("unused frame metadata".utf8).write(
+                        to: sparse.appendingPathComponent("frames.bin")
+                    )
+                    try Data("unused rig metadata".utf8).write(
+                        to: sparse.appendingPathComponent("rigs.bin")
+                    )
                 } catch {
                     XCTFail("Fixture setup failed: \(error)")
                 }
@@ -1360,6 +1718,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         ])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
         let geometryArtifact = try trainingGeometryArtifact(
+            paths: paths,
             sourceSparse: sourceSparse,
             learnedPointInitializer: initializer,
             canonicalOrientation: testOrientation(
@@ -1367,6 +1726,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
                 quaternion: CanonicalQuaternionWXYZ(w: 0, x: 1, y: 0, z: 0)
             )
         )
+        try writeGeometryManifestFixture(geometryArtifact, paths: paths)
 
         let preparedDataset = try await runner.prepareMsplatDataset(
             paths: paths,
@@ -1376,11 +1736,17 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
         let dataset = preparedDataset.url
 
-        let cameras = try String(
-            contentsOf: dataset.appendingPathComponent("sparse/0/cameras.txt"),
-            encoding: .utf8
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(
+                atPath: dataset.appendingPathComponent("sparse/0").path
+            ).sorted(),
+            [
+                "cameras.bin",
+                "easysplat_orientation.json",
+                "images.bin",
+                "points3D.bin",
+            ]
         )
-        XCTAssertTrue(cameras.contains(" PINHOLE "))
         XCTAssertEqual(
             subprocess.calls.map { $0.1.first },
             ["model_converter", "image_undistorter", "model_converter", "model_converter"]
@@ -1388,6 +1754,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(try orientationQuaternion(in: dataset), [0, 1, 0, 0])
         XCTAssertEqual(preparedDataset.identity.inputDigest.count, 64)
         XCTAssertEqual(preparedDataset.identity.geometryDigest.count, 64)
+        XCTAssertEqual(preparedDataset.derivation.preparationKind, .undistorted)
         XCTAssertFalse(
             FileManager.default.fileExists(
                 atPath: sourceSparse.appendingPathComponent("learned_points3D.txt").path
@@ -1400,6 +1767,144 @@ final class PipelineRunnerHelperTests: XCTestCase {
                 Data("stale \(name)".utf8)
             )
         }
+
+        var replayPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(detailProfile: .fast),
+            input: .photos(folder: root.path),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: DevelopmentOverrides(benchmarkSeed: 42)
+        )
+        replayPlan.maximumImageDimension = 2_048
+        func replayTooling() -> PipelineRunner.Tooling {
+            PipelineRunner.Tooling(runner: MockSubprocessRunner(scripts: [
+                modelConverterScript { try self.writeBinaryModel(to: $0) },
+                undistort,
+                textConverter,
+                modelConverterScript { try self.writeBinaryModel(to: $0) },
+            ]))
+        }
+        try await ProjectArtifactValidator.test_reproduceRetainedTrainingDataset(
+            projectURL: root,
+            geometryArtifact: geometryArtifact,
+            expectedDerivation: preparedDataset.derivation,
+            expectedIdentity: preparedDataset.identity,
+            resolvedRunPlan: replayPlan,
+            colmapURL: URL(fileURLWithPath: "/mock/colmap"),
+            tooling: replayTooling()
+        )
+
+        try Data("coherently forged undistorted pixels".utf8).write(
+            to: dataset.appendingPathComponent("images/frame.jpg"),
+            options: .atomic
+        )
+        let forgedIdentity = try MsplatDatasetIdentity.compute(
+            imageDirectory: dataset.appendingPathComponent("images", isDirectory: true),
+            sparseDirectory: dataset.appendingPathComponent("sparse/0", isDirectory: true)
+        )
+        var forgedDerivation = preparedDataset.derivation
+        forgedDerivation.datasetInputDigest = forgedIdentity.inputDigest
+        await XCTAssertThrowsErrorAsync {
+            try await ProjectArtifactValidator.test_reproduceRetainedTrainingDataset(
+                projectURL: root,
+                geometryArtifact: geometryArtifact,
+                expectedDerivation: forgedDerivation,
+                expectedIdentity: forgedIdentity,
+                resolvedRunPlan: replayPlan,
+                colmapURL: URL(fileURLWithPath: "/mock/colmap"),
+                tooling: replayTooling()
+            )
+        }
+    }
+
+    func testPrepareMsplatDatasetNormalizesClassicalUndistorterOutputToNativeClosure() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let selectedImage = paths.framesSelectedURL.appendingPathComponent("frame.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: selectedImage,
+            size: 8,
+            value: 128,
+            utType: .jpeg
+        ))
+        let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeSparseTextModel(at: sourceSparse, cameraModel: "OPENCV_FISHEYE")
+        let undistort = MockSubprocessRunner.Script(
+            path: "/mock/colmap",
+            argsPrefix: ["image_undistorter"],
+            result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+            onRun: { args in
+                do {
+                    let output = URL(fileURLWithPath: try XCTUnwrap(
+                        self.argumentValue("--output_path", args)
+                    ))
+                    let images = output.appendingPathComponent("images", isDirectory: true)
+                    let sparse = output.appendingPathComponent("sparse", isDirectory: true)
+                    try FileManager.default.createDirectory(
+                        at: images,
+                        withIntermediateDirectories: true
+                    )
+                    try FileManager.default.createDirectory(
+                        at: sparse,
+                        withIntermediateDirectories: true
+                    )
+                    try FileManager.default.copyItem(
+                        at: selectedImage,
+                        to: images.appendingPathComponent("frame.jpg")
+                    )
+                    try self.writeBinaryModelFiles(
+                        to: sparse,
+                        imageNames: ["frame.jpg"]
+                    )
+                    try Data("unused frame metadata".utf8).write(
+                        to: sparse.appendingPathComponent("frames.bin")
+                    )
+                    try Data("unused rig metadata".utf8).write(
+                        to: sparse.appendingPathComponent("rigs.bin")
+                    )
+                } catch {
+                    XCTFail("Fixture setup failed: \(error)")
+                }
+            }
+        )
+        let subprocess = MockSubprocessRunner(scripts: [
+            modelConverterScript { try self.writeBinaryModel(to: $0) },
+            undistort,
+        ])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+        let geometryArtifact = try trainingGeometryArtifact(
+            paths: paths,
+            sourceSparse: sourceSparse,
+            learnedPointInitializer: nil,
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
+            )
+        )
+        try writeGeometryManifestFixture(geometryArtifact, paths: paths)
+
+        let prepared = try await runner.prepareMsplatDataset(
+            paths: paths,
+            maxImageSize: 2_048,
+            geometryArtifact: geometryArtifact,
+            progress: { _, _ in }
+        )
+
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(
+                atPath: prepared.url.appendingPathComponent("sparse/0").path
+            ).sorted(),
+            [
+                "cameras.bin",
+                "easysplat_orientation.json",
+                "images.bin",
+                "points3D.bin",
+            ]
+        )
+        XCTAssertEqual(
+            subprocess.calls.map { $0.1.first },
+            ["model_converter", "image_undistorter"]
+        )
     }
 
     func testPrepareMsplatDatasetRejectsSourceModelHashMismatchWithoutReplacingDataset() async throws {
@@ -1416,12 +1921,14 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         try writeSparseTextModel(at: sourceSparse, cameraModel: "PINHOLE")
         let geometryArtifact = try trainingGeometryArtifact(
+            paths: paths,
             sourceSparse: sourceSparse,
             learnedPointInitializer: nil,
             canonicalOrientation: .unresolved(
                 openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
             )
         )
+        try writeGeometryManifestFixture(geometryArtifact, paths: paths)
         try "changed\n".write(
             to: sourceSparse.appendingPathComponent("cameras.txt"),
             atomically: true,
@@ -1466,12 +1973,14 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         try writeSparseTextModel(at: sourceSparse, cameraModel: "PINHOLE")
         let geometryArtifact = try trainingGeometryArtifact(
+            paths: paths,
             sourceSparse: sourceSparse,
             learnedPointInitializer: nil,
             canonicalOrientation: .unresolved(
                 openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
             )
         )
+        try writeGeometryManifestFixture(geometryArtifact, paths: paths)
 
         let existingDataset = paths.trainingURL.appendingPathComponent(
             "msplat_dataset",
@@ -1503,6 +2012,173 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }
 
         XCTAssertEqual(try Data(contentsOf: marker), Data("existing".utf8))
+    }
+
+    func testPrepareMsplatDatasetRejectsSelectedFrameMutationDuringConversionWithoutReplacingDataset() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try writeImageMappingDatabase(
+            at: paths.colmapDatabaseURL,
+            rows: [(1, "frame.jpg", 1)]
+        )
+        let selectedImage = paths.framesSelectedURL.appendingPathComponent("frame.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: selectedImage,
+            size: 8,
+            value: 128,
+            utType: .jpeg
+        ))
+        let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeSparseTextModel(at: sourceSparse, cameraModel: "PINHOLE")
+        let geometryArtifact = try trainingGeometryArtifact(
+            paths: paths,
+            sourceSparse: sourceSparse,
+            learnedPointInitializer: nil,
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
+            )
+        )
+        try writeGeometryManifestFixture(geometryArtifact, paths: paths)
+
+        let existingDataset = paths.trainingURL.appendingPathComponent(
+            "msplat_dataset",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: existingDataset, withIntermediateDirectories: true)
+        let marker = existingDataset.appendingPathComponent("keep.txt")
+        try Data("existing".utf8).write(to: marker)
+        let subprocess = MockSubprocessRunner(scripts: [
+            modelConverterScript { arguments in
+                try self.writeBinaryModel(to: arguments)
+                XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+                    url: selectedImage,
+                    size: 8,
+                    value: 1,
+                    utType: .jpeg
+                ))
+            },
+        ])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await runner.prepareMsplatDataset(
+                paths: paths,
+                maxImageSize: 1_024,
+                geometryArtifact: geometryArtifact,
+                progress: { _, _ in }
+            )
+        }
+
+        XCTAssertEqual(try Data(contentsOf: marker), Data("existing".utf8))
+    }
+
+    func testCurrentMsplatDatasetDerivationRejectsSelectedFrameChangedAfterPreparation() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try writeImageMappingDatabase(
+            at: paths.colmapDatabaseURL,
+            rows: [(1, "frame.jpg", 1)]
+        )
+        let selectedImage = paths.framesSelectedURL.appendingPathComponent("frame.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: selectedImage,
+            size: 8,
+            value: 128,
+            utType: .jpeg
+        ))
+        let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeSparseTextModel(at: sourceSparse, cameraModel: "PINHOLE")
+        let geometryArtifact = try trainingGeometryArtifact(
+            paths: paths,
+            sourceSparse: sourceSparse,
+            learnedPointInitializer: nil,
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
+            )
+        )
+        try writeGeometryManifestFixture(geometryArtifact, paths: paths)
+        let runner = makeRunner(
+            projectURL: root,
+            subprocess: MockSubprocessRunner(scripts: [
+                modelConverterScript { try self.writeBinaryModel(to: $0) },
+            ])
+        )
+        _ = try await runner.prepareMsplatDataset(
+            paths: paths,
+            maxImageSize: 1_024,
+            geometryArtifact: geometryArtifact,
+            progress: { _, _ in }
+        )
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: selectedImage,
+            size: 8,
+            value: 1,
+            utType: .jpeg
+        ))
+
+        XCTAssertThrowsError(
+            try runner.currentMsplatDatasetDerivation(
+                paths: paths,
+                geometryArtifact: geometryArtifact,
+                maxImageSize: 1_024
+            )
+        )
+    }
+
+    private func makeRGBAImage(
+        width: Int,
+        height: Int,
+        pixels: [UInt8]
+    ) throws -> CGImage {
+        XCTAssertEqual(pixels.count, width * height * 4)
+        let colorSpace = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        let provider = try XCTUnwrap(CGDataProvider(data: Data(pixels) as CFData))
+        return try XCTUnwrap(CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.union(
+                CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+            ),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ))
+    }
+
+    private func rgbaPixels(in image: CGImage) throws -> [UInt8] {
+        let colorSpace = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        let rendered = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(
+                data: bytes.baseAddress,
+                width: image.width,
+                height: image.height,
+                bitsPerComponent: 8,
+                bytesPerRow: image.width * 4,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                    | CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                return false
+            }
+            context.interpolationQuality = .none
+            context.draw(
+                image,
+                in: CGRect(x: 0, y: 0, width: image.width, height: image.height)
+            )
+            return true
+        }
+        XCTAssertTrue(rendered)
+        return pixels
     }
 
     private func makeRunner(
@@ -1537,9 +2213,34 @@ final class PipelineRunnerHelperTests: XCTestCase {
     private func writeBinaryModel(to arguments: [String]) throws {
         let output = URL(fileURLWithPath: try XCTUnwrap(argumentValue("--output_path", arguments)))
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
-        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-            try Data([1, 2, 3]).write(to: output.appendingPathComponent(name))
+        try writeBinaryModelFiles(to: output, imageNames: ["frame.jpg"])
+    }
+
+    private func writeBinaryModelFiles(to output: URL, imageNames: [String]) throws {
+        try Data([1, 2, 3]).write(to: output.appendingPathComponent("cameras.bin"))
+        try Data([1, 2, 3]).write(to: output.appendingPathComponent("points3D.bin"))
+        var images = Data()
+        append(UInt64(imageNames.count), to: &images)
+        for (offset, name) in imageNames.enumerated() {
+            append(UInt32(offset + 1), to: &images)
+            for value in [1.0, 0, 0, 0, 0, 0, 0] {
+                append(value, to: &images)
+            }
+            append(UInt32(1), to: &images)
+            images.append(contentsOf: name.utf8)
+            images.append(0)
+            append(UInt64(0), to: &images)
         }
+        try images.write(to: output.appendingPathComponent("images.bin"))
+    }
+
+    private func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private func append(_ value: Double, to data: inout Data) {
+        append(value.bitPattern, to: &data)
     }
 
     private func writeSparseTextModel(at directory: URL, cameraModel: String) throws {
@@ -1560,6 +2261,50 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
     }
 
+    private func writeConditioningModel(
+        at directory: URL,
+        imageNames: [String],
+        cameraCenters: [Double]
+    ) throws {
+        precondition(imageNames.count == cameraCenters.count)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try "1 PINHOLE 640 480 500 500 320 240\n".write(
+            to: directory.appendingPathComponent("cameras.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let points = (-2...2).flatMap { y in
+            (-2...2).map { x in (x: Double(x), y: Double(y), z: 12.0) }
+        }
+        var tracks = Array(repeating: [String](), count: points.count)
+        var imageLines: [String] = []
+        for (imageOffset, imageName) in imageNames.enumerated() {
+            let imageID = imageOffset + 1
+            let center = cameraCenters[imageOffset]
+            imageLines.append("\(imageID) 1 0 0 0 \(-center) 0 0 1 \(imageName)")
+            imageLines.append(points.enumerated().map { pointOffset, point in
+                tracks[pointOffset].append("\(imageID) \(pointOffset)")
+                let x = 500 * (point.x - center) / point.z + 320
+                let y = 500 * point.y / point.z + 240
+                return "\(x) \(y) \(pointOffset + 1)"
+            }.joined(separator: " "))
+        }
+        try (imageLines.joined(separator: "\n") + "\n").write(
+            to: directory.appendingPathComponent("images.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let pointLines = points.enumerated().map { offset, point in
+            "\(offset + 1) \(point.x) \(point.y) \(point.z) 128 128 128 0 "
+                + tracks[offset].joined(separator: " ")
+        }
+        try (pointLines.joined(separator: "\n") + "\n").write(
+            to: directory.appendingPathComponent("points3D.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
     private func testOrientation(
         status: CanonicalOrientationStatus,
         quaternion: CanonicalQuaternionWXYZ?
@@ -1574,15 +2319,36 @@ final class PipelineRunnerHelperTests: XCTestCase {
     }
 
     private func trainingGeometryArtifact(
+        paths: ProjectPaths,
         sourceSparse: URL,
         learnedPointInitializer: LearnedPointInitializerArtifact?,
         canonicalOrientation: CanonicalOrientationArtifact
     ) throws -> GeometryArtifact {
         var artifact = makeGeometryArtifact()
         artifact.modelHashes = try GeometryModelSnapshot.capture(in: sourceSparse).modelHashes
+        artifact.orderedImageNames = ["frame.jpg"]
+        artifact.orderedImageTimestamps = [nil]
+        artifact.registeredViewCount = 1
+        artifact.totalViewCount = 1
+        artifact.selectedFramesDigest = try GeometryArtifactStore.selectedFramesDigest(
+            orderedImageNames: artifact.orderedImageNames,
+            projectPaths: paths
+        )
         artifact.learnedPointInitializer = learnedPointInitializer
         artifact.canonicalOrientation = canonicalOrientation
         return artifact
+    }
+
+    private func writeGeometryManifestFixture(
+        _ artifact: GeometryArtifact,
+        paths: ProjectPaths
+    ) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(artifact).write(
+            to: paths.geometryManifestURL,
+            options: .atomic
+        )
     }
 
     private func orientationQuaternion(in dataset: URL) throws -> [Double] {

@@ -2,7 +2,7 @@ import XCTest
 @testable import EasySplatCore
 
 final class RequestedRunOptionsTests: XCTestCase {
-    func testDefaultsMatchPublicBetaAutomaticPolicy() throws {
+    func testDefaultsMatchAutomaticPolicy() throws {
         let options = RequestedRunOptions()
 
         XCTAssertEqual(options.capturePath, .automatic)
@@ -118,27 +118,58 @@ final class RequestedRunOptionsTests: XCTestCase {
     }
 }
 
-final class ProjectMetadataVersionSeventeenTests: XCTestCase {
-    func testNewMetadataUsesVersionSeventeenAndSuppliedRequestedOptions() {
+final class ProjectMetadataCurrentVersionTests: XCTestCase {
+    func testNewMetadataUsesCurrentVersionAndSuppliedRequestedOptions() {
         let metadata = ProjectMetadata(
             title: "New project",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 17)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 31)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
             RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         XCTAssertNil(metadata.resolvedRunPlan)
-        XCTAssertNil(metadata.geometryArtifact)
-        XCTAssertNil(metadata.trainingArtifact)
     }
 }
 
 final class PipelineArtifactContractTests: XCTestCase {
+    func testTrainingArtifactAcceptsALiveBudgetBelowTheResolvedMaximum() {
+        let plan = makeResolvedRunPlan()
+        var training = makeTrainingArtifact()
+        training.memoryBudgetBytes = plan.trainerMemoryBudgetBytes / 2
+
+        XCTAssertTrue(training.matchesResolvedTrainingPlan(
+            plan,
+            resourcePolicy: .automatic
+        ))
+
+        training.memoryBudgetBytes = 0
+        XCTAssertFalse(training.matchesResolvedTrainingPlan(
+            plan,
+            resourcePolicy: .automatic
+        ))
+        training.memoryBudgetBytes = plan.trainerMemoryBudgetBytes + 1
+        XCTAssertFalse(training.matchesResolvedTrainingPlan(
+            plan,
+            resourcePolicy: .automatic
+        ))
+        training.memoryBudgetBytes = plan.trainerMemoryBudgetBytes / 2
+        training.cameraOrderSeed = plan.runSeed &+ 1
+        XCTAssertFalse(training.matchesResolvedTrainingPlan(
+            plan,
+            resourcePolicy: .automatic
+        ))
+        training.cameraOrderSeed = plan.runSeed
+        XCTAssertFalse(training.matchesResolvedTrainingPlan(
+            plan,
+            resourcePolicy: .conserveMemory
+        ))
+    }
+
     func testTrainingArtifactPersistsCameraOrderSeedWithoutRetiredDeterministicKey() throws {
         let training = makeTrainingArtifact()
         let encoded = try JSONEncoder().encode(training)
@@ -146,9 +177,11 @@ final class PipelineArtifactContractTests: XCTestCase {
             JSONSerialization.jsonObject(with: encoded) as? [String: Any]
         )
 
-        XCTAssertEqual(TrainingArtifact.currentSchemaVersion, 5)
-        XCTAssertEqual(object["schemaVersion"] as? NSNumber, NSNumber(value: 5))
+        XCTAssertEqual(TrainingArtifact.currentSchemaVersion, 7)
+        XCTAssertEqual(object["schemaVersion"] as? NSNumber, NSNumber(value: 7))
         XCTAssertEqual(object["cameraOrderSeed"] as? NSNumber, NSNumber(value: 42))
+        let admission = try XCTUnwrap(object["resourceAdmission"] as? [String: Any])
+        XCTAssertEqual(admission["schema_version"] as? NSNumber, NSNumber(value: 2))
         XCTAssertNil(object["deterministicSeed"])
 
         var retiredObject = object
@@ -156,14 +189,23 @@ final class PipelineArtifactContractTests: XCTestCase {
         retiredObject["deterministicSeed"] = 42
         let retiredData = try JSONSerialization.data(withJSONObject: retiredObject)
         XCTAssertThrowsError(try JSONDecoder().decode(TrainingArtifact.self, from: retiredData))
+
+        var missingAdmission = object
+        missingAdmission.removeValue(forKey: "resourceAdmission")
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                TrainingArtifact.self,
+                from: JSONSerialization.data(withJSONObject: missingAdmission)
+            )
+        )
     }
 
     func testGeometryAndTrainingArtifactsRoundTripWithProjectRelativePaths() throws {
         let geometry = makeGeometryArtifact()
         let training = makeTrainingArtifact()
 
-        XCTAssertEqual(GeometryArtifact.currentSchemaVersion, 20)
-        XCTAssertEqual(GeometryWorkerExecutionArtifact.currentSchemaVersion, 3)
+        XCTAssertEqual(GeometryArtifact.currentSchemaVersion, 35)
+        XCTAssertEqual(GeometryWorkerExecutionArtifact.currentSchemaVersion, 13)
 
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
@@ -171,9 +213,55 @@ final class PipelineArtifactContractTests: XCTestCase {
             try decoder.decode(GeometryArtifact.self, from: encoder.encode(geometry)),
             geometry
         )
+        let geometryDocument = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(geometry))
+                as? [String: Any]
+        )
+        XCTAssertNotNil(geometryDocument["observationCount"])
+        XCTAssertNil(geometryDocument["trackCount"])
+        XCTAssertNil(geometryDocument["fallbackReason"])
         XCTAssertEqual(
             try decoder.decode(TrainingArtifact.self, from: encoder.encode(training)),
             training
+        )
+
+        var retiredGeometry = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(geometry)) as? [String: Any]
+        )
+        retiredGeometry.removeValue(forKey: "conditioning")
+        XCTAssertThrowsError(
+            try decoder.decode(
+                GeometryArtifact.self,
+                from: JSONSerialization.data(withJSONObject: retiredGeometry)
+            )
+        )
+    }
+
+    func testGeometryPersistsTheExactCanonicalColmapRuntimeClosureShape() throws {
+        let geometry = makeGeometryArtifact()
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(geometry))
+                as? [String: Any]
+        )
+        let worker = try XCTUnwrap(object["workerExecution"] as? [String: Any])
+        let closure = try XCTUnwrap(
+            worker["colmapRuntimeClosure"] as? [String: Any]
+        )
+        let components = try XCTUnwrap(
+            closure["components"] as? [[String: Any]]
+        )
+
+        XCTAssertEqual(Set(closure.keys), ["components", "closureSHA256"])
+        XCTAssertEqual(
+            components.compactMap { $0["toolchainRelativePath"] as? String },
+            ColmapRuntimeClosureEvidence.canonicalToolchainRelativePaths
+        )
+        XCTAssertTrue(components.allSatisfy {
+            Set($0.keys) == ["toolchainRelativePath", "sha256"]
+        })
+        XCTAssertEqual(
+            closure["closureSHA256"] as? String,
+            geometry.provenance.solver.payloadSHA256
         )
     }
 
@@ -237,8 +325,8 @@ private struct SplatTrainerStub: SplatTraining {
 
 private func makeResolvedRunPlan() -> ResolvedRunPlan {
     ResolvedRunPlan(
-        routeIdentifier: "geometry.apple-silicon.primary",
-        modelIdentifier: "geometry-model-v1",
+        geometryBackend: .colmap,
+        modelIdentifier: "none",
         memoryTier: "48gb",
         chunkSize: 12,
         keyframeBudget: 180,
@@ -255,8 +343,7 @@ private func makeResolvedRunPlan() -> ResolvedRunPlan {
             vocabularyRetrievalWorkers: 8,
             maximumConcurrentVideoSourceAnalysisTasks: 4
         ),
-        requiredToolchainCapabilities: ["geometry-v2", "training-v2"],
-        fallbackRouteIdentifiers: ["geometry.apple-silicon.fallback"],
+        requiredToolchainCapabilities: ["geometry.colmap", "runtime.core", "training.msplat"],
         baGlobalFramesRatio: 1.4,
         baGlobalPointsRatio: 1.4,
         baLocalMaxRefinements: 2,
@@ -273,7 +360,9 @@ func makeGeometryArtifact(
         maximumConcurrentVideoSourceAnalysisTasks: 4
     )
 ) -> GeometryArtifact {
-    GeometryArtifact(
+    let runtimeClosure = makeColmapRuntimeClosureEvidence()
+    let modelHashes = canonicalTextModelHashes()
+    return GeometryArtifact(
         schemaVersion: GeometryArtifact.currentSchemaVersion,
         solverVersion: "solver-1.2.3",
         runtimeVersion: "runtime-3.12",
@@ -289,32 +378,103 @@ func makeGeometryArtifact(
         scaleType: "metric",
         cameraModel: "PINHOLE",
         cameraGrouping: .sameCameraAndLens,
+        cameraGroupingReceipt: ColmapCameraGroupingReceipt(
+            mode: .allSelectedImagesShared,
+            cameraCountBefore: 2,
+            cameraCountAfter: 1,
+            groupedVideoSourceCount: 0,
+            groups: [
+                ColmapCameraGroupReceipt(
+                    sourceGroupID: "all-selected-images",
+                    memberCount: 2,
+                    canonicalCameraID: 1
+                )
+            ]
+        ),
+        cameraInitializationReceipt: ColmapCameraInitializationReceipt(
+            recipe: .colmapAutomatic,
+            cameraModel: "PINHOLE",
+            singleCamera: true,
+            pixelWidth: nil,
+            pixelHeight: nil,
+            diagonalFieldOfViewDegrees: nil,
+            cameraParameters: nil,
+            priorFocalLength: false
+        ),
+        featureDatabaseDigest: String(repeating: "e", count: 64),
         registeredViewCount: 2,
         totalViewCount: 2,
-        trackCount: 120,
+        observationCount: 120,
         pointCount: 80,
         residualProvenance: "bundle-adjusted-observations",
         medianPixelResidual: 0.42,
         p90PixelResidual: 0.91,
+        conditioning: makeGeometryConditioningArtifact(
+            modelHashes: modelHashes,
+            registeredViewCount: 2,
+            pointCount: 80,
+            observationCount: 120
+        ),
         timings: ["solve": 3.25, "refine": 1.75],
         peakMemoryBytes: 2_147_483_648,
-        modelHashes: ["geometry-model-v1": "sha256:model"],
-        fallbackReason: nil,
+        modelHashes: modelHashes,
         provenance: GeometryProvenance(
             toolchainVersion: "2.0.0",
             solver: GeometryComponentProvenance(
                 identifier: "colmap",
-                version: "4.1.0",
-                revision: "fa8e3b3ff591552855f8ad2806723c80f963f69c",
-                payloadSHA256: String(repeating: "a", count: 64)
+                version: "4.1.1",
+                revision: "a0d785fba74b2664f31edc4a29026a8b27c00f67",
+                payloadSHA256: runtimeClosure.closureSHA256
             ),
             runtime: nil,
             model: nil
         ),
         workerExecution: makeGeometryWorkerExecutionArtifact(
-            resolvedBudget: workerBudget
+            resolvedBudget: workerBudget,
+            pairExecution: ColmapPairWorkerExecutionEvidence(
+                attemptOrdinal: 1,
+                descriptorMatcher: .faiss,
+                scheduledPairCount: 1,
+                pairListDigest: String(repeating: "d", count: 64)
+            ),
+            colmapRuntimeClosure: runtimeClosure
         ),
-        pairGraph: .notEvaluated(),
+        pairGraph: .measured(PairGraphMeasurement(
+            scheduledPairCount: 1,
+            attemptedPairCount: 1,
+            rawMatchedPairCount: 1,
+            spatiallyVerifiedPairCount: 1,
+            localPairCount: 1,
+            retrievalPairCount: 0,
+            loopRevisitPairCount: 0,
+            connectedComponentCount: 1,
+            isolatedViewCount: 0,
+            componentViewCounts: [2],
+            articulationViewCount: 0,
+            biconnectedBlockCount: 1,
+            largestBiconnectedBlockViewCount: 2,
+            secondLargestBiconnectedBlockViewCount: 0,
+            degreeP10: 1,
+            degreeMedian: 1,
+            degreeP90: 1,
+            matcherAttempts: [
+                PairMatchingAttemptArtifact(
+                    attemptNumber: 1,
+                    matcher: .faiss,
+                    recoveryLevel: .normal,
+                    outcome: .completed,
+                    scheduledPairCount: 1,
+                    attemptedPairCount: 1,
+                    rawMatchedPairCount: 1,
+                    spatiallyVerifiedPairCount: 1,
+                    durationSeconds: 0.01
+                ),
+            ],
+            pairListDigest: String(repeating: "d", count: 64),
+            featureDatabaseDigest: String(repeating: "e", count: 64),
+            matchingDatabaseDigest: String(repeating: "f", count: 64),
+            matchingDurationSeconds: 0.01
+        )),
         mapping: MappingArtifact(
             modelCount: 1,
             largestModelRegisteredViewCount: 2,
@@ -330,6 +490,7 @@ func makeGeometryArtifact(
                 globalPointsRatio: 1.4,
                 globalMaxRefinements: 5
             ),
+            canonicalModelPublication: directTextPublication(),
             fallbackReason: nil
         ),
         canonicalOrientation: .unresolved(
@@ -338,13 +499,106 @@ func makeGeometryArtifact(
     )
 }
 
+func makeGeometryConditioningArtifact(
+    modelHashes: [String: String] = canonicalTextModelHashes(),
+    registeredViewCount: Int = 2,
+    pointCount: Int = 80,
+    observationCount: Int = 120
+) -> GeometryConditioningArtifact {
+    GeometryConditioningArtifact(
+        sourceModelClosureSHA256: GeometryArtifactStore.modelClosureDigest(
+            modelHashes,
+            expectedNames: ["cameras.txt", "images.txt", "points3D.txt"]
+        )!,
+        measurement: GeometryConditioningMeasurement(
+            pointCount: pointCount,
+            observationCount: observationCount,
+            positiveDepthObservationCount: observationCount,
+            stronglyMeasuredViewCount: registeredViewCount,
+            registeredViewCount: registeredViewCount,
+            perViewObservationMinimum: observationCount / registeredViewCount,
+            perViewObservationP10: observationCount / registeredViewCount,
+            perViewObservationMedian: Double(observationCount) / Double(registeredViewCount),
+            perViewObservationP90: observationCount / registeredViewCount,
+            distinctTrackLengthMinimum: 2,
+            distinctTrackLengthP10: 2,
+            distinctTrackLengthMedian: 2,
+            distinctTrackLengthP90: registeredViewCount,
+            pointsAtLeast1Point5Degrees: pointCount,
+            pointsAtLeast2Degrees: pointCount,
+            pointsAtLeast3Degrees: pointCount,
+            observationsAtLeast1Point5Degrees: observationCount,
+            observationsAtLeast2Degrees: observationCount,
+            observationsAtLeast3Degrees: observationCount,
+            medianObservedDepth: 10,
+            cameraBaselineToMedianDepthRatio: 0.2,
+            effectiveCameraCenterCount: registeredViewCount,
+            largestCameraCenterClusterSize: 1,
+            cameraCenterMergeToleranceToMedianDepthRatio: 1e-5,
+            numericallyConditionedPointCount: pointCount,
+            numericallyConditionedObservationCount: observationCount,
+            adaptiveParallaxThresholdMedianDegrees: 0.05,
+            adaptiveParallaxThresholdP90Degrees: 0.05,
+            cameraCenterEigenvalues: [0, 0, 1],
+            pointEigenvalues: [0, 0.4, 0.6],
+            cameraPairEvaluationCount:
+                registeredViewCount * (registeredViewCount - 1) / 2,
+            rayPairEvaluationCount: pointCount
+        )
+    )
+}
+
+func makeColmapRuntimeClosureEvidence(
+    executableSHA256: String = String(repeating: "a", count: 64),
+    openMPSHA256: String = String(repeating: "b", count: 64)
+) -> ColmapRuntimeClosureEvidence {
+    let components = [
+        ColmapRuntimeClosureEvidence.Component(
+            toolchainRelativePath: "bin/colmap",
+            sha256: executableSHA256
+        ),
+        ColmapRuntimeClosureEvidence.Component(
+            toolchainRelativePath: "lib/libomp.dylib",
+            sha256: openMPSHA256
+        ),
+    ]
+    return ColmapRuntimeClosureEvidence(
+        components: components,
+        closureSHA256: try! XCTUnwrap(
+            ColmapRuntimeClosureEvidence.closureDigest(for: components)
+        )
+    )
+}
+
+func canonicalTextModelHashes(_ character: Character = "a") -> [String: String] {
+    let digest = String(repeating: String(character), count: 64)
+    return [
+        "cameras.txt": digest,
+        "images.txt": digest,
+        "points3D.txt": digest,
+    ]
+}
+
+func directTextPublication(
+    _ hashes: [String: String] = canonicalTextModelHashes()
+) -> CanonicalModelPublicationArtifact {
+    CanonicalModelPublicationArtifact(
+        kind: .directText,
+        sourceModelHashes: hashes,
+        conversion: nil
+    )
+}
+
 func makeGeometryWorkerExecutionArtifact(
     resolvedBudget: GeometryWorkerBudget,
-    videoSourceCount: Int = 0
+    videoSourceCount: Int = 0,
+    pairExecution: ColmapPairWorkerExecutionEvidence? = nil,
+    colmapRuntimeClosure: ColmapRuntimeClosureEvidence = makeColmapRuntimeClosureEvidence()
 ) -> GeometryWorkerExecutionArtifact {
     func boundedInvocation(
         _ command: ColmapWorkerCommandIdentity,
-        workerCount: Int
+        workerCount: Int,
+        pairExecution: ColmapPairWorkerExecutionEvidence? = nil
     ) -> ColmapWorkerInvocationEvidence {
         let environment = [
             "OMP_NUM_THREADS": "\(workerCount)",
@@ -360,6 +614,7 @@ func makeGeometryWorkerExecutionArtifact(
             removedThreadEnvironmentKeysSHA256:
                 GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeysSHA256,
             effectiveSanitizedThreadEnvironment: environment,
+            pairExecution: pairExecution,
             exitStatus: 0,
             succeeded: true
         )
@@ -368,7 +623,25 @@ func makeGeometryWorkerExecutionArtifact(
     func nativeInvocation(
         _ command: ColmapWorkerCommandIdentity
     ) -> ColmapWorkerInvocationEvidence {
-        ColmapWorkerInvocationEvidence(
+        let mapperExecution = command == .mapper
+            ? ColmapMapperWorkerExecutionEvidence(
+                incrementalCadence: .balancedGlobal,
+                globalMaxNumIterations: 75,
+                randomSeed: 42,
+                refineFocalLength: true,
+                minimumPairInlierCount: 15,
+                pairGraphAttemptOrdinal: pairExecution?.attemptOrdinal ?? 1,
+                pairListDigest: pairExecution?.pairListDigest
+                    ?? String(repeating: "d", count: 64),
+                descriptorMatcher: pairExecution?.descriptorMatcher ?? .faiss,
+                matchingDatabaseDigest: String(repeating: "f", count: 64),
+                evaluation: ColmapMapperEvaluationEvidence(
+                    status: .accepted,
+                    fallbackTrigger: nil
+                )
+            )
+            : nil
+        return ColmapWorkerInvocationEvidence(
             command: command,
             mappingAttemptOrdinal: 1,
             threadPolicy: .nativeAuto,
@@ -377,11 +650,13 @@ func makeGeometryWorkerExecutionArtifact(
             removedThreadEnvironmentKeysSHA256:
                 GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeysSHA256,
             effectiveSanitizedThreadEnvironment: [:],
+            mapperExecution: mapperExecution,
             exitStatus: 0,
             succeeded: true
         )
     }
     return GeometryWorkerExecutionArtifact(
+        colmapRuntimeClosure: colmapRuntimeClosure,
         resolvedBudget: resolvedBudget,
         featureExtractionInvocations: [
             boundedInvocation(
@@ -392,7 +667,8 @@ func makeGeometryWorkerExecutionArtifact(
         matchingInvocations: [
             boundedInvocation(
                 .matchesImporter,
-                workerCount: resolvedBudget.coupledMatchingWorkers
+                workerCount: resolvedBudget.coupledMatchingWorkers,
+                pairExecution: pairExecution
             ),
         ],
         vocabularyRetrievalInvocations: [],
@@ -410,17 +686,50 @@ func makeGeometryWorkerExecutionArtifact(
     )
 }
 
+func makeMsplatDatasetDerivation(
+    inputDigest: String,
+    geometryDigest: String,
+    registeredImageNames: [String] = ["frame_000000.jpg"],
+    preparationKind: MsplatDatasetPreparationKind = .direct,
+    sourceGeometryManifestSHA256: String = String(repeating: "d", count: 64),
+    sourceSelectedFramesDigest: String = String(repeating: "e", count: 64),
+    maximumImageDimension: Int = 1_024
+) -> MsplatDatasetDerivationArtifact {
+    MsplatDatasetDerivationArtifact(
+        sourceGeometryManifestSHA256: sourceGeometryManifestSHA256,
+        sourceSelectedFramesDigest: sourceSelectedFramesDigest,
+        preparationKind: preparationKind,
+        maximumImageDimension: maximumImageDimension,
+        toolchainVersion: "2.0.0",
+        colmapProvenance: GeometryComponentProvenance(
+            identifier: "colmap",
+            version: "4.0.4",
+            revision: String(repeating: "f", count: 40),
+            payloadSHA256: String(repeating: "a", count: 64)
+        ),
+        registeredImageNames: registeredImageNames,
+        datasetInputDigest: inputDigest,
+        datasetGeometryDigest: geometryDigest
+    )
+}
+
 func makeTrainingArtifact(
     checkpointPath: String? = nil,
     outputPath: String? = "Output/splat.ply",
     completionStatus: TrainingCompletionStatus = .completed
 ) -> TrainingArtifact {
-    TrainingArtifact(
+    let inputDigest = String(repeating: "b", count: 64)
+    let geometryDigest = String(repeating: "c", count: 64)
+    return TrainingArtifact(
         trainerVersion: "trainer-1.4.0",
         runtimeVersion: "native-metal-cli-v2",
         trainerBuildDigest: String(repeating: "a", count: 64),
-        inputDigest: String(repeating: "b", count: 64),
-        geometryDigest: String(repeating: "c", count: 64),
+        inputDigest: inputDigest,
+        geometryDigest: geometryDigest,
+        datasetDerivation: makeMsplatDatasetDerivation(
+            inputDigest: inputDigest,
+            geometryDigest: geometryDigest
+        ),
         detailProfile: .highDetail,
         iterationLimit: 15_000,
         plateauWindow: 1_500,
@@ -435,6 +744,7 @@ func makeTrainingArtifact(
         elapsedSeconds: 812.5,
         peakMemoryBytes: 4_294_967_296,
         memoryBudgetBytes: 32_212_254_720,
+        resourceAdmission: makeTestTrainingResourceAdmission(),
         rasterFallbackCount: 0,
         rasterExactFallbackElapsedSeconds: 0,
         rasterExactBufferGrowthCount: 0,

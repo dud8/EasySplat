@@ -79,6 +79,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
     }
 
+    private final class EmptyURLSessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {}
+
     func testLoadInstallStateIgnoresSymlinkedReceipt() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -97,16 +99,73 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         XCTAssertTrue(manager.loadInstallState(root: root).installedArtifacts.isEmpty)
     }
 
-    func testLoadInstallStateAcceptsReceiptBetweenOneAndSixteenMiB() throws {
+    func testLoadInstallStateFallsBackForMissingRequiredFieldsAndMalformedJSON() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let stateURL = root.appendingPathComponent(".easysplat_toolchain_state.json")
-        let state = ToolchainManager.ToolchainInstallState(
-            installedArtifacts: ["macos-arm64-core": String(repeating: "a", count: 2 * 1_024 * 1_024)]
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
         )
-        let data = try JSONEncoder().encode(state)
-        XCTAssertGreaterThan(data.count, 1_024 * 1_024)
-        XCTAssertLessThan(data.count, 16 * 1_024 * 1_024)
+        let invalidDocuments = [
+            #"{"installedArtifacts":{"component":"hash"},"installedCapabilities":["runtime.core"],"signedManifest":null}"#,
+            #"{"schemaVersion":2,"installedCapabilities":["runtime.core"],"signedManifest":null}"#,
+            #"{"schemaVersion":2,"installedArtifacts":{"component":"hash"},"signedManifest":null}"#,
+            #"{"schemaVersion":2,"installedArtifacts":{},"installedCapabilities":[]"#,
+        ]
+
+        for document in invalidDocuments {
+            try Data(document.utf8).write(to: stateURL, options: .atomic)
+
+            let state = manager.loadInstallState(root: root)
+
+            XCTAssertEqual(state.schemaVersion, ToolchainManifest.currentSchemaVersion)
+            XCTAssertTrue(state.installedArtifacts.isEmpty)
+            XCTAssertTrue(state.installedCapabilities.isEmpty)
+            XCTAssertNil(state.signedManifest)
+        }
+    }
+
+    func testSaveInstallStateAtomicallyReplacesPrivateReceiptWithoutTemporaryResidue() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+
+        try manager.saveInstallState(
+            .init(installedArtifacts: ["macos-arm64-core": String(repeating: "a", count: 64)]),
+            root: root
+        )
+        try manager.saveInstallState(
+            .init(installedArtifacts: ["macos-arm64-core": String(repeating: "b", count: 64)]),
+            root: root
+        )
+
+        let receipt = root.appendingPathComponent(".easysplat_toolchain_state.json")
+        let attributes = try FileManager.default.attributesOfItem(atPath: receipt.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        let loaded = manager.loadInstallState(root: root)
+        XCTAssertEqual(loaded.schemaVersion, ToolchainManifest.currentSchemaVersion)
+        XCTAssertEqual(
+            loaded.installedArtifacts["macos-arm64-core"],
+            String(repeating: "b", count: 64)
+        )
+        XCTAssertTrue(loaded.installedCapabilities.isEmpty)
+        XCTAssertNil(loaded.signedManifest)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: root.path).sorted(),
+            [".easysplat_toolchain_state.json"]
+        )
+    }
+
+    func testLoadInstallStateAcceptsReceiptAtSixteenMiBEnvelopeLimit() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent(".easysplat_toolchain_state.json")
+        let data = try installStateData(exactly: 16 * 1_024 * 1_024)
+        XCTAssertEqual(data.count, 16 * 1_024 * 1_024)
         try data.write(to: stateURL)
         let manager = ToolchainManager(
             runner: MockSubprocessRunner(scripts: []),
@@ -116,16 +175,12 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         XCTAssertFalse(manager.loadInstallState(root: root).installedArtifacts.isEmpty)
     }
 
-    func testLoadInstallStateIgnoresReceiptLargerThanSixteenMiB() throws {
+    func testLoadInstallStateIgnoresReceiptOneByteAboveSixteenMiBEnvelopeLimit() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let stateURL = root.appendingPathComponent(".easysplat_toolchain_state.json")
-        let state = ToolchainManager.ToolchainInstallState(
-            installedArtifacts: ["macos-arm64-core": String(repeating: "a", count: 64)]
-        )
-        var data = try JSONEncoder().encode(state)
-        data.append(Data(repeating: 0x20, count: 16 * 1_024 * 1_024))
-        XCTAssertGreaterThan(data.count, 16 * 1_024 * 1_024)
+        let data = try installStateData(exactly: 16 * 1_024 * 1_024 + 1)
+        XCTAssertEqual(data.count, 16 * 1_024 * 1_024 + 1)
         try data.write(to: stateURL)
         let manager = ToolchainManager(
             runner: MockSubprocessRunner(scripts: []),
@@ -242,13 +297,19 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         let completeData = Data("zip-bytes".utf8)
         let session = makeSession()
         let task = session.dataTask(with: URL(string: "https://example.com/component.zip")!)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: session
+        )
+        let partialFile = try XCTUnwrap(
+            manager.openPartialDownloadFile(at: partialURL, create: false)
+        )
         let delegate = ToolchainManager.ResumableDownloadDelegate(
-            partialURL: partialURL,
+            partialFile: partialFile,
             expectedSize: UInt64(completeData.count),
             initialOffset: 4,
             label: "Downloading tools",
             onProgress: { _, _ in },
-            fileManager: .default,
             validateRedirect: { _ in }
         )
         let response = HTTPURLResponse(
@@ -303,6 +364,16 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         XCTAssertThrowsError(try manager.test_validateArchiveEntries(["bin\\escape"]))
     }
 
+    func testArchiveEntryValidationRejectsAliasesDirectoriesAndDuplicates() throws {
+        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []), urlSession: makeSession())
+
+        XCTAssertThrowsError(try manager.test_validateArchiveEntries(["licenses/a//b.txt"]))
+        XCTAssertThrowsError(try manager.test_validateArchiveEntries(["licenses/./a.txt"]))
+        XCTAssertThrowsError(try manager.test_validateArchiveEntries(["licenses/a/../b.txt"]))
+        XCTAssertThrowsError(try manager.test_validateArchiveEntries(["licenses/"]))
+        XCTAssertThrowsError(try manager.test_validateArchiveEntries(["bin/colmap", "bin/colmap"]))
+    }
+
     func testArchiveInspectionKeepsListingsLargerThanSubprocessCaptureTail() throws {
         let entries = (0..<20_000).map { index in
             "da3_mps/python/lib/python3.13/site-packages/runtime/"
@@ -336,6 +407,26 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 return XCTFail("Expected invalidToolchain, got \(error)")
             }
             XCTAssertTrue(message.contains("symbolic link"))
+        }
+    }
+
+    func testArchiveInspectionRejectsSpecialFileEntries() throws {
+        let runner = StreamingArchiveInspectionRunner(
+            entries: ["bin/colmap"],
+            metadataLines: [
+                "prw-r--r--  3.0 unx   0 bx   0 stor 01-Jan-26 00:00 bin/control",
+                "-rwxr-xr-x  3.0 unx 100 bx 100 defN 01-Jan-26 00:00 bin/colmap",
+            ]
+        )
+        let manager = ToolchainManager(runner: runner)
+
+        XCTAssertThrowsError(
+            try manager.test_inspectArchiveEntries(zipURL: URL(fileURLWithPath: "/tmp/core.zip"))
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain, got \(error)")
+            }
+            XCTAssertTrue(message.contains("special file"))
         }
     }
 
@@ -403,6 +494,36 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
     }
 
+    func testReceiptlessFutureSchemaCacheIsRejected() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1"
+        )
+        try manager.saveInstallState(
+            .init(
+                schemaVersion: ToolchainManifest.currentSchemaVersion + 1,
+                installedArtifacts: [
+                    "macos-arm64-core": String(repeating: "a", count: 64),
+                    "geometry-da3-base": String(repeating: "b", count: 64),
+                ]
+            ),
+            root: root
+        )
+        let key = Curve25519.Signing.PrivateKey()
+
+        XCTAssertThrowsError(
+            try manager.test_validateSignedReceipt(
+                root: root,
+                publicKeyBase64: key.publicKey.rawRepresentation.base64EncodedString(),
+                request: ToolchainCapabilityRequest(capabilities: [.da3Base])
+            )
+        )
+    }
+
     func testSignedReceiptRejectsMutatedCachedModelFiles() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -421,6 +542,14 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 (path, try manager.test_sha256Hex(url: root.appendingPathComponent(path)))
             })
         }
+        func closure(for paths: [String]) throws -> (
+            sha256: String, sizeBytes: UInt64, fileHashes: [String: String]
+        ) {
+            try manager.test_expandedClosureEvidence(paths: paths, root: root)
+        }
+        let coreClosure = try closure(for: corePaths)
+        let baseClosure = try closure(for: basePaths)
+        let smallClosure = try closure(for: smallPaths)
 
         let unsigned = ToolchainManifest(
             schemaVersion: 2,
@@ -430,9 +559,9 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             publishedAt: Date(),
             appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
             components: [
-                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, contents: corePaths, criticalFileHashes: try hashes(for: corePaths), dependencies: [], requirement: .required),
-                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: basePaths, criticalFileHashes: try hashes(for: basePaths), dependencies: ["macos-arm64-core"], requirement: .optional),
-                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallPaths, criticalFileHashes: try hashes(for: smallPaths), dependencies: ["geometry-da3-base"], requirement: .optional),
+                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, expandedSizeBytes: coreClosure.sizeBytes, expandedClosureSHA256: coreClosure.sha256, contents: corePaths, criticalFileHashes: try hashes(for: corePaths), dependencies: [], requirement: .required),
+                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, expandedSizeBytes: baseClosure.sizeBytes, expandedClosureSHA256: baseClosure.sha256, contents: basePaths, criticalFileHashes: try hashes(for: basePaths), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, expandedSizeBytes: smallClosure.sizeBytes, expandedClosureSHA256: smallClosure.sha256, contents: smallPaths, criticalFileHashes: try hashes(for: smallPaths), dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
             signatureEd25519: ""
         )
@@ -469,6 +598,55 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 request: .init(capabilities: [.da3Base])
             )
         )
+    }
+
+    func testSignedReceiptRejectsExecutableModeDrift() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1"
+        )
+        let signed = try makeSignedCachedFixture(at: root, manager: manager)
+
+        XCTAssertNoThrow(try manager.test_validateSignedReceipt(
+            root: root,
+            publicKeyBase64: signed.publicKey,
+            request: .init(capabilities: [.da3Base, .da3Small])
+        ))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: signed.fixture.colmap.path
+        )
+
+        XCTAssertThrowsError(try manager.test_validateSignedReceipt(
+            root: root,
+            publicKeyBase64: signed.publicKey,
+            request: .init(capabilities: [.da3Base, .da3Small])
+        ))
+    }
+
+    func testExpandedClosureRejectsSymlinkedIntermediateDirectory() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let actualBin = root.appendingPathComponent("actual-bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: actualBin, withIntermediateDirectories: true)
+        try Data("fixture".utf8).write(to: actualBin.appendingPathComponent("tool"))
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("bin"),
+            withDestinationURL: actualBin
+        )
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1"
+        )
+
+        XCTAssertThrowsError(try manager.test_expandedClosureEvidence(
+            paths: ["bin/tool"],
+            root: root
+        ))
     }
 
     func testSignedReceiptRejectsUndeclaredCachedEntries() throws {
@@ -610,6 +788,14 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 (path, try manager.test_sha256Hex(url: backupRoot.appendingPathComponent(path)))
             })
         }
+        func closure(for paths: [String]) throws -> (
+            sha256: String, sizeBytes: UInt64, fileHashes: [String: String]
+        ) {
+            try manager.test_expandedClosureEvidence(paths: paths, root: backupRoot)
+        }
+        let coreClosure = try closure(for: corePaths)
+        let baseClosure = try closure(for: basePaths)
+        let smallClosure = try closure(for: smallPaths)
         let unsigned = ToolchainManifest(
             schemaVersion: 2,
             toolchainAPI: 2,
@@ -618,9 +804,9 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             publishedAt: Date(),
             appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
             components: [
-                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, contents: corePaths, criticalFileHashes: try hashes(for: corePaths), dependencies: [], requirement: .required),
-                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: basePaths, criticalFileHashes: try hashes(for: basePaths), dependencies: ["macos-arm64-core"], requirement: .optional),
-                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallPaths, criticalFileHashes: try hashes(for: smallPaths), dependencies: ["geometry-da3-base"], requirement: .optional),
+                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, expandedSizeBytes: coreClosure.sizeBytes, expandedClosureSHA256: coreClosure.sha256, contents: corePaths, criticalFileHashes: try hashes(for: corePaths), dependencies: [], requirement: .required),
+                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, expandedSizeBytes: baseClosure.sizeBytes, expandedClosureSHA256: baseClosure.sha256, contents: basePaths, criticalFileHashes: try hashes(for: basePaths), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, expandedSizeBytes: smallClosure.sizeBytes, expandedClosureSHA256: smallClosure.sha256, contents: smallPaths, criticalFileHashes: try hashes(for: smallPaths), dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
             signatureEd25519: ""
         )
@@ -659,6 +845,229 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         XCTAssertEqual(manager.loadInstallState(root: canonical).installedArtifacts.count, 3)
     }
 
+    func testInterruptedBackupReplacesReceiptlessCanonicalInstall() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let version = "2.0.0"
+        let canonicalRoot = installationRoot.appendingPathComponent(version, isDirectory: true)
+        let backupRoot = installationRoot.appendingPathComponent(
+            "\(version).backup-fixture",
+            isDirectory: true
+        )
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(
+            at: backupRoot,
+            manager: manager,
+            version: version
+        )
+        try FileManager.default.copyItem(at: backupRoot, to: canonicalRoot)
+        try FileManager.default.removeItem(
+            at: canonicalRoot.appendingPathComponent(ToolchainManager.installStateFilename)
+        )
+
+        try manager.test_recoverInterruptedInstalls(
+            at: installationRoot,
+            publicKeyBase64: signed.publicKey
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backupRoot.path))
+        XCTAssertNoThrow(
+            try manager.test_validateSignedReceipt(
+                root: canonicalRoot,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small])
+            )
+        )
+    }
+
+    func testInterruptedRecoveryRejectsConflictingAuthenticatedManifestsAtSameSemanticVersion() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let firstRoot = installationRoot.appendingPathComponent(
+            "2.0.0.staging-first",
+            isDirectory: true
+        )
+        let secondRoot = installationRoot.appendingPathComponent(
+            "2.0.0.backup-second",
+            isDirectory: true
+        )
+        let first = try makeSignedCachedFixture(
+            at: firstRoot,
+            manager: manager,
+            version: "2.0.0+first",
+            signingKey: signingKey
+        )
+        let second = try makeSignedCachedFixture(
+            at: secondRoot,
+            manager: manager,
+            version: "2.0.0+second",
+            signingKey: signingKey
+        )
+        XCTAssertNotEqual(first.manifest.signatureEd25519, second.manifest.signatureEd25519)
+
+        XCTAssertThrowsError(
+            try manager.test_recoverInterruptedInstalls(
+                at: installationRoot,
+                publicKeyBase64: first.publicKey
+            )
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected authenticated publication conflict, got \(error)")
+            }
+            XCTAssertTrue(message.contains("conflicts with its authenticated immutable manifest"))
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: installationRoot.appendingPathComponent("2.0.0").path
+            )
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstRoot.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondRoot.path))
+    }
+
+    func testInterruptedRecoveryRejectsCandidateReplacedAfterValidationBeforePromotion() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        let replacementRoot = try TestFileBuilder.makeTempDir()
+        defer {
+            try? FileManager.default.removeItem(at: installationRoot)
+            try? FileManager.default.removeItem(at: replacementRoot)
+        }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let stagingRoot = installationRoot.appendingPathComponent(
+            "2.0.0.staging-original",
+            isDirectory: true
+        )
+        let signed = try makeSignedCachedFixture(
+            at: stagingRoot,
+            manager: manager,
+            version: "2.0.0"
+        )
+        let replacement = replacementRoot.appendingPathComponent("replacement", isDirectory: true)
+        try FileManager.default.copyItem(at: stagingRoot, to: replacement)
+        let promotionAttempts = LockedCounter()
+
+        XCTAssertThrowsError(
+            try manager.test_recoverInterruptedInstalls(
+                at: installationRoot,
+                publicKeyBase64: signed.publicKey,
+                beforeCandidatePromotion: { candidate in
+                    XCTAssertEqual(candidate.standardizedFileURL, stagingRoot.standardizedFileURL)
+                    _ = promotionAttempts.increment()
+                    try FileManager.default.removeItem(at: candidate)
+                    try FileManager.default.copyItem(at: replacement, to: candidate)
+                }
+            )
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected replaced recovery candidate failure, got \(error)")
+            }
+            XCTAssertTrue(message.contains("changed while recovery was in progress"))
+        }
+        XCTAssertEqual(promotionAttempts.current(), 1)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: installationRoot.appendingPathComponent("2.0.0").path
+            )
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagingRoot.path))
+    }
+
+    func testPruningKeepsNewestFullyValidatedPreviousToolchain() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let validRoot = installationRoot.appendingPathComponent("1.8.0", isDirectory: true)
+        _ = try makeSignedCachedFixture(
+            at: validRoot,
+            manager: manager,
+            version: "1.8.0",
+            signingKey: signingKey
+        )
+        let corruptRoot = installationRoot.appendingPathComponent("1.9.0", isDirectory: true)
+        let corrupt = try makeSignedCachedFixture(
+            at: corruptRoot,
+            manager: manager,
+            version: "1.9.0",
+            signingKey: signingKey
+        )
+        try FileManager.default.removeItem(at: corrupt.fixture.colmap)
+
+        manager.pruneSchema2Toolchains(
+            keeping: "2.0.0",
+            publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString()
+        )
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: validRoot.path),
+            "A signed receipt is not sufficient retention evidence when the newer closure is corrupt."
+        )
+    }
+
+    func testPruningTreatsBuildMetadataVariantAsCurrentPublicationIdentity() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let currentRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        _ = try makeSignedCachedFixture(
+            at: currentRoot,
+            manager: manager,
+            version: "2.0.0+release",
+            signingKey: signingKey
+        )
+        let previousRoot = installationRoot.appendingPathComponent("1.9.0", isDirectory: true)
+        _ = try makeSignedCachedFixture(
+            at: previousRoot,
+            manager: manager,
+            version: "1.9.0",
+            signingKey: signingKey
+        )
+        let obsoleteRoot = installationRoot.appendingPathComponent("1.8.0", isDirectory: true)
+        _ = try makeSignedCachedFixture(
+            at: obsoleteRoot,
+            manager: manager,
+            version: "1.8.0",
+            signingKey: signingKey
+        )
+
+        manager.pruneSchema2Toolchains(
+            keeping: "2.0.0+release",
+            publicKeyBase64: signingKey.publicKey.rawRepresentation.base64EncodedString()
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: currentRoot.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: previousRoot.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: obsoleteRoot.path))
+    }
+
     func testAtomicReplacementRestoresPriorInstallWhenPromotedTreeFailsValidation() async throws {
         let parent = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: parent) }
@@ -681,17 +1090,127 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 try Data("invalid".utf8).write(to: stagingRoot.appendingPathComponent("incomplete.marker"))
             }
         }
+        var failureDescription = ""
         do {
             _ = try await replacement.value
             XCTFail("Expected the incomplete replacement to fail validation")
         } catch {
-            // Expected: the replacement lacks the required toolchain closure.
+            failureDescription = String(describing: error)
         }
 
         XCTAssertEqual(try Data(contentsOf: marker), Data("keep".utf8))
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: parent.path)
             .filter { $0.contains(".backup-") || $0.contains(".staging-") }
-        XCTAssertTrue(leftovers.isEmpty)
+        XCTAssertTrue(
+            leftovers.isEmpty,
+            "Leftovers: \(leftovers); failure: \(failureDescription)"
+        )
+    }
+
+    func testAtomicInstallDoesNotDeleteDirectorySubstitutedBeforeAttestation() async throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let versionedRoot = parent.appendingPathComponent("2.0.0", isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            installationRoot: parent
+        )
+        let substitutedRoots = LockedMessages()
+        let install = Task.detached {
+            try await manager.installToolchainAtomically(
+                versionedRoot: versionedRoot,
+                requiredCapabilities: [.core],
+                onProgress: { _, _ in }
+            ) { stagingRoot in
+                try FileManager.default.removeItem(at: stagingRoot)
+                try FileManager.default.createDirectory(
+                    at: stagingRoot,
+                    withIntermediateDirectories: false
+                )
+                try Data("do not delete".utf8).write(
+                    to: stagingRoot.appendingPathComponent("sentinel")
+                )
+                substitutedRoots.append(stagingRoot.path)
+                throw URLError(.cancelled)
+            }
+        }
+        do {
+            _ = try await install.value
+            XCTFail("Expected the substituted install to fail")
+        } catch {
+            // Expected: the install closure deliberately stops before attestation.
+        }
+
+        let root = URL(fileURLWithPath: try XCTUnwrap(substitutedRoots.all().first))
+        XCTAssertEqual(
+            try Data(contentsOf: root.appendingPathComponent("sentinel")),
+            Data("do not delete".utf8)
+        )
+    }
+
+    func testAtomicInstallRejectsStagingDirectorySwapAndPreservesCanonicalInstall() async throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        let replacementParent = try TestFileBuilder.makeTempDir()
+        defer {
+            try? FileManager.default.removeItem(at: parent)
+            try? FileManager.default.removeItem(at: replacementParent)
+        }
+        let versionedRoot = parent.appendingPathComponent("2.0.0", isDirectory: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: parent
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: fixtureManager)
+        let signedLicensePath = "licenses/Ceres/LICENSE"
+        let canonicalLicense = versionedRoot.appendingPathComponent(signedLicensePath)
+        let canonicalLicenseBefore = try Data(contentsOf: canonicalLicense)
+        let replacement = replacementParent.appendingPathComponent("replacement", isDirectory: true)
+        try FileManager.default.copyItem(at: versionedRoot, to: replacement)
+        try Data("working but unattested replacement".utf8).write(
+            to: replacement.appendingPathComponent(signedLicensePath)
+        )
+        let swaps = LockedCounter()
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(
+                scripts: validationScripts(for: signed.fixture, installedAt: versionedRoot)
+            ),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: parent
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.test_installToolchainAtomically(
+                versionedRoot: versionedRoot,
+                requiredCapabilities: [.da3Base, .da3Small],
+                authenticatedManifest: signed.manifest,
+                seedFromExistingRoot: versionedRoot,
+                beforeStagingPromotion: { stagingRoot in
+                    _ = swaps.increment()
+                    try FileManager.default.removeItem(at: stagingRoot)
+                    try FileManager.default.copyItem(at: replacement, to: stagingRoot)
+                },
+                onProgress: { _, _ in },
+                installInto: { _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected staging identity failure, got \(error)")
+            }
+            XCTAssertTrue(message.contains("changed while preparing the install"))
+        })
+        XCTAssertEqual(swaps.current(), 1)
+        XCTAssertEqual(try Data(contentsOf: canonicalLicense), canonicalLicenseBefore)
+        XCTAssertNoThrow(
+            try manager.test_validateSignedReceipt(
+                root: versionedRoot,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small])
+            )
+        )
     }
 
     func testAtomicInstallRejectsUndeclaredCachedFileBeforeSeeding() async throws {
@@ -817,6 +1336,54 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
     }
 
+    func testSandboxDeniedManifestRequestUsesAuthenticatedOfflineFallback() {
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+
+        for code in [EPERM, EACCES] {
+            XCTAssertTrue(
+                manager.shouldAttemptOfflineFallback(
+                    forManifestError: NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+                )
+            )
+        }
+        XCTAssertFalse(
+            manager.shouldAttemptOfflineFallback(
+                forManifestError: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+            )
+        )
+    }
+
+    func testDefaultToolchainSessionDoesNotPersistHTTPState() {
+        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
+        let configuration = manager.urlSession.configuration
+
+        XCTAssertNil(configuration.urlCache)
+        XCTAssertNil(configuration.httpCookieStorage)
+        XCTAssertNil(configuration.urlCredentialStorage)
+        XCTAssertFalse(configuration.httpShouldSetCookies)
+        XCTAssertEqual(configuration.requestCachePolicy, .reloadIgnoringLocalCacheData)
+    }
+
+    func testStreamingArtifactSessionInheritsNonpersistentHTTPConfiguration() {
+        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
+        let queue = OperationQueue()
+        let session = manager.makeStreamingArtifactSession(
+            delegate: EmptyURLSessionDelegate(),
+            delegateQueue: queue
+        )
+        defer { session.invalidateAndCancel() }
+        let configuration = session.configuration
+
+        XCTAssertNil(configuration.urlCache)
+        XCTAssertNil(configuration.httpCookieStorage)
+        XCTAssertNil(configuration.urlCredentialStorage)
+        XCTAssertFalse(configuration.httpShouldSetCookies)
+        XCTAssertEqual(configuration.requestCachePolicy, .reloadIgnoringLocalCacheData)
+    }
+
     func testOfflineFallbackReportsRejectedCachedToolchainInsteadOfOnlyNetworkFailure() async throws {
         let installationRoot = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: installationRoot) }
@@ -862,6 +1429,1328 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             XCTAssertTrue(message.contains("undeclared file"))
             XCTAssertTrue(message.contains("da3_mps/python/runtime.pyc"))
         })
+    }
+
+    func testArtifact404FallsBackToPreviousAuthenticatedToolchainWithoutRetrying() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let previousRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let previous = try makeSignedCachedFixture(
+            at: previousRoot,
+            manager: fixtureManager,
+            version: "2.0.0",
+            signingKey: signingKey
+        )
+
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        var nextManifest = previous.manifest
+        nextManifest.version = "2.1.0"
+        nextManifest.publishedAt = Date(timeIntervalSince1970: 1)
+        nextManifest.signatureEd25519 = ""
+        for index in nextManifest.components.indices {
+            nextManifest.components[index].url = tokenizedURL(
+                "https://example.com/\(nextManifest.components[index].name).zip",
+                token: token
+            ).absoluteString
+        }
+        let next = try signedV2Manifest(nextManifest, key: signingKey)
+        let componentRequests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            if request.url == manifestURL {
+                return (
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    next.data
+                )
+            }
+            _ = componentRequests.increment()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let messages = LockedMessages()
+        let canonicalPreviousRoot = URL(
+            fileURLWithPath: try canonicalFileSystemPath(previousRoot),
+            isDirectory: true
+        )
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(
+                scripts: validationScripts(for: previous.fixture, installedAt: canonicalPreviousRoot)
+            ),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+
+        let toolchain = try await manager.ensureToolchain(
+            manifestURL: manifestURL,
+            publicKeyBase64: next.publicKey,
+            request: .init(capabilities: [.core, .colmap, .msplat]),
+            onProgress: { _, message in messages.append(message) }
+        )
+
+        XCTAssertEqual(
+            try canonicalFileSystemPath(toolchain.root),
+            try canonicalFileSystemPath(previousRoot)
+        )
+        XCTAssertEqual(componentRequests.current(), 1)
+        XCTAssertTrue(messages.all().contains("Tools ready (offline cached)"))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: installationRoot.appendingPathComponent("2.1.0", isDirectory: true).path
+            )
+        )
+    }
+
+    func testArtifact404FallsBackToAuthenticatedBundledCore() async throws {
+        let temporaryRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let installationRoot = temporaryRoot.appendingPathComponent("install", isDirectory: true)
+        let sourceRoot = temporaryRoot.appendingPathComponent("source", isDirectory: true)
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let bootstrapManifestURL = temporaryRoot.appendingPathComponent("bootstrap-manifest.json")
+        let bootstrapArchiveURL = temporaryRoot.appendingPathComponent("bootstrap-core.zip")
+        let archiveData = Data("fixture bundled core archive".utf8)
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let bootstrap = try makeSignedCachedFixture(
+            at: sourceRoot,
+            manager: fixtureManager,
+            coreArchiveData: archiveData,
+            version: "2.0.0",
+            signingKey: signingKey
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(bootstrap.manifest).write(to: bootstrapManifestURL)
+        try archiveData.write(to: bootstrapArchiveURL)
+
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        var remoteManifest = bootstrap.manifest
+        remoteManifest.version = "2.1.0"
+        remoteManifest.publishedAt = Date(timeIntervalSince1970: 1)
+        remoteManifest.signatureEd25519 = ""
+        for index in remoteManifest.components.indices {
+            remoteManifest.components[index].url = tokenizedURL(
+                "https://example.com/\(remoteManifest.components[index].name).zip",
+                token: token
+            ).absoluteString
+        }
+        let remote = try signedV2Manifest(remoteManifest, key: signingKey)
+        let componentRequests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            if request.url == manifestURL {
+                return (
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    remote.data
+                )
+            }
+            _ = componentRequests.increment()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+
+        let extraction = MockSubprocessRunner.Script(
+            path: "/usr/bin/unzip",
+            argsPrefix: ["-o", bootstrapArchiveURL.path, "-d"],
+            result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+            onRun: { arguments in
+                let destination = URL(fileURLWithPath: arguments[3], isDirectory: true)
+                for relativePath in Self.coreFixtureContents {
+                    let source = bootstrap.fixture.root.appendingPathComponent(relativePath)
+                    let target = destination.appendingPathComponent(relativePath)
+                    try FileManager.default.createDirectory(
+                        at: target.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try FileManager.default.copyItem(at: source, to: target)
+                }
+            }
+        )
+        let canonicalVersionedRoot = URL(
+            fileURLWithPath: try canonicalFileSystemPath(temporaryRoot),
+            isDirectory: true
+        )
+            .appendingPathComponent("install", isDirectory: true)
+            .appendingPathComponent("2.0.0", isDirectory: true)
+        let runner = MockSubprocessRunner(
+            scripts: bootstrapArchiveInspectionScripts(contents: Self.coreFixtureContents)
+                + bootstrapArchiveInspectionScripts(contents: Self.coreFixtureContents)
+                + [extraction]
+                + validationScripts(for: bootstrap.fixture, installedAt: versionedRoot)
+                + validationScripts(
+                    for: bootstrap.fixture,
+                    installedAt: canonicalVersionedRoot
+                )
+        )
+        let messages = LockedMessages()
+        let manager = ToolchainManager(
+            runner: runner,
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot,
+            bundledBootstrap: .init(
+                manifestURL: bootstrapManifestURL,
+                coreArchiveURL: bootstrapArchiveURL
+            )
+        )
+
+        let toolchain = try await manager.ensureToolchain(
+            manifestURL: manifestURL,
+            publicKeyBase64: remote.publicKey,
+            request: .init(capabilities: [.core, .colmap, .msplat]),
+            onProgress: { _, message in messages.append(message) }
+        )
+
+        XCTAssertEqual(
+            try canonicalFileSystemPath(toolchain.root),
+            try canonicalFileSystemPath(versionedRoot)
+        )
+        XCTAssertEqual(componentRequests.current(), 1)
+        XCTAssertTrue(messages.all().contains("Tools ready (bundled)"))
+    }
+
+    func testAuthenticatedManifestCannotReplaceDifferentIdentityAtSameVersion() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let installed = try makeSignedCachedFixture(
+            at: versionedRoot,
+            manager: fixtureManager,
+            version: "2.0.0",
+            signingKey: signingKey
+        )
+
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        var conflictingManifest = installed.manifest
+        conflictingManifest.publishedAt = installed.manifest.publishedAt.addingTimeInterval(1)
+        conflictingManifest.signatureEd25519 = ""
+        for index in conflictingManifest.components.indices {
+            conflictingManifest.components[index].url = tokenizedURL(
+                "https://example.com/\(conflictingManifest.components[index].name).zip",
+                token: token
+            ).absoluteString
+        }
+        let conflicting = try signedV2Manifest(conflictingManifest, key: signingKey)
+        let componentRequests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            if request.url == manifestURL {
+                return (
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    conflicting.data
+                )
+            }
+            _ = componentRequests.increment()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let canonicalRoot = URL(
+            fileURLWithPath: try canonicalFileSystemPath(versionedRoot),
+            isDirectory: true
+        )
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(
+                scripts: validationScripts(for: installed.fixture, installedAt: canonicalRoot)
+            ),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: manifestURL,
+                publicKeyBase64: conflicting.publicKey,
+                request: .init(capabilities: [.core, .colmap, .msplat]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected immutable-version conflict, got \(error)")
+            }
+            XCTAssertTrue(message.contains("conflicts with its authenticated immutable manifest"))
+        })
+        XCTAssertEqual(componentRequests.current(), 0)
+    }
+
+    func testDamagedAuthenticatedReceiptRejectsBuildMetadataEquivocationBeforeComponentRequest() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let installedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let installed = try makeSignedCachedFixture(
+            at: installedRoot,
+            manager: fixtureManager,
+            version: "2.0.0+installed",
+            signingKey: signingKey
+        )
+        var historicalManifest = installed.manifest
+        historicalManifest.appVersionRange = .init(
+            minimum: "0.1.0",
+            maximumExclusive: "0.2.0-beta.1"
+        )
+        historicalManifest.signatureEd25519 = ""
+        let historical = try signedV2Manifest(historicalManifest, key: signingKey)
+        try fixtureManager.saveInstallState(
+            .init(
+                schemaVersion: 2,
+                installedArtifacts: Dictionary(
+                    uniqueKeysWithValues: historical.manifest.components.map { ($0.name, $0.sha256) }
+                ),
+                installedCapabilities: Set(
+                    historical.manifest.components.flatMap(\.capabilities)
+                ).sorted(),
+                signedManifest: historical.manifest
+            ),
+            root: installedRoot
+        )
+        try FileManager.default.removeItem(at: installed.fixture.colmap)
+
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        var conflictingManifest = historical.manifest
+        conflictingManifest.version = "2.0.0+replacement"
+        conflictingManifest.publishedAt = historical.manifest.publishedAt.addingTimeInterval(1)
+        conflictingManifest.appVersionRange = .init(
+            minimum: "0.2.0-beta.1",
+            maximumExclusive: "0.3.0"
+        )
+        conflictingManifest.signatureEd25519 = ""
+        for index in conflictingManifest.components.indices {
+            conflictingManifest.components[index].url = tokenizedURL(
+                "https://example.com/\(conflictingManifest.components[index].name).zip",
+                token: token
+            ).absoluteString
+        }
+        let conflicting = try signedV2Manifest(conflictingManifest, key: signingKey)
+        let componentRequests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            if request.url == manifestURL {
+                return (
+                    HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!,
+                    conflicting.data
+                )
+            }
+            _ = componentRequests.increment()
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 404,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+
+        XCTAssertEqual(
+            try manager.test_versionedToolchainRoot(for: installed.manifest.version),
+            try manager.test_versionedToolchainRoot(for: conflicting.manifest.version)
+        )
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: manifestURL,
+                publicKeyBase64: conflicting.publicKey,
+                request: .init(capabilities: [.core, .colmap, .msplat]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected immutable semantic-version conflict, got \(error)")
+            }
+            XCTAssertTrue(message.contains("conflicts with its authenticated immutable manifest"))
+        })
+        XCTAssertEqual(componentRequests.current(), 0)
+    }
+
+    func testEnsureToolchainHoldsSemanticVersionLockAcrossRecoveryAndCacheResolution() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: fixtureManager)
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        let manifestEncoder = JSONEncoder()
+        manifestEncoder.dateEncodingStrategy = .iso8601
+        let manifestData = try manifestEncoder.encode(signed.manifest)
+        let manifestRequests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            _ = manifestRequests.increment()
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                manifestData
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+
+        let lockURL = installationRoot.appendingPathComponent(".2.0.0.install.lock")
+        let lockHolder = Process()
+        let lockHolderInput = Pipe()
+        let lockHolderOutput = Pipe()
+        lockHolder.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        lockHolder.arguments = [
+            "-c",
+            """
+            import fcntl, os, sys
+            descriptor = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+            os.fchmod(descriptor, 0o600)
+            fcntl.lockf(descriptor, fcntl.LOCK_EX)
+            print("locked", flush=True)
+            os.read(0, 1)
+            """,
+            lockURL.path,
+        ]
+        lockHolder.standardInput = lockHolderInput
+        lockHolder.standardOutput = lockHolderOutput
+        lockHolder.standardError = Pipe()
+        try lockHolder.run()
+        XCTAssertEqual(
+            lockHolderOutput.fileHandleForReading.readData(ofLength: 7),
+            Data("locked\n".utf8)
+        )
+        var lockIsHeld = true
+        defer {
+            if lockIsHeld {
+                try? lockHolderInput.fileHandleForWriting.write(contentsOf: Data([1]))
+                try? lockHolderInput.fileHandleForWriting.close()
+            }
+            if lockHolder.isRunning { lockHolder.waitUntilExit() }
+        }
+
+        let messages = LockedMessages()
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(
+                scripts: validationScripts(for: signed.fixture, installedAt: versionedRoot)
+            ),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let resolution = Task.detached {
+            try await manager.ensureToolchain(
+                manifestURL: manifestURL,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.core, .colmap, .msplat]),
+                onProgress: { _, message in messages.append(message) }
+            )
+        }
+        while manifestRequests.current() == 0 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertFalse(messages.all().contains("Validating tools"))
+
+        try lockHolderInput.fileHandleForWriting.write(contentsOf: Data([1]))
+        try lockHolderInput.fileHandleForWriting.close()
+        lockHolder.waitUntilExit()
+        XCTAssertEqual(lockHolder.terminationStatus, 0)
+        lockIsHeld = false
+        let toolchain = try await resolution.value
+        XCTAssertEqual(toolchain.root.standardizedFileURL, versionedRoot.standardizedFileURL)
+        XCTAssertTrue(messages.all().contains("Validating tools"))
+    }
+
+    func testInstallLockSerializesConcurrentTransactionsWithinSameProcess() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let releaseFirst = ToolchainInstallLockGate()
+        let firstEntries = LockedCounter()
+        let secondEntries = LockedCounter()
+        let first = Task.detached {
+            try await manager.test_withInstallLock(for: versionedRoot) {
+                _ = firstEntries.increment()
+                await releaseFirst.wait()
+            }
+        }
+        while firstEntries.current() == 0 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let second = Task.detached {
+            try await manager.test_withInstallLock(for: versionedRoot) {
+                _ = secondEntries.increment()
+            }
+        }
+
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(secondEntries.current(), 0)
+        await releaseFirst.open()
+        try await first.value
+        try await second.value
+        XCTAssertEqual(secondEntries.current(), 1)
+    }
+
+    func testCancelledInstallLockWaiterReturnsPromptlyWithoutEnteringTransaction() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let releaseHolder = ToolchainInstallLockGate()
+        let holderEntries = LockedCounter()
+        let waiterEntries = LockedCounter()
+        let waiterOutcomes = LockedMessages()
+        let holder = Task.detached {
+            try await manager.test_withInstallLock(for: versionedRoot) {
+                _ = holderEntries.increment()
+                await releaseHolder.wait()
+            }
+        }
+        while holderEntries.current() == 0 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let waiterFinished = expectation(description: "cancelled lock waiter finished")
+        let waiter = Task.detached {
+            defer { waiterFinished.fulfill() }
+            do {
+                try await manager.test_withInstallLock(for: versionedRoot) {
+                    _ = waiterEntries.increment()
+                }
+                waiterOutcomes.append("completed")
+            } catch is CancellationError {
+                waiterOutcomes.append("cancelled")
+            } catch {
+                waiterOutcomes.append("error: \(error)")
+            }
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        waiter.cancel()
+
+        await fulfillment(of: [waiterFinished], timeout: 0.25)
+        XCTAssertEqual(waiterOutcomes.all(), ["cancelled"])
+        XCTAssertEqual(waiterEntries.current(), 0)
+        await releaseHolder.open()
+        try await holder.value
+        _ = await waiter.result
+    }
+
+    func testCancelledOfflineFallbackWaitingForRecoveryLockReturnsPromptly() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let interruptedRoot = installationRoot.appendingPathComponent(
+            "2.0.0.staging-offline",
+            isDirectory: true
+        )
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: interruptedRoot, manager: fixtureManager)
+        try FileManager.default.removeItem(at: signed.fixture.colmap)
+
+        let lockURL = installationRoot.appendingPathComponent(".2.0.0.install.lock")
+        let lockHolder = Process()
+        let lockHolderInput = Pipe()
+        let lockHolderOutput = Pipe()
+        lockHolder.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        lockHolder.arguments = [
+            "-c",
+            """
+            import fcntl, os, sys
+            descriptor = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+            os.fchmod(descriptor, 0o600)
+            fcntl.lockf(descriptor, fcntl.LOCK_EX)
+            print("locked", flush=True)
+            os.read(0, 1)
+            """,
+            lockURL.path,
+        ]
+        lockHolder.standardInput = lockHolderInput
+        lockHolder.standardOutput = lockHolderOutput
+        lockHolder.standardError = Pipe()
+        try lockHolder.run()
+        XCTAssertEqual(
+            lockHolderOutput.fileHandleForReading.readData(ofLength: 7),
+            Data("locked\n".utf8)
+        )
+        var lockIsHeld = true
+        defer {
+            if lockIsHeld {
+                try? lockHolderInput.fileHandleForWriting.write(contentsOf: Data([1]))
+                try? lockHolderInput.fileHandleForWriting.close()
+            }
+            if lockHolder.isRunning { lockHolder.waitUntilExit() }
+        }
+
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        let manifestRequests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            _ = manifestRequests.increment()
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 404,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let outcome = LockedMessages()
+        let finished = expectation(description: "cancelled offline recovery finished")
+        let resolution = Task.detached {
+            defer { finished.fulfill() }
+            do {
+                _ = try await manager.ensureToolchain(
+                    manifestURL: manifestURL,
+                    publicKeyBase64: signed.publicKey,
+                    request: .init(capabilities: [.core, .colmap, .msplat]),
+                    onProgress: { _, _ in }
+                )
+                outcome.append("completed")
+            } catch is CancellationError {
+                outcome.append("cancelled")
+            } catch {
+                outcome.append("error: \(error)")
+            }
+        }
+        while manifestRequests.current() == 0 {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        resolution.cancel()
+
+        await fulfillment(of: [finished], timeout: 0.25)
+        XCTAssertEqual(outcome.all(), ["cancelled"])
+
+        try lockHolderInput.fileHandleForWriting.write(contentsOf: Data([1]))
+        try lockHolderInput.fileHandleForWriting.close()
+        lockHolder.waitUntilExit()
+        lockIsHeld = false
+        _ = await resolution.result
+    }
+
+    func testEnsureToolchainUsesValidSignedCacheWithoutNetworkOrReceiptMutation() async throws {
+        let temporaryRoot = try TestFileBuilder.makeTempDir()
+        let installationRoot = temporaryRoot.path.hasPrefix("/var/")
+            ? URL(fileURLWithPath: "/private\(temporaryRoot.path)", isDirectory: true)
+            : temporaryRoot
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: fixtureManager)
+        let receipt = versionedRoot.appendingPathComponent(".easysplat_toolchain_state.json")
+        let receiptBefore = try Data(contentsOf: receipt)
+        var statusBefore = stat()
+        XCTAssertEqual(lstat(receipt.path, &statusBefore), 0)
+
+        let requests = LockedCounter()
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        MockURLProtocol.register(token: token) { request in
+            _ = requests.increment()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let messages = LockedMessages()
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: validationScripts(for: signed.fixture)),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot,
+            sourcePolicy: .cachedOnly
+        )
+
+        let toolchain = try await manager.ensureToolchain(
+            manifestURL: manifestURL,
+            publicKeyBase64: signed.publicKey,
+            request: .init(capabilities: [.da3Base, .da3Small]),
+            onProgress: { _, message in messages.append(message) }
+        )
+
+        var statusAfter = stat()
+        XCTAssertEqual(lstat(receipt.path, &statusAfter), 0)
+        XCTAssertEqual(toolchain.root.standardizedFileURL, versionedRoot.standardizedFileURL)
+        XCTAssertEqual(requests.current(), 0)
+        XCTAssertEqual(try Data(contentsOf: receipt), receiptBefore)
+        XCTAssertEqual(statusAfter.st_dev, statusBefore.st_dev)
+        XCTAssertEqual(statusAfter.st_ino, statusBefore.st_ino)
+        XCTAssertEqual(statusAfter.st_mode, statusBefore.st_mode)
+        XCTAssertEqual(statusAfter.st_nlink, statusBefore.st_nlink)
+        XCTAssertTrue(messages.all().contains("Trying cached tools"))
+        XCTAssertTrue(messages.all().contains("Tools ready (offline cached)"))
+    }
+
+    func testValidatedInstallationEvidenceUsesSignedComponentsAndExactClosure() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: manager)
+        var state = manager.loadInstallState(root: versionedRoot)
+        state.installedCapabilities = ["forged.capability"]
+        try manager.saveInstallState(state, root: versionedRoot)
+        let request = ToolchainCapabilityRequest(capabilities: [.da3Base, .da3Small])
+
+        let evidence = try manager.validatedInstallationEvidence(
+            root: versionedRoot,
+            publicKeyBase64: signed.publicKey,
+            request: request,
+            matching: signed.manifest
+        )
+
+        XCTAssertEqual(evidence.toolchainVersion, signed.manifest.version)
+        XCTAssertEqual(evidence.keyID, signed.manifest.keyID)
+        XCTAssertEqual(
+            evidence.canonicalManifestSHA256,
+            SHA256.hash(data: try signed.manifest.canonicalData())
+                .map { String(format: "%02x", $0) }
+                .joined()
+        )
+        let signature = try XCTUnwrap(Data(base64Encoded: signed.manifest.signatureEd25519))
+        XCTAssertEqual(
+            evidence.signatureSHA256,
+            SHA256.hash(data: signature).map { String(format: "%02x", $0) }.joined()
+        )
+        XCTAssertEqual(
+            evidence.installedArtifacts,
+            Dictionary(uniqueKeysWithValues: signed.manifest.components.map {
+                ($0.name, $0.sha256.lowercased())
+            })
+        )
+        XCTAssertEqual(
+            evidence.installedCapabilities,
+            Set(signed.manifest.components.flatMap(\.capabilities)).sorted()
+        )
+        XCTAssertEqual(
+            evidence.installedCriticalFileSHA256,
+            signed.manifest.components.reduce(into: [:]) { result, component in
+                result.merge(component.criticalFileHashes) { current, replacement in
+                    XCTAssertEqual(current, replacement)
+                    return current
+                }
+            }
+        )
+        XCTAssertEqual(
+            evidence.nativeTrainerBuildDigest,
+            try expectedNativeTrainerBuildDigest(root: versionedRoot)
+        )
+        XCTAssertFalse(evidence.installedCapabilities.contains("forged.capability"))
+        XCTAssertEqual(evidence.closureSHA256.count, 64)
+        XCTAssertEqual(
+            evidence.signedComponents.map(\.name),
+            signed.manifest.components.map(\.name)
+        )
+        XCTAssertEqual(
+            evidence.signedComponents.first?.expandedClosureSHA256,
+            signed.manifest.components.first?.expandedClosureSHA256
+        )
+        XCTAssertTrue(
+            evidence.signedComponents.contains(where: {
+                $0.declaredContents.contains("da3_mps/models/DA3-BASE/model.safetensors")
+            })
+        )
+        XCTAssertTrue(
+            evidence.provenanceRecords.contains(where: {
+                $0.path == "msplat/build_info.json"
+                    && $0.stringFields["source_version"] == "1.1.3"
+            })
+        )
+
+        let unchanged = try manager.validatedInstallationEvidence(
+            root: versionedRoot,
+            publicKeyBase64: signed.publicKey,
+            request: request,
+            matching: signed.manifest
+        )
+        XCTAssertEqual(unchanged, evidence)
+
+        let replacement = versionedRoot.appendingPathComponent("bin/.colmap-replacement")
+        try Data(contentsOf: signed.fixture.colmap).write(to: replacement)
+        let originalAttributes = try FileManager.default.attributesOfItem(
+            atPath: signed.fixture.colmap.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: originalAttributes[.posixPermissions] ?? 0o755],
+            ofItemAtPath: replacement.path
+        )
+        XCTAssertEqual(Darwin.rename(replacement.path, signed.fixture.colmap.path), 0)
+        let replaced = try manager.validatedInstallationEvidence(
+            root: versionedRoot,
+            publicKeyBase64: signed.publicKey,
+            request: request,
+            matching: signed.manifest
+        )
+        XCTAssertEqual(replaced.closureSHA256, evidence.closureSHA256)
+        XCTAssertNotEqual(
+            replaced.installationIdentitySHA256,
+            evidence.installationIdentitySHA256
+        )
+
+        try Data("mutated".utf8).write(to: signed.fixture.colmap)
+        XCTAssertThrowsError(
+            try manager.validatedInstallationEvidence(
+                root: versionedRoot,
+                publicKeyBase64: signed.publicKey,
+                request: request,
+                matching: signed.manifest
+            )
+        )
+    }
+
+    func testValidatedInstallationEvidenceAcceptsSignedSupplyChainAboveOneMiB() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let supplyChain = try JSONSerialization.data(
+            withJSONObject: [
+                "schemaVersion": 1,
+                "components": [],
+                "files": [],
+                "fixturePadding": String(repeating: "x", count: 1_100_000),
+            ],
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        XCTAssertGreaterThan(supplyChain.count, 1_024 * 1_024)
+        XCTAssertLessThan(supplyChain.count, 16 * 1_024 * 1_024)
+        let signed = try makeSignedCachedFixture(
+            at: versionedRoot,
+            manager: manager,
+            additionalCoreFiles: ["supply-chain/components.json": supplyChain]
+        )
+
+        let evidence = try manager.validatedInstallationEvidence(
+            root: versionedRoot,
+            publicKeyBase64: signed.publicKey,
+            request: .init(capabilities: [.da3Base, .da3Small]),
+            matching: signed.manifest
+        )
+
+        XCTAssertTrue(evidence.provenanceRecords.contains(where: {
+            $0.path == "supply-chain/components.json"
+        }))
+    }
+
+    func testValidatedInstallationEvidenceRejectsDifferentExpectedManifest() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: manager)
+        var different = signed.manifest
+        different.signatureEd25519 = Data(repeating: 0, count: 64).base64EncodedString()
+
+        XCTAssertThrowsError(
+            try manager.validatedInstallationEvidence(
+                root: versionedRoot,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small]),
+                matching: different
+            )
+        )
+    }
+
+    func testNativeTrainerEvidenceRejectsPostClosureMutationAgainstSignedHashes() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1"
+        )
+        let signed = try makeSignedCachedFixture(at: root, manager: manager)
+        let signedHashes = signed.manifest.components.reduce(into: [String: String]()) {
+            $0.merge($1.criticalFileHashes) { current, replacement in
+                XCTAssertEqual(current, replacement)
+                return current
+            }
+        }
+
+        XCTAssertNoThrow(try manager.test_nativeTrainerBuildDigest(
+            root: root,
+            signedFileHashes: signedHashes
+        ))
+        try Data("post-closure mutation".utf8).write(
+            to: root.appendingPathComponent("bin/easysplat-train"),
+            options: .atomic
+        )
+
+        XCTAssertThrowsError(try manager.test_nativeTrainerBuildDigest(
+            root: root,
+            signedFileHashes: signedHashes
+        ))
+    }
+
+    func testValidatedInstallationEvidenceRejectsSignedTreeOutsideManagersVersionedRoot() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        let outsideContainer = try TestFileBuilder.makeTempDir()
+        defer {
+            try? FileManager.default.removeItem(at: installationRoot)
+            try? FileManager.default.removeItem(at: outsideContainer)
+        }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: manager)
+        let outsideRoot = outsideContainer.appendingPathComponent("2.0.0", isDirectory: true)
+        try FileManager.default.copyItem(at: versionedRoot, to: outsideRoot)
+
+        XCTAssertThrowsError(
+            try manager.validatedInstallationEvidence(
+                root: outsideRoot,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small]),
+                matching: signed.manifest
+            )
+        ) { error in
+            guard let toolchainError = error as? ToolchainManager.ToolchainError,
+                  case .invalidManifest = toolchainError else {
+                return XCTFail("Expected invalidManifest, got \(error)")
+            }
+        }
+    }
+
+    func testCachedOnlyRejectsUnsignedLocalOverrideBeforeCacheOrNetworkAccess() async throws {
+        let temporaryRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let installationRoot = temporaryRoot.appendingPathComponent("cache", isDirectory: true)
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let localRoot = temporaryRoot.appendingPathComponent("unsigned-local", isDirectory: true)
+        try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: fixtureManager)
+
+        let requests = LockedCounter()
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        MockURLProtocol.register(token: token) { request in
+            _ = requests.increment()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: validationScripts(for: signed.fixture)),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: localRoot,
+            installationRoot: installationRoot,
+            sourcePolicy: .cachedOnly
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: manifestURL,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidManifest = error else {
+                return XCTFail("Expected invalidManifest, got \(error)")
+            }
+        })
+        XCTAssertEqual(requests.current(), 0)
+    }
+
+    func testCachedOnlyDoesNotRepairExecutablePermissions() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: fixtureManager)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: signed.fixture.colmap.path
+        )
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: validationScripts(for: signed.fixture)),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot,
+            sourcePolicy: .cachedOnly
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: URL(string: "https://127.0.0.1:1/cached-only.json")!,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected an incomplete signed core without a permission repair, got \(error)")
+            }
+            XCTAssertTrue(message.contains("Cached toolchain component is incomplete: macos-arm64-core"))
+        })
+        let attributes = try FileManager.default.attributesOfItem(atPath: signed.fixture.colmap.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o644)
+    }
+
+    func testCachedOnlyDoesNotRecoverInterruptedInstall() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let stagingRoot = installationRoot.appendingPathComponent("2.0.0.staging-test", isDirectory: true)
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: stagingRoot, manager: fixtureManager)
+        let receipt = stagingRoot.appendingPathComponent(".easysplat_toolchain_state.json")
+        let receiptBefore = try Data(contentsOf: receipt)
+        var statusBefore = stat()
+        XCTAssertEqual(lstat(receipt.path, &statusBefore), 0)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: validationScripts(for: signed.fixture)),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot,
+            sourcePolicy: .cachedOnly
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: URL(string: "https://127.0.0.1:1/cached-only.json")!,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected an unavailable signed cache, got \(error)")
+            }
+            XCTAssertTrue(message.contains("No verified cached toolchain"))
+        })
+        var statusAfter = stat()
+        XCTAssertEqual(lstat(receipt.path, &statusAfter), 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stagingRoot.path))
+        XCTAssertEqual(try Data(contentsOf: receipt), receiptBefore)
+        XCTAssertEqual(statusAfter.st_dev, statusBefore.st_dev)
+        XCTAssertEqual(statusAfter.st_ino, statusBefore.st_ino)
+        XCTAssertEqual(statusAfter.st_ctimespec.tv_sec, statusBefore.st_ctimespec.tv_sec)
+        XCTAssertEqual(statusAfter.st_ctimespec.tv_nsec, statusBefore.st_ctimespec.tv_nsec)
+    }
+
+    func testBundledBootstrapOnlyInstallsSignedCoreWithoutNetworkAccess() async throws {
+        let temporaryRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let installationRoot = temporaryRoot.appendingPathComponent("install", isDirectory: true)
+        let sourceRoot = temporaryRoot.appendingPathComponent("source", isDirectory: true)
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let archiveData = Data("fixture bundled core archive".utf8)
+        let bootstrapManifestURL = temporaryRoot.appendingPathComponent("bootstrap-manifest.json")
+        let bootstrapArchiveURL = temporaryRoot.appendingPathComponent("bootstrap-core.zip")
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let fixture = try makeSignedCachedFixture(
+            at: sourceRoot,
+            manager: fixtureManager,
+            coreArchiveData: archiveData
+        )
+
+        let requests = LockedCounter()
+        let token = UUID().uuidString
+        var unsignedManifest = fixture.manifest
+        unsignedManifest.signatureEd25519 = ""
+        for index in unsignedManifest.components.indices {
+            let name = unsignedManifest.components[index].name
+            unsignedManifest.components[index].url = tokenizedURL(
+                "https://example.com/\(name).zip",
+                token: token
+            ).absoluteString
+        }
+        let signed = try signedV2Manifest(unsignedManifest)
+        try signed.data.write(to: bootstrapManifestURL)
+        try archiveData.write(to: bootstrapArchiveURL)
+        MockURLProtocol.register(token: token) { request in
+            _ = requests.increment()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+
+        let success = SubprocessResult(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "")
+        let extraction = MockSubprocessRunner.Script(
+            path: "/usr/bin/unzip",
+            argsPrefix: ["-o", bootstrapArchiveURL.path, "-d"],
+            result: success,
+            onRun: { arguments in
+                guard arguments.count == 4 else {
+                    throw NSError(
+                        domain: "BundledBootstrapFixture",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Unexpected unzip arguments: \(arguments)"]
+                    )
+                }
+                let destination = URL(fileURLWithPath: arguments[3], isDirectory: true)
+                for relativePath in Self.coreFixtureContents {
+                    let source = fixture.fixture.root.appendingPathComponent(relativePath)
+                    let target = destination.appendingPathComponent(relativePath)
+                    try FileManager.default.createDirectory(
+                        at: target.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try FileManager.default.copyItem(at: source, to: target)
+                }
+            }
+        )
+        let inspectionScripts = bootstrapArchiveInspectionScripts(contents: Self.coreFixtureContents)
+        let runner = MockSubprocessRunner(
+            scripts: inspectionScripts
+                + bootstrapArchiveInspectionScripts(contents: Self.coreFixtureContents)
+                + [extraction]
+                + validationScripts(for: fixture.fixture, installedAt: versionedRoot)
+        )
+        let messages = LockedMessages()
+        let manager = ToolchainManager(
+            runner: runner,
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot,
+            bundledBootstrap: .init(
+                manifestURL: bootstrapManifestURL,
+                coreArchiveURL: bootstrapArchiveURL
+            ),
+            sourcePolicy: .bundledBootstrapOnly
+        )
+        let request = ToolchainCapabilityRequest(capabilities: [.core, .colmap, .msplat])
+
+        let toolchain = try await manager.ensureToolchain(
+            manifestURL: tokenizedURL("https://example.com/manifest.json", token: token),
+            publicKeyBase64: signed.publicKey,
+            request: request,
+            onProgress: { _, message in messages.append(message) }
+        )
+
+        let core = try XCTUnwrap(signed.manifest.components.first { $0.name == "macos-arm64-core" })
+        let state = manager.loadInstallState(root: versionedRoot)
+        let receipt = try manager.validateSignedReceipt(
+            root: versionedRoot,
+            publicKeyBase64: signed.publicKey,
+            request: request
+        )
+        XCTAssertEqual(
+            toolchain.root.resolvingSymlinksInPath(),
+            versionedRoot.resolvingSymlinksInPath()
+        )
+        XCTAssertEqual(state.installedArtifacts, [core.name: core.sha256])
+        XCTAssertEqual(Set(state.installedCapabilities), ToolchainManager.coreCapabilities)
+        XCTAssertEqual(receipt.signatureEd25519, signed.manifest.signatureEd25519)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: versionedRoot.appendingPathComponent("da3_mps").path
+            )
+        )
+        XCTAssertEqual(requests.current(), 0)
+        XCTAssertTrue(messages.all().contains("Checking bundled tools"))
+        XCTAssertTrue(messages.all().contains("Tools ready (bundled)"))
+    }
+
+    func testBundledBootstrapOnlyRejectsConflictingAuthenticatedPublicationBeforeExtraction() async throws {
+        try await assertConflictingBundledBootstrapIsRejected(.bundledOnly)
+    }
+
+    func testOfflineFallbackRejectsConflictingAuthenticatedBootstrapBeforeExtraction() async throws {
+        try await assertConflictingBundledBootstrapIsRejected(.offlineFallback)
+    }
+
+    func testBundledBootstrapOnlyRejectsUnsatisfiedRequestWithoutNetworkAccess() async throws {
+        let temporaryRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let installationRoot = temporaryRoot.appendingPathComponent("install", isDirectory: true)
+        let fixtureRoot = temporaryRoot.appendingPathComponent("fixture", isDirectory: true)
+        let archiveData = Data("fixture bundled core archive".utf8)
+        let bootstrapManifestURL = temporaryRoot.appendingPathComponent("bootstrap-manifest.json")
+        let bootstrapArchiveURL = temporaryRoot.appendingPathComponent("bootstrap-core.zip")
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(
+            at: fixtureRoot,
+            manager: fixtureManager,
+            coreArchiveData: archiveData
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(signed.manifest).write(to: bootstrapManifestURL)
+        try archiveData.write(to: bootstrapArchiveURL)
+
+        let requests = LockedCounter()
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        MockURLProtocol.register(token: token) { request in
+            _ = requests.increment()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(
+                scripts: bootstrapArchiveInspectionScripts(contents: Self.coreFixtureContents)
+            ),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot,
+            bundledBootstrap: .init(
+                manifestURL: bootstrapManifestURL,
+                coreArchiveURL: bootstrapArchiveURL
+            ),
+            sourcePolicy: .bundledBootstrapOnly
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: manifestURL,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.artifactNotFound = error else {
+                return XCTFail("Expected an unsatisfied bundled-only request, got \(error)")
+            }
+        })
+        XCTAssertEqual(requests.current(), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installationRoot.path))
     }
 
     func testDA3RequestWithCorruptCacheAndValidCoreBootstrapReportsCacheIntegrityFailure() async throws {
@@ -931,7 +2820,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         })
     }
 
-    func testCacheFloorUsesSignedReceiptVersionInsteadOfDirectoryNameAndSkipsOlderReceipt() throws {
+    func testCacheRejectsSignedReceiptCopiedUnderAnotherVersionDirectory() throws {
         let installationRoot = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: installationRoot) }
         let misleadingRoot = installationRoot.appendingPathComponent("99.0.0", isDirectory: true)
@@ -944,13 +2833,11 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
         let signed = try makeSignedCachedFixture(at: misleadingRoot, manager: manager)
 
-        let result = try manager.loadBestCachedToolchain(
+        XCTAssertThrowsError(try manager.loadBestCachedToolchain(
             publicKeyBase64: signed.publicKey,
             request: .init(capabilities: [.da3Base, .da3Small]),
-            minimumVersion: "2.0.1"
-        )
-
-        XCTAssertNil(result)
+            minimumVersion: "1.0.0"
+        ))
     }
 
     func testCacheFloorAllowsEqualAndNewerSignedReceiptVersions() throws {
@@ -960,7 +2847,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 ? URL(fileURLWithPath: "/private\(temporaryRoot.path)", isDirectory: true)
                 : temporaryRoot
             defer { try? FileManager.default.removeItem(at: installationRoot) }
-            let misleadingRoot = installationRoot.appendingPathComponent("0.0.1", isDirectory: true)
+            let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
             let bootstrapManager = ToolchainManager(
                 runner: MockSubprocessRunner(scripts: []),
                 urlSession: makeSession(),
@@ -968,7 +2855,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 localToolchainRoot: nil,
                 installationRoot: installationRoot
             )
-            let signed = try makeSignedCachedFixture(at: misleadingRoot, manager: bootstrapManager)
+            let signed = try makeSignedCachedFixture(at: versionedRoot, manager: bootstrapManager)
             let manager = ToolchainManager(
                 runner: MockSubprocessRunner(scripts: validationScripts(for: signed.fixture)),
                 urlSession: makeSession(),
@@ -983,7 +2870,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 minimumVersion: floor
             )
 
-            XCTAssertEqual(result?.root.standardizedFileURL, misleadingRoot.standardizedFileURL)
+            XCTAssertEqual(result?.root.standardizedFileURL, versionedRoot.standardizedFileURL)
         }
     }
 
@@ -1016,8 +2903,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
     }
 
-    func testDownloadManifestAcceptsExactlySixteenMiB() async throws {
-        let maximumBytes = 16 * 1_024 * 1_024
+    func testDownloadManifestAcceptsExactlyEightMiB() async throws {
+        let maximumBytes = 8 * 1_024 * 1_024
         let signed = try minimalSignedManifest()
         var data = signed.data
         data.append(Data(repeating: 0x20, count: maximumBytes - data.count))
@@ -1050,7 +2937,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
     }
 
     func testDownloadManifestRejectsOversizedContentLengthBeforeReadingBody() async throws {
-        let maximumBytes = 16 * 1_024 * 1_024
+        let maximumBytes = 8 * 1_024 * 1_024
         let signed = try minimalSignedManifest()
         let token = UUID().uuidString
         let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
@@ -1080,13 +2967,13 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             guard case ToolchainManager.ToolchainError.manifestTooLarge(maximumBytes) = error else {
                 return XCTFail("Expected manifestTooLarge, got \(error)")
             }
-            XCTAssertEqual(maximumBytes, 16 * 1_024 * 1_024)
+            XCTAssertEqual(maximumBytes, 8 * 1_024 * 1_024)
         })
         XCTAssertEqual(requests.current(), 1)
     }
 
     func testDownloadManifestRejectsStreamingOverflowWithoutContentLength() async throws {
-        let maximumBytes = 16 * 1_024 * 1_024
+        let maximumBytes = 8 * 1_024 * 1_024
         let signed = try minimalSignedManifest()
         var data = signed.data
         data.append(Data(repeating: 0x20, count: maximumBytes + 1 - data.count))
@@ -1121,7 +3008,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             guard case ToolchainManager.ToolchainError.manifestTooLarge(maximumBytes) = error else {
                 return XCTFail("Expected manifestTooLarge, got \(error)")
             }
-            XCTAssertEqual(maximumBytes, 16 * 1_024 * 1_024)
+            XCTAssertEqual(maximumBytes, 8 * 1_024 * 1_024)
         })
         XCTAssertEqual(requests.current(), 1)
     }
@@ -1295,21 +3182,55 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             let baseData = Data("base-component".utf8)
             let smallData = Data("small-component".utf8)
 
-            let bootstrap = ToolchainManager(runner: MockSubprocessRunner(scripts: []), localToolchainRoot: nil)
+            let temporaryInstallationRoot = try TestFileBuilder.makeTempDir()
+            guard let canonicalPath = realpath(temporaryInstallationRoot.path, nil) else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            defer { free(canonicalPath) }
+            let installationRoot = URL(
+                fileURLWithPath: String(cString: canonicalPath),
+                isDirectory: true
+            )
+            defer { try? FileManager.default.removeItem(at: installationRoot) }
+            let bootstrap = ToolchainManager(
+                runner: MockSubprocessRunner(scripts: []),
+                localToolchainRoot: nil,
+                installationRoot: installationRoot
+            )
             let versionedRoot = bootstrap.toolchainRoot().appendingPathComponent(version, isDirectory: true)
             try? FileManager.default.removeItem(at: versionedRoot)
             let seedFixture = try ToolchainFixtureBuilder.createToolchain(at: versionedRoot)
-            let criticalCorePaths = ToolchainManager.criticalCoreFiles(in: Self.coreFixtureContents).sorted()
-            let criticalCoreHashes = try Dictionary(uniqueKeysWithValues: criticalCorePaths.map { path in
-                (path, try bootstrap.test_sha256Hex(url: versionedRoot.appendingPathComponent(path)))
-            })
+            let coreClosure = try bootstrap.test_expandedClosureEvidence(
+                paths: Self.coreFixtureContents,
+                root: versionedRoot
+            )
             let baseContents = Self.baseFixtureContents
             let smallContents = Self.smallFixtureContents
+            let baseClosure = try bootstrap.test_expandedClosureEvidence(
+                paths: baseContents,
+                root: versionedRoot
+            )
+            let smallClosure = try bootstrap.test_expandedClosureEvidence(
+                paths: smallContents,
+                root: versionedRoot
+            )
             let basePayloads = try Dictionary(uniqueKeysWithValues: baseContents.map { path in
                 (path, try Data(contentsOf: versionedRoot.appendingPathComponent(path)))
             })
             let smallPayloads = try Dictionary(uniqueKeysWithValues: smallContents.map { path in
                 (path, try Data(contentsOf: versionedRoot.appendingPathComponent(path)))
+            })
+            let baseModes = try Dictionary(uniqueKeysWithValues: baseContents.map { path in
+                let attributes = try FileManager.default.attributesOfItem(
+                    atPath: versionedRoot.appendingPathComponent(path).path
+                )
+                return (path, (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o644)
+            })
+            let smallModes = try Dictionary(uniqueKeysWithValues: smallContents.map { path in
+                let attributes = try FileManager.default.attributesOfItem(
+                    atPath: versionedRoot.appendingPathComponent(path).path
+                )
+                return (path, (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o644)
             })
             try FileManager.default.removeItem(at: versionedRoot)
             defer { try? FileManager.default.removeItem(at: versionedRoot) }
@@ -1317,12 +3238,6 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             func componentHash(_ data: Data) -> String {
                 SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             }
-            let baseCriticalHashes = Dictionary(
-                uniqueKeysWithValues: basePayloads.map { ($0.key, componentHash($0.value)) }
-            )
-            let smallCriticalHashes = Dictionary(
-                uniqueKeysWithValues: smallPayloads.map { ($0.key, componentHash($0.value)) }
-            )
             let manifest = ToolchainManifest(
                 schemaVersion: 2,
                 toolchainAPI: 2,
@@ -1331,9 +3246,9 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 publishedAt: Date(),
                 appVersionRange: .init(minimum: "1.0.0", maximumExclusive: "3.0.0"),
                 components: [
-                    .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "training.msplat"], url: coreURL.absoluteString, sha256: componentHash(coreData), sizeBytes: UInt64(coreData.count), contents: Self.coreFixtureContents, criticalFileHashes: criticalCoreHashes, dependencies: [], requirement: .required),
-                    .init(name: "geometry-da3-base", capabilities: ["geometry.da3.runtime", "geometry.da3.base"], url: baseURL.absoluteString, sha256: componentHash(baseData), sizeBytes: UInt64(baseData.count), contents: baseContents, criticalFileHashes: baseCriticalHashes, dependencies: ["macos-arm64-core"], requirement: .optional),
-                    .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: smallURL.absoluteString, sha256: componentHash(smallData), sizeBytes: UInt64(smallData.count), contents: smallContents, criticalFileHashes: smallCriticalHashes, dependencies: ["geometry-da3-base"], requirement: .optional),
+                    .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "training.msplat"], url: coreURL.absoluteString, sha256: componentHash(coreData), sizeBytes: UInt64(coreData.count), expandedSizeBytes: coreClosure.sizeBytes, expandedClosureSHA256: coreClosure.sha256, contents: Self.coreFixtureContents, criticalFileHashes: coreClosure.fileHashes, dependencies: [], requirement: .required),
+                    .init(name: "geometry-da3-base", capabilities: ["geometry.da3.runtime", "geometry.da3.base"], url: baseURL.absoluteString, sha256: componentHash(baseData), sizeBytes: UInt64(baseData.count), expandedSizeBytes: baseClosure.sizeBytes, expandedClosureSHA256: baseClosure.sha256, contents: baseContents, criticalFileHashes: baseClosure.fileHashes, dependencies: ["macos-arm64-core"], requirement: .optional),
+                    .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: smallURL.absoluteString, sha256: componentHash(smallData), sizeBytes: UInt64(smallData.count), expandedSizeBytes: smallClosure.sizeBytes, expandedClosureSHA256: smallClosure.sha256, contents: smallContents, criticalFileHashes: smallClosure.fileHashes, dependencies: ["geometry-da3-base"], requirement: .optional),
                 ],
                 signatureEd25519: ""
             )
@@ -1391,6 +3306,10 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                         let file = destination.appendingPathComponent(path)
                         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
                         FileManager.default.createFile(atPath: file.path, contents: payload)
+                        try? FileManager.default.setAttributes(
+                            [.posixPermissions: baseModes[path] ?? 0o644],
+                            ofItemAtPath: file.path
+                        )
                     }
                 }
             )
@@ -1405,23 +3324,36 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                         let file = destination.appendingPathComponent(path)
                         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
                         FileManager.default.createFile(atPath: file.path, contents: payload)
+                        try? FileManager.default.setAttributes(
+                            [.posixPermissions: smallModes[path] ?? 0o644],
+                            ofItemAtPath: file.path
+                        )
                     }
                 }
             )
             let firstModelUnzip = firstCapability == .da3Base ? baseUnzip : smallUnzip
             let secondModelUnzip = firstCapability == .da3Base ? smallUnzip : baseUnzip
+            let temporaryAliasRoot = URL(
+                fileURLWithPath: versionedRoot.path.replacingOccurrences(
+                    of: "/private/var/",
+                    with: "/var/"
+                ),
+                isDirectory: true
+            )
+            let validation = (0..<4).flatMap { _ in
+                validationScripts(for: seedFixture, installedAt: versionedRoot)
+                    + validationScripts(for: seedFixture, installedAt: temporaryAliasRoot)
+            }
             let runner = MockSubprocessRunner(
                 scripts: [coreUnzip, firstModelUnzip, secondModelUnzip]
-                    + validationScripts(for: seedFixture)
-                    + validationScripts(for: seedFixture)
-                    + validationScripts(for: seedFixture)
-                    + validationScripts(for: seedFixture)
+                    + validation
             )
             let manager = ToolchainManager(
                 runner: runner,
                 urlSession: makeSession(),
                 appVersion: "2.0.0",
-                localToolchainRoot: nil
+                localToolchainRoot: nil,
+                installationRoot: installationRoot
             )
 
             let toolchain = try await manager.ensureToolchain(
@@ -1431,7 +3363,10 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 onProgress: { _, _ in }
             )
 
-            XCTAssertEqual(toolchain.root, versionedRoot)
+            XCTAssertEqual(
+                try canonicalFileSystemPath(toolchain.root),
+                try canonicalFileSystemPath(versionedRoot)
+            )
             XCTAssertEqual(coreRequests.current(), 1)
             XCTAssertEqual(baseRequests.current(), firstCapability == .da3Base ? 1 : 0)
             XCTAssertEqual(smallRequests.current(), firstCapability == .da3Small ? 1 : 0)
@@ -1776,7 +3711,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             installationRoot: nextVersionRoot
         )
         XCTAssertNotEqual(changedHashPartial.path, changedVersionPartial.path)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: changedHashPartial.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: changedHashPartial.path))
         try Data(repeating: 0x04, count: 9).write(to: changedVersionPartial)
 
         let cleanedOversizedPartial = try manager.preparePartialDownload(
@@ -1786,6 +3721,81 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
         XCTAssertEqual(cleanedOversizedPartial.path, changedVersionPartial.path)
         XCTAssertFalse(FileManager.default.fileExists(atPath: cleanedOversizedPartial.path))
+    }
+
+    func testPreparingAnotherVersionDoesNotUnlinkLiveCrossProcessPartial() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+        let artifactURL = URL(string: "https://example.com/core.zip")!
+        let artifact = testComponent(
+            name: "macos-arm64-core",
+            url: artifactURL.absoluteString,
+            sha256: String(repeating: "a", count: 64),
+            sizeBytes: 8,
+            contents: ["bin/colmap"]
+        )
+        let firstRoot = parent.appendingPathComponent("2.0.0.staging-first", isDirectory: true)
+        let nextRoot = parent.appendingPathComponent("2.0.1.staging-first", isDirectory: true)
+        let firstPartial = try manager.preparePartialDownload(
+            artifact: artifact,
+            url: artifactURL,
+            installationRoot: firstRoot
+        )
+        try Data([0x01]).write(to: firstPartial)
+
+        let writer = Process()
+        let writerInput = Pipe()
+        let writerOutput = Pipe()
+        writer.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        writer.arguments = [
+            "-c",
+            """
+            import os, sys
+            descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND)
+            print("open", flush=True)
+            os.read(0, 1)
+            os.write(descriptor, b"\\x02")
+            os.fsync(descriptor)
+            os.close(descriptor)
+            """,
+            firstPartial.path,
+        ]
+        writer.standardInput = writerInput
+        writer.standardOutput = writerOutput
+        writer.standardError = Pipe()
+        try writer.run()
+        XCTAssertEqual(
+            writerOutput.fileHandleForReading.readData(ofLength: 5),
+            Data("open\n".utf8)
+        )
+        var writerReleased = false
+        defer {
+            if !writerReleased {
+                try? writerInput.fileHandleForWriting.write(contentsOf: Data([1]))
+                try? writerInput.fileHandleForWriting.close()
+            }
+            if writer.isRunning { writer.waitUntilExit() }
+        }
+
+        _ = try manager.preparePartialDownload(
+            artifact: artifact,
+            url: artifactURL,
+            installationRoot: nextRoot
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstPartial.path))
+
+        try writerInput.fileHandleForWriting.write(contentsOf: Data([1]))
+        try writerInput.fileHandleForWriting.close()
+        writer.waitUntilExit()
+        writerReleased = true
+        XCTAssertEqual(writer.terminationStatus, 0)
+        if FileManager.default.fileExists(atPath: firstPartial.path) {
+            XCTAssertEqual(try Data(contentsOf: firstPartial), Data([0x01, 0x02]))
+        }
     }
 
     func testDiskPreflightCreditsOnlyReusablePartialBytes() throws {
@@ -1975,6 +3985,75 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destination), zipData)
     }
 
+    func testPartialResumeRejectsSymlinkAndHardLinkBeforeRequestOrVictimWrite() async throws {
+        enum AliasKind: CaseIterable { case symbolic, hard }
+        for kind in AliasKind.allCases {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let token = UUID().uuidString
+            let artifactURL = tokenizedURL("https://example.com/models.zip", token: token)
+            let prefix = Data("safe".utf8)
+            let zipData = prefix + Data("-bytes".utf8)
+            let zipHash = SHA256.hash(data: zipData)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            let artifact = testComponent(
+                name: "geometry-da3-base",
+                url: artifactURL.absoluteString,
+                sha256: zipHash,
+                sizeBytes: UInt64(zipData.count),
+                contents: ["model.safetensors"]
+            )
+            let manager = ToolchainManager(
+                runner: MockSubprocessRunner(scripts: []),
+                urlSession: makeSession()
+            )
+            let partialURL = try manager.preparePartialDownload(
+                artifact: artifact,
+                url: artifactURL,
+                installationRoot: root
+            )
+            let victim = root.appendingPathComponent("victim-\(kind)")
+            try prefix.write(to: victim)
+            switch kind {
+            case .symbolic:
+                try FileManager.default.createSymbolicLink(at: partialURL, withDestinationURL: victim)
+            case .hard:
+                XCTAssertEqual(Darwin.link(victim.path, partialURL.path), 0)
+            }
+            let requests = LockedCounter()
+            MockURLProtocol.register(token: token) { request in
+                _ = requests.increment()
+                let suffix = Data(zipData.dropFirst(prefix.count))
+                return (
+                    HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 206,
+                        httpVersion: nil,
+                        headerFields: [
+                            "Content-Range": "bytes \(prefix.count)-\(zipData.count - 1)/\(zipData.count)"
+                        ]
+                    )!,
+                    suffix
+                )
+            }
+
+            await XCTAssertThrowsErrorAsync({
+                try await manager.downloadVerifiedArtifact(
+                    artifact,
+                    from: artifactURL,
+                    to: root.appendingPathComponent("verified.zip"),
+                    installationRoot: root,
+                    label: "Downloading tools",
+                    onProgress: { _, _ in }
+                )
+            })
+            MockURLProtocol.unregister(token: token)
+            XCTAssertEqual(requests.current(), 0, "Unsafe \(kind) alias reached the network")
+            XCTAssertEqual(try Data(contentsOf: victim), prefix, "Unsafe \(kind) alias mutated its victim")
+        }
+    }
+
     func testCorruptPersistedFullDownloadIsReplacedWithoutAResumeRequest() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2076,6 +4155,76 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
 
         XCTAssertEqual(ranges.all(), ["bytes=4-", "none"])
+        XCTAssertEqual(try Data(contentsOf: destination), zipData)
+    }
+
+    func testRangeNotSatisfiableRetriesOnceImmediatelyWithoutRange() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = UUID().uuidString
+        let artifactURL = tokenizedURL("https://example.com/models.zip", token: token)
+        let zipData = Data("zip-bytes".utf8)
+        let zipHash = SHA256.hash(data: zipData).map { String(format: "%02x", $0) }.joined()
+        let artifact = testComponent(
+            name: "geometry-da3-base",
+            url: artifactURL.absoluteString,
+            sha256: zipHash,
+            sizeBytes: UInt64(zipData.count),
+            contents: ["model.safetensors"]
+        )
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+        let partialURL = try manager.preparePartialDownload(
+            artifact: artifact,
+            url: artifactURL,
+            installationRoot: root
+        )
+        try Data(zipData.prefix(4)).write(to: partialURL)
+        let ranges = LockedMessages()
+        let requests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            ranges.append(request.value(forHTTPHeaderField: "Range") ?? "none")
+            switch requests.increment() {
+            case 1:
+                return (
+                    HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 416,
+                        httpVersion: nil,
+                        headerFields: ["Content-Range": "bytes */\(zipData.count)"]
+                    )!,
+                    Data()
+                )
+            case 2:
+                return (
+                    HTTPURLResponse(
+                        url: request.url!,
+                        statusCode: 200,
+                        httpVersion: nil,
+                        headerFields: nil
+                    )!,
+                    zipData
+                )
+            default:
+                throw URLError(.badServerResponse)
+            }
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+
+        let destination = root.appendingPathComponent("verified.zip")
+        try await manager.downloadVerifiedArtifact(
+            artifact,
+            from: artifactURL,
+            to: destination,
+            installationRoot: root,
+            label: "Downloading tools",
+            onProgress: { _, _ in }
+        )
+
+        XCTAssertEqual(ranges.all(), ["bytes=4-", "none"])
+        XCTAssertEqual(requests.current(), 2)
         XCTAssertEqual(try Data(contentsOf: destination), zipData)
     }
 
@@ -2206,6 +4355,113 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         XCTAssertEqual(requestCounter.current(), 2)
     }
 
+    func testEnsureArtifactPreservesNonretryableHTTPStatusAndURL() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = UUID().uuidString
+        let artifactURL = tokenizedURL("https://example.com/missing.zip", token: token)
+        let requests = LockedCounter()
+        let artifact = testComponent(
+            name: "geometry-da3-base",
+            url: artifactURL.absoluteString,
+            sha256: String(repeating: "a", count: 64),
+            sizeBytes: 1,
+            contents: ["da3_mps/models/DA3-BASE/model.safetensors"]
+        )
+        MockURLProtocol.register(token: token) { request in
+            _ = requests.increment()
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await manager.test_ensureArtifact(artifact, root: root) { _, _ in }
+        }, errorHandler: { error in
+            guard case let ToolchainManager.ToolchainError.artifactHTTPFailure(statusCode, resourceURL) = error else {
+                return XCTFail("Expected artifactHTTPFailure, got \(error)")
+            }
+            XCTAssertEqual(statusCode, 404)
+            XCTAssertEqual(resourceURL, artifactURL)
+        })
+        XCTAssertEqual(requests.current(), 1)
+    }
+
+    func testEnsureArtifactRetriesTransientHTTPFailure() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let token = UUID().uuidString
+        let artifactURL = tokenizedURL("https://example.com/component.zip", token: token)
+        let zipData = Data("zip-bytes".utf8)
+        let zipHash = SHA256.hash(data: zipData).map { String(format: "%02x", $0) }.joined()
+        let requests = LockedCounter()
+        let relativePath = "da3_mps/models/DA3-BASE/model.safetensors"
+        let artifact = testComponent(
+            name: "geometry-da3-base",
+            url: artifactURL.absoluteString,
+            sha256: zipHash,
+            sizeBytes: UInt64(zipData.count),
+            contents: [relativePath]
+        )
+        MockURLProtocol.register(token: token) { request in
+            let attempt = requests.increment()
+            let statusCode = attempt == 1 ? 503 : 200
+            return (
+                HTTPURLResponse(url: request.url!, statusCode: statusCode, httpVersion: nil, headerFields: nil)!,
+                statusCode == 200 ? zipData : Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/usr/bin/unzip",
+                argsPrefix: ["-o"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { @Sendable _ in
+                    let expectedFile = root.appendingPathComponent(relativePath)
+                    try? FileManager.default.createDirectory(
+                        at: expectedFile.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    FileManager.default.createFile(atPath: expectedFile.path, contents: Data([0x00]))
+                }
+            )
+        ])
+        let manager = ToolchainManager(runner: runner, urlSession: makeSession())
+
+        try await manager.test_ensureArtifact(artifact, root: root) { _, _ in }
+
+        XCTAssertEqual(requests.current(), 2)
+    }
+
+    func testComponentTransferFallbackRejectsIntegrityAndPolicyFailures() {
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+        let rejected: [ToolchainManager.ToolchainError] = [
+            .invalidManifest,
+            .signatureFailed,
+            .hashMismatch,
+            .unzipFailed,
+            .invalidToolchain("fixture"),
+            .invalidArtifactURL("fixture"),
+        ]
+
+        for error in rejected {
+            XCTAssertFalse(
+                manager.shouldAttemptOfflineFallback(forComponentTransferError: error),
+                "Unsafe fallback accepted \(error)"
+            )
+        }
+    }
+
     private func testComponent(
         name: String,
         url: String,
@@ -2213,14 +4469,36 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         sizeBytes: UInt64,
         contents: [String]
     ) -> ToolchainManifest.Component {
-        ToolchainManifest.Component(
+        let fileHash = SHA256.hash(data: Data([0x00]))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        var closureHasher = SHA256()
+        closureHasher.update(data: Data("EasySplat expanded component closure v1\n".utf8))
+        for path in contents.sorted() {
+            closureHasher.update(data: Data(path.utf8))
+            closureHasher.update(data: Data([0]))
+            closureHasher.update(data: Data(String(0o644).utf8))
+            closureHasher.update(data: Data([0]))
+            closureHasher.update(data: Data("1".utf8))
+            closureHasher.update(data: Data([0]))
+            closureHasher.update(data: Data(fileHash.utf8))
+            closureHasher.update(data: Data([10]))
+        }
+        let closureHash = closureHasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return ToolchainManifest.Component(
             name: name,
             capabilities: ["test.component"],
             url: url,
             sha256: sha256,
             sizeBytes: sizeBytes,
+            expandedSizeBytes: UInt64(contents.count),
+            expandedClosureSHA256: closureHash,
             contents: contents,
-            criticalFileHashes: [:],
+            criticalFileHashes: Dictionary(
+                uniqueKeysWithValues: contents.map { ($0, fileHash) }
+            ),
             dependencies: [],
             requirement: .required
         )
@@ -2230,7 +4508,9 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         at root: URL,
         manager: ToolchainManager,
         additionalCoreFiles: [String: Data] = [:],
-        coreArchiveData: Data? = nil
+        coreArchiveData: Data? = nil,
+        version: String = "2.0.0",
+        signingKey: Curve25519.Signing.PrivateKey = .init()
     ) throws -> (fixture: ToolchainFixture, publicKey: String, manifest: ToolchainManifest) {
         let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
         for (relativePath, data) in additionalCoreFiles {
@@ -2242,16 +4522,21 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             try data.write(to: url)
         }
 
-        let coreContents = (Self.coreFixtureContents + Array(additionalCoreFiles.keys)).sorted()
+        let coreContents = Set(Self.coreFixtureContents).union(additionalCoreFiles.keys).sorted()
         let baseContents = Self.baseFixtureContents.sorted()
         let smallContents = Self.smallFixtureContents.sorted()
-        func hashes(for paths: [String]) throws -> [String: String] {
-            try Dictionary(uniqueKeysWithValues: paths.map { path in
-                (path, try manager.test_sha256Hex(url: root.appendingPathComponent(path)))
-            })
+        func expandedClosure(for paths: [String]) throws -> (
+            digest: String,
+            size: UInt64,
+            hashes: [String: String]
+        ) {
+            let evidence = try manager.test_expandedClosureEvidence(paths: paths, root: root)
+            return (evidence.sha256, evidence.sizeBytes, evidence.fileHashes)
         }
 
-        let coreCritical = ToolchainManager.criticalCoreFiles(in: coreContents).sorted()
+        let coreClosure = try expandedClosure(for: coreContents)
+        let baseClosure = try expandedClosure(for: baseContents)
+        let smallClosure = try expandedClosure(for: smallContents)
         let coreArchiveSHA = coreArchiveData.map {
             SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined()
         } ?? String(repeating: "a", count: 64)
@@ -2260,17 +4545,17 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             schemaVersion: 2,
             toolchainAPI: 2,
             keyID: "",
-            version: "2.0.0",
+            version: version,
             publishedAt: Date(timeIntervalSince1970: 0),
             appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
             components: [
-                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: coreArchiveSHA, sizeBytes: coreArchiveSize, contents: coreContents, criticalFileHashes: try hashes(for: coreCritical), dependencies: [], requirement: .required),
-                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: baseContents, criticalFileHashes: try hashes(for: baseContents), dependencies: ["macos-arm64-core"], requirement: .optional),
-                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallContents, criticalFileHashes: try hashes(for: smallContents), dependencies: ["geometry-da3-base"], requirement: .optional),
+                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: coreArchiveSHA, sizeBytes: coreArchiveSize, expandedSizeBytes: coreClosure.size, expandedClosureSHA256: coreClosure.digest, contents: coreContents, criticalFileHashes: coreClosure.hashes, dependencies: [], requirement: .required),
+                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, expandedSizeBytes: baseClosure.size, expandedClosureSHA256: baseClosure.digest, contents: baseContents, criticalFileHashes: baseClosure.hashes, dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, expandedSizeBytes: smallClosure.size, expandedClosureSHA256: smallClosure.digest, contents: smallContents, criticalFileHashes: smallClosure.hashes, dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
             signatureEd25519: ""
         )
-        let signed = try signedV2Manifest(unsigned)
+        let signed = try signedV2Manifest(unsigned, key: signingKey)
         try manager.saveInstallState(
             .init(
                 schemaVersion: 2,
@@ -2283,6 +4568,24 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             root: root
         )
         return (fixture, signed.publicKey, signed.manifest)
+    }
+
+    private func installStateData(exactly byteCount: Int) throws -> Data {
+        let empty = ToolchainManager.ToolchainInstallState(
+            installedArtifacts: ["macos-arm64-core": ""]
+        )
+        let emptyData = try JSONEncoder().encode(empty)
+        guard byteCount >= emptyData.count else {
+            throw NSError(domain: "ToolchainManagerDownloadTests", code: 1)
+        }
+        let state = ToolchainManager.ToolchainInstallState(
+            installedArtifacts: [
+                "macos-arm64-core": String(repeating: "a", count: byteCount - emptyData.count)
+            ]
+        )
+        let data = try JSONEncoder().encode(state)
+        XCTAssertEqual(data.count, byteCount)
+        return data
     }
 
     private func bootstrapArchiveInspectionScripts(
@@ -2307,17 +4610,24 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         ]
     }
 
-    private func validationScripts(for fixture: ToolchainFixture) -> [MockSubprocessRunner.Script] {
-        let msplat = fixture.root.appendingPathComponent("bin/easysplat-train")
+    private func validationScripts(
+        for fixture: ToolchainFixture,
+        installedAt installedRoot: URL? = nil
+    ) -> [MockSubprocessRunner.Script] {
+        let root = installedRoot ?? fixture.root
+        let colmap = root.appendingPathComponent("bin/colmap")
+        let da3Python = root.appendingPathComponent("da3_mps/python/bin/python3")
+        let da3SfmTool = root.appendingPathComponent("da3_mps/bin/easysplat_da3_sfm")
+        let msplat = root.appendingPathComponent("bin/easysplat-train")
         return [
             .init(
                 path: "/usr/bin/file",
-                argsPrefix: ["-b", fixture.colmap.path],
+                argsPrefix: ["-b", colmap.path],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
                 onRun: nil
             ),
             .init(
-                path: fixture.colmap.path,
+                path: colmap.path,
                 argsPrefix: ["help"],
                 result: .init(
                     exitCode: 0,
@@ -2328,7 +4638,18 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 onRun: nil
             ),
             .init(
-                path: fixture.colmap.path,
+                path: colmap.path,
+                argsPrefix: ["matches_importer", "-h"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: NativeColmapHelpFixture.matchesImporter,
+                    stderr: ""
+                ),
+                onRun: nil
+            ),
+            .init(
+                path: colmap.path,
                 argsPrefix: ["mapper", "-h"],
                 result: .init(
                     exitCode: 0,
@@ -2339,7 +4660,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 onRun: nil
             ),
             .init(
-                path: fixture.colmap.path,
+                path: colmap.path,
                 argsPrefix: ["local_vocab_retriever", "-h"],
                 result: .init(
                     exitCode: 0,
@@ -2351,12 +4672,12 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: "/usr/bin/file",
-                argsPrefix: ["-b", fixture.da3Python.path],
+                argsPrefix: ["-b", da3Python.path],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
                 onRun: nil
             ),
             .init(
-                path: fixture.da3SfmTool.path,
+                path: da3SfmTool.path,
                 argsPrefix: ["--help"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: nil
@@ -2517,8 +4838,10 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
     }
 
-    private func signedV2Manifest(_ unsigned: ToolchainManifest) throws -> (manifest: ToolchainManifest, publicKey: String, data: Data) {
-        let key = Curve25519.Signing.PrivateKey()
+    private func signedV2Manifest(
+        _ unsigned: ToolchainManifest,
+        key: Curve25519.Signing.PrivateKey = .init()
+    ) throws -> (manifest: ToolchainManifest, publicKey: String, data: Data) {
         let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
         var manifest = unsigned
         manifest.keyID = ToolchainManifest.keyID(publicKeyBase64: publicKey)!
@@ -2527,6 +4850,149 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
         return (manifest, publicKey, try encoder.encode(manifest))
+    }
+
+    private func expectedNativeTrainerBuildDigest(root: URL) throws -> String {
+        var hasher = SHA256()
+        hasher.update(data: Data("EasySplat file digest v1".utf8))
+        for name in ["easysplat-train", "default.metallib"] {
+            let bytes = try Data(contentsOf: root.appendingPathComponent("bin/\(name)"))
+            var nameLength = UInt64(name.utf8.count).bigEndian
+            withUnsafeBytes(of: &nameLength) { hasher.update(bufferPointer: $0) }
+            hasher.update(data: Data(name.utf8))
+            var byteCount = UInt64(bytes.count).bigEndian
+            withUnsafeBytes(of: &byteCount) { hasher.update(bufferPointer: $0) }
+            hasher.update(data: bytes)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private enum BundledConflictPath {
+        case bundledOnly
+        case offlineFallback
+    }
+
+    private func assertConflictingBundledBootstrapIsRejected(
+        _ path: BundledConflictPath
+    ) async throws {
+        let temporaryRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: temporaryRoot) }
+        let installationRoot = temporaryRoot.appendingPathComponent("install", isDirectory: true)
+        let canonicalRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let bundleSourceRoot = temporaryRoot.appendingPathComponent("bundle-source", isDirectory: true)
+        let bootstrapManifestURL = temporaryRoot.appendingPathComponent("bootstrap-manifest.json")
+        let bootstrapArchiveURL = temporaryRoot.appendingPathComponent("bootstrap-core.zip")
+        let archiveData = Data("conflicting bundled core archive".utf8)
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let fixtureManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot
+        )
+        let installed = try makeSignedCachedFixture(
+            at: canonicalRoot,
+            manager: fixtureManager,
+            version: "2.0.0+installed",
+            signingKey: signingKey
+        )
+        let bundled = try makeSignedCachedFixture(
+            at: bundleSourceRoot,
+            manager: fixtureManager,
+            coreArchiveData: archiveData,
+            version: "2.0.0+bundle",
+            signingKey: signingKey
+        )
+        XCTAssertNotEqual(
+            installed.manifest.signatureEd25519,
+            bundled.manifest.signatureEd25519
+        )
+        try FileManager.default.removeItem(at: installed.fixture.colmap)
+        let receipt = canonicalRoot.appendingPathComponent(ToolchainManager.installStateFilename)
+        let receiptBefore = try Data(contentsOf: receipt)
+        var receiptStatusBefore = stat()
+        XCTAssertEqual(lstat(receipt.path, &receiptStatusBefore), 0)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(bundled.manifest).write(to: bootstrapManifestURL)
+        try archiveData.write(to: bootstrapArchiveURL)
+
+        let extractions = LockedCounter()
+        let extraction = MockSubprocessRunner.Script(
+            path: "/usr/bin/unzip",
+            argsPrefix: ["-o", bootstrapArchiveURL.path, "-d"],
+            result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+            onRun: { arguments in
+                _ = extractions.increment()
+                let destination = URL(fileURLWithPath: arguments[3], isDirectory: true)
+                for relativePath in Self.coreFixtureContents {
+                    let source = bundled.fixture.root.appendingPathComponent(relativePath)
+                    let target = destination.appendingPathComponent(relativePath)
+                    try FileManager.default.createDirectory(
+                        at: target.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    try FileManager.default.copyItem(at: source, to: target)
+                }
+            }
+        )
+        let runner = MockSubprocessRunner(
+            scripts: bootstrapArchiveInspectionScripts(contents: Self.coreFixtureContents)
+                + bootstrapArchiveInspectionScripts(contents: Self.coreFixtureContents)
+                + [extraction]
+                + validationScripts(for: bundled.fixture, installedAt: canonicalRoot)
+        )
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        let manifestRequests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            _ = manifestRequests.increment()
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 404,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+        let manager = ToolchainManager(
+            runner: runner,
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: installationRoot,
+            bundledBootstrap: .init(
+                manifestURL: bootstrapManifestURL,
+                coreArchiveURL: bootstrapArchiveURL
+            ),
+            sourcePolicy: path == .bundledOnly ? .bundledBootstrapOnly : .automatic
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: manifestURL,
+                publicKeyBase64: bundled.publicKey,
+                request: .init(capabilities: [.core, .colmap, .msplat]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected immutable bundled publication conflict, got \(error)")
+            }
+            XCTAssertTrue(message.contains("conflicts with its authenticated immutable manifest"))
+        })
+        XCTAssertEqual(extractions.current(), 0)
+        XCTAssertEqual(manifestRequests.current(), path == .bundledOnly ? 0 : 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installed.fixture.colmap.path))
+        XCTAssertEqual(try Data(contentsOf: receipt), receiptBefore)
+        var receiptStatusAfter = stat()
+        XCTAssertEqual(lstat(receipt.path, &receiptStatusAfter), 0)
+        XCTAssertEqual(receiptStatusAfter.st_dev, receiptStatusBefore.st_dev)
+        XCTAssertEqual(receiptStatusAfter.st_ino, receiptStatusBefore.st_ino)
     }
 
     private func makeSession() -> URLSession {
@@ -2541,6 +5007,35 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         items.append(URLQueryItem(name: "easysplat_test_token", value: token))
         components.queryItems = items
         return components.url!
+    }
+
+    private func canonicalFileSystemPath(_ url: URL) throws -> String {
+        guard let canonicalPath = realpath(url.path, nil) else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        defer { free(canonicalPath) }
+        return String(cString: canonicalPath)
+    }
+}
+
+private actor ToolchainInstallLockGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume()
+        }
     }
 }
 

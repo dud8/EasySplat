@@ -7,22 +7,39 @@ struct ViewerView: View {
     let onNewSplat: () -> Void
 
     @EnvironmentObject private var model: AppModel
+    @StateObject private var artifactLoader = ViewerArtifactLoader<ProjectArtifactSnapshot>()
     @State private var isInspectorPresented = true
     @State private var isTechnicalExpanded = false
     @State private var resetCameraToken = 0
-    @State private var metadata: ProjectMetadata?
+    @State private var artifactSnapshot: ProjectArtifactSnapshot?
     @State private var loadedMetadataProjectURL: URL?
+    @State private var artifactLoadError: String?
     @State private var viewerAlert: ViewerAlert?
     @State private var isExporting = false
 
     var body: some View {
         Group {
-            if let plyURL = model.outputPlyURL {
-                if loadedMetadataProjectURL == model.currentProjectURL?.standardizedFileURL {
+            if let plyURL = model.outputPlyURL,
+               let projectURL = model.currentProjectURL {
+                if let artifactLoadError {
+                    ContentUnavailableView(
+                        "Splat unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(artifactLoadError)
+                    )
+                } else if loadedMetadataProjectURL == model.currentProjectURL?.standardizedFileURL,
+                          artifactSnapshot != nil {
                     SplatViewerView(
                         splatURL: plyURL,
                         resetCameraToken: resetCameraToken,
                         sceneConfiguration: viewerSceneConfiguration,
+                        onLoadStateChanged: { state in
+                            guard state == .ready else { return }
+                            model.resultViewerDidBecomeReady(
+                                projectURL: projectURL,
+                                outputURL: plyURL
+                            )
+                        },
                         overlayDensity: .compact
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -52,12 +69,10 @@ struct ViewerView: View {
                 dismissButton: .default(Text("OK"))
             )
         }
-        .onAppear(perform: loadMetadata)
-        .onChange(of: model.currentProjectURL) { _, _ in loadMetadata() }
-        .task(id: model.outputPlyURL) {
-            guard model.outputPlyURL != nil else { return }
-            await model.prepareCurrentSplatForSharing()
-        }
+        .onAppear { requestArtifactLoad() }
+        .onChange(of: model.currentProjectURL) { _, _ in requestArtifactLoad() }
+        .onChange(of: model.outputPlyURL) { _, _ in requestArtifactLoad() }
+        .onDisappear { artifactLoader.cancel() }
     }
 
     @ToolbarContentBuilder
@@ -78,10 +93,17 @@ struct ViewerView: View {
 
             ShareToolbarButton(
                 isEnabled: model.outputPlyURL != nil
-                    && model.isShareReady
+                    && !model.isPreparingShare
                     && !model.isShareSheetActive
             ) { sourceView in
-                model.presentPreparedShare(from: sourceView)
+                model.requestCurrentSplatShare(from: sourceView)
+            }
+
+            if model.isPreparingShare {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("Preparing splat for sharing")
+                    .accessibilityIdentifier("result.shareProgress")
             }
 
             Button {
@@ -103,11 +125,11 @@ struct ViewerView: View {
                 }
                 .disabled(model.outputPlyURL == nil)
 
-                if Self.offersUprightFlip(for: metadata?.geometryArtifact) {
+                if Self.offersUprightFlip(for: artifactSnapshot?.geometryArtifact) {
                     Toggle(
                         "Flip Upright",
                         isOn: Binding(
-                            get: { metadata?.viewerPreferences.isUprightFlipActive == true },
+                            get: { artifactSnapshot?.viewerPreferences.isUprightFlipActive == true },
                             set: { isActive in updateUprightFlip(isActive) }
                         )
                     )
@@ -151,6 +173,7 @@ struct ViewerView: View {
             }
             .padding(Theme.Spacing.large)
         }
+        .accessibilityIdentifier("result.inspectorContent")
     }
 
     private var outputSection: some View {
@@ -219,13 +242,13 @@ struct ViewerView: View {
             Text("Reconstruction")
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
-            if let geometry = metadata?.geometryArtifact {
+            if let geometry = artifactSnapshot?.geometryArtifact {
                 LabeledContent(
                     "Registered",
                     value: "\(geometry.registeredViewCount) of \(geometry.totalViewCount)"
                 )
                 LabeledContent("Points", value: geometry.pointCount.formatted())
-                LabeledContent("Observations", value: geometry.trackCount.formatted())
+                LabeledContent("Observations", value: geometry.observationCount.formatted())
                 LabeledContent(
                     "Median residual",
                     value: geometry.medianPixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
@@ -234,23 +257,6 @@ struct ViewerView: View {
                     "P90 residual",
                     value: geometry.p90PixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
                 )
-            } else if let summary = model.currentReconstruction {
-                LabeledContent(
-                    "Registered",
-                    value: "\(summary.registeredImages) of \(summary.totalImages)"
-                )
-                if let points = summary.pointCountText {
-                    LabeledContent("Points", value: points)
-                }
-                if let observations = summary.observationCountText {
-                    LabeledContent("Observations", value: observations)
-                }
-                if let trackLength = summary.meanTrackLengthText {
-                    LabeledContent("Track length", value: trackLength)
-                }
-                if let residual = summary.meanReprojectionErrorText {
-                    LabeledContent("Mean residual", value: residual)
-                }
             } else {
                 Text("No reconstruction measurements were recorded.")
                     .font(.caption)
@@ -264,14 +270,20 @@ struct ViewerView: View {
             Text("Timing")
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
-            if let total = model.currentStageTimings.totalDurationSeconds {
+            if let total = Self.totalDurationSeconds(
+                createToViewerReadySeconds: model.currentCreateToViewerReadySeconds,
+                stageTimings: model.currentStageTimings
+            ) {
                 LabeledContent("Total", value: StageTimingDisplay.formatDuration(seconds: total))
             }
             timingRow("Prepare", stages: [.importInput, .extractFrames, .selectFrames])
             timingRow("Reconstruct", stages: [.sfmFeatures, .sfmMatching, .sfmMapping])
             timingRow("Train", stages: [.trainSplat])
             timingRow("Finish", stages: [.exportSplat, .done])
-            if model.currentStageTimings.isEmpty {
+            if Self.totalDurationSeconds(
+                createToViewerReadySeconds: model.currentCreateToViewerReadySeconds,
+                stageTimings: model.currentStageTimings
+            ) == nil {
                 Text("No timing measurements were recorded.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -304,6 +316,7 @@ struct ViewerView: View {
                     .stroke(Theme.border)
             }
             .accessibilityLabel("Project notes")
+            .accessibilityIdentifier("result.notes")
             notesSaveStatus
         }
     }
@@ -334,7 +347,7 @@ struct ViewerView: View {
     private var technicalSection: some View {
         DisclosureGroup(isExpanded: $isTechnicalExpanded) {
             VStack(alignment: .leading, spacing: Theme.Spacing.small) {
-                if let geometry = metadata?.geometryArtifact {
+                if let geometry = artifactSnapshot?.geometryArtifact {
                     LabeledContent("Solver", value: geometry.solverVersion)
                     LabeledContent("Model", value: geometry.modelVersion)
                     LabeledContent("Camera", value: geometry.cameraModel)
@@ -342,17 +355,15 @@ struct ViewerView: View {
                     if geometry.canonicalOrientation.status == .unresolved {
                         LabeledContent("Upright", value: "Not determined")
                     }
-                } else if let reconstruction = model.currentReconstruction {
-                    LabeledContent("Solver", value: reconstruction.displayMapper)
                 }
-                if let trainer = metadata?.trainingArtifact {
+                if let trainer = artifactSnapshot?.trainingArtifact {
                     LabeledContent("Trainer", value: trainer.trainerVersion)
                     LabeledContent("Iterations", value: trainer.completedIteration.formatted())
                 }
                 if let format = model.currentOutputPlyInfo?.formatLabel {
                     LabeledContent("Format", value: format)
                 }
-                if let relativePath = metadata?.outputs?.splatPlyPath {
+                if let relativePath = artifactSnapshot?.trainingArtifact?.outputPath {
                     LabeledContent("Project path") {
                         Text(relativePath)
                             .lineLimit(2)
@@ -382,8 +393,15 @@ struct ViewerView: View {
         return matching.reduce(0) { $0 + $1.durationSeconds }
     }
 
+    nonisolated static func totalDurationSeconds(
+        createToViewerReadySeconds: TimeInterval?,
+        stageTimings: [StageTimingRecord]
+    ) -> TimeInterval? {
+        createToViewerReadySeconds ?? stageTimings.totalDurationSeconds
+    }
+
     private var displayedRunOptions: RequestedRunOptions {
-        metadata?.requestedRunOptions
+        artifactSnapshot?.metadata.requestedRunOptions
             ?? model.currentRunOptions
             ?? RequestedRunOptions()
     }
@@ -395,19 +413,64 @@ struct ViewerView: View {
            }) {
             return summary.title
         }
-        if let title = metadata?.title, !title.isEmpty { return title }
+        if let title = artifactSnapshot?.metadata.title, !title.isEmpty { return title }
         guard let projectURL = model.currentProjectURL else { return "Result" }
         return projectURL.deletingPathExtension().lastPathComponent
     }
 
-    private func loadMetadata() {
-        guard let projectURL = model.currentProjectURL else {
-            metadata = nil
+    private func requestArtifactLoad(
+        preservingCurrentSnapshot: Bool = false,
+        failurePresentation: ArtifactLoadFailurePresentation = .workspace
+    ) {
+        guard let projectURL = model.currentProjectURL,
+              let outputURL = model.outputPlyURL else {
+            artifactLoader.cancel()
+            artifactSnapshot = nil
             loadedMetadataProjectURL = nil
+            artifactLoadError = nil
             return
         }
-        metadata = try? ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
-        loadedMetadataProjectURL = projectURL.standardizedFileURL
+
+        if !preservingCurrentSnapshot {
+            artifactSnapshot = nil
+            loadedMetadataProjectURL = nil
+            artifactLoadError = nil
+            viewerAlert = nil
+        }
+
+        let request = ViewerArtifactLoadRequest(
+            projectURL: projectURL,
+            outputURL: outputURL
+        )
+        artifactLoader.load(
+            request,
+            operation: { projectURL in
+                try ProjectArtifactSnapshotStore.load(projectURL: projectURL)
+            }
+        ) { request, outcome in
+            guard ProjectSummary.hasSameLocation(model.currentProjectURL, request.projectURL),
+                  ProjectSummary.hasSameLocation(model.outputPlyURL, request.outputURL) else {
+                return
+            }
+
+            switch outcome {
+            case .success(let snapshot):
+                artifactSnapshot = snapshot
+                loadedMetadataProjectURL = request.projectURL
+                artifactLoadError = nil
+            case .failure(let message):
+                if failurePresentation == .alert {
+                    viewerAlert = ViewerAlert(
+                        title: "Couldn’t update view",
+                        message: message
+                    )
+                } else {
+                    artifactSnapshot = nil
+                    loadedMetadataProjectURL = nil
+                    artifactLoadError = "The project artifacts could not be verified."
+                }
+            }
+        }
     }
 
     private func presentExportPanel() {
@@ -454,9 +517,7 @@ struct ViewerView: View {
                 Task { @MainActor in
                     defer { isExporting = false }
                     do {
-                        try await Task.detached(priority: .userInitiated) {
-                            try AppModel.exportValidatedSplat(from: source, to: destination)
-                        }.value
+                        try await model.exportCurrentSplat(to: destination)
                     } catch {
                         viewerAlert = ViewerAlert(
                             title: "Couldn’t export splat",
@@ -476,43 +537,42 @@ struct ViewerView: View {
     }
 
     private var viewerSceneConfiguration: SplatViewerSceneConfiguration {
-        let storedBounds = metadata?.trainingArtifact?.sceneBounds
-        let bounds = storedBounds.flatMap { stored -> ViewerSceneBounds? in
+        let storedBounds = artifactSnapshot?.trainingArtifact?.sceneBounds
+        let bounds = storedBounds.map { stored in
             let center = SIMD3<Float>(
                 Float(stored.center.x),
                 Float(stored.center.y),
                 Float(stored.center.z)
             )
             let radius = Float(stored.radius)
-            guard center.x.isFinite,
-                  center.y.isFinite,
-                  center.z.isFinite,
-                  radius.isFinite,
-                  radius > 0 else { return nil }
             return ViewerSceneBounds(center: center, radius: radius)
         }
-        let storedDirection = metadata?.geometryArtifact?
+        let storedDirection = artifactSnapshot?.geometryArtifact?
             .canonicalOrientation.canonicalOpeningViewDirection
         let openingDirection = storedDirection.map {
             SIMD3<Float>(Float($0.x), Float($0.y), Float($0.z))
         }
-        let canFlip = metadata?.geometryArtifact?.allowsViewOnlyUprightFlip == true
+        let canFlip = artifactSnapshot?.geometryArtifact?.allowsViewOnlyUprightFlip == true
         return SplatViewerSceneConfiguration(
             bounds: bounds,
             openingDirection: openingDirection,
             isViewOnlyFlipActive: canFlip
-                && metadata?.viewerPreferences.isUprightFlipActive == true
+                && artifactSnapshot?.viewerPreferences.isUprightFlipActive == true
         )
     }
 
     private func updateUprightFlip(_ isActive: Bool) {
         guard let projectURL = model.currentProjectURL else { return }
         do {
-            metadata = try ProjectMetadataStore.update(
+            _ = try ProjectMetadataStore.update(
                 at: ProjectPaths(root: projectURL).metadataURL
             ) { metadata in
                 metadata.viewerPreferences.isUprightFlipActive = isActive
             }
+            requestArtifactLoad(
+                preservingCurrentSnapshot: true,
+                failurePresentation: .alert
+            )
         } catch {
             viewerAlert = ViewerAlert(
                 title: "Couldn’t update view",
@@ -601,4 +661,9 @@ private struct ViewerAlert: Identifiable {
     let id = UUID()
     let title: String
     let message: String
+}
+
+private enum ArtifactLoadFailurePresentation {
+    case workspace
+    case alert
 }

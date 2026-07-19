@@ -65,6 +65,73 @@ final class FrameExtractorMediaTests: XCTestCase {
         )
     }
 
+    func testRecordedOriginsRederiveExactSourceSamplesAndRejectForgedTime() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let videoURL = root.appendingPathComponent("fixture.mov")
+        let originalDirectory = root.appendingPathComponent("original", isDirectory: true)
+        let reproducedDirectory = root.appendingPathComponent("reproduced", isDirectory: true)
+        let forgedDirectory = root.appendingPathComponent("forged", isDirectory: true)
+        _ = try await writeFixture(to: videoURL)
+
+        let extractor = FrameExtractor()
+        let options = FrameExtractionOptions(
+            targetCount: 4,
+            maxDimension: 128,
+            targetFPS: 4,
+            minDistanceRatio: 0,
+            outputFormat: .png
+        )
+        let analysis = try await extractor.analyze(
+            videoURL,
+            options: options,
+            progress: { _, _ in }
+        )
+        let original = try await extractor.extractFrameOutputs(
+            from: analysis,
+            targetCount: options.targetCount,
+            to: originalDirectory,
+            options: options,
+            progress: { _, _ in }
+        )
+        let origins = original.map(\.origin)
+        XCTAssertTrue(origins.allSatisfy(\.isValidEvidence))
+
+        let reproduced = try await extractor.reextractRecordedFrames(
+            from: videoURL,
+            origins: origins,
+            to: reproducedDirectory,
+            options: options
+        )
+        XCTAssertEqual(reproduced.outputs.map(\.origin), origins)
+        for (expected, actual) in zip(original, reproduced.outputs) {
+            XCTAssertEqual(try Data(contentsOf: actual.url), try Data(contentsOf: expected.url))
+        }
+
+        let first = try XCTUnwrap(origins.first)
+        let firstTime = try XCTUnwrap(first.presentationTime)
+        let forgedTime = CMTimeAdd(firstTime, CMTime(value: 1, timescale: firstTime.timescale))
+        var forgedOrigins = origins
+        forgedOrigins[0] = VideoFrameOrigin(
+            decodedFrameIndex: first.decodedFrameIndex,
+            timestampSeconds: CMTimeGetSeconds(forgedTime),
+            presentationTimeValue: forgedTime.value,
+            presentationTimeTimescale: forgedTime.timescale,
+            timestampWasRepaired: false
+        )
+        do {
+            _ = try await extractor.reextractRecordedFrames(
+                from: videoURL,
+                origins: forgedOrigins,
+                to: forgedDirectory,
+                options: options
+            )
+            XCTFail("A forged presentation time must not authenticate a decoded frame index.")
+        } catch FrameExtractor.ExtractionError.extractionFailed {
+            // Expected: the decode index and exact presentation time must name one sample.
+        }
+    }
+
     func testSparseDecodeMatchesSequentialDecodeForClusteredVariableFrameTimes() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -145,13 +212,18 @@ final class FrameExtractorMediaTests: XCTestCase {
         let sparseOutput = root.appendingPathComponent("sparse-gop", isDirectory: true)
         let sequentialOutput = root.appendingPathComponent("sequential-gop", isDirectory: true)
         let times = (0..<60).map { Double($0) / 30 }
-        try await TestVideoBuilder.writeH264(
-            to: videoURL,
-            times: times,
-            levels: times.indices.map { UInt8(96 + $0 % 12) },
-            expectedFrameRate: 30,
-            keyFrameInterval: 30
-        )
+        do {
+            try await TestVideoBuilder.writeH264(
+                to: videoURL,
+                times: times,
+                levels: times.indices.map { UInt8(96 + $0 % 12) },
+                expectedFrameRate: 30,
+                keyFrameInterval: 30,
+                requireH264: true
+            )
+        } catch TestVideoBuilder.FixtureError.unsupportedCodec(let reason) {
+            throw XCTSkip(reason)
+        }
         let nonSyncTimes = try await nonSyncSampleTimes(in: videoURL)
         XCTAssertGreaterThan(nonSyncTimes.count, 40)
 
@@ -242,15 +314,19 @@ final class FrameExtractorMediaTests: XCTestCase {
             isDirectory: true
         )
         let times = (0..<60).map { Double($0) / 30 }
-        try await TestVideoBuilder.writeH264(
-            to: videoURL,
-            times: times,
-            levels: times.indices.map { UInt8(48 + $0 % 160) },
-            width: 320,
-            height: 240,
-            expectedFrameRate: 30,
-            keyFrameInterval: 30
-        )
+        do {
+            try await TestVideoBuilder.writeH264(
+                to: videoURL,
+                times: times,
+                levels: times.indices.map { UInt8(48 + $0 % 160) },
+                width: 320,
+                height: 240,
+                expectedFrameRate: 30,
+                keyFrameInterval: 30
+            )
+        } catch TestVideoBuilder.FixtureError.unsupportedCodec(let reason) {
+            throw XCTSkip(reason)
+        }
         let extractor = FrameExtractor()
         let options = FrameExtractionOptions(
             targetCount: 60,
@@ -420,7 +496,7 @@ final class FrameExtractorMediaTests: XCTestCase {
         XCTAssertLessThan(meanLuma(image), 254)
     }
 
-    func testSparseMissFallsBackWithoutPublishingPartialFrames() async throws {
+    func testMismatchedSparseOriginFailsWithoutPublishingPartialFrames() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let videoURL = root.appendingPathComponent("fixture.mov")
@@ -456,30 +532,33 @@ final class FrameExtractorMediaTests: XCTestCase {
         )
 
         let progress = FrameProgressRecorder()
-        let frames = try await extractor.extractFrames(
-            from: forcedMiss,
-            targetCount: 5,
-            to: output,
-            options: options,
-            progress: { fraction, _ in
-                progress.append(
-                    fraction: fraction,
-                    destinationStillPresent: FileManager.default.fileExists(
-                        atPath: sentinel.path
+        do {
+            _ = try await extractor.extractFrames(
+                from: forcedMiss,
+                targetCount: 5,
+                to: output,
+                options: options,
+                progress: { fraction, _ in
+                    progress.append(
+                        fraction: fraction,
+                        destinationStillPresent: FileManager.default.fileExists(
+                            atPath: sentinel.path
+                        )
                     )
-                )
-            }
-        )
+                }
+            )
+            XCTFail("A presentation time that names a different sample must fail.")
+        } catch FrameExtractor.ExtractionError.extractionFailed {
+            // Expected: sequential fallback cannot authenticate the forged time either.
+        }
 
-        XCTAssertEqual(frames.count, 5)
-        XCTAssertTrue(frames.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
         let observations = progress.observations
         XCTAssertTrue(zip(observations, observations.dropFirst()).allSatisfy {
             $1.fraction >= $0.fraction
         })
         XCTAssertTrue(observations.contains { $0.fraction > 0 && $0.fraction < 0.2 })
         XCTAssertTrue(observations.filter { $0.fraction < 1 }.allSatisfy(\.destinationStillPresent))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
         let siblings = try FileManager.default.contentsOfDirectory(
             at: output.deletingLastPathComponent(),
             includingPropertiesForKeys: nil
@@ -549,22 +628,26 @@ final class FrameExtractorMediaTests: XCTestCase {
         let width = 64
         let height = 48
         let levels = (0..<fixtureTimes.count).map { UInt8(32 + 26 * $0) }
-        try await TestVideoBuilder.writeH264(
-            to: url,
-            times: fixtureTimes,
-            levels: levels,
-            width: width,
-            height: height,
-            expectedFrameRate: 4,
-            transform: CGAffineTransform(
-                a: 0,
-                b: 1,
-                c: -1,
-                d: 0,
-                tx: CGFloat(height),
-                ty: 0
+        do {
+            try await TestVideoBuilder.writeH264(
+                to: url,
+                times: fixtureTimes,
+                levels: levels,
+                width: width,
+                height: height,
+                expectedFrameRate: 4,
+                transform: CGAffineTransform(
+                    a: 0,
+                    b: 1,
+                    c: -1,
+                    d: 0,
+                    tx: CGFloat(height),
+                    ty: 0
+                )
             )
-        )
+        } catch TestVideoBuilder.FixtureError.unsupportedCodec(let reason) {
+            throw XCTSkip(reason)
+        }
         return levels
     }
 

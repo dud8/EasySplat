@@ -53,6 +53,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .normal,
             activePlan: plans.source,
             attempts: [makeAttempt(
@@ -80,7 +81,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let plans = try makePlans()
-        let normalAttempt = makeAttempt(
+        var normalAttempt = makeAttempt(
             number: 1,
             matcher: .faiss,
             recoveryLevel: .normal,
@@ -88,13 +89,21 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             plan: plans.sparse,
             duration: 1.25
         )
+        normalAttempt.retrieval = makeRetrievalEvidence(directedPairLines: [])
+        normalAttempt.retrievalWasExecuted = true
+        let activeRetrieval = makeRetrievalEvidence(
+            directedPairLines: ["a.jpg d.jpg"]
+        )
         let state = PairGraphRecoveryState(
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
+            pairingPolicy: .orderedOrbit,
             mode: .policy,
             activeRecoveryLevel: .expanded,
             activePlan: plans.source,
+            activeRetrieval: activeRetrieval,
             attempts: [normalAttempt],
+            retrievalWasScheduled: true,
             usedLocalVocabularyRetrieval: true,
             matchingDurationSeconds: 1.25,
             fallbackReasons: ["Reconstruction coverage was below the acceptance gate"]
@@ -114,8 +123,337 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(restored.mode, .policy)
         XCTAssertEqual(restored.recoveryLevel, .expanded)
         XCTAssertEqual(restored.activePlan, plans.source)
+        XCTAssertEqual(restored.activeRetrieval, activeRetrieval)
         XCTAssertEqual(restored.attempts, [normalAttempt])
+        XCTAssertTrue(restored.retrievalWasScheduled)
         XCTAssertTrue(restored.usedLocalVocabularyRetrieval)
+    }
+
+    func testRecoveryRejectsACompletedRetrievalRequestWithAnExplicitZeroOutcome() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        var attempt = makeAttempt(
+            number: 1,
+            matcher: .faiss,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            plan: plans.source,
+            duration: 1
+        )
+        attempt.retrieval = makeRetrievalEvidence(directedPairLines: [])
+        attempt.retrievalWasExecuted = true
+        let activeRetrieval = makeRetrievalEvidence(
+            directedPairLines: [],
+            explicitZero: true
+        )
+        let state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            pairingPolicy: .orderedOrbit,
+            mode: .policy,
+            activeRecoveryLevel: .normal,
+            activePlan: plans.source,
+            activeRetrieval: activeRetrieval,
+            attempts: [attempt],
+            retrievalWasScheduled: true,
+            usedLocalVocabularyRetrieval: true,
+            matchingDurationSeconds: 1,
+            fallbackReasons: []
+        )
+
+        XCTAssertThrowsError(try PairGraphRecoveryStore.save(
+            state,
+            to: fixture.paths.pairGraphRecoveryURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testInitialVocabularyScheduleIsDurableBeforeTheFirstInvocation() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        let state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            pairingPolicy: .orderedOrbit,
+            mode: .policy,
+            phase: .preparing,
+            activeRecoveryLevel: .normal,
+            activePlan: plans.source,
+            attempts: [],
+            retrievalWasScheduled: true,
+            usedLocalVocabularyRetrieval: false,
+            matchingDurationSeconds: 0,
+            fallbackReasons: []
+        )
+
+        try PairGraphRecoveryStore.save(
+            state,
+            to: fixture.paths.pairGraphRecoveryURL,
+            projectPaths: fixture.paths
+        )
+        let restored = try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: plans.source.imageNames,
+            projectPaths: fixture.paths
+        ).restoredRecovery()
+
+        XCTAssertEqual(restored.phase, .preparing)
+        XCTAssertEqual(restored.attempts, [])
+        XCTAssertTrue(restored.retrievalWasScheduled)
+        XCTAssertFalse(restored.usedLocalVocabularyRetrieval)
+    }
+
+    func testAutomaticMultiVideoCrossClipRequirementIsDurableAndAuthenticated() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let crossClipPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .automatic),
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        XCTAssertEqual(crossClipPlan.pairingPolicy, .segmentedMixed)
+        XCTAssertTrue(crossClipPlan.requiresCrossClipRetrieval)
+        let groups = [
+            ColmapPairGroup(imageNames: ["a.jpg", "b.jpg"], isVideo: true),
+            ColmapPairGroup(imageNames: ["c.jpg", "d.jpg"], isVideo: true),
+        ]
+        var state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            groups: groups,
+            pairingPolicy: crossClipPlan.pairingPolicy,
+            planBinding: PairGraphPlanBinding(crossClipPlan),
+            mode: .policy,
+            phase: .preparing,
+            activeRecoveryLevel: .normal,
+            activePlan: plans.source,
+            attempts: [],
+            retrievalWasScheduled: true,
+            usedLocalVocabularyRetrieval: false,
+            matchingDurationSeconds: 0,
+            fallbackReasons: []
+        )
+
+        try save(state, fixture: fixture)
+        let restored = try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: plans.source.imageNames,
+            expectedGroups: groups,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(restored.groups, groups)
+        XCTAssertTrue(restored.planBinding.requiresCrossClipRetrieval)
+        XCTAssertTrue(restored.retrievalWasScheduled)
+
+        let singleClipPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: .video(files: ["/tmp/one.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        state.planBinding = PairGraphPlanBinding(singleClipPlan)
+        XCTAssertThrowsError(try save(state, fixture: fixture))
+    }
+
+    func testShortCrossClipMatchingRecoveryPreservesRetrievalAcrossEscalation() throws {
+        let firstClip = (0..<17).map { "a_\($0).jpg" }
+        let secondClip = (0..<3).map { "b_\($0).jpg" }
+        let imageNames = firstClip + secondClip
+        let fixture = try makeProject(imageNames: imageNames)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let crossClipPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        let groups = [
+            ColmapPairGroup(imageNames: firstClip, isVideo: true),
+            ColmapPairGroup(imageNames: secondClip, isVideo: true),
+        ]
+        let retrievalLines = [
+            "a_0.jpg b_0.jpg",
+            "a_10.jpg b_1.jpg",
+            "b_0.jpg a_1.jpg",
+        ]
+        let groupContract = try XCTUnwrap(
+            PipelineRunner.vocabularyRetrievalImageGroupContract(
+                imageNames: imageNames,
+                groups: groups,
+                requiresCrossClipRetrieval: true
+            )
+        )
+        let retrieval = PairGraphRetrievalAttemptEvidence(
+            engine: crossClipPlan.retrievalEngine,
+            queryImageNames: ["a_0.jpg", "a_10.jpg", "b_0.jpg"],
+            queryStride: crossClipPlan.retrievalQueryStride,
+            candidateCount: crossClipPlan.retrievalCandidateCount,
+            returnedNeighborCount: crossClipPlan.retrievalNeighborCount,
+            minimumFrameSeparation: 0,
+            candidatePolicy: groupContract.policy,
+            imageGroupListDigest: groupContract.digest,
+            imageGroupLines: groupContract.canonicalLines,
+            queryOutcomes: [
+                PairGraphRetrievalQueryOutcome(
+                    queryImageName: "a_0.jpg",
+                    status: .ranked,
+                    rankedNeighborImageNames: ["b_0.jpg"]
+                ),
+                PairGraphRetrievalQueryOutcome(
+                    queryImageName: "a_10.jpg",
+                    status: .ranked,
+                    rankedNeighborImageNames: ["b_1.jpg"]
+                ),
+                PairGraphRetrievalQueryOutcome(
+                    queryImageName: "b_0.jpg",
+                    status: .ranked,
+                    rankedNeighborImageNames: ["a_1.jpg"]
+                ),
+            ],
+            directedPairLines: retrievalLines
+        )
+        let basePlan = try PipelineRunner.baseColmapPairPlan(
+            imageNames: imageNames,
+            groups: groups,
+            resolvedPlan: crossClipPlan,
+            recoveryLevel: .normal
+        )
+        let recoveredPlan = try basePlan.addingRetrievalPairLines(
+            retrievalLines,
+            pairingPolicy: crossClipPlan.pairingPolicy,
+            groups: groups,
+            requiresCrossClipRetrieval: true
+        )
+        var priorAttempt = makeAttempt(
+            number: 1,
+            matcher: .faiss,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            plan: recoveredPlan,
+            duration: 1
+        )
+        priorAttempt.retrieval = retrieval
+        priorAttempt.retrievalWasExecuted = true
+        let state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: imageNames,
+            groups: groups,
+            pairingPolicy: .orderedContinuous,
+            planBinding: PairGraphPlanBinding(crossClipPlan),
+            mode: .policy,
+            phase: .matching,
+            activeRecoveryLevel: .expanded,
+            activePlan: recoveredPlan,
+            activeRetrieval: retrieval,
+            attempts: [priorAttempt],
+            retrievalWasScheduled: true,
+            usedLocalVocabularyRetrieval: true,
+            matchingDurationSeconds: 1,
+            fallbackReasons: ["Reconstruction coverage was below the acceptance gate"]
+        )
+
+        try save(state, fixture: fixture)
+        let restored = try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: imageNames,
+            expectedGroups: groups,
+            projectPaths: fixture.paths
+        ).restoredRecovery()
+
+        XCTAssertEqual(restored.phase, .matching)
+        XCTAssertEqual(restored.recoveryLevel, .expanded)
+        XCTAssertEqual(restored.activeRetrieval, retrieval)
+        XCTAssertEqual(restored.attempts, [priorAttempt])
+        XCTAssertTrue(restored.retrievalWasScheduled)
+        XCTAssertTrue(restored.usedLocalVocabularyRetrieval)
+        XCTAssertEqual(restored.groups, groups)
+    }
+
+    func testShortCrossClipRecoveryRejectsChangedClipBoundaries() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        let crossClipPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        let storedGroups = [
+            ColmapPairGroup(imageNames: ["a.jpg", "b.jpg"], isVideo: true),
+            ColmapPairGroup(imageNames: ["c.jpg", "d.jpg"], isVideo: true),
+        ]
+        let state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            groups: storedGroups,
+            pairingPolicy: .orderedContinuous,
+            planBinding: PairGraphPlanBinding(crossClipPlan),
+            mode: .policy,
+            phase: .preparing,
+            activeRecoveryLevel: .normal,
+            activePlan: plans.source,
+            attempts: [],
+            retrievalWasScheduled: true,
+            usedLocalVocabularyRetrieval: false,
+            matchingDurationSeconds: 0,
+            fallbackReasons: []
+        )
+        try save(state, fixture: fixture)
+
+        let changedGroups = [
+            ColmapPairGroup(imageNames: ["a.jpg"], isVideo: true),
+            ColmapPairGroup(
+                imageNames: ["b.jpg", "c.jpg", "d.jpg"],
+                isVideo: true
+            ),
+        ]
+        XCTAssertThrowsError(try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: plans.source.imageNames,
+            expectedGroups: changedGroups,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testRecoveryRejectsStructurallyInvalidCrossClipPlanBinding() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        let crossClipPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        var state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            groups: [
+                ColmapPairGroup(imageNames: ["a.jpg", "b.jpg"], isVideo: true),
+                ColmapPairGroup(imageNames: ["c.jpg", "d.jpg"], isVideo: true),
+            ],
+            pairingPolicy: .orderedContinuous,
+            planBinding: PairGraphPlanBinding(crossClipPlan),
+            mode: .policy,
+            phase: .preparing,
+            activeRecoveryLevel: .normal,
+            activePlan: plans.source,
+            attempts: [],
+            retrievalWasScheduled: true,
+            usedLocalVocabularyRetrieval: false,
+            matchingDurationSeconds: 0,
+            fallbackReasons: []
+        )
+        state.planBinding.temporalPairing = .none
+        state.planBinding.temporalOffsets = []
+
+        XCTAssertThrowsError(try save(state, fixture: fixture))
     }
 
     func testPreparingPolicyRecoveryPreservesDisconnectedPlanningFailure() throws {
@@ -154,7 +492,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(restored.recoveryLevel, .expanded)
     }
 
-    func testPreparingExactRecoveryPreservesDensityTransitionBeforePlanExists() throws {
+    func testPreparingExactRecoveryRejectsDensityTransition() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let plans = try makePlans()
@@ -180,6 +518,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             phase: .preparing,
             activeRecoveryLevel: .expanded,
             activePlan: plans.sparse,
@@ -188,12 +527,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             fallbackReasons: ["exact descriptor matching"]
         )
 
-        let restored = try state.restoredRecovery()
-
-        XCTAssertEqual(restored.phase, .preparing)
-        XCTAssertEqual(restored.mode, .sameScheduleExact)
-        XCTAssertEqual(restored.activePlan, plans.sparse)
-        XCTAssertEqual(restored.recoveryLevel, .expanded)
+        XCTAssertThrowsError(try state.restoredRecovery())
     }
 
     func testPolicyRecoveryRejectsExactOrSkippedDensityHistory() throws {
@@ -255,6 +589,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .normal,
             activePlan: plans.source,
             attempts: [failedPolicy],
@@ -271,23 +606,60 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             plan: plans.source,
             duration: 0.75
         )
-        let retryingSameSchedule = PairGraphRecoveryState(
+        let terminalExact = PairGraphRecoveryState(
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
-            mode: .sameScheduleExact,
+            mode: .terminalExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .normal,
             activePlan: plans.source,
             attempts: [failedPolicy, failedExact],
             matchingDurationSeconds: 1.25,
             fallbackReasons: ["exact descriptor matching"]
         )
-        let restoredRetry = try retryingSameSchedule.restoredRecovery()
+        let restoredRetry = try terminalExact.restoredRecovery()
+        XCTAssertEqual(restoredRetry.mode, .terminalExact)
         XCTAssertEqual(restoredRetry.attempts, [failedPolicy, failedExact])
         XCTAssertEqual(restoredRetry.matchingDurationSeconds, 1.25)
 
     }
 
-    func testSameScheduleExactRestoresPendingLevelAcrossDensityLadder() throws {
+    func testSameScheduleExactRecoveryRejectsMoreThan256Pairs() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let imageNames = (0..<24).map { String(format: "frame-%03d.jpg", $0) }
+        let exhaustive = try ColmapPairPlan.exhaustive(imageNames: imageNames)
+
+        func state(pairCount: Int) throws -> PairGraphRecoveryState {
+            let plan = try ColmapPairPlan.persisted(
+                imageNames: imageNames,
+                scheduledPairs: Array(exhaustive.pairs.prefix(pairCount))
+            )
+            let failedFaiss = makeAttempt(
+                number: 1,
+                matcher: .faiss,
+                outcome: .failed,
+                plan: plan,
+                duration: 1
+            )
+            return PairGraphRecoveryState(
+                selectedFramesDigest: fixture.selectedFramesDigest,
+                imageNames: imageNames,
+                mode: .sameScheduleExact,
+                exactRecoveryReason: .faissCrash,
+                activeRecoveryLevel: .normal,
+                activePlan: plan,
+                attempts: [failedFaiss],
+                matchingDurationSeconds: 1,
+                fallbackReasons: ["exact descriptor matching"]
+            )
+        }
+
+        XCTAssertNoThrow(try state(pairCount: 256).restoredRecovery())
+        XCTAssertThrowsError(try state(pairCount: 257).restoredRecovery())
+    }
+
+    func testSameScheduleExactRejectsPendingLevelAcrossDensityLadder() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let imageNames = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
@@ -346,28 +718,17 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .maximum,
             activePlan: maximum,
             attempts: attempts,
             matchingDurationSeconds: 6,
             fallbackReasons: ["exact descriptor matching"]
         )
-        try save(state, fixture: fixture)
-        let loaded = try PairGraphRecoveryStore.loadBound(
-            from: fixture.paths.pairGraphRecoveryURL,
-            expectedImageNames: imageNames,
-            projectPaths: fixture.paths
-        )
-
-        let restored = try loaded.restoredRecovery()
-
-        XCTAssertEqual(loaded.activeRecoveryLevel, .maximum)
-        XCTAssertEqual(restored.recoveryLevel, .maximum)
-        XCTAssertEqual(restored.activePlan, maximum)
-        XCTAssertEqual(restored.attempts, attempts)
+        XCTAssertThrowsError(try save(state, fixture: fixture))
     }
 
-    func testSameScheduleAllowsEscalationAfterFailedConnectedExactAttempt() throws {
+    func testSameScheduleRejectsEscalationAfterFailedConnectedExactAttempt() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let plans = try makePlans()
@@ -393,6 +754,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .expanded,
             activePlan: plans.source,
             attempts: attempts,
@@ -400,10 +762,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             fallbackReasons: []
         )
 
-        let restored = try state.restoredRecovery()
-
-        XCTAssertEqual(restored.recoveryLevel, .expanded)
-        XCTAssertEqual(restored.activePlan, plans.source)
+        XCTAssertThrowsError(try state.restoredRecovery())
     }
 
     func testSameScheduleExactRejectsInvalidLadderTransitions() throws {
@@ -420,6 +779,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
                 selectedFramesDigest: fixture.selectedFramesDigest,
                 imageNames: activePlan.imageNames,
                 mode: .sameScheduleExact,
+                exactRecoveryReason: .faissCrash,
                 activeRecoveryLevel: activeLevel,
                 activePlan: activePlan,
                 attempts: attempts,
@@ -469,6 +829,11 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             attempts: [faissNormal],
             activeLevel: .maximum,
             activePlan: plans.source
+        ).restoredRecovery())
+        XCTAssertThrowsError(try state(
+            attempts: [faissNormal],
+            activeLevel: .normal,
+            activePlan: plans.sparse
         ).restoredRecovery())
         XCTAssertThrowsError(try state(
             attempts: [faissNormal],
@@ -589,6 +954,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .normal,
             activePlan: plans.sparse,
             attempts: [policy],
@@ -614,6 +980,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: unsafePlan.imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .normal,
             activePlan: unsafePlan,
             attempts: [unsafeAttempt],
@@ -652,6 +1019,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .normal,
             activePlan: plans.source,
             attempts: [policy],
@@ -779,7 +1147,9 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
         )
     }
 
-    private func makeProject() throws -> (
+    private func makeProject(
+        imageNames: [String] = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+    ) throws -> (
         root: URL,
         paths: ProjectPaths,
         selectedFramesDigest: String
@@ -788,7 +1158,6 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
         let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
-        let imageNames = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
         for (index, imageName) in imageNames.enumerated() {
             try Data("frame-\(index)".utf8).write(
                 to: paths.framesSelectedURL.appendingPathComponent(imageName)
@@ -839,6 +1208,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
                 matcher: matcher,
                 recoveryLevel: recoveryLevel,
                 outcome: outcome,
+                exactRecoveryReason: matcher == .exact ? .faissCrash : nil,
                 scheduledPairCount: plan.pairs.count,
                 attemptedPairCount: completedCount,
                 rawMatchedPairCount: completedCount,
@@ -846,6 +1216,37 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
                 durationSeconds: duration
             ),
             scheduledPairs: plan.pairs
+        )
+    }
+
+    private func makeRetrievalEvidence(
+        directedPairLines: [String],
+        explicitZero: Bool = false
+    ) -> PairGraphRetrievalAttemptEvidence {
+        let returnedNeighbors = directedPairLines.compactMap { line -> String? in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            return fields.count == 2 ? String(fields[1]) : nil
+        }.sorted()
+        let firstQueryNeighbors = returnedNeighbors.isEmpty && !explicitZero
+            ? ["b.jpg"]
+            : returnedNeighbors
+        let queryImageNames = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        let neighbors = [firstQueryNeighbors, ["a.jpg"], ["b.jpg"], ["c.jpg"]]
+        return PairGraphRetrievalAttemptEvidence(
+            engine: .localSiftVocabularyV2,
+            queryImageNames: queryImageNames,
+            queryStride: 1,
+            candidateCount: 20,
+            returnedNeighborCount: 8,
+            minimumFrameSeparation: 12,
+            queryOutcomes: zip(queryImageNames, neighbors).map { query, values in
+                PairGraphRetrievalQueryOutcome(
+                    queryImageName: query,
+                    status: values.isEmpty ? .noRankedNeighbors : .ranked,
+                    rankedNeighborImageNames: values
+                )
+            },
+            directedPairLines: directedPairLines
         )
     }
 
@@ -864,6 +1265,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
             mode: .sameScheduleExact,
+            exactRecoveryReason: .faissCrash,
             activeRecoveryLevel: .normal,
             activePlan: plans.source,
             attempts: [policy],

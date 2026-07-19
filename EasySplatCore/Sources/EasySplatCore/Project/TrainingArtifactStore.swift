@@ -4,6 +4,18 @@ public enum TrainingArtifactStore {
     private static let maximumBytes = 1_048_576
 
     public static func load(from url: URL, projectPaths: ProjectPaths) throws -> TrainingArtifact {
+        let artifact = try loadManifest(from: url, projectPaths: projectPaths)
+        try validateArtifact(artifact, projectPaths: projectPaths)
+        guard try loadManifest(from: url, projectPaths: projectPaths) == artifact else {
+            throw TrainingArtifactStoreError.invalidManifest
+        }
+        return artifact
+    }
+
+    static func loadManifest(
+        from url: URL,
+        projectPaths: ProjectPaths
+    ) throws -> TrainingArtifact {
         try validateManifestLocation(url, projectPaths: projectPaths)
         let data = try BoundedFileReader.readRegularFile(at: url, maximumBytes: maximumBytes)
         guard !data.isEmpty else {
@@ -13,7 +25,14 @@ public enum TrainingArtifactStore {
             TrainingArtifact.self,
             from: data
         )
-        try validateArtifact(artifact, projectPaths: projectPaths)
+        try validateManifest(artifact, projectPaths: projectPaths)
+        let stableData = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: maximumBytes
+        )
+        guard stableData == data else {
+            throw TrainingArtifactStoreError.invalidManifest
+        }
         return artifact
     }
 
@@ -35,33 +54,18 @@ public enum TrainingArtifactStore {
 
     public static func persist(
         _ artifact: TrainingArtifact,
-        metadata: inout ProjectMetadata,
         paths: ProjectPaths
     ) throws {
         try save(artifact, to: paths.trainingManifestURL, projectPaths: paths)
-        metadata.trainingArtifact = artifact
-        try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
-    }
-
-    @discardableResult
-    public static func reconcile(metadata: inout ProjectMetadata, paths: ProjectPaths) throws -> Bool {
-        guard FileManager.default.fileExists(atPath: paths.trainingManifestURL.path) else {
-            return false
+        guard try load(from: paths.trainingManifestURL, projectPaths: paths) == artifact else {
+            throw TrainingArtifactStoreError.invalidManifest
         }
-        let artifact = try load(from: paths.trainingManifestURL, projectPaths: paths)
-        guard metadata.trainingArtifact != artifact else { return false }
-        metadata.trainingArtifact = artifact
-        try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
-        return true
     }
 
     public static func discardCheckpointedArtifact(
         metadata: inout ProjectMetadata,
         paths: ProjectPaths
     ) throws {
-        if metadata.trainingArtifact?.completionStatus == .checkpointed {
-            metadata.trainingArtifact = nil
-        }
         let fileManager = FileManager.default
         let trainingDirectory = try paths.resolveProjectRelativePath("Training")
         let manifestURL = trainingDirectory.appendingPathComponent("training_manifest.json")
@@ -98,15 +102,11 @@ public enum TrainingArtifactStore {
         metadata: inout ProjectMetadata,
         paths: ProjectPaths
     ) throws {
-        guard metadata.trainingArtifact?.completionStatus == .completed else {
-            return
-        }
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: paths.trainingURL.path)
             || (try? fileManager.destinationOfSymbolicLink(atPath: paths.trainingURL.path)) != nil {
             try fileManager.removeItem(at: paths.trainingURL)
         }
-        metadata.trainingArtifact = nil
         try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
     }
 
@@ -132,12 +132,30 @@ public enum TrainingArtifactStore {
         case .balanced: (7_000, 800)
         case .highDetail: (15_000, 1_500)
         }
+        let derivation = artifact.datasetDerivation
         guard artifact.schemaVersion == TrainingArtifact.currentSchemaVersion,
               !artifact.trainerVersion.isEmpty,
               !artifact.runtimeVersion.isEmpty,
               isSHA256(artifact.trainerBuildDigest),
               isSHA256(artifact.inputDigest),
               isSHA256(artifact.geometryDigest),
+              derivation.schemaVersion == MsplatDatasetDerivationArtifact.currentSchemaVersion,
+              isSHA256(derivation.sourceGeometryManifestSHA256),
+              isSHA256(derivation.sourceSelectedFramesDigest),
+              derivation.maximumImageDimension > 0,
+              !derivation.toolchainVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              derivation.colmapProvenance.identifier == "colmap",
+              !derivation.colmapProvenance.version
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !derivation.colmapProvenance.revision
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              isSHA256(derivation.colmapProvenance.payloadSHA256),
+              !derivation.registeredImageNames.isEmpty,
+              Set(derivation.registeredImageNames).count
+                == derivation.registeredImageNames.count,
+              derivation.registeredImageNames.allSatisfy(isSafeImageName),
+              derivation.datasetInputDigest == artifact.inputDigest,
+              derivation.datasetGeometryDigest == artifact.geometryDigest,
               artifact.iterationLimit == expectedBudget.iterationLimit,
               artifact.plateauWindow == expectedBudget.plateauWindow,
               artifact.completedIteration >= 0,
@@ -146,6 +164,10 @@ public enum TrainingArtifactStore {
               artifact.elapsedSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true,
               artifact.peakMemoryBytes > 0,
               artifact.memoryBudgetBytes > 0,
+              TrainingMemoryBudget.isValid(artifact.resourceAdmission),
+              UInt64(exactly: artifact.memoryBudgetBytes).map({
+                  $0 <= artifact.resourceAdmission.allowedTrainerBytes
+              }) == true,
               artifact.rasterFallbackCount >= 0,
               artifact.rasterFallbackCount <= min(
                   artifact.completedIteration,
@@ -219,16 +241,17 @@ public enum TrainingArtifactStore {
         _ artifact: TrainingArtifact,
         outputURL: URL
     ) throws {
+        let evidence = try? ProjectArtifactValidator.validatedPlyEvidence(at: outputURL)
         guard artifact.completionStatus == .completed,
               let expectedDigest = artifact.outputSHA256,
               let expectedBytes = artifact.outputBytes,
-              ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid,
-              let header = ProjectArtifactValidator.readPlyHeader(at: outputURL),
-              header.vertexCount == artifact.gaussianCount,
-              let size = try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              Int64(size) == expectedBytes,
-              let digest = try? GeometryArtifactStore.sha256(of: outputURL),
-              digest == expectedDigest else {
+              expectedBytes > 0,
+              let evidence,
+              evidence.vertexCount == artifact.gaussianCount,
+              evidence.byteCount == UInt64(expectedBytes),
+              evidence.sha256 == expectedDigest,
+              let recordedBounds = artifact.sceneBounds,
+              SplatSceneBoundsCalculator.matches(recordedBounds, evidence.sceneBounds) else {
             throw TrainingArtifactStoreError.invalidManifest
         }
     }
@@ -255,6 +278,18 @@ public enum TrainingArtifactStore {
         value.count == 64 && value.utf8.allSatisfy { byte in
             (48...57).contains(byte) || (97...102).contains(byte)
         }
+    }
+
+    private static func isSafeImageName(_ name: String) -> Bool {
+        guard !name.isEmpty,
+              name != ".",
+              name != "..",
+              URL(fileURLWithPath: name).lastPathComponent == name else {
+            return false
+        }
+        return ["jpg", "jpeg", "png"].contains(
+            URL(fileURLWithPath: name).pathExtension.lowercased()
+        )
     }
 }
 

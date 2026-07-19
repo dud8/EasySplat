@@ -10,7 +10,7 @@ public enum BoundedFileReader {
         return code == ENOENT
     }
 
-    static func readRegularFile(at url: URL, maximumBytes: Int) throws -> Data {
+    public static func readRegularFile(at url: URL, maximumBytes: Int) throws -> Data {
         guard maximumBytes >= 0 else { throw BoundedFileReadError.invalidLimit }
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else {

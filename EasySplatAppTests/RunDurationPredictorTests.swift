@@ -6,6 +6,7 @@ final class RunDurationPredictorTests: XCTestCase {
     private func makeSummary(
         status: ProjectStatus = .ready,
         totalSeconds: TimeInterval?,
+        createToViewerReadySeconds: TimeInterval? = nil,
         input: InputSpec = .video(files: ["/tmp/input.mov"]),
         requestedOptions: RequestedRunOptions? = RequestedRunOptions()
     ) -> ProjectSummary {
@@ -29,6 +30,7 @@ final class RunDurationPredictorTests: XCTestCase {
             isInterrupted: false,
             checkpointUpdatedAt: nil,
             stageTimings: timings,
+            createToViewerReadySeconds: createToViewerReadySeconds,
             input: input,
             requestedRunOptions: requestedOptions,
             lastOpenedAt: nil,
@@ -60,6 +62,22 @@ final class RunDurationPredictorTests: XCTestCase {
         XCTAssertEqual(prediction?.minimumSeconds, 60)
         XCTAssertEqual(prediction?.maximumSeconds, 120)
         XCTAssertEqual(prediction?.sampleCount, 3)
+    }
+
+    func testPrefersCreateToViewerReadyDurationOverStageSum() {
+        let prediction = RunDurationPredictor.predict(
+            options: RequestedRunOptions(),
+            input: .video(files: ["/tmp/new.mov"]),
+            from: [
+                makeSummary(totalSeconds: 10, createToViewerReadySeconds: 100),
+                makeSummary(totalSeconds: 20, createToViewerReadySeconds: 200),
+                makeSummary(totalSeconds: 30, createToViewerReadySeconds: 300),
+            ]
+        )
+
+        XCTAssertEqual(prediction?.seconds, 200)
+        XCTAssertEqual(prediction?.minimumSeconds, 100)
+        XCTAssertEqual(prediction?.maximumSeconds, 300)
     }
 
     func testCompleteRequestedOptionsDefineComparableRuns() {

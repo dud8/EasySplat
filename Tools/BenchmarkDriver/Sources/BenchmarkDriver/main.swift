@@ -30,16 +30,18 @@ do {
             manifestURL: outputURL,
             rendererExecutableURL: executableURL
         )
-    } else if arguments.count == 16,
+    } else if arguments.count == 20,
               arguments[1] == "extract-orientation",
               arguments[2] == "--geometry-manifest",
-              arguments[4] == "--candidate-images",
-              arguments[6] == "--ground-truth-poses",
-              arguments[8] == "--ground-truth-poses-sha256",
-              arguments[10] == "--orientation-label",
-              arguments[12] == "--orientation-label-sha256",
-              arguments[14] == "--output" {
-        let outputURL = URL(fileURLWithPath: arguments[15])
+              arguments[4] == "--geometry-manifest-sha256",
+              arguments[6] == "--candidate-images",
+              arguments[8] == "--candidate-images-sha256",
+              arguments[10] == "--ground-truth-poses",
+              arguments[12] == "--ground-truth-poses-sha256",
+              arguments[14] == "--orientation-label",
+              arguments[16] == "--orientation-label-sha256",
+              arguments[18] == "--output" {
+        let outputURL = URL(fileURLWithPath: arguments[19])
         guard !FileManager.default.fileExists(atPath: outputURL.path) else {
             throw BenchmarkDriverError.invalidJob(
                 "The orientation evidence output already exists."
@@ -47,11 +49,13 @@ do {
         }
         let evidence = try OrientationEvidenceExtractor.extract(
             geometryManifestURL: URL(fileURLWithPath: arguments[3]),
-            candidateImagesURL: URL(fileURLWithPath: arguments[5]),
-            groundTruthPosesURL: URL(fileURLWithPath: arguments[7]),
-            expectedGroundTruthPosesSHA256: arguments[9],
-            orientationLabelURL: URL(fileURLWithPath: arguments[11]),
-            expectedOrientationLabelSHA256: arguments[13]
+            expectedGeometryManifestSHA256: arguments[5],
+            candidateImagesURL: URL(fileURLWithPath: arguments[7]),
+            expectedCandidateImagesSHA256: arguments[9],
+            groundTruthPosesURL: URL(fileURLWithPath: arguments[11]),
+            expectedGroundTruthPosesSHA256: arguments[13],
+            orientationLabelURL: URL(fileURLWithPath: arguments[15]),
+            expectedOrientationLabelSHA256: arguments[17]
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -84,7 +88,9 @@ do {
                 + "--artifact-root <directory> --output <rendering-manifest.json>\n"
                 + "   or: EasySplatBenchmarkDriver extract-orientation "
                 + "--geometry-manifest <geometry_manifest.json> "
+                + "--geometry-manifest-sha256 <sha256:...> "
                 + "--candidate-images <images.txt> "
+                + "--candidate-images-sha256 <sha256:...> "
                 + "--ground-truth-poses <ground-truth-poses.json> "
                 + "--ground-truth-poses-sha256 <sha256:...> "
                 + "--orientation-label <orientation-label.json> "

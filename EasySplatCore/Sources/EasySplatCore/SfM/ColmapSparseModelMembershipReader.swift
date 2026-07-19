@@ -63,6 +63,7 @@ enum ColmapSparseModelMembershipReaderError: Error, LocalizedError, Equatable {
         expectedName: String,
         actualName: String
     )
+    case unknownModelImageName(modelOrder: Int, name: String)
 
     var errorDescription: String? {
         switch self {
@@ -112,6 +113,8 @@ enum ColmapSparseModelMembershipReaderError: Error, LocalizedError, Equatable {
             return "COLMAP sparse model \(order) refers to unknown image ID \(imageID)."
         case .imageBindingMismatch(let order, let imageID, let expected, let actual):
             return "COLMAP sparse model \(order) binds image ID \(imageID) to \(actual), but the database binds it to \(expected)."
+        case .unknownModelImageName(let order, let name):
+            return "COLMAP sparse model \(order) refers to an image outside the selected set: \(name)."
         }
     }
 }
@@ -221,6 +224,60 @@ struct ColmapSparseModelMembershipReader: Sendable {
             throw mappedDatabase(error)
         }
         return ColmapSparseModelMembershipSummary(models: memberships)
+    }
+
+    /// Returns the exact camera image set consumed from `images.bin`, preserving the
+    /// authenticated selected-frame order. The training dataset intentionally has no
+    /// database dependency, so this path binds names directly to the selected set.
+    func registeredImageNames(
+        in modelDirectory: URL,
+        checkCancellation: () throws -> Void = { try Task.checkCancellation() }
+    ) throws -> [String] {
+        try checkCancellation()
+        let selectedNames = try validatedSelectedImageNames(
+            checkCancellation: checkCancellation
+        )
+        let models = try validatedModelDirectories(
+            [modelDirectory],
+            checkCancellation: checkCancellation
+        )
+        guard let model = models.first else {
+            throw ColmapSparseModelMembershipReaderError.emptyModelSet
+        }
+        let records = try readModel(
+            model,
+            maximumImageCount: selectedNames.count,
+            checkCancellation: checkCancellation
+        )
+        let selectedSet = Set(selectedNames)
+        var imageIDs: Set<UInt32> = []
+        var registeredNames: Set<String> = []
+        for record in records {
+            try checkCancellation()
+            guard imageIDs.insert(record.id).inserted else {
+                throw ColmapSparseModelMembershipReaderError.duplicateModelImageID(
+                    modelOrder: model.order,
+                    imageID: record.id
+                )
+            }
+            guard registeredNames.insert(record.name).inserted else {
+                throw ColmapSparseModelMembershipReaderError.duplicateModelImageName(
+                    modelOrder: model.order,
+                    name: record.name
+                )
+            }
+            guard selectedSet.contains(record.name) else {
+                throw ColmapSparseModelMembershipReaderError.unknownModelImageName(
+                    modelOrder: model.order,
+                    name: record.name
+                )
+            }
+        }
+        let ordered = selectedNames.filter(registeredNames.contains)
+        guard !ordered.isEmpty, ordered.count == registeredNames.count else {
+            throw ColmapSparseModelMembershipReaderError.emptySelectedImageSet
+        }
+        return ordered
     }
 
     private func validatedSelectedImageNames(

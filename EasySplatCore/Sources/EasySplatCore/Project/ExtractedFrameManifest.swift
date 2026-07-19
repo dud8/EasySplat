@@ -1,9 +1,10 @@
 import CryptoKit
+import CoreMedia
 import Darwin
 import Foundation
 
 struct ExtractedFrameManifest: Codable, Equatable, Sendable {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 3
 
     let schemaVersion: Int
     let groups: [ExtractedFrameGroup]
@@ -12,7 +13,48 @@ struct ExtractedFrameManifest: Codable, Equatable, Sendable {
 struct ExtractedFrameGroup: Codable, Equatable, Sendable {
     let index: Int
     let targetCount: Int
+    let sourceProjectRelativePath: String
+    let sourceByteCount: Int64
+    let sourceSHA256: String
     let files: [ExtractedFrameFile]
+
+    init(
+        index: Int,
+        targetCount: Int,
+        sourceProjectRelativePath: String? = nil,
+        sourceByteCount: Int64 = 1,
+        sourceSHA256: String? = nil,
+        files: [ExtractedFrameFile]
+    ) {
+        self.index = index
+        self.targetCount = targetCount
+        self.sourceProjectRelativePath = sourceProjectRelativePath
+            ?? String(format: "Originals/video-%04d.mov", index)
+        self.sourceByteCount = sourceByteCount
+        self.sourceSHA256 = sourceSHA256
+            ?? SHA256.hash(data: Data("test-video-source-\(index)".utf8))
+                .map { String(format: "%02x", $0) }
+                .joined()
+        self.files = files
+    }
+}
+
+struct ExtractedFrameSourceEvidence: Equatable, Sendable {
+    let projectRelativePath: String
+    let byteCount: Int64
+    let sha256: String
+
+    init(projectRelativePath: String, byteCount: Int64, sha256: String) {
+        self.projectRelativePath = projectRelativePath
+        self.byteCount = byteCount
+        self.sha256 = sha256
+    }
+
+    init(receipt: VideoInputReceipt) {
+        projectRelativePath = receipt.projectRelativePath
+        byteCount = receipt.byteCount
+        sha256 = receipt.sha256
+    }
 }
 
 struct ExtractedFrameFile: Codable, Equatable, Sendable {
@@ -20,6 +62,91 @@ struct ExtractedFrameFile: Codable, Equatable, Sendable {
     let fileName: String
     let byteCount: Int64
     let sha256: String
+    let origin: VideoFrameOrigin
+
+    init(
+        index: Int,
+        fileName: String,
+        byteCount: Int64,
+        sha256: String,
+        origin: VideoFrameOrigin? = nil
+    ) {
+        self.index = index
+        self.fileName = fileName
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.origin = origin ?? VideoFrameOrigin(
+            decodedFrameIndex: index,
+            timestampSeconds: Double(index),
+            presentationTimeValue: nil,
+            presentationTimeTimescale: nil,
+            timestampWasRepaired: true
+        )
+    }
+}
+
+struct VideoFrameOrigin: Codable, Equatable, Sendable {
+    let decodedFrameIndex: Int
+    let timestampSeconds: Double
+    let presentationTimeValue: Int64?
+    let presentationTimeTimescale: Int32?
+    let timestampWasRepaired: Bool
+
+    init(candidate: TimedFrameCandidate) {
+        decodedFrameIndex = candidate.frameIndex
+        timestampSeconds = candidate.timestampSeconds
+        if let presentationTime = candidate.presentationTime {
+            presentationTimeValue = presentationTime.value
+            presentationTimeTimescale = presentationTime.timescale
+            timestampWasRepaired = false
+        } else {
+            presentationTimeValue = nil
+            presentationTimeTimescale = nil
+            timestampWasRepaired = true
+        }
+    }
+
+    init(
+        decodedFrameIndex: Int,
+        timestampSeconds: Double,
+        presentationTimeValue: Int64?,
+        presentationTimeTimescale: Int32?,
+        timestampWasRepaired: Bool
+    ) {
+        self.decodedFrameIndex = decodedFrameIndex
+        self.timestampSeconds = timestampSeconds
+        self.presentationTimeValue = presentationTimeValue
+        self.presentationTimeTimescale = presentationTimeTimescale
+        self.timestampWasRepaired = timestampWasRepaired
+    }
+
+    var presentationTime: CMTime? {
+        guard !timestampWasRepaired,
+              let presentationTimeValue,
+              let presentationTimeTimescale,
+              presentationTimeTimescale > 0 else {
+            return nil
+        }
+        return CMTime(value: presentationTimeValue, timescale: presentationTimeTimescale)
+    }
+
+    var isValidEvidence: Bool {
+        guard decodedFrameIndex >= 0,
+              timestampSeconds.isFinite,
+              timestampSeconds >= 0 else {
+            return false
+        }
+        if timestampWasRepaired {
+            return presentationTimeValue == nil && presentationTimeTimescale == nil
+        }
+        guard let presentationTime,
+              presentationTime.isValid,
+              presentationTime.isNumeric,
+              presentationTime.epoch == 0 else {
+            return false
+        }
+        return abs(CMTimeGetSeconds(presentationTime) - timestampSeconds) <= 1e-6
+    }
 }
 
 enum ExtractedFrameManifestError: Error, Equatable {
@@ -36,11 +163,13 @@ enum ExtractedFrameManifestStore {
     private static let maximumAggregateBytes: Int64 = 64 * 1_024 * 1_024 * 1_024
 
     static func persist(
-        groups: [[URL]],
+        groups: [[ExtractedFrameOutput]],
         targetCounts: [Int],
+        sourceEvidence: [ExtractedFrameSourceEvidence],
         paths: ProjectPaths
     ) throws -> ExtractedFrameManifest {
         guard groups.count == targetCounts.count,
+              groups.count == sourceEvidence.count,
               !groups.isEmpty,
               targetCounts.allSatisfy({ $0 > 0 }) else {
             throw ExtractedFrameManifestError.invalidManifest
@@ -56,8 +185,8 @@ enum ExtractedFrameManifestStore {
             let expectedDirectory = try groupDirectory(index: index, paths: paths)
             let expectedPath = expectedDirectory.standardizedFileURL.path + "/"
             var seenNames = Set<String>()
-            let manifestFiles = try files.enumerated().map { frameIndex, file -> ExtractedFrameFile in
-                let standardized = file.standardizedFileURL
+            let manifestFiles = try files.enumerated().map { frameIndex, output -> ExtractedFrameFile in
+                let standardized = output.url.standardizedFileURL
                 guard standardized.deletingLastPathComponent() == expectedDirectory.standardizedFileURL,
                       standardized.path.hasPrefix(expectedPath),
                       isSafeFrameFileName(standardized.lastPathComponent),
@@ -77,12 +206,16 @@ enum ExtractedFrameManifestStore {
                     index: frameIndex,
                     fileName: standardized.lastPathComponent,
                     byteCount: fingerprint.byteCount,
-                    sha256: fingerprint.sha256
+                    sha256: fingerprint.sha256,
+                    origin: output.origin
                 )
             }
             return ExtractedFrameGroup(
                 index: index,
                 targetCount: targetCount,
+                sourceProjectRelativePath: sourceEvidence[index].projectRelativePath,
+                sourceByteCount: sourceEvidence[index].byteCount,
+                sourceSHA256: sourceEvidence[index].sha256,
                 files: manifestFiles
             )
         }
@@ -106,9 +239,82 @@ enum ExtractedFrameManifestStore {
         return manifest
     }
 
+#if DEBUG
+    static func persist(
+        groups: [[ExtractedFrameOutput]],
+        targetCounts: [Int],
+        paths: ProjectPaths
+    ) throws -> ExtractedFrameManifest {
+        try persist(
+            groups: groups,
+            targetCounts: targetCounts,
+            sourceEvidence: syntheticSourceEvidence(count: groups.count),
+            paths: paths
+        )
+    }
+
+    static func persist(
+        groups: [[URL]],
+        targetCounts: [Int],
+        paths: ProjectPaths
+    ) throws -> ExtractedFrameManifest {
+        let outputs = groups.map { files in
+            files.enumerated().map { index, file in
+                ExtractedFrameOutput(
+                    url: file,
+                    origin: VideoFrameOrigin(
+                        decodedFrameIndex: index,
+                        timestampSeconds: FrameExtractor.timestampSeconds(
+                            from: file.lastPathComponent
+                        ) ?? Double(index),
+                        presentationTimeValue: nil,
+                        presentationTimeTimescale: nil,
+                        timestampWasRepaired: true
+                    )
+                )
+            }
+        }
+        return try persist(
+            groups: outputs,
+            targetCounts: targetCounts,
+            sourceEvidence: syntheticSourceEvidence(count: groups.count),
+            paths: paths
+        )
+    }
+#endif
+
+    static func loadVerified(
+        paths: ProjectPaths,
+        expectedSourceEvidence: [ExtractedFrameSourceEvidence],
+        maximumTotalFrames: Int
+    ) throws -> ExtractedFrameManifest {
+        try loadVerified(
+            paths: paths,
+            expectedVideoCount: expectedSourceEvidence.count,
+            expectedSourceEvidence: expectedSourceEvidence,
+            maximumTotalFrames: maximumTotalFrames
+        )
+    }
+
+#if DEBUG
     static func loadVerified(
         paths: ProjectPaths,
         expectedVideoCount: Int,
+        maximumTotalFrames: Int
+    ) throws -> ExtractedFrameManifest {
+        try loadVerified(
+            paths: paths,
+            expectedVideoCount: expectedVideoCount,
+            expectedSourceEvidence: nil,
+            maximumTotalFrames: maximumTotalFrames
+        )
+    }
+#endif
+
+    private static func loadVerified(
+        paths: ProjectPaths,
+        expectedVideoCount: Int,
+        expectedSourceEvidence: [ExtractedFrameSourceEvidence]?,
         maximumTotalFrames: Int
     ) throws -> ExtractedFrameManifest {
         let data: Data
@@ -131,14 +337,29 @@ enum ExtractedFrameManifestStore {
               manifest.schemaVersion == ExtractedFrameManifest.currentSchemaVersion,
               manifest.groups.count == expectedVideoCount,
               manifest.groups.map(\.index) == Array(0..<expectedVideoCount),
+              Set(manifest.groups.map(\.sourceProjectRelativePath)).count
+                == expectedVideoCount,
+              Set(manifest.groups.map(\.sourceSHA256)).count == expectedVideoCount,
               manifest.groups.allSatisfy({
                   $0.targetCount > 0
                       && $0.targetCount <= maximumTotalFrames
                       && $0.files.count == $0.targetCount
                       && $0.files.map(\.index) == Array(0..<$0.files.count)
                       && Set($0.files.map { $0.fileName.lowercased() }).count == $0.files.count
+                      && validSourceEvidence($0)
+                      && $0.files.allSatisfy({ validOrigin($0.origin) })
               }) else {
             throw ExtractedFrameManifestError.invalidManifest
+        }
+
+        if let expectedSourceEvidence {
+            guard zip(manifest.groups, expectedSourceEvidence).allSatisfy({ group, source in
+                group.sourceProjectRelativePath == source.projectRelativePath
+                    && group.sourceByteCount == source.byteCount
+                    && group.sourceSHA256 == source.sha256
+            }) else {
+                throw ExtractedFrameManifestError.invalidManifest
+            }
         }
 
         var totalFrames = 0
@@ -190,6 +411,21 @@ enum ExtractedFrameManifestStore {
         try manifest.groups.map { group in
             let directory = try groupDirectory(index: group.index, paths: paths)
             return group.files.map { directory.appendingPathComponent($0.fileName) }
+        }
+    }
+
+    static func frameGroupsWithEvidence(
+        from manifest: ExtractedFrameManifest,
+        paths: ProjectPaths
+    ) throws -> [[ExtractedFrameOutput]] {
+        try manifest.groups.map { group in
+            let directory = try groupDirectory(index: group.index, paths: paths)
+            return group.files.map {
+                ExtractedFrameOutput(
+                    url: directory.appendingPathComponent($0.fileName),
+                    origin: $0.origin
+                )
+            }
         }
     }
 
@@ -283,6 +519,59 @@ enum ExtractedFrameManifestStore {
         let suffix = fileName.dropFirst(prefix.count)
         return suffix.first == "." || suffix.first == "_"
     }
+
+    private static func validOrigin(_ origin: VideoFrameOrigin) -> Bool {
+        origin.isValidEvidence
+    }
+
+    private static func validSourceEvidence(_ group: ExtractedFrameGroup) -> Bool {
+        let components = group.sourceProjectRelativePath.split(separator: "/")
+        guard components.count == 2,
+              components[0] == "Originals",
+              isControlledVideoLeaf(String(components[1])),
+              group.sourceByteCount > 0 else {
+            return false
+        }
+        return group.sourceSHA256.count == 64
+            && group.sourceSHA256 == group.sourceSHA256.lowercased()
+            && group.sourceSHA256.allSatisfy(\.isHexDigit)
+    }
+
+    private static func isControlledVideoLeaf(_ leaf: String) -> Bool {
+        let fields = leaf.split(
+            separator: ".",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        guard fields.count == 2,
+              fields[0].hasPrefix("video-"),
+              fields[0].utf8.count == 10,
+              fields[0].dropFirst(6).utf8.allSatisfy({ (48...57).contains($0) }),
+              !fields[1].isEmpty,
+              fields[1].utf8.count <= 8 else {
+            return false
+        }
+        return fields[1].unicodeScalars.allSatisfy { scalar in
+            (scalar.value >= 48 && scalar.value <= 57)
+                || (scalar.value >= 97 && scalar.value <= 122)
+        }
+    }
+
+#if DEBUG
+    private static func syntheticSourceEvidence(
+        count: Int
+    ) -> [ExtractedFrameSourceEvidence] {
+        (0..<count).map { index in
+            ExtractedFrameSourceEvidence(
+                projectRelativePath: String(format: "Originals/video-%04d.mov", index),
+                byteCount: 1,
+                sha256: SHA256.hash(data: Data("test-video-source-\(index)".utf8))
+                    .map { String(format: "%02x", $0) }
+                    .joined()
+            )
+        }
+    }
+#endif
 
     private static func fingerprint(
         _ url: URL,

@@ -100,6 +100,41 @@ public struct MsplatRasterResourceLimitExceeded: Error, LocalizedError, Sendable
     }
 }
 
+public struct MsplatMetalAllocationUnavailable: Error, LocalizedError, Sendable, Equatable {
+    public let iteration: Int
+    public let requestedBytes: Int64
+    public let currentAllocatedBytes: Int64
+    public let requiredBytes: Int64
+    public let budgetBytes: Int64
+    public let recommendedWorkingSetBytes: Int64
+    public let maximumBufferBytes: Int64
+    public let intersectionCount: Int64?
+
+    public init(
+        iteration: Int,
+        requestedBytes: Int64,
+        currentAllocatedBytes: Int64,
+        requiredBytes: Int64,
+        budgetBytes: Int64,
+        recommendedWorkingSetBytes: Int64,
+        maximumBufferBytes: Int64,
+        intersectionCount: Int64? = nil
+    ) {
+        self.iteration = iteration
+        self.requestedBytes = requestedBytes
+        self.currentAllocatedBytes = currentAllocatedBytes
+        self.requiredBytes = requiredBytes
+        self.budgetBytes = budgetBytes
+        self.recommendedWorkingSetBytes = recommendedWorkingSetBytes
+        self.maximumBufferBytes = maximumBufferBytes
+        self.intersectionCount = intersectionCount
+    }
+
+    public var errorDescription: String? {
+        "Training could not reserve unified memory. Close other demanding apps, then try again."
+    }
+}
+
 public struct MsplatTrainingResult: Sendable, Equatable {
     public let profile: DetailProfile
     public let iterationLimit: Int
@@ -215,6 +250,8 @@ public final class MsplatRunner: Sendable {
             "--dataset", datasetPath.path,
             "--output", stagingOutputPath.path,
             "--profile", contract.argument,
+            "--iteration-limit", String(contract.iterationLimit),
+            "--plateau-window", String(contract.plateauWindow),
             "--checkpoint", checkpointPath.path,
             "--seed", String(seed),
             "--expected-input-digest", expectedIdentity.inputDigest,
@@ -295,6 +332,14 @@ public final class MsplatRunner: Sendable {
                 )
             }
             throw resourceFailure
+        }
+        if let allocationFailure = try events.finishMetalAllocationFailure() {
+            guard result.exitCode == 71, result.terminationReason == .exit else {
+                throw MsplatEventProtocolError(
+                    "metal_allocation_unavailable must terminate with operating-system status 71"
+                )
+            }
+            throw allocationFailure
         }
         guard result.exitCode == 0 else {
             throw SubprocessFailure(
@@ -444,9 +489,12 @@ private struct MsplatNativeEvent: Decodable {
     let droppedIntersectionCount: Int?
     let intersectionCount: Int64?
     let allocationBytes: Int64?
+    let currentAllocatedBytes: Int64?
+    let requestedBytes: Int64?
     let requiredBytes: Int64?
     let budgetBytes: Int64?
     let maximumBufferBytes: Int64?
+    let recommendedWorkingSetBytes: Int64?
     let sceneCenter: [Double]?
     let sceneRadius: Double?
 
@@ -497,9 +545,12 @@ private struct MsplatNativeEvent: Decodable {
         case droppedIntersectionCount = "dropped_intersection_count"
         case intersectionCount = "intersection_count"
         case allocationBytes = "allocation_bytes"
+        case currentAllocatedBytes = "current_allocated_bytes"
+        case requestedBytes = "requested_bytes"
         case requiredBytes = "required_bytes"
         case budgetBytes = "budget_bytes"
         case maximumBufferBytes = "max_buffer_bytes"
+        case recommendedWorkingSetBytes = "recommended_working_set_bytes"
         case sceneCenter = "scene_center"
         case sceneRadius = "scene_radius"
     }
@@ -550,9 +601,12 @@ private struct MsplatNativeEvent: Decodable {
         case droppedIntersectionCount = "dropped_intersection_count"
         case intersectionCount = "intersection_count"
         case allocationBytes = "allocation_bytes"
+        case currentAllocatedBytes = "current_allocated_bytes"
+        case requestedBytes = "requested_bytes"
         case requiredBytes = "required_bytes"
         case budgetBytes = "budget_bytes"
         case maximumBufferBytes = "max_buffer_bytes"
+        case recommendedWorkingSetBytes = "recommended_working_set_bytes"
         case sceneCenter = "scene_center"
         case sceneRadius = "scene_radius"
         case lastImprovementIteration = "last_improvement_iteration"
@@ -607,6 +661,10 @@ private struct MsplatNativeEvent: Decodable {
         .allocationBytes, .intersectionCount, .iteration, .maximumBufferBytes,
         .requiredBytes,
     ]
+    private static let metalAllocationUnavailableFields: Set<Field> = [
+        .budgetBytes, .currentAllocatedBytes, .intersectionCount, .iteration,
+        .maximumBufferBytes, .recommendedWorkingSetBytes, .requestedBytes, .requiredBytes,
+    ]
     private static let cancellationRequestedFields: Set<Field> = [
         .iteration, .signal,
     ]
@@ -660,6 +718,8 @@ private struct MsplatNativeEvent: Decodable {
             eventFields = rasterMemoryBudgetExceededFields
         case "raster_resource_limit_exceeded":
             eventFields = rasterResourceLimitExceededFields
+        case "metal_allocation_unavailable":
+            eventFields = metalAllocationUnavailableFields
         case "cancellation_requested":
             eventFields = cancellationRequestedFields
         case "cancelled":
@@ -716,6 +776,7 @@ private final class MsplatEventStream: @unchecked Sendable {
     private var resumeRejection: MsplatResumeRejected?
     private var memoryBudgetFailure: MsplatRasterMemoryBudgetExceeded?
     private var resourceLimitFailure: MsplatRasterResourceLimitExceeded?
+    private var metalAllocationFailure: MsplatMetalAllocationUnavailable?
     private var rasterFallbackCount = 0
     private var rasterExactFallbackElapsedSeconds = 0.0
     private var rasterExactBufferGrowthCount = 0
@@ -811,12 +872,19 @@ private final class MsplatEventStream: @unchecked Sendable {
         }
     }
 
+    func finishMetalAllocationFailure() throws -> MsplatMetalAllocationUnavailable? {
+        try lock.withLock {
+            if let failure { throw failure }
+            return metalAllocationFailure
+        }
+    }
+
     func finishInterruption() throws -> MsplatTrainingInterrupted? {
         let evidence: (Int, MsplatCheckpointReceipt, MsplatCheckpointExpectation)? = try lock.withLock {
             if let failure { throw failure }
             guard lineCount > 0 else { return nil }
             if completed || resumeRejection != nil || memoryBudgetFailure != nil
-                || resourceLimitFailure != nil { return nil }
+                || resourceLimitFailure != nil || metalAllocationFailure != nil { return nil }
             guard started else {
                 throw MsplatEventProtocolError("cancelled event stream is missing started")
             }
@@ -865,7 +933,8 @@ private final class MsplatEventStream: @unchecked Sendable {
         }
         nextSequence += 1
         guard !completed, !cancelled, resumeRejection == nil,
-              memoryBudgetFailure == nil, resourceLimitFailure == nil else {
+              memoryBudgetFailure == nil, resourceLimitFailure == nil,
+              metalAllocationFailure == nil else {
             throw MsplatEventProtocolError("event arrived after a terminal event")
         }
 
@@ -1018,6 +1087,40 @@ private final class MsplatEventStream: @unchecked Sendable {
             resourceLimitFailure = MsplatRasterResourceLimitExceeded(
                 iteration: iteration,
                 requiredBytes: requiredBytes,
+                maximumBufferBytes: maximumBufferBytes,
+                intersectionCount: event.intersectionCount
+            )
+            return nil
+        case "metal_allocation_unavailable":
+            guard let iteration = event.iteration,
+                  (started
+                    ? iteration >= lastIteration && iteration <= contract.iterationLimit
+                    : event.sequence == 1 && iteration == 0),
+                  let requestedBytes = event.requestedBytes,
+                  requestedBytes > 0,
+                  let currentAllocatedBytes = event.currentAllocatedBytes,
+                  currentAllocatedBytes >= 0,
+                  let requiredBytes = event.requiredBytes,
+                  requiredBytes == currentAllocatedBytes.addingReportingOverflow(requestedBytes).partialValue,
+                  !currentAllocatedBytes.addingReportingOverflow(requestedBytes).overflow,
+                  event.budgetBytes == memoryBudgetBytes,
+                  let recommendedWorkingSetBytes = event.recommendedWorkingSetBytes,
+                  recommendedWorkingSetBytes > 0,
+                  let maximumBufferBytes = event.maximumBufferBytes,
+                  maximumBufferBytes > 0,
+                  requestedBytes <= maximumBufferBytes,
+                  event.intersectionCount.map({ $0 > 0 }) ?? true else {
+                throw MsplatEventProtocolError(
+                    "event metal_allocation_unavailable record is invalid"
+                )
+            }
+            metalAllocationFailure = MsplatMetalAllocationUnavailable(
+                iteration: iteration,
+                requestedBytes: requestedBytes,
+                currentAllocatedBytes: currentAllocatedBytes,
+                requiredBytes: requiredBytes,
+                budgetBytes: memoryBudgetBytes,
+                recommendedWorkingSetBytes: recommendedWorkingSetBytes,
                 maximumBufferBytes: maximumBufferBytes,
                 intersectionCount: event.intersectionCount
             )

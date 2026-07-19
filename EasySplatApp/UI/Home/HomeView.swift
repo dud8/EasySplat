@@ -58,6 +58,7 @@ struct HomeView: View {
                     }
                 }
                 .font(.headline)
+                .accessibilityIdentifier("home.options")
 
                 if let warning = model.selectionWarning {
                     Text(warning)
@@ -175,6 +176,7 @@ struct HomeView: View {
                     Text("Through a space").tag(CapturePath.walkthrough)
                     Text("Across a large area").tag(CapturePath.largeArea)
                 }
+                .accessibilityIdentifier("home.capturePath")
             }
 
             optionRow("Detail") {
@@ -187,6 +189,7 @@ struct HomeView: View {
                         .tag(DetailProfile.highDetail)
                         .disabled(!RunPlanResolver.supports(detail: .highDetail, memoryGB: memoryGB))
                 }
+                .accessibilityIdentifier("home.detail")
             }
             if let explanation = Self.detailAvailabilityHelp(memoryGB: memoryGB) {
                 Text(explanation)
@@ -201,6 +204,7 @@ struct HomeView: View {
                     Text("Same camera and lens").tag(CameraGrouping.sameCameraAndLens)
                     Text("Mixed cameras or lenses").tag(CameraGrouping.mixedCamerasOrLenses)
                 }
+                .accessibilityIdentifier("home.cameraSource")
             }
 
             optionRow("Lens") {
@@ -209,6 +213,7 @@ struct HomeView: View {
                     Text("Perspective").tag(LensProjection.perspective)
                     Text("Fisheye").tag(LensProjection.fisheye)
                 }
+                .accessibilityIdentifier("home.lens")
             }
 
             optionRow("Input Order") {
@@ -220,6 +225,7 @@ struct HomeView: View {
                         .help(continuousOrderingHelp)
                     Text("Unordered").tag(InputOrdering.unordered)
                 }
+                .accessibilityIdentifier("home.inputOrder")
             }
 
             optionRow("Resource Use") {
@@ -234,6 +240,7 @@ struct HomeView: View {
                                 ?? "Use more of this Mac for the fastest run."
                         )
                 }
+                .accessibilityIdentifier("home.resourceUse")
             }
 
             if hasPhotos {
@@ -242,6 +249,7 @@ struct HomeView: View {
                         Text("Automatic selection").tag(PhotoSelection.automatic)
                         Text("Use all valid photos").tag(PhotoSelection.useAllValidPhotos)
                     }
+                    .accessibilityIdentifier("home.photoUse")
                 }
             }
         }
@@ -260,7 +268,7 @@ struct HomeView: View {
     private var continuousOrderingHelp: String {
         continuousOrderingIsAvailable
             ? "Treat the input as one ordered capture."
-            : "Continuous sequence requires one video or an ordered photo folder."
+            : "Continuous sequence can't combine videos and photos."
     }
 
     nonisolated static func maximumPerformanceIsAvailable(memoryGB: Double) -> Bool {
@@ -376,12 +384,13 @@ struct HomeView: View {
     }
 
     private func start() {
+        let timingBoundary = RunTimingBoundary.capture()
         let freeBytes = model.freeDiskSpaceBytes()
         model.cachedFreeDiskBytes = freeBytes
         if let freeBytes, freeBytes < AppModel.recommendedFreeSpaceBytes {
             showLowDiskWarning = true
         } else {
-            model.startFromPendingSelection()
+            model.startFromPendingSelection(timingBoundary: timingBoundary)
         }
     }
 

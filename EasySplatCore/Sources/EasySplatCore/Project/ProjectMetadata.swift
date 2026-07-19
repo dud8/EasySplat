@@ -7,21 +7,47 @@ public struct ProjectMetadata: Codable, Sendable {
     public var createdAt: Date
     public var title: String
     public var input: InputSpec
+    public var videoInputReceipts: [VideoInputReceipt]?
+    public var photoInputReceipts: [PhotoInputReceipt]?
+    public var photoSelectionReceipt: PhotoSelectionReceipt?
     public var requestedRunOptions: RequestedRunOptions
     public var resolvedRunPlan: ResolvedRunPlan?
     public var trainingMemoryRetryBudgetBytes: Int64?
     public var geometryRecovery: GeometryRecoveryState?
-    public var geometryArtifact: GeometryArtifact?
-    public var trainingArtifact: TrainingArtifact?
     public var viewerPreferences: ViewerPreferences
     public var state: PipelineState
-    public var outputs: OutputSpec?
     public var checkpoint: PipelineCheckpoint?
     public var lastRunStartedAt: Date?
-    public var reconstruction: ReconstructionSummary?
     public var stageTimings: [StageTimingRecord]?
+    /// Monotonic elapsed time from the user's Create action until the first
+    /// rendered preview for that run. This is an end-to-end boundary, not a
+    /// pipeline stage, and must not be included in stage timing totals.
+    public var createToViewerReadySeconds: Double?
     public var notes: String?
     public var lastFailureAt: Date?
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case formatVersion
+        case id
+        case createdAt
+        case title
+        case input
+        case videoInputReceipts
+        case photoInputReceipts
+        case photoSelectionReceipt
+        case requestedRunOptions
+        case resolvedRunPlan
+        case trainingMemoryRetryBudgetBytes
+        case geometryRecovery
+        case viewerPreferences
+        case state
+        case checkpoint
+        case lastRunStartedAt
+        case stageTimings
+        case createToViewerReadySeconds
+        case notes
+        case lastFailureAt
+    }
 
     public init(
         formatVersion: Int = ProjectMetadataStore.supportedFormatVersion,
@@ -29,19 +55,19 @@ public struct ProjectMetadata: Codable, Sendable {
         createdAt: Date = Date(),
         title: String,
         input: InputSpec,
+        videoInputReceipts: [VideoInputReceipt]? = nil,
+        photoInputReceipts: [PhotoInputReceipt]? = nil,
+        photoSelectionReceipt: PhotoSelectionReceipt? = nil,
         requestedRunOptions: RequestedRunOptions = RequestedRunOptions(),
         resolvedRunPlan: ResolvedRunPlan? = nil,
         trainingMemoryRetryBudgetBytes: Int64? = nil,
         geometryRecovery: GeometryRecoveryState? = nil,
-        geometryArtifact: GeometryArtifact? = nil,
-        trainingArtifact: TrainingArtifact? = nil,
         viewerPreferences: ViewerPreferences = ViewerPreferences(),
         state: PipelineState = PipelineState(stage: .importInput, lastError: nil),
-        outputs: OutputSpec? = nil,
         checkpoint: PipelineCheckpoint? = nil,
         lastRunStartedAt: Date? = nil,
-        reconstruction: ReconstructionSummary? = nil,
         stageTimings: [StageTimingRecord]? = nil,
+        createToViewerReadySeconds: Double? = nil,
         notes: String? = nil,
         lastFailureAt: Date? = nil
     ) {
@@ -50,19 +76,19 @@ public struct ProjectMetadata: Codable, Sendable {
         self.createdAt = createdAt
         self.title = title
         self.input = input
+        self.videoInputReceipts = videoInputReceipts
+        self.photoInputReceipts = photoInputReceipts
+        self.photoSelectionReceipt = photoSelectionReceipt
         self.requestedRunOptions = requestedRunOptions
         self.resolvedRunPlan = resolvedRunPlan
         self.trainingMemoryRetryBudgetBytes = trainingMemoryRetryBudgetBytes
         self.geometryRecovery = geometryRecovery
-        self.geometryArtifact = geometryArtifact
-        self.trainingArtifact = trainingArtifact
         self.viewerPreferences = viewerPreferences
         self.state = state
-        self.outputs = outputs
         self.checkpoint = checkpoint
         self.lastRunStartedAt = lastRunStartedAt
-        self.reconstruction = reconstruction
         self.stageTimings = stageTimings
+        self.createToViewerReadySeconds = createToViewerReadySeconds
         self.notes = notes
         self.lastFailureAt = lastFailureAt
     }
@@ -106,67 +132,13 @@ extension Array where Element == StageTimingRecord {
     }
 }
 
-/// Persisted measurements from the accepted sparse reconstruction.
-public struct ReconstructionSummary: Codable, Sendable, Equatable {
-    public var mapper: String
-    public var capturedAt: Date
-    public var registeredImages: Int
-    public var totalImages: Int
-    public var meanReprojectionError: Double?
-    public var pointCount: Int?
-    public var observationCount: Int?
-    public var meanTrackLength: Double?
-
-    public init(
-        mapper: String,
-        capturedAt: Date,
-        registeredImages: Int,
-        totalImages: Int,
-        meanReprojectionError: Double? = nil,
-        pointCount: Int? = nil,
-        observationCount: Int? = nil,
-        meanTrackLength: Double? = nil
-    ) {
-        self.mapper = mapper
-        self.capturedAt = capturedAt
-        self.registeredImages = registeredImages
-        self.totalImages = totalImages
-        self.meanReprojectionError = meanReprojectionError
-        self.pointCount = pointCount
-        self.observationCount = observationCount
-        self.meanTrackLength = meanTrackLength
-    }
-
-    /// Fraction of the requested frames that the mapper actually registered.
-    /// Returns 0 when `totalImages` is non-positive so callers do not need to guard.
-    public var registeredFraction: Double {
-        guard totalImages > 0 else { return 0 }
-        return Double(registeredImages) / Double(totalImages)
-    }
-}
-
-extension ReconstructionSummary {
-    /// Bridges the measured per-run score onto the persisted summary.
-    public init(score: ReconstructionScore, mapper: String, capturedAt: Date) {
-        self.init(
-            mapper: mapper,
-            capturedAt: capturedAt,
-            registeredImages: score.registeredImages,
-            totalImages: score.totalImages,
-            meanReprojectionError: score.meanReprojectionError,
-            pointCount: score.pointCount,
-            observationCount: score.observationCount,
-            meanTrackLength: score.meanTrackLength
-        )
-    }
-}
-
 /// Resume and recovery marker captured while a pipeline stage is in flight.
 public struct PipelineCheckpoint: Codable, Sendable {
     public var stage: PipelineStage
     public var updatedAt: Date
     public var progressFraction: Double?
     public var message: String?
+    public var inputReceiptDigest: String?
     public var details: PipelineCheckpointDetails?
 
     public init(
@@ -174,12 +146,14 @@ public struct PipelineCheckpoint: Codable, Sendable {
         updatedAt: Date = Date(),
         progressFraction: Double? = nil,
         message: String? = nil,
+        inputReceiptDigest: String? = nil,
         details: PipelineCheckpointDetails? = nil
     ) {
         self.stage = stage
         self.updatedAt = updatedAt
         self.progressFraction = progressFraction
         self.message = message
+        self.inputReceiptDigest = inputReceiptDigest
         self.details = details
     }
 }
@@ -190,7 +164,6 @@ public enum PipelineCheckpointDetails: Codable, Sendable {
     case selectFrames(SelectFramesCheckpoint)
     case sfmFeatures(SfmFeaturesCheckpoint)
     case sfmMatching(SfmMatchingCheckpoint)
-    case sfmMapping(SfmMappingCheckpoint)
     case trainSplat(TrainSplatCheckpoint)
     case exportSplat(ExportSplatCheckpoint)
 
@@ -199,7 +172,6 @@ public enum PipelineCheckpointDetails: Codable, Sendable {
         case selectFrames
         case sfmFeatures
         case sfmMatching
-        case sfmMapping
         case trainSplat
         case exportSplat
     }
@@ -231,8 +203,6 @@ public enum PipelineCheckpointDetails: Codable, Sendable {
             self = .sfmFeatures(try decode(SfmFeaturesCheckpoint.self, for: key))
         case .sfmMatching:
             self = .sfmMatching(try decode(SfmMatchingCheckpoint.self, for: key))
-        case .sfmMapping:
-            self = .sfmMapping(try decode(SfmMappingCheckpoint.self, for: key))
         case .trainSplat:
             self = .trainSplat(try decode(TrainSplatCheckpoint.self, for: key))
         case .exportSplat:
@@ -255,9 +225,6 @@ public enum PipelineCheckpointDetails: Codable, Sendable {
             try value.encode(details, forKey: .value)
         case .sfmMatching(let details):
             var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .sfmMatching)
-            try value.encode(details, forKey: .value)
-        case .sfmMapping(let details):
-            var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .sfmMapping)
             try value.encode(details, forKey: .value)
         case .trainSplat(let details):
             var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .trainSplat)
@@ -301,10 +268,22 @@ public struct SelectFramesCheckpoint: Codable, Sendable {
 public struct SfmFeaturesCheckpoint: Codable, Sendable {
     public var databasePath: String
     public var imageCount: Int
+    public var cameraGroupingReceipt: ColmapCameraGroupingReceipt?
+    public var cameraInitializationReceipt: ColmapCameraInitializationReceipt?
+    public var featureDatabaseDigest: String?
 
-    public init(databasePath: String, imageCount: Int) {
+    public init(
+        databasePath: String,
+        imageCount: Int,
+        cameraGroupingReceipt: ColmapCameraGroupingReceipt? = nil,
+        cameraInitializationReceipt: ColmapCameraInitializationReceipt? = nil,
+        featureDatabaseDigest: String? = nil
+    ) {
         self.databasePath = databasePath
         self.imageCount = imageCount
+        self.cameraGroupingReceipt = cameraGroupingReceipt
+        self.cameraInitializationReceipt = cameraInitializationReceipt
+        self.featureDatabaseDigest = featureDatabaseDigest
     }
 }
 
@@ -318,19 +297,6 @@ public struct SfmMatchingCheckpoint: Codable, Sendable {
         self.databasePath = databasePath
         self.expectedPairs = expectedPairs
         self.processedPairs = processedPairs
-    }
-}
-
-/// Checkpoint details for sparse reconstruction output.
-public struct SfmMappingCheckpoint: Codable, Sendable {
-    public var mapper: String
-    public var sparsePath: String
-    public var registeredImages: Int?
-
-    public init(mapper: String, sparsePath: String, registeredImages: Int?) {
-        self.mapper = mapper
-        self.sparsePath = sparsePath
-        self.registeredImages = registeredImages
     }
 }
 
@@ -355,6 +321,321 @@ public struct ExportSplatCheckpoint: Codable, Sendable {
         self.outputPath = outputPath
         self.sourcePath = sourcePath
         self.sizeBytes = sizeBytes
+    }
+}
+
+/// Immutable proof that a selected external video was copied, decoded through the
+/// shipping frame path, and adopted under a controlled project-relative name.
+public struct VideoInputReceipt: Codable, Equatable, Sendable {
+    public static let currentSchemaVersion = 2
+
+    public let schemaVersion: Int
+    public let projectRelativePath: String
+    public let safeDisplayName: String
+    public let byteCount: Int64
+    public let sha256: String
+    public let trackID: Int32
+    public let pixelWidth: Int
+    public let pixelHeight: Int
+    public let durationSeconds: Double
+    public let nominalFrameRate: Double
+    public let isHDR: Bool
+    public let decodedFrameCount: Int
+    public let transformA: Double
+    public let transformB: Double
+    public let transformC: Double
+    public let transformD: Double
+    public let transformTX: Double
+    public let transformTY: Double
+    public let clipGroupID: String
+    public let analysisPolicySHA256: String
+    public let analysisArtifactPath: String
+    public let analysisArtifactByteCount: Int64
+    public let analysisArtifactSHA256: String
+
+    public init(
+        schemaVersion: Int = VideoInputReceipt.currentSchemaVersion,
+        projectRelativePath: String,
+        safeDisplayName: String,
+        byteCount: Int64,
+        sha256: String,
+        trackID: Int32,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        durationSeconds: Double,
+        nominalFrameRate: Double,
+        isHDR: Bool,
+        decodedFrameCount: Int,
+        transformA: Double,
+        transformB: Double,
+        transformC: Double,
+        transformD: Double,
+        transformTX: Double,
+        transformTY: Double,
+        clipGroupID: String,
+        analysisPolicySHA256: String,
+        analysisArtifactPath: String,
+        analysisArtifactByteCount: Int64,
+        analysisArtifactSHA256: String
+    ) {
+        self.schemaVersion = schemaVersion
+        self.projectRelativePath = projectRelativePath
+        self.safeDisplayName = safeDisplayName
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.trackID = trackID
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.durationSeconds = durationSeconds
+        self.nominalFrameRate = nominalFrameRate
+        self.isHDR = isHDR
+        self.decodedFrameCount = decodedFrameCount
+        self.transformA = transformA
+        self.transformB = transformB
+        self.transformC = transformC
+        self.transformD = transformD
+        self.transformTX = transformTX
+        self.transformTY = transformTY
+        self.clipGroupID = clipGroupID
+        self.analysisPolicySHA256 = analysisPolicySHA256
+        self.analysisArtifactPath = analysisArtifactPath
+        self.analysisArtifactByteCount = analysisArtifactByteCount
+        self.analysisArtifactSHA256 = analysisArtifactSHA256
+    }
+}
+
+public struct PhotoSourceProvenance: Codable, Equatable, Sendable {
+    public let byteCount: Int64
+    public let sha256: String
+    public let typeIdentifier: String
+
+    public init(byteCount: Int64, sha256: String, typeIdentifier: String) {
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.typeIdentifier = typeIdentifier
+    }
+}
+
+public struct RawDevelopmentSettings: Codable, Equatable, Sendable {
+    /// Version 2 binds orientation-normalized, privacy-sanitized camera metadata.
+    public static let currentVersion = 2
+
+    public let version: Int
+    public let maximumPixelDimension: Int
+    public let draftModeEnabled: Bool
+    public let lensCorrectionEnabled: Bool
+    public let highlightRecoveryEnabled: Bool
+    public let luminanceNoiseReductionAmount: Float
+    public let colorNoiseReductionAmount: Float
+    public let sharpnessAmount: Float
+    public let detailAmount: Float
+    public let moireReductionAmount: Float
+    public let extendedDynamicRangeAmount: Float
+    public let outputTypeIdentifier: String
+    public let outputColorSpace: String
+    public let outputBitDepth: Int
+
+    public static func production(maximumPixelDimension: Int) -> Self {
+        Self(
+            version: currentVersion,
+            maximumPixelDimension: maximumPixelDimension,
+            draftModeEnabled: false,
+            lensCorrectionEnabled: true,
+            highlightRecoveryEnabled: true,
+            luminanceNoiseReductionAmount: 0.5,
+            colorNoiseReductionAmount: 0.5,
+            sharpnessAmount: 0,
+            detailAmount: 0,
+            moireReductionAmount: 0,
+            extendedDynamicRangeAmount: 0,
+            outputTypeIdentifier: "public.png",
+            outputColorSpace: "sRGB IEC61966-2.1",
+            outputBitDepth: 8
+        )
+    }
+
+    public init(
+        version: Int,
+        maximumPixelDimension: Int,
+        draftModeEnabled: Bool,
+        lensCorrectionEnabled: Bool,
+        highlightRecoveryEnabled: Bool,
+        luminanceNoiseReductionAmount: Float,
+        colorNoiseReductionAmount: Float,
+        sharpnessAmount: Float,
+        detailAmount: Float,
+        moireReductionAmount: Float,
+        extendedDynamicRangeAmount: Float,
+        outputTypeIdentifier: String,
+        outputColorSpace: String,
+        outputBitDepth: Int
+    ) {
+        self.version = version
+        self.maximumPixelDimension = maximumPixelDimension
+        self.draftModeEnabled = draftModeEnabled
+        self.lensCorrectionEnabled = lensCorrectionEnabled
+        self.highlightRecoveryEnabled = highlightRecoveryEnabled
+        self.luminanceNoiseReductionAmount = luminanceNoiseReductionAmount
+        self.colorNoiseReductionAmount = colorNoiseReductionAmount
+        self.sharpnessAmount = sharpnessAmount
+        self.detailAmount = detailAmount
+        self.moireReductionAmount = moireReductionAmount
+        self.extendedDynamicRangeAmount = extendedDynamicRangeAmount
+        self.outputTypeIdentifier = outputTypeIdentifier
+        self.outputColorSpace = outputColorSpace
+        self.outputBitDepth = outputBitDepth
+    }
+}
+
+public struct RawDevelopmentEvidence: Codable, Equatable, Sendable {
+    public let decoderIdentifier: String
+    public let decoderVersion: String
+    public let settings: RawDevelopmentSettings
+    public let nativePixelWidth: Int
+    public let nativePixelHeight: Int
+    public let sourceOrientation: Int
+
+    public init(
+        decoderIdentifier: String,
+        decoderVersion: String,
+        settings: RawDevelopmentSettings,
+        nativePixelWidth: Int,
+        nativePixelHeight: Int,
+        sourceOrientation: Int
+    ) {
+        self.decoderIdentifier = decoderIdentifier
+        self.decoderVersion = decoderVersion
+        self.settings = settings
+        self.nativePixelWidth = nativePixelWidth
+        self.nativePixelHeight = nativePixelHeight
+        self.sourceOrientation = sourceOrientation
+    }
+}
+
+public enum PhotoImportMode: Codable, Equatable, Sendable {
+    case unchanged
+    case rawDevelopment(RawDevelopmentEvidence)
+}
+
+/// Immutable identity and policy closure for `Frames/photo_selection.json`.
+public struct PhotoSelectionReceipt: Codable, Equatable, Sendable {
+    public static let currentSchemaVersion = 1
+    public static let projectRelativePath = "Frames/photo_selection.json"
+
+    public let schemaVersion: Int
+    public let projectRelativePath: String
+    public let byteCount: Int64
+    public let sha256: String
+    public let artifactSchemaVersion: Int
+    public let analysisRecipeVersion: Int
+    public let analysisRecipeSHA256: String
+    public let selectorPolicyVersion: Int
+    public let selectorPolicySHA256: String
+
+    public init(
+        schemaVersion: Int = PhotoSelectionReceipt.currentSchemaVersion,
+        projectRelativePath: String,
+        byteCount: Int64,
+        sha256: String,
+        artifactSchemaVersion: Int,
+        analysisRecipeVersion: Int,
+        analysisRecipeSHA256: String,
+        selectorPolicyVersion: Int,
+        selectorPolicySHA256: String
+    ) {
+        self.schemaVersion = schemaVersion
+        self.projectRelativePath = projectRelativePath
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.artifactSchemaVersion = artifactSchemaVersion
+        self.analysisRecipeVersion = analysisRecipeVersion
+        self.analysisRecipeSHA256 = analysisRecipeSHA256
+        self.selectorPolicyVersion = selectorPolicyVersion
+        self.selectorPolicySHA256 = selectorPolicySHA256
+    }
+}
+
+/// Immutable source and controlled-output proof for a photo adopted below `Originals/Photos`.
+public struct PhotoInputReceipt: Codable, Equatable, Sendable {
+    public static let currentSchemaVersion = 3
+
+    public let schemaVersion: Int
+    public let projectRelativePath: String
+    public let safeDisplayName: String
+    public let byteCount: Int64
+    public let sha256: String
+    public let pixelWidth: Int
+    public let pixelHeight: Int
+    public let orientation: Int
+    public let typeIdentifier: String
+    public let source: PhotoSourceProvenance
+    public let importMode: PhotoImportMode
+    public let analysisEvidence: PhotoAnalysisEvidence
+    public let retainedRank: Int
+
+    public init(
+        schemaVersion: Int = PhotoInputReceipt.currentSchemaVersion,
+        projectRelativePath: String,
+        safeDisplayName: String,
+        byteCount: Int64,
+        sha256: String,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        orientation: Int,
+        typeIdentifier: String,
+        source: PhotoSourceProvenance,
+        importMode: PhotoImportMode,
+        analysisEvidence: PhotoAnalysisEvidence,
+        retainedRank: Int
+    ) {
+        self.schemaVersion = schemaVersion
+        self.projectRelativePath = projectRelativePath
+        self.safeDisplayName = safeDisplayName
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.orientation = orientation
+        self.typeIdentifier = typeIdentifier
+        self.source = source
+        self.importMode = importMode
+        self.analysisEvidence = analysisEvidence
+        self.retainedRank = retainedRank
+    }
+
+    /// Convenience for controlled formats whose admitted source bytes are retained unchanged.
+    public init(
+        schemaVersion: Int = PhotoInputReceipt.currentSchemaVersion,
+        projectRelativePath: String,
+        safeDisplayName: String,
+        byteCount: Int64,
+        sha256: String,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        orientation: Int,
+        typeIdentifier: String,
+        analysisEvidence: PhotoAnalysisEvidence,
+        retainedRank: Int
+    ) {
+        self.init(
+            schemaVersion: schemaVersion,
+            projectRelativePath: projectRelativePath,
+            safeDisplayName: safeDisplayName,
+            byteCount: byteCount,
+            sha256: sha256,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight,
+            orientation: orientation,
+            typeIdentifier: typeIdentifier,
+            source: PhotoSourceProvenance(
+                byteCount: byteCount,
+                sha256: sha256,
+                typeIdentifier: typeIdentifier
+            ),
+            importMode: .unchanged,
+            analysisEvidence: analysisEvidence,
+            retainedRank: retainedRank
+        )
     }
 }
 
@@ -398,16 +679,5 @@ public struct PipelineState: Codable, Sendable {
     public init(stage: PipelineStage, lastError: String?) {
         self.stage = stage
         self.lastError = lastError
-    }
-}
-
-/// Paths for the final exported artifacts recorded in project metadata.
-public struct OutputSpec: Codable, Sendable {
-    public var splatPlyPath: String
-    public var colmapModelPath: String
-
-    public init(splatPlyPath: String, colmapModelPath: String) {
-        self.splatPlyPath = splatPlyPath
-        self.colmapModelPath = colmapModelPath
     }
 }

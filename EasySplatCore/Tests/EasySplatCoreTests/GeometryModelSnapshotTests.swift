@@ -63,6 +63,25 @@ final class GeometryModelSnapshotTests: XCTestCase {
         }
     }
 
+    func testCaptureChecksCancellationWhileHashingLargeModelFile() throws {
+        let fixture = try makeModel()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try Data(repeating: UInt8(ascii: "#"), count: 5 * 1_024 * 1_024).write(
+            to: fixture.model.appendingPathComponent("cameras.txt"),
+            options: [.atomic]
+        )
+        var cancellationChecks = 0
+
+        XCTAssertThrowsError(try GeometryModelSnapshot.capture(
+            in: fixture.model,
+            checkCancellation: {
+                cancellationChecks += 1
+                throw CancellationError()
+            }
+        )) { XCTAssertTrue($0 is CancellationError) }
+        XCTAssertEqual(cancellationChecks, 1)
+    }
+
     private func makeModel() throws -> (root: URL, model: URL) {
         let root = try TestFileBuilder.makeTempDir()
         let model = root.appendingPathComponent("0", isDirectory: true)

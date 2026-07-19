@@ -56,6 +56,84 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         XCTAssertEqual(result.stdout, "sync-done")
     }
 
+    func testRunAlwaysSanitizesAmbientCredentialEnvironment() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scriptURL = root.appendingPathComponent("print-env.sh")
+        try TestFileBuilder.createExecutable(
+            at: scriptURL,
+            script: """
+            #!/bin/sh
+            /usr/bin/env
+            """
+        )
+        let ambientSecretKeys: [String: String?] = [
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "task-token",
+            "GH_TOKEN": "gh-token",
+            "GITHUB_TOKEN": "github-token",
+            "OPENAI_API_KEY": "api-key",
+            "AWS_SECRET_ACCESS_KEY": "aws-secret",
+            "DATABASE_PASSWORD": "database-password",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+            "GIT_ASKPASS": "/tmp/askpass",
+            "DYLD_INSERT_LIBRARIES": "/tmp/injected.dylib",
+            "HTTPS_PROXY": "http://proxy.invalid",
+            "SSL_CERT_FILE": "/tmp/ca.pem",
+        ]
+
+        let result = try await withEnvironmentAsync(ambientSecretKeys) {
+            try SubprocessRunner().run(scriptURL.path, [])
+        }
+
+        XCTAssertEqual(result.exitCode, 0)
+        for key in ambientSecretKeys.keys {
+            XCTAssertFalse(result.stdout.contains("\(key)="), key)
+        }
+        let receipt = try XCTUnwrap(result.environmentReceipt)
+        for key in ambientSecretKeys.keys {
+            XCTAssertTrue(receipt.removedKeys.contains(key), key)
+        }
+        XCTAssertTrue(receipt.explicitOverrides.isEmpty)
+        XCTAssertTrue(receipt.effectiveValuesForControlledKeys.isEmpty)
+    }
+
+    func testExplicitOverrideCanReintroduceAControlledEnvironmentValue() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scriptURL = root.appendingPathComponent("print-one-env.sh")
+        try TestFileBuilder.createExecutable(
+            at: scriptURL,
+            script: """
+            #!/bin/sh
+            /usr/bin/printf '%s' "${GITHUB_TOKEN:-}"
+            """
+        )
+
+        let result = try await withEnvironmentAsync(["GITHUB_TOKEN": "ambient-token"]) {
+            try SubprocessRunner().run(
+                scriptURL.path,
+                [],
+                currentDirectory: nil,
+                environment: ["GITHUB_TOKEN": "explicit-token"],
+                removingEnvironmentKeys: [],
+                onStdout: { _ in },
+                onStderr: { _ in }
+            )
+        }
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(result.stdout, "explicit-token")
+        XCTAssertEqual(
+            result.environmentReceipt?.effectiveValuesForControlledKeys["GITHUB_TOKEN"],
+            "explicit-token"
+        )
+        XCTAssertEqual(
+            result.environmentReceipt?.explicitOverrides["GITHUB_TOKEN"],
+            "explicit-token"
+        )
+        XCTAssertTrue(result.environmentReceipt?.removedKeys.contains("GITHUB_TOKEN") == true)
+    }
+
     func testRunAsyncHandlesInstantExit() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -77,8 +155,7 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
             at: scriptURL,
             script: """
             #!/bin/sh
-            pgid=$(/bin/ps -o pgid= -p $$ | /usr/bin/tr -d ' ')
-            printf '%s %s\n' "$$" "$pgid"
+            /usr/bin/python3 -I -c 'import os; print(os.getppid(), os.getpgrp())'
             """
         )
 
@@ -146,13 +223,12 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         let result = try XCTUnwrap(results.values.first)
         XCTAssertEqual(results.values.count, 1)
         XCTAssertNotEqual(result.exitCode, 0)
+        let receipt = try XCTUnwrap(result.environmentReceipt)
+        XCTAssertEqual(receipt.explicitOverrides, ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"])
+        XCTAssertTrue(receipt.removedKeys.contains("EASYSPLAT_SUBPROCESS_CUSTOM"))
         XCTAssertEqual(
-            result.environmentReceipt,
-            SubprocessEnvironmentReceipt(
-                explicitOverrides: ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"],
-                removedKeys: ["EASYSPLAT_SUBPROCESS_CUSTOM"],
-                effectiveValuesForControlledKeys: ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"]
-            )
+            receipt.effectiveValuesForControlledKeys["EASYSPLAT_SUBPROCESS_CUSTOM"],
+            "child"
         )
     }
 
@@ -692,15 +768,12 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertTrue(result.stdout.contains("sentinel=\n"))
         XCTAssertTrue(result.stdout.contains("custom=child"))
+        let receipt = try XCTUnwrap(result.environmentReceipt)
+        XCTAssertEqual(receipt.explicitOverrides, ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"])
+        XCTAssertTrue(receipt.removedKeys.isSuperset(of: [sentinelKey, "EASYSPLAT_SUBPROCESS_CUSTOM"]))
         XCTAssertEqual(
-            result.environmentReceipt,
-            SubprocessEnvironmentReceipt(
-                explicitOverrides: ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"],
-                removedKeys: [sentinelKey, "EASYSPLAT_SUBPROCESS_CUSTOM"],
-                effectiveValuesForControlledKeys: [
-                    "EASYSPLAT_SUBPROCESS_CUSTOM": "child"
-                ]
-            )
+            receipt.effectiveValuesForControlledKeys["EASYSPLAT_SUBPROCESS_CUSTOM"],
+            "child"
         )
     }
 
@@ -729,15 +802,12 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertTrue(result.stdout.contains("sentinel=\n"))
         XCTAssertTrue(result.stdout.contains("custom=child"))
+        let receipt = try XCTUnwrap(result.environmentReceipt)
+        XCTAssertEqual(receipt.explicitOverrides, ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"])
+        XCTAssertTrue(receipt.removedKeys.isSuperset(of: [sentinelKey, "EASYSPLAT_SUBPROCESS_CUSTOM"]))
         XCTAssertEqual(
-            result.environmentReceipt,
-            SubprocessEnvironmentReceipt(
-                explicitOverrides: ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"],
-                removedKeys: [sentinelKey, "EASYSPLAT_SUBPROCESS_CUSTOM"],
-                effectiveValuesForControlledKeys: [
-                    "EASYSPLAT_SUBPROCESS_CUSTOM": "child"
-                ]
-            )
+            receipt.effectiveValuesForControlledKeys["EASYSPLAT_SUBPROCESS_CUSTOM"],
+            "child"
         )
     }
 

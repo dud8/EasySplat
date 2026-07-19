@@ -11,7 +11,7 @@ enum TestToolchains {
             python: da3Root.appendingPathComponent("python/bin/python3"),
             models: models,
             modelBundle: models.appendingPathComponent("DA3-BASE", isDirectory: true),
-            fallbackModelBundle: models.appendingPathComponent("DA3-SMALL", isDirectory: true)
+            smallModelBundle: models.appendingPathComponent("DA3-SMALL", isDirectory: true)
         )
         return ToolchainPaths(
             root: root,
@@ -28,7 +28,7 @@ enum TestToolchains {
         let buildInfo = da3Root.appendingPathComponent("build_info.json")
         let models = da3Root.appendingPathComponent("models", isDirectory: true)
         let modelBundle = models.appendingPathComponent("DA3-BASE", isDirectory: true)
-        let fallbackModelBundle = models.appendingPathComponent("DA3-SMALL", isDirectory: true)
+        let smallModelBundle = models.appendingPathComponent("DA3-SMALL", isDirectory: true)
         let appDir = da3Root.appendingPathComponent("app/easysplat_da3_sfm", isDirectory: true)
 
         if createFiles {
@@ -44,7 +44,7 @@ enum TestToolchains {
             try pythonStub.write(to: python, atomically: true, encoding: .utf8)
             try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: python.path)
             try fm.createDirectory(at: modelBundle, withIntermediateDirectories: true)
-            try fm.createDirectory(at: fallbackModelBundle, withIntermediateDirectories: true)
+            try fm.createDirectory(at: smallModelBundle, withIntermediateDirectories: true)
             try fm.createDirectory(at: appDir, withIntermediateDirectories: true)
             try """
             {
@@ -60,7 +60,7 @@ enum TestToolchains {
               "torchvision_version": "0.25.0"
             }
             """.write(to: buildInfo, atomically: true, encoding: .utf8)
-            for (modelName, modelDir) in [("DA3-BASE", modelBundle), ("DA3-SMALL", fallbackModelBundle)] {
+            for (modelName, modelDir) in [("DA3-BASE", modelBundle), ("DA3-SMALL", smallModelBundle)] {
                 try "{}\n".write(to: modelDir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
                 fm.createFile(atPath: modelDir.appendingPathComponent("model.safetensors").path, contents: Data([0x00]))
                 let resolvedSHA = modelName == "DA3-BASE"
@@ -83,7 +83,7 @@ enum TestToolchains {
             python: python,
             models: models,
             modelBundle: modelBundle,
-            fallbackModelBundle: fallbackModelBundle
+            smallModelBundle: smallModelBundle
         )
     }
 }

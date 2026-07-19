@@ -20,4 +20,4 @@ SwiftUI front-end for EasySplat. `AppModel` is the single source of truth for UI
 
 ## Tests
 - App-level tests live in `EasySplatAppTests/` at repo root.
-- Packaged accessibility, keyboard, appearance, and viewport checks live in `Tools/UIVerifier/` and run through `scripts/release/verify_ui.sh`.
+- Presentation and navigation contracts use deterministic app tests. Release automation never synthesizes global input or captures the user session.

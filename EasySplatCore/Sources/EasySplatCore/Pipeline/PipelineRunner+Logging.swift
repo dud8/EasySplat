@@ -199,6 +199,39 @@ final class StageTimingTracker: @unchecked Sendable {
     private var firstStarts: [PipelineStage: Date] = [:]
     private var accumulatedSeconds: [PipelineStage: TimeInterval] = [:]
 
+    init(
+        initialImportDurationSeconds: TimeInterval = 0,
+        importStartedAt: Date? = nil
+    ) {
+        let now = Date()
+        var initial: TimeInterval
+        var hasInitialBoundary = false
+        if initialImportDurationSeconds.isFinite,
+           initialImportDurationSeconds > 0 {
+            initial = initialImportDurationSeconds
+            hasInitialBoundary = true
+        } else if initialImportDurationSeconds == 0,
+                  importStartedAt != nil {
+            // A supplied start label distinguishes an explicit zero-duration
+            // boundary from the default "no preparation boundary" value.
+            initial = 0
+            hasInitialBoundary = true
+        } else if let importStartedAt {
+            let wallDuration = now.timeIntervalSince(importStartedAt)
+            initial = wallDuration.isFinite && wallDuration >= 0 ? wallDuration : 0
+            hasInitialBoundary = initial > 0
+        } else {
+            initial = 0
+        }
+        if hasInitialBoundary {
+            accumulatedSeconds[.importInput] = initial
+            firstStarts[.importInput] = importStartedAt ?? now.addingTimeInterval(-initial)
+            // Keep Import active until its real stage starts so validation and
+            // runner setup between configuration and the first event stay in Total.
+            starts[.importInput] = (instant: clock.now, wallClock: now)
+        }
+    }
+
     func start(_ stage: PipelineStage) {
         lock.lock()
         let now = clock.now

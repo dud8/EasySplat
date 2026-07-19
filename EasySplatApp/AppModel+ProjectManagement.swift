@@ -7,8 +7,120 @@ private let projectLibraryLogger = Logger(
     category: "ProjectLibrary"
 )
 
+struct RunTimingBoundary: Sendable {
+    struct Sample: Sendable, Equatable {
+        let wallClock: Date
+        let monotonicSeconds: TimeInterval
+    }
+
+    let startedAt: Date
+    private let elapsed: @Sendable () -> TimeInterval
+
+    static func capture() -> RunTimingBoundary {
+        let clock = ContinuousClock()
+        let monotonicStartedAt = clock.now
+        return RunTimingBoundary(startedAt: Date()) {
+            durationSeconds(clock.now - monotonicStartedAt)
+        }
+    }
+
+    static func capture(
+        sample: @escaping @Sendable () -> Sample
+    ) -> RunTimingBoundary {
+        let started = sample()
+        return RunTimingBoundary(startedAt: started.wallClock) {
+            sample().monotonicSeconds - started.monotonicSeconds
+        }
+    }
+
+    func elapsedSeconds() -> TimeInterval {
+        let seconds = elapsed()
+        guard seconds.isFinite, seconds >= 0 else { return 0 }
+        return seconds
+    }
+
+    private static func durationSeconds(_ duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return TimeInterval(components.seconds)
+            + TimeInterval(components.attoseconds) / 1e18
+    }
+}
+
+struct PendingResultViewerTiming: Sendable {
+    let projectID: UUID
+    let projectURL: URL
+    let outputURL: URL
+    let boundary: RunTimingBoundary
+    var firstReadyElapsedSeconds: TimeInterval?
+}
+
 extension AppModel {
-    func startFromPendingSelection() {
+    func prepareResultViewerTiming(
+        projectID: UUID,
+        projectURL: URL,
+        outputURL: URL,
+        boundary: RunTimingBoundary
+    ) {
+        pendingResultViewerTiming = PendingResultViewerTiming(
+            projectID: projectID,
+            projectURL: projectURL,
+            outputURL: outputURL,
+            boundary: boundary,
+            firstReadyElapsedSeconds: nil
+        )
+    }
+
+    func resultViewerDidBecomeReady(projectURL: URL, outputURL: URL) {
+        guard viewState == .viewer,
+              ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
+              ProjectSummary.hasSameLocation(outputPlyURL, outputURL),
+              var pending = pendingResultViewerTiming,
+              ProjectSummary.hasSameLocation(pending.projectURL, projectURL),
+              ProjectSummary.hasSameLocation(pending.outputURL, outputURL) else {
+            return
+        }
+
+        if pending.firstReadyElapsedSeconds == nil {
+            pending.firstReadyElapsedSeconds = pending.boundary.elapsedSeconds()
+            pendingResultViewerTiming = pending
+        }
+        let elapsedSeconds = pending.firstReadyElapsedSeconds ?? 0
+        let metadataURL = ProjectPaths(root: projectURL).metadataURL
+        do {
+            let snapshot = try ProjectMetadataStore.load(from: metadataURL)
+            guard snapshot.id == pending.projectID else {
+                pendingResultViewerTiming = nil
+                return
+            }
+            guard snapshot.createToViewerReadySeconds == nil else {
+                pendingResultViewerTiming = nil
+                return
+            }
+            var didRecord = false
+            let metadata = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+                guard metadata.id == pending.projectID,
+                      metadata.createToViewerReadySeconds == nil else {
+                    return
+                }
+                metadata.createToViewerReadySeconds = elapsedSeconds
+                didRecord = true
+            }
+            guard didRecord
+                    || (metadata.id == pending.projectID
+                        && metadata.createToViewerReadySeconds != nil) else {
+                return
+            }
+            currentCreateToViewerReadySeconds = metadata.createToViewerReadySeconds
+            pendingResultViewerTiming = nil
+            refreshProjectSummaries()
+        } catch {
+            // Keep the pending boundary so a later ready notification can retry
+            // after a transient metadata write failure.
+        }
+    }
+
+    func startFromPendingSelection(timingBoundary: RunTimingBoundary? = nil) {
+        let timingBoundary = timingBoundary ?? .capture()
         guard !isRunActive else { return }
         guard let inputSpec = buildInputSpec() else { return }
         photoFolderCountTask?.cancel()
@@ -17,7 +129,14 @@ extension AppModel {
         let token = UUID()
         currentTaskToken = token
         isRunActive = true
-        currentTask = Task { await startProject(input: inputSpec, title: title, taskToken: token) }
+        currentTask = Task {
+            await startProject(
+                input: inputSpec,
+                title: title,
+                taskToken: token,
+                timingBoundary: timingBoundary
+            )
+        }
     }
 
     @discardableResult
@@ -33,7 +152,7 @@ extension AppModel {
 
     static func validationRecovery(for error: RunPlanResolver.ValidationError) -> RunValidationRecovery? {
         switch error {
-        case .continuousMultipleClipsUnsupported:
+        case .continuousMixedInputUnsupported:
             return .useUnordered
         case .fastDetailRequired:
             return .useFast
@@ -84,6 +203,31 @@ extension AppModel {
 
     func configureRuntimeRecovery(for error: Error) {
         let options = currentRunOptions ?? requestedRunOptions
+        if let admissionError = error as? TrainingResourceAdmissionError {
+            let message: String = switch admissionError {
+            case .invalidObservation:
+                "Current memory availability could not be verified. Try again."
+            case .staleObservation:
+                "Memory availability changed before training could start. Try again."
+            case .insufficientAvailableMemory:
+                "Training needs more free unified memory. Close other demanding apps, then try again."
+            }
+            validationRecovery = nil
+            failureRetryAllowed = true
+            lastError = message
+            statusTitle = message
+            statusDetail = nil
+            return
+        }
+        if error is MsplatMetalAllocationUnavailable {
+            let message = "Training could not reserve unified memory. Close other demanding apps, then try again."
+            validationRecovery = nil
+            failureRetryAllowed = true
+            lastError = message
+            statusTitle = message
+            statusDetail = nil
+            return
+        }
         if error is MsplatRasterResourceLimitExceeded {
             let recovery = Self.rasterResourceRecovery(requestedOptions: options)
             validationRecovery = recovery
@@ -233,6 +377,7 @@ extension AppModel {
         currentProjectURL: URL?,
         isRunActive: Bool
     ) -> [ProjectSummary] {
+        _ = ProjectPublicationTransaction.reconcile(in: base)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: base,
@@ -249,21 +394,37 @@ extension AppModel {
             ), values.isDirectory == true, values.isSymbolicLink != true else {
                 continue
             }
-            let metadataURL = url.appendingPathComponent("project.json")
+            let snapshot: ProjectArtifactSnapshot?
             let metadata: ProjectMetadata
             do {
-                metadata = try ProjectMetadataStore.load(from: metadataURL)
-            } catch {
-                projectLibraryLogger.notice(
-                    "Skipping unreadable project at \(url.path, privacy: .private): \(String(describing: error), privacy: .public)"
+                let loaded = try ProjectArtifactSnapshotStore.load(
+                    projectURL: url,
+                    validationDepth: .quick
                 )
-                continue
+                snapshot = loaded
+                metadata = loaded.metadata
+            } catch {
+                guard let currentMetadata = try? ProjectMetadataStore.load(
+                    from: ProjectPaths(root: url).metadataURL
+                ) else {
+                    projectLibraryLogger.notice(
+                        "Skipping unreadable project at \(url.path, privacy: .private): \(String(describing: error), privacy: .public)"
+                    )
+                    continue
+                }
+                snapshot = nil
+                metadata = currentMetadata
+                projectLibraryLogger.notice(
+                    "Project artifacts are unavailable at \(url.path, privacy: .private): \(String(describing: error), privacy: .public)"
+                )
             }
-            let outputURL = readyOutputURLOnDisk(
-                projectURL: url,
-                metadata: metadata,
-                validationDepth: .quick
-            )
+            let outputURL = snapshot.flatMap {
+                readyOutputURLOnDisk(
+                    projectURL: url,
+                    snapshot: $0,
+                    validationDepth: .quick
+                )
+            }
             let outputExists = outputURL != nil
             let isActive = ProjectSummary.hasSameLocation(currentProjectURL, url)
                 && isRunActive
@@ -296,6 +457,7 @@ extension AppModel {
                 isInterrupted: isInterrupted,
                 checkpointUpdatedAt: metadata.checkpoint?.updatedAt,
                 stageTimings: metadata.stageTimings ?? [],
+                createToViewerReadySeconds: metadata.createToViewerReadySeconds,
                 input: metadata.input,
                 requestedRunOptions: metadata.requestedRunOptions,
                 lastOpenedAt: sidecarOpened,
@@ -305,19 +467,6 @@ extension AppModel {
         }
 
         return summaries.sorted { $0.createdAt > $1.createdAt }
-    }
-
-    func createProjectDirectory(title: String) throws -> URL {
-        let fm = FileManager.default
-        let base = projectBaseDirectory()
-        try fm.createDirectory(at: base, withIntermediateDirectories: true)
-        let safeTitle = title.isEmpty ? "Project" : title
-        var projectURL = base.appendingPathComponent("\(safeTitle).easysplatproj", isDirectory: true)
-        if fm.fileExists(atPath: projectURL.path) {
-            projectURL = base.appendingPathComponent("\(safeTitle)-\(UUID().uuidString.prefix(6)).easysplatproj", isDirectory: true)
-        }
-        try fm.createDirectory(at: projectURL, withIntermediateDirectories: true)
-        return projectURL
     }
 
     func projectBaseDirectory() -> URL {
@@ -348,20 +497,16 @@ extension AppModel {
         return (exists, isDirectory.boolValue)
     }
 
-    func metadataOutputURL(projectURL: URL, metadata: ProjectMetadata? = nil) -> URL? {
-        let loadedMetadata: ProjectMetadata
-        if let metadata {
-            loadedMetadata = metadata
-        } else {
-            guard let metadata = try? ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL) else {
-                return nil
-            }
-            loadedMetadata = metadata
+    func canonicalOutputURL(projectURL: URL, metadata: ProjectMetadata? = nil) -> URL? {
+        guard let snapshot = try? ProjectArtifactSnapshotStore.load(projectURL: projectURL) else {
+            return nil
         }
-        guard let relativePath = loadedMetadata.outputs?.splatPlyPath else { return nil }
         let paths = ProjectPaths(root: projectURL)
-        guard let outputURL = try? paths.resolveProjectRelativePath(relativePath) else { return nil }
-        return outputURL
+        guard snapshot.trainingArtifact?.completionStatus == .completed,
+              snapshot.trainingArtifact?.outputPath == "Output/splat.ply" else {
+            return nil
+        }
+        return paths.outputSplatURL
     }
 
     func readyOutputURL(
@@ -381,25 +526,36 @@ extension AppModel {
         metadata: ProjectMetadata? = nil,
         validationDepth: ProjectArtifactValidationDepth
     ) -> URL? {
-        let persistedMetadata: ProjectMetadata
-        if let metadata {
-            persistedMetadata = metadata
-        } else {
-            guard let loaded = try? ProjectMetadataStore.load(
-                from: ProjectPaths(root: projectURL).metadataURL
-            ) else { return nil }
-            persistedMetadata = loaded
+        let snapshotDepth: ProjectArtifactSnapshotStore.ValidationDepth = switch validationDepth {
+        case .quick: .quick
+        case .full: .full
         }
-        guard persistedMetadata.state.stage == .done,
-              persistedMetadata.state.lastError == nil,
-              let relativePath = persistedMetadata.outputs?.splatPlyPath,
-              let trainingArtifact = persistedMetadata.trainingArtifact,
-              trainingArtifact.completionStatus == .completed,
-              trainingArtifact.outputPath == relativePath,
-              let outputURL = try? ProjectPaths(root: projectURL)
-                .resolveProjectRelativePath(relativePath) else {
+        guard let snapshot = try? ProjectArtifactSnapshotStore.load(
+            projectURL: projectURL,
+            validationDepth: snapshotDepth
+        ) else {
             return nil
         }
+        return readyOutputURLOnDisk(
+            projectURL: projectURL,
+            snapshot: snapshot,
+            validationDepth: validationDepth
+        )
+    }
+
+    nonisolated private static func readyOutputURLOnDisk(
+        projectURL: URL,
+        snapshot: ProjectArtifactSnapshot,
+        validationDepth: ProjectArtifactValidationDepth
+    ) -> URL? {
+        guard snapshot.metadata.state.stage == .done,
+              snapshot.metadata.state.lastError == nil,
+              let trainingArtifact = snapshot.trainingArtifact,
+              trainingArtifact.completionStatus == .completed,
+              trainingArtifact.outputPath == "Output/splat.ply" else {
+            return nil
+        }
+        let outputURL = ProjectPaths(root: projectURL).outputSplatURL
         switch validationDepth {
         case .quick:
             guard ProjectArtifactValidator.validatePlyFile(at: outputURL, depth: .quick) == .valid else {
@@ -432,19 +588,17 @@ extension AppModel {
         }
     }
 
-    /// Reload the persisted reconstruction summary for a project from disk. The pipeline
-    /// writes the summary as part of `metadata.reconstruction`, so we just decode the
-    /// current project.json.
-    func loadReconstructionSummary(projectURL: URL) -> ReconstructionSummary? {
-        let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        return (try? ProjectMetadataStore.load(from: metadataURL))?.reconstruction
-    }
-
     /// Reload the persisted per-stage timings. Returns an empty array when no timings
     /// have been recorded yet so callers can drive UI state with a single property.
     func loadStageTimings(projectURL: URL) -> [StageTimingRecord] {
         let metadataURL = ProjectPaths(root: projectURL).metadataURL
         return (try? ProjectMetadataStore.load(from: metadataURL))?.stageTimings ?? []
+    }
+
+    func loadCreateToViewerReadySeconds(projectURL: URL) -> TimeInterval? {
+        let metadataURL = ProjectPaths(root: projectURL).metadataURL
+        return (try? ProjectMetadataStore.load(from: metadataURL))?
+            .createToViewerReadySeconds
     }
 
     func loadProjectConfig(projectURL: URL) -> (options: RequestedRunOptions, input: InputSpec)? {

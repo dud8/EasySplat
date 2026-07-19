@@ -17,7 +17,50 @@ enum TestVideoBuilder {
         height: Int = 48,
         expectedFrameRate: Int = 30,
         keyFrameInterval: Int = 1,
+        requireH264: Bool = false,
+        fileType: AVFileType = .mov,
         transform: CGAffineTransform = .identity
+    ) async throws {
+        do {
+            try await writeEightBitVideo(
+                to: url,
+                times: times,
+                levels: levels,
+                width: width,
+                height: height,
+                expectedFrameRate: expectedFrameRate,
+                keyFrameInterval: keyFrameInterval,
+                codec: .h264,
+                fileType: fileType,
+                transform: transform
+            )
+        } catch FixtureError.unsupportedCodec where !requireH264 {
+            try await writeEightBitVideo(
+                to: url,
+                times: times,
+                levels: levels,
+                width: width,
+                height: height,
+                expectedFrameRate: expectedFrameRate,
+                keyFrameInterval: 1,
+                codec: .jpeg,
+                fileType: fileType,
+                transform: transform
+            )
+        }
+    }
+
+    private static func writeEightBitVideo(
+        to url: URL,
+        times: [Double],
+        levels: [UInt8],
+        width: Int,
+        height: Int,
+        expectedFrameRate: Int,
+        keyFrameInterval: Int,
+        codec: AVVideoCodecType,
+        fileType: AVFileType,
+        transform: CGAffineTransform
     ) async throws {
         precondition(!times.isEmpty && times.count == levels.count)
         let fileManager = FileManager.default
@@ -28,12 +71,14 @@ enum TestVideoBuilder {
         if fileManager.fileExists(atPath: url.path) {
             try fileManager.removeItem(at: url)
         }
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        let settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+        let writer = try AVAssetWriter(outputURL: url, fileType: fileType)
+        var settings: [String: Any] = [
+            AVVideoCodecKey: codec,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [
+        ]
+        if codec == .h264 {
+            settings[AVVideoCompressionPropertiesKey] = [
                 AVVideoAverageBitRateKey: 500_000,
                 AVVideoExpectedSourceFrameRateKey: expectedFrameRate,
                 AVVideoMaxKeyFrameIntervalKey: max(1, keyFrameInterval),
@@ -41,10 +86,12 @@ enum TestVideoBuilder {
                 AVVideoProfileLevelKey: keyFrameInterval > 1
                     ? AVVideoProfileLevelH264HighAutoLevel
                     : AVVideoProfileLevelH264BaselineAutoLevel,
-            ],
-        ]
+            ]
+        } else {
+            settings[AVVideoCompressionPropertiesKey] = [AVVideoQualityKey: 1.0]
+        }
         guard writer.canApply(outputSettings: settings, forMediaType: .video) else {
-            throw error("H.264 fixture settings are unavailable")
+            throw error("\(codec.rawValue) fixture settings are invalid on this test host")
         }
 
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
@@ -56,7 +103,6 @@ enum TestVideoBuilder {
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
             ]
         )
         guard writer.canAdd(input) else {
@@ -64,7 +110,11 @@ enum TestVideoBuilder {
         }
         writer.add(input)
         guard writer.startWriting() else {
-            throw writer.error ?? error("Could not start fixture writer")
+            throw codecWriterError(
+                writer.error,
+                codec: codec,
+                fallbackMessage: "Could not start fixture writer"
+            )
         }
         writer.startSession(atSourceTime: .zero)
         guard let pool = adaptor.pixelBufferPool else {
@@ -100,7 +150,11 @@ enum TestVideoBuilder {
         input.markAsFinished()
         await writer.finishWriting()
         guard writer.status == .completed else {
-            throw writer.error ?? error("Fixture writer did not complete")
+            throw codecWriterError(
+                writer.error,
+                codec: codec,
+                fallbackMessage: "Fixture writer did not complete"
+            )
         }
     }
 
@@ -143,7 +197,7 @@ enum TestVideoBuilder {
             ],
         ]
         guard writer.canApply(outputSettings: settings, forMediaType: .video) else {
-            throw FixtureError.unsupportedCodec("HEVC Main10 HLG encoding is unavailable")
+            throw error("HEVC Main10 HLG fixture settings are invalid on this test host")
         }
 
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
@@ -155,7 +209,6 @@ enum TestVideoBuilder {
                     kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
             ]
         )
         guard writer.canAdd(input) else {
@@ -163,7 +216,11 @@ enum TestVideoBuilder {
         }
         writer.add(input)
         guard writer.startWriting() else {
-            throw writer.error ?? error("Could not start HEVC fixture writer")
+            throw codecWriterError(
+                writer.error,
+                codec: .hevc,
+                fallbackMessage: "Could not start HEVC fixture writer"
+            )
         }
         writer.startSession(atSourceTime: .zero)
         guard let pool = adaptor.pixelBufferPool else {
@@ -199,7 +256,11 @@ enum TestVideoBuilder {
         input.markAsFinished()
         await writer.finishWriting()
         guard writer.status == .completed else {
-            throw writer.error ?? error("HEVC fixture writer did not complete")
+            throw codecWriterError(
+                writer.error,
+                codec: .hevc,
+                fallbackMessage: "HEVC fixture writer did not complete"
+            )
         }
     }
 
@@ -282,6 +343,27 @@ enum TestVideoBuilder {
                 row[x * 2 + 1] = neutralChroma
             }
         }
+    }
+
+    private static func codecWriterError(
+        _ underlyingError: Error?,
+        codec: AVVideoCodecType,
+        fallbackMessage: String
+    ) -> Error {
+        if let underlyingError {
+            let cocoaError = underlyingError as NSError
+            let mediaSessionError = cocoaError.userInfo[NSUnderlyingErrorKey] as? NSError
+            if cocoaError.domain == AVFoundationErrorDomain,
+               (cocoaError.code == AVError.Code.encoderNotFound.rawValue
+                    || (mediaSessionError?.domain == NSOSStatusErrorDomain
+                        && mediaSessionError?.code == Int(kVTInvalidSessionErr))) {
+                return FixtureError.unsupportedCodec(
+                    "\(codec.rawValue) encoding is unavailable on this test host"
+                )
+            }
+            return underlyingError
+        }
+        return error(fallbackMessage)
     }
 
     private static func error(_ message: String) -> NSError {

@@ -42,6 +42,35 @@ public class SplatPLYSceneReader: SplatSceneReader {
         self.validatesRenderEncoding = validatesRenderEncoding
     }
 
+    public static func isRetryableReadError(_ error: Swift.Error) -> Bool {
+        if error is SplatRenderEncodingValidationError || error is Error {
+            return false
+        }
+        guard let plyError = error as? PLYReader.Error else {
+            return true
+        }
+        switch plyError {
+        case .cannotOpenSource, .readError:
+            return true
+        case .headerStartMissing,
+             .headerEndMissing,
+             .headerFormatMissing,
+             .headerInvalidCharacters,
+             .headerUnknownKeyword,
+             .headerUnexpectedKeyword,
+             .headerInvalidLine,
+             .headerInvalidFileFormatType,
+             .headerUnknownPropertyType,
+             .headerInvalidListCountType,
+             .bodyInvalidStringForPropertyType,
+             .bodyMissingPropertyValuesInElement,
+             .bodyUnexpectedValuesInElement,
+             .unexpectedEndOfFile,
+             .internalConsistency:
+            return false
+        }
+    }
+
     public func read(to delegate: SplatSceneReaderDelegate) {
         read(to: delegate, shouldCancel: { false })
     }

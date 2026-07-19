@@ -966,7 +966,7 @@ final class FrameExtractorLogicTests: XCTestCase {
             64,
             64,
             format,
-            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
+            nil,
             &buffer
         )
         guard status == kCVReturnSuccess, let buffer else {

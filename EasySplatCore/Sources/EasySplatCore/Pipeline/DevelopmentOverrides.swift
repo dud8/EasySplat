@@ -50,8 +50,4 @@ public struct DevelopmentOverrides: Sendable, Equatable {
             benchmarkSeed: benchmarkSeed
         )
     }
-
-    public static func fromProcessEnvironment() -> DevelopmentOverrides {
-        fromEnvironment(RuntimeEnvironment.current)
-    }
 }

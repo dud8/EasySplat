@@ -64,6 +64,8 @@ final class MsplatRunnerTests: XCTestCase {
                     result: .init(exitCode: 0, terminationReason: .exit, stdout: stdout, stderr: ""),
                     onRun: { arguments in
                         XCTAssertEqual(argumentValue("--profile", in: arguments), argument)
+                        XCTAssertEqual(argumentValue("--iteration-limit", in: arguments), String(limit))
+                        XCTAssertEqual(argumentValue("--plateau-window", in: arguments), String(plateau))
                         XCTAssertEqual(argumentValue("--checkpoint", in: arguments), context.checkpoint.path)
                         XCTAssertEqual(argumentValue("--seed", in: arguments), "9")
                         XCTAssertEqual(
@@ -113,6 +115,49 @@ final class MsplatRunnerTests: XCTestCase {
             )
             XCTAssertTrue(FileManager.default.fileExists(atPath: context.output.deletingLastPathComponent().path))
         }
+    }
+
+    func testRunTrainForwardsExplicitReferenceBudget() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(
+                        profile: "high-detail",
+                        limit: 30_000,
+                        plateau: 30_000,
+                        seed: 42
+                    ),
+                    stderr: ""
+                ),
+                onRun: { arguments in
+                    XCTAssertEqual(argumentValue("--iteration-limit", in: arguments), "30000")
+                    XCTAssertEqual(argumentValue("--plateau-window", in: arguments), "30000")
+                    try? writeFixtureOutput(arguments: arguments)
+                }
+            ),
+        ])
+
+        let result = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            profile: .highDetail,
+            seed: 42,
+            iterationLimit: 30_000,
+            plateauWindow: 30_000,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(result.completedIteration, 30_000)
+        XCTAssertEqual(result.iterationLimit, 30_000)
+        XCTAssertEqual(result.plateauWindow, 30_000)
     }
 
     func testRunTrainPassesMemoryBudgetAndReportsExactRasterFallback() async throws {
@@ -447,6 +492,129 @@ final class MsplatRunnerTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
         XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testMetalAllocationUnavailableIsTypedAndPreservesExistingOutput() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let prior = Data("previous validated output".utf8)
+        try FileManager.default.createDirectory(
+            at: context.output.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try prior.write(to: context.output)
+        let requestedBytes: Int64 = 67_108_864
+        let currentAllocatedBytes: Int64 = 6_442_450_944
+        let requiredBytes = currentAllocatedBytes + requestedBytes
+        let recommendedWorkingSetBytes: Int64 = 38_654_705_664
+        let maximumBufferBytes: Int64 = 17_179_869_184
+        let stdout = """
+        {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(testGeometryDigest)","initial_gaussian_count":750,"input_digest":"\(testInputDigest)","iteration":0,"iteration_limit":7000,"memory_budget_bytes":\(testMemoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(testTrainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"budget_bytes":\(testMemoryBudgetBytes),"current_allocated_bytes":\(currentAllocatedBytes),"event":"metal_allocation_unavailable","intersection_count":4096,"iteration":12,"max_buffer_bytes":\(maximumBufferBytes),"recommended_working_set_bytes":\(recommendedWorkingSetBytes),"requested_bytes":\(requestedBytes),"required_bytes":\(requiredBytes),"schema_version":2,"sequence":2}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 71, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected transient Metal allocation failure")
+        } catch let failure as MsplatMetalAllocationUnavailable {
+            XCTAssertEqual(failure.iteration, 12)
+            XCTAssertEqual(failure.requestedBytes, requestedBytes)
+            XCTAssertEqual(failure.currentAllocatedBytes, currentAllocatedBytes)
+            XCTAssertEqual(failure.requiredBytes, requiredBytes)
+            XCTAssertEqual(failure.budgetBytes, testMemoryBudgetBytes)
+            XCTAssertEqual(failure.recommendedWorkingSetBytes, recommendedWorkingSetBytes)
+            XCTAssertEqual(failure.maximumBufferBytes, maximumBufferBytes)
+            XCTAssertEqual(failure.intersectionCount, 4_096)
+        }
+        XCTAssertEqual(try Data(contentsOf: context.output), prior)
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testSetupMetalAllocationUnavailableIsTypedBeforeStartedEvent() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let requestedBytes: Int64 = 33_554_432
+        let currentAllocatedBytes: Int64 = 536_870_912
+        let stdout = """
+        {"budget_bytes":\(testMemoryBudgetBytes),"current_allocated_bytes":\(currentAllocatedBytes),"event":"metal_allocation_unavailable","iteration":0,"max_buffer_bytes":17179869184,"recommended_working_set_bytes":38654705664,"requested_bytes":\(requestedBytes),"required_bytes":\(currentAllocatedBytes + requestedBytes),"schema_version":2,"sequence":1}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 71, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected setup Metal allocation failure")
+        } catch let failure as MsplatMetalAllocationUnavailable {
+            XCTAssertEqual(failure.iteration, 0)
+            XCTAssertEqual(failure.requestedBytes, requestedBytes)
+            XCTAssertEqual(failure.currentAllocatedBytes, currentAllocatedBytes)
+            XCTAssertNil(failure.intersectionCount)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testMetalAllocationUnavailableRequiresOperatingSystemExitStatus() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let stdout = """
+        {"budget_bytes":\(testMemoryBudgetBytes),"current_allocated_bytes":536870912,"event":"metal_allocation_unavailable","iteration":0,"max_buffer_bytes":17179869184,"recommended_working_set_bytes":38654705664,"requested_bytes":33554432,"required_bytes":570425344,"schema_version":2,"sequence":1}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 75, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected event/exit mismatch")
+        } catch is MsplatMetalAllocationUnavailable {
+            XCTFail("An allocation event with the budget-failure status cannot be trusted")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("status 71"))
+        }
     }
 
     func testDroppedIntersectionsRejectCompletionBeforeReplacingExistingOutput() async throws {
@@ -1921,6 +2089,10 @@ private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> Train
         trainerBuildDigest: receipt.trainerBuildDigest,
         inputDigest: receipt.inputDigest,
         geometryDigest: receipt.geometryDigest,
+        datasetDerivation: makeMsplatDatasetDerivation(
+            inputDigest: receipt.inputDigest,
+            geometryDigest: receipt.geometryDigest
+        ),
         detailProfile: .balanced,
         iterationLimit: 7_000,
         plateauWindow: 800,
@@ -1933,6 +2105,7 @@ private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> Train
         elapsedSeconds: nil,
         peakMemoryBytes: receipt.peakMemoryBytes,
         memoryBudgetBytes: receipt.memoryBudgetBytes,
+        resourceAdmission: makeTestTrainingResourceAdmission(),
         rasterFallbackCount: receipt.rasterFallbackCount,
         rasterExactFallbackElapsedSeconds: receipt.rasterExactFallbackElapsedSeconds,
         rasterExactBufferGrowthCount: receipt.rasterExactBufferGrowthCount,

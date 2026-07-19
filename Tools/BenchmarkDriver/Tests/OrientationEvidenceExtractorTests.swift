@@ -112,6 +112,56 @@ final class OrientationEvidenceExtractorTests: XCTestCase {
         }
     }
 
+    func testPreOpenGeometrySwapCannotSubstituteAuthenticatedExecutionBytes() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertThrowsError(
+            try OrientationEvidenceExtractor.extract(
+                geometryManifestURL: fixture.manifest,
+                expectedGeometryManifestSHA256: "sha256:" + String(repeating: "0", count: 64),
+                candidateImagesURL: fixture.candidateImages,
+                expectedCandidateImagesSHA256: try MetalOffscreenRenderer.sha256(
+                    fileAt: fixture.candidateImages
+                ),
+                groundTruthPosesURL: fixture.groundTruthPoses,
+                expectedGroundTruthPosesSHA256: fixture.groundTruthSHA256,
+                orientationLabelURL: fixture.label,
+                expectedOrientationLabelSHA256: fixture.labelSHA256
+            )
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("geometry-manifest digest"),
+                error.localizedDescription
+            )
+        }
+    }
+
+    func testPreOpenCandidateImagesSwapCannotSubstituteAuthenticatedGeometryBytes() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertThrowsError(
+            try OrientationEvidenceExtractor.extract(
+                geometryManifestURL: fixture.manifest,
+                expectedGeometryManifestSHA256: try MetalOffscreenRenderer.sha256(
+                    fileAt: fixture.manifest
+                ),
+                candidateImagesURL: fixture.candidateImages,
+                expectedCandidateImagesSHA256: "sha256:" + String(repeating: "0", count: 64),
+                groundTruthPosesURL: fixture.groundTruthPoses,
+                expectedGroundTruthPosesSHA256: fixture.groundTruthSHA256,
+                orientationLabelURL: fixture.label,
+                expectedOrientationLabelSHA256: fixture.labelSHA256
+            )
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("candidate images digest"),
+                error.localizedDescription
+            )
+        }
+    }
+
     func testGroundTruthPoseDigestMustMatchPinnedReference() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -119,7 +169,13 @@ final class OrientationEvidenceExtractorTests: XCTestCase {
         XCTAssertThrowsError(
             try OrientationEvidenceExtractor.extract(
                 geometryManifestURL: fixture.manifest,
+                expectedGeometryManifestSHA256: try MetalOffscreenRenderer.sha256(
+                    fileAt: fixture.manifest
+                ),
                 candidateImagesURL: fixture.candidateImages,
+                expectedCandidateImagesSHA256: try MetalOffscreenRenderer.sha256(
+                    fileAt: fixture.candidateImages
+                ),
                 groundTruthPosesURL: fixture.groundTruthPoses,
                 expectedGroundTruthPosesSHA256: "sha256:" + String(repeating: "0", count: 64),
                 orientationLabelURL: fixture.label,
@@ -136,7 +192,13 @@ final class OrientationEvidenceExtractorTests: XCTestCase {
         XCTAssertThrowsError(
             try OrientationEvidenceExtractor.extract(
                 geometryManifestURL: fixture.manifest,
+                expectedGeometryManifestSHA256: try MetalOffscreenRenderer.sha256(
+                    fileAt: fixture.manifest
+                ),
                 candidateImagesURL: fixture.candidateImages,
+                expectedCandidateImagesSHA256: try MetalOffscreenRenderer.sha256(
+                    fileAt: fixture.candidateImages
+                ),
                 groundTruthPosesURL: fixture.groundTruthPoses,
                 expectedGroundTruthPosesSHA256: fixture.groundTruthSHA256,
                 orientationLabelURL: fixture.label,
@@ -157,7 +219,13 @@ final class OrientationEvidenceExtractorTests: XCTestCase {
         XCTAssertThrowsError(
             try OrientationEvidenceExtractor.extract(
                 geometryManifestURL: fixture.manifest,
+                expectedGeometryManifestSHA256: try MetalOffscreenRenderer.sha256(
+                    fileAt: fixture.manifest
+                ),
                 candidateImagesURL: fixture.candidateImages,
+                expectedCandidateImagesSHA256: try MetalOffscreenRenderer.sha256(
+                    fileAt: fixture.candidateImages
+                ),
                 groundTruthPosesURL: fixture.groundTruthPoses,
                 expectedGroundTruthPosesSHA256: fixture.groundTruthSHA256,
                 orientationLabelURL: fixture.label,
@@ -371,7 +439,13 @@ final class OrientationEvidenceExtractorTests: XCTestCase {
     private func extract(_ fixture: Fixture) throws -> OrientationBenchmarkEvidence {
         try OrientationEvidenceExtractor.extract(
             geometryManifestURL: fixture.manifest,
+            expectedGeometryManifestSHA256: try MetalOffscreenRenderer.sha256(
+                fileAt: fixture.manifest
+            ),
             candidateImagesURL: fixture.candidateImages,
+            expectedCandidateImagesSHA256: try MetalOffscreenRenderer.sha256(
+                fileAt: fixture.candidateImages
+            ),
             groundTruthPosesURL: fixture.groundTruthPoses,
             expectedGroundTruthPosesSHA256: fixture.groundTruthSHA256,
             orientationLabelURL: fixture.label,

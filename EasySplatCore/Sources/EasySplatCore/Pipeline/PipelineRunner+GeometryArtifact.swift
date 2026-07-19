@@ -1,23 +1,28 @@
 import Foundation
 
 extension PipelineRunner {
-    func validatedGeometryMeasurement(
+    func validatedConditionedGeometry(
         modelDirectory: URL,
         selectedFrames: [URL],
         minimumRegisteredViewCount: Int? = nil,
         requireStrongObservationCoverage: Bool
-    ) throws -> (
-        residuals: ColmapResidualAnalyzer.Result,
-        snapshot: GeometryModelSnapshot.Verified
-    ) {
-        let snapshot = try GeometryModelSnapshot.capture(in: modelDirectory)
-        let residuals: ColmapResidualAnalyzer.Result
+    ) throws -> GeometryConditioningAnalysis {
+        let analysis: GeometryConditioningAnalysis
         do {
-            residuals = try ColmapResidualAnalyzer.analyze(modelDirectory: modelDirectory)
-            try GeometryModelSnapshot.validate(snapshot, at: modelDirectory)
+            analysis = try ColmapResidualAnalyzer.analyzeConditioning(
+                modelDirectory: modelDirectory,
+                maximumRayPairEvaluations:
+                    GeometryConditioningArtifact.defaultMaximumRayPairEvaluations,
+                checkCancellation: { try Task.checkCancellation() }
+            )
+        } catch let failure as GeometryConditioningFailure {
+            throw PipelineError.geometryConditioningRejected(failure)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw PipelineError.geometryResidualsUnavailable(error.localizedDescription)
         }
+        let residuals = analysis.residuals
         let requiredRegisteredViews: Int
         if let minimumRegisteredViewCount {
             guard minimumRegisteredViewCount > 0,
@@ -67,7 +72,40 @@ extension PipelineRunner {
                 p90: residuals.p90PixelResidual
             )
         }
-        return (residuals, snapshot)
+        return analysis
+    }
+
+    func requirePublishedGeometry(
+        _ published: GeometryConditioningAnalysis,
+        matches accepted: GeometryConditioningAnalysis,
+        at modelDirectory: URL
+    ) throws {
+        do {
+            try GeometryModelSnapshot.validate(accepted.modelSnapshot, at: modelDirectory)
+            try GeometryModelSnapshot.validate(published.modelSnapshot, at: modelDirectory)
+        } catch {
+            throw PipelineError.geometryResidualsUnavailable(
+                "The published geometry model changed after acceptance"
+            )
+        }
+        let expectedNames = ["cameras.txt", "images.txt", "points3D.txt"]
+        let acceptedClosure = GeometryArtifactStore.modelClosureDigest(
+            accepted.modelSnapshot.modelHashes,
+            expectedNames: expectedNames
+        )
+        let publishedClosure = GeometryArtifactStore.modelClosureDigest(
+            published.modelSnapshot.modelHashes,
+            expectedNames: expectedNames
+        )
+        guard accepted.residuals == published.residuals,
+              accepted.measurement == published.measurement,
+              accepted.modelSnapshot.modelHashes == published.modelSnapshot.modelHashes,
+              acceptedClosure != nil,
+              acceptedClosure == publishedClosure else {
+            throw PipelineError.geometryResidualsUnavailable(
+                "The published geometry did not exactly match the accepted candidate"
+            )
+        }
     }
 
     func persistMeasuredGeometryArtifact(
@@ -78,24 +116,46 @@ extension PipelineRunner {
         acceptedDa3ModelSubdirectory: String?,
         selectedFrames: [URL],
         selectedFrameManifest: [SelectedFrameMapping],
+        inputSnapshots: [RuntimeInputSnapshotLease.Snapshot],
         peakMemoryBytes: Int64,
         pairGraph: PairGraphArtifact,
         mapping: MappingArtifact,
         workerExecution: GeometryWorkerExecutionArtifact,
-        acceptedReconstructionSummary: ReconstructionSummary?,
+        acceptedAnalysis: GeometryConditioningAnalysis,
         currentMappingDurationSeconds: () -> TimeInterval?
     ) throws {
         let modelDirectory = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         // The artifact contract uses COLMAP's text form so residuals remain inspectable
         // and model files remain hashable across trainer versions.
         try requireTextSparseModelFiles(at: modelDirectory)
-        let acceptedMeasurement = try validatedGeometryMeasurement(
-            modelDirectory: modelDirectory,
-            selectedFrames: selectedFrames,
-            requireStrongObservationCoverage: acceptedDa3ModelSubdirectory != nil
+        try requirePublishedGeometry(
+            acceptedAnalysis,
+            matches: acceptedAnalysis,
+            at: modelDirectory
         )
 
         let orderedFrames = selectedFrames.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let cameraGroupingEvidence = try Self.colmapCameraGroupingEvidence(
+            imageNames: selectedFrames.map(\.lastPathComponent),
+            manifest: selectedFrameManifest
+        )
+        let expectedCameraInitialization = try ColmapCameraInitializationReceipt.resolve(
+            plan: resolvedPlan,
+            detailProfile: metadata.requestedRunOptions.detailProfile,
+            selectedImages: selectedFrames
+        )
+        let featureEvidence = try ColmapFeatureEvidenceStore.loadVerified(
+            from: paths.colmapFeatureEvidenceURL,
+            expectedImageNames: selectedFrames.map(\.lastPathComponent),
+            expectedCameraEvidence: cameraGroupingEvidence,
+            expectedCameraGroupingMode: Self.colmapCameraGroupingMode(
+                cameraGrouping: resolvedPlan.cameraGrouping,
+                evidence: cameraGroupingEvidence
+            ),
+            expectedCameraInitializationReceipt: expectedCameraInitialization,
+            databaseURL: paths.colmapDatabaseURL,
+            projectPaths: paths
+        )
         let mappingByName = Dictionary(
             selectedFrameManifest.map { ($0.outputFileName, $0) },
             uniquingKeysWith: { first, _ in first }
@@ -104,12 +164,9 @@ extension PipelineRunner {
         guard peakMemoryBytes > 0 else {
             throw PipelineError.geometryResidualsUnavailable("Peak resident memory could not be measured")
         }
-        let fallbackReason = resolvedPlan.routeIdentifier == SfmBackend.da3.rawValue
-            && !mapper.lowercased().contains("da3")
-            ? "learned geometry did not pass; used classical compatibility solve"
-            : nil
         let provenance = try geometryProvenance(
-            acceptedDa3ModelSubdirectory: acceptedDa3ModelSubdirectory
+            acceptedDa3ModelSubdirectory: acceptedDa3ModelSubdirectory,
+            colmapRuntimeClosure: workerExecution.colmapRuntimeClosure
         )
         let solverRevision = provenance.solver.revision.prefix(7)
         let solverVersion = "\(mapper); COLMAP \(provenance.solver.version) (git \(solverRevision))"
@@ -170,7 +227,7 @@ extension PipelineRunner {
         let allowCameraUpFallback = resolvedPlan.pairingPolicy == .orderedContinuous
             || resolvedPlan.pairingPolicy == .orderedWalkthrough
         let orientation = CanonicalOrientationEstimator.estimate(
-            cameras: acceptedMeasurement.residuals.cameraSamples,
+            cameras: acceptedAnalysis.residuals.cameraSamples,
             orderedImageNames: orderedFrames.map(\.lastPathComponent),
             orderedInput: isOrderedInput,
             allowCameraUpFallback: allowCameraUpFallback,
@@ -178,10 +235,18 @@ extension PipelineRunner {
         )
         let orientationEstimationDuration = orientationEstimationClock.now - orientationEstimationStart
         try Task.checkCancellation()
-        try GeometryModelSnapshot.validate(acceptedMeasurement.snapshot, at: modelDirectory)
-        let sourceSnapshot = acceptedMeasurement.snapshot
+        try GeometryModelSnapshot.validate(acceptedAnalysis.modelSnapshot, at: modelDirectory)
+        let sourceSnapshot = acceptedAnalysis.modelSnapshot
         let sourceModelHashes = sourceSnapshot.modelHashes
-        let residuals = acceptedMeasurement.residuals
+        guard let sourceModelClosureSHA256 = GeometryArtifactStore.modelClosureDigest(
+            sourceModelHashes,
+            expectedNames: ["cameras.txt", "images.txt", "points3D.txt"]
+        ) else {
+            throw PipelineError.geometryResidualsUnavailable(
+                "The accepted geometry model closure could not be measured"
+            )
+        }
+        let residuals = acceptedAnalysis.residuals
         var timings = Dictionary(uniqueKeysWithValues: (metadata.stageTimings ?? []).map {
             ($0.stage.rawValue, $0.durationSeconds)
         })
@@ -198,7 +263,9 @@ extension PipelineRunner {
             solverVersion: solverVersion,
             runtimeVersion: runtimeVersion,
             modelVersion: modelVersion,
-            inputDigest: try GeometryArtifactStore.inputDigest(projectPaths: paths),
+            inputDigest: try GeometryArtifactStore.inputDigest(
+                snapshots: inputSnapshots
+            ),
             selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
                 orderedImageNames: orderedFrames.map(\.lastPathComponent),
                 projectPaths: paths
@@ -212,17 +279,23 @@ extension PipelineRunner {
             scaleType: "arbitrary-sim3",
             cameraModel: residuals.cameraModel,
             cameraGrouping: resolvedPlan.cameraGrouping,
+            cameraGroupingReceipt: featureEvidence.cameraGroupingReceipt,
+            cameraInitializationReceipt: featureEvidence.cameraInitializationReceipt,
+            featureDatabaseDigest: featureEvidence.featureDatabaseDigest,
             registeredViewCount: residuals.registeredViewCount,
             totalViewCount: orderedFrames.count,
-            trackCount: residuals.observationCount,
+            observationCount: residuals.observationCount,
             pointCount: residuals.pointCount,
             residualProvenance: residuals.provenance,
             medianPixelResidual: residuals.medianPixelResidual,
             p90PixelResidual: residuals.p90PixelResidual,
+            conditioning: GeometryConditioningArtifact(
+                sourceModelClosureSHA256: sourceModelClosureSHA256,
+                measurement: acceptedAnalysis.measurement
+            ),
             timings: timings,
             peakMemoryBytes: peakMemoryBytes,
             modelHashes: sourceModelHashes,
-            fallbackReason: fallbackReason,
             provenance: provenance,
             workerExecution: workerExecution,
             pairGraph: pairGraph,
@@ -230,35 +303,23 @@ extension PipelineRunner {
             learnedPointInitializer: learnedPointInitializer,
             canonicalOrientation: orientation.artifact
         )
-        let reconstruction = ReconstructionSummary(
-            mapper: mapper,
-            capturedAt: acceptedReconstructionSummary?.capturedAt
-                ?? metadata.reconstruction?.capturedAt
-                ?? Date(),
-            registeredImages: residuals.registeredViewCount,
-            totalImages: orderedFrames.count,
-            meanReprojectionError: residuals.meanPixelResidual,
-            pointCount: residuals.pointCount,
-            observationCount: residuals.observationCount,
-            meanTrackLength: Double(residuals.observationCount)
-                / Double(residuals.pointCount)
-        )
         try Task.checkCancellation()
         var persistedMetadata = metadata
-        persistedMetadata.reconstruction = reconstruction
         persistedMetadata.geometryRecovery = nil
         try GeometryArtifactStore.persist(
             artifact,
             metadata: &persistedMetadata,
             paths: paths,
             measuredResiduals: residuals,
-            verifiedSourceSnapshot: sourceSnapshot
+            verifiedSourceSnapshot: sourceSnapshot,
+            measuredAnalysis: acceptedAnalysis
         )
         metadata = persistedMetadata
     }
 
     private func geometryProvenance(
-        acceptedDa3ModelSubdirectory: String?
+        acceptedDa3ModelSubdirectory: String?,
+        colmapRuntimeClosure: ColmapRuntimeClosureEvidence
     ) throws -> GeometryProvenance {
         let toolchain = config.toolchain
         let toolchainVersion = toolchain.root.lastPathComponent
@@ -272,7 +333,12 @@ extension PipelineRunner {
             at: colmapReceiptURL,
             label: "COLMAP"
         )
-        let colmapSHA256 = try GeometryArtifactStore.sha256(of: toolchain.colmap)
+        guard colmapRuntimeClosure.isValid,
+              let colmapSHA256 = colmapRuntimeClosure.sha256(for: "bin/colmap") else {
+            throw PipelineError.geometryProvenanceUnavailable(
+                "COLMAP runtime closure was invalid"
+            )
+        }
         guard colmapReceipt.toolchainName == "colmap",
               !colmapReceipt.sourceVersion.isEmpty,
               !colmapReceipt.sourceCommit.isEmpty,
@@ -285,7 +351,7 @@ extension PipelineRunner {
             identifier: "colmap",
             version: colmapReceipt.sourceVersion,
             revision: colmapReceipt.sourceCommit,
-            payloadSHA256: colmapSHA256
+            payloadSHA256: colmapRuntimeClosure.closureSHA256
         )
 
         guard let acceptedDa3ModelSubdirectory else {
@@ -302,7 +368,7 @@ extension PipelineRunner {
         case "DA3-BASE":
             modelBundle = toolchain.da3.modelBundle
         case "DA3-SMALL":
-            modelBundle = toolchain.da3.fallbackModelBundle
+            modelBundle = toolchain.da3.smallModelBundle
         default:
             throw PipelineError.geometryProvenanceUnavailable(
                 "DA3 selected an unrecognized model \(acceptedDa3ModelSubdirectory)"

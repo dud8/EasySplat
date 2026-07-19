@@ -180,6 +180,31 @@ final class ViewerCameraStateTests: XCTestCase {
         XCTAssertLessThan(vertical.pitch, .pi / 2)
     }
 
+    func testFlipHeadingMatchesTheRepresentedCameraAtNadirThresholds() {
+        let directions = [
+            SIMD3<Float>(0, -1, 0),
+            SIMD3<Float>(5e-6, -1, 5e-6),
+            SIMD3<Float>(2e-5, -1, 2e-5),
+            SIMD3<Float>(5e-5, -1, 5e-5),
+            SIMD3<Float>(2e-4, -1, 2e-4),
+        ]
+
+        for direction in directions {
+            let state = makeState(opening: direction)
+            let representedHorizontal = SIMD3<Float>(
+                state.forwardDirection.x,
+                0,
+                state.forwardDirection.z
+            )
+            let expected = simd_normalize(representedHorizontal)
+            let heading = ViewerCameraState.stableHorizontalHeading(for: direction)
+
+            assertVector(heading, expected, accuracy: 1e-6)
+            XCTAssertEqual(heading.y, 0)
+            XCTAssertEqual(simd_length(heading), 1, accuracy: 1e-6)
+        }
+    }
+
     func testExtremeFiniteInputsRemainUsable() throws {
         let hugeDirection = SIMD3<Float>(
             .greatestFiniteMagnitude,
@@ -207,6 +232,22 @@ final class ViewerCameraStateTests: XCTestCase {
                 at: CGPoint(x: state.viewportSize.width / 2, y: state.viewportSize.height / 2)
             )
         )
+        assertVectorIsFinite(state.cameraPosition)
+    }
+
+    func testUnrepresentableFiniteTargetFallsBackToAUsableCamera() {
+        let state = ViewerCameraState(
+            target: SIMD3<Float>(.greatestFiniteMagnitude, 0, 0),
+            sceneRadius: .greatestFiniteMagnitude,
+            openingDirection: SIMD3<Float>(0, 0, -1)
+        )
+
+        assertVector(state.target, .zero)
+        assertVector(state.sceneCenter, .zero)
+        assertVectorIsFinite(state.cameraPosition)
+        XCTAssertTrue(state.clipPlanes.near.isFinite)
+        XCTAssertTrue(state.clipPlanes.far.isFinite)
+        XCTAssertGreaterThan(state.clipPlanes.far, state.clipPlanes.near)
     }
 
     func testLateBoundsDoNotOverrideUserInteraction() {
@@ -246,6 +287,70 @@ final class ViewerCameraStateTests: XCTestCase {
         assertVector(state.target, userTarget)
         XCTAssertEqual(state.distance, userDistance, accuracy: 1e-6)
         XCTAssertNotEqual(state.distance, state.fittedDistance)
+    }
+
+    func testManualFitRearmsResponsiveViewportFittingUntilTheNextInteraction() {
+        var state = makeState(viewport: CGSize(width: 1_200, height: 800), radius: 5)
+        state.pan(screenDelta: SIMD2<Float>(40, -15))
+        state.zoomIn()
+
+        state.fit()
+        state.updateViewportSize(CGSize(width: 400, height: 800))
+
+        XCTAssertEqual(state.distance, state.fittedDistance, accuracy: 1e-5)
+        let fittedDistance = state.distance
+        state.orbit(deltaYaw: 0.2, deltaPitch: 0)
+        state.updateViewportSize(CGSize(width: 1_200, height: 800))
+        XCTAssertEqual(state.distance, fittedDistance, accuracy: 1e-6)
+        XCTAssertNotEqual(state.distance, state.fittedDistance)
+    }
+
+    func testNoOpManualFitStillRearmsResponsiveViewportFitting() {
+        var state = makeState(viewport: CGSize(width: 1_200, height: 800), radius: 5)
+        state.orbit(deltaYaw: 0.2, deltaPitch: 0.1)
+        let revisionBeforeFit = state.interactionRevision
+        let distanceBeforeFit = state.distance
+
+        state.fit()
+
+        XCTAssertEqual(state.interactionRevision, revisionBeforeFit)
+        XCTAssertEqual(state.distance, distanceBeforeFit)
+        state.updateViewportSize(CGSize(width: 400, height: 800))
+        XCTAssertEqual(state.distance, state.fittedDistance, accuracy: 1e-5)
+        XCTAssertNotEqual(state.distance, distanceBeforeFit)
+    }
+
+    func testManualResetRearmsResponsiveViewportFittingUntilTheNextInteraction() {
+        var state = makeState(viewport: CGSize(width: 1_200, height: 800), radius: 5)
+        state.orbit(deltaYaw: 0.6, deltaPitch: 0.2)
+        state.zoomOut()
+
+        state.reset()
+        state.updateViewportSize(CGSize(width: 400, height: 800))
+
+        XCTAssertEqual(state.distance, state.fittedDistance, accuracy: 1e-5)
+        let fittedDistance = state.distance
+        state.zoomIn()
+        state.updateViewportSize(CGSize(width: 1_200, height: 800))
+        XCTAssertEqual(state.distance, fittedDistance * 0.85, accuracy: 1e-5)
+        XCTAssertNotEqual(state.distance, state.fittedDistance)
+    }
+
+    func testNoOpManualResetStillRearmsResponsiveViewportFitting() {
+        var state = makeState(viewport: CGSize(width: 1_200, height: 800), radius: 5)
+        state.orbit(deltaYaw: 0.25, deltaPitch: 0)
+        state.orbit(deltaYaw: -0.25, deltaPitch: 0)
+        XCTAssertEqual(state.yaw, 0)
+        let revisionBeforeReset = state.interactionRevision
+        let distanceBeforeReset = state.distance
+
+        state.reset()
+
+        XCTAssertEqual(state.interactionRevision, revisionBeforeReset)
+        XCTAssertEqual(state.distance, distanceBeforeReset)
+        state.updateViewportSize(CGSize(width: 400, height: 800))
+        XCTAssertEqual(state.distance, state.fittedDistance, accuracy: 1e-5)
+        XCTAssertNotEqual(state.distance, distanceBeforeReset)
     }
 
     func testBoundsAutoFitWhenNoInteractionOccurred() {
@@ -292,14 +397,54 @@ final class ViewerCameraStateTests: XCTestCase {
         XCTAssertEqual(state, original)
     }
 
-    func testLateBoundsCanUpdateScaleWithoutMovingAnInteractedCamera() {
+    func testUnrepresentableFiniteBoundsAreRejectedWithoutPoisoningTheCamera() {
+        var state = makeState()
+        state.orbit(deltaYaw: 0.3, deltaPitch: -0.2)
+        state.pan(screenDelta: SIMD2<Float>(15, -8))
+        let original = state
+        let impossibleCenter = SIMD3<Float>(.greatestFiniteMagnitude, 0, 0)
+
+        XCTAssertFalse(
+            state.applyBounds(
+                center: impossibleCenter,
+                radius: .greatestFiniteMagnitude,
+                openingDirection: nil,
+                ifInteractionRevisionMatches: state.interactionRevision
+            )
+        )
+        XCTAssertEqual(state, original)
+        assertVectorIsFinite(state.cameraPosition)
+
+        XCTAssertFalse(
+            state.adoptBoundsPreservingView(
+                center: impossibleCenter,
+                radius: .greatestFiniteMagnitude,
+                openingDirection: nil
+            )
+        )
+        XCTAssertEqual(state, original)
+        assertVectorIsFinite(state.cameraPosition)
+
+        XCTAssertFalse(
+            state.applyBounds(
+                center: .zero,
+                radius: .greatestFiniteMagnitude,
+                openingDirection: nil,
+                ifInteractionRevisionMatches: state.interactionRevision
+            )
+        )
+        XCTAssertEqual(state, original)
+        assertVectorIsFinite(state.cameraPosition)
+    }
+
+    func testLateBoundsPreserveInteractedViewInSceneRelativeCoordinates() {
         var state = makeState(target: .zero, radius: 1)
         state.orbit(deltaYaw: 0.4, deltaPitch: -0.2)
         state.pan(screenDelta: SIMD2<Float>(25, -10))
-        let target = state.target
+        let targetOffsetInRadii = state.target / state.sceneRadius
         let yaw = state.yaw
         let pitch = state.pitch
-        let distance = state.distance
+        let distanceInRadii = state.distance / state.sceneRadius
         let revision = state.interactionRevision
         let center = SIMD3<Float>(8, 9, 10)
         let opening = simd_normalize(SIMD3<Float>(1, 0.2, -3))
@@ -312,10 +457,11 @@ final class ViewerCameraStateTests: XCTestCase {
             )
         )
 
-        assertVector(state.target, target)
+        assertVector(state.sceneCenter, center)
+        assertVector(state.target, center + targetOffsetInRadii * 40, accuracy: 1e-4)
         XCTAssertEqual(state.yaw, yaw)
         XCTAssertEqual(state.pitch, pitch)
-        XCTAssertEqual(state.distance, distance)
+        XCTAssertEqual(state.distance, distanceInRadii * 40, accuracy: 1e-4)
         XCTAssertEqual(state.interactionRevision, revision)
         XCTAssertEqual(state.sceneRadius, 40)
         assertVector(state.openingDirection, opening, accuracy: 1e-5)
@@ -325,29 +471,69 @@ final class ViewerCameraStateTests: XCTestCase {
         XCTAssertEqual(state.distance, state.fittedDistance, accuracy: 1e-5)
     }
 
-    func testLateExtremeBoundsPreserveInteractedCameraDistanceExactly() {
+    func testLateExtremeBoundsRemainFiniteAndPreserveRelativeView() {
         for radius: Float in [1e-6, 1e6] {
             var state = makeState(target: .zero, radius: 1)
             state.zoomIn()
             state.orbit(deltaYaw: 0.4, deltaPitch: -0.2)
             state.pan(screenDelta: SIMD2<Float>(25, -10))
             let interacted = state
+            let targetOffsetInRadii = interacted.target / interacted.sceneRadius
+            let distanceInRadii = interacted.distance / interacted.sceneRadius
+            let center = SIMD3<Float>(8, 9, 10)
 
             XCTAssertTrue(
                 state.adoptBoundsPreservingView(
-                    center: SIMD3<Float>(8, 9, 10),
+                    center: center,
                     radius: radius,
                     openingDirection: SIMD3<Float>(0, 0, -1)
                 )
             )
 
-            assertVector(state.target, interacted.target)
+            assertVector(
+                state.target,
+                center + targetOffsetInRadii * radius,
+                accuracy: max(1e-6, radius * 1e-4)
+            )
             XCTAssertEqual(state.yaw, interacted.yaw)
             XCTAssertEqual(state.pitch, interacted.pitch)
-            XCTAssertEqual(state.distance, interacted.distance)
+            XCTAssertEqual(
+                state.distance,
+                distanceInRadii * radius,
+                accuracy: max(1e-9, radius * 1e-4)
+            )
             XCTAssertEqual(state.interactionRevision, interacted.interactionRevision)
             XCTAssertEqual(state.sceneRadius, radius)
+            XCTAssertTrue(state.target.x.isFinite)
+            XCTAssertTrue(state.target.y.isFinite)
+            XCTAssertTrue(state.target.z.isFinite)
+            XCTAssertTrue(state.distance.isFinite)
+            assertVectorIsFinite(state.cameraPosition)
+            XCTAssertTrue(state.clipPlanes.near.isFinite)
+            XCTAssertTrue(state.clipPlanes.far.isFinite)
+            XCTAssertGreaterThan(state.clipPlanes.far, state.clipPlanes.near)
         }
+    }
+
+    func testLateBoundsClippingIncludesSceneAfterRelativePanIsPreserved() {
+        var state = makeState(target: .zero, radius: 1)
+        state.pan(screenDelta: SIMD2<Float>(-400, 250))
+        state.zoomOut()
+        let center = SIMD3<Float>(1_000_000, -2_000_000, 3_000_000)
+
+        XCTAssertTrue(
+            state.adoptBoundsPreservingView(
+                center: center,
+                radius: 750_000,
+                openingDirection: nil
+            )
+        )
+
+        let cameraToSceneCenter = simd_length(state.cameraPosition - center)
+        XCTAssertGreaterThanOrEqual(
+            state.clipPlanes.far,
+            cameraToSceneCenter + state.sceneRadius
+        )
     }
 
     private func makeState(
@@ -380,5 +566,15 @@ final class ViewerCameraStateTests: XCTestCase {
         XCTAssertEqual(actual.x, expected.x, accuracy: accuracy, file: file, line: line)
         XCTAssertEqual(actual.y, expected.y, accuracy: accuracy, file: file, line: line)
         XCTAssertEqual(actual.z, expected.z, accuracy: accuracy, file: file, line: line)
+    }
+
+    private func assertVectorIsFinite(
+        _ value: SIMD3<Float>,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(value.x.isFinite, file: file, line: line)
+        XCTAssertTrue(value.y.isFinite, file: file, line: line)
+        XCTAssertTrue(value.z.isFinite, file: file, line: line)
     }
 }

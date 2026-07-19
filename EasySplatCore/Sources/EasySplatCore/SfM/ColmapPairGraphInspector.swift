@@ -93,6 +93,8 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
     let featureDatabaseDigest: String
     let matchingDatabaseDigest: String
     let descriptorlessImageNames: [String]
+    private(set) var attemptedPairs: [ColmapScheduledPair] = []
+    private(set) var rawMatchedPairs: [ColmapScheduledPair] = []
     private(set) var verifiedGraph = ColmapVerifiedGraphSnapshot(
         verifiedPairs: [],
         components: []
@@ -407,19 +409,28 @@ struct ColmapPairGraphInspector: Sendable {
             }
         }
 
+        let attemptedPairIDs = Set(rawRows.keys).union(verifiedRows.keys)
+        let rawMatchedPairIDs = Set(rawRows.compactMap { pairID, rows in
+            rows > 0 ? pairID : nil
+        })
         let verifiedPairIDs = Set(
             verifiedRows.compactMap { pairID, rows in
                 rows >= ColmapMappingPolicy.minimumPairInlierCount ? pairID : nil
             })
-        let verifiedPairs = validatedSchedule.pairs.filter { pair in
-            guard let pairID = pairIDByNames[NameEdge(
-                pair.firstImageName,
-                pair.secondImageName
-            )] else {
-                return false
+        func scheduledPairs(with pairIDs: Set<Int64>) -> [ColmapScheduledPair] {
+            validatedSchedule.pairs.filter { pair in
+                guard let pairID = pairIDByNames[NameEdge(
+                    pair.firstImageName,
+                    pair.secondImageName
+                )] else {
+                    return false
+                }
+                return pairIDs.contains(pairID)
             }
-            return verifiedPairIDs.contains(pairID)
         }
+        let attemptedPairs = scheduledPairs(with: attemptedPairIDs)
+        let rawMatchedPairs = scheduledPairs(with: rawMatchedPairIDs)
+        let verifiedPairs = scheduledPairs(with: verifiedPairIDs)
         let descriptorlessImageNames = validatedSchedule.imageNames.filter { name in
             imageIDByName[name].map(descriptorlessImageIDs.contains) ?? false
         }
@@ -431,8 +442,8 @@ struct ColmapPairGraphInspector: Sendable {
         let databaseDigests = try ColmapDatabaseDigester.digests(in: database)
         inspection = ColmapPairGraphInspection(
             scheduledPairCount: validatedSchedule.pairs.count,
-            attemptedPairCount: Set(rawRows.keys).union(verifiedRows.keys).count,
-            rawMatchedPairCount: rawRows.values.count(where: { $0 > 0 }),
+            attemptedPairCount: attemptedPairs.count,
+            rawMatchedPairCount: rawMatchedPairs.count,
             spatiallyVerifiedPairCount: verifiedPairIDs.count,
             localPairCount: validatedSchedule.pairs.count(where: { $0.role == .local }),
             retrievalPairCount: validatedSchedule.pairs.count(where: { $0.role == .retrieval }),
@@ -449,6 +460,8 @@ struct ColmapPairGraphInspector: Sendable {
             featureDatabaseDigest: databaseDigests.feature,
             matchingDatabaseDigest: databaseDigests.matching,
             descriptorlessImageNames: descriptorlessImageNames,
+            attemptedPairs: attemptedPairs,
+            rawMatchedPairs: rawMatchedPairs,
             verifiedGraph: graph.snapshot
         )
         try Task.checkCancellation()

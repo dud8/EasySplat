@@ -1,4 +1,71 @@
+import CryptoKit
 import Foundation
+
+public struct ColmapRuntimeClosureEvidence: Codable, Sendable, Equatable {
+    public struct Component: Codable, Sendable, Equatable {
+        public var toolchainRelativePath: String
+        public var sha256: String
+
+        public init(toolchainRelativePath: String, sha256: String) {
+            self.toolchainRelativePath = toolchainRelativePath
+            self.sha256 = sha256
+        }
+    }
+
+    public static let canonicalToolchainRelativePaths = [
+        "bin/colmap",
+        "lib/libomp.dylib",
+    ]
+
+    public var components: [Component]
+    public var closureSHA256: String
+
+    public init(components: [Component], closureSHA256: String) {
+        self.components = components
+        self.closureSHA256 = closureSHA256
+    }
+
+    public static func canonical(
+        executableSHA256: String,
+        openMPSHA256: String
+    ) -> Self? {
+        let components = [
+            Component(toolchainRelativePath: "bin/colmap", sha256: executableSHA256),
+            Component(toolchainRelativePath: "lib/libomp.dylib", sha256: openMPSHA256),
+        ]
+        guard let closureSHA256 = closureDigest(for: components) else { return nil }
+        return Self(components: components, closureSHA256: closureSHA256)
+    }
+
+    public static func closureDigest(for components: [Component]) -> String? {
+        guard components.map(\.toolchainRelativePath) == canonicalToolchainRelativePaths,
+              components.allSatisfy({ GeometryArtifactStore.isSHA256($0.sha256) }) else {
+            return nil
+        }
+        var hasher = SHA256()
+        func update(_ data: Data) {
+            var byteCount = UInt64(data.count).bigEndian
+            withUnsafeBytes(of: &byteCount) { hasher.update(bufferPointer: $0) }
+            hasher.update(data: data)
+        }
+        update(Data("easysplat-colmap-runtime-closure-v1".utf8))
+        for component in components {
+            update(Data(component.toolchainRelativePath.utf8))
+            update(Data(component.sha256.utf8))
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    public var isValid: Bool {
+        Self.closureDigest(for: components) == closureSHA256
+    }
+
+    public func sha256(for toolchainRelativePath: String) -> String? {
+        components.first {
+            $0.toolchainRelativePath == toolchainRelativePath
+        }?.sha256
+    }
+}
 
 public struct GeometryComponentProvenance: Codable, Sendable, Equatable {
     public var identifier: String
@@ -77,6 +144,7 @@ public struct PairMatchingAttemptArtifact: Codable, Sendable, Equatable {
     public var matcher: DescriptorMatcher
     public var recoveryLevel: PairGraphRecoveryLevel
     public var outcome: PairMatchingAttemptOutcome
+    public var exactRecoveryReason: DescriptorMatcherRecoveryReason?
     public var scheduledPairCount: Int
     public var attemptedPairCount: Int
     public var rawMatchedPairCount: Int
@@ -88,6 +156,7 @@ public struct PairMatchingAttemptArtifact: Codable, Sendable, Equatable {
         matcher: DescriptorMatcher,
         recoveryLevel: PairGraphRecoveryLevel,
         outcome: PairMatchingAttemptOutcome,
+        exactRecoveryReason: DescriptorMatcherRecoveryReason? = nil,
         scheduledPairCount: Int,
         attemptedPairCount: Int,
         rawMatchedPairCount: Int,
@@ -98,6 +167,7 @@ public struct PairMatchingAttemptArtifact: Codable, Sendable, Equatable {
         self.matcher = matcher
         self.recoveryLevel = recoveryLevel
         self.outcome = outcome
+        self.exactRecoveryReason = exactRecoveryReason
         self.scheduledPairCount = scheduledPairCount
         self.attemptedPairCount = attemptedPairCount
         self.rawMatchedPairCount = rawMatchedPairCount
@@ -188,15 +258,21 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
 public struct PairGraphArtifact: Codable, Sendable, Equatable {
     public var status: PairGraphMeasurementStatus
     public var measurement: PairGraphMeasurement?
+    public var requiresCrossClipRetrieval: Bool
+    public var retrievalWasScheduled: Bool
     public var usedLocalVocabularyRetrieval: Bool
 
     public init(
         status: PairGraphMeasurementStatus,
         measurement: PairGraphMeasurement?,
+        requiresCrossClipRetrieval: Bool = false,
+        retrievalWasScheduled: Bool = false,
         usedLocalVocabularyRetrieval: Bool = false
     ) {
         self.status = status
         self.measurement = measurement
+        self.requiresCrossClipRetrieval = requiresCrossClipRetrieval
+        self.retrievalWasScheduled = retrievalWasScheduled
         self.usedLocalVocabularyRetrieval = usedLocalVocabularyRetrieval
     }
 
@@ -204,25 +280,86 @@ public struct PairGraphArtifact: Codable, Sendable, Equatable {
         PairGraphArtifact(
             status: .notEvaluated,
             measurement: nil,
+            requiresCrossClipRetrieval: false,
+            retrievalWasScheduled: false,
             usedLocalVocabularyRetrieval: false
         )
     }
 
     public static func measured(
         _ measurement: PairGraphMeasurement,
+        requiresCrossClipRetrieval: Bool = false,
+        retrievalWasScheduled: Bool = false,
         usedLocalVocabularyRetrieval: Bool = false
     ) -> PairGraphArtifact {
         PairGraphArtifact(
             status: .measured,
             measurement: measurement,
+            requiresCrossClipRetrieval: requiresCrossClipRetrieval,
+            retrievalWasScheduled: retrievalWasScheduled,
             usedLocalVocabularyRetrieval: usedLocalVocabularyRetrieval
         )
+    }
+}
+
+enum PairGraphRetrievalScheduling {
+    static func isRequired(
+        pairingPolicy: ResolvedPairingPolicy,
+        selectedFrameCount: Int,
+        requiresCrossClipRetrieval: Bool
+    ) -> Bool {
+        if requiresCrossClipRetrieval {
+            return true
+        }
+        switch pairingPolicy {
+        case .orderedContinuous:
+            return selectedFrameCount >= 120
+        case .orderedOrbit, .orderedWalkthrough, .orderedLargeArea, .segmentedMixed:
+            return true
+        case .unorderedRetrieval:
+            return selectedFrameCount > 60
+        }
     }
 }
 
 public enum MappingRefinementKind: String, Codable, Sendable, Equatable {
     case incrementalGlobal
     case seededBundleAdjustment
+}
+
+public enum MappingCadenceFallbackTrigger: String, Codable, Sendable, Equatable {
+    case insufficientViewSupport
+    case collapsedCameraTrajectory
+    case insufficientParallax
+    case degeneratePointDistribution
+    case lowReconstructionQuality
+    case fragmentedReconstruction
+    case lowRegisteredViewCoverage
+    case sparseResidualCoverage
+    case excessiveResiduals
+
+    var diagnosticReason: String {
+        switch self {
+        case .insufficientViewSupport:
+            return "mapping cadence retry after insufficient view support"
+        case .collapsedCameraTrajectory:
+            return "mapping cadence retry after collapsed camera motion"
+        case .insufficientParallax:
+            return "mapping cadence retry after insufficient parallax"
+        case .degeneratePointDistribution:
+            return "mapping cadence retry after degenerate scene structure"
+        case .lowReconstructionQuality:
+            return "mapping cadence retry after quality rejection"
+        case .fragmentedReconstruction:
+            return "mapping cadence retry after fragmented reconstruction"
+        case .lowRegisteredViewCoverage:
+            return "mapping cadence retry after low registered-view coverage"
+        case .sparseResidualCoverage:
+            return "mapping cadence retry after sparse residual coverage"
+        case .excessiveResiduals:
+            return "mapping cadence retry after excessive residuals"
+        }
+    }
 }
 
 public struct IncrementalMappingCadenceArtifact: Codable, Sendable, Equatable {
@@ -262,10 +399,17 @@ public struct IncrementalMappingCadenceArtifact: Codable, Sendable, Equatable {
         globalMaxRefinements: 5
     )
 
-    public static let conservative = Self(
+    public static let balancedGlobal = Self(
         localMaxRefinements: 2,
         globalFramesRatio: 1.4,
         globalPointsRatio: 1.4,
+        globalMaxRefinements: 5
+    )
+
+    public static let frequentGlobal = Self(
+        localMaxRefinements: 2,
+        globalFramesRatio: 1.1,
+        globalPointsRatio: 1.1,
         globalMaxRefinements: 5
     )
 
@@ -285,6 +429,79 @@ public struct IncrementalMappingCadenceArtifact: Codable, Sendable, Equatable {
     }
 }
 
+enum IncrementalMappingCadencePolicy {
+    static func isRecognized(_ cadence: IncrementalMappingCadenceArtifact) -> Bool {
+        cadence == .orderedFast
+            || cadence == .balancedGlobal
+            || cadence == .frequentGlobal
+    }
+
+    static func fallbackCadence(
+        planned: IncrementalMappingCadenceArtifact,
+        active: IncrementalMappingCadenceArtifact,
+        existingTrigger: MappingCadenceFallbackTrigger?
+    ) -> IncrementalMappingCadenceArtifact? {
+        guard active == planned, existingTrigger == nil else { return nil }
+        if planned == .orderedFast {
+            return .balancedGlobal
+        }
+        if planned == .balancedGlobal {
+            return .frequentGlobal
+        }
+        return nil
+    }
+
+    static func validates(
+        planned: IncrementalMappingCadenceArtifact,
+        accepted: IncrementalMappingCadenceArtifact,
+        trigger: MappingCadenceFallbackTrigger?
+    ) -> Bool {
+        guard isRecognized(planned), isRecognized(accepted) else { return false }
+        if planned == accepted {
+            return trigger == nil
+        }
+        guard trigger != nil else { return false }
+        return (planned == .orderedFast && accepted == .balancedGlobal)
+            || (planned == .balancedGlobal && accepted == .frequentGlobal)
+    }
+}
+
+public enum CanonicalModelPublicationKind: String, Codable, Sendable, Equatable {
+    case convertedFromBinary
+    case directText
+    case resumedCanonicalText
+}
+
+public struct CanonicalModelConversionArtifact: Codable, Sendable, Equatable {
+    /// One-based ordinal among model-converter invocations in the accepted mapping attempt.
+    public var invocationOrdinal: Int
+    public var workerEvidence: ColmapModelConversionWorkerEvidence
+
+    public init(
+        invocationOrdinal: Int,
+        workerEvidence: ColmapModelConversionWorkerEvidence
+    ) {
+        self.invocationOrdinal = invocationOrdinal
+        self.workerEvidence = workerEvidence
+    }
+}
+
+public struct CanonicalModelPublicationArtifact: Codable, Sendable, Equatable {
+    public var kind: CanonicalModelPublicationKind
+    public var sourceModelHashes: [String: String]
+    public var conversion: CanonicalModelConversionArtifact?
+
+    public init(
+        kind: CanonicalModelPublicationKind,
+        sourceModelHashes: [String: String],
+        conversion: CanonicalModelConversionArtifact?
+    ) {
+        self.kind = kind
+        self.sourceModelHashes = sourceModelHashes
+        self.conversion = conversion
+    }
+}
+
 public struct MappingArtifact: Codable, Sendable, Equatable {
     public var modelCount: Int
     public var largestModelRegisteredViewCount: Int
@@ -295,7 +512,10 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
     public var acceptedRefinementKind: MappingRefinementKind
     /// Observed global-refinement invocations from the accepted mapping attempt.
     public var acceptedRefinementInvocationCount: Int
+    public var plannedIncrementalCadence: IncrementalMappingCadenceArtifact?
     public var incrementalCadence: IncrementalMappingCadenceArtifact?
+    public var cadenceFallbackTrigger: MappingCadenceFallbackTrigger?
+    public var canonicalModelPublication: CanonicalModelPublicationArtifact
     public var fallbackReason: String?
 
     public init(
@@ -307,7 +527,10 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
         acceptedMappingAttemptOrdinal: Int,
         acceptedRefinementKind: MappingRefinementKind,
         acceptedRefinementInvocationCount: Int,
+        plannedIncrementalCadence: IncrementalMappingCadenceArtifact? = nil,
         incrementalCadence: IncrementalMappingCadenceArtifact?,
+        cadenceFallbackTrigger: MappingCadenceFallbackTrigger? = nil,
+        canonicalModelPublication: CanonicalModelPublicationArtifact,
         fallbackReason: String?
     ) {
         self.modelCount = modelCount
@@ -318,7 +541,11 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
         self.acceptedMappingAttemptOrdinal = acceptedMappingAttemptOrdinal
         self.acceptedRefinementKind = acceptedRefinementKind
         self.acceptedRefinementInvocationCount = acceptedRefinementInvocationCount
+        self.plannedIncrementalCadence = plannedIncrementalCadence
+            ?? incrementalCadence
         self.incrementalCadence = incrementalCadence
+        self.cadenceFallbackTrigger = cadenceFallbackTrigger
+        self.canonicalModelPublication = canonicalModelPublication
         self.fallbackReason = fallbackReason
     }
 }
@@ -461,8 +688,37 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
     }
 }
 
+public struct GeometryConditioningArtifact: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 2
+    public static let currentAcceptancePolicy = "capture-agnostic-conditioning-v2"
+    public static let defaultMaximumRayPairEvaluations = 100_000_000
+
+    public var schemaVersion: Int
+    public var measurementProvenance: String
+    public var acceptancePolicy: String
+    public var maximumRayPairEvaluations: Int
+    public var sourceModelClosureSHA256: String
+    public var measurement: GeometryConditioningMeasurement
+
+    public init(
+        schemaVersion: Int = currentSchemaVersion,
+        measurementProvenance: String = GeometryConditioningMeasurement.provenance,
+        acceptancePolicy: String = currentAcceptancePolicy,
+        maximumRayPairEvaluations: Int = defaultMaximumRayPairEvaluations,
+        sourceModelClosureSHA256: String,
+        measurement: GeometryConditioningMeasurement
+    ) {
+        self.schemaVersion = schemaVersion
+        self.measurementProvenance = measurementProvenance
+        self.acceptancePolicy = acceptancePolicy
+        self.maximumRayPairEvaluations = maximumRayPairEvaluations
+        self.sourceModelClosureSHA256 = sourceModelClosureSHA256
+        self.measurement = measurement
+    }
+}
+
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 20
+    public static let currentSchemaVersion = 35
 
     public var schemaVersion: Int
     public var solverVersion: String
@@ -483,17 +739,20 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var scaleType: String
     public var cameraModel: String
     public var cameraGrouping: CameraGrouping
+    public var cameraGroupingReceipt: ColmapCameraGroupingReceipt?
+    public var cameraInitializationReceipt: ColmapCameraInitializationReceipt
+    public var featureDatabaseDigest: String?
     public var registeredViewCount: Int
     public var totalViewCount: Int
-    public var trackCount: Int
+    public var observationCount: Int
     public var pointCount: Int
     public var residualProvenance: String
     public var medianPixelResidual: Double
     public var p90PixelResidual: Double
+    public var conditioning: GeometryConditioningArtifact
     public var timings: [String: Double]
     public var peakMemoryBytes: Int64
     public var modelHashes: [String: String]
-    public var fallbackReason: String?
     public var provenance: GeometryProvenance
     public var learnedPointInitializer: LearnedPointInitializerArtifact?
     public var workerExecution: GeometryWorkerExecutionArtifact
@@ -525,17 +784,20 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         scaleType: String,
         cameraModel: String,
         cameraGrouping: CameraGrouping,
+        cameraGroupingReceipt: ColmapCameraGroupingReceipt? = nil,
+        cameraInitializationReceipt: ColmapCameraInitializationReceipt,
+        featureDatabaseDigest: String? = nil,
         registeredViewCount: Int,
         totalViewCount: Int,
-        trackCount: Int,
+        observationCount: Int,
         pointCount: Int,
         residualProvenance: String,
         medianPixelResidual: Double,
         p90PixelResidual: Double,
+        conditioning: GeometryConditioningArtifact,
         timings: [String: Double],
         peakMemoryBytes: Int64,
         modelHashes: [String: String],
-        fallbackReason: String?,
         provenance: GeometryProvenance,
         workerExecution: GeometryWorkerExecutionArtifact,
         pairGraph: PairGraphArtifact,
@@ -558,17 +820,20 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         self.scaleType = scaleType
         self.cameraModel = cameraModel
         self.cameraGrouping = cameraGrouping
+        self.cameraGroupingReceipt = cameraGroupingReceipt
+        self.cameraInitializationReceipt = cameraInitializationReceipt
+        self.featureDatabaseDigest = featureDatabaseDigest
         self.registeredViewCount = registeredViewCount
         self.totalViewCount = totalViewCount
-        self.trackCount = trackCount
+        self.observationCount = observationCount
         self.pointCount = pointCount
         self.residualProvenance = residualProvenance
         self.medianPixelResidual = medianPixelResidual
         self.p90PixelResidual = p90PixelResidual
+        self.conditioning = conditioning
         self.timings = timings
         self.peakMemoryBytes = peakMemoryBytes
         self.modelHashes = modelHashes
-        self.fallbackReason = fallbackReason
         self.provenance = provenance
         self.learnedPointInitializer = learnedPointInitializer
         self.workerExecution = workerExecution

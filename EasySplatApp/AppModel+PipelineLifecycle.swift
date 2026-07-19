@@ -229,8 +229,15 @@ extension AppModel {
         }
     }
 
-    func startProject(input: InputSpec, title: String, taskToken: UUID? = nil) async {
-        guard isCurrentTaskToken(taskToken) else { return }
+    @discardableResult
+    func startProject(
+        input: InputSpec,
+        title: String,
+        taskToken: UUID? = nil,
+        timingBoundary: RunTimingBoundary? = nil
+    ) async -> ToolchainPaths? {
+        guard isCurrentTaskToken(taskToken) else { return nil }
+        let timingBoundary = timingBoundary ?? .capture()
         defer { finishRun(taskToken: taskToken) }
         reset()
         viewState = .processing
@@ -238,6 +245,13 @@ extension AppModel {
         statusTitle = "Preparing project"
         statusDetail = nil
         progress = nil
+        var preparedVideoInput: PreparedVideoInput?
+        var preparedPhotoInput: PreparedPhotoInput?
+        var projectPublication: ProjectPublicationTransaction?
+        var emptyMixedPhotoInput = false
+        defer { preparedVideoInput?.discard() }
+        defer { preparedPhotoInput?.discard() }
+        defer { try? projectPublication?.abort() }
 
         do {
             let requestedOptions = requestedRunOptions
@@ -246,21 +260,108 @@ extension AppModel {
                 input: input,
                 hardware: hardwareProfile
             )
-            let developmentOverrides = DevelopmentOverrides.fromProcessEnvironment()
+            let developmentOverrides = AppConfig.currentDevelopmentOverrides
             let resolvedRunPlan = RunPlanResolver.resolve(
                 requestedOptions: requestedOptions,
                 input: input,
                 hardware: hardwareProfile,
                 developmentOverrides: developmentOverrides
             )
-            try await validatePhotoSelection(input: input, resolvedRunPlan: resolvedRunPlan)
-            guard isCurrentTaskToken(taskToken) else { return }
-            let capabilityRequest = try resolvedRunPlan.toolchainCapabilityRequest()
 
-            // Keep the Mac awake for the whole flow, including the first-run toolchain
-            // download, which happens before the runner (and its own assertion) exists.
-            let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is preparing and processing a project")
+            // Preflight authenticates and stages the complete source capture. Keep the Mac
+            // awake from that first durable read through tool preparation and processing.
+            let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(
+                reason: "EasySplat is preparing and processing a project"
+            )
             defer { idleSleepAssertion.release() }
+
+            if let photosFolder = input.photosFolder {
+                statusTitle = "Checking photos"
+                statusDetail = nil
+                progress = nil
+                let reservedVideoFrames = RunPlanResolver.minimumReservedVideoFrameCount(
+                    keyframeBudget: resolvedRunPlan.keyframeBudget,
+                    videoCount: input.videoFiles.count
+                )
+                let photoBudget = resolvedRunPlan.photoSelection == .automatic
+                    ? resolvedRunPlan.keyframeBudget
+                    : max(1, resolvedRunPlan.keyframeBudget - reservedVideoFrames)
+                do {
+                    preparedPhotoInput = try await PhotoInputPreflight.prepare(
+                        folder: URL(fileURLWithPath: photosFolder, isDirectory: true),
+                        stagingParent: projectBaseDirectory(),
+                        photoSelection: resolvedRunPlan.photoSelection,
+                        inputOrdering: resolvedRunPlan.inputOrdering,
+                        keyframeBudget: photoBudget,
+                        requiredAtomicWorkspaceReserveBytes: VideoInputPreflight
+                            .requiredAtomicWorkspaceReserveBytes(
+                                keyframeBudget: resolvedRunPlan.keyframeBudget,
+                                maximumImageDimension: resolvedRunPlan.maximumImageDimension,
+                                maximumFeatureCount: resolvedRunPlan.colmapMaximumFeatureCount,
+                                maximumMatchCount: resolvedRunPlan.colmapMaximumMatchCount,
+                                retrievalCandidateCount: resolvedRunPlan.retrievalCandidateCount
+                            ),
+                        limits: .init(
+                            maximumDecodedDimension: min(4_096, resolvedRunPlan.maximumImageDimension)
+                        )
+                    ) { [weak self] fraction, message in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.isCurrentTaskToken(taskToken) else { return }
+                            self.progress = fraction
+                            self.statusTitle = "Checking photos"
+                            self.statusDetail = message
+                        }
+                    }
+                } catch let failure as PhotoInputPreflightFailure
+                    where input.hasVideos && failure.issue == .noValidPhotos {
+                    emptyMixedPhotoInput = true
+                    preparedPhotoInput = nil
+                }
+                if let preparedPhotoInput {
+                    try RunPlanResolver.validatePhotoSelection(
+                        validPhotoCount: preparedPhotoInput.summary.validPhotoCount,
+                        resolvedPlan: resolvedRunPlan,
+                        input: input
+                    )
+                } else if emptyMixedPhotoInput {
+                    try RunPlanResolver.validatePhotoSelection(
+                        validPhotoCount: 0,
+                        resolvedPlan: resolvedRunPlan,
+                        input: input
+                    )
+                }
+            }
+            guard isCurrentTaskToken(taskToken) else { return nil }
+            if input.hasVideos {
+                statusTitle = "Checking videos"
+                statusDetail = nil
+                progress = nil
+                preparedVideoInput = try await videoInputPreflight.prepare(
+                    videoURLs: input.videoFiles.map(URL.init(fileURLWithPath:)),
+                    stagingParent: projectBaseDirectory(),
+                    requiredAtomicWorkspaceReserveBytes: VideoInputPreflight
+                        .requiredAtomicWorkspaceReserveBytes(
+                            keyframeBudget: resolvedRunPlan.keyframeBudget,
+                            maximumImageDimension: resolvedRunPlan.maximumImageDimension,
+                            maximumFeatureCount: resolvedRunPlan.colmapMaximumFeatureCount,
+                            maximumMatchCount: resolvedRunPlan.colmapMaximumMatchCount,
+                            retrievalCandidateCount: resolvedRunPlan.retrievalCandidateCount
+                        ),
+                    analysisPolicy: VideoFrameAnalysisPolicy(
+                        resolvedRunPlan: resolvedRunPlan
+                    ),
+                    pairingPolicy: resolvedRunPlan.pairingPolicy
+                ) { [weak self] fraction, message in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isCurrentTaskToken(taskToken) else { return }
+                        self.progress = fraction
+                        self.statusTitle = "Checking videos"
+                        self.statusDetail = message
+                    }
+                }
+            }
+            guard isCurrentTaskToken(taskToken) else { return nil }
+            let capabilityRequest = try resolvedRunPlan.toolchainCapabilityRequest()
 
             statusTitle = "Preparing tools"
             statusDetail = nil
@@ -273,51 +374,105 @@ extension AppModel {
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
             }
-            guard isCurrentTaskToken(taskToken) else { return }
+            guard isCurrentTaskToken(taskToken) else { return nil }
 
             try Task.checkCancellation()
-            let projectURL = try createProjectDirectory(title: title)
-            let metadata = ProjectMetadata(
-                title: projectURL.deletingPathExtension().lastPathComponent,
-                input: input,
-                requestedRunOptions: requestedOptions,
-                resolvedRunPlan: resolvedRunPlan
+            let projectID = UUID()
+            let publication = try ProjectPublicationTransaction.begin(
+                in: projectBaseDirectory(),
+                title: title,
+                projectID: projectID,
+                checkpointHandler: { [projectPublicationCheckpointHook] checkpoint in
+                    try projectPublicationCheckpointHook.handle(checkpoint)
+                }
             )
-            let paths = ProjectPaths(root: projectURL)
-            do {
-                try paths.ensureDirectories()
-                try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-            } catch {
-                try? FileManager.default.removeItem(at: projectURL)
-                throw error
+            projectPublication = publication
+            let paths = ProjectPaths(root: publication.bundleURL)
+            var inputAdoption = ProjectInputAdoption(requestedInput: input)
+            defer { inputAdoption.videoInputIntegrityHandoff?.discard() }
+            if let preparedVideoInput {
+                try inputAdoption.adoptVideos(preparedVideoInput, into: paths)
+                try publication.reached(.videoAdopted)
             }
+            try Task.checkCancellation()
+            if let preparedPhotoInput {
+                try inputAdoption.adoptPhotos(preparedPhotoInput, into: paths)
+                try publication.reached(.photosAdopted)
+            } else if emptyMixedPhotoInput {
+                try inputAdoption.adoptEmptyMixedPhotoFolder(into: paths)
+                try publication.reached(.photosAdopted)
+            }
+            try Task.checkCancellation()
+            try paths.ensureDirectories()
+            let metadata = ProjectMetadata(
+                id: projectID,
+                title: title,
+                input: inputAdoption.input,
+                videoInputReceipts: inputAdoption.videoInputReceipts,
+                photoInputReceipts: inputAdoption.photoInputReceipts,
+                photoSelectionReceipt: inputAdoption.photoSelectionReceipt,
+                requestedRunOptions: requestedOptions,
+                resolvedRunPlan: resolvedRunPlan,
+                lastRunStartedAt: Date()
+            )
+            try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            try publication.validateAndSeal(expectedMetadata: metadata)
+            try Task.checkCancellation()
+            let freshPublication: FreshProjectPublication
+            if inputAdoption.input.hasVideos {
+                guard let videoInputIntegrityHandoff = inputAdoption.videoInputIntegrityHandoff else {
+                    throw VideoInputIntegrityHandoffError.unavailable
+                }
+                freshPublication = try publication.publishWithFreshAttestation(
+                    videoInputIntegrityHandoff: videoInputIntegrityHandoff
+                )
+            } else {
+                freshPublication = try publication
+                    .publishWithFreshAttestationForProjectWithoutVideos()
+            }
+            defer { freshPublication.attestation.discard() }
+            let projectURL = freshPublication.projectURL
+            projectPublication = nil
             currentProjectURL = projectURL
             currentRunOptions = requestedOptions
-            currentInput = input
+            currentInput = inputAdoption.input
             clearPendingInputs()
             refreshProjectSummaries()
+
+            try Task.checkCancellation()
+            guard isCurrentTaskToken(taskToken) else {
+                freshPublication.attestation.discard()
+                return nil
+            }
 
             let runner = pipelineRunnerFactory(
                 projectURL,
                 pipelineConfig(
                     toolchain: toolchain,
                     resolvedRunPlan: resolvedRunPlan,
-                    developmentOverrides: developmentOverrides
+                    developmentOverrides: developmentOverrides,
+                    prePipelineDurationSeconds: timingBoundary.elapsedSeconds(),
+                    prePipelineStartedAt: timingBoundary.startedAt
                 )
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
-            try await runner.run(resumeFrom: Optional<PipelineStage>.none) { event in
+            try await runner.run(
+                resumeFrom: Optional<PipelineStage>.none,
+                freshPublicationAttestation: freshPublication.attestation
+            ) { event in
                 forwarder.handle(event)
             }
-            guard isCurrentTaskToken(taskToken) else { return }
+            guard isCurrentTaskToken(taskToken) else { return nil }
 
             guard let outputURL = try await validatedFinishedOutputURL(projectURL: projectURL) else {
                 presentOutputMissingFailure(projectURL: projectURL)
-                return
+                return nil
             }
             outputPlyURL = outputURL
-            currentReconstruction = loadReconstructionSummary(projectURL: projectURL)
             currentStageTimings = loadStageTimings(projectURL: projectURL)
+            currentCreateToViewerReadySeconds = loadCreateToViewerReadySeconds(
+                projectURL: projectURL
+            )
             currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
             if let config = loadProjectConfig(projectURL: projectURL) {
                 currentRunOptions = config.options
@@ -328,13 +483,20 @@ extension AppModel {
             }
             currentProjectNotes = loadProjectNotes(projectURL: projectURL)
             markProjectOpened(at: projectURL)
+            prepareResultViewerTiming(
+                projectID: projectID,
+                projectURL: projectURL,
+                outputURL: outputURL,
+                boundary: timingBoundary
+            )
             viewState = .viewer
             refreshProjectSummaries()
             refreshFreeDiskSpace()
+            return toolchain
         } catch is CancellationError {
-            return
+            return nil
         } catch let error as RunPlanResolver.ValidationError {
-            guard isCurrentTaskToken(taskToken) else { return }
+            guard isCurrentTaskToken(taskToken) else { return nil }
             let message = error.localizedDescription
             validationRecovery = Self.validationRecovery(for: error)
             lastError = message
@@ -343,8 +505,59 @@ extension AppModel {
             errorDetails = "Preflight stopped before downloading tools or creating a project."
             progress = nil
             viewState = .processing
+        } catch let failure as PhotoInputPreflightFailure {
+            guard isCurrentTaskToken(taskToken) else { return nil }
+            if case .unsupportedSpherical(let issue) = failure.issue {
+                let presentation = Self.unsupportedSphericalMediaPresentation(issue)
+                lastError = presentation.title
+                statusTitle = presentation.title
+                statusDetail = nil
+                errorDetails = presentation.details
+                progress = nil
+                failureRetryAllowed = false
+                viewState = .processing
+                return nil
+            }
+            let validationError: RunPlanResolver.ValidationError?
+            switch failure.issue {
+            case .noValidPhotos:
+                validationError = .noValidPhotos
+            case .useAllExceedsBudget(let selected, let maximum):
+                validationError = .photoSelectionExceedsSafeLimit(
+                    selected: selected,
+                    maximum: maximum
+                )
+            default:
+                validationError = nil
+            }
+            if let validationError {
+                let message = validationError.localizedDescription
+                validationRecovery = Self.validationRecovery(for: validationError)
+                lastError = message
+                statusTitle = message
+                errorDetails = "Preflight stopped before downloading tools or creating a project."
+            } else {
+                lastError = "Photos couldn’t be prepared"
+                statusTitle = "Photos couldn’t be prepared"
+                errorDetails = String(describing: failure.issue)
+                validationRecovery = nil
+            }
+            statusDetail = nil
+            progress = nil
+            failureRetryAllowed = validationRecovery != nil
+            viewState = .processing
+        } catch let failure as VideoInputPreflightFailure {
+            guard isCurrentTaskToken(taskToken) else { return nil }
+            let presentation = Self.videoPreflightFailurePresentation(failure)
+            lastError = presentation.title
+            statusTitle = presentation.title
+            statusDetail = nil
+            errorDetails = presentation.details
+            progress = nil
+            failureRetryAllowed = false
+            viewState = .processing
         } catch {
-            guard isCurrentTaskToken(taskToken) else { return }
+            guard isCurrentTaskToken(taskToken) else { return nil }
             configureRuntimeRecovery(for: error)
             let stopFailureCopy = stopAction.map {
                 stopFailurePresentation(for: $0)
@@ -384,6 +597,113 @@ extension AppModel {
             viewState = .processing
             refreshProjectSummaries()
         }
+        return nil
+    }
+
+    private static func videoPreflightFailurePresentation(
+        _ failure: VideoInputPreflightFailure
+    ) -> (title: String, details: String) {
+        if let issue = failure.rejectedVideos.lazy.compactMap({ rejection -> UnsupportedSphericalMediaIssue? in
+            guard case .unsupportedSpherical(let issue) = rejection.issue else { return nil }
+            return issue
+        }).first {
+            return unsupportedSphericalMediaPresentation(issue)
+        }
+        let count = failure.rejectedVideos.count
+        let issues = failure.rejectedVideos.map(\.issue)
+        let title: String
+        if issues.contains(where: {
+            if case .insufficientSpace = $0 { return true }
+            return false
+        }) {
+            title = "Not enough free space"
+        } else if issues.contains(where: Self.isVideoSelectionIssue) {
+            title = "Check your video selection"
+        } else if issues.allSatisfy(Self.isUnreadableVideoIssue) {
+            title = count == 1
+                ? "This video couldn’t be read"
+                : "Some videos couldn’t be read"
+        } else {
+            title = "Videos couldn’t be prepared"
+        }
+        let details = failure.rejectedVideos.map { rejection in
+            "Video \(rejection.index + 1) (\(rejection.safeDisplayName)): \(videoPreflightIssueDescription(rejection.issue))."
+        }.joined(separator: "\n")
+        return (title, details)
+    }
+
+    private static func isVideoSelectionIssue(_ issue: VideoInputPreflightIssue) -> Bool {
+        switch issue {
+        case .noVideosSelected, .sourceUnavailable, .symbolicLink, .notRegularFile,
+             .emptyFile, .duplicateSource, .sourceChanged, .tooManyVideos,
+             .totalBytesExceeded, .invalidLimits:
+            return true
+        case .unreadableMedia, .noUsableVideoTrack, .decodeFailed,
+             .insufficientSpace, .stagingUnavailable, .capacityUnavailable,
+             .copyFailed, .unsupportedSpherical:
+            return false
+        }
+    }
+
+    private static func isUnreadableVideoIssue(_ issue: VideoInputPreflightIssue) -> Bool {
+        switch issue {
+        case .unreadableMedia, .noUsableVideoTrack, .decodeFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func videoPreflightIssueDescription(
+        _ issue: VideoInputPreflightIssue
+    ) -> String {
+        switch issue {
+        case .noVideosSelected:
+            return "no videos were selected"
+        case .sourceUnavailable:
+            return "the selected file is no longer available"
+        case .symbolicLink:
+            return "choose the original file instead of an alias"
+        case .notRegularFile:
+            return "the selection is not a supported file"
+        case .emptyFile:
+            return "file is empty"
+        case .duplicateSource(let firstIndex):
+            return "duplicates video \(firstIndex + 1)"
+        case .sourceChanged:
+            return "the file changed while it was being copied"
+        case .unreadableMedia:
+            return "media could not be read"
+        case .noUsableVideoTrack:
+            return "no usable video track"
+        case .decodeFailed:
+            return "decode failed"
+        case .tooManyVideos(let maximum):
+            return "select no more than \(maximum) videos"
+        case .totalBytesExceeded:
+            return "selection exceeds the video size limit"
+        case .insufficientSpace:
+            return "not enough free space to prepare the videos"
+        case .invalidLimits:
+            return "the video limits are unavailable"
+        case .stagingUnavailable:
+            return "a secure temporary copy could not be prepared"
+        case .capacityUnavailable:
+            return "free space could not be checked"
+        case .copyFailed:
+            return "the file could not be copied safely"
+        case .unsupportedSpherical(let issue):
+            return "unsupported standardized projection tag \(issue.tag.rawValue)"
+        }
+    }
+
+    static func unsupportedSphericalMediaPresentation(
+        _ issue: UnsupportedSphericalMediaIssue
+    ) -> (title: String, details: String) {
+        (
+            title: "This appears to be 180°/360° panoramic media. EasySplat does not yet unwrap spherical captures. Export ordinary perspective views and try again.",
+            details: "Detected standardized projection tag: \(issue.tag.rawValue)."
+        )
     }
 
     func resumeProjectTask(at url: URL, taskToken: UUID? = nil) async {
@@ -400,14 +720,23 @@ extension AppModel {
         do {
             let paths = ProjectPaths(root: url)
             let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+            if metadata.input.hasVideos {
+                statusDetail = "Checking saved videos"
+                try await Task.detached(priority: .userInitiated) {
+                    try VideoInputReceiptValidator.validateFiles(
+                        metadata: metadata,
+                        paths: paths
+                    )
+                }.value
+            }
             currentProjectURL = url
             currentRunOptions = metadata.requestedRunOptions
             currentInput = metadata.input
             if let outputURL = try await validatedFinishedOutputURL(projectURL: url) {
                 guard isCurrentTaskToken(taskToken) else { return }
                 outputPlyURL = outputURL
-                currentReconstruction = metadata.reconstruction
                 currentStageTimings = metadata.stageTimings ?? []
+                currentCreateToViewerReadySeconds = metadata.createToViewerReadySeconds
                 currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
                 currentProjectNotes = metadata.notes ?? ""
                 markProjectOpened(at: url)
@@ -416,7 +745,7 @@ extension AppModel {
                 return
             }
             refreshProjectSummaries()
-            let developmentOverrides = DevelopmentOverrides.fromProcessEnvironment()
+            let developmentOverrides = AppConfig.currentDevelopmentOverrides
             let requestedOptions = metadata.requestedRunOptions
             try RunPlanResolver.validate(
                 requestedOptions: requestedOptions,
@@ -504,8 +833,8 @@ extension AppModel {
                 return
             }
             outputPlyURL = outputURL
-            currentReconstruction = loadReconstructionSummary(projectURL: url)
             currentStageTimings = loadStageTimings(projectURL: url)
+            currentCreateToViewerReadySeconds = loadCreateToViewerReadySeconds(projectURL: url)
             currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
             if let config = loadProjectConfig(projectURL: url) {
                 currentRunOptions = config.options
@@ -530,6 +859,16 @@ extension AppModel {
             statusDetail = "The saved project and its checkpoint are unchanged."
             errorDetails = "Resume preflight stopped before downloading tools or changing project files."
             progress = nil
+            viewState = .processing
+            refreshProjectSummaries()
+        } catch let error as VideoInputReceiptValidationError {
+            guard isCurrentTaskToken(taskToken) else { return }
+            lastError = "A saved video changed"
+            statusTitle = "A saved video changed"
+            statusDetail = "Choose the original video again and start a new project."
+            errorDetails = error.localizedDescription
+            progress = nil
+            failureRetryAllowed = false
             viewState = .processing
             refreshProjectSummaries()
         } catch {
@@ -645,13 +984,14 @@ extension AppModel {
         // when reset() runs as part of app teardown).
         let notesSaved = flushPendingNotesSave()
         outputPlyURL = nil
-        currentReconstruction = nil
         currentStageTimings = []
+        currentCreateToViewerReadySeconds = nil
         currentOutputPlyInfo = nil
         currentRunOptions = nil
         currentInput = nil
         currentProjectNotes = ""
         currentProjectURL = nil
+        pendingResultViewerTiming = nil
         stopAction = nil
         cancelSharing()
         shareStatusMessage = nil
@@ -709,7 +1049,6 @@ extension AppModel {
         progress = nil
         errorDetails = "The run finished, but EasySplat could not find a valid output PLY file."
         outputPlyURL = nil
-        currentReconstruction = nil
         currentOutputPlyInfo = nil
         currentRunOptions = nil
         currentInput = nil
@@ -751,13 +1090,17 @@ extension AppModel {
     func pipelineConfig(
         toolchain: ToolchainPaths,
         resolvedRunPlan: ResolvedRunPlan? = nil,
-        developmentOverrides: DevelopmentOverrides = .fromProcessEnvironment()
+        developmentOverrides: DevelopmentOverrides = AppConfig.currentDevelopmentOverrides,
+        prePipelineDurationSeconds: TimeInterval = 0,
+        prePipelineStartedAt: Date? = nil
     ) -> PipelineRunner.PipelineConfig {
         PipelineRunner.PipelineConfig(
             toolchain: toolchain,
             developmentOverrides: developmentOverrides,
             hardwareProfile: hardwareProfile,
-            resolvedRunPlan: resolvedRunPlan
+            resolvedRunPlan: resolvedRunPlan,
+            prePipelineDurationSeconds: prePipelineDurationSeconds,
+            prePipelineStartedAt: prePipelineStartedAt
         )
     }
 
@@ -817,6 +1160,22 @@ private final class ProgressForwarder: @unchecked Sendable {
 
 protocol PipelineRunning {
     func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws
+    func run(
+        resumeFrom lastCompletedStage: PipelineStage?,
+        freshPublicationAttestation: FreshProjectPublicationAttestation,
+        events: @escaping @Sendable (PipelineEvent) -> Void
+    ) async throws
+}
+
+extension PipelineRunning {
+    func run(
+        resumeFrom lastCompletedStage: PipelineStage?,
+        freshPublicationAttestation: FreshProjectPublicationAttestation,
+        events: @escaping @Sendable (PipelineEvent) -> Void
+    ) async throws {
+        freshPublicationAttestation.discard()
+        try await run(resumeFrom: lastCompletedStage, events: events)
+    }
 }
 
 extension PipelineRunner: PipelineRunning {}

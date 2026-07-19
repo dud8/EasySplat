@@ -1,6 +1,7 @@
 #if os(iOS) || os(macOS)
 
 import Foundation
+import EasySplatCore
 import Metal
 import MetalKit
 import MetalSplatter
@@ -14,6 +15,87 @@ private struct SendableMetalDevice: @unchecked Sendable {
 
 private struct SendableSplatRenderer: @unchecked Sendable {
     let value: SplatRenderer
+}
+
+private enum SceneBoundsApplicationResult: Equatable {
+    case fitted
+    case preservedView
+    case rejected
+}
+
+enum PreparedViewerModelLoad {
+    case unchanged
+    case replacement(model: ModelIdentifier?, renderer: SplatRenderer?)
+}
+
+enum ViewerMemoryAdmissionPolicy {
+    private static let mebibyte: UInt64 = 1_048_576
+    private static let physicalMemoryUsePercent: UInt64 = 65
+    private static let recommendedWorkingSetUsePercent: UInt64 = 80
+
+    private static func scaled(_ value: UInt64, numerator: UInt64, denominator: UInt64) -> UInt64 {
+        let whole = (value / denominator) * numerator
+        let remainder = ((value % denominator) * numerator) / denominator
+        return whole.addingReportingOverflow(remainder).overflow ? UInt64.max : whole + remainder
+    }
+
+    static func resolveBudgetBytes(
+        physicalMemoryBytes: UInt64,
+        recommendedMaxWorkingSetBytes: UInt64,
+        currentAllocatedBytes: UInt64,
+        availableHostMemoryBytes: UInt64? = nil,
+        memoryPressure: MemoryPressureState = .normal
+    ) -> Int {
+        let maximumRecoverableBytes = UInt64(
+            resolveMaximumRecoverableBytes(
+                physicalMemoryBytes: physicalMemoryBytes,
+                recommendedMaxWorkingSetBytes: recommendedMaxWorkingSetBytes
+            )
+        )
+        guard maximumRecoverableBytes > currentAllocatedBytes else { return 0 }
+        let metalCapacity = maximumRecoverableBytes - currentAllocatedBytes
+
+        let availableHostMemory = min(
+            availableHostMemoryBytes ?? physicalMemoryBytes,
+            physicalMemoryBytes
+        )
+        let hostReserve = min(
+            availableHostMemory,
+            max(512 * mebibyte, physicalMemoryBytes / 20)
+        )
+        let unpressuredHostCapacity = availableHostMemory - hostReserve
+        let hostCapacity: UInt64 = switch memoryPressure {
+        case .normal:
+            unpressuredHostCapacity
+        case .warning:
+            scaled(unpressuredHostCapacity, numerator: 3, denominator: 5)
+        case .critical:
+            UInt64.zero
+        case .unknown:
+            scaled(unpressuredHostCapacity, numerator: 4, denominator: 5)
+        }
+
+        return Int(clamping: min(min(metalCapacity, hostCapacity), UInt64(Int.max)))
+    }
+
+    static func resolveMaximumRecoverableBytes(
+        physicalMemoryBytes: UInt64,
+        recommendedMaxWorkingSetBytes: UInt64
+    ) -> Int {
+        let physicalLimit = scaled(
+            physicalMemoryBytes,
+            numerator: physicalMemoryUsePercent,
+            denominator: 100
+        )
+        let deviceLimit = recommendedMaxWorkingSetBytes > 0
+            ? scaled(
+                recommendedMaxWorkingSetBytes,
+                numerator: recommendedWorkingSetUsePercent,
+                denominator: 100
+            )
+            : UInt64.max
+        return Int(clamping: min(physicalLimit, deviceLimit))
+    }
 }
 
 final class ModelLoadCancellationToken: @unchecked Sendable {
@@ -98,6 +180,8 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var model: ModelIdentifier?
     var modelRenderer: (any ModelRenderer)?
     private(set) var lastLoadError: String? = nil
+    var onSortFailure: ((String) -> Void)?
+    var onSortSuccess: (() -> Void)?
 
     let inFlightSemaphore = DispatchSemaphore(value: Constants.maxSimultaneousRenders)
 
@@ -142,25 +226,25 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     func load(_ model: ModelIdentifier?, forceReload: Bool = false) async throws {
-        if !forceReload, model == self.model {
-            return
-        }
-        self.model = model
+        let prepared = try await prepareModelLoad(model, forceReload: forceReload)
+        commitPreparedModelLoad(prepared)
+    }
 
-        modelRenderer = nil
+    func prepareModelLoad(
+        _ model: ModelIdentifier?,
+        forceReload: Bool = false
+    ) async throws -> PreparedViewerModelLoad {
+        if !forceReload, model == self.model {
+            return .unchanged
+        }
         lastLoadError = nil
         do {
             switch model {
             case .gaussianSplat(let url):
                 let splat = try await loadSplatRenderer(from: url)
-                splat.onSortComplete = { [weak self] _ in
-                    Task { @MainActor [weak self] in
-                        self?.requestDraw()
-                    }
-                }
-                modelRenderer = splat
+                return .replacement(model: model, renderer: splat)
             case .none:
-                break
+                return .replacement(model: nil, renderer: nil)
             }
         } catch {
             lastLoadError = error.localizedDescription
@@ -168,11 +252,41 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    func commitPreparedModelLoad(_ prepared: PreparedViewerModelLoad) {
+        guard case .replacement(let model, let renderer) = prepared else {
+            requestDraw()
+            return
+        }
+
+        if let renderer {
+            installSortCallbacks(on: renderer)
+        }
+        detachSortCallbacks(from: modelRenderer)
+        modelRenderer = renderer
+        self.model = model
+        requestDraw()
+    }
+
     private func loadSplatRenderer(from url: URL) async throws -> SplatRenderer {
         let device = SendableMetalDevice(value: self.device)
         let colorFormat = metalKitView.colorPixelFormat
         let depthFormat = metalKitView.depthStencilPixelFormat
         let sampleCount = metalKitView.sampleCount
+        let hostObservation = try? LiveTrainingResourceObserver().observe()
+        let installedMemoryBytes = hostObservation?.installedMemoryBytes
+            ?? ProcessInfo.processInfo.physicalMemory
+        let maximumWorkingSetBytes = ViewerMemoryAdmissionPolicy.resolveBudgetBytes(
+            physicalMemoryBytes: installedMemoryBytes,
+            recommendedMaxWorkingSetBytes: device.value.recommendedMaxWorkingSetSize,
+            currentAllocatedBytes: UInt64(max(0, device.value.currentAllocatedSize)),
+            availableHostMemoryBytes: hostObservation?.availableHostMemoryBytes,
+            memoryPressure: hostObservation?.memoryPressure ?? .normal
+        )
+        let maximumRecoverableWorkingSetBytes =
+            ViewerMemoryAdmissionPolicy.resolveMaximumRecoverableBytes(
+                physicalMemoryBytes: installedMemoryBytes,
+                recommendedMaxWorkingSetBytes: device.value.recommendedMaxWorkingSetSize
+            )
 
         let loaded = try await Self.modelLoadExecutor.perform { cancellation in
             let splat = try SplatRenderer(
@@ -182,7 +296,9 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                 stencilFormat: depthFormat,
                 sampleCount: sampleCount,
                 maxViewCount: 1,
-                maxSimultaneousRenders: Constants.maxSimultaneousRenders
+                maxSimultaneousRenders: Constants.maxSimultaneousRenders,
+                maximumWorkingSetBytes: maximumWorkingSetBytes,
+                maximumRecoverableWorkingSetBytes: maximumRecoverableWorkingSetBytes
             )
             try splat.readPLY(
                 from: url,
@@ -191,6 +307,44 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             return SendableSplatRenderer(value: splat)
         }
         return loaded.value
+    }
+
+    private func reportSortFailure(_ message: String) {
+        onSortFailure?(message)
+    }
+
+    private func reportSortSuccess() {
+        onSortSuccess?()
+    }
+
+    private func installSortCallbacks(on renderer: SplatRenderer) {
+        renderer.onSortComplete = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.requestDraw()
+            }
+        }
+        renderer.onSortFailure = { [weak self] failure in
+            let message = failure.localizedDescription
+            Task { @MainActor [weak self] in
+                self?.reportSortFailure(message)
+            }
+        }
+        renderer.onSortSuccess = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.reportSortSuccess()
+            }
+        }
+    }
+
+    private func detachSortCallbacks(from renderer: (any ModelRenderer)?) {
+        guard let renderer = renderer as? SplatRenderer else { return }
+        renderer.onSortComplete = nil
+        renderer.onSortFailure = nil
+        renderer.onSortSuccess = nil
+    }
+
+    func retrySortOrdering() {
+        (modelRenderer as? SplatRenderer)?.resortIndices()
     }
 
     private func requestDraw() {
@@ -235,15 +389,14 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     private func flipRotationMatrix(for openingDirection: SIMD3<Float>) -> matrix_float4x4 {
-        let horizontal = SIMD3<Float>(openingDirection.x, 0, openingDirection.z)
-        let axis: SIMD3<Float>
-        let lengthSquared = simd_length_squared(horizontal)
-        if lengthSquared.isFinite, lengthSquared > 1e-8 {
-            axis = horizontal / sqrt(lengthSquared)
-        } else {
-            axis = SIMD3<Float>(1, 0, 0)
-        }
-        return matrix4x4_rotation(radians: .pi, axis: axis)
+        let axis = ViewerCameraState.stableHorizontalHeading(for: openingDirection)
+        let doubled = 2 * axis
+        return matrix_float4x4(columns: (
+            SIMD4<Float>(doubled.x * axis.x - 1, doubled.x * axis.y, doubled.x * axis.z, 0),
+            SIMD4<Float>(doubled.y * axis.x, doubled.y * axis.y - 1, doubled.y * axis.z, 0),
+            SIMD4<Float>(doubled.z * axis.x, doubled.z * axis.y, doubled.z * axis.z - 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
     }
 
     private func lookAtMatrix(
@@ -359,14 +512,14 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         openingDirection: SIMD3<Float>?,
         ifInteractionRevisionMatches expectedRevision: UInt64
     ) -> Bool {
-        let didFit = applyBoundsWithoutDrawing(
+        let result = applyBoundsWithoutDrawing(
             center: center,
             radius: radius,
             openingDirection: openingDirection,
             ifInteractionRevisionMatches: expectedRevision
         )
         requestDraw()
-        return didFit
+        return result == .fitted
     }
 
     @discardableResult
@@ -374,12 +527,14 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         bounds: ViewerSceneBounds?,
         openingDirection: SIMD3<Float>?,
         isViewOnlyFlipActive: Bool,
-        ifInteractionRevisionMatches expectedRevision: UInt64
+        ifInteractionRevisionMatches expectedRevision: UInt64,
+        requestDraw shouldRequestDraw: Bool = true
     ) -> Bool {
+        let previousFlipState = self.isViewOnlyFlipActive
         self.isViewOnlyFlipActive = isViewOnlyFlipActive
-        let didFit: Bool
+        let result: SceneBoundsApplicationResult
         if let bounds {
-            didFit = applyBoundsWithoutDrawing(
+            result = applyBoundsWithoutDrawing(
                 center: bounds.center,
                 radius: bounds.radius,
                 openingDirection: openingDirection,
@@ -406,10 +561,16 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                 interactionRevision: current.interactionRevision
             )
             sourceOpeningDirection = sourceDirection
-            didFit = false
+            result = .preservedView
         }
-        requestDraw()
-        return didFit
+        guard result != .rejected else {
+            self.isViewOnlyFlipActive = previousFlipState
+            return false
+        }
+        if shouldRequestDraw {
+            requestDraw()
+        }
+        return true
     }
 
     private func applyBoundsWithoutDrawing(
@@ -417,7 +578,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         radius: Float,
         openingDirection: SIMD3<Float>?,
         ifInteractionRevisionMatches expectedRevision: UInt64
-    ) -> Bool {
+    ) -> SceneBoundsApplicationResult {
         let sourceDirection = sanitizedDirection(openingDirection)
         let effectiveDirection = isViewOnlyFlipActive
             ? transformedDirection(
@@ -437,29 +598,41 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                 radius: radius,
                 openingDirection: effectiveDirection
             ) else {
-                return false
+                return .rejected
             }
         }
         sceneCenter = center
         sourceOpeningDirection = sourceDirection
-        return didFit
+        return didFit ? .fitted : .preservedView
     }
 
-    func setViewOnlyFlipActive(_ active: Bool) {
-        guard active != isViewOnlyFlipActive else { return }
-        isViewOnlyFlipActive = active
-        let effectiveDirection = active
-            ? transformedDirection(sourceOpeningDirection, by: flipRotationMatrix)
-            : sourceOpeningDirection
-        cameraState = ViewerCameraState(
-            target: sceneCenter,
-            sceneRadius: cameraState.sceneRadius,
-            openingDirection: effectiveDirection,
-            viewportSize: cameraState.viewportSize,
-            verticalFOV: cameraState.verticalFOV,
-            interactionRevision: cameraState.interactionRevision &+ 1
+    @discardableResult
+    func setViewOnlyFlipActive(_ active: Bool) -> Bool {
+        guard active != isViewOnlyFlipActive else { return true }
+        let rotation = flipRotationMatrix
+        let current = cameraState
+        let transformedOffset = transformedVector(
+            current.target - sceneCenter,
+            by: rotation
         )
+        let transformedTarget = sceneCenter + transformedOffset
+        let transformedForward = transformedDirection(
+            current.forwardDirection,
+            by: rotation
+        )
+        let effectiveDirection = active
+            ? transformedDirection(sourceOpeningDirection, by: rotation)
+            : sourceOpeningDirection
+
+        guard cameraState.applyViewOnlyPose(
+            target: transformedTarget,
+            forwardDirection: transformedForward,
+            openingDirection: effectiveDirection
+        ) else { return false }
+
+        isViewOnlyFlipActive = active
         requestDraw()
+        return true
     }
 
     private func sanitizedDirection(_ direction: SIMD3<Float>?) -> SIMD3<Float> {
@@ -482,6 +655,14 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     ) -> SIMD3<Float> {
         let transformed = matrix * SIMD4<Float>(direction.x, direction.y, direction.z, 0)
         return sanitizedDirection(SIMD3<Float>(transformed.x, transformed.y, transformed.z))
+    }
+
+    private func transformedVector(
+        _ vector: SIMD3<Float>,
+        by matrix: matrix_float4x4
+    ) -> SIMD3<Float> {
+        let transformed = matrix * SIMD4<Float>(vector.x, vector.y, vector.z, 0)
+        return SIMD3<Float>(transformed.x, transformed.y, transformed.z)
     }
 }
 

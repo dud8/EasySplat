@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import EasySplatCore
@@ -128,7 +129,7 @@ final class RunPlanResolverTests: XCTestCase {
     func testIncompleteRunPlanIsRejected() throws {
         let json = """
         {
-          "routeIdentifier": "da3",
+          "geometryBackend": "da3",
           "modelIdentifier": "DA3-BASE",
           "memoryTier": "performance",
           "chunkSize": 8,
@@ -139,8 +140,7 @@ final class RunPlanResolverTests: XCTestCase {
           "refinementIterationLimit": 75,
           "trainerIterationLimit": 7000,
           "plateauWindow": 800,
-          "requiredToolchainCapabilities": ["geometry.da3.base"],
-          "fallbackRouteIdentifiers": ["colmap"]
+          "requiredToolchainCapabilities": ["geometry.da3.base"]
         }
         """
 
@@ -157,7 +157,7 @@ final class RunPlanResolverTests: XCTestCase {
             developmentOverrides: .none
         )
 
-        XCTAssertEqual(plan.routeIdentifier, SfmBackend.colmap.rawValue)
+        XCTAssertEqual(plan.geometryBackend, .colmap)
         XCTAssertEqual(plan.modelIdentifier, "none")
         XCTAssertEqual(plan.memoryTier, "performance")
         XCTAssertEqual(plan.chunkSize, 0)
@@ -171,7 +171,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.pairingPolicy, .unorderedRetrieval)
         XCTAssertEqual(plan.temporalPairing, .none)
         XCTAssertEqual(plan.temporalOffsets, [])
-        XCTAssertEqual(plan.retrievalEngine, .localSiftVocabularyV1)
+        XCTAssertEqual(plan.retrievalEngine, .localSiftVocabularyV2)
         XCTAssertEqual(plan.retrievalCandidateCount, 20)
         XCTAssertEqual(plan.retrievalNeighborCount, 8)
         XCTAssertEqual(plan.retrievalQueryStride, 1)
@@ -186,8 +186,8 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.geometryWorkerBudget.featureExtractionWorkers, 12)
         XCTAssertEqual(plan.geometryWorkerBudget.coupledMatchingWorkers, 8)
         XCTAssertEqual(plan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks, 1)
-        XCTAssertEqual(plan.baGlobalFramesRatio, 1.1)
-        XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
+        XCTAssertEqual(plan.baGlobalFramesRatio, 1.4)
+        XCTAssertEqual(plan.baGlobalPointsRatio, 1.4)
         XCTAssertEqual(plan.baLocalMaxRefinements, 2)
         XCTAssertEqual(plan.baGlobalMaxRefinements, 5)
         XCTAssertEqual(plan.baLocalMaxNumIterations, 10)
@@ -195,6 +195,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.baGlobalFunctionTolerance, 0.000_001)
         XCTAssertEqual(plan.baLocalImageCount, 6)
         XCTAssertEqual(plan.runSeed, 42)
+        XCTAssertEqual(plan.incrementalMappingCadence, .balancedGlobal)
         XCTAssertEqual(
             plan.requiredToolchainCapabilities,
             [
@@ -203,11 +204,26 @@ final class RunPlanResolverTests: XCTestCase {
                 "training.msplat",
             ]
         )
-        XCTAssertEqual(plan.fallbackRouteIdentifiers, [])
         XCTAssertEqual(
             try plan.toolchainCapabilityRequest().capabilities,
             [.core, .colmap, .msplat]
         )
+    }
+
+    func testResolvedPlanPersistsOneTypedBackendWithoutAnArbitraryFallbackList() throws {
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(),
+            input: .photos(folder: "/tmp/photos"),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(plan)) as? [String: Any]
+        )
+
+        XCTAssertEqual(object["geometryBackend"] as? String, SfmBackend.colmap.rawValue)
+        XCTAssertNil(object["routeIdentifier"])
+        XCTAssertNil(object["fallbackRouteIdentifiers"])
     }
 
     func testOrderedPlansUseMeasuredFastMappingCadence() {
@@ -237,6 +253,26 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(plan.baLocalFunctionTolerance, 0.001, "capture path: \(capturePath)")
             XCTAssertEqual(plan.baGlobalFunctionTolerance, 0.000_001, "capture path: \(capturePath)")
             XCTAssertEqual(plan.baLocalImageCount, 6, "capture path: \(capturePath)")
+            XCTAssertEqual(
+                plan.incrementalMappingCadence,
+                .orderedFast,
+                "capture path: \(capturePath)"
+            )
+        }
+    }
+
+    func testNamedIncrementalMappingCadencesPreserveMeasuredPolicies() {
+        let cases: [(IncrementalMappingCadenceArtifact, Double, Int)] = [
+            (.orderedFast, 4, 1),
+            (.balancedGlobal, 1.4, 2),
+            (.frequentGlobal, 1.1, 2),
+        ]
+
+        for (cadence, expectedGlobalRatio, expectedLocalRefinements) in cases {
+            XCTAssertEqual(cadence.globalFramesRatio, expectedGlobalRatio)
+            XCTAssertEqual(cadence.globalPointsRatio, expectedGlobalRatio)
+            XCTAssertEqual(cadence.localMaxRefinements, expectedLocalRefinements)
+            XCTAssertEqual(cadence.globalMaxRefinements, 5)
         }
     }
 
@@ -316,9 +352,8 @@ final class RunPlanResolverTests: XCTestCase {
             developmentOverrides: .none
         )
 
-        XCTAssertEqual(plan.routeIdentifier, SfmBackend.colmap.rawValue)
+        XCTAssertEqual(plan.geometryBackend, .colmap)
         XCTAssertEqual(plan.modelIdentifier, "none")
-        XCTAssertEqual(plan.fallbackRouteIdentifiers, [])
         XCTAssertEqual(plan.cameraGrouping, .sameCameraAndLens)
         XCTAssertEqual(plan.lensProjection, .automatic)
         XCTAssertEqual(
@@ -335,16 +370,156 @@ final class RunPlanResolverTests: XCTestCase {
             developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
         )
 
-        XCTAssertEqual(plan.routeIdentifier, SfmBackend.da3.rawValue)
+        XCTAssertEqual(plan.geometryBackend, .da3)
         XCTAssertEqual(plan.modelIdentifier, "DA3-BASE")
         XCTAssertEqual(plan.keyframeBudget, 29)
         XCTAssertEqual(plan.chunkSize, 29)
         XCTAssertEqual(plan.geometryProcessResolution, 336)
-        XCTAssertEqual(plan.fallbackRouteIdentifiers, [])
         XCTAssertEqual(
             try plan.toolchainCapabilityRequest().capabilities,
-            [.core, .colmap, .da3Runtime, .msplat, .da3Base, .da3Small]
+            [.core, .colmap, .da3Runtime, .msplat, .da3Base]
         )
+    }
+
+    func testExplicitDa3CandidateFailsClosedForIncompatibleCameraPolicies() throws {
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let cases: [(RequestedRunOptions, InputSpec, LensProjection)] = [
+            (
+                RequestedRunOptions(lensProjection: .fisheye),
+                .video(files: ["/tmp/fisheye.mov"]),
+                .fisheye
+            ),
+            (
+                RequestedRunOptions(cameraGrouping: .mixedCamerasOrLenses),
+                .photos(folder: "/tmp/mixed-cameras"),
+                .automatic
+            ),
+            (
+                RequestedRunOptions(
+                    cameraGrouping: .sameCameraAndLens,
+                    inputOrdering: .continuous
+                ),
+                .video(files: ["/tmp/first.mov", "/tmp/second.mov"]),
+                .automatic
+            ),
+        ]
+
+        for (options, input, expectedProjection) in cases {
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: options,
+                input: input,
+                hardware: hardware,
+                developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
+            )
+
+            XCTAssertEqual(plan.geometryBackend, .da3)
+            XCTAssertEqual(plan.modelIdentifier, "DA3-BASE")
+            XCTAssertEqual(plan.lensProjection, expectedProjection)
+            XCTAssertThrowsError(try plan.validate()) { error in
+                XCTAssertEqual(
+                    error as? ResolvedRunPlanValidationError,
+                    .incompatibleCameraPolicy
+                )
+            }
+        }
+
+        XCTAssertEqual(
+            ResolvedCameraModelPolicy.model(
+                detailProfile: .balanced,
+                capturePath: .automatic,
+                lensProjection: .fisheye
+            ),
+            "OPENCV_FISHEYE"
+        )
+    }
+
+    func testDa3ModelIsSelectedProactivelyFromResolvedMemoryTier() throws {
+        struct Fixture {
+            let memoryGB: Double
+            let resourcePolicy: ResourcePolicy
+            let expectedModel: String
+            let expectedCapability: ToolchainCapability
+        }
+        let fixtures = [
+            Fixture(
+                memoryGB: 16,
+                resourcePolicy: .automatic,
+                expectedModel: "DA3-SMALL",
+                expectedCapability: .da3Small
+            ),
+            Fixture(
+                memoryGB: 48,
+                resourcePolicy: .conserveMemory,
+                expectedModel: "DA3-SMALL",
+                expectedCapability: .da3Small
+            ),
+            Fixture(
+                memoryGB: 48,
+                resourcePolicy: .automatic,
+                expectedModel: "DA3-BASE",
+                expectedCapability: .da3Base
+            ),
+        ]
+
+        for fixture in fixtures {
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: fixture.resourcePolicy
+                ),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(
+                    memoryGB: fixture.memoryGB,
+                    cpuCount: 16,
+                    gpuWorkingSetGB: min(fixture.memoryGB, 36)
+                ),
+                developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
+            )
+
+            XCTAssertEqual(plan.modelIdentifier, fixture.expectedModel)
+            XCTAssertNoThrow(try plan.validate())
+            let capabilities = try plan.toolchainCapabilityRequest().capabilities
+            XCTAssertTrue(capabilities.contains(fixture.expectedCapability))
+            XCTAssertEqual(
+                capabilities.filter { $0 == .da3Base || $0 == .da3Small },
+                [fixture.expectedCapability]
+            )
+        }
+    }
+
+    func testPersistedPlanRejectsDa3WithIncompatibleCameraPolicies() {
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let invalidPolicies: [(CameraGrouping, LensProjection)] = [
+            (.sameCameraAndLens, .fisheye),
+            (.mixedCamerasOrLenses, .automatic),
+        ]
+
+        for (cameraGrouping, lensProjection) in invalidPolicies {
+            var plan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: hardware,
+                developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
+            )
+            plan.cameraGrouping = cameraGrouping
+            plan.lensProjection = lensProjection
+
+            XCTAssertThrowsError(try plan.validate())
+        }
+
+        var crossClipPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: hardware,
+            developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
+        )
+        crossClipPlan.inputOrdering = .continuous
+        crossClipPlan.pairingPolicy = .orderedContinuous
+        crossClipPlan.temporalPairing = .multiscale
+        crossClipPlan.temporalOffsets = [1, 2, 4, 8, 16, 32, 64, 128]
+        crossClipPlan.requiresCrossClipRetrieval = true
+
+        XCTAssertThrowsError(try crossClipPlan.validate())
     }
 
     func testDA3CapturePathChangeInvalidatesVideoFrameSelection() {
@@ -481,7 +656,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(automatic.trainerMemoryBudgetBytes, 12 * 1_073_741_824)
     }
 
-    func testContinuousOrderingIsUnavailableForSeparateClipsAndMixedInput() {
+    func testContinuousOrderingSupportsMultipleClipsButRejectsMixedInput() {
         XCTAssertTrue(RunPlanResolver.supports(
             inputOrdering: .continuous,
             input: .video(files: ["/tmp/one.mov"])
@@ -490,13 +665,346 @@ final class RunPlanResolverTests: XCTestCase {
             inputOrdering: .continuous,
             input: .photos(folder: "/tmp/photos")
         ))
-        XCTAssertFalse(RunPlanResolver.supports(
+        XCTAssertTrue(RunPlanResolver.supports(
             inputOrdering: .continuous,
             input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"])
+        ))
+        XCTAssertTrue(RunPlanResolver.supports(
+            inputOrdering: .continuous,
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov", "/tmp/three.mov"])
         ))
         XCTAssertFalse(RunPlanResolver.supports(
             inputOrdering: .continuous,
             input: .mixed(videos: ["/tmp/one.mov"], photosFolder: "/tmp/photos")
+        ))
+    }
+
+    func testMultipleVideoOrderingIntentSelectsDistinctPairingPolicies() {
+        let input = InputSpec.video(files: ["/tmp/one.mov", "/tmp/two.mov"])
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+
+        let automatic = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .automatic),
+            input: input,
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let continuous = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: input,
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let unordered = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .unordered),
+            input: input,
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+
+        XCTAssertEqual(automatic.inputOrdering, .unordered)
+        XCTAssertEqual(automatic.pairingPolicy, .segmentedMixed)
+        XCTAssertEqual(continuous.inputOrdering, .continuous)
+        XCTAssertEqual(continuous.pairingPolicy, .orderedContinuous)
+        XCTAssertEqual(unordered.inputOrdering, .unordered)
+        XCTAssertEqual(unordered.pairingPolicy, .unorderedRetrieval)
+    }
+
+    func testResolvedPlanPersistsCrossClipRetrievalIntentOnlyWhenRequired() throws {
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let multipleVideos = InputSpec.video(files: ["/tmp/one.mov", "/tmp/two.mov"])
+        let singleVideo = InputSpec.video(files: ["/tmp/one.mov"])
+        let mixedInput = InputSpec.mixed(
+            videos: ["/tmp/one.mov", "/tmp/two.mov"],
+            photosFolder: "/tmp/photos"
+        )
+        let fixtures: [(RequestedRunOptions, InputSpec, Bool)] = [
+            (RequestedRunOptions(inputOrdering: .continuous), multipleVideos, true),
+            (RequestedRunOptions(inputOrdering: .automatic), multipleVideos, true),
+            (RequestedRunOptions(inputOrdering: .unordered), multipleVideos, false),
+            (RequestedRunOptions(inputOrdering: .continuous), singleVideo, false),
+            (RequestedRunOptions(inputOrdering: .automatic), mixedInput, false),
+        ]
+
+        for (options, input, expected) in fixtures {
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: options,
+                input: input,
+                hardware: hardware,
+                developmentOverrides: .none
+            )
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: JSONEncoder().encode(plan))
+                    as? [String: Any]
+            )
+
+            XCTAssertEqual(
+                object["requiresCrossClipRetrieval"] as? Bool,
+                expected,
+                "options: \(options), input: \(input)"
+            )
+        }
+    }
+
+    func testExplicitContinuousThreeClipPlanUsesCaptureSpecificOrderedPolicies() {
+        let input = InputSpec.video(files: [
+            "/tmp/one.mov",
+            "/tmp/two.mov",
+            "/tmp/three.mov",
+        ])
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let cases: [(CapturePath, ResolvedPairingPolicy, TemporalPairing)] = [
+            (.automatic, .orderedContinuous, .multiscale),
+            (.orbit, .orderedOrbit, .multiscale),
+            (.walkthrough, .orderedWalkthrough, .linear),
+            (.largeArea, .orderedLargeArea, .multiscale),
+        ]
+
+        for (capturePath, expectedPolicy, expectedTemporalPairing) in cases {
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(
+                    capturePath: capturePath,
+                    inputOrdering: .continuous
+                ),
+                input: input,
+                hardware: hardware,
+                developmentOverrides: .none
+            )
+
+            XCTAssertEqual(plan.pairingPolicy, expectedPolicy, "capture path: \(capturePath)")
+            XCTAssertEqual(
+                plan.temporalPairing,
+                expectedTemporalPairing,
+                "capture path: \(capturePath)"
+            )
+        }
+    }
+
+    func testExplicitContinuousPlanMakesRuntimeIdentityOrderSensitive() throws {
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let options = RequestedRunOptions(inputOrdering: .continuous)
+        let forwardPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: .video(files: ["Originals/one.mov", "Originals/two.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let reversePlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: .video(files: ["Originals/two.mov", "Originals/one.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let digestA = String(repeating: "1", count: 64)
+        let digestB = String(repeating: "a", count: 64)
+        let forward = multiClipMetadata(
+            pathsAndDigests: [
+                ("Originals/one.mov", digestA),
+                ("Originals/two.mov", digestB),
+            ],
+            plan: forwardPlan
+        )
+        let reverse = multiClipMetadata(
+            pathsAndDigests: [
+                ("Originals/two.mov", digestB),
+                ("Originals/one.mov", digestA),
+            ],
+            plan: reversePlan
+        )
+
+        let forwardIdentities = try VideoClipIdentityResolver.resolve(
+            sourceSHA256s: [digestA, digestB],
+            pairingPolicy: forwardPlan.pairingPolicy
+        )
+        let reverseIdentities = try VideoClipIdentityResolver.resolve(
+            sourceSHA256s: [digestB, digestA],
+            pairingPolicy: reversePlan.pairingPolicy
+        )
+
+        XCTAssertEqual(forwardIdentities.map(\.groupID), ["video_000", "video_001"])
+        XCTAssertEqual(reverseIdentities.map(\.groupID), ["video_000", "video_001"])
+        XCTAssertEqual(forwardIdentities.map(\.sourceSHA256), [digestA, digestB])
+        XCTAssertEqual(reverseIdentities.map(\.sourceSHA256), [digestB, digestA])
+        XCTAssertNotEqual(
+            try RuntimeInputSnapshotLease.receiptDigest(metadata: forward),
+            try RuntimeInputSnapshotLease.receiptDigest(metadata: reverse)
+        )
+    }
+
+    func testExplicitContinuousTemporalPairsStayInsideClipGroupsWhileRetrievalSpansThem() throws {
+        let firstClip = (0..<20).map { String(format: "a_%03d.jpg", $0) }
+        let secondClip = (0..<20).map { String(format: "b_%03d.jpg", $0) }
+        let imageNames = firstClip + secondClip
+        let groups = [
+            ColmapPairGroup(imageNames: firstClip, isVideo: true),
+            ColmapPairGroup(imageNames: secondClip, isVideo: true),
+        ]
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        let pairs = try PipelineRunner.baseColmapPairPlan(
+            imageNames: imageNames,
+            groups: groups,
+            resolvedPlan: plan,
+            recoveryLevel: .normal
+        )
+        let retrieval = try XCTUnwrap(PipelineRunner.vocabularyRetrievalRequest(
+            imageNames: imageNames,
+            groups: groups,
+            resolvedPlan: plan,
+            recoveryLevel: .normal
+        ))
+
+        XCTAssertEqual(plan.pairingPolicy, .orderedContinuous)
+        XCTAssertFalse(pairs.pairs.contains { pair in
+            (firstClip.contains(pair.firstImageName) && secondClip.contains(pair.secondImageName))
+                || (secondClip.contains(pair.firstImageName) && firstClip.contains(pair.secondImageName))
+        })
+        XCTAssertTrue(retrieval.queryImageNames.contains(firstClip[0]))
+        XCTAssertTrue(retrieval.queryImageNames.contains(secondClip[0]))
+        XCTAssertEqual(retrieval.minimumFrameSeparation, 0)
+
+        let imageIndexByName = Dictionary(
+            uniqueKeysWithValues: imageNames.enumerated().map { ($0.element, $0.offset) }
+        )
+        let retrievalOutcomes = try retrieval.queryImageNames.map { queryName in
+            let queryIndex = try XCTUnwrap(imageIndexByName[queryName])
+            let neighborIndex = queryIndex < firstClip.count
+                ? queryIndex + firstClip.count
+                : queryIndex - firstClip.count
+            return PairGraphRetrievalQueryOutcome(
+                queryImageName: queryName,
+                status: .ranked,
+                rankedNeighborImageNames: [imageNames[neighborIndex]]
+            )
+        }
+        let directedPairLines = retrievalOutcomes
+            .prefix(retrievalOutcomes.count / 2)
+            .map { "\($0.queryImageName) \($0.rankedNeighborImageNames[0])" }
+            .sorted(by: PairGraphEvidenceStore.canonicalUTF8Less)
+        let produced = PairGraphRetrievalAttemptEvidence(
+            engine: .localSiftVocabularyV2,
+            queryImageNames: retrieval.queryImageNames,
+            queryStride: plan.retrievalQueryStride,
+            candidateCount: retrieval.candidateCount,
+            returnedNeighborCount: retrieval.returnedNeighborCount,
+            minimumFrameSeparation: retrieval.minimumFrameSeparation,
+            candidatePolicy: retrieval.imageGroupContract?.policy,
+            imageGroupListDigest: retrieval.imageGroupContract?.digest,
+            imageGroupLines: retrieval.imageGroupContract?.canonicalLines,
+            queryOutcomes: retrievalOutcomes,
+            directedPairLines: directedPairLines
+        )
+        let parsed = try PipelineRunner.validatedVocabularyRetrievalContract(
+            PairGraphEvidenceStore.retrievalContractLines(produced),
+            engine: .localSiftVocabularyV2,
+            queryStride: plan.retrievalQueryStride,
+            request: retrieval,
+            imageNames: imageNames,
+            excluding: pairs
+        )
+
+        XCTAssertEqual(parsed.directedPairLines, directedPairLines)
+        XCTAssertTrue(parsed.directedPairLines.allSatisfy { line in
+            let names = line.split(separator: " ").map(String.init)
+            return names.count == 2
+                && firstClip.contains(names[0])
+                && secondClip.contains(names[1])
+        })
+    }
+
+    func testShortVideoRetrievalSchedulingDistinguishesInputTopology() throws {
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let names = (0..<40).map { String(format: "frame_%03d.jpg", $0) }
+        let single = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: .video(files: ["/tmp/one.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let segmented = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .automatic),
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let continuous = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let singleGroup = [ColmapPairGroup(imageNames: names, isVideo: true)]
+        let multiGroups = [
+            ColmapPairGroup(imageNames: Array(names.prefix(20)), isVideo: true),
+            ColmapPairGroup(imageNames: Array(names.suffix(20)), isVideo: true),
+        ]
+
+        XCTAssertFalse(single.requiresCrossClipRetrieval)
+        XCTAssertNil(try PipelineRunner.vocabularyRetrievalRequest(
+            imageNames: names,
+            groups: singleGroup,
+            resolvedPlan: single,
+            recoveryLevel: .normal
+        ))
+        XCTAssertTrue(segmented.requiresCrossClipRetrieval)
+        let segmentedRequest = try XCTUnwrap(PipelineRunner.vocabularyRetrievalRequest(
+            imageNames: names,
+            groups: multiGroups,
+            resolvedPlan: segmented,
+            recoveryLevel: .normal
+        ))
+        XCTAssertEqual(segmentedRequest.queryImageNames, names)
+        XCTAssertEqual(segmentedRequest.imageGroupContract?.policy, .crossGroupV1)
+        XCTAssertTrue(continuous.requiresCrossClipRetrieval)
+        XCTAssertNotNil(try PipelineRunner.vocabularyRetrievalRequest(
+            imageNames: names,
+            groups: multiGroups,
+            resolvedPlan: continuous,
+            recoveryLevel: .normal
+        ))
+    }
+
+    func testShortContinuousMulticlipRecoveryRetainsAConnectionPath() throws {
+        let firstClip = (0..<20).map { String(format: "a_%03d.jpg", $0) }
+        let secondClip = (0..<20).map { String(format: "b_%03d.jpg", $0) }
+        let names = firstClip + secondClip
+        let groups = [
+            ColmapPairGroup(imageNames: firstClip, isVideo: true),
+            ColmapPairGroup(imageNames: secondClip, isVideo: true),
+        ]
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .continuous),
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+
+        for level in [PipelineRunner.PairRecoveryLevel.normal, .expanded] {
+            XCTAssertNotNil(try PipelineRunner.vocabularyRetrievalRequest(
+                imageNames: names,
+                groups: groups,
+                resolvedPlan: plan,
+                recoveryLevel: level
+            ))
+        }
+
+        let maximumPlan = try PipelineRunner.baseColmapPairPlan(
+            imageNames: names,
+            groups: groups,
+            resolvedPlan: plan,
+            recoveryLevel: .maximum
+        )
+        XCTAssertEqual(maximumPlan.pairs.count, names.count * (names.count - 1) / 2)
+        XCTAssertTrue(maximumPlan.isConnected)
+        XCTAssertNil(try PipelineRunner.vocabularyRetrievalRequest(
+            imageNames: names,
+            groups: groups,
+            resolvedPlan: plan,
+            recoveryLevel: .maximum
         ))
     }
 
@@ -577,9 +1085,12 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.retrievalCandidateCount, 20)
         XCTAssertEqual(plan.retrievalNeighborCount, 8)
         XCTAssertEqual(plan.retrievalQueryStride, 1)
+        XCTAssertTrue(plan.requiresCrossClipRetrieval)
         XCTAssertEqual(plan.cameraGrouping, .mixedCamerasOrLenses)
-        XCTAssertEqual(plan.baGlobalFramesRatio, 1.1)
-        XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
+        XCTAssertEqual(plan.baGlobalFramesRatio, 1.4)
+        XCTAssertEqual(plan.baGlobalPointsRatio, 1.4)
+        XCTAssertEqual(plan.baLocalMaxRefinements, 2)
+        XCTAssertEqual(plan.incrementalMappingCadence, .balancedGlobal)
 
         let mixedPlan = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(),
@@ -590,8 +1101,11 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(mixedPlan.pairingPolicy, .segmentedMixed)
         XCTAssertEqual(mixedPlan.temporalPairing, .linear)
         XCTAssertEqual(mixedPlan.temporalOffsets, [1, 2, 3, 4, 5, 6])
-        XCTAssertEqual(mixedPlan.baGlobalFramesRatio, 1.1)
-        XCTAssertEqual(mixedPlan.baGlobalPointsRatio, 1.1)
+        XCTAssertFalse(mixedPlan.requiresCrossClipRetrieval)
+        XCTAssertEqual(mixedPlan.baGlobalFramesRatio, 1.4)
+        XCTAssertEqual(mixedPlan.baGlobalPointsRatio, 1.4)
+        XCTAssertEqual(mixedPlan.baLocalMaxRefinements, 2)
+        XCTAssertEqual(mixedPlan.incrementalMappingCadence, .balancedGlobal)
     }
 
     func testAutomaticSingleVideoUsesNeutralContinuousPolicyWithoutInventingCaptureIntent() {
@@ -640,9 +1154,8 @@ final class RunPlanResolverTests: XCTestCase {
             developmentOverrides: DevelopmentOverrides(candidateRoute: .colmap, benchmarkSeed: 99)
         )
 
-        XCTAssertEqual(plan.routeIdentifier, SfmBackend.colmap.rawValue)
+        XCTAssertEqual(plan.geometryBackend, .colmap)
         XCTAssertEqual(plan.modelIdentifier, "none")
-        XCTAssertEqual(plan.fallbackRouteIdentifiers, [])
         XCTAssertEqual(plan.requiredToolchainCapabilities, ["geometry.colmap", "runtime.core", "training.msplat"])
         XCTAssertEqual(plan.cameraGrouping, .mixedCamerasOrLenses)
         XCTAssertEqual(plan.lensProjection, .fisheye)
@@ -674,23 +1187,32 @@ final class RunPlanResolverTests: XCTestCase {
             )
         }
 
-        corrupt = plan
-        corrupt.routeIdentifier = "geometry.unknown"
-        XCTAssertThrowsError(try corrupt.toolchainCapabilityRequest()) { error in
-            XCTAssertEqual(
-                error as? ResolvedRunPlanValidationError,
-                .unknownRouteIdentifier("geometry.unknown")
-            )
-        }
+        var encodedPlan = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(plan)) as? [String: Any]
+        )
+        encodedPlan["geometryBackend"] = "geometry.unknown"
+        let unknownBackendData = try JSONSerialization.data(withJSONObject: encodedPlan)
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(ResolvedRunPlan.self, from: unknownBackendData)
+        )
 
         corrupt = plan
-        corrupt.fallbackRouteIdentifiers = [SfmBackend.colmap.rawValue, "geometry.unknown"]
-        XCTAssertThrowsError(try corrupt.toolchainCapabilityRequest()) { error in
-            XCTAssertEqual(
-                error as? ResolvedRunPlanValidationError,
-                .unknownRouteIdentifier("geometry.unknown")
-            )
-        }
+        corrupt.modelIdentifier = "DA3-BASE"
+        XCTAssertThrowsError(try corrupt.toolchainCapabilityRequest())
+
+        corrupt = plan
+        corrupt.requiredToolchainCapabilities.append("geometry.da3.small")
+        XCTAssertThrowsError(try corrupt.toolchainCapabilityRequest())
+
+        corrupt = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(detailProfile: .balanced),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
+        )
+        corrupt.requiredToolchainCapabilities.append("geometry.da3.small")
+        corrupt.requiredToolchainCapabilities.sort()
+        XCTAssertThrowsError(try corrupt.toolchainCapabilityRequest())
 
         corrupt = plan
         corrupt.baLocalMaxRefinements = 0
@@ -698,6 +1220,24 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(
                 error as? ResolvedRunPlanValidationError,
                 .invalidBundleAdjustmentConfiguration
+            )
+        }
+
+        corrupt = plan
+        corrupt.runSeed = UInt64(Int32.max) + 1
+        XCTAssertThrowsError(try corrupt.toolchainCapabilityRequest()) { error in
+            XCTAssertEqual(
+                error as? ResolvedRunPlanValidationError,
+                .randomSeedOutOfRange
+            )
+        }
+
+        corrupt = plan
+        corrupt.requiresCrossClipRetrieval = true
+        XCTAssertThrowsError(try corrupt.toolchainCapabilityRequest()) { error in
+            XCTAssertEqual(
+                error as? ResolvedRunPlanValidationError,
+                .invalidPairingConfiguration
             )
         }
     }
@@ -740,17 +1280,26 @@ final class RunPlanResolverTests: XCTestCase {
     func testResolvedPlanPersistsBeforeImportProcessCompletes() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
+        let sourcePhotos = root.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: false
+        )
+        for index in 0..<3 {
+            XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+                url: sourcePhotos.appendingPathComponent("photo-\(index).jpg"),
+                size: 16,
+                value: UInt8(32 + index * 32),
+                utType: .jpeg
+            ))
+        }
         let projectURL = root.appendingPathComponent("Plan.easysplatproj", isDirectory: true)
-        let source = root.appendingPathComponent("Photos", isDirectory: true)
-        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
-        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
-            url: source.appendingPathComponent("one.jpg"),
-            size: 16,
-            value: 32,
-            utType: .jpeg
-        ))
         let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: paths.root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
         let options = RequestedRunOptions(
             capturePath: .largeArea,
             detailProfile: .fast,
@@ -760,13 +1309,56 @@ final class RunPlanResolverTests: XCTestCase {
             resourcePolicy: .conserveMemory,
             photoSelection: .useAllValidPhotos
         )
+        let requestedInput = InputSpec.photos(folder: sourcePhotos.path)
+        let admissionPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: requestedInput,
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        let prepared = try await PhotoInputPreflight.prepare(
+            folder: sourcePhotos,
+            stagingParent: root,
+            photoSelection: admissionPlan.photoSelection,
+            inputOrdering: admissionPlan.inputOrdering,
+            keyframeBudget: admissionPlan.keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: 0,
+            limits: .init(
+                maximumPhotoCount: 16,
+                maximumTotalBytes: 16 * 1_024 * 1_024,
+                maximumSinglePhotoBytes: 4 * 1_024 * 1_024,
+                maximumPixelCount: 1_024 * 1_024,
+                maximumDecodedDimension: 128,
+                maximumTraversalEntryCount: 32,
+                maximumRecursionDepth: 4,
+                minimumFreeSpaceReserveBytes: 0
+            ),
+            progress: { _, _ in }
+        )
+        defer { prepared.discard() }
+        XCTAssertEqual(prepared.photos.count, 3)
+        var adoption = ProjectInputAdoption(requestedInput: requestedInput)
+        try adoption.adoptPhotos(prepared, into: paths)
         let metadata = ProjectMetadata(
             title: "Plan",
-            input: .photos(folder: source.path),
-            requestedRunOptions: options
+            input: adoption.input,
+            photoInputReceipts: try XCTUnwrap(adoption.photoInputReceipts),
+            photoSelectionReceipt: try XCTUnwrap(adoption.photoSelectionReceipt),
+            requestedRunOptions: options,
+            resolvedRunPlan: admissionPlan
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-        let toolchain = TestToolchains.toolchainPaths(root: root)
+        try PhotoInputReceiptValidator.validateFiles(metadata: metadata, paths: paths)
+        let toolchainRoot = root.appendingPathComponent("Toolchain", isDirectory: true)
+        let colmap = toolchainRoot.appendingPathComponent("bin/colmap")
+        try TestFileBuilder.createExecutable(at: colmap)
+        let openMPRuntime = toolchainRoot.appendingPathComponent("lib/libomp.dylib")
+        try FileManager.default.createDirectory(
+            at: openMPRuntime.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("fixture OpenMP runtime".utf8).write(to: openMPRuntime)
+        let toolchain = TestToolchains.toolchainPaths(root: toolchainRoot, colmap: colmap)
         let runner = PipelineRunner(
             projectURL: projectURL,
             config: .init(
@@ -780,7 +1372,7 @@ final class RunPlanResolverTests: XCTestCase {
         let saved = try ProjectMetadataStore.load(from: paths.metadataURL)
         let plan = try XCTUnwrap(saved.resolvedRunPlan)
         XCTAssertEqual(plan.capturePath, .largeArea)
-        XCTAssertEqual(plan.routeIdentifier, SfmBackend.colmap.rawValue)
+        XCTAssertEqual(plan.geometryBackend, .colmap)
         XCTAssertEqual(plan.modelIdentifier, "none")
         XCTAssertEqual(plan.photoSelection, .useAllValidPhotos)
         XCTAssertEqual(plan.runSeed, 7)
@@ -874,6 +1466,18 @@ final class RunPlanResolverTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? RunPlanResolver.ValidationError, .noValidPhotos)
         }
+    }
+
+    func testNoValidPhotosGuidanceIncludesSupportedRawFormats() throws {
+        let message = try XCTUnwrap(
+            RunPlanResolver.ValidationError.noValidPhotos.errorDescription
+        )
+
+        XCTAssertEqual(
+            message,
+            "This folder has no readable photos. Choose JPEG, PNG, HEIC, HEIF, or a RAW format supported by macOS."
+        )
+        XCTAssertFalse(message.contains("TIFF"))
     }
 
     func testPhotoOnlyPreflightRequiresThreeUsableViews() {
@@ -1141,7 +1745,7 @@ final class RunPlanResolverTests: XCTestCase {
                 previousPlan: currentVideoPlan,
                 currentPlan: mappingPolicyPlan
             ),
-            .sfmMatching
+            .sfmFeatures
         )
 
         mappingPolicyPlan = currentVideoPlan
@@ -1194,6 +1798,18 @@ final class RunPlanResolverTests: XCTestCase {
 
         var pairingPolicyPlan = currentVideoPlan
         pairingPolicyPlan.temporalOffsets = [1, 2, 4]
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: pairingPolicyPlan
+            ),
+            .sfmFeatures
+        )
+
+        pairingPolicyPlan = currentVideoPlan
+        pairingPolicyPlan.requiresCrossClipRetrieval.toggle()
         XCTAssertEqual(
             RunPlanResolver.safeResumeStage(
                 .exportSplat,
@@ -1262,6 +1878,50 @@ final class RunPlanResolverTests: XCTestCase {
                 currentPlan: retrievalWorkersPlan
             ),
             .sfmFeatures
+        )
+    }
+
+    private func multiClipMetadata(
+        pathsAndDigests: [(String, String)],
+        plan: ResolvedRunPlan
+    ) -> ProjectMetadata {
+        ProjectMetadata(
+            title: "Continuous clips",
+            input: .video(files: pathsAndDigests.map(\.0)),
+            videoInputReceipts: pathsAndDigests.enumerated().map { index, entry in
+                let (path, digest) = entry
+                return VideoInputReceipt(
+                    projectRelativePath: path,
+                    safeDisplayName: URL(fileURLWithPath: path).lastPathComponent,
+                    byteCount: 1,
+                    sha256: digest,
+                    trackID: 1,
+                    pixelWidth: 64,
+                    pixelHeight: 48,
+                    durationSeconds: 1,
+                    nominalFrameRate: 30,
+                    isHDR: false,
+                    decodedFrameCount: 3,
+                    transformA: 1,
+                    transformB: 0,
+                    transformC: 0,
+                    transformD: 1,
+                    transformTX: 0,
+                    transformTY: 0,
+                    clipGroupID: String(format: "video_%03d", index),
+                    analysisPolicySHA256: VideoFrameAnalysisPolicy(
+                        resolvedRunPlan: plan
+                    ).sha256,
+                    analysisArtifactPath: String(
+                        format: "Frames/video-analysis-%04d.json",
+                        index
+                    ),
+                    analysisArtifactByteCount: 1,
+                    analysisArtifactSHA256: digest
+                )
+            },
+            requestedRunOptions: RequestedRunOptions(inputOrdering: .continuous),
+            resolvedRunPlan: plan
         )
     }
 }

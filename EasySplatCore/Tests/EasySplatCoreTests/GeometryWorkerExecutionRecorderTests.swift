@@ -64,6 +64,151 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
         XCTAssertEqual(afterRecovery.matchingInvocations, [failed, recovered])
     }
 
+    func testCompletedVocabularyRetrievalTransitionsIntoRejectedEvidence() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: nil,
+            inputHasVideos: false
+        )
+        let imageNames = (0..<61).map { "image_\($0).jpg" }
+        let retrieval = rejectedRetrievalEvidence(imageNames: imageNames)
+        let invocation = rejectedRetrievalInvocation(
+            attemptOrdinal: 1,
+            retrieval: retrieval
+        )
+        try recorder.record(invocation)
+
+        try recorder.rejectCompletedVocabularyRetrieval(
+            pairAttemptOrdinal: 1,
+            planBinding: .testingDefault(pairingPolicy: .unorderedRetrieval),
+            recoveryLevel: .normal,
+            imageNames: imageNames,
+            groups: [ColmapPairGroup(imageNames: imageNames, isVideo: false)],
+            retrieval: retrieval,
+            durationSeconds: 0.5
+        )
+
+        let artifact = try loadArtifact(fixture.paths, budget: budget)
+        XCTAssertTrue(artifact.vocabularyRetrievalInvocations.isEmpty)
+        XCTAssertEqual(artifact.rejectedVocabularyRetrievalInvocations.count, 1)
+        XCTAssertEqual(
+            artifact.rejectedVocabularyRetrievalInvocations[0].retrievalAttemptOrdinal,
+            1
+        )
+        XCTAssertEqual(
+            artifact.rejectedVocabularyRetrievalInvocations[0].invocation,
+            invocation
+        )
+        XCTAssertEqual(
+            artifact.rejectedVocabularyRetrievalInvocations[0].retrieval,
+            retrieval
+        )
+    }
+
+    func testRejectedVocabularyRetrievalTransitionFailsClosedForUnmatchedEvidence() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: nil,
+            inputHasVideos: false
+        )
+        let imageNames = (0..<61).map { "image_\($0).jpg" }
+        let retrieval = rejectedRetrievalEvidence(imageNames: imageNames)
+        let invocation = rejectedRetrievalInvocation(
+            attemptOrdinal: 1,
+            retrieval: retrieval
+        )
+        try recorder.record(invocation)
+        var forged = retrieval
+        forged.outputDigest = String(repeating: "f", count: 64)
+
+        XCTAssertThrowsError(try recorder.rejectCompletedVocabularyRetrieval(
+            pairAttemptOrdinal: 1,
+            planBinding: .testingDefault(pairingPolicy: .unorderedRetrieval),
+            recoveryLevel: .normal,
+            imageNames: imageNames,
+            groups: [ColmapPairGroup(imageNames: imageNames, isVideo: false)],
+            retrieval: forged,
+            durationSeconds: 0.5
+        ))
+
+        let artifact = try loadArtifact(fixture.paths, budget: budget)
+        XCTAssertEqual(artifact.vocabularyRetrievalInvocations, [invocation])
+        XCTAssertTrue(artifact.rejectedVocabularyRetrievalInvocations.isEmpty)
+    }
+
+    func testDiscardUnacceptedMatcherInvocationRollsBackOnlyTheActiveAttempt() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: nil,
+            inputHasVideos: false
+        )
+        let first = boundedInvocation(
+            .matchesImporter,
+            workers: budget.coupledMatchingWorkers,
+            pairExecution: pairExecution(attemptOrdinal: 1)
+        )
+        let interrupted = boundedInvocation(
+            .matchesImporter,
+            workers: budget.coupledMatchingWorkers,
+            exitStatus: SIGINT,
+            pairExecution: pairExecution(attemptOrdinal: 2)
+        )
+        let retrieval = boundedInvocation(
+            .localVocabularyRetriever,
+            workers: budget.vocabularyRetrievalWorkers,
+            pairExecution: pairExecution(
+                attemptOrdinal: 2,
+                pairListDigest: nil,
+                retrievalRequestDigest: String(repeating: "b", count: 64),
+                retrievalOutputDigest: String(repeating: "c", count: 64)
+            )
+        )
+        try recorder.record(first)
+        try recorder.record(retrieval)
+        try recorder.record(interrupted)
+
+        try recorder.discardUnacceptedMatcherInvocation(attemptOrdinal: 2)
+
+        let recovered = try loadArtifact(fixture.paths, budget: budget)
+        XCTAssertEqual(recovered.matchingInvocations, [first])
+        XCTAssertEqual(recovered.vocabularyRetrievalInvocations, [retrieval])
+    }
+
+    func testDiscardUnacceptedMatcherInvocationRemovesDuplicateCrashResidue() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: nil,
+            inputHasVideos: false
+        )
+        let interrupted = boundedInvocation(
+            .matchesImporter,
+            workers: budget.coupledMatchingWorkers,
+            exitStatus: SIGINT,
+            pairExecution: pairExecution(attemptOrdinal: 1)
+        )
+        try recorder.record(interrupted)
+        try recorder.record(interrupted)
+
+        try recorder.discardUnacceptedMatcherInvocation(attemptOrdinal: 1)
+
+        XCTAssertTrue(
+            try loadArtifact(fixture.paths, budget: budget)
+                .matchingInvocations.isEmpty
+        )
+    }
+
     func testPlanChangePreservesCompletedEvidenceAndClearsInvalidatedEvidence() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -108,6 +253,74 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
         XCTAssertTrue(resumed.matchingInvocations.isEmpty)
         XCTAssertTrue(resumed.vocabularyRetrievalInvocations.isEmpty)
         XCTAssertTrue(resumed.mappingAndRefinementInvocations.isEmpty)
+    }
+
+    func testRuntimeClosureChangeWinsOverPlanRebaseAndForcesSafeRecovery() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let staleClosure = makeColmapRuntimeClosureEvidence()
+        let currentClosure = makeColmapRuntimeClosureEvidence(
+            executableSHA256: String(repeating: "c", count: 64),
+            openMPSHA256: String(repeating: "d", count: 64)
+        )
+        try save(
+            completeArtifact(budget: budget, runtimeClosure: staleClosure),
+            paths: fixture.paths,
+            budget: budget
+        )
+
+        let reopened = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            runtimeClosure: currentClosure,
+            resumeAfter: .sfmFeatures,
+            inputHasVideos: false,
+            resetForPlanChange: true
+        )
+
+        XCTAssertEqual(reopened.maximumSafeResumeBoundary, .selectFrames)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.workerExecutionURL.path
+        ))
+        XCTAssertEqual(
+            try quarantinedLedgers(
+                in: fixture.paths,
+                prefix: "worker_execution.stale-runtime-closure-"
+            ).count,
+            1
+        )
+        try reopened.commitRecoveryBaseline()
+        XCTAssertEqual(
+            try loadArtifact(fixture.paths, budget: budget),
+            emptyArtifact(budget: budget, runtimeClosure: currentClosure)
+        )
+    }
+
+    func testRuntimeClosureRebindRejectsAChangedClosureWithoutRewritingEvidence() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let runtimeClosure = makeColmapRuntimeClosureEvidence()
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            runtimeClosure: runtimeClosure,
+            resumeAfter: nil,
+            inputHasVideos: false
+        )
+        let original = try Data(contentsOf: fixture.paths.workerExecutionURL)
+
+        XCTAssertThrowsError(try recorder.rebindColmapRuntimeClosure(
+            makeColmapRuntimeClosureEvidence(
+                executableSHA256: String(repeating: "c", count: 64),
+                openMPSHA256: String(repeating: "d", count: 64)
+            )
+        )) { error in
+            XCTAssertEqual(
+                error as? GeometryWorkerExecutionArtifactError,
+                .invalidRuntimeClosure
+            )
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.workerExecutionURL), original)
     }
 
     func testBudgetRebaseSucceedsWhenResumeBoundaryClearsAffectedStage() throws {
@@ -478,9 +691,11 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
     )
 
     private func completeArtifact(
-        budget: GeometryWorkerBudget
+        budget: GeometryWorkerBudget,
+        runtimeClosure: ColmapRuntimeClosureEvidence = makeColmapRuntimeClosureEvidence()
     ) -> GeometryWorkerExecutionArtifact {
         GeometryWorkerExecutionArtifact(
+            colmapRuntimeClosure: runtimeClosure,
             resolvedBudget: budget,
             featureExtractionInvocations: [
                 boundedInvocation(
@@ -512,9 +727,11 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
     }
 
     private func emptyArtifact(
-        budget: GeometryWorkerBudget
+        budget: GeometryWorkerBudget,
+        runtimeClosure: ColmapRuntimeClosureEvidence = makeColmapRuntimeClosureEvidence()
     ) -> GeometryWorkerExecutionArtifact {
         GeometryWorkerExecutionArtifact(
+            colmapRuntimeClosure: runtimeClosure,
             resolvedBudget: budget,
             featureExtractionInvocations: [],
             matchingInvocations: [],
@@ -538,7 +755,8 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
     private func boundedInvocation(
         _ command: ColmapWorkerCommandIdentity,
         workers: Int,
-        exitStatus: Int32 = 0
+        exitStatus: Int32 = 0,
+        pairExecution: ColmapPairWorkerExecutionEvidence? = nil
     ) -> ColmapWorkerInvocationEvidence {
         let environment = [
             "OMP_NUM_THREADS": "\(workers)",
@@ -554,8 +772,62 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
             removedThreadEnvironmentKeysSHA256:
                 GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeysSHA256,
             effectiveSanitizedThreadEnvironment: environment,
+            pairExecution: pairExecution,
             exitStatus: exitStatus,
             succeeded: exitStatus == 0
+        )
+    }
+
+    private func pairExecution(
+        attemptOrdinal: Int,
+        pairListDigest: String? = String(repeating: "a", count: 64),
+        retrievalRequestDigest: String? = nil,
+        retrievalOutputDigest: String? = nil
+    ) -> ColmapPairWorkerExecutionEvidence {
+        ColmapPairWorkerExecutionEvidence(
+            attemptOrdinal: attemptOrdinal,
+            descriptorMatcher: .faiss,
+            scheduledPairCount: pairListDigest == nil ? nil : 3,
+            pairListDigest: pairListDigest,
+            retrievalRequestDigest: retrievalRequestDigest,
+            retrievalOutputDigest: retrievalOutputDigest
+        )
+    }
+
+    private func rejectedRetrievalEvidence(
+        imageNames: [String]
+    ) -> PairGraphRetrievalAttemptEvidence {
+        PairGraphRetrievalAttemptEvidence(
+            engine: .localSiftVocabularyV2,
+            queryImageNames: imageNames,
+            queryStride: 1,
+            candidateCount: 20,
+            returnedNeighborCount: 8,
+            minimumFrameSeparation: 0,
+            queryOutcomes: imageNames.map {
+                PairGraphRetrievalQueryOutcome(
+                    queryImageName: $0,
+                    status: .noRankedNeighbors,
+                    rankedNeighborImageNames: []
+                )
+            },
+            directedPairLines: []
+        )
+    }
+
+    private func rejectedRetrievalInvocation(
+        attemptOrdinal: Int,
+        retrieval: PairGraphRetrievalAttemptEvidence
+    ) -> ColmapWorkerInvocationEvidence {
+        boundedInvocation(
+            .localVocabularyRetriever,
+            workers: budget.vocabularyRetrievalWorkers,
+            pairExecution: pairExecution(
+                attemptOrdinal: attemptOrdinal,
+                pairListDigest: nil,
+                retrievalRequestDigest: PairGraphEvidenceStore.retrievalRequestDigest(retrieval),
+                retrievalOutputDigest: retrieval.outputDigest
+            )
         )
     }
 
@@ -564,7 +836,21 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
         exitStatus: Int32 = 0,
         mappingAttemptOrdinal: Int? = nil
     ) -> ColmapWorkerInvocationEvidence {
-        ColmapWorkerInvocationEvidence(
+        let mapperExecution = command == .mapper
+            ? ColmapMapperWorkerExecutionEvidence(
+                incrementalCadence: .balancedGlobal,
+                globalMaxNumIterations: 75,
+                randomSeed: 42,
+                refineFocalLength: true,
+                minimumPairInlierCount: ColmapMappingPolicy.minimumPairInlierCount,
+                pairGraphAttemptOrdinal: 1,
+                pairListDigest: String(repeating: "a", count: 64),
+                descriptorMatcher: .faiss,
+                matchingDatabaseDigest: String(repeating: "b", count: 64),
+                evaluation: nil
+            )
+            : nil
+        return ColmapWorkerInvocationEvidence(
             command: command,
             mappingAttemptOrdinal: mappingAttemptOrdinal,
             threadPolicy: .nativeAuto,
@@ -573,6 +859,7 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
             removedThreadEnvironmentKeysSHA256:
                 GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeysSHA256,
             effectiveSanitizedThreadEnvironment: [:],
+            mapperExecution: mapperExecution,
             exitStatus: exitStatus,
             succeeded: exitStatus == 0
         )
@@ -608,6 +895,25 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
             from: paths.workerExecutionURL,
             expectedBudget: budget,
             projectPaths: paths
+        )
+    }
+}
+
+private extension GeometryWorkerExecutionRecorder {
+    convenience init(
+        paths: ProjectPaths,
+        budget: GeometryWorkerBudget,
+        resumeAfter lastCompletedStage: PipelineStage?,
+        inputHasVideos: Bool,
+        resetForPlanChange: Bool = false
+    ) throws {
+        try self.init(
+            paths: paths,
+            budget: budget,
+            runtimeClosure: makeColmapRuntimeClosureEvidence(),
+            resumeAfter: lastCompletedStage,
+            inputHasVideos: inputHasVideos,
+            resetForPlanChange: resetForPlanChange
         )
     }
 }

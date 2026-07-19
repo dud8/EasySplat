@@ -6,7 +6,7 @@ public enum RunPlanResolver {
     public static let minimumReconstructionImageCount = 3
 
     public enum ValidationError: Error, LocalizedError, Equatable {
-        case continuousMultipleClipsUnsupported
+        case continuousMixedInputUnsupported
         case fastDetailRequired
         case highDetailRequiresMoreMemory
         case noValidPhotos
@@ -15,14 +15,14 @@ public enum RunPlanResolver {
 
         public var errorDescription: String? {
             switch self {
-            case .continuousMultipleClipsUnsupported:
-                return "Continuous sequence currently supports one video clip. Use Automatic or Unordered for separate clips."
+            case .continuousMixedInputUnsupported:
+                return "Continuous sequence can't combine videos and photos. Use Automatic or Unordered."
             case .fastDetailRequired:
                 return "This Mac supports the Fast detail profile. Choose Fast to stay within its memory limit."
             case .highDetailRequiresMoreMemory:
                 return "High Detail requires a Mac with at least 24 GB of unified memory. Choose Balanced or Fast."
             case .noValidPhotos:
-                return "This folder has no readable photos. Choose a folder with JPEG, PNG, HEIC, or HEIF images."
+                return "This folder has no readable photos. Choose JPEG, PNG, HEIC, HEIF, or a RAW format supported by macOS."
             case let .insufficientValidPhotos(actual, minimum):
                 let noun = actual == 1 ? "photo" : "photos"
                 return "This folder has \(actual) usable \(noun). Choose at least \(minimum) photos from different viewpoints."
@@ -56,7 +56,7 @@ public enum RunPlanResolver {
             throw ValidationError.highDetailRequiresMoreMemory
         }
         if !supports(inputOrdering: requestedOptions.inputOrdering, input: input) {
-            throw ValidationError.continuousMultipleClipsUnsupported
+            throw ValidationError.continuousMixedInputUnsupported
         }
     }
 
@@ -73,7 +73,7 @@ public enum RunPlanResolver {
 
     public static func supports(inputOrdering: InputOrdering, input: InputSpec) -> Bool {
         guard inputOrdering == .continuous else { return true }
-        return input.videoFiles.count <= 1 && !(input.hasVideos && input.hasPhotos)
+        return !(input.hasVideos && input.hasPhotos)
     }
 
     public static func maximumValidPhotoCount(for resolvedPlan: ResolvedRunPlan) -> Int? {
@@ -192,7 +192,7 @@ public enum RunPlanResolver {
             || videoSourceAnalysisChanged
             || previousPlan.photoSelection != currentPlan.photoSelection
             || previousPlan.capturePath != currentPlan.capturePath
-        let geometryChanged = previousPlan.routeIdentifier != currentPlan.routeIdentifier
+        let geometryChanged = previousPlan.geometryBackend != currentPlan.geometryBackend
             || previousPlan.modelIdentifier != currentPlan.modelIdentifier
             || previousPlan.memoryTier != currentPlan.memoryTier
             || previousPlan.chunkSize != currentPlan.chunkSize
@@ -206,7 +206,6 @@ public enum RunPlanResolver {
             || previousPlan.geometryWorkerBudget.featureExtractionWorkers
                 != currentPlan.geometryWorkerBudget.featureExtractionWorkers
             || previousPlan.requiredToolchainCapabilities != currentPlan.requiredToolchainCapabilities
-            || previousPlan.fallbackRouteIdentifiers != currentPlan.fallbackRouteIdentifiers
             || previousPlan.inputOrdering != currentPlan.inputOrdering
         let mappingPolicyChanged = previousPlan.baGlobalFramesRatio != currentPlan.baGlobalFramesRatio
             || previousPlan.baGlobalPointsRatio != currentPlan.baGlobalPointsRatio
@@ -216,7 +215,6 @@ public enum RunPlanResolver {
             || previousPlan.baLocalFunctionTolerance != currentPlan.baLocalFunctionTolerance
             || previousPlan.baGlobalFunctionTolerance != currentPlan.baGlobalFunctionTolerance
             || previousPlan.baLocalImageCount != currentPlan.baLocalImageCount
-            || previousPlan.runSeed != currentPlan.runSeed
         let matchingPolicyChanged = previousPlan.pairingPolicy != currentPlan.pairingPolicy
             || previousPlan.temporalPairing != currentPlan.temporalPairing
             || previousPlan.temporalOffsets != currentPlan.temporalOffsets
@@ -224,7 +222,10 @@ public enum RunPlanResolver {
             || previousPlan.retrievalCandidateCount != currentPlan.retrievalCandidateCount
             || previousPlan.retrievalNeighborCount != currentPlan.retrievalNeighborCount
             || previousPlan.retrievalQueryStride != currentPlan.retrievalQueryStride
+            || previousPlan.requiresCrossClipRetrieval
+                != currentPlan.requiresCrossClipRetrieval
             || previousPlan.normalDescriptorMatcher != currentPlan.normalDescriptorMatcher
+            || previousPlan.runSeed != currentPlan.runSeed
             || previousPlan.geometryWorkerBudget.coupledMatchingWorkers
                 != currentPlan.geometryWorkerBudget.coupledMatchingWorkers
             || previousPlan.geometryWorkerBudget.vocabularyRetrievalWorkers
@@ -263,11 +264,15 @@ public enum RunPlanResolver {
             input: input
         )
         let pairingConfiguration = pairingConfiguration(for: pairingPolicy)
+        let requiresCrossClipRetrieval = Self.requiresCrossClipRetrieval(
+            requestedInputOrdering: options.inputOrdering,
+            input: input
+        )
         let baGlobalRatio: Double
         let baLocalMaxRefinements: Int
         switch pairingPolicy {
         case .unorderedRetrieval, .segmentedMixed:
-            baGlobalRatio = 1.1
+            baGlobalRatio = 1.4
             baLocalMaxRefinements = 2
         case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
             baGlobalRatio = 4
@@ -278,8 +283,10 @@ public enum RunPlanResolver {
             detail: options.detailProfile,
             memoryGB: hardware.memoryGB
         )
+        let cameraGrouping = resolvedCameraGrouping(options.cameraGrouping, input: input)
+        let lensProjection = options.lensProjection
         let route = developmentOverrides.candidateRoute ?? .colmap
-        let model = resolvedModel(route: route)
+        let model = resolvedModel(route: route, memoryTier: memoryTier)
         let keyframeBudget = route == .da3
             ? 29
             : resolvedKeyframeBudget(
@@ -312,8 +319,6 @@ public enum RunPlanResolver {
         let resolvedTrainingMemoryBudget = trainingMemoryRetryBudgetBytes
             .map { max(baseTrainingMemoryBudget, min($0, maximumTrainingMemoryBudget)) }
             ?? baseTrainingMemoryBudget
-        let cameraGrouping = resolvedCameraGrouping(options.cameraGrouping, input: input)
-        let lensProjection = options.lensProjection
         let colmapBudget = resolvedColmapBudget(
             memoryTier: memoryTier,
             resourcePolicy: options.resourcePolicy
@@ -331,7 +336,7 @@ public enum RunPlanResolver {
         }
 
         return ResolvedRunPlan(
-            routeIdentifier: route.rawValue,
+            geometryBackend: route,
             modelIdentifier: model,
             memoryTier: memoryTier.rawValue,
             chunkSize: route == .da3 ? 29 : 0,
@@ -344,6 +349,10 @@ public enum RunPlanResolver {
             colmapMaximumImageDimension: colmapMaximumImageDimension,
             cameraGrouping: cameraGrouping,
             lensProjection: lensProjection,
+            cameraInitializationRecipe: ColmapCameraInitializationRecipe.resolve(
+                lensProjection: lensProjection,
+                cameraGrouping: cameraGrouping
+            ),
             refinementIterationLimit: resolvedRefinementLimit(
                 detail: options.detailProfile,
                 capturePath: capturePath,
@@ -356,17 +365,17 @@ public enum RunPlanResolver {
             colmapMaximumMatchCount: colmapBudget.matches,
             geometryWorkerBudget: geometryWorkerBudget,
             requiredToolchainCapabilities: requiredCapabilities(route: route, model: model),
-            fallbackRouteIdentifiers: [],
             capturePath: capturePath,
             inputOrdering: inputOrdering,
             photoSelection: options.photoSelection,
             pairingPolicy: pairingPolicy,
             temporalPairing: pairingConfiguration.temporalPairing,
             temporalOffsets: pairingConfiguration.temporalOffsets,
-            retrievalEngine: .localSiftVocabularyV1,
+            retrievalEngine: .localSiftVocabularyV2,
             retrievalCandidateCount: pairingConfiguration.retrievalCandidateCount,
             retrievalNeighborCount: pairingConfiguration.retrievalNeighborCount,
             retrievalQueryStride: pairingConfiguration.retrievalQueryStride,
+            requiresCrossClipRetrieval: requiresCrossClipRetrieval,
             normalDescriptorMatcher: .faiss,
             baGlobalFramesRatio: baGlobalRatio,
             baGlobalPointsRatio: baGlobalRatio,
@@ -396,6 +405,15 @@ public enum RunPlanResolver {
         }
     }
 
+    static func requiresCrossClipRetrieval(
+        requestedInputOrdering: InputOrdering,
+        input: InputSpec
+    ) -> Bool {
+        input.videoFiles.count > 1
+            && !input.hasPhotos
+            && requestedInputOrdering != .unordered
+    }
+
     private static func resolvedCameraGrouping(
         _ requested: CameraGrouping,
         input: InputSpec
@@ -415,7 +433,11 @@ public enum RunPlanResolver {
         if requestedInputOrdering == .unordered {
             return .unorderedRetrieval
         }
-        if input.videoFiles.count > 1 || (input.hasVideos && input.hasPhotos) {
+        if input.hasVideos && input.hasPhotos {
+            return .segmentedMixed
+        }
+        if input.videoFiles.count > 1,
+           requestedInputOrdering != .continuous {
             return .segmentedMixed
         }
         guard resolvedInputOrdering == .continuous else { return .unorderedRetrieval }
@@ -450,9 +472,9 @@ public enum RunPlanResolver {
         }
     }
 
-    private static func resolvedModel(route: SfmBackend) -> String {
+    private static func resolvedModel(route: SfmBackend, memoryTier: MemoryTier) -> String {
         guard route == .da3 else { return "none" }
-        return "DA3-BASE"
+        return memoryTier == .constrained ? "DA3-SMALL" : "DA3-BASE"
     }
 
     private static func resolvedKeyframeBudget(
@@ -612,17 +634,13 @@ public enum RunPlanResolver {
             let modelCapability = model == "DA3-SMALL"
                 ? "geometry.da3.small"
                 : "geometry.da3.base"
-            var capabilities = [
+            return [
                 modelCapability,
                 "geometry.colmap",
                 "geometry.da3.runtime",
                 "runtime.core",
                 "training.msplat",
-            ]
-            if model == "DA3-BASE" {
-                capabilities.append("geometry.da3.small")
-            }
-            return capabilities.sorted()
+            ].sorted()
         }
     }
 

@@ -1,16 +1,8 @@
 import Foundation
 
 extension PipelineRunner {
-    func sfmBackendFallbackOrder(resolvedPlan: ResolvedRunPlan) throws -> [SfmBackend] {
-        try resolvedPlan.validatedBackendOrder()
-    }
-
     func da3DevicePreference() -> String {
         "mps"
-    }
-
-    func da3FallbackModelPreference() -> String {
-        "DA3-SMALL"
     }
 
     func da3MaxPointsPreference(detailProfile: DetailProfile) -> Int {

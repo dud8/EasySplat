@@ -8,8 +8,8 @@ let package = Package(
         .library(name: "EasySplatCore", targets: ["EasySplatCore"]),
         .executable(name: "EasySplatApp", targets: ["EasySplatApp"]),
         .executable(name: "EasySplatReleaseVerifier", targets: ["EasySplatReleaseVerifier"]),
-        .executable(name: "EasySplatUIVerifier", targets: ["EasySplatUIVerifier"]),
-        .executable(name: "EasySplatBenchmarkDriver", targets: ["EasySplatBenchmarkDriver"])
+        .executable(name: "EasySplatBenchmarkDriver", targets: ["EasySplatBenchmarkDriver"]),
+        .executable(name: "EasySplatMeasurementRunner", targets: ["EasySplatMeasurementRunner"])
     ],
     dependencies: [
         .package(path: "ThirdParty/MetalSplatter")
@@ -17,14 +17,22 @@ let package = Package(
     targets: [
         .target(
             name: "EasySplatCore",
-            dependencies: [],
+            dependencies: [
+                .product(name: "SplatIO", package: "MetalSplatter")
+            ],
             path: "EasySplatCore/Sources/EasySplatCore",
             exclude: ["AGENTS.md"]
+        ),
+        .target(
+            name: "EasySplatReleaseVerifierCore",
+            dependencies: ["EasySplatCore"],
+            path: "Tools/ReleaseVerifierCore"
         ),
         .executableTarget(
             name: "EasySplatApp",
             dependencies: [
                 "EasySplatCore",
+                "EasySplatReleaseVerifierCore",
                 .product(name: "MetalSplatter", package: "MetalSplatter"),
                 .product(name: "SplatIO", package: "MetalSplatter")
             ],
@@ -38,18 +46,8 @@ let package = Package(
         ),
         .executableTarget(
             name: "EasySplatReleaseVerifier",
-            dependencies: ["EasySplatCore"],
+            dependencies: ["EasySplatCore", "EasySplatReleaseVerifierCore"],
             path: "Tools/ReleaseVerifier"
-        ),
-        .target(
-            name: "EasySplatUIVerifierCore",
-            dependencies: ["EasySplatCore"],
-            path: "Tools/UIVerifier/Sources/UIVerifierCore"
-        ),
-        .executableTarget(
-            name: "EasySplatUIVerifier",
-            dependencies: ["EasySplatUIVerifierCore"],
-            path: "Tools/UIVerifier/Sources/UIVerifier"
         ),
         .target(
             name: "EasySplatBenchmarkDriverCore",
@@ -64,6 +62,20 @@ let package = Package(
             dependencies: ["EasySplatBenchmarkDriverCore"],
             path: "Tools/BenchmarkDriver/Sources/BenchmarkDriver"
         ),
+        .target(
+            name: "EasySplatMeasurementRunnerCore",
+            path: "Tools/MeasurementRunner/Sources/MeasurementRunnerCore"
+        ),
+        .target(
+            name: "EasySplatMeasurementAdapterSupport",
+            dependencies: ["EasySplatCore"],
+            path: "Tools/MeasurementRunner/Sources/MeasurementAdapterSupport"
+        ),
+        .executableTarget(
+            name: "EasySplatMeasurementRunner",
+            dependencies: ["EasySplatCore", "EasySplatMeasurementRunnerCore"],
+            path: "Tools/MeasurementRunner/Sources/MeasurementRunner"
+        ),
         .testTarget(
             name: "EasySplatCoreTests",
             dependencies: ["EasySplatCore"],
@@ -71,19 +83,32 @@ let package = Package(
             exclude: ["AGENTS.md"]
         ),
         .testTarget(
-            name: "EasySplatAppTests",
-            dependencies: ["EasySplatApp", "EasySplatCore"],
-            path: "EasySplatAppTests"
+            name: "EasySplatReleaseVerifierTests",
+            dependencies: ["EasySplatReleaseVerifierCore", "EasySplatCore"],
+            path: "Tools/ReleaseVerifierTests"
         ),
         .testTarget(
-            name: "EasySplatUIVerifierTests",
-            dependencies: ["EasySplatUIVerifierCore"],
-            path: "Tools/UIVerifier/Tests"
+            name: "EasySplatAppTests",
+            dependencies: [
+                "EasySplatApp",
+                "EasySplatCore",
+                "EasySplatReleaseVerifierCore",
+            ],
+            path: "EasySplatAppTests"
         ),
         .testTarget(
             name: "EasySplatBenchmarkDriverTests",
             dependencies: ["EasySplatBenchmarkDriverCore"],
             path: "Tools/BenchmarkDriver/Tests"
+        ),
+        .testTarget(
+            name: "EasySplatMeasurementRunnerTests",
+            dependencies: [
+                "EasySplatCore",
+                "EasySplatMeasurementRunnerCore",
+                "EasySplatMeasurementAdapterSupport"
+            ],
+            path: "Tools/MeasurementRunner/Tests"
         )
     ]
 )

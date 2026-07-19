@@ -5,6 +5,56 @@ public enum TrainingCompletionStatus: String, Codable, Sendable, Equatable {
     case completed
 }
 
+public enum MsplatDatasetPreparationKind: String, Codable, Sendable, Equatable {
+    case direct
+    case undistorted
+}
+
+public struct MsplatDatasetDerivationArtifact: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 1
+
+    public var schemaVersion: Int
+    public var sourceGeometryManifestSHA256: String
+    public var sourceSelectedFramesDigest: String
+    public var preparationKind: MsplatDatasetPreparationKind
+    public var maximumImageDimension: Int
+    public var toolchainVersion: String
+    public var colmapProvenance: GeometryComponentProvenance
+    public var registeredImageNames: [String]
+    public var datasetInputDigest: String
+    public var datasetGeometryDigest: String
+
+    public init(
+        schemaVersion: Int = currentSchemaVersion,
+        sourceGeometryManifestSHA256: String,
+        sourceSelectedFramesDigest: String,
+        preparationKind: MsplatDatasetPreparationKind,
+        maximumImageDimension: Int,
+        toolchainVersion: String,
+        colmapProvenance: GeometryComponentProvenance,
+        registeredImageNames: [String],
+        datasetInputDigest: String,
+        datasetGeometryDigest: String
+    ) {
+        self.schemaVersion = schemaVersion
+        self.sourceGeometryManifestSHA256 = sourceGeometryManifestSHA256
+        self.sourceSelectedFramesDigest = sourceSelectedFramesDigest
+        self.preparationKind = preparationKind
+        self.maximumImageDimension = maximumImageDimension
+        self.toolchainVersion = toolchainVersion
+        self.colmapProvenance = colmapProvenance
+        self.registeredImageNames = registeredImageNames
+        self.datasetInputDigest = datasetInputDigest
+        self.datasetGeometryDigest = datasetGeometryDigest
+    }
+}
+
+struct PreparedMsplatDataset: Sendable, Equatable {
+    let url: URL
+    let identity: MsplatDatasetIdentity
+    let derivation: MsplatDatasetDerivationArtifact
+}
+
 public struct ScenePoint3D: Codable, Sendable, Equatable {
     public var x: Double
     public var y: Double
@@ -36,7 +86,7 @@ public struct SplatSceneBounds: Codable, Sendable, Equatable {
 }
 
 public struct TrainingArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 5
+    public static let currentSchemaVersion = 7
 
     public var schemaVersion: Int
     public var trainerVersion: String
@@ -44,6 +94,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
     public var trainerBuildDigest: String
     public var inputDigest: String
     public var geometryDigest: String
+    public var datasetDerivation: MsplatDatasetDerivationArtifact
     public var detailProfile: DetailProfile
     public var iterationLimit: Int
     public var plateauWindow: Int
@@ -58,6 +109,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
     public var elapsedSeconds: Double?
     public var peakMemoryBytes: Int64
     public var memoryBudgetBytes: Int64
+    public var resourceAdmission: TrainingResourceAdmission
     public var rasterFallbackCount: Int
     public var rasterExactFallbackElapsedSeconds: Double
     public var rasterExactBufferGrowthCount: Int
@@ -75,6 +127,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         trainerBuildDigest: String,
         inputDigest: String,
         geometryDigest: String,
+        datasetDerivation: MsplatDatasetDerivationArtifact,
         detailProfile: DetailProfile,
         iterationLimit: Int,
         plateauWindow: Int,
@@ -89,6 +142,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         elapsedSeconds: Double?,
         peakMemoryBytes: Int64,
         memoryBudgetBytes: Int64,
+        resourceAdmission: TrainingResourceAdmission,
         rasterFallbackCount: Int,
         rasterExactFallbackElapsedSeconds: Double,
         rasterExactBufferGrowthCount: Int,
@@ -105,6 +159,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         self.trainerBuildDigest = trainerBuildDigest
         self.inputDigest = inputDigest
         self.geometryDigest = geometryDigest
+        self.datasetDerivation = datasetDerivation
         self.detailProfile = detailProfile
         self.iterationLimit = iterationLimit
         self.plateauWindow = plateauWindow
@@ -119,6 +174,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         self.elapsedSeconds = elapsedSeconds
         self.peakMemoryBytes = peakMemoryBytes
         self.memoryBudgetBytes = memoryBudgetBytes
+        self.resourceAdmission = resourceAdmission
         self.rasterFallbackCount = rasterFallbackCount
         self.rasterExactFallbackElapsedSeconds = rasterExactFallbackElapsedSeconds
         self.rasterExactBufferGrowthCount = rasterExactBufferGrowthCount
@@ -130,4 +186,15 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         self.completionStatus = completionStatus
     }
 
+    func matchesResolvedTrainingPlan(
+        _ plan: ResolvedRunPlan,
+        resourcePolicy: ResourcePolicy
+    ) -> Bool {
+        iterationLimit == plan.trainerIterationLimit
+            && plateauWindow == plan.plateauWindow
+            && memoryBudgetBytes > 0
+            && memoryBudgetBytes <= plan.trainerMemoryBudgetBytes
+            && cameraOrderSeed == plan.runSeed
+            && resourceAdmission.resourcePolicy == resourcePolicy
+    }
 }

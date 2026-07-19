@@ -17,7 +17,8 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
         XCTAssertEqual(
             DescriptorMatcherRecoveryPolicy.reason(
                 for: error,
-                currentMatcher: .faiss
+                currentMatcher: .faiss,
+                scheduledPairCount: 1
             ),
             .faissCrash
         )
@@ -36,7 +37,8 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
             XCTAssertNil(
                 DescriptorMatcherRecoveryPolicy.reason(
                     for: error,
-                    currentMatcher: .faiss
+                    currentMatcher: .faiss,
+                    scheduledPairCount: 1
                 ),
                 "signal \(signal) must remain a cancellation instead of starting recovery"
             )
@@ -55,7 +57,8 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
         XCTAssertEqual(
             DescriptorMatcherRecoveryPolicy.reason(
                 for: error,
-                currentMatcher: .faiss
+                currentMatcher: .faiss,
+                scheduledPairCount: 1
             ),
             .faissUnsupportedOperation
         )
@@ -73,7 +76,8 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
         XCTAssertNil(
             DescriptorMatcherRecoveryPolicy.reason(
                 for: error,
-                currentMatcher: .faiss
+                currentMatcher: .faiss,
+                scheduledPairCount: 1
             )
         )
     }
@@ -90,7 +94,8 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
         XCTAssertNil(
             DescriptorMatcherRecoveryPolicy.reason(
                 for: error,
-                currentMatcher: .faiss
+                currentMatcher: .faiss,
+                scheduledPairCount: 1
             )
         )
     }
@@ -107,7 +112,8 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
         XCTAssertNil(
             DescriptorMatcherRecoveryPolicy.reason(
                 for: error,
-                currentMatcher: .faiss
+                currentMatcher: .faiss,
+                scheduledPairCount: 1
             )
         )
     }
@@ -124,7 +130,8 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
         XCTAssertNil(
             DescriptorMatcherRecoveryPolicy.reason(
                 for: error,
-                currentMatcher: .exact
+                currentMatcher: .exact,
+                scheduledPairCount: 1
             )
         )
     }
@@ -133,96 +140,80 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
         XCTAssertNil(
             DescriptorMatcherRecoveryPolicy.reasonForRejectedGeometry(
                 currentMatcher: .faiss,
-                exhaustedFaissRetries: false
+                exhaustedFaissRetries: false,
+                scheduledPairCount: 1
             )
         )
         XCTAssertEqual(
             DescriptorMatcherRecoveryPolicy.reasonForRejectedGeometry(
                 currentMatcher: .faiss,
-                exhaustedFaissRetries: true
+                exhaustedFaissRetries: true,
+                scheduledPairCount: 1
             ),
             .faissGeometryRejectedAfterRetries
         )
         XCTAssertNil(
             DescriptorMatcherRecoveryPolicy.reasonForRejectedGeometry(
                 currentMatcher: .exact,
-                exhaustedFaissRetries: true
+                exhaustedFaissRetries: true,
+                scheduledPairCount: 1
             )
         )
     }
 
-    func testDa3ExactTransitionIsReportedEvenWhenExactAttemptAlsoFails() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        try writeEmptyMatchTables(at: paths.colmapDatabaseURL)
-        let pairList = root.appendingPathComponent("pairs.txt")
-        try "a.jpg b.jpg\n".write(to: pairList, atomically: true, encoding: .utf8)
-
-        let toolchain = TestToolchains.toolchainPaths(root: root)
-        let subprocess = MockSubprocessRunner(scripts: [
-            .init(
-                path: toolchain.colmap.path,
-                argsPrefix: ["matches_importer"],
-                result: .init(
-                    exitCode: SIGSEGV,
-                    terminationReason: .uncaughtSignal,
-                    stdout: "",
-                    stderr: "segmentation fault"
-                )
-            ),
-            .init(
-                path: toolchain.colmap.path,
-                argsPrefix: ["matches_importer"],
-                result: .init(
-                    exitCode: 1,
-                    terminationReason: .exit,
-                    stdout: "",
-                    stderr: "exact matcher failed"
-                )
-            ),
-        ])
-        let runner = PipelineRunner(
-            projectURL: root,
-            config: .init(toolchain: toolchain),
-            tooling: .init(runner: subprocess)
+    func testExactRecoveryAcceptsAtMost256ScheduledPairs() {
+        let error = ColmapRunnerError.failed(
+            command: "matches_importer",
+            exitCode: SIGSEGV,
+            terminationReason: .uncaughtSignal,
+            stdoutTail: "",
+            stderrTail: "segmentation fault"
         )
-        var didSelectExactRecovery = false
 
-        do {
-            try await runner.test_runDa3MatchesImporterWithOneShotExactRecovery(
-                database: paths.colmapDatabaseURL,
-                matchListPath: pairList,
-                options: ColmapOptions(
-                    useGPU: false,
-                    extractThreads: 1,
-                    matchThreads: 1
-                ),
-                onExactRecovery: { didSelectExactRecovery = true }
-            )
-            XCTFail("Expected the exact retry to fail")
-        } catch {
-            XCTAssertTrue(didSelectExactRecovery)
-        }
-    }
-
-    private func writeEmptyMatchTables(at url: URL) throws {
-        var database: OpaquePointer?
-        defer { sqlite3_close(database) }
-        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
-            return XCTFail("Could not create matcher database")
-        }
         XCTAssertEqual(
-            sqlite3_exec(
-                database,
-                "CREATE TABLE matches(pair_id INTEGER PRIMARY KEY); CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY);",
-                nil,
-                nil,
-                nil
+            DescriptorMatcherRecoveryPolicy.reason(
+                for: error,
+                currentMatcher: .faiss,
+                scheduledPairCount: 256
             ),
-            SQLITE_OK
+            .faissCrash
+        )
+        XCTAssertNil(
+            DescriptorMatcherRecoveryPolicy.reason(
+                for: error,
+                currentMatcher: .faiss,
+                scheduledPairCount: 257
+            )
+        )
+        XCTAssertEqual(
+            DescriptorMatcherRecoveryPolicy.reasonForRejectedGeometry(
+                currentMatcher: .faiss,
+                exhaustedFaissRetries: true,
+                scheduledPairCount: 256
+            ),
+            .faissGeometryRejectedAfterRetries
+        )
+        XCTAssertNil(
+            DescriptorMatcherRecoveryPolicy.reasonForRejectedGeometry(
+                currentMatcher: .faiss,
+                exhaustedFaissRetries: true,
+                scheduledPairCount: 257
+            )
         )
     }
+
+    func testUnorderedExhaustiveSchedulesAt60And250ViewsCannotUseExactRecovery() throws {
+        for imageCount in [60, 250] {
+            let imageNames = (0..<imageCount).map { String(format: "frame-%03d.jpg", $0) }
+            let plan = try ColmapPairPlan.exhaustive(imageNames: imageNames)
+            XCTAssertFalse(
+                DescriptorMatcherRecoveryPolicy.permitsExactRecovery(
+                    scheduledPairCount: plan.pairs.count
+                ),
+                "an exhaustive (imageCount)-view schedule must remain FAISS-only"
+            )
+        }
+    }
+
 }
 #endif

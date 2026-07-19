@@ -7,8 +7,8 @@ extension ToolchainManager {
 
     // The signed manifest carries the exact Python runtime closure. Keep the
     // unauthenticated response and cached receipt bounded above that real size.
-    static let maximumManifestDownloadBytes = 16 * 1_024 * 1_024
-    private static let maximumInstallStateBytes = 16 * 1_024 * 1_024
+    static let maximumManifestDownloadBytes = ToolchainManifest.maximumEncodedBytes
+    private static let maximumInstallStateBytes = ToolchainManifest.maximumInstallStateEnvelopeBytes
 
     final class RedirectValidationDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
         private let validate: @Sendable (URL) throws -> Void
@@ -202,38 +202,204 @@ extension ToolchainManager {
         case restart
     }
 
+    final class PartialDownloadFile: @unchecked Sendable {
+        let directoryDescriptor: Int32
+        let fileDescriptor: Int32
+        let leafName: String
+        let url: URL
+
+        init(
+            directoryDescriptor: Int32,
+            fileDescriptor: Int32,
+            leafName: String,
+            url: URL
+        ) {
+            self.directoryDescriptor = directoryDescriptor
+            self.fileDescriptor = fileDescriptor
+            self.leafName = leafName
+            self.url = url
+        }
+
+        deinit {
+            Darwin.close(fileDescriptor)
+            Darwin.close(directoryDescriptor)
+        }
+
+        func size() throws -> UInt64 {
+            let status = try verifiedStatus()
+            guard status.st_size >= 0 else {
+                throw ToolchainError.fileIOFailed("The partial toolchain download has an invalid size.")
+            }
+            return UInt64(status.st_size)
+        }
+
+        func reset() throws {
+            guard Darwin.ftruncate(fileDescriptor, 0) == 0,
+                  Darwin.lseek(fileDescriptor, 0, SEEK_SET) == 0 else {
+                throw partialWriteError("reset", errno: errno)
+            }
+            _ = try verifiedStatus()
+        }
+
+        func append(_ data: Data, expectedOffset: UInt64) throws {
+            guard try size() == expectedOffset,
+                  expectedOffset <= UInt64(Int64.max),
+                  Darwin.lseek(fileDescriptor, off_t(expectedOffset), SEEK_SET) >= 0 else {
+                throw ToolchainError.fileIOFailed(
+                    "The partial toolchain download changed before it could be resumed."
+                )
+            }
+            try data.withUnsafeBytes { bytes in
+                guard let base = bytes.baseAddress else { return }
+                var written = 0
+                while written < bytes.count {
+                    let count = Darwin.write(
+                        fileDescriptor,
+                        base.advanced(by: written),
+                        bytes.count - written
+                    )
+                    if count < 0, errno == EINTR { continue }
+                    guard count > 0 else {
+                        throw partialWriteError("write", errno: count < 0 ? errno : EIO)
+                    }
+                    written += count
+                }
+            }
+            _ = try verifiedStatus()
+        }
+
+        func replace(with data: Data) throws {
+            try reset()
+            try append(data, expectedOffset: 0)
+        }
+
+        func synchronize() throws {
+            while Darwin.fsync(fileDescriptor) != 0 {
+                if errno == EINTR { continue }
+                throw partialWriteError("sync", errno: errno)
+            }
+            _ = try verifiedStatus()
+        }
+
+        func sha256(
+            maximumBytes: UInt64,
+            namedDirectoryDescriptor: Int32? = nil,
+            namedLeafName: String? = nil
+        ) throws -> String {
+            let initial = try verifiedStatus(
+                namedDirectoryDescriptor: namedDirectoryDescriptor,
+                namedLeafName: namedLeafName
+            )
+            guard initial.st_size >= 0, UInt64(initial.st_size) <= maximumBytes else {
+                throw ToolchainError.hashMismatch
+            }
+            var hasher = SHA256()
+            var offset: Int64 = 0
+            var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
+            while offset < initial.st_size {
+                let remaining = min(Int64(buffer.count), initial.st_size - offset)
+                let count = buffer.withUnsafeMutableBytes { bytes in
+                    Darwin.pread(fileDescriptor, bytes.baseAddress, Int(remaining), off_t(offset))
+                }
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else { throw partialWriteError("read", errno: count < 0 ? errno : EIO) }
+                hasher.update(data: Data(buffer[0..<count]))
+                offset += Int64(count)
+            }
+            let final = try verifiedStatus(
+                namedDirectoryDescriptor: namedDirectoryDescriptor,
+                namedLeafName: namedLeafName
+            )
+            guard sameMutableFileObject(initial, final), final.st_size == initial.st_size else {
+                throw ToolchainError.fileIOFailed(
+                    "The partial toolchain download changed while it was being verified."
+                )
+            }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+
+        func unlinkNamedFile() throws {
+            _ = try verifiedStatus()
+            let result = leafName.withCString {
+                Darwin.unlinkat(directoryDescriptor, $0, 0)
+            }
+            guard result == 0 || errno == ENOENT else {
+                throw partialWriteError("discard", errno: errno)
+            }
+        }
+
+        func verifiedStatus(
+            namedDirectoryDescriptor: Int32? = nil,
+            namedLeafName: String? = nil
+        ) throws -> stat {
+            let namedDirectoryDescriptor = namedDirectoryDescriptor ?? directoryDescriptor
+            let namedLeafName = namedLeafName ?? leafName
+            var descriptorStatus = stat()
+            var namedStatus = stat()
+            let namedResult = namedLeafName.withCString {
+                Darwin.fstatat(namedDirectoryDescriptor, $0, &namedStatus, AT_SYMLINK_NOFOLLOW)
+            }
+            guard fstat(fileDescriptor, &descriptorStatus) == 0,
+                  namedResult == 0,
+                  (descriptorStatus.st_mode & S_IFMT) == S_IFREG,
+                  (namedStatus.st_mode & S_IFMT) == S_IFREG,
+                  descriptorStatus.st_nlink == 1,
+                  namedStatus.st_nlink == 1,
+                  descriptorStatus.st_uid == getuid(),
+                  namedStatus.st_uid == getuid(),
+                  descriptorStatus.st_mode & 0o777 == 0o600,
+                  namedStatus.st_mode & 0o777 == 0o600,
+                  sameMutableFileObject(descriptorStatus, namedStatus) else {
+                throw ToolchainError.fileIOFailed(
+                    "The partial toolchain download is not a safe ordinary file."
+                )
+            }
+            return descriptorStatus
+        }
+
+        private func sameMutableFileObject(_ lhs: stat, _ rhs: stat) -> Bool {
+            lhs.st_dev == rhs.st_dev
+                && lhs.st_ino == rhs.st_ino
+                && lhs.st_nlink == rhs.st_nlink
+                && lhs.st_uid == rhs.st_uid
+                && lhs.st_mode == rhs.st_mode
+        }
+
+        private func partialWriteError(_ action: String, errno value: Int32) -> ToolchainError {
+            ToolchainError.fileIOFailed(
+                "Failed to \(action) the partial toolchain download (errno \(value))."
+            )
+        }
+    }
+
     final class ResumableDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-        private let partialURL: URL
+        private let partialFile: PartialDownloadFile
         private let expectedSize: UInt64
         private let initialOffset: UInt64
         private let label: String
         private let onProgress: @Sendable (Double, String) -> Void
-        private let fileManager: FileManager
         private let validateRedirect: @Sendable (URL) throws -> Void
         private let lock = NSLock()
         private var continuation: CheckedContinuation<Void, Error>?
         private weak var task: URLSessionDataTask?
-        private var fileHandle: FileHandle?
         private var receivedBytes: UInt64
         private var completed = false
         private let startedAt = Date()
         private var lastUpdate = Date.distantPast
 
         init(
-            partialURL: URL,
+            partialFile: PartialDownloadFile,
             expectedSize: UInt64,
             initialOffset: UInt64,
             label: String,
             onProgress: @escaping @Sendable (Double, String) -> Void,
-            fileManager: FileManager,
             validateRedirect: @escaping @Sendable (URL) throws -> Void
         ) {
-            self.partialURL = partialURL
+            self.partialFile = partialFile
             self.expectedSize = expectedSize
             self.initialOffset = initialOffset
             self.label = label
             self.onProgress = onProgress
-            self.fileManager = fileManager
             self.validateRedirect = validateRedirect
             self.receivedBytes = initialOffset
         }
@@ -275,13 +441,30 @@ extension ToolchainManager {
                 return
             }
 
+            guard http.statusCode == 200 || http.statusCode == 206 else {
+                if http.statusCode == 416 {
+                    try? partialFile.unlinkNamedFile()
+                }
+                completionHandler(.cancel)
+                finish(
+                    with: ToolchainError.artifactHTTPFailure(
+                        statusCode: http.statusCode,
+                        resourceURL: http.url
+                            ?? dataTask.currentRequest?.url
+                            ?? dataTask.originalRequest?.url
+                            ?? partialFile.url
+                    )
+                )
+                return
+            }
+
             guard let mode = ToolchainManager.resumableResponseMode(
                 for: http,
                 requestedOffset: initialOffset,
                 expectedSize: expectedSize
             ) else {
                 if http.statusCode == 206 || http.statusCode == 416 {
-                    try? fileManager.removeItem(at: partialURL)
+                    try? partialFile.unlinkNamedFile()
                 }
                 completionHandler(.cancel)
                 finish(with: ToolchainError.downloadFailed)
@@ -290,23 +473,20 @@ extension ToolchainManager {
 
             do {
                 if mode == .restart {
-                    try Data().write(to: partialURL, options: .atomic)
-                } else if !fileManager.fileExists(atPath: partialURL.path) {
-                    guard fileManager.createFile(atPath: partialURL.path, contents: nil) else {
-                        throw ToolchainError.fileIOFailed("Failed to create the partial toolchain download.")
-                    }
+                    try partialFile.reset()
+                } else if try partialFile.size() != initialOffset {
+                    throw ToolchainError.fileIOFailed(
+                        "The partial toolchain download changed before it could be resumed."
+                    )
                 }
-                let handle = try FileHandle(forWritingTo: partialURL)
-                let offset = try handle.seekToEnd()
+                let offset = try partialFile.size()
 
                 lock.lock()
                 guard !completed else {
                     lock.unlock()
-                    try? handle.close()
                     completionHandler(.cancel)
                     return
                 }
-                fileHandle = handle
                 receivedBytes = offset
                 lock.unlock()
                 completionHandler(.allow)
@@ -321,14 +501,14 @@ extension ToolchainManager {
             var total: UInt64 = 0
 
             lock.lock()
-            if !completed, let fileHandle {
+            if !completed {
                 let byteCount = UInt64(data.count)
                 let (newTotal, overflow) = receivedBytes.addingReportingOverflow(byteCount)
                 if overflow || newTotal > expectedSize {
                     failure = ToolchainError.hashMismatch
                 } else {
                     do {
-                        try fileHandle.write(contentsOf: data)
+                        try partialFile.append(data, expectedOffset: receivedBytes)
                         receivedBytes = newTotal
                         total = newTotal
                     } catch {
@@ -341,7 +521,7 @@ extension ToolchainManager {
             lock.unlock()
 
             if let failure {
-                try? fileManager.removeItem(at: partialURL)
+                try? partialFile.unlinkNamedFile()
                 dataTask.cancel()
                 finish(with: failure)
                 return
@@ -353,7 +533,12 @@ extension ToolchainManager {
             if let error {
                 finish(with: error)
             } else {
-                finish(with: nil)
+                do {
+                    try partialFile.synchronize()
+                    finish(with: nil)
+                } catch {
+                    finish(with: error)
+                }
             }
         }
 
@@ -394,7 +579,6 @@ extension ToolchainManager {
 
         private func finish(with error: Error?) {
             let continuation: CheckedContinuation<Void, Error>?
-            let handle: FileHandle?
             let total: UInt64
             lock.lock()
             guard !completed else {
@@ -404,12 +588,9 @@ extension ToolchainManager {
             completed = true
             continuation = self.continuation
             self.continuation = nil
-            handle = fileHandle
-            fileHandle = nil
             total = receivedBytes
             lock.unlock()
 
-            try? handle?.close()
             if let error {
                 continuation?.resume(throwing: error)
             } else {
@@ -511,6 +692,8 @@ extension ToolchainManager {
                 return true
             case .manifestHTTPFailure(let statusCode, _):
                 return statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode)
+            case .artifactHTTPFailure(let statusCode, _):
+                return statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode)
             default:
                 return false
             }
@@ -579,12 +762,13 @@ extension ToolchainManager {
                 expectedSize: artifact.sizeBytes,
                 expectedSHA256: artifact.sha256
             ) {
-                try? fileManager.removeItem(at: partialURL)
+                try? discardPartialDownload(at: partialURL)
                 return
             }
             try fileManager.removeItem(at: destination)
         }
 
+        var retriedRangeNotSatisfiableWithoutRange = false
         try await withTransientRetries(onRetry: { nextAttempt, _ in
             onProgress(-1.0, "Retrying \(label) (\(nextAttempt)/3)")
         }) {
@@ -598,18 +782,22 @@ extension ToolchainManager {
             }
 
             let offset = try fileSize(at: partialURL)
-            if shouldUseDataTaskForTests() {
-                try await downloadArtifactViaDataTask(
+            do {
+                try await downloadArtifactAttempt(
                     url: url,
                     partialURL: partialURL,
                     offset: offset,
-                    expectedSize: artifact.sizeBytes
+                    expectedSize: artifact.sizeBytes,
+                    label: label,
+                    onProgress: onProgress
                 )
-            } else {
-                try await downloadArtifactViaStreamingTask(
+            } catch ToolchainError.artifactHTTPFailure(let statusCode, _)
+                where statusCode == 416 && offset > 0 && !retriedRangeNotSatisfiableWithoutRange {
+                retriedRangeNotSatisfiableWithoutRange = true
+                try await downloadArtifactAttempt(
                     url: url,
                     partialURL: partialURL,
-                    offset: offset,
+                    offset: 0,
                     expectedSize: artifact.sizeBytes,
                     label: label,
                     onProgress: onProgress
@@ -631,15 +819,158 @@ extension ToolchainManager {
 
         try Task.checkCancellation()
         do {
-            try fileManager.createDirectory(
-                at: destination.deletingLastPathComponent(),
-                withIntermediateDirectories: true
+            try promotePartialDownload(
+                at: partialURL,
+                to: destination,
+                expectedSize: artifact.sizeBytes,
+                expectedSHA256: artifact.sha256
             )
-            try fileManager.moveItem(at: partialURL, to: destination)
-            removeEmptyDownloadDirectories(startingAt: partialURL.deletingLastPathComponent())
         } catch {
             throw ToolchainError.fileIOFailed(
                 "Failed to finish the toolchain download. \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func discardPartialDownload(at url: URL) throws {
+        if let partialFile = try openPartialDownloadFile(at: url, create: false) {
+            try partialFile.unlinkNamedFile()
+        }
+    }
+
+    private func promotePartialDownload(
+        at partialURL: URL,
+        to destination: URL,
+        expectedSize: UInt64,
+        expectedSHA256: String
+    ) throws {
+        guard let partialFile = try openPartialDownloadFile(at: partialURL, create: false),
+              try partialFile.size() == expectedSize,
+              try partialFile.sha256(maximumBytes: expectedSize).lowercased()
+                == expectedSHA256.lowercased() else {
+            throw ToolchainError.hashMismatch
+        }
+        try partialFile.synchronize()
+        let destinationDirectoryURL = destination.deletingLastPathComponent()
+        try fileManager.createDirectory(
+            at: destinationDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        let destinationDirectory = Darwin.open(
+            destinationDirectoryURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard destinationDirectory >= 0 else {
+            throw ToolchainError.fileIOFailed(
+                "The toolchain download destination could not be opened safely."
+            )
+        }
+        defer { Darwin.close(destinationDirectory) }
+        var destinationDirectoryStatus = stat()
+        var namedDestinationDirectoryStatus = stat()
+        guard fstat(destinationDirectory, &destinationDirectoryStatus) == 0,
+              lstat(destinationDirectoryURL.path, &namedDestinationDirectoryStatus) == 0,
+              (destinationDirectoryStatus.st_mode & S_IFMT) == S_IFDIR,
+              (namedDestinationDirectoryStatus.st_mode & S_IFMT) == S_IFDIR,
+              destinationDirectoryStatus.st_uid == getuid(),
+              namedDestinationDirectoryStatus.st_uid == getuid(),
+              destinationDirectoryStatus.st_dev == namedDestinationDirectoryStatus.st_dev,
+              destinationDirectoryStatus.st_ino == namedDestinationDirectoryStatus.st_ino else {
+            throw ToolchainError.fileIOFailed(
+                "The toolchain download destination is unsafe."
+            )
+        }
+        let destinationLeaf = destination.lastPathComponent
+        guard !destinationLeaf.isEmpty,
+              destinationLeaf != ".",
+              destinationLeaf != "..",
+              !destinationLeaf.contains("/") else {
+            throw ToolchainError.invalidManifest
+        }
+        let renameFlags = UInt32(RENAME_EXCL | RENAME_NOFOLLOW_ANY)
+        let renameResult = partialFile.leafName.withCString { sourcePointer in
+            destinationLeaf.withCString { destinationPointer in
+                Darwin.renameatx_np(
+                    partialFile.directoryDescriptor,
+                    sourcePointer,
+                    destinationDirectory,
+                    destinationPointer,
+                    renameFlags
+                )
+            }
+        }
+        guard renameResult == 0 else {
+            throw ToolchainError.fileIOFailed(
+                "Failed to publish the verified toolchain download (errno \(errno))."
+            )
+        }
+
+        do {
+            _ = try partialFile.verifiedStatus(
+                namedDirectoryDescriptor: destinationDirectory,
+                namedLeafName: destinationLeaf
+            )
+            guard try partialFile.sha256(
+                maximumBytes: expectedSize,
+                namedDirectoryDescriptor: destinationDirectory,
+                namedLeafName: destinationLeaf
+            ).lowercased() == expectedSHA256.lowercased() else {
+                throw ToolchainError.hashMismatch
+            }
+            while Darwin.fsync(destinationDirectory) != 0 {
+                if errno == EINTR { continue }
+                throw ToolchainError.fileIOFailed(
+                    "Failed to sync the toolchain download destination (errno \(errno))."
+                )
+            }
+            while Darwin.fsync(partialFile.directoryDescriptor) != 0 {
+                if errno == EINTR { continue }
+                throw ToolchainError.fileIOFailed(
+                    "Failed to sync the toolchain download cache (errno \(errno))."
+                )
+            }
+        } catch {
+            let rollback = destinationLeaf.withCString { destinationPointer in
+                partialFile.leafName.withCString { sourcePointer in
+                    Darwin.renameatx_np(
+                        destinationDirectory,
+                        destinationPointer,
+                        partialFile.directoryDescriptor,
+                        sourcePointer,
+                        renameFlags
+                    )
+                }
+            }
+            if rollback == 0 {
+                try? partialFile.synchronize()
+            }
+            throw error
+        }
+    }
+
+    private func downloadArtifactAttempt(
+        url: URL,
+        partialURL: URL,
+        offset: UInt64,
+        expectedSize: UInt64,
+        label: String,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws {
+        if shouldUseDataTaskForTests() {
+            try await downloadArtifactViaDataTask(
+                url: url,
+                partialURL: partialURL,
+                offset: offset,
+                expectedSize: expectedSize
+            )
+        } else {
+            try await downloadArtifactViaStreamingTask(
+                url: url,
+                partialURL: partialURL,
+                offset: offset,
+                expectedSize: expectedSize,
+                label: label,
+                onProgress: onProgress
             )
         }
     }
@@ -663,30 +994,231 @@ extension ToolchainManager {
         let componentDirectory = versionDirectory.appendingPathComponent(componentKey, isDirectory: true)
         let partialURL = componentDirectory.appendingPathComponent("\(identityKey).partial")
 
-        try fileManager.createDirectory(at: componentDirectory, withIntermediateDirectories: true)
-        if stagingMarker != nil,
-           let cachedVersions = try? fileManager.contentsOfDirectory(
-            at: cacheBase,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-           ) {
-            for cachedVersion in cachedVersions where cachedVersion.lastPathComponent != versionKey {
-                try? fileManager.removeItem(at: cachedVersion)
-            }
-        }
+        let preparedDirectory = try openDownloadComponentDirectory(
+            for: partialURL,
+            create: true
+        )
+        Darwin.close(preparedDirectory)
         if let staleFiles = try? fileManager.contentsOfDirectory(
             at: componentDirectory,
             includingPropertiesForKeys: nil
         ) {
             for staleFile in staleFiles
             where staleFile.standardizedFileURL.path != partialURL.standardizedFileURL.path {
-                try? fileManager.removeItem(at: staleFile)
+                guard let stalePartial = try openPartialDownloadFile(
+                    at: staleFile,
+                    create: false
+                ) else { continue }
+                try stalePartial.unlinkNamedFile()
             }
         }
-        if try fileSize(at: partialURL) > artifact.sizeBytes {
-            try fileManager.removeItem(at: partialURL)
+        if let partialFile = try openPartialDownloadFile(at: partialURL, create: false),
+           try partialFile.size() > artifact.sizeBytes {
+            try partialFile.unlinkNamedFile()
         }
         return partialURL
+    }
+
+    func openPartialDownloadFile(
+        at url: URL,
+        create: Bool
+    ) throws -> PartialDownloadFile? {
+        let leafName = url.lastPathComponent
+        guard !leafName.isEmpty,
+              leafName != ".",
+              leafName != "..",
+              !leafName.contains("/") else {
+            throw ToolchainError.invalidManifest
+        }
+        let directoryDescriptor = try openDownloadComponentDirectory(for: url, create: false)
+
+        var flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW
+        if create { flags |= O_CREAT }
+        let fileDescriptor = leafName.withCString {
+            Darwin.openat(
+                directoryDescriptor,
+                $0,
+                flags,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+        }
+        if fileDescriptor < 0, !create, errno == ENOENT {
+            Darwin.close(directoryDescriptor)
+            return nil
+        }
+        guard fileDescriptor >= 0 else {
+            Darwin.close(directoryDescriptor)
+            throw ToolchainError.fileIOFailed(
+                "The partial toolchain download is not a safe ordinary file."
+            )
+        }
+        var fileStatus = stat()
+        var namedFileStatus = stat()
+        let namedResult = leafName.withCString {
+            Darwin.fstatat(directoryDescriptor, $0, &namedFileStatus, AT_SYMLINK_NOFOLLOW)
+        }
+        guard fstat(fileDescriptor, &fileStatus) == 0,
+              namedResult == 0,
+              (fileStatus.st_mode & S_IFMT) == S_IFREG,
+              (namedFileStatus.st_mode & S_IFMT) == S_IFREG,
+              fileStatus.st_nlink == 1,
+              namedFileStatus.st_nlink == 1,
+              fileStatus.st_uid == getuid(),
+              namedFileStatus.st_uid == getuid(),
+              fileStatus.st_dev == namedFileStatus.st_dev,
+              fileStatus.st_ino == namedFileStatus.st_ino else {
+            Darwin.close(fileDescriptor)
+            Darwin.close(directoryDescriptor)
+            throw ToolchainError.fileIOFailed(
+                "The partial toolchain download is not a safe ordinary file."
+            )
+        }
+        if fileStatus.st_mode & 0o777 != 0o600 {
+            guard Darwin.fchmod(fileDescriptor, 0o600) == 0 else {
+                Darwin.close(fileDescriptor)
+                Darwin.close(directoryDescriptor)
+                throw ToolchainError.fileIOFailed(
+                    "The partial toolchain download permissions could not be secured."
+                )
+            }
+        }
+        let partialFile = PartialDownloadFile(
+            directoryDescriptor: directoryDescriptor,
+            fileDescriptor: fileDescriptor,
+            leafName: leafName,
+            url: url
+        )
+        _ = try partialFile.verifiedStatus()
+        return partialFile
+    }
+
+    private func openDownloadComponentDirectory(
+        for partialURL: URL,
+        create: Bool
+    ) throws -> Int32 {
+        let componentDirectory = partialURL.deletingLastPathComponent()
+        let versionDirectory = componentDirectory.deletingLastPathComponent()
+        let cacheDirectory = versionDirectory.deletingLastPathComponent()
+        guard cacheDirectory.lastPathComponent == ".easysplat-downloads",
+              componentDirectory.lastPathComponent.count == 64,
+              versionDirectory.lastPathComponent.count == 64 else {
+            let descriptor = Darwin.open(
+                componentDirectory.path,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+            guard descriptor >= 0 else {
+                throw ToolchainError.fileIOFailed(
+                    "The partial toolchain download directory could not be opened safely."
+                )
+            }
+            try validateOwnedDirectoryDescriptor(descriptor, namedAt: componentDirectory)
+            return descriptor
+        }
+
+        let containerURL = cacheDirectory.deletingLastPathComponent()
+        let container = Darwin.open(
+            containerURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard container >= 0 else {
+            throw ToolchainError.fileIOFailed(
+                "The toolchain download cache container could not be opened safely."
+            )
+        }
+        var descriptors = [container]
+        var returningLeaf = false
+        defer {
+            let descriptorsToClose = returningLeaf ? descriptors.dropLast() : descriptors[...]
+            descriptorsToClose.forEach { Darwin.close($0) }
+        }
+        do {
+            try validateOwnedDirectoryDescriptor(container, namedAt: containerURL)
+            for name in [
+                cacheDirectory.lastPathComponent,
+                versionDirectory.lastPathComponent,
+                componentDirectory.lastPathComponent,
+            ] {
+                let parent = descriptors.last!
+                if create {
+                    let creation = name.withCString {
+                        Darwin.mkdirat(parent, $0, mode_t(S_IRWXU))
+                    }
+                    guard creation == 0 || errno == EEXIST else {
+                        throw ToolchainError.fileIOFailed(
+                            "The toolchain download cache could not be created safely."
+                        )
+                    }
+                }
+                let child = name.withCString {
+                    Darwin.openat(
+                        parent,
+                        $0,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                    )
+                }
+                guard child >= 0 else {
+                    throw ToolchainError.fileIOFailed(
+                        "The toolchain download cache path is unsafe."
+                    )
+                }
+                do {
+                    try validateOwnedDirectoryDescriptor(child, parent: parent, name: name)
+                } catch {
+                    Darwin.close(child)
+                    throw error
+                }
+                descriptors.append(child)
+            }
+            returningLeaf = true
+            return descriptors.last!
+        } catch {
+            throw error
+        }
+    }
+
+    private func validateOwnedDirectoryDescriptor(
+        _ descriptor: Int32,
+        namedAt url: URL
+    ) throws {
+        var descriptorStatus = stat()
+        var namedStatus = stat()
+        guard fstat(descriptor, &descriptorStatus) == 0,
+              lstat(url.path, &namedStatus) == 0,
+              (descriptorStatus.st_mode & S_IFMT) == S_IFDIR,
+              (namedStatus.st_mode & S_IFMT) == S_IFDIR,
+              descriptorStatus.st_uid == getuid(),
+              namedStatus.st_uid == getuid(),
+              descriptorStatus.st_dev == namedStatus.st_dev,
+              descriptorStatus.st_ino == namedStatus.st_ino else {
+            throw ToolchainError.fileIOFailed(
+                "The partial toolchain download directory is unsafe."
+            )
+        }
+    }
+
+    private func validateOwnedDirectoryDescriptor(
+        _ descriptor: Int32,
+        parent: Int32,
+        name: String
+    ) throws {
+        var descriptorStatus = stat()
+        var namedStatus = stat()
+        let namedResult = name.withCString {
+            Darwin.fstatat(parent, $0, &namedStatus, AT_SYMLINK_NOFOLLOW)
+        }
+        guard fstat(descriptor, &descriptorStatus) == 0,
+              namedResult == 0,
+              (descriptorStatus.st_mode & S_IFMT) == S_IFDIR,
+              (namedStatus.st_mode & S_IFMT) == S_IFDIR,
+              descriptorStatus.st_uid == getuid(),
+              namedStatus.st_uid == getuid(),
+              descriptorStatus.st_dev == namedStatus.st_dev,
+              descriptorStatus.st_ino == namedStatus.st_ino,
+              Darwin.fchmod(descriptor, mode_t(S_IRWXU)) == 0 else {
+            throw ToolchainError.fileIOFailed(
+                "The toolchain download cache path is unsafe."
+            )
+        }
     }
 
     func downloadArtifactViaDataTask(
@@ -695,20 +1227,36 @@ extension ToolchainManager {
         offset: UInt64,
         expectedSize: UInt64
     ) async throws {
+        guard let partialFile = try openPartialDownloadFile(at: partialURL, create: true),
+              try partialFile.size() == offset else {
+            throw ToolchainError.fileIOFailed(
+                "The partial toolchain download changed before it could be resumed."
+            )
+        }
         let request = resumableRequest(url: url, offset: offset)
         let delegate = RedirectValidationDelegate { [self] redirectedURL in
             try validateRedirectTarget(redirectedURL)
         }
         let (data, response) = try await urlSession.data(for: request, delegate: delegate)
-        guard let http = response as? HTTPURLResponse,
-              let mode = Self.resumableResponseMode(
-                for: http,
-                requestedOffset: offset,
-                expectedSize: expectedSize
-              ) else {
-            if let statusCode = (response as? HTTPURLResponse)?.statusCode,
-               statusCode == 206 || statusCode == 416 {
-                try? fileManager.removeItem(at: partialURL)
+        guard let http = response as? HTTPURLResponse else {
+            throw ToolchainError.downloadFailed
+        }
+        guard http.statusCode == 200 || http.statusCode == 206 else {
+            if http.statusCode == 416 {
+                try? partialFile.unlinkNamedFile()
+            }
+            throw ToolchainError.artifactHTTPFailure(
+                statusCode: http.statusCode,
+                resourceURL: http.url ?? request.url ?? url
+            )
+        }
+        guard let mode = Self.resumableResponseMode(
+            for: http,
+            requestedOffset: offset,
+            expectedSize: expectedSize
+        ) else {
+            if http.statusCode == 206 {
+                try? partialFile.unlinkNamedFile()
             }
             throw ToolchainError.downloadFailed
         }
@@ -716,27 +1264,21 @@ extension ToolchainManager {
         let incomingSize = UInt64(data.count)
         if mode == .restart {
             guard incomingSize <= expectedSize else {
-                try? fileManager.removeItem(at: partialURL)
+                try? partialFile.unlinkNamedFile()
                 throw ToolchainError.hashMismatch
             }
-            try data.write(to: partialURL, options: .atomic)
+            try partialFile.replace(with: data)
+            try partialFile.synchronize()
             return
         }
 
         let (combinedSize, overflow) = offset.addingReportingOverflow(incomingSize)
         guard !overflow, combinedSize <= expectedSize else {
-            try? fileManager.removeItem(at: partialURL)
+            try? partialFile.unlinkNamedFile()
             throw ToolchainError.hashMismatch
         }
-        if !fileManager.fileExists(atPath: partialURL.path) {
-            guard fileManager.createFile(atPath: partialURL.path, contents: nil) else {
-                throw ToolchainError.fileIOFailed("Failed to create the partial toolchain download.")
-            }
-        }
-        let handle = try FileHandle(forWritingTo: partialURL)
-        defer { try? handle.close() }
-        try handle.seekToEnd()
-        try handle.write(contentsOf: data)
+        try partialFile.append(data, expectedOffset: offset)
+        try partialFile.synchronize()
     }
 
     func downloadArtifactViaStreamingTask(
@@ -747,21 +1289,29 @@ extension ToolchainManager {
         label: String,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws {
+        guard let partialFile = try openPartialDownloadFile(at: partialURL, create: true),
+              try partialFile.size() == offset else {
+            throw ToolchainError.fileIOFailed(
+                "The partial toolchain download changed before it could be resumed."
+            )
+        }
         let request = resumableRequest(url: url, offset: offset)
         let delegate = ResumableDownloadDelegate(
-            partialURL: partialURL,
+            partialFile: partialFile,
             expectedSize: expectedSize,
             initialOffset: offset,
             label: label,
             onProgress: onProgress,
-            fileManager: fileManager,
             validateRedirect: { [self] redirectedURL in
                 try validateRedirectTarget(redirectedURL)
             }
         )
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: queue)
+        let session = makeStreamingArtifactSession(
+            delegate: delegate,
+            delegateQueue: queue
+        )
         defer { session.finishTasksAndInvalidate() }
 
         try await withTaskCancellationHandler(operation: {
@@ -782,6 +1332,17 @@ extension ToolchainManager {
         }, onCancel: {
             delegate.cancel()
         })
+    }
+
+    func makeStreamingArtifactSession(
+        delegate: URLSessionDelegate,
+        delegateQueue: OperationQueue
+    ) -> URLSession {
+        URLSession(
+            configuration: urlSession.configuration,
+            delegate: delegate,
+            delegateQueue: delegateQueue
+        )
     }
 
     static func resumableResponseMode(
@@ -845,14 +1406,18 @@ extension ToolchainManager {
         expectedSize: UInt64,
         expectedSHA256: String
     ) throws -> Bool {
-        let size = try fileSize(at: partialURL)
+        guard let partialFile = try openPartialDownloadFile(at: partialURL, create: false) else {
+            return false
+        }
+        let size = try partialFile.size()
         if size > expectedSize {
-            try fileManager.removeItem(at: partialURL)
+            try partialFile.unlinkNamedFile()
             throw ToolchainError.hashMismatch
         }
         guard size == expectedSize else { return false }
-        guard try sha256Hex(url: partialURL).lowercased() == expectedSHA256.lowercased() else {
-            try fileManager.removeItem(at: partialURL)
+        guard try partialFile.sha256(maximumBytes: expectedSize).lowercased()
+            == expectedSHA256.lowercased() else {
+            try partialFile.unlinkNamedFile()
             throw ToolchainError.hashMismatch
         }
         return true
@@ -884,37 +1449,28 @@ extension ToolchainManager {
     }
 
     func fileSize(at url: URL) throws -> UInt64 {
-        guard fileManager.fileExists(atPath: url.path) else { return 0 }
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        return (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        var status = stat()
+        guard lstat(url.path, &status) == 0 else {
+            if errno == ENOENT { return 0 }
+            throw ToolchainError.fileIOFailed("Could not inspect the toolchain download.")
+        }
+        guard (status.st_mode & S_IFMT) == S_IFREG,
+              status.st_nlink == 1,
+              status.st_uid == getuid(),
+              status.st_size >= 0 else {
+            throw ToolchainError.fileIOFailed(
+                "The toolchain download is not a safe ordinary file."
+            )
+        }
+        return UInt64(status.st_size)
     }
 
     func sha256String(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    func removeEmptyDownloadDirectories(startingAt directory: URL) {
-        var current = directory
-        for _ in 0..<3 {
-            guard (try? fileManager.contentsOfDirectory(atPath: current.path).isEmpty) == true else {
-                return
-            }
-            try? fileManager.removeItem(at: current)
-            current.deleteLastPathComponent()
-        }
-    }
-
     func sha256Hex(url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while true {
-            let data = try handle.read(upToCount: 1024 * 1024) ?? Data()
-            if data.isEmpty { break }
-            hasher.update(data: data)
-        }
-        let digest = hasher.finalize()
-        return digest.map { String(format: "%02x", $0) }.joined()
+        try regularFileEvidence(at: url).sha256
     }
 
     func unzip(
@@ -955,9 +1511,87 @@ extension ToolchainManager {
     }
 
     func saveInstallState(_ state: ToolchainInstallState, root: URL) throws {
-        let url = installStateURL(root: root)
         let data = try JSONEncoder().encode(state)
-        try data.write(to: url, options: [.atomic])
+        guard data.count <= Self.maximumInstallStateBytes else {
+            throw ToolchainError.invalidManifest
+        }
+
+        let directory = Darwin.open(
+            root.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard directory >= 0 else {
+            throw installStateWriteError("open directory", errno: errno)
+        }
+        defer { Darwin.close(directory) }
+
+        let temporaryName = ".easysplat-toolchain-state-\(UUID().uuidString).tmp"
+        let temporary = temporaryName.withCString {
+            Darwin.openat(
+                directory,
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
+        }
+        guard temporary >= 0 else {
+            throw installStateWriteError("create temporary receipt", errno: errno)
+        }
+        var shouldRemoveTemporary = true
+        defer {
+            Darwin.close(temporary)
+            if shouldRemoveTemporary {
+                temporaryName.withCString { _ = Darwin.unlinkat(directory, $0, 0) }
+            }
+        }
+
+        try data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var written = 0
+            while written < bytes.count {
+                let count = Darwin.write(
+                    temporary,
+                    base.advanced(by: written),
+                    bytes.count - written
+                )
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw installStateWriteError("write receipt", errno: errno)
+                }
+                guard count > 0 else {
+                    throw installStateWriteError("write receipt", errno: EIO)
+                }
+                written += count
+            }
+        }
+        guard Darwin.fchmod(temporary, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+            throw installStateWriteError("set receipt permissions", errno: errno)
+        }
+        try synchronizeInstallStateDescriptor(temporary, action: "sync receipt")
+
+        let renamed = temporaryName.withCString { temporaryPointer in
+            Self.installStateFilename.withCString { receiptPointer in
+                Darwin.renameat(directory, temporaryPointer, directory, receiptPointer)
+            }
+        }
+        guard renamed == 0 else {
+            throw installStateWriteError("replace receipt", errno: errno)
+        }
+        shouldRemoveTemporary = false
+        try synchronizeInstallStateDescriptor(directory, action: "sync receipt directory")
+    }
+
+    private func synchronizeInstallStateDescriptor(_ descriptor: Int32, action: String) throws {
+        while Darwin.fsync(descriptor) != 0 {
+            if errno == EINTR { continue }
+            throw installStateWriteError(action, errno: errno)
+        }
+    }
+
+    private func installStateWriteError(_ action: String, errno value: Int32) -> ToolchainError {
+        ToolchainError.fileIOFailed(
+            "Failed to save the signed toolchain receipt (\(action), errno \(value))."
+        )
     }
 
     func validatedRemoteURL(_ urlString: String) throws -> URL {
@@ -1055,6 +1689,7 @@ extension ToolchainManager {
             onProgress: onProgress
         )
         try validateCriticalFileHashes(artifact.criticalFileHashes, root: root)
+        try validateExpandedClosure(artifact, root: root)
     }
 
     func isRegularSingleLinkFile(_ url: URL, exactSize: UInt64) throws -> Bool {
@@ -1087,6 +1722,9 @@ extension ToolchainManager {
         if inspection.foundSymbolicLink() {
             throw ToolchainError.invalidToolchain("Archive contains a symbolic link entry.")
         }
+        if inspection.foundSpecialFile() {
+            throw ToolchainError.invalidToolchain("Archive contains a special file entry.")
+        }
         let result = try runner.run(
             "/usr/bin/unzip",
             ["-Z1", zipURL.path],
@@ -1103,6 +1741,9 @@ extension ToolchainManager {
     }
 
     func validateArchiveEntries(_ entries: [String]) throws {
+        guard Set(entries).count == entries.count else {
+            throw ToolchainError.invalidToolchain("Archive contains duplicate entries.")
+        }
         for entry in entries {
             guard !entry.isEmpty,
                   !entry.hasPrefix("/"),
@@ -1111,7 +1752,7 @@ extension ToolchainManager {
                 throw ToolchainError.invalidToolchain("Archive contains an unsafe entry path.")
             }
             let parts = entry.split(separator: "/", omittingEmptySubsequences: false)
-            guard !parts.contains(where: { $0 == ".." || $0 == "." }) else {
+            guard parts.allSatisfy({ !$0.isEmpty && $0 != ".." && $0 != "." }) else {
                 throw ToolchainError.invalidToolchain("Archive contains a path traversal entry: \(entry).")
             }
         }
@@ -1154,8 +1795,7 @@ extension ToolchainManager {
                 throw ToolchainError.invalidManifest
             }
             let url = root.appendingPathComponent(relativePath)
-            guard fileManager.fileExists(atPath: url.path),
-                  try sha256Hex(url: url) == expectedHash else {
+            guard try regularFileEvidence(at: url).sha256 == expectedHash else {
                 throw ToolchainError.invalidToolchain("Critical toolchain hash mismatch: \(relativePath).")
             }
         }
@@ -1229,6 +1869,7 @@ private final class ArchiveInspectionAccumulator: @unchecked Sendable {
     private var entryBytes = 0
     private var exceededLimit = false
     private var containsSymbolicLink = false
+    private var containsSpecialFile = false
 
     init(maximumEntryBytes: Int, maximumEntryCount: Int) {
         self.maximumEntryBytes = maximumEntryBytes
@@ -1236,9 +1877,14 @@ private final class ArchiveInspectionAccumulator: @unchecked Sendable {
     }
 
     func inspectMetadataLine(_ line: String) {
-        guard line.first == "l" else { return }
+        guard let type = line.first,
+              type == "l" || ["b", "c", "p", "s"].contains(type) else { return }
         lock.lock()
-        containsSymbolicLink = true
+        if type == "l" {
+            containsSymbolicLink = true
+        } else {
+            containsSpecialFile = true
+        }
         lock.unlock()
     }
 
@@ -1264,6 +1910,12 @@ private final class ArchiveInspectionAccumulator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return containsSymbolicLink
+    }
+
+    func foundSpecialFile() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return containsSpecialFile
     }
 
     func entrySnapshot() -> (entries: [String], exceededLimit: Bool) {

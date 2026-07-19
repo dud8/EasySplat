@@ -82,15 +82,19 @@ public enum FrameScoring {
     }
 
     private static func loadCGImage(url: URL) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 256,
-            kCGImageSourceShouldCache: false
-        ]
-        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                  source,
+                  CGImageSourceGetPrimaryImageIndex(source),
+                  nil
+              ) as? [CFString: Any] else {
+            return nil
+        }
+        return SDRImageDecoder.createOrientedThumbnail(
+            source: source,
+            properties: properties,
+            maximumPixelDimension: 256
+        )
     }
 
     private static func grayscalePixels(cgImage: CGImage, width: Int, height: Int) -> [UInt8] {

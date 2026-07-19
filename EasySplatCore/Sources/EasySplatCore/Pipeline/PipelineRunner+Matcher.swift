@@ -47,7 +47,7 @@ extension PipelineRunner {
 
     func writeVocabularyQueryList(
         _ imageNames: [String],
-        attemptNumber: Int,
+        recoveryLevel: PairGraphRecoveryLevel,
         paths: ProjectPaths
     ) throws -> URL {
         guard !imageNames.isEmpty,
@@ -57,9 +57,34 @@ extension PipelineRunner {
         }
         return try writeColmapPairList(
             imageNames,
-            fileName: "retrieval_queries_attempt_\(attemptNumber).txt",
+            fileName: "retrieval_queries_\(recoveryLevel.rawValue).txt",
             paths: paths
         )
+    }
+
+    func writeVocabularyImageGroupList(
+        _ contract: VocabularyRetrievalImageGroupContract,
+        recoveryLevel: PairGraphRecoveryLevel,
+        paths: ProjectPaths
+    ) throws -> URL {
+        guard !contract.canonicalLines.isEmpty,
+              contract.digest == PairGraphEvidenceStore.imageGroupListDigest(
+                  policy: contract.policy,
+                  canonicalLines: contract.canonicalLines
+              ) else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        let url = paths.colmapSeedURL.appendingPathComponent(
+            "retrieval_image_groups_\(recoveryLevel.rawValue).txt"
+        )
+        try contract.serializedData.write(to: url, options: .atomic)
+        guard try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: Self.maximumGeneratedPairListBytes
+        ) == contract.serializedData else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        return url
     }
 
     func readGeneratedPairLines(from url: URL) throws -> [String] {
@@ -137,8 +162,14 @@ extension PipelineRunner {
                 try? await Task.sleep(for: .seconds(1))
             }
         }
-        defer { pollTask.cancel() }
-
-        try await invokeMatcher(onLog)
+        do {
+            try await invokeMatcher(onLog)
+        } catch {
+            pollTask.cancel()
+            await pollTask.value
+            throw error
+        }
+        pollTask.cancel()
+        await pollTask.value
     }
 }

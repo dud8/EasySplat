@@ -96,6 +96,41 @@ final class SplatRendererSortTests: XCTestCase {
         )
     }
 
+    func testFailedSortCanBeRetriedExplicitlyAndReportsOnlyConfirmedRecovery() async throws {
+        let renderer = try makeRenderer()
+        try renderer.add(makePoint(x: -1))
+        try renderer.add(makePoint(x: 1))
+        renderer.sortedOrderBufferCapacityLimit = 1
+        let failed = expectation(description: "sort failed")
+        var failures = 0
+        var successes = 0
+        renderer.onSortFailure = { _ in
+            failures += 1
+            failed.fulfill()
+        }
+        renderer.onSortSuccess = {
+            successes += 1
+        }
+
+        renderer.resortIndicesOnCPU()
+        await fulfillment(of: [failed], timeout: 2)
+
+        XCTAssertEqual(failures, 1)
+        XCTAssertEqual(successes, 0)
+
+        renderer.sortedOrderBufferCapacityLimit = nil
+        let recovered = expectation(description: "sort recovered")
+        renderer.onSortSuccess = {
+            successes += 1
+            recovered.fulfill()
+        }
+        renderer.resortIndicesOnCPU()
+        await fulfillment(of: [recovered], timeout: 2)
+
+        XCTAssertEqual(failures, 1)
+        XCTAssertEqual(successes, 1)
+    }
+
     func testAccelerateScratchFailureBalancesCallbacksAndPreservesLastOrdering() async throws {
         let renderer = try makeRenderer()
         try renderer.add(makePoint(x: -1))
