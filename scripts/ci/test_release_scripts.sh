@@ -439,6 +439,7 @@ grep -Fq 'retained packaged-app project evidence because attestation preservatio
 python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
 python3 "$ROOT/scripts/toolchain/tests/test_da3_payload.py"
 python3 "$ROOT/scripts/toolchain/tests/test_create_reproducible_zip.py"
+python3 "$ROOT/scripts/toolchain/tests/test_local_launcher.py"
 /usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_atomic_swap_install.py"
 /usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_colmap_build_supervisor.py"
 /usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_colmap_support_builder.py" \

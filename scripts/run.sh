@@ -201,24 +201,108 @@ toolchain_inputs_newer() {
   return 1
 }
 
-archive_contains() {
-  unzip -Z1 "$1" | grep -Fx "$2" >/dev/null
+archive_component_owned() {
+  python3 - "$1" "$2" <<'PY' >/dev/null
+import stat
+import sys
+import zipfile
+
+archive_path, component = sys.argv[1:]
+core_anchors = {
+    "bin/colmap",
+    "bin/easysplat-train",
+    "bin/default.metallib",
+    "lib/libomp.dylib",
+    "provenance/colmap.json",
+    "provenance/colmap-support.json",
+    "provenance/ceres.json",
+    "provenance/openimageio.json",
+    "msplat/build_info.json",
+    "msplat/LICENSE",
+    "supply-chain/components.json",
+}
+base_anchors = {
+    "da3_mps/bin/easysplat_da3_sfm",
+    "da3_mps/python/bin/python3",
+    "da3_mps/app/easysplat_da3_sfm/run.py",
+    "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
+    "da3_mps/build_info.json",
+    "da3_mps/models/DA3-BASE/config.json",
+    "da3_mps/models/DA3-BASE/model.safetensors",
+    "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+    "da3_mps/models/DA3-BASE/LICENSE",
+}
+small_files = {
+    "da3_mps/models/DA3-SMALL/config.json",
+    "da3_mps/models/DA3-SMALL/model.safetensors",
+    "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
+    "da3_mps/models/DA3-SMALL/LICENSE",
+}
+
+try:
+    with zipfile.ZipFile(archive_path) as archive:
+        infos = archive.infolist()
+except (OSError, zipfile.BadZipFile):
+    raise SystemExit(1)
+
+paths = []
+for info in infos:
+    path = info.filename
+    parts = path.split("/")
+    file_type = stat.S_IFMT(info.external_attr >> 16)
+    if (
+        not path
+        or info.is_dir()
+        or path.startswith("/")
+        or "\\" in path
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+        or file_type not in {0, stat.S_IFREG}
+    ):
+        raise SystemExit(1)
+    paths.append(path)
+
+if not paths or len(paths) != len(set(paths)):
+    raise SystemExit(1)
+
+if component == "core":
+    owned = core_anchors.issubset(paths) and all(
+        path in core_anchors
+        or path == "provenance/distribution-signing.json"
+        or (path.startswith("licenses/") and len(path) > len("licenses/"))
+        for path in paths
+    )
+elif component == "da3-base":
+    prefixes = (
+        "da3_mps/bin/",
+        "da3_mps/python/",
+        "da3_mps/app/",
+        "da3_mps/vendor/",
+        "da3_mps/licenses/",
+        "da3_mps/models/DA3-BASE/",
+    )
+    owned = (
+        base_anchors.issubset(paths)
+        and any(path.startswith("da3_mps/licenses/") for path in paths)
+        and all(
+            path == "da3_mps/build_info.json"
+            or path.startswith(prefixes)
+            for path in paths
+        )
+    )
+elif component == "da3-small":
+    owned = set(paths) == small_files
+else:
+    owned = False
+
+raise SystemExit(0 if owned else 1)
+PY
 }
 
 core_zip_valid() {
   test -f "$CORE_ZIP" || return 1
   "$MSPLAT_VALIDATOR" --archive "$CORE_ZIP" >/dev/null 2>&1 || return 1
-  archive_contains "$CORE_ZIP" "bin/colmap" || return 1
-  archive_contains "$CORE_ZIP" "bin/easysplat-train" || return 1
-  archive_contains "$CORE_ZIP" "bin/default.metallib" || return 1
-  archive_contains "$CORE_ZIP" "msplat/build_info.json" || return 1
-  archive_contains "$CORE_ZIP" "msplat/LICENSE" || return 1
-  archive_contains "$CORE_ZIP" "da3_mps/bin/easysplat_da3_sfm" || return 1
-  archive_contains "$CORE_ZIP" "da3_mps/python/bin/python3" || return 1
-  archive_contains "$CORE_ZIP" "da3_mps/build_info.json" || return 1
-  archive_contains "$CORE_ZIP" "da3_mps/app/easysplat_da3_sfm/run.py" || return 1
-  archive_contains "$CORE_ZIP" "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
-  archive_contains "$CORE_ZIP" "supply-chain/components.json" || return 1
+  archive_component_owned "$CORE_ZIP" "core" || return 1
 
   local tmp
   tmp="$(mktemp -d)"
@@ -268,13 +352,16 @@ ensure_msplat_bundle() {
   fi
 }
 
-da3_model_zip_valid() {
+da3_base_zip_valid() {
   local zip_path="$1"
-  local model="$2"
   test -f "$zip_path" || return 1
-  archive_contains "$zip_path" "da3_mps/models/$model/config.json" || return 1
-  archive_contains "$zip_path" "da3_mps/models/$model/model.safetensors" || return 1
-  archive_contains "$zip_path" "da3_mps/models/$model/easysplat_model_info.json" || return 1
+  archive_component_owned "$zip_path" "da3-base" || return 1
+}
+
+da3_small_zip_valid() {
+  local zip_path="$1"
+  test -f "$zip_path" || return 1
+  archive_component_owned "$zip_path" "da3-small" || return 1
 }
 
 da3_bundle_sources_newer() {
@@ -339,10 +426,23 @@ ensure_da3_mps_bundle() {
   fi
 }
 
-validate_installed_toolchain() {
+validate_installed_core() {
   local root="$1"
   test -x "$root/bin/colmap" || return 1
   "$MSPLAT_VALIDATOR" --packaged "$root" >/dev/null 2>&1 || return 1
+  test -f "$root/lib/libomp.dylib" || return 1
+  test -f "$root/provenance/colmap.json" || return 1
+  test -f "$root/provenance/colmap-support.json" || return 1
+  test -f "$root/provenance/ceres.json" || return 1
+  test -f "$root/provenance/openimageio.json" || return 1
+  test -f "$root/supply-chain/components.json" || return 1
+
+  /usr/bin/codesign --verify --strict "$root/bin/colmap" || return 1
+  "$root/bin/colmap" -h >/dev/null 2>&1 || return 1
+}
+
+validate_installed_da3_base() {
+  local root="$1"
   test -x "$root/da3_mps/bin/easysplat_da3_sfm" || return 1
   test -x "$root/da3_mps/python/bin/python3" || return 1
   test -f "$root/da3_mps/build_info.json" || return 1
@@ -351,13 +451,17 @@ validate_installed_toolchain() {
   test -f "$root/da3_mps/models/DA3-BASE/model.safetensors" || return 1
   test -f "$root/da3_mps/models/DA3-BASE/config.json" || return 1
   test -f "$root/da3_mps/models/DA3-BASE/easysplat_model_info.json" || return 1
+  test -f "$root/da3_mps/models/DA3-BASE/LICENSE" || return 1
+  test -d "$root/da3_mps/licenses" || return 1
+  test -f "$root/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
+}
+
+validate_installed_da3_small() {
+  local root="$1"
   test -f "$root/da3_mps/models/DA3-SMALL/model.safetensors" || return 1
   test -f "$root/da3_mps/models/DA3-SMALL/config.json" || return 1
   test -f "$root/da3_mps/models/DA3-SMALL/easysplat_model_info.json" || return 1
-  test -f "$root/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
-
-  /usr/bin/codesign --verify --strict "$root/bin/colmap" || return 1
-  "$root/bin/colmap" -h >/dev/null 2>&1 || return 1
+  test -f "$root/da3_mps/models/DA3-SMALL/LICENSE" || return 1
 }
 
 models_present() {
@@ -386,13 +490,18 @@ wipe_installed_core() {
     "${root:?}/da3_mps/app"
 }
 
-INSTALLED_OK=0
-if [ -d "$TOOLCHAIN_ROOT" ] && validate_installed_toolchain "$TOOLCHAIN_ROOT"; then
-  INSTALLED_OK=1
+INSTALLED_CORE_OK=0
+INSTALLED_FULL_OK=0
+if [ -d "$TOOLCHAIN_ROOT" ] && validate_installed_core "$TOOLCHAIN_ROOT"; then
+  INSTALLED_CORE_OK=1
+  if validate_installed_da3_base "$TOOLCHAIN_ROOT" && \
+     validate_installed_da3_small "$TOOLCHAIN_ROOT"; then
+    INSTALLED_FULL_OK=1
+  fi
 fi
 
 if [ "$FAST" -eq 1 ]; then
-  if [ "$INSTALLED_OK" -ne 1 ]; then
+  if [ "$INSTALLED_CORE_OK" -ne 1 ]; then
     echo "Local toolchain not found or incomplete at: $TOOLCHAIN_ROOT" >&2
     echo "Run ./scripts/run.sh to auto-build/install it, or use --rebuild to force a fresh toolchain." >&2
     exit 1
@@ -402,7 +511,7 @@ if [ "$FAST" -eq 1 ]; then
   exit 0
 fi
 
-if [ "$REBUILD" -eq 0 ] && [ "$INSTALLED_OK" -eq 1 ]; then
+if [ "$REBUILD" -eq 0 ] && [ "$INSTALLED_FULL_OK" -eq 1 ]; then
   export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
   launch_app "installed toolchain at $TOOLCHAIN_ROOT"
   exit 0
@@ -410,14 +519,18 @@ fi
 
 NEED_PACKAGE=0
 if [ "$REBUILD" -eq 1 ] || ! core_zip_valid \
-  || ! da3_model_zip_valid "$DA3_BASE_ZIP" "DA3-BASE" \
-  || ! da3_model_zip_valid "$DA3_SMALL_ZIP" "DA3-SMALL"; then
+  || ! da3_base_zip_valid "$DA3_BASE_ZIP" \
+  || ! da3_small_zip_valid "$DA3_SMALL_ZIP"; then
   NEED_PACKAGE=1
-elif [ "$INSTALLED_OK" -eq 0 ] && toolchain_inputs_newer; then
+elif [ "$INSTALLED_FULL_OK" -eq 0 ] && toolchain_inputs_newer; then
   NEED_PACKAGE=1
 fi
 
 if [ "$NEED_PACKAGE" -eq 1 ]; then
+  "$ROOT/scripts/toolchain/build_colmap_support.sh"
+  "$ROOT/scripts/toolchain/build_ceres.sh"
+  "$ROOT/scripts/toolchain/build_openimageio.sh"
+  "$ROOT/scripts/toolchain/build_colmap.sh"
   ensure_msplat_bundle
   ensure_da3_mps_bundle
   rm -f "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"
