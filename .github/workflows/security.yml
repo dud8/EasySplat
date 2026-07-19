@@ -47,12 +47,27 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: Tools/Da3Sfm/requirements.txt
-      - name: Audit pinned Python runtime dependencies
+          cache-dependency-path: |
+            Tools/Da3Sfm/requirements.txt
+            scripts/benchmark/requirements.txt
+            scripts/benchmark/render-requirements.txt
+      - name: Audit pinned Python dependencies
         run: |
           python -m pip install --disable-pip-version-check --no-input pip-audit==2.10.1
           python -m pip_audit \
             --requirement Tools/Da3Sfm/requirements.txt \
+            --progress-spinner off \
+            --desc \
+            --no-deps \
+            --disable-pip
+          python -m pip_audit \
+            --requirement scripts/benchmark/requirements.txt \
+            --progress-spinner off \
+            --desc \
+            --no-deps \
+            --disable-pip
+          python -m pip_audit \
+            --requirement scripts/benchmark/render-requirements.txt \
             --progress-spinner off \
             --desc \
             --no-deps \

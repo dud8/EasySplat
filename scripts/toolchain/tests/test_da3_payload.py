@@ -139,8 +139,8 @@ class Da3PayloadTests(unittest.TestCase):
             "supplemental_license_manifest": "licenses/python-package-upstream-notices.json",
             "supplemental_license_manifest_sha256": sha256(supplemental),
             "pip_install_report": "licenses/python-packages-install-report.json",
-            "torch_version": "2.12.1",
-            "torchvision_version": "0.27.1",
+            "torch_version": "2.13.0",
+            "torchvision_version": "0.28.0",
             "huggingface_hub_version": "1.14.0",
         }
         (root / "build_info.json").write_text(

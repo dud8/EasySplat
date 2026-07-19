@@ -126,6 +126,7 @@ jobs:
       - name: Install minimal bridge test dependencies
         run: |
           python -m pip install --disable-pip-version-check --no-input \
-            numpy==2.3.5 pillow==12.2.0 torch==2.12.1 torchvision==0.27.1
+            numpy==2.3.5 pillow==12.3.0 setuptools==83.0.0 \
+            torch==2.13.0 torchvision==0.28.0
       - name: Run Python bridge tests
         run: ./scripts/test_python_tools.sh

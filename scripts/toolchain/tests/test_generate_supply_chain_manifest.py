@@ -74,7 +74,7 @@ class PythonLicenseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             python_root = Path(temporary)
             site_packages = python_root / "lib/python3.13/site-packages"
-            top_level = site_packages / "setuptools-81.0.0.dist-info/METADATA"
+            top_level = site_packages / "setuptools-83.0.0.dist-info/METADATA"
             vendored = (
                 site_packages
                 / "setuptools/_vendor/autocommand-2.2.2.dist-info/METADATA"

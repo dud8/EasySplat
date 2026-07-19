@@ -107,7 +107,7 @@ struct ProductionToolchainFileFixture {
       slug: "omegaconf", version: "2.3.0",
       dependencies: ["python:antlr4-python3-runtime", "python:pyyaml"]),
     .init(slug: "packaging", version: "26.2", dependencies: []),
-    .init(slug: "pillow", version: "12.2.0", dependencies: ["python:packaging"]),
+    .init(slug: "pillow", version: "12.3.0", dependencies: ["python:packaging"]),
     .init(slug: "pygments", version: "2.20.0", dependencies: []),
     .init(slug: "pyyaml", version: "6.0.3", dependencies: []),
     .init(
@@ -116,17 +116,17 @@ struct ProductionToolchainFileFixture {
       slug: "safetensors", version: "0.7.0",
       dependencies: ["python:huggingface-hub", "python:numpy", "python:packaging", "python:torch"]),
     .init(
-      slug: "setuptools", version: "81.0.0", dependencies: ["python:filelock", "python:packaging"]),
+      slug: "setuptools", version: "83.0.0", dependencies: ["python:filelock", "python:packaging"]),
     .init(slug: "shellingham", version: "1.5.4", dependencies: []),
     .init(slug: "sympy", version: "1.14.0", dependencies: ["python:mpmath"]),
     .init(
-      slug: "torch", version: "2.12.1",
+      slug: "torch", version: "2.13.0",
       dependencies: [
         "python:filelock", "python:fsspec", "python:jinja2", "python:networkx", "python:pyyaml",
         "python:setuptools", "python:sympy", "python:typing-extensions",
       ]),
     .init(
-      slug: "torchvision", version: "0.27.1",
+      slug: "torchvision", version: "0.28.0",
       dependencies: ["python:numpy", "python:pillow", "python:torch"]),
     .init(slug: "tqdm", version: "4.68.4", dependencies: []),
     .init(
@@ -422,8 +422,8 @@ struct ProductionToolchainFileFixture {
       "supplemental_license_manifest": "licenses/python-package-upstream-notices.json",
       "supplemental_license_manifest_sha256": Self.sha256(supplemental),
       "pip_install_report": "licenses/python-packages-install-report.json",
-      "torch_version": "2.12.1",
-      "torchvision_version": "0.27.1",
+      "torch_version": "2.13.0",
+      "torchvision_version": "0.28.0",
       "huggingface_hub_version": "1.14.0",
     ])
   }

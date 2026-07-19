@@ -80,7 +80,13 @@ require_job_count "$CODEQL" 4
 
 require_line '^[[:space:]]+GOBIN=.*go install github\.com/rhysd/actionlint/cmd/actionlint@v[0-9]+\.[0-9]+\.[0-9]+$' "$SECURITY"
 require_line '^[[:space:]]+.*shellcheck --severity=warning$' "$SECURITY"
-require_line '^[[:space:]]+python -m pip_audit \\$' "$SECURITY"
+for lock in \
+  Tools/Da3Sfm/requirements.txt \
+  scripts/benchmark/requirements.txt \
+  scripts/benchmark/render-requirements.txt; do
+  require_text "$lock" "$SECURITY"
+  require_line "^[[:space:]]+--requirement $lock \\\\$" "$SECURITY"
+done
 require_line '^[[:space:]]+"\$RUNNER_TEMP/gitleaks" git --redact --no-banner .* \.$' "$SECURITY"
 require_line '^[[:space:]]+- uses: actions/dependency-review-action@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$' "$SECURITY"
 
