@@ -331,21 +331,37 @@ def _validate_prepared_attestation(
     request: Mapping[str, Any],
     lane: str,
     runner: Mapping[str, Any],
+    *,
+    artifact_root: Path | None = None,
 ) -> dict[str, Any]:
     attestation = _mapping(value, "prepared evidence")
-    _exact_keys(
-        attestation,
-        {
-            "schema_version", "binding", "baseline_run_configuration",
-            "candidate_run_configuration", "category", "capture_traits",
-            "holdout_indices", "reference_artifacts", "timing_basis",
-            "expected_outcome", "input_kind", "video_source_count", "gate_scopes",
-            "rendering_driver_identity", "scoring_runtime", "lane", "machine",
-            "producer", "measurement_runner", "commands", "resolved_compute",
-            "actual", "metrics", "artifacts",
-        },
-        "prepared evidence",
-    )
+    attestation_fields = {
+        "schema_version", "binding", "baseline_run_configuration",
+        "candidate_run_configuration", "category", "capture_traits",
+        "holdout_indices", "reference_artifacts", "timing_basis",
+        "expected_outcome", "input_kind", "video_source_count", "gate_scopes",
+        "rendering_driver_identity", "scoring_runtime", "lane", "machine",
+        "producer", "measurement_runner", "commands", "resolved_compute",
+        "actual", "metrics", "artifacts",
+    }
+    if "photo_permutation" in attestation:
+        attestation_fields.update(
+            {
+                "photo_permutation",
+                "photo_permutation_execution_receipt",
+                "photo_permutation_source_authorization",
+                "photo_permutation_supervisor_provenance",
+            }
+        )
+    elif {
+        "photo_permutation_execution_receipt",
+        "photo_permutation_source_authorization",
+        "photo_permutation_supervisor_provenance",
+    } & set(attestation):
+        raise AggregationError(
+            "prepared photo permutation proof has no permutation evidence"
+        )
+    _exact_keys(attestation, attestation_fields, "prepared evidence")
     if (
         attestation["schema_version"] != evidence.ATTESTATION_SCHEMA_VERSION
         or attestation["lane"] != lane
@@ -373,6 +389,40 @@ def _validate_prepared_attestation(
         )
     elif attestation["resolved_compute"] != {"status": "not_applicable"}:
         raise AggregationError("invalid evidence must mark resolved compute not_applicable")
+    if "photo_permutation" in attestation:
+        if (
+            lane != evidence.LANE_REFERENCE
+            or validated_request["expected_outcome"]["kind"] != "valid"
+        ):
+            raise AggregationError(
+                "prepared photo permutation evidence is restricted to the valid reference lane"
+            )
+        try:
+            evidence.aggregate_photo_permutation_group(
+                attestation["photo_permutation"],
+                validated_request,
+                formal_release=validated_request["binding"]["profile"] == "release",
+                execution_receipt=attestation[
+                    "photo_permutation_execution_receipt"
+                ],
+            )
+            source_authorization = (
+                evidence.validate_photo_permutation_source_authorization(
+                    attestation["photo_permutation_source_authorization"],
+                    attestation["photo_permutation_execution_receipt"],
+                    validated_request,
+                )
+            )
+            evidence.validate_photo_permutation_supervisor_provenance(
+                attestation["photo_permutation_supervisor_provenance"],
+                attestation["photo_permutation_execution_receipt"],
+                validated_request,
+                source_authorization,
+            )
+        except evidence.EvidenceError as error:
+            raise AggregationError(
+                f"prepared photo permutation evidence is invalid: {error}"
+            ) from error
     _validate_producer(attestation["producer"], "prepared evidence producer")
     if evidence.validate_runner_identity(attestation["measurement_runner"], lane) != (
         evidence.validate_runner_identity(runner, lane)
@@ -388,6 +438,52 @@ def _validate_prepared_attestation(
         if not isinstance(name, str) or not evidence.SAFE_TOKEN_PATTERN.fullmatch(name):
             raise AggregationError("prepared artifact name is invalid")
         _validate_descriptor(descriptor, f"prepared artifact {name}")
+    if "photo_permutation" in attestation:
+        if artifact_root is None:
+            raise AggregationError(
+                "prepared photo permutation trust artifacts require their artifact root"
+            )
+        try:
+            receipt_descriptor = _mapping(
+                artifacts["photo_permutation_execution_receipt"],
+                "prepared photo permutation execution receipt descriptor",
+            )
+            bundle_descriptor = _mapping(
+                artifacts["photo_permutation_attestation_bundle"],
+                "prepared photo permutation attestation bundle descriptor",
+            )
+            source_authorization_descriptor = _mapping(
+                artifacts["photo_permutation_source_authorization"],
+                "prepared photo permutation source authorization descriptor",
+            )
+            source_authorization_bundle_descriptor = _mapping(
+                artifacts[
+                    "photo_permutation_source_authorization_attestation_bundle"
+                ],
+                "prepared photo permutation source authorization bundle descriptor",
+            )
+            verified_provenance = (
+                evidence.verify_photo_permutation_github_attestations(
+                    attestation["photo_permutation_execution_receipt"],
+                    artifact_root / receipt_descriptor["path"],
+                    artifact_root / bundle_descriptor["path"],
+                    attestation["photo_permutation_source_authorization"],
+                    artifact_root / source_authorization_descriptor["path"],
+                    artifact_root
+                    / source_authorization_bundle_descriptor["path"],
+                    validated_request,
+                )
+            )
+        except (KeyError, evidence.EvidenceError) as error:
+            raise AggregationError(
+                f"prepared photo permutation supervisor proof is invalid: {error}"
+            ) from error
+        if verified_provenance != attestation[
+            "photo_permutation_supervisor_provenance"
+        ]:
+            raise AggregationError(
+                "prepared photo permutation supervisor provenance changed"
+            )
     try:
         output_descriptor = artifacts.get("output_ply")
         evidence._validate_prepared_execution_receipts(
@@ -826,7 +922,11 @@ def _scene_result(
             raise AggregationError("prepared evidence receipt digest does not match its index")
         if record["kind"] == "attestation":
             attestation = _validate_prepared_attestation(
-                value, requests[key], lane, runners[lane]
+                value,
+                requests[key],
+                lane,
+                runners[lane],
+                artifact_root=path.parent,
             )
             receipts.append(attestation)
             attestations[lane] = attestation
@@ -1022,6 +1122,12 @@ def aggregate_evidence(*, prepared_roots: Iterable[Path], output: Path) -> dict[
             all_receipts.extend(receipts)
     if len(all_receipts) != EXPECTED_RECORD_COUNT:
         raise AggregationError("prepared evidence receipt closure is incomplete")
+    try:
+        evidence.validate_photo_permutation_release_coverage(all_receipts)
+    except evidence.EvidenceError as error:
+        raise AggregationError(
+            f"release photo permutation coverage is incomplete: {error}"
+        ) from error
     suite_performance = benchmark.evaluate_suite_performance(
         scene_results, benchmark.APPROVED_THRESHOLDS
     )

@@ -299,7 +299,6 @@ run_case() {
       --device mps \
       --input-ordering continuous \
       --model-subdir DA3-BASE \
-      --fallback-model-subdir DA3-SMALL \
       --process-res "$PROCESS_RES" \
       --max-points "$MAX_POINTS" \
       --camera-type PINHOLE \
@@ -336,7 +335,9 @@ PY
   "$COLMAP_BIN" matches_importer \
     --database_path "$database_path" \
     --match_list_path "$case_dir/match_pairs.txt" \
-    --match_type pairs >>"$log_path" 2>&1
+    --match_type pairs \
+    --EasySplat.require_empty_matching_results 1 \
+    --TwoViewGeometry.random_seed 42 >>"$log_path" 2>&1
   mkdir -p "$triangulated_dir" "$refined_dir"
   "$COLMAP_BIN" point_triangulator \
     --database_path "$database_path" \

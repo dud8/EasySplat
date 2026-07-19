@@ -135,8 +135,8 @@ class RenderTargetPreparationTests(unittest.TestCase):
         helper = helper_root / "easysplat-train"
         metallib = helper_root / "default.metallib"
         helper.write_text(
-            """#!/usr/bin/env python3
-import argparse, hashlib, json, os, struct
+            f"#!{sys.executable}\n"
+            + """import argparse, hashlib, json, os, struct
 from pathlib import Path
 from PIL import Image
 

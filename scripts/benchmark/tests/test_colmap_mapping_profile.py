@@ -21,10 +21,7 @@ def _profiler():
 
 
 def _line(second: str, message: str) -> str:
-    return (
-        f"I20260102 03:04:{second} 0xabc synthetic_mapper.cc:7] "
-        f"{message}"
-    )
+    return f"I20260102 03:04:{second} 0xabc synthetic_mapper.cc:7] {message}"
 
 
 def _report(
@@ -166,6 +163,44 @@ class ColmapMappingProfileTests(unittest.TestCase):
         self.assertEqual(profile["timing"]["global_refinement_region_share"], 0.625)
         self.assertEqual(profile["timing"]["bundle_adjustment_solver_share"], 0.25)
 
+    def test_structure_less_fallback_is_not_a_second_registration_attempt(self) -> None:
+        log = "\n".join(
+            [
+                _line("00.000000", "Loading database"),
+                _line("01.000000", "Global bundle adjustment"),
+                *_report("01.100000", "Bundle adjustment report"),
+                _line("02.000000", "Registering image #7 (num_reg_frames=2)"),
+                _line("02.010000", "Registering image with structure-less fallback"),
+                *_report("02.100000", "Bundle adjustment report"),
+                _line(
+                    "03.000000",
+                    "Retriangulation and Global bundle adjustment",
+                ),
+                *_report("03.100000", "Bundle adjustment report"),
+                _line("04.000000", "Keeping successful reconstruction"),
+                _line("05.000000", "Elapsed time: 0.083 [minutes]"),
+            ]
+        )
+
+        profile = _profiler().parse_mapping_profile(log)
+
+        self.assertEqual(
+            profile["marker_counts"],
+            {
+                "initial_global_markers": 1,
+                "iterative_global_refinement_markers": 1,
+                "registration_attempts": 1,
+            },
+        )
+        self.assertEqual(
+            profile["report_totals"]["global_bundle_adjustment"]["calls"],
+            2,
+        )
+        self.assertEqual(
+            profile["report_totals"]["local_bundle_adjustment"]["calls"],
+            1,
+        )
+
     def test_amdahl_math_excludes_pose_refinement(self) -> None:
         profile = _profiler().parse_mapping_profile(_valid_log())
 
@@ -188,7 +223,9 @@ class ColmapMappingProfileTests(unittest.TestCase):
             1 / (1 - share),
         )
 
-    def test_external_wall_time_is_validated_with_one_millisecond_tolerance(self) -> None:
+    def test_external_wall_time_is_validated_with_one_millisecond_tolerance(
+        self,
+    ) -> None:
         profiler = _profiler()
         profile = profiler.parse_mapping_profile(_valid_log(), wall_seconds=7.9995)
         self.assertEqual(profile["timing"]["mapper_wall_seconds"], 7.9995)
@@ -335,12 +372,9 @@ class ColmapMappingProfileTests(unittest.TestCase):
         duplicate_field = complete[:2] + ["Residuals : 11"] + complete[2:]
         missing_time = [line for line in complete if "Time :" not in line]
         invalid_integer = [
-            line.replace("Iterations : 2", "Iterations : many")
-            for line in complete
+            line.replace("Iterations : 2", "Iterations : many") for line in complete
         ]
-        negative_time = [
-            line.replace("Time : 0.5", "Time : -0.5") for line in complete
-        ]
+        negative_time = [line.replace("Time : 0.5", "Time : -0.5") for line in complete]
         nonfinite_cost = [
             line.replace("Initial cost : 1.25", "Initial cost : nan")
             for line in complete
@@ -470,7 +504,9 @@ class ColmapMappingProfileTests(unittest.TestCase):
         self.assertNotIn("20260102", serialized)
         self.assertNotIn("Opening", serialized)
 
-    def test_serialization_and_cli_stdout_and_file_output_are_deterministic(self) -> None:
+    def test_serialization_and_cli_stdout_and_file_output_are_deterministic(
+        self,
+    ) -> None:
         profiler = _profiler()
         log = _valid_log()
         profile = profiler.parse_mapping_profile(log, wall_seconds=12.0)

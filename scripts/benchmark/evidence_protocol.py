@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import itertools
 import json
 import math
 import mmap
@@ -31,14 +32,59 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 
-PROTOCOL_VERSION = 8
-PRODUCER_VERSION = "8.0.0"
-REQUEST_SCHEMA_VERSION = 8
-ATTESTATION_SCHEMA_VERSION = 7
-GEOMETRY_ARTIFACT_SCHEMA_VERSION = 20
-GEOMETRY_WORKER_EXECUTION_SCHEMA_VERSION = 3
+PROTOCOL_VERSION = 16
+PRODUCER_VERSION = "16.0.0"
+REQUEST_SCHEMA_VERSION = 11
+ATTESTATION_SCHEMA_VERSION = 13
+GEOMETRY_ARTIFACT_SCHEMA_VERSION = 35
+GEOMETRY_CONDITIONING_SCHEMA_VERSION = 2
+GEOMETRY_CONDITIONING_PROVENANCE = "colmap-text-conditioning-v2"
+GEOMETRY_CONDITIONING_ACCEPTANCE_POLICY = "capture-agnostic-conditioning-v2"
+GEOMETRY_CONDITIONING_MAXIMUM_RAY_PAIR_EVALUATIONS = 100_000_000
+GEOMETRY_WORKER_EXECUTION_SCHEMA_VERSION = 13
 MAXIMUM_MAPPING_ATTEMPT_ORDINAL = 10_000
+MAXIMUM_EXACT_RECOVERY_PAIR_COUNT = 256
+# GPU-to-CPU FAISS recovery can precede normal, expanded, maximum, and exact
+# attempts. This is the protocol's closed upper bound, not an arbitrary fixture cap.
+MAXIMUM_PAIR_GRAPH_MATCHER_ATTEMPTS = 5
+EXACT_RECOVERY_REASONS = frozenset(
+    {
+        "faissCrash",
+        "faissUnsupportedOperation",
+        "faissGeometryRejectedAfterRetries",
+    }
+)
+MAPPING_CADENCE_FALLBACK_TRIGGERS = frozenset(
+    {
+        "insufficientViewSupport",
+        "collapsedCameraTrajectory",
+        "insufficientParallax",
+        "degeneratePointDistribution",
+        "lowReconstructionQuality",
+        "fragmentedReconstruction",
+        "lowRegisteredViewCoverage",
+        "sparseResidualCoverage",
+        "excessiveResiduals",
+    }
+)
+_MISSING = object()
 PRODUCER_RELATIVE_PATH = "scripts/benchmark/evidence_protocol.py"
+PHOTO_PERMUTATION_PRODUCER_RELATIVE_PATH = (
+    "scripts/benchmark/photo_permutation_producer.py"
+)
+COLMAP_RUNTIME_COMPONENT_PATHS = ("bin/colmap", "lib/libomp.dylib")
+SHIPPING_MACHINE_SOFTWARE = {
+    "clang_version": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+    "macos_build": "25F84",
+    "macos_version": "26.5.2",
+    "macos_sdk_build": "25F70",
+    "macos_sdk_version": "26.5",
+    "metal_version": "Apple metal version 32023.883 (metalfe-32023.883)",
+    "swift_version": (
+        "Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)"
+    ),
+    "xcode_version": "Xcode 26.6\nBuild version 17F113",
+}
 COLMAP_THREAD_ENVIRONMENT_KEYS = (
     "BLIS_NUM_THREADS",
     "GOMP_CPU_AFFINITY",
@@ -72,14 +118,17 @@ COLMAP_THREAD_ENVIRONMENT_KEYS = (
     "OPENBLAS_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 )
-COLMAP_THREAD_ENVIRONMENT_KEYS_SHA256 = "sha256:" + hashlib.sha256(
-    json.dumps(
-        list(COLMAP_THREAD_ENVIRONMENT_KEYS),
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-).hexdigest()
+COLMAP_THREAD_ENVIRONMENT_KEYS_SHA256 = (
+    "sha256:"
+    + hashlib.sha256(
+        json.dumps(
+            list(COLMAP_THREAD_ENVIRONMENT_KEYS),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+)
 LANE_REFERENCE = "reference_m4_max"
 LANE_CONSTRAINED = "constrained_14_16gb"
 LANE_EIGHT_GB = "eight_gb_fast"
@@ -98,7 +147,46 @@ ACCURATE_REFERENCE_CONFIGURATION = {
     "pose_source": "accurate_colmap",
 }
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+OPAQUE_SHA256_PATTERN = re.compile(r"^opaque-sha256:[0-9a-f]{64}$")
 SAFE_TOKEN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+PHOTO_PERMUTATION_FORMAL_VARIANT_COUNT = 20
+PHOTO_PERMUTATION_FORMAL_SHUFFLE_COUNT = PHOTO_PERMUTATION_FORMAL_VARIANT_COUNT - 1
+PHOTO_PERMUTATION_SOURCE_KINDS = frozenset(
+    {
+        "native_photos",
+        "single_video_derived_stills",
+        "multi_video_derived_stills",
+        "mixed_derived_stills",
+        "calibration_dataset_derived_stills",
+    }
+)
+PHOTO_PERMUTATION_FORMAL_SEEDS = (
+    4_831_724_571_275_814_301,
+    299_878_011_999_028_456,
+    2_844_834_447_830_983_243,
+    6_231_082_215_795_779_454,
+    4_800_438_096_911_084_048,
+    2_716_919_709_073_054,
+    6_182_739_618_928_064_372,
+    1_890_503_712_009_985_873,
+    1_568_370_770_626_313_518,
+    5_229_953_635_493_634_764,
+    2_975_060_197_054_291_650,
+    8_734_660_529_696_552_112,
+    5_732_113_024_416_928_989,
+    7_080_989_793_255_452_606,
+    3_391_660_995_046_289_640,
+    1_455_629_253_019_862_542,
+    4_421_409_204_413_149_686,
+    1_852_296_383_023_932_283,
+    5_338_892_799_857_249_680,
+)
+MAX_PHOTO_PERMUTATION_MAPPING_BYTES = 8 * 1024 * 1024
+MAX_PHOTO_PERMUTATION_ATTESTATION_BUNDLE_BYTES = 16 * 1024 * 1024
+PHOTO_PERMUTATION_ATTESTATION_REPOSITORY = "dud8/EasySplat"
+PHOTO_PERMUTATION_ATTESTATION_WORKFLOW = (
+    "dud8/EasySplat/.github/workflows/benchmark-release.yml"
+)
 MONOTONIC_TIMESTAMP_TOLERANCE_SECONDS = 1e-6
 PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = (
     Path(__file__).resolve().parents[2]
@@ -112,6 +200,7 @@ MAX_ATTESTATION_BYTES = 16 * 1024 * 1024
 MAX_OBSERVATIONS_BYTES = 256 * 1024 * 1024
 MAX_WORKER_EXECUTION_ARTIFACT_BYTES = 2 * 1024 * 1024
 MAX_GEOMETRY_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_CANONICAL_CAMERAS_BYTES = 16 * 1024 * 1024
 MAX_WORKER_INVOCATIONS_PER_STAGE = 4_096
 MAX_EXTERNAL_CPU_FRACTION = 0.10
 MAX_UNATTRIBUTED_CHILD_CPU_FRACTION = 0.02
@@ -321,8 +410,7 @@ LPIPS_SQUEEZENET_CALIBRATION_SHA256 = (
     "sha256:4a5350f23600cb79923ce65bb07cbf57dca461329894153e05a1346bd531cf76"
 )
 LPIPS_CALIBRATION_HEAD_KEYS = frozenset(
-    f"lin{index}.model.1.weight"
-    for index in range(7)
+    f"lin{index}.model.1.weight" for index in range(7)
 )
 RENDER_SCORING_PACKAGE_VERSIONS = {
     "lpips": "0.1.4",
@@ -368,6 +456,384 @@ class EvidenceError(ValueError):
     """Raw evidence is incomplete, inconsistent, or unsafe."""
 
 
+POSE_ALIGNMENT_NUMPY_VERSION = RENDER_SCORING_PACKAGE_VERSIONS["numpy"]
+
+
+class PoseAlignmentError(EvidenceError):
+    """Name-bound camera poses cannot produce trustworthy Sim(3) evidence."""
+
+    def __init__(self, reason: str, detail: str | None = None):
+        self.reason = reason
+        message = reason if detail is None else f"{reason}: {detail}"
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class NameBoundCameraPose:
+    image_name: str
+    center_xyz: tuple[float, float, float]
+    rotation_cw: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]
+
+
+@dataclass(frozen=True)
+class Sim3PoseDeviation:
+    camera_center_p95_scene_radius_fraction: float
+    rotation_p95_degrees: float
+
+
+def _pose_number_vector(
+    value: Any,
+    *,
+    count: int,
+    label: str,
+) -> tuple[float, ...]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != count
+        or any(
+            isinstance(component, bool)
+            or not isinstance(component, (int, float))
+            or not math.isfinite(float(component))
+            for component in value
+        )
+    ):
+        raise PoseAlignmentError(
+            "pose_artifact_invalid",
+            f"{label} must contain {count} finite numbers",
+        )
+    return tuple(float(component) for component in value)
+
+
+def _pose_quaternion_rotation(
+    value: Any,
+    *,
+    label: str,
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    quaternion = _pose_number_vector(value, count=4, label=label)
+    norm = math.sqrt(sum(component * component for component in quaternion))
+    if not math.isfinite(norm) or abs(norm - 1.0) > 1e-6:
+        raise PoseAlignmentError(
+            "pose_artifact_invalid",
+            f"{label} must be a unit quaternion in wxyz order",
+        )
+    w, x, y, z = (component / norm for component in quaternion)
+    return (
+        (
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ),
+        (
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ),
+        (
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ),
+    )
+
+
+def _pose_rotation_matrix(
+    value: Any,
+    *,
+    label: str,
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise PoseAlignmentError(
+            "pose_artifact_invalid", f"{label} must be a 3 by 3 matrix"
+        )
+    rows = tuple(
+        _pose_number_vector(row, count=3, label=f"{label}[{index}]")
+        for index, row in enumerate(value)
+    )
+    for first in range(3):
+        for second in range(3):
+            dot = sum(rows[row][first] * rows[row][second] for row in range(3))
+            expected = 1.0 if first == second else 0.0
+            if abs(dot - expected) > 1e-6:
+                raise PoseAlignmentError(
+                    "pose_artifact_invalid",
+                    f"{label} must be an orthonormal rotation",
+                )
+    determinant = (
+        rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
+        - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
+        + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0])
+    )
+    if abs(determinant - 1.0) > 1e-6:
+        raise PoseAlignmentError(
+            "pose_artifact_invalid", f"{label} must have determinant +1"
+        )
+    return rows
+
+
+def name_bound_w2c_poses(
+    records: Iterable[Mapping[str, Any]],
+) -> dict[str, NameBoundCameraPose]:
+    """Validate w2c pose records and bind each pose to its image name."""
+    if isinstance(records, (str, bytes, Mapping)):
+        raise PoseAlignmentError(
+            "pose_artifact_invalid", "pose records must be an ordered collection"
+        )
+    result: dict[str, NameBoundCameraPose] = {}
+    try:
+        iterator = iter(records)
+    except TypeError as error:
+        raise PoseAlignmentError(
+            "pose_artifact_invalid", "pose records must be an ordered collection"
+        ) from error
+    for index, raw in enumerate(iterator):
+        if not isinstance(raw, Mapping):
+            raise PoseAlignmentError(
+                "pose_artifact_invalid", f"pose record {index} must be an object"
+            )
+        expected = {"image_name", "w2c_quaternion_wxyz"}
+        coordinate_fields = {"translation_xyz", "center_xyz"} & set(raw)
+        if len(coordinate_fields) != 1 or set(raw) != expected | coordinate_fields:
+            raise PoseAlignmentError(
+                "pose_artifact_invalid",
+                "pose records require exactly one of translation_xyz or center_xyz",
+            )
+        image_name = raw["image_name"]
+        if not isinstance(image_name, str) or not image_name:
+            raise PoseAlignmentError(
+                "pose_artifact_invalid", "pose image names must be nonempty strings"
+            )
+        if image_name in result:
+            raise PoseAlignmentError(
+                "pose_artifact_invalid", "pose names must be unique"
+            )
+        rotation = _pose_quaternion_rotation(
+            raw["w2c_quaternion_wxyz"],
+            label=f"pose record {image_name}.w2c_quaternion_wxyz",
+        )
+        if "center_xyz" in raw:
+            center = _pose_number_vector(
+                raw["center_xyz"], count=3, label=f"pose record {image_name}.center_xyz"
+            )
+        else:
+            translation = _pose_number_vector(
+                raw["translation_xyz"],
+                count=3,
+                label=f"pose record {image_name}.translation_xyz",
+            )
+            center = tuple(
+                -sum(rotation[row][column] * translation[row] for row in range(3))
+                for column in range(3)
+            )
+        result[image_name] = NameBoundCameraPose(image_name, center, rotation)
+    if not result:
+        raise PoseAlignmentError(
+            "pose_artifact_invalid", "pose records must not be empty"
+        )
+    return result
+
+
+def mapper_cadence_name_bound_poses(
+    envelope: Mapping[str, Any],
+) -> dict[str, NameBoundCameraPose]:
+    """Bind the mapper-cadence parallel pose arrays before comparison."""
+    if not isinstance(envelope, Mapping):
+        raise PoseAlignmentError(
+            "pose_artifact_invalid", "mapper cadence envelope must be an object"
+        )
+    names = envelope.get("registered_image_names")
+    poses = envelope.get("camera_poses_wxyz_xyz")
+    if (
+        not isinstance(names, list)
+        or not isinstance(poses, list)
+        or not names
+        or len(names) != len(poses)
+    ):
+        raise PoseAlignmentError(
+            "pose_artifact_invalid",
+            "mapper cadence pose arrays must have the same nonzero length",
+        )
+    records = []
+    for index, (name, pose) in enumerate(zip(names, poses, strict=True)):
+        if not isinstance(pose, (list, tuple)) or len(pose) != 7:
+            raise PoseAlignmentError(
+                "pose_artifact_invalid",
+                f"mapper cadence pose {index} must contain seven values",
+            )
+        records.append(
+            {
+                "image_name": name,
+                "w2c_quaternion_wxyz": pose[:4],
+                "translation_xyz": pose[4:],
+            }
+        )
+    return name_bound_w2c_poses(records)
+
+
+def _coerce_name_bound_pose_mapping(
+    value: Mapping[str, Any],
+    *,
+    label: str,
+) -> dict[str, NameBoundCameraPose]:
+    if not isinstance(value, Mapping) or not value:
+        raise PoseAlignmentError(
+            "pose_artifact_invalid", f"{label} must be a nonempty name-bound mapping"
+        )
+    if any(not isinstance(name, str) or not name for name in value):
+        raise PoseAlignmentError(
+            "pose_artifact_invalid", f"{label} names must be nonempty strings"
+        )
+    result: dict[str, NameBoundCameraPose] = {}
+    for name in sorted(value):
+        raw = value[name]
+        if isinstance(raw, NameBoundCameraPose):
+            if raw.image_name != name:
+                raise PoseAlignmentError(
+                    "pose_artifact_invalid",
+                    f"{label} pose name does not match its mapping key",
+                )
+            center = _pose_number_vector(
+                raw.center_xyz, count=3, label=f"{label}.{name}.center_xyz"
+            )
+            rotation = _pose_rotation_matrix(
+                raw.rotation_cw, label=f"{label}.{name}.rotation_cw"
+            )
+            result[name] = NameBoundCameraPose(name, center, rotation)
+            continue
+        if not isinstance(raw, Mapping):
+            raise PoseAlignmentError(
+                "pose_artifact_invalid", f"{label}.{name} must be a pose object"
+            )
+        if set(raw) == {"center", "rotation_cw"}:
+            center = _pose_number_vector(
+                raw["center"], count=3, label=f"{label}.{name}.center"
+            )
+            rotation = _pose_rotation_matrix(
+                raw["rotation_cw"], label=f"{label}.{name}.rotation_cw"
+            )
+            result[name] = NameBoundCameraPose(name, center, rotation)
+            continue
+        record = dict(raw)
+        supplied_name = record.setdefault("image_name", name)
+        if supplied_name != name:
+            raise PoseAlignmentError(
+                "pose_artifact_invalid",
+                f"{label} pose name does not match its mapping key",
+            )
+        result[name] = name_bound_w2c_poses([record])[name]
+    return result
+
+
+def _pose_alignment_numpy() -> Any:
+    try:
+        import importlib.metadata
+        import numpy
+
+        version = importlib.metadata.version("numpy")
+    except (ImportError, importlib.metadata.PackageNotFoundError) as error:
+        raise PoseAlignmentError("pose_alignment_runtime_unavailable") from error
+    if version != POSE_ALIGNMENT_NUMPY_VERSION:
+        raise PoseAlignmentError("pose_alignment_runtime_unavailable")
+    return numpy
+
+
+def sim3_pose_deviation(
+    reference_poses: Mapping[str, Any],
+    candidate_poses: Mapping[str, Any],
+) -> Sim3PoseDeviation:
+    """Compare name-bound w2c poses after one proper Umeyama Sim(3)."""
+    reference = _coerce_name_bound_pose_mapping(
+        reference_poses, label="reference poses"
+    )
+    candidate = _coerce_name_bound_pose_mapping(
+        candidate_poses, label="candidate poses"
+    )
+    common = sorted(set(reference) & set(candidate))
+    if len(common) < 3:
+        raise PoseAlignmentError("pose_alignment_unavailable")
+    np = _pose_alignment_numpy()
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            source = np.asarray(
+                [candidate[name].center_xyz for name in common], dtype=float
+            )
+            target = np.asarray(
+                [reference[name].center_xyz for name in common], dtype=float
+            )
+            source_mean = source.mean(axis=0)
+            target_mean = target.mean(axis=0)
+            source_centered = source - source_mean
+            target_centered = target - target_mean
+            source_variance = float(
+                np.sum(source_centered * source_centered) / len(common)
+            )
+            target_variance = float(
+                np.sum(target_centered * target_centered) / len(common)
+            )
+            source_rank = int(np.linalg.matrix_rank(source_centered))
+            target_rank = int(np.linalg.matrix_rank(target_centered))
+    except (FloatingPointError, np.linalg.LinAlgError) as error:
+        raise PoseAlignmentError("pose_alignment_degenerate") from error
+    if (
+        not math.isfinite(source_variance)
+        or not math.isfinite(target_variance)
+        or min(source_variance, target_variance) <= 1e-12
+        or source_rank < 2
+        or target_rank < 2
+    ):
+        raise PoseAlignmentError("pose_alignment_degenerate")
+    covariance = target_centered.T @ source_centered / len(common)
+    try:
+        left, singular_values, right_transpose = np.linalg.svd(covariance)
+    except np.linalg.LinAlgError as error:
+        raise PoseAlignmentError("pose_alignment_degenerate") from error
+    correction = np.eye(3)
+    if float(np.linalg.det(left @ right_transpose)) < 0.0:
+        correction[-1, -1] = -1.0
+    alignment_rotation = left @ correction @ right_transpose
+    determinant = float(np.linalg.det(alignment_rotation))
+    if not math.isfinite(determinant) or abs(determinant - 1.0) > 1e-8:
+        raise PoseAlignmentError("pose_alignment_degenerate")
+    alignment_scale = float(
+        np.sum(singular_values * np.diag(correction)) / source_variance
+    )
+    if not math.isfinite(alignment_scale) or alignment_scale <= 0.0:
+        raise PoseAlignmentError("pose_alignment_degenerate")
+    translation = target_mean - alignment_scale * (alignment_rotation @ source_mean)
+    aligned = (alignment_scale * (alignment_rotation @ source.T)).T + translation
+    deviations = np.linalg.norm(aligned - target, axis=1)
+    reference_center = np.median(target, axis=0)
+    scene_radius = float(
+        np.percentile(np.linalg.norm(target - reference_center, axis=1), 95)
+    )
+    if not math.isfinite(scene_radius) or scene_radius <= 1e-12:
+        raise PoseAlignmentError("pose_alignment_degenerate")
+    center_p95 = float(np.percentile(deviations, 95) / scene_radius)
+    rotation_errors: list[float] = []
+    for name in common:
+        reference_rotation = np.asarray(reference[name].rotation_cw, dtype=float)
+        candidate_rotation = np.asarray(candidate[name].rotation_cw, dtype=float)
+        predicted_rotation = candidate_rotation @ alignment_rotation.T
+        relative_rotation = reference_rotation @ predicted_rotation.T
+        cosine = float(np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0))
+        rotation_errors.append(math.degrees(math.acos(cosine)))
+    rotation_p95 = float(np.percentile(np.asarray(rotation_errors), 95))
+    if not math.isfinite(center_p95) or not math.isfinite(rotation_p95):
+        raise PoseAlignmentError("pose_alignment_degenerate")
+    return Sim3PoseDeviation(center_p95, rotation_p95)
+
+
 def _decode_json_text(value: str, label: str) -> Any:
     def reject_constant(constant: str) -> None:
         raise EvidenceError(f"{label} contains {constant}")
@@ -402,6 +868,44 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 def sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def colmap_runtime_closure_digest(components: Iterable[tuple[str, str]]) -> str:
+    hasher = hashlib.sha256()
+
+    def update(field: str) -> None:
+        encoded = field.encode("utf-8")
+        hasher.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+        hasher.update(encoded)
+
+    update("easysplat-colmap-runtime-closure-v1")
+    for path, digest in components:
+        update(path)
+        update(digest)
+    return hasher.hexdigest()
+
+
+def geometry_model_closure_digest(model_hashes: Mapping[str, str]) -> str:
+    """Mirror GeometryArtifactStore.modelClosureDigest for canonical text models."""
+    expected_names = ("cameras.txt", "images.txt", "points3D.txt")
+    if set(model_hashes) != set(expected_names) or any(
+        not isinstance(model_hashes[name], str)
+        or re.fullmatch(r"[0-9a-f]{64}", model_hashes[name]) is None
+        for name in expected_names
+    ):
+        raise EvidenceError("geometry model closure hashes are invalid")
+    hasher = hashlib.sha256()
+
+    def update(field: str) -> None:
+        encoded = field.encode("utf-8")
+        hasher.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
+        hasher.update(encoded)
+
+    update("easysplat-model-closure-v1")
+    for name in sorted(expected_names):
+        update(name)
+        update(model_hashes[name])
+    return hasher.hexdigest()
 
 
 def render_camera_digest(value: Any) -> str:
@@ -486,6 +990,10 @@ def _digest(value: Any, label: str) -> str:
     return value
 
 
+def _valid_exact_recovery_reason(value: Any) -> bool:
+    return isinstance(value, str) and value in EXACT_RECOVERY_REASONS
+
+
 def validate_runner_identity(value: Any, lane: str) -> dict[str, Any]:
     if lane == RENDERING_DRIVER_IDENTITY:
         return validate_rendering_driver_identity(value)
@@ -549,7 +1057,10 @@ def validate_runner_identities(value: Any) -> dict[str, dict[str, Any]]:
     identities = _mapping(value, "measurement runner identities")
     required = RELEASE_LANES | {RENDERING_DRIVER_IDENTITY}
     _exact_keys(identities, required, "measurement runner identities")
-    return {name: validate_runner_identity(identities[name], name) for name in sorted(required)}
+    return {
+        name: validate_runner_identity(identities[name], name)
+        for name in sorted(required)
+    }
 
 
 def _finite_numbers(
@@ -577,7 +1088,11 @@ def _finite_numbers(
 
 
 def _booleans(value: Any, label: str) -> list[bool]:
-    if not isinstance(value, list) or not value or any(not isinstance(item, bool) for item in value):
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, bool) for item in value)
+    ):
         raise EvidenceError(f"{label} must be a nonempty boolean array")
     return list(value)
 
@@ -619,7 +1134,9 @@ def _residual_samples(
             or not 0 <= view_index < len(registered_views)
             or not registered_views[view_index]
         ):
-            raise EvidenceError("residual view_index must identify a candidate-registered view")
+            raise EvidenceError(
+                "residual view_index must identify a candidate-registered view"
+            )
         if type(point_id) is not int or point_id < 0:
             raise EvidenceError("residual point_id must be a nonnegative integer")
         if (
@@ -631,14 +1148,20 @@ def _residual_samples(
             raise EvidenceError("residual_pixels values must be finite and nonnegative")
         observation = (view_index, point_id)
         if observation in seen_observations:
-            raise EvidenceError("residual observations must be unique view and point pairs")
+            raise EvidenceError(
+                "residual observations must be unique view and point pairs"
+            )
         seen_observations.add(observation)
         covered_views.add(view_index)
         point_ids.add(point_id)
         residuals.append(float(residual))
-    expected_views = {index for index, registered in enumerate(registered_views) if registered}
+    expected_views = {
+        index for index, registered in enumerate(registered_views) if registered
+    }
     if covered_views != expected_views:
-        raise EvidenceError("residual observations must cover every candidate-registered view")
+        raise EvidenceError(
+            "residual observations must cover every candidate-registered view"
+        )
     return residuals, len(point_ids)
 
 
@@ -646,7 +1169,9 @@ def _pose_samples(
     value: Any,
     candidate_registered: list[bool],
     colmap_registered: list[bool],
-) -> tuple[list[float], list[float], list[float], list[float], list[float], list[float]]:
+) -> tuple[
+    list[float], list[float], list[float], list[float], list[float], list[float]
+]:
     pose = _mapping(value, "observations.pose")
     _exact_keys(pose, {"absolute", "relative"}, "observations.pose")
     common_views = [
@@ -657,7 +1182,9 @@ def _pose_samples(
         if candidate and colmap
     ]
     if len(common_views) < 2:
-        raise EvidenceError("pose evidence requires at least two commonly registered views")
+        raise EvidenceError(
+            "pose evidence requires at least two commonly registered views"
+        )
     absolute = pose["absolute"]
     if not isinstance(absolute, list) or len(absolute) != len(common_views):
         raise EvidenceError("pose.absolute must cover every commonly registered view")
@@ -665,9 +1192,15 @@ def _pose_samples(
     colmap_ate: list[float] = []
     for index, raw in enumerate(absolute):
         record = _mapping(raw, f"pose.absolute[{index}]")
-        _exact_keys(record, {"view_index", "candidate_ate", "colmap_ate"}, f"pose.absolute[{index}]")
+        _exact_keys(
+            record,
+            {"view_index", "candidate_ate", "colmap_ate"},
+            f"pose.absolute[{index}]",
+        )
         if record["view_index"] != common_views[index]:
-            raise EvidenceError("pose.absolute view indices must match the common registration set")
+            raise EvidenceError(
+                "pose.absolute view indices must match the common registration set"
+            )
         for field, destination in (
             ("candidate_ate", candidate_ate),
             ("colmap_ate", colmap_ate),
@@ -679,7 +1212,9 @@ def _pose_samples(
                 or not math.isfinite(number)
                 or number < 0
             ):
-                raise EvidenceError(f"pose.absolute[{index}].{field} must be finite and nonnegative")
+                raise EvidenceError(
+                    f"pose.absolute[{index}].{field} must be finite and nonnegative"
+                )
             destination.append(float(number))
 
     expected_pairs = list(zip(common_views, common_views[1:]))
@@ -707,8 +1242,12 @@ def _pose_samples(
     for index, raw in enumerate(relative):
         record = _mapping(raw, f"pose.relative[{index}]")
         _exact_keys(record, fields, f"pose.relative[{index}]")
-        if (record["from_view_index"], record["to_view_index"]) != expected_pairs[index]:
-            raise EvidenceError("pose.relative pairs must match adjacent common registered views")
+        if (record["from_view_index"], record["to_view_index"]) != expected_pairs[
+            index
+        ]:
+            raise EvidenceError(
+                "pose.relative pairs must match adjacent common registered views"
+            )
         for field, destination in destinations:
             number = record[field]
             if (
@@ -717,7 +1256,9 @@ def _pose_samples(
                 or not math.isfinite(number)
                 or number < 0
             ):
-                raise EvidenceError(f"pose.relative[{index}].{field} must be finite and nonnegative")
+                raise EvidenceError(
+                    f"pose.relative[{index}].{field} must be finite and nonnegative"
+                )
             destination.append(float(number))
     return (
         candidate_ate,
@@ -747,7 +1288,9 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
             result[name] = unavailable()
         elif name in PIPELINE_INTEGER_METRICS:
             if type(item) is not int or item < 0:
-                raise EvidenceError(f"observations.pipeline_metrics.{name} must be null or a nonnegative integer")
+                raise EvidenceError(
+                    f"observations.pipeline_metrics.{name} must be null or a nonnegative integer"
+                )
             result[name] = measured(item)
         elif name in PIPELINE_NUMBER_METRICS:
             if (
@@ -756,7 +1299,9 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
                 or not math.isfinite(item)
                 or item < 0
             ):
-                raise EvidenceError(f"observations.pipeline_metrics.{name} must be null or finite and nonnegative")
+                raise EvidenceError(
+                    f"observations.pipeline_metrics.{name} must be null or finite and nonnegative"
+                )
             result[name] = measured(float(item))
         elif name in PIPELINE_BOOLEAN_METRICS:
             if type(item) is not bool:
@@ -765,7 +1310,9 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
                 )
             result[name] = measured(item)
         elif item not in PIPELINE_ENUM_METRICS[name]:
-            raise EvidenceError(f"observations.pipeline_metrics.{name} has an unsupported value")
+            raise EvidenceError(
+                f"observations.pipeline_metrics.{name} has an unsupported value"
+            )
         else:
             result[name] = measured(item)
     raster_values = {
@@ -781,7 +1328,9 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
     }
     measured_raster = {name for name, item in raster_values.items() if item is not None}
     if measured_raster and len(measured_raster) != len(raster_values):
-        raise EvidenceError("raster recovery pipeline metrics must be measured together")
+        raise EvidenceError(
+            "raster recovery pipeline metrics must be measured together"
+        )
     if measured_raster:
         fallback_count = raster_values["raster_fallback_count"]
         exact_elapsed = raster_values["raster_exact_fallback_elapsed_seconds"]
@@ -790,12 +1339,20 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
         replay_elapsed = raster_values["raster_replay_elapsed_seconds"]
         peak_capacity = raster_values["raster_peak_exact_intersection_capacity"]
         if peak_capacity > (1 << 32) - 1:
-            raise EvidenceError("raster peak exact capacity exceeds the native counter range")
+            raise EvidenceError(
+                "raster peak exact capacity exceeds the native counter range"
+            )
         if growth_count > fallback_count:
             raise EvidenceError("raster buffer growth count exceeds fallback count")
         if fallback_count == 0 and any(
             value != 0
-            for value in (exact_elapsed, growth_count, bytes_added, replay_elapsed, peak_capacity)
+            for value in (
+                exact_elapsed,
+                growth_count,
+                bytes_added,
+                replay_elapsed,
+                peak_capacity,
+            )
         ):
             raise EvidenceError("zero raster fallbacks require zero recovery metrics")
         if fallback_count > 0 and (
@@ -807,7 +1364,9 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
         ):
             raise EvidenceError("raster fallback recovery evidence is incomplete")
         if growth_count == 0 and (bytes_added != 0 or peak_capacity != 0):
-            raise EvidenceError("zero raster buffer growth requires zero allocation evidence")
+            raise EvidenceError(
+                "zero raster buffer growth requires zero allocation evidence"
+            )
         if growth_count > 0 and (bytes_added == 0 or peak_capacity <= 2_048):
             raise EvidenceError("raster buffer growth evidence is incomplete")
         maximum_tile_intersections = raw["maximum_tile_intersections"]
@@ -817,7 +1376,10 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
                 raise EvidenceError(
                     "raster fallback evidence contradicts the measured overflow threshold"
                 )
-            if crossed_overflow_threshold and peak_capacity < maximum_tile_intersections:
+            if (
+                crossed_overflow_threshold
+                and peak_capacity < maximum_tile_intersections
+            ):
                 raise EvidenceError(
                     "raster peak exact capacity is below the measured tile intersections"
                 )
@@ -865,15 +1427,15 @@ def _validate_orientation_label(path: Path) -> None:
             or not isinstance(value, (int, float))
             or not math.isfinite(value)
         ):
-            raise EvidenceError(
-                f"orientation label physical_up.{name} must be finite"
-            )
+            raise EvidenceError(f"orientation label physical_up.{name} must be finite")
         components.append(float(value))
     if math.sqrt(sum(value * value for value in components)) <= 1e-12:
         raise EvidenceError("orientation label physical_up must be nonzero")
 
 
-def validate_orientation_metrics(value: Any, label: str = "orientation metrics") -> dict[str, Any]:
+def validate_orientation_metrics(
+    value: Any, label: str = "orientation metrics"
+) -> dict[str, Any]:
     raw = _mapping(value, label)
     _exact_keys(raw, ORIENTATION_EVIDENCE_FIELDS, label)
     status = raw["orientation_status"]
@@ -889,10 +1451,13 @@ def validate_orientation_metrics(value: Any, label: str = "orientation metrics")
         "alignment_p90_residual_degrees",
     ):
         result[name] = _nonnegative_number(raw[name], f"{label}.{name}")
-    if result["alignment_p90_residual_degrees"] < result[
-        "alignment_median_residual_degrees"
-    ]:
-        raise EvidenceError(f"{label} alignment p90 residual cannot be below its median")
+    if (
+        result["alignment_p90_residual_degrees"]
+        < result["alignment_median_residual_degrees"]
+    ):
+        raise EvidenceError(
+            f"{label} alignment p90 residual cannot be below its median"
+        )
 
     quaternion = raw["candidate_source_to_ground_truth_wxyz"]
     if (
@@ -907,14 +1472,24 @@ def validate_orientation_metrics(value: Any, label: str = "orientation metrics")
     ):
         raise EvidenceError(f"{label}.candidate_source_to_ground_truth_wxyz is invalid")
     normalized_quaternion = [float(component) for component in quaternion]
-    if abs(math.sqrt(sum(component * component for component in normalized_quaternion)) - 1) > 1e-6:
-        raise EvidenceError(f"{label} source-to-ground-truth quaternion must be normalized")
+    if (
+        abs(
+            math.sqrt(sum(component * component for component in normalized_quaternion))
+            - 1
+        )
+        > 1e-6
+    ):
+        raise EvidenceError(
+            f"{label} source-to-ground-truth quaternion must be normalized"
+        )
     first_nonzero = next(
         (component for component in normalized_quaternion if component != 0),
         0.0,
     )
     if first_nonzero < 0:
-        raise EvidenceError(f"{label} source-to-ground-truth quaternion must be sign-canonical")
+        raise EvidenceError(
+            f"{label} source-to-ground-truth quaternion must be sign-canonical"
+        )
     result["candidate_source_to_ground_truth_wxyz"] = normalized_quaternion
 
     physical_error = raw["orientation_physical_up_error_degrees"]
@@ -930,15 +1505,26 @@ def validate_orientation_metrics(value: Any, label: str = "orientation metrics")
     if sign_correct is not None and type(sign_correct) is not bool:
         raise EvidenceError(f"{label}.orientation_sign_correct must be null or boolean")
     if status == "verified":
-        if result["orientation_physical_up_error_degrees"] is None or sign_correct is None:
-            raise EvidenceError(f"{label} verified orientation lacks directed up evidence")
+        if (
+            result["orientation_physical_up_error_degrees"] is None
+            or sign_correct is None
+        ):
+            raise EvidenceError(
+                f"{label} verified orientation lacks directed up evidence"
+            )
     elif status == "axis_aligned_sign_unverified":
-        if result["orientation_physical_up_error_degrees"] is None or sign_correct is not None:
+        if (
+            result["orientation_physical_up_error_degrees"] is None
+            or sign_correct is not None
+        ):
             raise EvidenceError(
                 f"{label} axis_aligned_sign_unverified orientation requires physical-up "
                 "error without a sign claim"
             )
-    elif result["orientation_physical_up_error_degrees"] is not None or sign_correct is not None:
+    elif (
+        result["orientation_physical_up_error_degrees"] is not None
+        or sign_correct is not None
+    ):
         raise EvidenceError(f"{label} unresolved orientation cannot claim physical up")
     angle_fields = (
         "alignment_median_residual_degrees",
@@ -956,7 +1542,9 @@ def _paired_losses(
     expected_holdout_indices: list[int],
     *,
     include_paired_baseline: bool,
-) -> tuple[list[float], list[float], list[float], list[float], list[float], list[float]]:
+) -> tuple[
+    list[float], list[float], list[float], list[float], list[float], list[float]
+]:
     if not isinstance(records, list) or not records:
         raise EvidenceError(f"{label} must be a nonempty array")
     psnr: list[float] = []
@@ -986,23 +1574,39 @@ def _paired_losses(
         values = {}
         for field in fields - {"holdout_index"}:
             number = record[field]
-            if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, (int, float))
+                or not math.isfinite(number)
+            ):
                 raise EvidenceError(f"{label}[{index}].{field} must be finite")
             values[field] = float(number)
         for field, number in values.items():
             if field.endswith("_psnr") and number < 0:
-                raise EvidenceError(f"{label}[{index}].{field} is outside the rendering domain")
+                raise EvidenceError(
+                    f"{label}[{index}].{field} is outside the rendering domain"
+                )
             if field.endswith("_ssim") and not 0 <= number <= 1:
-                raise EvidenceError(f"{label}[{index}].{field} is outside the rendering domain")
+                raise EvidenceError(
+                    f"{label}[{index}].{field} is outside the rendering domain"
+                )
             if field.endswith("_lpips") and number < 0:
-                raise EvidenceError(f"{label}[{index}].{field} is outside the rendering domain")
+                raise EvidenceError(
+                    f"{label}[{index}].{field} is outside the rendering domain"
+                )
         psnr.append(max(0.0, values["reference_psnr"] - values["candidate_psnr"]))
         ssim.append(max(0.0, values["reference_ssim"] - values["candidate_ssim"]))
         lpips.append(max(0.0, values["candidate_lpips"] - values["reference_lpips"]))
         if include_paired_baseline:
-            paired_psnr.append(max(0.0, values["baseline_psnr"] - values["candidate_psnr"]))
-            paired_ssim.append(max(0.0, values["baseline_ssim"] - values["candidate_ssim"]))
-            paired_lpips.append(max(0.0, values["candidate_lpips"] - values["baseline_lpips"]))
+            paired_psnr.append(
+                max(0.0, values["baseline_psnr"] - values["candidate_psnr"])
+            )
+            paired_ssim.append(
+                max(0.0, values["baseline_ssim"] - values["candidate_ssim"])
+            )
+            paired_lpips.append(
+                max(0.0, values["candidate_lpips"] - values["baseline_lpips"])
+            )
     return psnr, ssim, lpips, paired_psnr, paired_ssim, paired_lpips
 
 
@@ -1026,6 +1630,1760 @@ def _nonnegative_number(value: Any, label: str) -> float:
     ):
         raise EvidenceError(f"{label} must be nonnegative and finite")
     return float(value)
+
+
+def _opaque_digest(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not OPAQUE_SHA256_PATTERN.fullmatch(value):
+        raise EvidenceError(f"{label} must be an opaque SHA-256 digest")
+    return value
+
+
+def _photo_pair_graph_digest(edges: list[str]) -> str:
+    payload = canonical_json_bytes(edges)
+    return (
+        "opaque-sha256:"
+        + hashlib.sha256(b"easysplat-photo-pair-graph-v1\0" + payload).hexdigest()
+    )
+
+
+def photo_permutation_release_seed(index: int) -> int:
+    """Return the immutable public seed for one formal release permutation."""
+    if (
+        type(index) is not int
+        or not 1 <= index <= PHOTO_PERMUTATION_FORMAL_SHUFFLE_COUNT
+    ):
+        raise EvidenceError("formal photo permutation index is invalid")
+    digest = hashlib.sha256(
+        b"easysplat-photo-permutation-release-seed-v1\0" + struct.pack(">I", index)
+    ).digest()
+    derived = int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)
+    reviewed = PHOTO_PERMUTATION_FORMAL_SEEDS[index - 1]
+    if derived != reviewed:
+        raise AssertionError("reviewed photo permutation seed table changed")
+    return reviewed
+
+
+def _photo_content_set_digest(content_ids: list[str]) -> str:
+    return (
+        "opaque-sha256:"
+        + hashlib.sha256(
+            b"easysplat-photo-content-set-v1\0" + canonical_json_bytes(content_ids)
+        ).hexdigest()
+    )
+
+
+def _photo_pair_edge_id(content_a: str, content_b: str) -> str:
+    return (
+        "opaque-sha256:"
+        + hashlib.sha256(
+            b"easysplat-photo-pair-edge-v1\0"
+            + canonical_json_bytes([content_a, content_b])
+        ).hexdigest()
+    )
+
+
+def _photo_permutation_request_contract(
+    request: Mapping[str, Any],
+) -> tuple[int, int, str]:
+    if request.get("input_kind") != "photos":
+        raise EvidenceError("photo permutation evidence requires photo-only input")
+    configuration = _mapping(
+        request.get("candidate_run_configuration"),
+        "photo permutation request candidate configuration",
+    )
+    if (
+        configuration.get("input_topology") != "unordered"
+        or configuration.get("capture_path") != "automatic"
+        or configuration.get("photo_selection", "automatic") != "automatic"
+    ):
+        raise EvidenceError(
+            "photo permutation evidence requires unordered automatic photo selection"
+        )
+    binding = _mapping(request.get("binding"), "photo permutation request binding")
+    scale = binding.get("scale")
+    seed = configuration.get("run_seed")
+    if type(scale) is not int or scale < 2:
+        raise EvidenceError("photo permutation request scale must be at least 2")
+    if type(seed) is not int or seed < 0:
+        raise EvidenceError("photo permutation request seed must be nonnegative")
+    return scale, seed, sha256_bytes(canonical_json_bytes(configuration))
+
+
+def photo_permutation_request_binding_sha256(request: Mapping[str, Any]) -> str:
+    """Bind every identity-bearing request field without exposing source media."""
+    value = {
+        field: request.get(field)
+        for field in (
+            "schema_version",
+            "binding",
+            "baseline_run_configuration",
+            "candidate_run_configuration",
+            "category",
+            "capture_traits",
+            "holdout_indices",
+            "reference_artifacts",
+            "timing_basis",
+            "expected_outcome",
+            "input_kind",
+            "video_source_count",
+            "gate_scopes",
+            "rendering_driver_identity",
+        )
+    }
+    return sha256_bytes(canonical_json_bytes(value))
+
+
+def photo_permutation_producer_implementation_sha256() -> str:
+    """Return the exact checkout closure used by the photo evidence producer."""
+    repository_root = Path(__file__).resolve().parents[2]
+    records: list[dict[str, Any]] = []
+    for label, relative_path in (
+        ("photo_permutation_producer.py", PHOTO_PERMUTATION_PRODUCER_RELATIVE_PATH),
+        ("evidence_protocol.py", PRODUCER_RELATIVE_PATH),
+    ):
+        path = repository_root / relative_path
+        try:
+            metadata = path.lstat()
+            if (
+                path.is_symlink()
+                or not stat.S_ISREG(metadata.st_mode)
+                or not 0 < metadata.st_size <= 64 * 1024 * 1024
+            ):
+                raise EvidenceError("photo permutation producer closure is unsafe")
+            contents = path.read_bytes()
+            after = path.lstat()
+        except OSError as error:
+            raise EvidenceError(
+                "photo permutation producer closure is unavailable"
+            ) from error
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or len(contents) != metadata.st_size:
+            raise EvidenceError(
+                "photo permutation producer closure changed during read"
+            )
+        records.append(
+            {
+                "label": label,
+                "bytes": len(contents),
+                "sha256": sha256_bytes(contents),
+            }
+        )
+    return sha256_bytes(canonical_json_bytes(records))
+
+
+def _validate_photo_permutation_variant(
+    value: Any,
+    *,
+    position: int,
+    expected_scale: int,
+    expected_seed: int,
+    expected_plan_digest: str,
+) -> dict[str, Any]:
+    label = f"photo permutation variants[{position}]"
+    record = _mapping(value, label)
+    _exact_keys(
+        record,
+        {
+            "group_id",
+            "variant_id",
+            "permutation",
+            "order_commitment",
+            "content_set_attestation",
+            "canonical_observation_attestation",
+            "source_kind",
+            "selected_content_ids",
+            "registered_content_ids",
+            "selected_content_set_sha256",
+            "registered_content_set_sha256",
+            "normalized_pair_graph_sha256",
+            "normalized_pair_edges",
+            "requested_plan_sha256",
+            "scale",
+            "run_seed",
+            "pairing_policy",
+            "accepted_attempt",
+            "scheduled_pair_count",
+            "scheduled_pair_graph_sha256",
+            "attempted_pair_count",
+            "attempted_pair_graph_sha256",
+            "raw_matched_pair_count",
+            "raw_matched_pair_graph_sha256",
+            "spatially_verified_pair_count",
+            "retrieval_worker_executed",
+            "pair_counts",
+            "registered_views",
+            "point_count",
+            "observation_count",
+            "residual_median_pixels",
+            "residual_p90_pixels",
+            "camera_center_p95_scene_radius_fraction",
+            "rotation_p95_degrees",
+        },
+        label,
+    )
+    group_id = _token(record["group_id"], f"{label}.group_id")
+    variant_id = _token(record["variant_id"], f"{label}.variant_id")
+    permutation = _mapping(record["permutation"], f"{label}.permutation")
+    kind = permutation.get("kind")
+    if kind == "canonical":
+        _exact_keys(permutation, {"kind"}, f"{label}.permutation")
+        permutation_index: int | None = None
+        permutation_seed: int | None = None
+    elif kind == "shuffled":
+        _exact_keys(
+            permutation,
+            {"kind", "index", "seed"},
+            f"{label}.permutation",
+        )
+        permutation_index = permutation["index"]
+        permutation_seed = permutation["seed"]
+        if (
+            type(permutation_index) is not int
+            or permutation_index < 1
+            or type(permutation_seed) is not int
+            or permutation_seed < 0
+        ):
+            raise EvidenceError(
+                f"{label}.permutation shuffled index and seed must be nonnegative integers"
+            )
+    else:
+        raise EvidenceError(f"{label}.permutation kind is invalid")
+
+    source_kind = record["source_kind"]
+    if source_kind not in PHOTO_PERMUTATION_SOURCE_KINDS:
+        raise EvidenceError(f"{label}.source_kind is invalid")
+    scale = record["scale"]
+    run_seed = record["run_seed"]
+    if scale != expected_scale or run_seed != expected_seed:
+        raise EvidenceError(
+            "photo permutation variants must share the requested scale and run seed"
+        )
+    if record["requested_plan_sha256"] != expected_plan_digest:
+        raise EvidenceError(
+            "photo permutation variants must share the requested run plan"
+        )
+    _opaque_digest(record["order_commitment"], f"{label}.order_commitment")
+    content_attestation = _opaque_digest(
+        record["content_set_attestation"],
+        f"{label}.content_set_attestation",
+    )
+    canonical_observation_attestation = _opaque_digest(
+        record["canonical_observation_attestation"],
+        f"{label}.canonical_observation_attestation",
+    )
+    selected_ids = record["selected_content_ids"]
+    if (
+        not isinstance(selected_ids, list)
+        or len(selected_ids) != expected_scale
+        or selected_ids != sorted(selected_ids)
+        or len(selected_ids) != len(set(selected_ids))
+    ):
+        raise EvidenceError(
+            f"{label}.selected_content_ids must bind every selected view exactly once"
+        )
+    normalized_selected_ids = [
+        _opaque_digest(content_id, f"{label}.selected_content_ids[{index}]")
+        for index, content_id in enumerate(selected_ids)
+    ]
+    registered_ids = record["registered_content_ids"]
+    if (
+        not isinstance(registered_ids, list)
+        or registered_ids != sorted(registered_ids)
+        or len(registered_ids) != len(set(registered_ids))
+    ):
+        raise EvidenceError(f"{label}.registered_content_ids must be sorted and unique")
+    normalized_registered_ids = [
+        _opaque_digest(content_id, f"{label}.registered_content_ids[{index}]")
+        for index, content_id in enumerate(registered_ids)
+    ]
+    if not set(normalized_registered_ids).issubset(normalized_selected_ids):
+        raise EvidenceError(
+            f"{label}.registered content IDs must be selected content IDs"
+        )
+    selected_digest = _opaque_digest(
+        record["selected_content_set_sha256"],
+        f"{label}.selected_content_set_sha256",
+    )
+    registered_digest = _opaque_digest(
+        record["registered_content_set_sha256"],
+        f"{label}.registered_content_set_sha256",
+    )
+    if selected_digest != _photo_content_set_digest(normalized_selected_ids):
+        raise EvidenceError(
+            f"{label}.selected_content_set_sha256 does not match selected content IDs"
+        )
+    if registered_digest != _photo_content_set_digest(normalized_registered_ids):
+        raise EvidenceError(
+            f"{label}.registered_content_set_sha256 does not match registered content IDs"
+        )
+    pair_graph_digest = _opaque_digest(
+        record["normalized_pair_graph_sha256"],
+        f"{label}.normalized_pair_graph_sha256",
+    )
+    edges = record["normalized_pair_edges"]
+    if not isinstance(edges, list) or not edges:
+        raise EvidenceError(
+            f"{label}.normalized_pair_edges must be a sorted unique nonempty array"
+        )
+    normalized_edges: list[dict[str, str]] = []
+    selected_id_set = set(normalized_selected_ids)
+    for index, raw_edge in enumerate(edges):
+        edge_label = f"{label}.normalized_pair_edges[{index}]"
+        edge = _mapping(raw_edge, edge_label)
+        _exact_keys(edge, {"content_a", "content_b", "edge_id"}, edge_label)
+        content_a = _opaque_digest(edge["content_a"], f"{edge_label}.content_a")
+        content_b = _opaque_digest(edge["content_b"], f"{edge_label}.content_b")
+        edge_id = _opaque_digest(edge["edge_id"], f"{edge_label}.edge_id")
+        if (
+            content_a >= content_b
+            or content_a not in selected_id_set
+            or content_b not in selected_id_set
+        ):
+            raise EvidenceError(
+                f"{edge_label} must reference two ordered selected content IDs"
+            )
+        if edge_id != _photo_pair_edge_id(content_a, content_b):
+            raise EvidenceError(f"{edge_label}.edge_id is not bound to its endpoints")
+        normalized_edges.append(
+            {"content_a": content_a, "content_b": content_b, "edge_id": edge_id}
+        )
+    edge_ids = [edge["edge_id"] for edge in normalized_edges]
+    if edge_ids != sorted(edge_ids) or len(edge_ids) != len(set(edge_ids)):
+        raise EvidenceError(
+            f"{label}.normalized_pair_edges must be sorted and unique by edge_id"
+        )
+    if pair_graph_digest != _photo_pair_graph_digest(edge_ids):
+        raise EvidenceError(
+            f"{label}.normalized_pair_graph_sha256 does not match its opaque edge set"
+        )
+    adjacency = {content_id: set() for content_id in normalized_selected_ids}
+    for edge in normalized_edges:
+        adjacency[edge["content_a"]].add(edge["content_b"])
+        adjacency[edge["content_b"]].add(edge["content_a"])
+    reached = {normalized_selected_ids[0]}
+    pending = [normalized_selected_ids[0]]
+    while pending:
+        current = pending.pop()
+        for neighbor in adjacency[current]:
+            if neighbor not in reached:
+                reached.add(neighbor)
+                pending.append(neighbor)
+    if len(reached) != len(normalized_selected_ids):
+        raise EvidenceError(
+            f"{label} accepted pair graph must be connected across every selected photo"
+        )
+
+    pair_counts = _mapping(record["pair_counts"], f"{label}.pair_counts")
+    count_fields = {
+        "temporal",
+        "vocabulary_retrieval",
+        "loop_revisit",
+        "exhaustive_primary",
+        "exhaustive_recovery",
+    }
+    _exact_keys(pair_counts, count_fields, f"{label}.pair_counts")
+    if any(
+        type(pair_counts[field]) is not int or pair_counts[field] < 0
+        for field in count_fields
+    ):
+        raise EvidenceError(f"{label}.pair_counts must be nonnegative integers")
+    if sum(pair_counts.values()) != len(normalized_edges):
+        raise EvidenceError(
+            f"{label}.pair_counts must account for every normalized edge"
+        )
+    scheduled_pair_count = record["scheduled_pair_count"]
+    scheduled_pair_graph = _opaque_digest(
+        record["scheduled_pair_graph_sha256"],
+        f"{label}.scheduled_pair_graph_sha256",
+    )
+    attempted_pair_count = record["attempted_pair_count"]
+    attempted_pair_graph = _opaque_digest(
+        record["attempted_pair_graph_sha256"],
+        f"{label}.attempted_pair_graph_sha256",
+    )
+    raw_matched_pair_count = record["raw_matched_pair_count"]
+    raw_matched_pair_graph = _opaque_digest(
+        record["raw_matched_pair_graph_sha256"],
+        f"{label}.raw_matched_pair_graph_sha256",
+    )
+    spatially_verified_pair_count = record["spatially_verified_pair_count"]
+    retrieval_worker_executed = record["retrieval_worker_executed"]
+    if (
+        type(scheduled_pair_count) is not int
+        or scheduled_pair_count <= 0
+        or scheduled_pair_count < len(normalized_edges)
+        or type(attempted_pair_count) is not int
+        or attempted_pair_count != scheduled_pair_count
+        or attempted_pair_graph != scheduled_pair_graph
+        or type(raw_matched_pair_count) is not int
+        or type(spatially_verified_pair_count) is not int
+        or not spatially_verified_pair_count
+        <= raw_matched_pair_count
+        <= attempted_pair_count
+        or spatially_verified_pair_count != len(normalized_edges)
+        or type(retrieval_worker_executed) is not bool
+    ):
+        raise EvidenceError(f"{label} attempted pair closure is invalid")
+    if pair_counts["temporal"] != 0:
+        raise EvidenceError("unordered photo evidence cannot claim temporal pairs")
+    if expected_scale > 250 and record["accepted_attempt"] == "exhaustive_recovery":
+        raise EvidenceError("exhaustive recovery is unavailable above 250 views")
+    if expected_scale <= 60:
+        exhaustive_pair_count = expected_scale * (expected_scale - 1) // 2
+        exhaustive_edge_ids = sorted(
+            _photo_pair_edge_id(first, second)
+            for first, second in itertools.combinations(
+                normalized_selected_ids,
+                2,
+            )
+        )
+        if (
+            record["pairing_policy"] != "unordered_exhaustive"
+            or record["accepted_attempt"] != "exhaustive_primary"
+            or scheduled_pair_count != exhaustive_pair_count
+            or scheduled_pair_graph != _photo_pair_graph_digest(exhaustive_edge_ids)
+            or retrieval_worker_executed
+            or pair_counts["exhaustive_primary"] <= 0
+            or pair_counts["vocabulary_retrieval"] != 0
+            or pair_counts["exhaustive_recovery"] != 0
+        ):
+            raise EvidenceError(
+                "unordered photo evidence at 60 or fewer views must use the complete "
+                "exhaustive primary FAISS graph"
+            )
+    elif (
+        record["pairing_policy"] != "unordered_retrieval"
+        or record["accepted_attempt"] != "vocabulary_retrieval"
+        or scheduled_pair_count < expected_scale
+        or not retrieval_worker_executed
+        or pair_counts["vocabulary_retrieval"] <= 0
+        or pair_counts["exhaustive_primary"] != 0
+    ):
+        raise EvidenceError(
+            "unordered photo evidence at more than 60 views must be accepted from vocabulary retrieval"
+        )
+    if expected_scale > 60 and pair_counts["exhaustive_recovery"] != 0:
+        raise EvidenceError(
+            "retrieval evidence requires zero exhaustive recovery pairs"
+        )
+    registered_views = record["registered_views"]
+    if type(registered_views) is not int or registered_views != len(
+        normalized_registered_ids
+    ):
+        raise EvidenceError(f"{label}.registered_views is invalid")
+    if registered_views * 10 < expected_scale * 9:
+        raise EvidenceError(
+            f"{label} absolute registration coverage is below 90 percent"
+        )
+    point_count = record["point_count"]
+    observation_count = record["observation_count"]
+    if (
+        type(point_count) is not int
+        or point_count <= 0
+        or type(observation_count) is not int
+        or observation_count <= 0
+    ):
+        raise EvidenceError(f"{label} sparse geometry counts must be positive")
+    residual_median = _nonnegative_number(
+        record["residual_median_pixels"],
+        f"{label}.residual_median_pixels",
+    )
+    residual_p90 = _nonnegative_number(
+        record["residual_p90_pixels"],
+        f"{label}.residual_p90_pixels",
+    )
+    if residual_p90 < residual_median:
+        raise EvidenceError(f"{label} p90 residual cannot be below its median")
+    if residual_median > 1.5 + 1e-12:
+        raise EvidenceError(f"{label} median residual exceeds 1.5 px")
+    if residual_p90 > 3.0 + 1e-12:
+        raise EvidenceError(f"{label} p90 residual exceeds 3.0 px")
+    camera_center_p95 = _nonnegative_number(
+        record["camera_center_p95_scene_radius_fraction"],
+        f"{label}.camera_center_p95_scene_radius_fraction",
+    )
+    rotation_p95 = _nonnegative_number(
+        record["rotation_p95_degrees"],
+        f"{label}.rotation_p95_degrees",
+    )
+    return {
+        **dict(record),
+        "group_id": group_id,
+        "variant_id": variant_id,
+        "permutation_index": permutation_index,
+        "permutation_seed": permutation_seed,
+        "source_kind": source_kind,
+        "selected_content_ids": normalized_selected_ids,
+        "registered_content_ids": normalized_registered_ids,
+        "content_set_attestation": content_attestation,
+        "canonical_observation_attestation": canonical_observation_attestation,
+        "selected_content_set_sha256": selected_digest,
+        "registered_content_set_sha256": registered_digest,
+        "normalized_pair_graph_sha256": pair_graph_digest,
+        "normalized_pair_edges": normalized_edges,
+        "normalized_pair_edge_ids": edge_ids,
+        "scheduled_pair_graph_sha256": scheduled_pair_graph,
+        "attempted_pair_graph_sha256": attempted_pair_graph,
+        "raw_matched_pair_graph_sha256": raw_matched_pair_graph,
+        "registered_views": registered_views,
+        "point_count": point_count,
+        "observation_count": observation_count,
+        "residual_median_pixels": residual_median,
+        "residual_p90_pixels": residual_p90,
+        "camera_center_p95_scene_radius_fraction": camera_center_p95,
+        "rotation_p95_degrees": rotation_p95,
+    }
+
+
+def validate_photo_permutation_group(
+    value: Any,
+    request: Mapping[str, Any],
+    *,
+    formal_release: bool,
+    execution_receipt: Any | None = None,
+) -> dict[str, Any]:
+    """Validate one logical unordered-photo scene across filename permutations."""
+    scale, run_seed, plan_digest = _photo_permutation_request_contract(request)
+    group = _mapping(value, "photo permutation evidence")
+    _exact_keys(
+        group,
+        {
+            "schema_version",
+            "mode",
+            "expected_variant_count",
+            "closure_claims",
+            "variants",
+            "execution_provenance",
+        },
+        "photo permutation evidence",
+    )
+    if group["schema_version"] != 1:
+        raise EvidenceError("photo permutation evidence schema_version must be 1")
+    expected_count = group["expected_variant_count"]
+    if type(expected_count) is not int or expected_count < 2 or expected_count > 100:
+        raise EvidenceError("photo permutation expected variant count is invalid")
+    mode = group["mode"]
+    if formal_release:
+        if (
+            mode != "release"
+            or expected_count != PHOTO_PERMUTATION_FORMAL_VARIANT_COUNT
+        ):
+            raise EvidenceError("formal release evidence requires exactly 20 variants")
+    elif mode != "development":
+        raise EvidenceError(
+            "non-release permutation evidence must use explicit development mode"
+        )
+    claims = group["closure_claims"]
+    allowed_claims = {"order_mechanics", "professional_photo", "raw_camera_metadata"}
+    if (
+        not isinstance(claims, list)
+        or not claims
+        or claims != sorted(claims)
+        or len(claims) != len(set(claims))
+        or any(claim not in allowed_claims for claim in claims)
+        or "order_mechanics" not in claims
+    ):
+        raise EvidenceError("photo permutation closure claims are invalid")
+    variants = group["variants"]
+    if not isinstance(variants, list) or len(variants) != expected_count:
+        raise EvidenceError(
+            "photo permutation variants must match expected_variant_count"
+        )
+    normalized = [
+        _validate_photo_permutation_variant(
+            raw,
+            position=index,
+            expected_scale=scale,
+            expected_seed=run_seed,
+            expected_plan_digest=plan_digest,
+        )
+        for index, raw in enumerate(variants)
+    ]
+    provenance = _mapping(
+        group["execution_provenance"],
+        "photo permutation execution provenance",
+    )
+    provenance_fields = {
+        "schema_version",
+        "group_contract_sha256",
+        "request_binding_sha256",
+        "source_authorization_sha256",
+        "source_kind",
+        "source_provenance_commitment",
+        "trust_boundary",
+        "producer_implementation_sha256",
+        "adapter_sha256",
+        "toolchain_closure_sha256",
+        "variant_schedule_sha256",
+        "variant_receipts_sha256",
+        "execution_receipt_sha256",
+    }
+    _exact_keys(
+        provenance,
+        provenance_fields,
+        "photo permutation execution provenance",
+    )
+    if provenance["schema_version"] != 1:
+        raise EvidenceError("photo permutation execution provenance schema is invalid")
+    for field in provenance_fields - {
+        "schema_version",
+        "source_kind",
+        "source_provenance_commitment",
+        "trust_boundary",
+    }:
+        _digest(provenance[field], f"photo permutation execution provenance.{field}")
+    if provenance["source_kind"] not in PHOTO_PERMUTATION_SOURCE_KINDS:
+        raise EvidenceError(
+            "photo permutation execution provenance source kind is invalid"
+        )
+    _opaque_digest(
+        provenance["source_provenance_commitment"],
+        "photo permutation execution provenance.source_provenance_commitment",
+    )
+    if provenance["trust_boundary"] != "requires_github_artifact_attestation":
+        raise EvidenceError(
+            "photo permutation execution provenance trust boundary is invalid"
+        )
+    if execution_receipt is None:
+        raise EvidenceError("photo permutation execution receipt is required")
+    receipt = _mapping(
+        execution_receipt,
+        "photo permutation execution receipt",
+    )
+    receipt_fields = {
+        "schema_version",
+        "kind",
+        "group_contract_sha256",
+        "request_binding_sha256",
+        "source_authorization_sha256",
+        "source_kind",
+        "source_provenance_commitment",
+        "trust_boundary",
+        "producer_implementation_sha256",
+        "adapter_sha256",
+        "toolchain_closure_sha256",
+        "variant_schedule_sha256",
+        "variant_receipts",
+        "variant_receipts_sha256",
+        "group_payload_sha256",
+    }
+    _exact_keys(receipt, receipt_fields, "photo permutation execution receipt")
+    if (
+        receipt["schema_version"] != 1
+        or receipt["kind"] != "easysplat-photo-permutation-execution-receipt"
+    ):
+        raise EvidenceError("photo permutation execution receipt schema is invalid")
+    for field in receipt_fields - {
+        "schema_version",
+        "kind",
+        "source_kind",
+        "source_provenance_commitment",
+        "trust_boundary",
+        "variant_receipts",
+    }:
+        _digest(receipt[field], f"photo permutation execution receipt.{field}")
+    if receipt["source_kind"] not in PHOTO_PERMUTATION_SOURCE_KINDS:
+        raise EvidenceError(
+            "photo permutation execution receipt source kind is invalid"
+        )
+    _opaque_digest(
+        receipt["source_provenance_commitment"],
+        "photo permutation execution receipt.source_provenance_commitment",
+    )
+    if receipt["trust_boundary"] != "requires_github_artifact_attestation":
+        raise EvidenceError(
+            "photo permutation execution receipt trust boundary is invalid"
+        )
+    receipt_digest = sha256_bytes(canonical_json_bytes(receipt) + b"\n")
+    if provenance["execution_receipt_sha256"] != receipt_digest:
+        raise EvidenceError("photo permutation execution receipt digest is invalid")
+    for field in (
+        "group_contract_sha256",
+        "request_binding_sha256",
+        "source_authorization_sha256",
+        "source_kind",
+        "source_provenance_commitment",
+        "trust_boundary",
+        "producer_implementation_sha256",
+        "adapter_sha256",
+        "toolchain_closure_sha256",
+        "variant_schedule_sha256",
+        "variant_receipts_sha256",
+    ):
+        if provenance[field] != receipt[field]:
+            raise EvidenceError(
+                "photo permutation execution provenance does not match its receipt"
+            )
+    if receipt["request_binding_sha256"] != photo_permutation_request_binding_sha256(
+        request
+    ):
+        raise EvidenceError(
+            "photo permutation execution receipt request binding is invalid"
+        )
+    if (
+        receipt["producer_implementation_sha256"]
+        != photo_permutation_producer_implementation_sha256()
+    ):
+        raise EvidenceError(
+            "photo permutation producer implementation does not match this checkout"
+        )
+    if receipt["source_kind"] != normalized[0]["source_kind"]:
+        raise EvidenceError(
+            "photo permutation source provenance does not match its variants"
+        )
+    variant_ids = [record["variant_id"] for record in normalized]
+    if len(variant_ids) != len(set(variant_ids)):
+        raise EvidenceError("photo permutation variant IDs must be unique")
+    group_payload = {key: group[key] for key in group if key != "execution_provenance"}
+    if receipt["group_payload_sha256"] != sha256_bytes(
+        canonical_json_bytes(group_payload)
+    ):
+        raise EvidenceError(
+            "photo permutation execution receipt does not bind the group"
+        )
+    schedule = [
+        {
+            "variant_id": record["variant_id"],
+            "permutation": record["permutation"],
+        }
+        for record in normalized
+    ]
+    if receipt["variant_schedule_sha256"] != sha256_bytes(
+        canonical_json_bytes(schedule)
+    ):
+        raise EvidenceError("photo permutation execution receipt schedule is invalid")
+    raw_slot_receipts = receipt["variant_receipts"]
+    if not isinstance(raw_slot_receipts, list) or len(raw_slot_receipts) != len(
+        normalized
+    ):
+        raise EvidenceError("photo permutation variant receipts are incomplete")
+    slot_receipts: list[dict[str, str]] = []
+    for index, (raw_slot, raw_variant) in enumerate(
+        zip(raw_slot_receipts, variants, strict=True)
+    ):
+        slot = _mapping(
+            raw_slot,
+            f"photo permutation variant receipts[{index}]",
+        )
+        _exact_keys(
+            slot,
+            {"variant_id", "public_variant_sha256", "receipt_sha256"},
+            f"photo permutation variant receipts[{index}]",
+        )
+        variant_id = _token(
+            slot["variant_id"],
+            f"photo permutation variant receipts[{index}].variant_id",
+        )
+        public_digest = _digest(
+            slot["public_variant_sha256"],
+            f"photo permutation variant receipts[{index}].public_variant_sha256",
+        )
+        receipt_file_digest = _digest(
+            slot["receipt_sha256"],
+            f"photo permutation variant receipts[{index}].receipt_sha256",
+        )
+        if variant_id != normalized[index][
+            "variant_id"
+        ] or public_digest != sha256_bytes(canonical_json_bytes(raw_variant)):
+            raise EvidenceError(
+                "photo permutation variant receipt does not bind its public payload"
+            )
+        slot_receipts.append(
+            {
+                "variant_id": variant_id,
+                "public_variant_sha256": public_digest,
+                "receipt_sha256": receipt_file_digest,
+            }
+        )
+    if len({slot["receipt_sha256"] for slot in slot_receipts}) != len(slot_receipts):
+        raise EvidenceError("photo permutation variant receipt digests must be unique")
+    if receipt["variant_receipts_sha256"] != sha256_bytes(
+        canonical_json_bytes(slot_receipts)
+    ):
+        raise EvidenceError("photo permutation variant receipt closure is invalid")
+    if mode == "release":
+        expected_schedule: list[tuple[str, int | None, int | None]] = [
+            ("canonical", None, None)
+        ] + [
+            ("shuffled", index, photo_permutation_release_seed(index))
+            for index in range(1, PHOTO_PERMUTATION_FORMAL_SHUFFLE_COUNT + 1)
+        ]
+        actual_schedule = [
+            (
+                record["permutation"]["kind"],
+                record["permutation_index"],
+                record["permutation_seed"],
+            )
+            for record in normalized
+        ]
+        if actual_schedule != expected_schedule:
+            raise EvidenceError(
+                "formal photo permutation evidence requires the fixed canonical and "
+                "shuffled index/seed schedule"
+            )
+    order_commitments = [record["order_commitment"] for record in normalized]
+    if len(order_commitments) != len(set(order_commitments)):
+        raise EvidenceError("photo permutation order commitments must be unique")
+    shuffled_coordinates = [
+        (record["permutation_index"], record["permutation_seed"])
+        for record in normalized
+        if record["permutation"]["kind"] == "shuffled"
+    ]
+    if len(shuffled_coordinates) != len(set(shuffled_coordinates)):
+        raise EvidenceError("photo permutation index and seed pairs must be unique")
+    canonical = [
+        record for record in normalized if record["permutation"]["kind"] == "canonical"
+    ]
+    if len(canonical) != 1:
+        raise EvidenceError(
+            "photo permutation evidence requires exactly one canonical variant"
+        )
+    reference = canonical[0]
+
+    group_ids = {record["group_id"] for record in normalized}
+    content_attestations = {record["content_set_attestation"] for record in normalized}
+    canonical_observation_attestations = {
+        record["canonical_observation_attestation"] for record in normalized
+    }
+    source_kinds = {record["source_kind"] for record in normalized}
+    selected_sets = {record["selected_content_set_sha256"] for record in normalized}
+    selected_id_sets = {tuple(record["selected_content_ids"]) for record in normalized}
+    scheduled_pair_closures = {
+        (
+            record["scheduled_pair_count"],
+            record["scheduled_pair_graph_sha256"],
+            record["attempted_pair_count"],
+            record["attempted_pair_graph_sha256"],
+        )
+        for record in normalized
+    }
+    if len(group_ids) != 1:
+        raise EvidenceError("photo permutation variants must share one opaque group ID")
+    if len(content_attestations) != 1:
+        raise EvidenceError(
+            "photo permutation variants have a mismatched protected content-set attestation"
+        )
+    if len(canonical_observation_attestations) != 1:
+        raise EvidenceError(
+            "photo permutation variants have a mismatched canonical observation attestation"
+        )
+    if len(source_kinds) != 1:
+        raise EvidenceError("photo permutation variants must share one source kind")
+    if len(selected_sets) != 1 or len(selected_id_sets) != 1:
+        raise EvidenceError(
+            "automatic photo selection changed the selected content set across permutations"
+        )
+    if scale <= 60 and len(scheduled_pair_closures) != 1:
+        raise EvidenceError(
+            "photo permutation scheduled or attempted pair closure changed"
+        )
+    source_kind = next(iter(source_kinds))
+    category = request.get("category")
+    professional_claim = category == "professional_photos" or bool(
+        {"professional_photo", "raw_camera_metadata"} & set(claims)
+    )
+    if source_kind != "native_photos" and professional_claim:
+        raise EvidenceError(
+            "non-native still controls cannot satisfy professional photo or RAW metadata closure"
+        )
+
+    reference_edges = set(reference["normalized_pair_edge_ids"])
+    reference_registered = set(reference["registered_content_ids"])
+    jaccards: list[float] = []
+    registered_losses: list[int] = []
+    registered_content_lost: list[int] = []
+    registered_content_gained: list[int] = []
+    registered_content_symmetric_differences: list[int] = []
+    median_deltas: list[float] = []
+    p90_deltas: list[float] = []
+    point_count_delta_fractions: list[float] = []
+    observation_count_delta_fractions: list[float] = []
+    for record in normalized:
+        registered_loss = reference["registered_views"] - record["registered_views"]
+        registered_losses.append(registered_loss)
+        if registered_loss > 1:
+            raise EvidenceError("photo permutation registered-view loss exceeds 1")
+        registered = set(record["registered_content_ids"])
+        lost_count = len(reference_registered - registered)
+        gained_count = len(registered - reference_registered)
+        symmetric_difference = lost_count + gained_count
+        registered_content_lost.append(lost_count)
+        registered_content_gained.append(gained_count)
+        registered_content_symmetric_differences.append(symmetric_difference)
+        if symmetric_difference != 0:
+            raise EvidenceError(
+                "photo permutation registered content set changed; filename-invariance "
+                "evidence requires the same registered views"
+            )
+        median_delta = abs(
+            record["residual_median_pixels"] - reference["residual_median_pixels"]
+        )
+        p90_delta = abs(
+            record["residual_p90_pixels"] - reference["residual_p90_pixels"]
+        )
+        median_deltas.append(median_delta)
+        p90_deltas.append(p90_delta)
+        if median_delta > 0.05 + 1e-12:
+            raise EvidenceError(
+                "photo permutation median residual delta exceeds 0.05 px"
+            )
+        if p90_delta > 0.10 + 1e-12:
+            raise EvidenceError("photo permutation p90 residual delta exceeds 0.10 px")
+        for field, deltas, label in (
+            ("point_count", point_count_delta_fractions, "point"),
+            (
+                "observation_count",
+                observation_count_delta_fractions,
+                "observation",
+            ),
+        ):
+            reference_count = reference[field]
+            count_delta = abs(record[field] - reference_count)
+            delta_fraction = count_delta / reference_count
+            deltas.append(delta_fraction)
+            if count_delta * 100 > reference_count:
+                raise EvidenceError(
+                    f"photo permutation {label} count delta exceeds 1 percent"
+                )
+        if record["camera_center_p95_scene_radius_fraction"] > 0.01 + 1e-12:
+            raise EvidenceError("photo permutation camera-center deviation exceeds 1%")
+        if record["rotation_p95_degrees"] > 0.20 + 1e-12:
+            raise EvidenceError(
+                "photo permutation rotation deviation exceeds 0.2 degrees"
+            )
+        if scale > 60:
+            edges = set(record["normalized_pair_edge_ids"])
+            union = reference_edges | edges
+            jaccard = len(reference_edges & edges) / len(union)
+            jaccards.append(jaccard)
+            if jaccard < 0.98 - 1e-12:
+                raise EvidenceError(
+                    "photo permutation pair-graph Jaccard is below 0.98"
+                )
+    return {
+        "group_id": next(iter(group_ids)),
+        "source_kind": source_kind,
+        "variant_count": len(normalized),
+        "scale": scale,
+        "run_seed": run_seed,
+        "requested_plan_sha256": plan_digest,
+        "canonical_observation_attestation": next(
+            iter(canonical_observation_attestations)
+        ),
+        "execution_receipt_sha256": receipt_digest,
+        "minimum_pair_graph_jaccard": min(jaccards) if jaccards else None,
+        "maximum_registered_view_loss": max(registered_losses),
+        "maximum_registered_content_lost": max(registered_content_lost),
+        "maximum_registered_content_gained": max(registered_content_gained),
+        "maximum_registered_content_symmetric_difference": max(
+            registered_content_symmetric_differences
+        ),
+        "maximum_median_residual_delta_pixels": max(median_deltas),
+        "maximum_p90_residual_delta_pixels": max(p90_deltas),
+        "maximum_point_count_delta_fraction": max(point_count_delta_fractions),
+        "maximum_observation_count_delta_fraction": max(
+            observation_count_delta_fractions
+        ),
+    }
+
+
+def aggregate_photo_permutation_group(
+    value: Any,
+    request: Mapping[str, Any],
+    *,
+    formal_release: bool,
+    execution_receipt: Any,
+) -> dict[str, Any]:
+    """Return the bounded cross-variant summary after validating the full group."""
+    return validate_photo_permutation_group(
+        value,
+        request,
+        formal_release=formal_release,
+        execution_receipt=execution_receipt,
+    )
+
+
+def validate_photo_permutation_release_coverage(
+    receipts: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Require healthy native-photo order evidence for both pairing regimes."""
+    native_groups: dict[str, dict[str, Any]] = {}
+    execution_receipt_digests: set[str] = set()
+    for position, raw_receipt in enumerate(receipts):
+        receipt = _mapping(raw_receipt, f"release evidence receipts[{position}]")
+        group = receipt.get("photo_permutation")
+        execution_receipt = receipt.get("photo_permutation_execution_receipt")
+        source_authorization = receipt.get("photo_permutation_source_authorization")
+        if group is None and execution_receipt is None and source_authorization is None:
+            continue
+        if group is None or execution_receipt is None or source_authorization is None:
+            raise EvidenceError(
+                "release photo permutation evidence, execution receipt, and source "
+                "authorization must be paired"
+            )
+        validated_source_authorization = (
+            validate_photo_permutation_source_authorization(
+                source_authorization,
+                execution_receipt,
+                receipt,
+            )
+        )
+        validate_photo_permutation_supervisor_provenance(
+            receipt.get("photo_permutation_supervisor_provenance"),
+            execution_receipt,
+            receipt,
+            validated_source_authorization,
+        )
+        summary = validate_photo_permutation_group(
+            group,
+            receipt,
+            formal_release=True,
+            execution_receipt=execution_receipt,
+        )
+        execution_digest = summary["execution_receipt_sha256"]
+        if execution_digest in execution_receipt_digests:
+            raise EvidenceError(
+                "release photo permutation execution receipts must be unique"
+            )
+        execution_receipt_digests.add(execution_digest)
+        if summary["source_kind"] != "native_photos":
+            continue
+        if validated_source_authorization["source_kind"] != "native_photos":
+            continue
+        binding = _mapping(
+            receipt.get("binding"),
+            f"release evidence receipts[{position}].binding",
+        )
+        expected_outcome = _mapping(
+            receipt.get("expected_outcome"),
+            f"release evidence receipts[{position}].expected_outcome",
+        )
+        capture_traits = receipt.get("capture_traits")
+        if (
+            receipt.get("lane") != LANE_REFERENCE
+            or binding.get("lane") != LANE_REFERENCE
+            or binding.get("profile") != "release"
+            or receipt.get("category") != "professional_photos"
+            or receipt.get("input_kind") != "photos"
+            or not isinstance(capture_traits, list)
+            or "unordered" not in capture_traits
+            or expected_outcome.get("kind") != "valid"
+        ):
+            continue
+        if summary["scale"] == 30:
+            regime = "small_exhaustive"
+        elif summary["scale"] == 120:
+            regime = "large_retrieval"
+        else:
+            continue
+        native_groups.setdefault(
+            regime,
+            {
+                "group_id": summary["group_id"],
+                "scale": summary["scale"],
+                "execution_receipt_sha256": execution_digest,
+            },
+        )
+
+    missing = [
+        label
+        for regime, label in (
+            ("small_exhaustive", "small native-photo exhaustive"),
+            ("large_retrieval", "large native-photo retrieval"),
+        )
+        if regime not in native_groups
+    ]
+    if missing:
+        raise EvidenceError(
+            "release evidence requires "
+            + " and ".join(missing)
+            + " photo permutation groups"
+        )
+    return {
+        "source_kind": "native_photos",
+        "small_exhaustive": native_groups["small_exhaustive"],
+        "large_retrieval": native_groups["large_retrieval"],
+    }
+
+
+def validate_photo_permutation_supervisor_provenance(
+    value: Any,
+    execution_receipt: Any,
+    request: Mapping[str, Any],
+    source_authorization: Any,
+) -> dict[str, Any]:
+    provenance = _mapping(value, "photo permutation supervisor provenance")
+    fields = {
+        "schema_version",
+        "status",
+        "repository",
+        "signer_workflow",
+        "source_commit",
+        "source_ref",
+        "subject_sha256",
+        "bundle_sha256",
+        "verified_attestation_count",
+        "source_authorization_subject_sha256",
+        "source_authorization_bundle_sha256",
+        "verified_source_authorization_attestation_count",
+    }
+    _exact_keys(provenance, fields, "photo permutation supervisor provenance")
+    binding = _mapping(request.get("binding"), "photo permutation request binding")
+    if (
+        provenance["schema_version"] != 1
+        or provenance["status"] != "verified"
+        or provenance["repository"] != PHOTO_PERMUTATION_ATTESTATION_REPOSITORY
+        or provenance["signer_workflow"] != PHOTO_PERMUTATION_ATTESTATION_WORKFLOW
+        or provenance["source_commit"] != binding.get("git_commit")
+        or provenance["source_ref"] != "refs/heads/main"
+        or type(provenance["verified_attestation_count"]) is not int
+        or provenance["verified_attestation_count"] < 1
+        or type(provenance["verified_source_authorization_attestation_count"])
+        is not int
+        or provenance["verified_source_authorization_attestation_count"] < 1
+    ):
+        raise EvidenceError("photo permutation supervisor provenance is invalid")
+    subject_digest = _digest(
+        provenance["subject_sha256"],
+        "photo permutation supervisor provenance.subject_sha256",
+    )
+    _digest(
+        provenance["bundle_sha256"],
+        "photo permutation supervisor provenance.bundle_sha256",
+    )
+    source_authorization_subject = _digest(
+        provenance["source_authorization_subject_sha256"],
+        "photo permutation supervisor provenance.source_authorization_subject_sha256",
+    )
+    _digest(
+        provenance["source_authorization_bundle_sha256"],
+        "photo permutation supervisor provenance.source_authorization_bundle_sha256",
+    )
+    expected_subject = sha256_bytes(canonical_json_bytes(execution_receipt) + b"\n")
+    if subject_digest != expected_subject:
+        raise EvidenceError(
+            "photo permutation supervisor provenance subject is invalid"
+        )
+    expected_source_authorization_subject = sha256_bytes(
+        canonical_json_bytes(source_authorization) + b"\n"
+    )
+    if source_authorization_subject != expected_source_authorization_subject:
+        raise EvidenceError(
+            "photo permutation source authorization attestation subject is invalid"
+        )
+    return dict(provenance)
+
+
+def validate_photo_permutation_source_authorization(
+    value: Any,
+    execution_receipt: Any,
+    request: Mapping[str, Any],
+) -> dict[str, Any]:
+    authorization = _mapping(value, "photo permutation source authorization")
+    fields = {
+        "schema_version",
+        "kind",
+        "request_binding_sha256",
+        "source_kind",
+        "source_manifest_sha256",
+        "source_content_set_sha256",
+        "origin_evidence_sha256",
+        "adapter_sha256",
+        "toolchain_closure_sha256",
+        "containment_supervisor_sha256",
+        "containment_policy_sha256",
+        "dedicated_uid",
+        "gh_verifier_sha256",
+        "source_commit",
+        "source_ref",
+    }
+    _exact_keys(authorization, fields, "photo permutation source authorization")
+    receipt = _mapping(execution_receipt, "photo permutation execution receipt")
+    binding = _mapping(request.get("binding"), "photo permutation request binding")
+    if (
+        authorization["schema_version"] != 1
+        or authorization["kind"] != "easysplat-photo-permutation-source-authorization"
+        or authorization["request_binding_sha256"]
+        != photo_permutation_request_binding_sha256(request)
+        or authorization["source_kind"] != receipt.get("source_kind")
+        or authorization["adapter_sha256"] != receipt.get("adapter_sha256")
+        or authorization["toolchain_closure_sha256"]
+        != receipt.get("toolchain_closure_sha256")
+        or authorization["source_commit"] != binding.get("git_commit")
+        or authorization["source_ref"] != "refs/heads/main"
+        or type(authorization["dedicated_uid"]) is not int
+        or authorization["dedicated_uid"] <= 0
+    ):
+        raise EvidenceError("photo permutation source authorization is invalid")
+    for field in fields - {
+        "schema_version",
+        "kind",
+        "source_kind",
+        "dedicated_uid",
+        "source_commit",
+        "source_ref",
+    }:
+        _digest(authorization[field], f"photo permutation source authorization.{field}")
+    artifact_digest = sha256_bytes(canonical_json_bytes(authorization) + b"\n")
+    if receipt.get("source_authorization_sha256") != artifact_digest:
+        raise EvidenceError(
+            "photo permutation source authorization does not match its execution receipt"
+        )
+    return dict(authorization)
+
+
+def _verify_photo_permutation_github_subject(
+    subject: Any,
+    subject_path: Path,
+    bundle_path: Path,
+    request: Mapping[str, Any],
+    *,
+    expected_subject_name: str,
+    expected_bundle_name: str,
+    gh_executable: Path | None,
+    expected_gh_sha256: str | None,
+) -> dict[str, Any]:
+    binding = _mapping(request.get("binding"), "photo permutation request binding")
+    source_commit = binding.get("git_commit")
+    if (
+        binding.get("profile") != "release"
+        or binding.get("lane") != LANE_REFERENCE
+        or not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+    ):
+        raise EvidenceError(
+            "GitHub-attested photo permutation evidence requires a release reference request"
+        )
+    if (
+        subject_path.name != expected_subject_name
+        or bundle_path.name != expected_bundle_name
+        or subject_path.parent.resolve() != bundle_path.parent.resolve()
+    ):
+        raise EvidenceError("photo permutation attestation paths are not canonical")
+    for path, label, maximum_bytes in (
+        (
+            subject_path,
+            "photo permutation attestation subject artifact",
+            MAX_ATTESTATION_BYTES,
+        ),
+        (
+            bundle_path,
+            "photo permutation attestation bundle",
+            MAX_PHOTO_PERMUTATION_ATTESTATION_BUNDLE_BYTES,
+        ),
+    ):
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise EvidenceError(f"{label} is unavailable") from error
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not 0 < metadata.st_size <= maximum_bytes
+        ):
+            raise EvidenceError(f"{label} is unsafe")
+    stored_subject = _load_bounded_json(
+        subject_path,
+        "photo permutation attestation subject artifact",
+        maximum_bytes=MAX_ATTESTATION_BYTES,
+    )
+    if stored_subject != subject:
+        raise EvidenceError(
+            "photo permutation attestation subject artifact does not match observations"
+        )
+    if sha256_file(subject_path) != sha256_bytes(canonical_json_bytes(subject) + b"\n"):
+        raise EvidenceError(
+            "photo permutation attestation subject artifact is not canonical JSON"
+        )
+    if gh_executable is None or expected_gh_sha256 is None:
+        raise EvidenceError(
+            "GitHub attestation verifier requires a protected executable and digest pin"
+        )
+    expected_digest = _digest(
+        expected_gh_sha256,
+        "photo permutation GitHub attestation verifier digest",
+    )
+    executable = Path(os.path.abspath(gh_executable))
+    try:
+        executable_metadata = executable.lstat()
+    except OSError as error:
+        raise EvidenceError("GitHub attestation verifier is unavailable") from error
+    if (
+        executable.is_symlink()
+        or not stat.S_ISREG(executable_metadata.st_mode)
+        or executable_metadata.st_nlink != 1
+        or not os.access(executable, os.X_OK)
+        or sha256_file(executable) != expected_digest
+    ):
+        raise EvidenceError("GitHub attestation verifier is unsafe")
+    command = [
+        str(executable),
+        "attestation",
+        "verify",
+        str(subject_path),
+        "--bundle",
+        str(bundle_path),
+        "--repo",
+        PHOTO_PERMUTATION_ATTESTATION_REPOSITORY,
+        "--signer-workflow",
+        PHOTO_PERMUTATION_ATTESTATION_WORKFLOW,
+        "--source-digest",
+        source_commit,
+        "--source-ref",
+        "refs/heads/main",
+        "--format",
+        "json",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                "HOME": os.environ.get("HOME", ""),
+                "PATH": os.environ.get("PATH", ""),
+                "GH_HOST": "github.com",
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise EvidenceError(
+            "GitHub photo permutation attestation verification failed"
+        ) from error
+    if (
+        completed.returncode != 0
+        or len(completed.stdout.encode("utf-8")) > 8 * 1024 * 1024
+    ):
+        raise EvidenceError("GitHub photo permutation attestation verification failed")
+    try:
+        verified = json.loads(completed.stdout)
+    except (json.JSONDecodeError, UnicodeError) as error:
+        raise EvidenceError(
+            "GitHub photo permutation attestation verification output is invalid"
+        ) from error
+    if sha256_file(executable) != expected_digest:
+        raise EvidenceError("GitHub attestation verifier changed during verification")
+    subject_sha256 = sha256_file(subject_path)
+    subject_hex = subject_sha256.removeprefix("sha256:")
+    matching_attestations = 0
+    if not isinstance(verified, list) or not verified:
+        raise EvidenceError(
+            "GitHub photo permutation attestation has no verified subject"
+        )
+    for raw in verified:
+        if not isinstance(raw, dict):
+            continue
+        result = raw.get("verificationResult")
+        statement = result.get("statement") if isinstance(result, dict) else None
+        subjects = statement.get("subject") if isinstance(statement, dict) else None
+        if not isinstance(subjects, list):
+            continue
+        if any(
+            isinstance(subject, dict)
+            and subject.get("name") == subject_path.name
+            and isinstance(subject.get("digest"), dict)
+            and subject["digest"].get("sha256") == subject_hex
+            for subject in subjects
+        ):
+            matching_attestations += 1
+    if matching_attestations < 1:
+        raise EvidenceError(
+            "GitHub photo permutation attestation subject does not match the execution receipt"
+        )
+    return {
+        "subject_sha256": subject_sha256,
+        "bundle_sha256": sha256_file(bundle_path),
+        "verified_attestation_count": matching_attestations,
+    }
+
+
+def verify_photo_permutation_github_attestation(
+    execution_receipt: Any,
+    execution_receipt_path: Path,
+    bundle_path: Path,
+    request: Mapping[str, Any],
+    *,
+    gh_executable: Path | None = None,
+    expected_gh_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Verify the exact execution receipt with an externally pinned gh binary."""
+    verified = _verify_photo_permutation_github_subject(
+        execution_receipt,
+        execution_receipt_path,
+        bundle_path,
+        request,
+        expected_subject_name="photo-permutation-execution-receipt.json",
+        expected_bundle_name="photo-permutation-attestation.jsonl",
+        gh_executable=gh_executable,
+        expected_gh_sha256=expected_gh_sha256,
+    )
+    binding = _mapping(request.get("binding"), "photo permutation request binding")
+    return {
+        "schema_version": 1,
+        "status": "verified",
+        "repository": PHOTO_PERMUTATION_ATTESTATION_REPOSITORY,
+        "signer_workflow": PHOTO_PERMUTATION_ATTESTATION_WORKFLOW,
+        "source_commit": binding["git_commit"],
+        "source_ref": "refs/heads/main",
+        **verified,
+    }
+
+
+def verify_photo_permutation_source_authorization_github_attestation(
+    source_authorization: Any,
+    source_authorization_path: Path,
+    bundle_path: Path,
+    request: Mapping[str, Any],
+    *,
+    gh_executable: Path | None = None,
+    expected_gh_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Verify the protected source classification and runtime authority artifact."""
+    authorization = _mapping(
+        source_authorization,
+        "photo permutation source authorization",
+    )
+    if authorization.get("gh_verifier_sha256") != expected_gh_sha256:
+        raise EvidenceError(
+            "photo permutation source authorization does not bind the protected gh verifier"
+        )
+    return _verify_photo_permutation_github_subject(
+        source_authorization,
+        source_authorization_path,
+        bundle_path,
+        request,
+        expected_subject_name="photo-permutation-source-authorization.json",
+        expected_bundle_name=(
+            "photo-permutation-source-authorization-attestation.jsonl"
+        ),
+        gh_executable=gh_executable,
+        expected_gh_sha256=expected_gh_sha256,
+    )
+
+
+def verify_photo_permutation_github_attestations(
+    execution_receipt: Any,
+    execution_receipt_path: Path,
+    execution_bundle_path: Path,
+    source_authorization: Any,
+    source_authorization_path: Path,
+    source_authorization_bundle_path: Path,
+    request: Mapping[str, Any],
+    *,
+    gh_executable: Path | None = None,
+    expected_gh_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Verify independently attested execution and source-authority subjects."""
+    validated_authorization = validate_photo_permutation_source_authorization(
+        source_authorization,
+        execution_receipt,
+        request,
+    )
+    execution = verify_photo_permutation_github_attestation(
+        execution_receipt,
+        execution_receipt_path,
+        execution_bundle_path,
+        request,
+        gh_executable=gh_executable,
+        expected_gh_sha256=expected_gh_sha256,
+    )
+    authorization = verify_photo_permutation_source_authorization_github_attestation(
+        validated_authorization,
+        source_authorization_path,
+        source_authorization_bundle_path,
+        request,
+        gh_executable=gh_executable,
+        expected_gh_sha256=expected_gh_sha256,
+    )
+    return {
+        **execution,
+        "source_authorization_subject_sha256": authorization["subject_sha256"],
+        "source_authorization_bundle_sha256": authorization["bundle_sha256"],
+        "verified_source_authorization_attestation_count": authorization[
+            "verified_attestation_count"
+        ],
+    }
+
+
+def _safe_photo_manifest_relative_path(value: Any, label: str) -> PurePosixPath:
+    if not isinstance(value, str):
+        raise EvidenceError(f"{label} must be a safe relative path")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or value.startswith(("~", "\\"))
+        or "\\" in value
+    ):
+        raise EvidenceError(f"{label} must be a safe relative path")
+    return path
+
+
+def build_photo_permutation_mapping(
+    manifest: Any,
+    *,
+    scale: int,
+    permutation_index: int,
+    permutation_seed: int,
+) -> dict[str, Any]:
+    """Build a private mapping receipt without copying or modifying source media."""
+    value = _mapping(manifest, "photo source manifest")
+    _exact_keys(
+        value,
+        {"schema_version", "corpus_id", "entries"},
+        "photo source manifest",
+    )
+    if value["schema_version"] != 1:
+        raise EvidenceError("photo source manifest schema_version must be 1")
+    corpus_id = _token(value["corpus_id"], "photo source manifest corpus_id")
+    if (
+        type(scale) is not int
+        or scale < 2
+        or type(permutation_index) is not int
+        or permutation_index < 1
+        or type(permutation_seed) is not int
+        or permutation_seed < 0
+    ):
+        raise EvidenceError("photo permutation scale, index, and seed are invalid")
+    entries = value["entries"]
+    if not isinstance(entries, list) or not 2 <= len(entries) <= 100_000:
+        raise EvidenceError("photo source manifest entries are invalid")
+    source_paths: set[str] = set()
+    source_digests: set[str] = set()
+    ordered: list[tuple[str, str, str]] = []
+    extension_aliases = {".jpeg": ".jpg", ".tiff": ".tif"}
+    allowed_extensions = {
+        ".arw",
+        ".cr2",
+        ".cr3",
+        ".dng",
+        ".heic",
+        ".heif",
+        ".jpg",
+        ".jpeg",
+        ".nef",
+        ".orf",
+        ".png",
+        ".raf",
+        ".rw2",
+        ".tif",
+        ".tiff",
+    }
+    for index, raw in enumerate(entries):
+        label = f"photo source manifest entries[{index}]"
+        entry = _mapping(raw, label)
+        _exact_keys(entry, {"relative_path", "source_sha256"}, label)
+        relative = _safe_photo_manifest_relative_path(
+            entry["relative_path"], f"{label}.relative_path"
+        )
+        relative_string = relative.as_posix()
+        if relative_string in source_paths:
+            raise EvidenceError(
+                "photo source manifest contains duplicate relative paths"
+            )
+        source_paths.add(relative_string)
+        source_digest = _digest(entry["source_sha256"], f"{label}.source_sha256")
+        if source_digest in source_digests:
+            raise EvidenceError("photo source manifest source digest collision")
+        source_digests.add(source_digest)
+        extension = relative.suffix.lower()
+        if extension not in allowed_extensions:
+            raise EvidenceError(
+                "photo source manifest contains an unsupported extension"
+            )
+        extension = extension_aliases.get(extension, extension)
+        order_key = (
+            "sha256:"
+            + hashlib.sha256(
+                b"easysplat-unordered-v1\0"
+                + corpus_id.encode("utf-8")
+                + b"\0"
+                + str(scale).encode("ascii")
+                + b"\0"
+                + str(permutation_index).encode("ascii")
+                + b"\0"
+                + str(permutation_seed).encode("ascii")
+                + b"\0"
+                + source_digest.encode("ascii")
+            ).hexdigest()
+        )
+        ordered.append((order_key, source_digest, extension))
+    ordered.sort()
+    mapped_entries = [
+        {
+            "source_sha256": source_digest,
+            "order_key_sha256": order_key,
+            "target_relative_path": f"photo-{position:06d}{extension}",
+        }
+        for position, (order_key, source_digest, extension) in enumerate(
+            ordered, start=1
+        )
+    ]
+    targets = [entry["target_relative_path"] for entry in mapped_entries]
+    if len(targets) != len(set(targets)):
+        raise EvidenceError("photo permutation target-name collision")
+    order_manifest_sha256 = sha256_bytes(
+        canonical_json_bytes(
+            [
+                {
+                    "source_sha256": entry["source_sha256"],
+                    "target_relative_path": entry["target_relative_path"],
+                }
+                for entry in mapped_entries
+            ]
+        )
+    )
+    receipt = {
+        "schema_version": 1,
+        "operation": "mapping_only",
+        "corpus_id": corpus_id,
+        "scale": scale,
+        "permutation_index": permutation_index,
+        "permutation_seed": permutation_seed,
+        "order_manifest_sha256": order_manifest_sha256,
+        "entries": mapped_entries,
+    }
+    if len(canonical_json_bytes(receipt)) + 1 > MAX_PHOTO_PERMUTATION_MAPPING_BYTES:
+        raise EvidenceError("photo permutation mapping exceeds its bounded size")
+    return receipt
+
+
+def _validate_photo_permutation_mapping(value: Any) -> dict[str, Any]:
+    receipt = _mapping(value, "photo permutation mapping")
+    _exact_keys(
+        receipt,
+        {
+            "schema_version",
+            "operation",
+            "corpus_id",
+            "scale",
+            "permutation_index",
+            "permutation_seed",
+            "order_manifest_sha256",
+            "entries",
+        },
+        "photo permutation mapping",
+    )
+    if receipt["schema_version"] != 1 or receipt["operation"] != "mapping_only":
+        raise EvidenceError("photo permutation mapping schema or operation is invalid")
+    corpus_id = _token(receipt["corpus_id"], "photo permutation mapping corpus_id")
+    scale = receipt["scale"]
+    permutation_index = receipt["permutation_index"]
+    permutation_seed = receipt["permutation_seed"]
+    if (
+        type(scale) is not int
+        or scale < 2
+        or type(permutation_index) is not int
+        or permutation_index < 1
+        or type(permutation_seed) is not int
+        or permutation_seed < 0
+    ):
+        raise EvidenceError("photo permutation mapping coordinates are invalid")
+    entries = receipt["entries"]
+    if not isinstance(entries, list) or not 2 <= len(entries) <= 100_000:
+        raise EvidenceError("photo permutation mapping entries are invalid")
+    normalized_entries: list[dict[str, str]] = []
+    seen_sources: set[str] = set()
+    seen_targets: set[str] = set()
+    previous_order_key = ""
+    for position, raw in enumerate(entries, start=1):
+        label = f"photo permutation mapping entries[{position - 1}]"
+        entry = _mapping(raw, label)
+        _exact_keys(
+            entry,
+            {"source_sha256", "order_key_sha256", "target_relative_path"},
+            label,
+        )
+        source_digest = _digest(entry["source_sha256"], f"{label}.source_sha256")
+        order_key = _digest(entry["order_key_sha256"], f"{label}.order_key_sha256")
+        target = entry["target_relative_path"]
+        if (
+            not isinstance(target, str)
+            or re.fullmatch(rf"photo-{position:06d}\.[a-z0-9]{{2,5}}", target) is None
+        ):
+            raise EvidenceError(f"{label}.target_relative_path is not canonical")
+        expected_order_key = (
+            "sha256:"
+            + hashlib.sha256(
+                b"easysplat-unordered-v1\0"
+                + corpus_id.encode("utf-8")
+                + b"\0"
+                + str(scale).encode("ascii")
+                + b"\0"
+                + str(permutation_index).encode("ascii")
+                + b"\0"
+                + str(permutation_seed).encode("ascii")
+                + b"\0"
+                + source_digest.encode("ascii")
+            ).hexdigest()
+        )
+        if order_key != expected_order_key or order_key <= previous_order_key:
+            raise EvidenceError("photo permutation mapping order key is invalid")
+        previous_order_key = order_key
+        if source_digest in seen_sources:
+            raise EvidenceError("photo permutation mapping source digest collision")
+        if target in seen_targets:
+            raise EvidenceError("photo permutation mapping target-name collision")
+        seen_sources.add(source_digest)
+        seen_targets.add(target)
+        normalized_entries.append(dict(entry))
+    expected_manifest = sha256_bytes(
+        canonical_json_bytes(
+            [
+                {
+                    "source_sha256": entry["source_sha256"],
+                    "target_relative_path": entry["target_relative_path"],
+                }
+                for entry in normalized_entries
+            ]
+        )
+    )
+    if receipt["order_manifest_sha256"] != expected_manifest:
+        raise EvidenceError("photo permutation order manifest digest is invalid")
+    return dict(receipt)
+
+
+def write_photo_permutation_mapping(path: Path, value: Any) -> None:
+    """Atomically write a validated private permutation mapping receipt."""
+    if path.is_symlink() or path.exists() and not path.is_file():
+        raise EvidenceError("photo permutation output must be a regular file path")
+    parent = path.parent.resolve(strict=True)
+    if not parent.is_dir() or path.parent.is_symlink():
+        raise EvidenceError("photo permutation output parent must be a real directory")
+    validated = _validate_photo_permutation_mapping(value)
+    data = canonical_json_bytes(validated) + b"\n"
+    if len(data) > MAX_PHOTO_PERMUTATION_MAPPING_BYTES:
+        raise EvidenceError("photo permutation mapping exceeds its bounded size")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _validate_timing_repeatability(
@@ -1079,17 +3437,25 @@ def _validate_timing_sequence(
             )
         run_id = _token(record["run_id"], f"{label}[{index}].run_id")
         expected_discarded = index < 2
-        if type(record["discarded"]) is not bool or record["discarded"] != expected_discarded:
+        if (
+            type(record["discarded"]) is not bool
+            or record["discarded"] != expected_discarded
+        ):
             raise EvidenceError(f"{label} must discard exactly one warm-up per variant")
         measurements = {
             field: _positive_number(record[field], f"{label}[{index}].{field}")
             for field in measurement_fields
         }
         component_fields = set(measurement_fields) - {"end_to_end_seconds"}
-        if "end_to_end_seconds" in measurements and component_fields and measurements[
-            "end_to_end_seconds"
-        ] + 1e-9 < sum(measurements[field] for field in component_fields):
-            raise EvidenceError(f"{label}[{index}] end-to-end time is below its phase sum")
+        if (
+            "end_to_end_seconds" in measurements
+            and component_fields
+            and measurements["end_to_end_seconds"] + 1e-9
+            < sum(measurements[field] for field in component_fields)
+        ):
+            raise EvidenceError(
+                f"{label}[{index}] end-to-end time is below its phase sum"
+            )
         measurements["run_id"] = run_id
         if not expected_discarded:
             grouped[expected_variant].append(measurements)
@@ -1111,8 +3477,13 @@ def _validate_candidate_timing(value: Any) -> list[float]:
             raise EvidenceError("timing.candidate_runs may contain candidate runs only")
         _token(record["run_id"], f"timing.candidate_runs[{index}].run_id")
         expected_discarded = index == 0
-        if type(record["discarded"]) is not bool or record["discarded"] != expected_discarded:
-            raise EvidenceError("timing.candidate_runs must mark only its first warm-up as discarded")
+        if (
+            type(record["discarded"]) is not bool
+            or record["discarded"] != expected_discarded
+        ):
+            raise EvidenceError(
+                "timing.candidate_runs must mark only its first warm-up as discarded"
+            )
         seconds = _positive_number(
             record["end_to_end_seconds"],
             f"timing.candidate_runs[{index}].end_to_end_seconds",
@@ -1143,13 +3514,21 @@ def _timing_metrics(
             timing["ordinary_runs"],
             "timing.ordinary_runs",
             repetitions=3,
-            measurement_fields=("end_to_end_seconds", "geometry_seconds", "training_seconds"),
+            measurement_fields=(
+                "end_to_end_seconds",
+                "geometry_seconds",
+                "training_seconds",
+            ),
         )
         phases = _validate_timing_sequence(
             timing["phase_runs"],
             "timing.phase_runs",
             repetitions=5,
-            measurement_fields=("end_to_end_seconds", "matcher_seconds", "mapping_seconds"),
+            measurement_fields=(
+                "end_to_end_seconds",
+                "matcher_seconds",
+                "mapping_seconds",
+            ),
         )
         fast_profile = _validate_timing_sequence(
             timing["fast_profile_runs"],
@@ -1159,19 +3538,32 @@ def _timing_metrics(
             baseline_variant="accurate_reference",
             candidate_variant="fast_candidate",
         )
-        candidate_end = [record["end_to_end_seconds"] for record in ordinary["candidate"]]
-        candidate_geometry = [record["geometry_seconds"] for record in ordinary["candidate"]]
-        baseline_geometry = [record["geometry_seconds"] for record in ordinary["baseline"]]
-        candidate_training = [record["training_seconds"] for record in ordinary["candidate"]]
-        candidate_matcher = [record["matcher_seconds"] for record in phases["candidate"]]
+        candidate_end = [
+            record["end_to_end_seconds"] for record in ordinary["candidate"]
+        ]
+        candidate_geometry = [
+            record["geometry_seconds"] for record in ordinary["candidate"]
+        ]
+        baseline_geometry = [
+            record["geometry_seconds"] for record in ordinary["baseline"]
+        ]
+        candidate_training = [
+            record["training_seconds"] for record in ordinary["candidate"]
+        ]
+        candidate_matcher = [
+            record["matcher_seconds"] for record in phases["candidate"]
+        ]
         baseline_matcher = [record["matcher_seconds"] for record in phases["baseline"]]
-        candidate_mapping = [record["mapping_seconds"] for record in phases["candidate"]]
+        candidate_mapping = [
+            record["mapping_seconds"] for record in phases["candidate"]
+        ]
         baseline_mapping = [record["mapping_seconds"] for record in phases["baseline"]]
         fast_candidate_end = [
             record["end_to_end_seconds"] for record in fast_profile["fast_candidate"]
         ]
         accurate_reference_end = [
-            record["end_to_end_seconds"] for record in fast_profile["accurate_reference"]
+            record["end_to_end_seconds"]
+            for record in fast_profile["accurate_reference"]
         ]
         candidate_median = statistics.median(candidate_end)
         metrics.update(
@@ -1183,17 +3575,20 @@ def _timing_metrics(
                     / statistics.median(fast_candidate_end)
                 ),
                 "balanced_geometry_speedup": measured(
-                    statistics.median(baseline_geometry) / statistics.median(candidate_geometry)
+                    statistics.median(baseline_geometry)
+                    / statistics.median(candidate_geometry)
                 ),
                 "geometry_seconds": measured(statistics.median(candidate_geometry)),
                 "training_seconds": measured(statistics.median(candidate_training)),
                 "matcher_seconds": measured(statistics.median(candidate_matcher)),
                 "mapping_seconds": measured(statistics.median(candidate_mapping)),
                 "matching_speedup": measured(
-                    statistics.median(baseline_matcher) / statistics.median(candidate_matcher)
+                    statistics.median(baseline_matcher)
+                    / statistics.median(candidate_matcher)
                 ),
                 "mapping_speedup": measured(
-                    statistics.median(baseline_mapping) / statistics.median(candidate_mapping)
+                    statistics.median(baseline_mapping)
+                    / statistics.median(candidate_mapping)
                 ),
             }
         )
@@ -1209,7 +3604,11 @@ def _timing_metrics(
             timing["ordinary_runs"],
             "timing.ordinary_runs",
             repetitions=3,
-            measurement_fields=("end_to_end_seconds", "geometry_seconds", "training_seconds"),
+            measurement_fields=(
+                "end_to_end_seconds",
+                "geometry_seconds",
+                "training_seconds",
+            ),
         )
         _validate_timing_sequence(
             timing["fast_profile_runs"],
@@ -1220,12 +3619,16 @@ def _timing_metrics(
             candidate_variant="fast_candidate",
         )
         metrics["wall_time_seconds"] = measured(
-            statistics.median(record["end_to_end_seconds"] for record in ordinary["candidate"])
+            statistics.median(
+                record["end_to_end_seconds"] for record in ordinary["candidate"]
+            )
         )
         return metrics
 
     _exact_keys(timing, {"candidate_runs"}, "observations.timing")
-    candidate_median = statistics.median(_validate_candidate_timing(timing["candidate_runs"]))
+    candidate_median = statistics.median(
+        _validate_candidate_timing(timing["candidate_runs"])
+    )
     metrics["wall_time_seconds"] = measured(candidate_median)
     if lane == LANE_CONSTRAINED and "suite_performance" in gate_scopes:
         metrics["constrained_fast_p50_seconds"] = measured(candidate_median)
@@ -1253,7 +3656,9 @@ def _execution_runs(
             raise EvidenceError(f"timing.{group_name} must be an array")
         for index, raw in enumerate(records):
             record = _mapping(raw, f"timing.{group_name}[{index}]")
-            run_id = _token(record.get("run_id"), f"timing.{group_name}[{index}].run_id")
+            run_id = _token(
+                record.get("run_id"), f"timing.{group_name}[{index}].run_id"
+            )
             if run_id in seen:
                 raise EvidenceError("timing run IDs must be unique")
             seen.add(run_id)
@@ -1283,14 +3688,18 @@ def _published_training_duration(
         if isinstance(command, Mapping) and command.get("published_output") is True
     ]
     if len(published) != 1:
-        raise EvidenceError("valid evidence requires exactly one published training receipt")
+        raise EvidenceError(
+            "valid evidence requires exactly one published training receipt"
+        )
     receipt = published[0]
     run_id = _token(receipt.get("run_id"), "published training receipt run_id")
     phase = _token(receipt.get("phase"), "published training receipt phase")
     variant = _token(receipt.get("variant"), "published training receipt variant")
     expected_phase = "ordinary" if "ordinary_runs" in timing else "candidate"
     if variant != "candidate" or phase != expected_phase:
-        raise EvidenceError("published output must come from the candidate end-to-end run")
+        raise EvidenceError(
+            "published output must come from the candidate end-to-end run"
+        )
     group_name = f"{phase}_runs"
     records = timing.get(group_name)
     if not isinstance(records, list):
@@ -1303,10 +3712,14 @@ def _published_training_duration(
         and record.get("variant") == variant
     ]
     if len(matching) != 1:
-        raise EvidenceError("published training receipt does not resolve to one timing run")
+        raise EvidenceError(
+            "published training receipt does not resolve to one timing run"
+        )
     record = matching[0]
     if record.get("discarded") is not False:
-        raise EvidenceError("published output must come from a measured candidate end-to-end run")
+        raise EvidenceError(
+            "published output must come from a measured candidate end-to-end run"
+        )
     field = "training_seconds" if "training_seconds" in record else "end_to_end_seconds"
     return _positive_number(
         record.get(field),
@@ -1347,7 +3760,7 @@ def _candidate_mapper_cadence(
         "unordered",
     }:
         raise EvidenceError("request input topology is invalid for mapper cadence")
-    expected_ratio = 4.0 if topology == "continuous" else 1.1
+    expected_ratio = 4.0 if topology == "continuous" else 1.4
     expected_local = 1 if topology == "continuous" else 2
     frames = configuration["ba_global_frames_ratio"]
     points = configuration["ba_global_points_ratio"]
@@ -1375,12 +3788,87 @@ def _candidate_mapper_cadence(
     for field, expected in promoted_convergence.items():
         if configuration[field] != expected:
             raise EvidenceError(f"{field} must remain {expected!r}")
-    if frames != expected_ratio or points != expected_ratio or local_refinements != expected_local:
+    if (
+        frames != expected_ratio
+        or points != expected_ratio
+        or local_refinements != expected_local
+    ):
         raise EvidenceError(
             f"{topology} mapper cadence requires global ratios {expected_ratio} "
             f"and local refinements {expected_local}"
         )
     return float(frames), float(points), global_refinements, local_refinements
+
+
+MAPPER_CADENCE_FIELDS = {
+    "localMaxRefinements",
+    "globalFramesRatio",
+    "globalPointsRatio",
+    "globalMaxRefinements",
+    "localMaxNumIterations",
+    "localFunctionTolerance",
+    "globalFunctionTolerance",
+    "localImageCount",
+}
+
+
+def _mapper_cadence(
+    value: Any,
+    label: str,
+) -> dict[str, int | float]:
+    cadence = _mapping(value, label)
+    _exact_keys(cadence, MAPPER_CADENCE_FIELDS, label)
+    for field in (
+        "localMaxRefinements",
+        "globalMaxRefinements",
+        "localMaxNumIterations",
+        "localImageCount",
+    ):
+        if type(cadence[field]) is not int or cadence[field] <= 0:
+            raise EvidenceError(f"{label} is invalid")
+    for field in (
+        "globalFramesRatio",
+        "globalPointsRatio",
+        "localFunctionTolerance",
+        "globalFunctionTolerance",
+    ):
+        number = cadence[field]
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or not math.isfinite(number)
+            or number <= 0
+            or (field in {"globalFramesRatio", "globalPointsRatio"} and number <= 1)
+        ):
+            raise EvidenceError(f"{label} is invalid")
+    return dict(cadence)
+
+
+def _cadence_from_tuple(
+    cadence: tuple[float, float, int, int],
+) -> dict[str, int | float]:
+    return {
+        "localMaxRefinements": cadence[3],
+        "globalFramesRatio": cadence[0],
+        "globalPointsRatio": cadence[1],
+        "globalMaxRefinements": cadence[2],
+        "localMaxNumIterations": 10,
+        "localFunctionTolerance": 0.001,
+        "globalFunctionTolerance": 0.000_001,
+        "localImageCount": 6,
+    }
+
+
+def _candidate_mapper_cadence_contract(
+    configuration: Mapping[str, Any],
+) -> tuple[dict[str, int | float], dict[str, int | float]]:
+    planned = _cadence_from_tuple(_candidate_mapper_cadence(configuration))
+    fallback = _cadence_from_tuple(
+        (1.4, 1.4, 5, 2)
+        if configuration["input_topology"] == "continuous"
+        else (1.1, 1.1, 5, 2)
+    )
+    return planned, fallback
 
 
 MAPPER_CADENCE_OPTIONS = (
@@ -1392,6 +3880,10 @@ MAPPER_CADENCE_OPTIONS = (
     "--Mapper.ba_local_function_tolerance",
     "--Mapper.ba_global_function_tolerance",
     "--Mapper.ba_local_num_images",
+    "--Mapper.ba_global_max_num_iterations",
+    "--Mapper.random_seed",
+    "--Mapper.min_num_matches",
+    "--Mapper.ba_refine_focal_length",
 )
 
 
@@ -1400,10 +3892,13 @@ def _validate_mapper_invocation_argv(
     variant: str,
     *,
     expected_cadence: tuple[float, float, int, int] | None,
+    expected_options: Mapping[str, str] | None = None,
     label: str,
 ) -> None:
-    if not isinstance(raw, list) or len(raw) < 2 or any(
-        not isinstance(argument, str) or not argument for argument in raw
+    if (
+        not isinstance(raw, list)
+        or len(raw) < 2
+        or any(not isinstance(argument, str) or not argument for argument in raw)
     ):
         raise EvidenceError(f"{label} argv must be a nonempty redacted argument array")
     if any("/Users/" in argument or "/home/" in argument for argument in raw):
@@ -1414,16 +3909,16 @@ def _validate_mapper_invocation_argv(
         else "toolchain://resolved/bin/colmap"
     )
     if raw[0] != expected_executable or raw[1] != "mapper":
-        raise EvidenceError(f"{label} argv does not identify the canonical COLMAP mapper executable")
+        raise EvidenceError(
+            f"{label} argv does not identify the canonical COLMAP mapper executable"
+        )
     if expected_cadence is None:
         if any(
             argument == option or argument.startswith(option + "=")
             for argument in raw
             for option in MAPPER_CADENCE_OPTIONS
         ):
-            raise EvidenceError(
-                f"{label} cannot contain production cadence options"
-            )
+            raise EvidenceError(f"{label} cannot contain production cadence options")
         return
     expected = {
         "--Mapper.ba_global_frames_ratio": str(expected_cadence[0]),
@@ -1435,13 +3930,19 @@ def _validate_mapper_invocation_argv(
         "--Mapper.ba_global_function_tolerance": "1e-06",
         "--Mapper.ba_local_num_images": "6",
     }
+    if expected_options is not None:
+        expected.update(expected_options)
     for option, expected_value in expected.items():
         indices = [index for index, argument in enumerate(raw) if argument == option]
         ambiguous = any(argument.startswith(option + "=") for argument in raw)
         if len(indices) != 1 or ambiguous or indices[0] + 1 >= len(raw):
-            raise EvidenceError(f"{label} cadence must contain one split {option} value")
+            raise EvidenceError(
+                f"{label} cadence must contain one split {option} value"
+            )
         if raw[indices[0] + 1] != expected_value:
-            raise EvidenceError(f"{label} cadence {option} does not match the bound value")
+            raise EvidenceError(
+                f"{label} cadence {option} does not match the bound value"
+            )
 
 
 def _validate_mapper_invocations(
@@ -1450,17 +3951,52 @@ def _validate_mapper_invocations(
     request: Mapping[str, Any],
     *,
     valid_outcome: bool,
+    planned_mapper_cadence: Any = _MISSING,
+    accepted_mapper_cadence: Any = _MISSING,
+    cadence_fallback_trigger: Any = _MISSING,
     geometry_execution: Mapping[str, Any] | None = None,
 ) -> None:
     if not isinstance(raw, list):
         raise EvidenceError("mapper_invocations must be an ordered array")
+    if planned_mapper_cadence is _MISSING:
+        if variant in {"candidate", "fast_candidate"} and raw:
+            planned_mapper_cadence = raw[0].get("incremental_cadence")
+            accepted_mapper_cadence = raw[-1].get("incremental_cadence")
+            cadence_fallback_trigger = (
+                raw[0].get("evaluation", {}).get("fallback_trigger")
+                if planned_mapper_cadence != accepted_mapper_cadence
+                else None
+            )
+        else:
+            planned_mapper_cadence = None
+            accepted_mapper_cadence = None
+            cadence_fallback_trigger = None
     if not valid_outcome:
-        if raw:
-            raise EvidenceError("invalid-input execution receipts require empty mapper_invocations")
+        if raw or any(
+            value is not None
+            for value in (
+                planned_mapper_cadence,
+                accepted_mapper_cadence,
+                cadence_fallback_trigger,
+            )
+        ):
+            raise EvidenceError(
+                "invalid-input execution receipts cannot claim mapper evidence"
+            )
         return
-    invocations: list[Mapping[str, Any]] = []
-    for index, item in enumerate(raw):
-        invocation = _mapping(item, f"mapper_invocations[{index}]")
+    if variant in {"baseline", "accurate_reference"}:
+        if any(
+            value is not None
+            for value in (
+                planned_mapper_cadence,
+                accepted_mapper_cadence,
+                cadence_fallback_trigger,
+            )
+        ):
+            raise EvidenceError(f"{variant} cannot claim production cadence evidence")
+        if len(raw) != 1:
+            raise EvidenceError(f"{variant} requires exactly one mapper invocation")
+        invocation = _mapping(raw[0], f"{variant} mapper invocation")
         _exact_keys(
             invocation,
             {
@@ -1471,248 +4007,274 @@ def _validate_mapper_invocations(
                 "pair_list_digest",
                 "descriptor_matcher",
             },
-            f"mapper_invocations[{index}]",
+            f"{variant} mapper invocation",
         )
-        if invocation["outcome"] not in {"accepted", "rejected_geometry_gate"}:
-            raise EvidenceError(f"mapper_invocations[{index}].outcome is invalid")
-        mapping_attempt_ordinal = invocation["mapping_attempt_ordinal"]
         if (
-            type(mapping_attempt_ordinal) is not int
-            or not 1
-            <= mapping_attempt_ordinal
-            <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
-            or (
-                invocations
-                and mapping_attempt_ordinal
-                <= invocations[-1]["mapping_attempt_ordinal"]
-            )
+            invocation["outcome"] != "accepted"
+            or invocation["mapping_attempt_ordinal"] != 1
+            or invocation["matching_attempt"] != 1
+            or invocation["descriptor_matcher"] != "exact"
         ):
             raise EvidenceError(
-                "mapper_invocations mapping-attempt ordinals must strictly increase"
+                f"{variant} mapper invocation must record one accepted exact mapping"
             )
-        matching_attempt = invocation["matching_attempt"]
-        if type(matching_attempt) is not int or matching_attempt <= 0:
-            raise EvidenceError(
-                f"mapper_invocations[{index}].matching_attempt must be a positive integer"
-            )
-        _digest(
-            invocation["pair_list_digest"],
-            f"mapper_invocations[{index}].pair_list_digest",
-        )
-        if invocation["descriptor_matcher"] not in {"faiss", "exact"}:
-            raise EvidenceError(
-                f"mapper_invocations[{index}].descriptor_matcher is invalid"
-            )
-        invocations.append(invocation)
-    accepted = [
-        index for index, invocation in enumerate(invocations)
-        if invocation["outcome"] == "accepted"
-    ]
-    if geometry_execution is not None:
-        outer_ordinals = [
-            invocation["mapping_attempt_ordinal"] for invocation in invocations
-        ]
-        if outer_ordinals != geometry_execution["successful_mapper_attempt_ordinals"]:
-            raise EvidenceError(
-                "mapper invocation ordinals do not match successful worker mapping attempts"
-            )
-    if geometry_execution is not None and geometry_execution["refinement_kind"] == (
-        "seededBundleAdjustment"
-    ):
-        if accepted:
-            raise EvidenceError(
-                "seeded geometry cannot claim an accepted incremental mapper invocation"
-            )
-        if variant not in {"candidate", "fast_candidate"}:
-            raise EvidenceError("seeded geometry is only valid for candidate execution")
-        initial_cadence = _candidate_mapper_cadence(
-            request["candidate_run_configuration"]
-        )
-        topology = request["candidate_run_configuration"]["input_topology"]
-        for index, invocation in enumerate(invocations):
-            expected_cadence = (
-                (1.4, 1.4, 5, 2)
-                if topology == "continuous" and index > 0
-                else initial_cadence
-            )
-            _validate_mapper_invocation_argv(
-                invocation["argv"],
-                variant,
-                expected_cadence=expected_cadence,
-                label=f"seeded fallback rejected mapper invocation {index}",
-            )
-            if index == 0:
-                continue
-            previous = invocations[index - 1]
-            same_first_graph_retry = topology == "continuous" and index == 1
-            if same_first_graph_retry:
-                if any(
-                    invocation[field] != previous[field]
-                    for field in (
-                        "matching_attempt",
-                        "pair_list_digest",
-                        "descriptor_matcher",
-                    )
-                ):
-                    raise EvidenceError(
-                        "seeded conservative retry must reuse the fast mapper pair graph"
-                    )
-            elif invocation["matching_attempt"] <= previous["matching_attempt"]:
-                raise EvidenceError(
-                    "seeded mapper matching attempts must increase after rematching"
-                )
-        return
-    if len(accepted) != 1:
-        raise EvidenceError("mapper_invocations require exactly one accepted invocation")
-    if accepted[0] != len(invocations) - 1:
-        raise EvidenceError("the accepted mapper invocation must be last")
-    if any(
-        invocation["outcome"] != "rejected_geometry_gate"
-        for invocation in invocations[:-1]
-    ):
-        raise EvidenceError(
-            "every mapper invocation before the accepted final invocation must fail its geometry gate"
-        )
-    if (
-        geometry_execution is not None
-        and invocations[accepted[0]]["mapping_attempt_ordinal"]
-        != geometry_execution["accepted_mapping_attempt_ordinal"]
-    ):
-        raise EvidenceError(
-            "accepted mapper ordinal does not match the geometry accepted attempt"
-        )
-
-    if variant in {"baseline", "accurate_reference"}:
-        if len(invocations) != 1:
-            raise EvidenceError(f"{variant} requires exactly one mapper invocation")
-        if invocations[0]["descriptor_matcher"] != "exact":
-            raise EvidenceError(f"{variant} mapper invocation must record exact matching")
+        _digest(invocation["pair_list_digest"], f"{variant} pair-list digest")
         _validate_mapper_invocation_argv(
-            invocations[0]["argv"],
+            invocation["argv"],
             variant,
             expected_cadence=None,
             label=f"{variant} mapper invocation",
         )
         return
-
-    initial_cadence = _candidate_mapper_cadence(request["candidate_run_configuration"])
-    topology = request["candidate_run_configuration"]["input_topology"]
-    planned_matcher = request["candidate_run_configuration"]["descriptor_matcher"]
-
-    def validate_accepted_geometry(expected_cadence: tuple[float, float, int, int]) -> None:
-        if geometry_execution is None:
-            return
-        if geometry_execution["refinement_kind"] != "incrementalGlobal":
-            raise EvidenceError("incremental mapper receipt contradicts the geometry route")
-        cadence = _mapping(
-            geometry_execution["incremental_cadence"],
-            "geometry accepted mapper cadence",
-        )
-        expected_manifest_cadence = {
-            "localMaxRefinements": expected_cadence[3],
-            "globalFramesRatio": expected_cadence[0],
-            "globalPointsRatio": expected_cadence[1],
-            "globalMaxRefinements": expected_cadence[2],
-            "localMaxNumIterations": 10,
-            "localFunctionTolerance": 0.001,
-            "globalFunctionTolerance": 0.000_001,
-            "localImageCount": 6,
-        }
-        if dict(cadence) != expected_manifest_cadence:
-            raise EvidenceError(
-                "geometry accepted mapper cadence contradicts the execution receipt"
+    if variant not in {"candidate", "fast_candidate"}:
+        raise EvidenceError(f"unsupported mapper receipt variant: {variant}")
+    seeded = geometry_execution is not None and geometry_execution["refinement_kind"] == "seededBundleAdjustment"
+    if not raw:
+        if seeded and not geometry_execution["successful_mapper_attempt_ordinals"] and all(
+            value is None
+            for value in (
+                planned_mapper_cadence,
+                accepted_mapper_cadence,
+                cadence_fallback_trigger,
             )
-        accepted_invocation = invocations[accepted[0]]
-        if accepted_invocation["pair_list_digest"] != geometry_execution["pair_list_digest"]:
-            raise EvidenceError(
-                "geometry pair-list digest contradicts the accepted mapper receipt"
-            )
-        if accepted_invocation["descriptor_matcher"] != geometry_execution["accepted_matcher"]:
-            raise EvidenceError(
-                "geometry matcher contradicts the accepted mapper receipt"
-            )
-    first_invocation = invocations[0]
-    if first_invocation["descriptor_matcher"] != planned_matcher:
-        if (
-            first_invocation["descriptor_matcher"] != "exact"
-            or first_invocation["matching_attempt"] <= 1
         ):
-            raise EvidenceError(
-                "candidate first exact mapper invocation requires a prior FAISS matching attempt"
-            )
-    if topology != "continuous":
-        for index, invocation in enumerate(invocations):
-            _validate_mapper_invocation_argv(
-                invocation["argv"],
-                variant,
-                expected_cadence=initial_cadence,
-                label=f"{topology} candidate mapper invocation {index}",
-            )
-            if index == 0:
-                continue
-            previous = invocations[index - 1]
-            if invocation["matching_attempt"] <= previous["matching_attempt"]:
-                raise EvidenceError(
-                    f"{topology} mapper matching attempts must strictly increase after a retry"
-                )
-            if (
-                invocation["pair_list_digest"] == previous["pair_list_digest"]
-                and invocation["descriptor_matcher"] == previous["descriptor_matcher"]
-            ):
-                raise EvidenceError(
-                    f"{topology} mapper retries must change the pair list or matcher"
-                )
-            if (
-                previous["descriptor_matcher"] == "exact"
-                and invocation["descriptor_matcher"] == "faiss"
-            ):
-                raise EvidenceError("mapper recovery cannot return from exact to faiss matching")
-        validate_accepted_geometry(initial_cadence)
-        return
-
-    _validate_mapper_invocation_argv(
-        invocations[0]["argv"],
-        variant,
-        expected_cadence=initial_cadence,
-        label="continuous candidate fast 4.0/1 invocation",
+            return
+        raise EvidenceError("candidate mapper evidence is missing")
+    expected_planned, expected_fallback = _candidate_mapper_cadence_contract(
+        request["candidate_run_configuration"]
     )
-    if len(invocations) == 1:
-        validate_accepted_geometry(initial_cadence)
-        return
-    for index, invocation in enumerate(invocations[1:], start=1):
+    if seeded:
+        if any(
+            value is not None
+            for value in (
+                planned_mapper_cadence,
+                accepted_mapper_cadence,
+                cadence_fallback_trigger,
+            )
+        ):
+            raise EvidenceError("seeded geometry cannot claim accepted mapper cadence")
+        planned: dict[str, int | float] = {}
+        accepted_cadence: dict[str, int | float] = {}
+    else:
+        planned = _mapper_cadence(planned_mapper_cadence, "planned mapper cadence")
+        accepted_cadence = _mapper_cadence(
+            accepted_mapper_cadence,
+            "accepted mapper cadence",
+        )
+        if planned != expected_planned:
+            raise EvidenceError(
+                "planned mapper cadence contradicts the protected request"
+            )
+        if accepted_cadence not in (expected_planned, expected_fallback):
+            raise EvidenceError("accepted mapper cadence is not a production cadence")
+        if cadence_fallback_trigger is not None and (
+            cadence_fallback_trigger not in MAPPING_CADENCE_FALLBACK_TRIGGERS
+        ):
+            raise EvidenceError("mapper cadence fallback trigger is invalid")
+
+    invocations: list[Mapping[str, Any]] = []
+    for index, item in enumerate(raw):
+        label = f"mapper_invocations[{index}]"
+        invocation = _mapping(item, label)
+        _exact_keys(
+            invocation,
+            {
+                "argv",
+                "mapping_attempt_ordinal",
+                "incremental_cadence",
+                "global_max_num_iterations",
+                "random_seed",
+                "refine_focal_length",
+                "minimum_pair_inlier_count",
+                "pair_graph_attempt_ordinal",
+                "pair_list_digest",
+                "descriptor_matcher",
+                "matching_database_digest",
+                "evaluation",
+            },
+            label,
+        )
+        mapping_ordinal = invocation["mapping_attempt_ordinal"]
+        pair_ordinal = invocation["pair_graph_attempt_ordinal"]
+        if (
+            type(mapping_ordinal) is not int
+            or not 1 <= mapping_ordinal <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
+            or (invocations and mapping_ordinal <= invocations[-1]["mapping_attempt_ordinal"])
+            or type(pair_ordinal) is not int
+            or pair_ordinal <= 0
+            or (invocations and pair_ordinal < invocations[-1]["pair_graph_attempt_ordinal"])
+        ):
+            raise EvidenceError("mapper invocation ordinals are invalid")
+        cadence = _mapper_cadence(invocation["incremental_cadence"], f"{label}.incremental_cadence")
         _validate_mapper_invocation_argv(
             invocation["argv"],
             variant,
-            expected_cadence=(1.4, 1.4, 5, 2),
-            label=f"continuous candidate conservative 1.4/2 recovery invocation {index}",
+            expected_cadence=(
+                float(cadence["globalFramesRatio"]),
+                float(cadence["globalPointsRatio"]),
+                int(cadence["globalMaxRefinements"]),
+                int(cadence["localMaxRefinements"]),
+            ),
+            expected_options={
+                "--Mapper.ba_global_max_num_iterations": str(
+                    invocation["global_max_num_iterations"]
+                ),
+                "--Mapper.random_seed": str(invocation["random_seed"]),
+                "--Mapper.min_num_matches": str(
+                    invocation["minimum_pair_inlier_count"]
+                ),
+                "--Mapper.ba_refine_focal_length": "1",
+            },
+            label=label,
         )
-    if any(
-        invocations[1][field] != invocations[0][field]
-        for field in ("matching_attempt", "pair_list_digest", "descriptor_matcher")
+        if (
+            type(invocation["global_max_num_iterations"]) is not int
+            or invocation["global_max_num_iterations"] <= 0
+            or type(invocation["random_seed"]) is not int
+            or not 0 <= invocation["random_seed"] <= 2_147_483_647
+            or invocation["refine_focal_length"] is not True
+            or type(invocation["minimum_pair_inlier_count"]) is not int
+            or invocation["minimum_pair_inlier_count"] <= 0
+            or invocation["descriptor_matcher"] not in {"faiss", "exact"}
+        ):
+            raise EvidenceError(f"{label} options are invalid")
+        _digest(invocation["pair_list_digest"], f"{label}.pair_list_digest")
+        _digest(
+            invocation["matching_database_digest"],
+            f"{label}.matching_database_digest",
+        )
+        evaluation = _mapping(invocation["evaluation"], f"{label}.evaluation")
+        _exact_keys(evaluation, {"status", "fallback_trigger"}, f"{label}.evaluation")
+        if evaluation["status"] not in {"accepted", "rejected", "interrupted", "failed"}:
+            raise EvidenceError(f"{label} evaluation status is invalid")
+        trigger = evaluation["fallback_trigger"]
+        if trigger is not None and trigger not in MAPPING_CADENCE_FALLBACK_TRIGGERS:
+            raise EvidenceError(f"{label} fallback trigger is invalid")
+        if evaluation["status"] != "rejected" and trigger is not None:
+            raise EvidenceError(f"{label} fallback trigger requires rejection")
+        invocations.append(invocation)
+
+    first_invocation = invocations[0]
+    if (
+        first_invocation["descriptor_matcher"]
+        != request["candidate_run_configuration"]["descriptor_matcher"]
+        and (
+            first_invocation["descriptor_matcher"] != "exact"
+            or first_invocation["pair_graph_attempt_ordinal"] <= 1
+        )
     ):
         raise EvidenceError(
-            "the first continuous conservative retry must reuse the fast mapper pair graph"
+            "candidate first exact mapper invocation requires prior FAISS evidence"
         )
-    for index in range(2, len(invocations)):
-        previous = invocations[index - 1]
-        invocation = invocations[index]
-        if invocation["matching_attempt"] <= previous["matching_attempt"]:
-            raise EvidenceError(
-                "continuous mapper matching attempts must strictly increase after rematching"
-            )
-        if (
-            invocation["pair_list_digest"] == previous["pair_list_digest"]
-            and invocation["descriptor_matcher"] == previous["descriptor_matcher"]
+
+    accepted_indices = [
+        index
+        for index, invocation in enumerate(invocations)
+        if invocation["evaluation"]["status"] == "accepted"
+    ]
+    if seeded:
+        if accepted_indices or any(
+            invocation["evaluation"]["status"] != "rejected"
+            for invocation in invocations
         ):
-            raise EvidenceError(
-                "continuous mapper rematches must change the pair list or matcher"
-            )
+            raise EvidenceError("seeded geometry cannot claim accepted mapper cadence")
+        outer_ordinals = [item["mapping_attempt_ordinal"] for item in invocations]
+        compact_outer = [
+            {key: value for key, value in invocation.items() if key != "argv"}
+            for invocation in invocations
+        ]
         if (
-            previous["descriptor_matcher"] == "exact"
-            and invocation["descriptor_matcher"] == "faiss"
+            outer_ordinals
+            != geometry_execution["successful_mapper_attempt_ordinals"]
+            or compact_outer != geometry_execution["mapper_invocations"]
         ):
-            raise EvidenceError("mapper recovery cannot return from exact to faiss matching")
-    validate_accepted_geometry((1.4, 1.4, 5, 2))
+            raise EvidenceError("seeded mapper receipt does not bind worker history")
+        return
+    if accepted_indices != [len(invocations) - 1]:
+        raise EvidenceError("the one accepted mapper invocation must be last")
+    if any(
+        invocation["evaluation"]["status"] != "rejected"
+        for invocation in invocations[:-1]
+    ):
+        raise EvidenceError("successful mapper history may contain only rejected then accepted evaluations")
+
+    cadences = [dict(invocation["incremental_cadence"]) for invocation in invocations]
+    transitions = [
+        index for index in range(1, len(cadences)) if cadences[index - 1] != cadences[index]
+    ]
+    if planned == accepted_cadence:
+        if transitions or cadence_fallback_trigger is not None or any(
+            cadence != planned for cadence in cadences
+        ) or any(
+            invocation["evaluation"]["fallback_trigger"] is not None
+            for invocation in invocations
+        ):
+            raise EvidenceError("mapper cadence changed without an accepted fallback")
+    else:
+        transition_index = transitions[0] if len(transitions) == 1 else None
+        if (
+            accepted_cadence != expected_fallback
+            or transition_index is None
+            or cadence_fallback_trigger is None
+            or any(cadence != planned for cadence in cadences[:transition_index])
+            or any(
+                cadence != accepted_cadence
+                for cadence in cadences[transition_index:]
+            )
+            or any(
+                invocation["evaluation"]["fallback_trigger"] is not None
+                for index, invocation in enumerate(invocations)
+                if index != transition_index - 1
+            )
+        ):
+            raise EvidenceError("mapper cadence transition is invalid")
+        assert transition_index is not None
+        first = invocations[transition_index - 1]
+        second = invocations[transition_index]
+        if (
+            first["evaluation"]["status"] != "rejected"
+            or first["evaluation"]["fallback_trigger"] != cadence_fallback_trigger
+            or any(
+                first[field] != second[field]
+                for field in (
+                    "pair_graph_attempt_ordinal",
+                    "pair_list_digest",
+                    "descriptor_matcher",
+                    "matching_database_digest",
+                )
+            )
+        ):
+            raise EvidenceError("mapper cadence fallback must reuse one rejected pair graph")
+
+    final = invocations[-1]
+    if dict(final["incremental_cadence"]) != accepted_cadence:
+        raise EvidenceError("accepted mapper invocation cadence is invalid")
+    if geometry_execution is not None:
+        if (
+            geometry_execution["refinement_kind"] != "incrementalGlobal"
+            or geometry_execution["planned_incremental_cadence"] != planned
+            or geometry_execution["incremental_cadence"] != accepted_cadence
+            or geometry_execution["cadence_fallback_trigger"]
+            != cadence_fallback_trigger
+            or final["mapping_attempt_ordinal"]
+            != geometry_execution["accepted_mapping_attempt_ordinal"]
+            or final["pair_list_digest"] != geometry_execution["pair_list_digest"]
+            or final["descriptor_matcher"] != geometry_execution["accepted_matcher"]
+            or final["pair_graph_attempt_ordinal"]
+            != geometry_execution["accepted_pair_graph_attempt_ordinal"]
+            or final["matching_database_digest"]
+            != geometry_execution["matching_database_digest"]
+        ):
+            raise EvidenceError("mapper receipt contradicts accepted geometry")
+        outer_ordinals = [item["mapping_attempt_ordinal"] for item in invocations]
+        if outer_ordinals != geometry_execution["successful_mapper_attempt_ordinals"]:
+            raise EvidenceError("mapper receipt does not bind successful worker history")
+        compact_outer = [
+            {key: value for key, value in invocation.items() if key != "argv"}
+            for invocation in invocations
+        ]
+        if geometry_execution["mapper_invocations"] != compact_outer:
+            raise EvidenceError("mapper receipt does not match worker mapper evidence")
 
 
 def _expected_variant_identity(
@@ -1756,14 +4318,83 @@ def _read_command_log(path: Path) -> list[Any]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
         return [
-            _decode_json_text(line, "command_log")
-            for line in lines
-            if line.strip()
+            _decode_json_text(line, "command_log") for line in lines if line.strip()
         ]
     except EvidenceError:
         raise
     except (OSError, UnicodeError, ValueError) as error:
         raise EvidenceError("command_log is not valid JSONL") from error
+
+
+def _validate_mapper_evaluation(value: Any, label: str) -> Mapping[str, Any]:
+    evaluation = _mapping(value, label)
+    _exact_keys(evaluation, {"status", "fallbackTrigger"}, label)
+    status = evaluation["status"]
+    trigger = evaluation["fallbackTrigger"]
+    if status not in {"accepted", "rejected", "interrupted", "failed"}:
+        raise EvidenceError(f"{label} status is invalid")
+    if trigger is not None and trigger not in MAPPING_CADENCE_FALLBACK_TRIGGERS:
+        raise EvidenceError(f"{label} fallback trigger is invalid")
+    if status != "rejected" and trigger is not None:
+        raise EvidenceError(f"{label} fallback trigger requires rejection")
+    return evaluation
+
+
+def _validate_mapper_execution(
+    value: Any,
+    *,
+    label: str,
+    succeeded: bool,
+) -> Mapping[str, Any]:
+    execution = _mapping(value, label)
+    _exact_keys(
+        execution,
+        {
+            "incrementalCadence",
+            "globalMaxNumIterations",
+            "randomSeed",
+            "refineFocalLength",
+            "minimumPairInlierCount",
+            "pairGraphAttemptOrdinal",
+            "pairListDigest",
+            "descriptorMatcher",
+            "matchingDatabaseDigest",
+            "evaluation",
+        },
+        label,
+    )
+    _mapper_cadence(execution["incrementalCadence"], f"{label}.incrementalCadence")
+    if (
+        type(execution["globalMaxNumIterations"]) is not int
+        or execution["globalMaxNumIterations"] <= 0
+        or type(execution["randomSeed"]) is not int
+        or not 0 <= execution["randomSeed"] <= 2_147_483_647
+        or execution["refineFocalLength"] is not True
+        or type(execution["minimumPairInlierCount"]) is not int
+        or execution["minimumPairInlierCount"] <= 0
+        or type(execution["pairGraphAttemptOrdinal"]) is not int
+        or execution["pairGraphAttemptOrdinal"] <= 0
+        or execution["descriptorMatcher"] not in {"faiss", "exact"}
+        or not isinstance(execution["pairListDigest"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", execution["pairListDigest"]) is None
+        or not isinstance(execution["matchingDatabaseDigest"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", execution["matchingDatabaseDigest"])
+        is None
+    ):
+        raise EvidenceError(f"{label} options or graph identity are invalid")
+    evaluation = execution["evaluation"]
+    if evaluation is None:
+        if succeeded:
+            raise EvidenceError(f"{label} successful mapper lacks evaluation")
+        return execution
+    validated_evaluation = _validate_mapper_evaluation(
+        evaluation,
+        f"{label}.evaluation",
+    )
+    status = validated_evaluation["status"]
+    if succeeded != (status in {"accepted", "rejected"}):
+        raise EvidenceError(f"{label} evaluation contradicts process status")
+    return execution
 
 
 def _validate_worker_invocations(
@@ -1790,6 +4421,9 @@ def _validate_worker_invocations(
         "explicitThreadEnvironment",
         "removedThreadEnvironmentKeysSHA256",
         "effectiveSanitizedThreadEnvironment",
+        "pairExecution",
+        "mapperExecution",
+        "modelConversion",
         "exitStatus",
         "succeeded",
     }
@@ -1807,14 +4441,14 @@ def _validate_worker_invocations(
         ):
             raise EvidenceError(f"{invocation_context} command is invalid")
         if command not in allowed_commands:
-            raise EvidenceError(f"{invocation_context} command belongs to another stage")
+            raise EvidenceError(
+                f"{invocation_context} command belongs to another stage"
+            )
         mapping_attempt_ordinal = invocation["mappingAttemptOrdinal"]
         if expects_mapping_attempt_ordinal:
             if (
                 type(mapping_attempt_ordinal) is not int
-                or not 1
-                <= mapping_attempt_ordinal
-                <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
+                or not 1 <= mapping_attempt_ordinal <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
                 or mapping_attempt_ordinal < previous_mapping_attempt_ordinal
             ):
                 raise EvidenceError(
@@ -1836,6 +4470,111 @@ def _validate_worker_invocations(
             or succeeded != (exit_status == 0)
         ):
             raise EvidenceError(f"{invocation_context} process status is inconsistent")
+        pair_execution = invocation["pairExecution"]
+        if command == "matchesImporter":
+            _validate_pair_execution(
+                pair_execution,
+                context=f"{invocation_context}.pairExecution",
+                kind="matching",
+                succeeded=succeeded,
+            )
+        elif command == "localVocabularyRetriever":
+            _validate_pair_execution(
+                pair_execution,
+                context=f"{invocation_context}.pairExecution",
+                kind="retrieval",
+                succeeded=succeeded,
+            )
+        elif pair_execution is not None:
+            raise EvidenceError(f"{invocation_context} cannot claim pair execution")
+        mapper_execution = invocation["mapperExecution"]
+        if command == "mapper":
+            _validate_mapper_execution(
+                mapper_execution,
+                label=f"{invocation_context}.mapperExecution",
+                succeeded=succeeded,
+            )
+        elif mapper_execution is not None:
+            raise EvidenceError(f"{invocation_context} cannot claim mapper execution")
+        model_conversion = invocation["modelConversion"]
+        if command == "modelConverter":
+            conversion = _mapping(
+                model_conversion,
+                f"{invocation_context}.modelConversion",
+            )
+            _exact_keys(
+                conversion,
+                {
+                    "executableComponentPath",
+                    "executableSHA256",
+                    "candidateProjectRelativePath",
+                    "inputProjectRelativePath",
+                    "outputProjectRelativePath",
+                    "sourceModelDigest",
+                    "convertedModelDigest",
+                    "candidateIdentitySHA256",
+                },
+                f"{invocation_context}.modelConversion",
+            )
+            if conversion["executableComponentPath"] != "bin/colmap":
+                raise EvidenceError(
+                    f"{invocation_context} model-conversion executable path is invalid"
+                )
+            for field in (
+                "candidateProjectRelativePath",
+                "inputProjectRelativePath",
+                "outputProjectRelativePath",
+            ):
+                raw_path = conversion[field]
+                if not isinstance(raw_path, str):
+                    raise EvidenceError(
+                        f"{invocation_context} model-conversion path is invalid"
+                    )
+                relative = PurePosixPath(raw_path)
+                if (
+                    relative.is_absolute()
+                    or not relative.parts
+                    or any(part in {"", ".", ".."} for part in relative.parts)
+                    or "\\" in raw_path
+                ):
+                    raise EvidenceError(
+                        f"{invocation_context} model-conversion path is unsafe"
+                    )
+            if (
+                conversion["inputProjectRelativePath"]
+                == conversion["outputProjectRelativePath"]
+            ):
+                raise EvidenceError(
+                    f"{invocation_context} model-conversion input and output paths must differ"
+                )
+            for field in (
+                "executableSHA256",
+                "sourceModelDigest",
+                "candidateIdentitySHA256",
+            ):
+                raw_digest = conversion[field]
+                if (
+                    not isinstance(raw_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", raw_digest) is None
+                ):
+                    raise EvidenceError(
+                        f"{invocation_context} model-conversion digest is invalid"
+                    )
+            converted_digest = conversion["convertedModelDigest"]
+            if succeeded:
+                if (
+                    not isinstance(converted_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", converted_digest) is None
+                ):
+                    raise EvidenceError(
+                        f"{invocation_context} successful model conversion lacks its digest"
+                    )
+            elif converted_digest is not None:
+                raise EvidenceError(
+                    f"{invocation_context} failed model conversion cannot claim an output digest"
+                )
+        elif model_conversion is not None:
+            raise EvidenceError(f"{invocation_context} cannot claim model conversion")
         if (
             invocation["removedThreadEnvironmentKeysSHA256"]
             != COLMAP_THREAD_ENVIRONMENT_KEYS_SHA256
@@ -1861,13 +4600,772 @@ def _validate_worker_invocations(
                 or dict(explicit_environment) != expected_environment
                 or dict(effective_environment) != expected_environment
             ):
-                raise EvidenceError(f"{invocation_context} bounded worker launch is invalid")
+                raise EvidenceError(
+                    f"{invocation_context} bounded worker launch is invalid"
+                )
         elif (
             invocation["argvWorkerCount"] is not None
             or explicit_environment
             or effective_environment
         ):
             raise EvidenceError(f"{invocation_context} native-auto launch is invalid")
+
+
+def _validate_pair_execution(
+    value: Any,
+    *,
+    context: str,
+    kind: str,
+    succeeded: bool,
+) -> None:
+    binding = _mapping(value, context)
+    required_fields = {"attemptOrdinal", "descriptorMatcher"}
+    optional_fields = {
+        "scheduledPairCount",
+        "pairListDigest",
+        "exactRecoveryReason",
+        "retrievalRequestDigest",
+        "retrievalOutputDigest",
+    }
+    if not required_fields.issubset(binding) or not set(binding).issubset(
+        required_fields | optional_fields
+    ):
+        raise EvidenceError(f"{context} has invalid fields")
+    attempt_ordinal = binding["attemptOrdinal"]
+    descriptor_matcher = binding["descriptorMatcher"]
+    scheduled_pair_count = binding.get("scheduledPairCount")
+    pair_list_digest = binding.get("pairListDigest")
+    exact_recovery_reason = binding.get("exactRecoveryReason")
+    request_digest = binding.get("retrievalRequestDigest")
+    output_digest = binding.get("retrievalOutputDigest")
+    if (
+        type(attempt_ordinal) is not int
+        or not 1 <= attempt_ordinal <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
+        or not isinstance(descriptor_matcher, str)
+        or descriptor_matcher not in {"faiss", "exact"}
+    ):
+        raise EvidenceError(f"{context} identity is invalid")
+
+    def is_sha256(value: Any) -> bool:
+        return (
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+
+    if kind == "matching":
+        if (
+            type(scheduled_pair_count) is not int
+            or scheduled_pair_count <= 0
+            or not is_sha256(pair_list_digest)
+            or (descriptor_matcher == "exact")
+            != _valid_exact_recovery_reason(exact_recovery_reason)
+            or (
+                descriptor_matcher == "exact"
+                and scheduled_pair_count > MAXIMUM_EXACT_RECOVERY_PAIR_COUNT
+            )
+        ):
+            raise EvidenceError(f"{context} pair-list digest is invalid")
+        if (request_digest is None) != (output_digest is None):
+            raise EvidenceError(f"{context} retrieval digests are incomplete")
+        if request_digest is not None and (
+            not is_sha256(request_digest) or not is_sha256(output_digest)
+        ):
+            raise EvidenceError(f"{context} retrieval digests are invalid")
+        return
+    if kind != "retrieval":
+        raise AssertionError(f"unsupported pair-execution kind: {kind}")
+    if (
+        scheduled_pair_count is not None
+        or pair_list_digest is not None
+        or exact_recovery_reason is not None
+        or not is_sha256(request_digest)
+    ):
+        raise EvidenceError(f"{context} retrieval request is invalid")
+    if succeeded and not is_sha256(output_digest):
+        raise EvidenceError(f"{context} successful retrieval output is invalid")
+    if output_digest is not None and not is_sha256(output_digest):
+        raise EvidenceError(f"{context} retrieval output is invalid")
+
+
+def _canonical_string_digest(fields: Iterable[str]) -> str:
+    hasher = hashlib.sha256()
+    for field in fields:
+        encoded = field.encode("utf-8")
+        hasher.update(f"{len(encoded)}:".encode("utf-8"))
+        hasher.update(encoded)
+    return hasher.hexdigest()
+
+
+def _validate_retrieval_contract(
+    value: Any,
+    *,
+    image_names: list[str],
+    context: str,
+) -> tuple[str, str]:
+    retrieval = _mapping(value, context)
+    _exact_keys(
+        retrieval,
+        {
+            "engine",
+            "queryImageNames",
+            "queryStride",
+            "candidateCount",
+            "returnedNeighborCount",
+            "minimumFrameSeparation",
+            "queryOutcomes",
+            "directedPairLines",
+            "outputDigest",
+        },
+        context,
+    )
+    image_name_set = set(image_names)
+    if len(image_name_set) != len(image_names) or any(
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or "\0" in name
+        or len(name.encode("utf-8")) > 255
+        for name in image_names
+    ):
+        raise EvidenceError(f"{context} image identity is invalid")
+    engine = retrieval["engine"]
+    query_names = retrieval["queryImageNames"]
+    query_stride = retrieval["queryStride"]
+    candidate_count = retrieval["candidateCount"]
+    neighbor_count = retrieval["returnedNeighborCount"]
+    minimum_separation = retrieval["minimumFrameSeparation"]
+    if (
+        engine != "localSiftVocabularyV2"
+        or not isinstance(query_names, list)
+        or not query_names
+        or len(query_names) != len(set(query_names))
+        or any(name not in image_name_set for name in query_names)
+        or type(query_stride) is not int
+        or query_stride <= 0
+        or type(candidate_count) is not int
+        or candidate_count <= 0
+        or type(neighbor_count) is not int
+        or not 0 < neighbor_count <= candidate_count
+        or type(minimum_separation) is not int
+        or minimum_separation < 0
+    ):
+        raise EvidenceError(f"{context} request is invalid")
+
+    raw_outcomes = retrieval["queryOutcomes"]
+    if not isinstance(raw_outcomes, list) or len(raw_outcomes) != len(query_names):
+        raise EvidenceError(f"{context} outcomes are invalid")
+    outcomes: list[tuple[str, str, list[str]]] = []
+    outcome_edges: set[tuple[str, str]] = set()
+    for index, raw_outcome in enumerate(raw_outcomes):
+        outcome_context = f"{context}.queryOutcomes[{index}]"
+        outcome = _mapping(raw_outcome, outcome_context)
+        _exact_keys(
+            outcome,
+            {"queryImageName", "status", "rankedNeighborImageNames"},
+            outcome_context,
+        )
+        query_name = outcome["queryImageName"]
+        status = outcome["status"]
+        neighbors = outcome["rankedNeighborImageNames"]
+        if (
+            query_name != query_names[index]
+            or status not in {"ranked", "noRankedNeighbors"}
+            or not isinstance(neighbors, list)
+            or len(neighbors) != len(set(neighbors))
+            or neighbors != sorted(neighbors, key=lambda name: name.encode("utf-8"))
+            or any(
+                not isinstance(neighbor, str)
+                or neighbor not in image_name_set
+                or neighbor == query_name
+                for neighbor in neighbors
+            )
+            or (status == "ranked") != bool(neighbors)
+        ):
+            raise EvidenceError(f"{outcome_context} is invalid")
+        outcomes.append((query_name, status, neighbors))
+        outcome_edges.update((query_name, neighbor) for neighbor in neighbors)
+
+    directed_lines = retrieval["directedPairLines"]
+    if (
+        not isinstance(directed_lines, list)
+        or len(directed_lines) != len(set(directed_lines))
+        or directed_lines
+        != sorted(directed_lines, key=lambda line: line.encode("utf-8"))
+    ):
+        raise EvidenceError(f"{context} directed pairs are invalid")
+    for line in directed_lines:
+        if not isinstance(line, str):
+            raise EvidenceError(f"{context} directed pairs are invalid")
+        fields = line.split()
+        if len(fields) != 2 or (fields[0], fields[1]) not in outcome_edges:
+            raise EvidenceError(f"{context} directed pairs are invalid")
+
+    request_digest = _canonical_string_digest(
+        [
+            engine,
+            str(query_stride),
+            str(candidate_count),
+            str(neighbor_count),
+            str(minimum_separation),
+            *query_names,
+        ]
+    )
+    header = " ".join(
+        [
+            "EASYSPLAT_RETRIEVAL_OUTCOMES_V2",
+            engine,
+            str(query_stride),
+            str(candidate_count),
+            str(neighbor_count),
+            str(minimum_separation),
+            str(len(query_names)),
+            request_digest,
+        ]
+    )
+    contract_lines = [header]
+    contract_lines.extend(
+        " ".join(["Q", status, query, str(len(neighbors)), *neighbors])
+        for query, status, neighbors in outcomes
+    )
+    contract_lines.extend(f"P {line}" for line in directed_lines)
+    output_digest = retrieval["outputDigest"]
+    expected_output_digest = _canonical_string_digest(contract_lines)
+    if (
+        not isinstance(output_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", output_digest) is None
+        or output_digest != expected_output_digest
+    ):
+        raise EvidenceError(f"{context} output digest is invalid")
+    return request_digest, output_digest
+
+
+def _validate_rejected_retrieval_topology(
+    *,
+    retrieval: Mapping[str, Any],
+    image_names: list[str],
+    groups: list[dict[str, Any]],
+    pairing_policy: str,
+    temporal_pairing: str,
+    temporal_offsets: list[int],
+    recovery_level: str,
+    context: str,
+) -> None:
+    image_index = {name: index for index, name in enumerate(image_names)}
+    base_edges: set[tuple[int, int]] = set()
+    if recovery_level == "maximum" and len(image_names) <= 250:
+        base_edges.update(
+            (first, second)
+            for first in range(len(image_names) - 1)
+            for second in range(first + 1, len(image_names))
+        )
+    elif temporal_pairing in {"linear", "multiscale"}:
+        offsets = temporal_offsets
+        if recovery_level != "normal" and pairing_policy != "segmentedMixed":
+            offsets = sorted(set(offsets).union(range(1, 13)))
+        for group in groups:
+            if pairing_policy == "segmentedMixed" and not group["isVideo"]:
+                continue
+            indices = [image_index[name] for name in group["imageNames"]]
+            for offset in offsets:
+                for first in range(len(indices) - offset):
+                    base_edges.add((indices[first], indices[first + offset]))
+    elif temporal_pairing != "none":
+        raise EvidenceError(f"{context} temporal pairing is invalid")
+
+    expected_lines: list[str] = []
+    retrieval_edges: set[tuple[int, int]] = set()
+    minimum_separation = retrieval["minimumFrameSeparation"]
+    maximum_neighbors = retrieval["returnedNeighborCount"]
+    for index, raw_outcome in enumerate(retrieval["queryOutcomes"]):
+        outcome = _mapping(raw_outcome, f"{context}.queryOutcomes[{index}]")
+        query_name = outcome["queryImageName"]
+        query_index = image_index[query_name]
+        retained_neighbor_count = 0
+        for neighbor_name in outcome["rankedNeighborImageNames"]:
+            neighbor_index = image_index[neighbor_name]
+            edge = (
+                min(query_index, neighbor_index),
+                max(query_index, neighbor_index),
+            )
+            if edge in base_edges:
+                continue
+            if abs(query_index - neighbor_index) < minimum_separation:
+                raise EvidenceError(f"{context} retrieval separation is invalid")
+            retained_neighbor_count += 1
+            if retained_neighbor_count > maximum_neighbors:
+                raise EvidenceError(f"{context} retrieval neighbor count is invalid")
+            if edge not in retrieval_edges:
+                retrieval_edges.add(edge)
+                expected_lines.append(f"{query_name} {neighbor_name}")
+    expected_lines.sort(key=lambda line: line.encode("utf-8"))
+    if retrieval["directedPairLines"] != expected_lines:
+        raise EvidenceError(f"{context} directed pairs do not match ranked outcomes")
+
+    adjacency = [set() for _ in image_names]
+    for first, second in base_edges.union(retrieval_edges):
+        adjacency[first].add(second)
+        adjacency[second].add(first)
+    visited = {0}
+    frontier = [0]
+    while frontier:
+        current = frontier.pop()
+        for neighbor in adjacency[current]:
+            if neighbor not in visited:
+                visited.add(neighbor)
+                frontier.append(neighbor)
+    if len(visited) == len(image_names):
+        raise EvidenceError(
+            f"{context} does not prove a disconnected merged schedule"
+        )
+
+
+def _validate_rejected_vocabulary_retrieval_history(
+    value: Any,
+    *,
+    accepted_invocations: list[Any],
+    expected_worker_count: int,
+    candidate_configuration: Mapping[str, Any],
+    request: Mapping[str, Any],
+    image_names: list[str],
+) -> tuple[str, ...]:
+    context = "runtime rejected vocabulary retrieval history"
+    if not isinstance(value, list) or len(value) > 3:
+        raise EvidenceError(f"{context} is invalid")
+    if not value:
+        return ()
+
+    pairing_policy = {
+        "generic_continuous": "orderedContinuous",
+        "object_orbit": "orderedOrbit",
+        "walkthrough": "orderedWalkthrough",
+        "large_area": "orderedLargeArea",
+        "segmented_mixed": "segmentedMixed",
+        "unordered_exhaustive": "unorderedRetrieval",
+        "unordered_retrieval": "unorderedRetrieval",
+    }[candidate_configuration["pairing_policy"]]
+    requires_cross_clip = _requires_cross_clip_retrieval(
+        request,
+        candidate_configuration,
+    )
+    expected_camera_model = _resolved_camera_model(candidate_configuration)
+    expected_camera_grouping = _resolved_camera_grouping(
+        candidate_configuration["camera_grouping"], request
+    )
+    expected_camera_recipe = (
+        "sharedOpenCVFisheyeEquidistantDiagonal150V1"
+        if expected_camera_model == "OPENCV_FISHEYE"
+        and expected_camera_grouping == "sameCameraAndLens"
+        else "colmapAutomatic"
+    )
+    expected_plan = {
+        "pairingPolicy": pairing_policy,
+        "geometryBackend": "colmap",
+        "modelIdentifier": "none",
+        "temporalPairing": candidate_configuration["temporal_pairing"],
+        "temporalOffsets": candidate_configuration["temporal_offsets"],
+        "retrievalEngine": "localSiftVocabularyV2",
+        "retrievalCandidateCount": candidate_configuration[
+            "vocabulary_candidate_count"
+        ],
+        "retrievalNeighborCount": candidate_configuration[
+            "vocabulary_returned_neighbor_count"
+        ],
+        "retrievalQueryStride": candidate_configuration["vocabulary_query_stride"],
+        "requiresCrossClipRetrieval": requires_cross_clip,
+        "normalDescriptorMatcher": candidate_configuration["descriptor_matcher"],
+        "cameraInitializationRecipe": expected_camera_recipe,
+        "runSeed": candidate_configuration["run_seed"],
+    }
+    accepted_digest_pairs = {
+        (
+            invocation["pairExecution"].get("retrievalRequestDigest"),
+            invocation["pairExecution"].get("retrievalOutputDigest"),
+        )
+        for invocation in accepted_invocations
+        if invocation["succeeded"]
+        and invocation["pairExecution"] is not None
+        and invocation["pairExecution"].get("retrievalRequestDigest") is not None
+        and invocation["pairExecution"].get("retrievalOutputDigest") is not None
+    }
+    recovery_indices = {"normal": 0, "expanded": 1, "maximum": 2}
+    previous_recovery_index = -1
+    previous_pair_attempt = 0
+    bound_groups: list[Any] | None = None
+    for index, raw_entry in enumerate(value, start=1):
+        entry_context = f"{context}[{index - 1}]"
+        entry = _mapping(raw_entry, entry_context)
+        _exact_keys(
+            entry,
+            {
+                "retrievalAttemptOrdinal",
+                "pairingPolicy",
+                "planBinding",
+                "recoveryLevel",
+                "imageNames",
+                "groups",
+                "invocation",
+                "retrieval",
+                "durationSeconds",
+            },
+            entry_context,
+        )
+        recovery_level = entry["recoveryLevel"]
+        recovery_index = recovery_indices.get(recovery_level)
+        duration = entry["durationSeconds"]
+        if (
+            type(entry["retrievalAttemptOrdinal"]) is not int
+            or entry["retrievalAttemptOrdinal"] != index
+            or not isinstance(entry["pairingPolicy"], str)
+            or entry["pairingPolicy"] != pairing_policy
+            or not isinstance(recovery_level, str)
+            or recovery_index is None
+            or recovery_index <= previous_recovery_index
+            or isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(duration)
+            or duration < 0
+            or entry["imageNames"] != image_names
+        ):
+            raise EvidenceError(f"{entry_context} identity is invalid")
+
+        plan = _mapping(entry["planBinding"], f"{entry_context}.planBinding")
+        _exact_keys(plan, set(expected_plan), f"{entry_context}.planBinding")
+        if (
+            not isinstance(plan["pairingPolicy"], str)
+            or not isinstance(plan["geometryBackend"], str)
+            or not isinstance(plan["modelIdentifier"], str)
+            or not isinstance(plan["temporalPairing"], str)
+            or not isinstance(plan["temporalOffsets"], list)
+            or any(type(offset) is not int for offset in plan["temporalOffsets"])
+            or not isinstance(plan["retrievalEngine"], str)
+            or type(plan["retrievalCandidateCount"]) is not int
+            or type(plan["retrievalNeighborCount"]) is not int
+            or type(plan["retrievalQueryStride"]) is not int
+            or type(plan["requiresCrossClipRetrieval"]) is not bool
+            or not isinstance(plan["normalDescriptorMatcher"], str)
+            or not isinstance(plan["cameraInitializationRecipe"], str)
+            or type(plan["runSeed"]) is not int
+            or dict(plan) != expected_plan
+        ):
+            raise EvidenceError(f"{entry_context} plan binding is invalid")
+
+        groups = entry["groups"]
+        if not isinstance(groups, list) or not groups:
+            raise EvidenceError(f"{entry_context} groups are invalid")
+        normalized_groups: list[dict[str, Any]] = []
+        for group_index, raw_group in enumerate(groups):
+            group = _mapping(raw_group, f"{entry_context}.groups[{group_index}]")
+            _exact_keys(
+                group,
+                {"imageNames", "isVideo"},
+                f"{entry_context}.groups[{group_index}]",
+            )
+            if (
+                not isinstance(group["imageNames"], list)
+                or not group["imageNames"]
+                or type(group["isVideo"]) is not bool
+            ):
+                raise EvidenceError(f"{entry_context} groups are invalid")
+            normalized_groups.append(dict(group))
+        if (
+            [name for group in normalized_groups for name in group["imageNames"]]
+            != image_names
+            or (bound_groups is not None and normalized_groups != bound_groups)
+            or (
+                requires_cross_clip
+                and (
+                    len(normalized_groups) <= 1
+                    or not all(group["isVideo"] for group in normalized_groups)
+                )
+            )
+            or sum(group["isVideo"] for group in normalized_groups)
+            != request["video_source_count"]
+        ):
+            raise EvidenceError(f"{entry_context} groups are invalid")
+
+        retrieval = _mapping(entry["retrieval"], f"{entry_context}.retrieval")
+        if requires_cross_clip:
+            expected_queries = [
+                name
+                for group in normalized_groups
+                for name in group["imageNames"][
+                    :: candidate_configuration["vocabulary_query_stride"]
+                ]
+            ]
+        else:
+            expected_queries = image_names[
+                :: candidate_configuration["vocabulary_query_stride"]
+            ]
+        expected_candidate_count = candidate_configuration["vocabulary_candidate_count"]
+        expected_neighbor_count = candidate_configuration[
+            "vocabulary_returned_neighbor_count"
+        ]
+        if recovery_level == "expanded" and pairing_policy in {
+            "segmentedMixed",
+            "unorderedRetrieval",
+        }:
+            expected_candidate_count, expected_neighbor_count = 40, 16
+        elif recovery_level == "maximum":
+            expected_candidate_count, expected_neighbor_count = 80, 32
+        expected_minimum_separation = (
+            0
+            if requires_cross_clip
+            or pairing_policy in {"segmentedMixed", "unorderedRetrieval"}
+            else max(12, len(image_names) // 10)
+        )
+        retrieval_is_required = not (
+            (recovery_level == "maximum" and len(image_names) <= 250)
+            or (pairing_policy == "unorderedRetrieval" and len(image_names) <= 60)
+        ) and (
+            requires_cross_clip
+            or pairing_policy
+            in {
+                "orderedOrbit",
+                "orderedWalkthrough",
+                "orderedLargeArea",
+                "segmentedMixed",
+                "unorderedRetrieval",
+            }
+            or (pairing_policy == "orderedContinuous" and len(image_names) >= 120)
+        )
+        if (
+            not retrieval_is_required
+            or retrieval.get("queryImageNames") != expected_queries
+            or retrieval.get("queryStride")
+            != candidate_configuration["vocabulary_query_stride"]
+            or retrieval.get("candidateCount") != expected_candidate_count
+            or retrieval.get("returnedNeighborCount") != expected_neighbor_count
+            or retrieval.get("minimumFrameSeparation") != expected_minimum_separation
+        ):
+            raise EvidenceError(f"{entry_context} retrieval does not match its plan")
+        request_digest, output_digest = _validate_retrieval_contract(
+            retrieval,
+            image_names=image_names,
+            context=f"{entry_context}.retrieval",
+        )
+        _validate_rejected_retrieval_topology(
+            retrieval=retrieval,
+            image_names=image_names,
+            groups=normalized_groups,
+            pairing_policy=pairing_policy,
+            temporal_pairing=plan["temporalPairing"],
+            temporal_offsets=plan["temporalOffsets"],
+            recovery_level=recovery_level,
+            context=f"{entry_context}.retrieval",
+        )
+
+        invocation = entry["invocation"]
+        _validate_worker_invocations(
+            [invocation],
+            context=f"{entry_context}.invocation",
+            allowed_commands=frozenset({"localVocabularyRetriever"}),
+            expected_policy="bounded",
+            expected_worker_count=expected_worker_count,
+            expects_mapping_attempt_ordinal=False,
+            required=True,
+        )
+        binding = invocation["pairExecution"]
+        digest_pair = (request_digest, output_digest)
+        if (
+            not invocation["succeeded"]
+            or binding["attemptOrdinal"] < previous_pair_attempt
+            or binding["descriptorMatcher"] != "faiss"
+            or binding.get("scheduledPairCount") is not None
+            or binding.get("pairListDigest") is not None
+            or binding.get("exactRecoveryReason") is not None
+            or binding.get("retrievalRequestDigest") != request_digest
+            or binding.get("retrievalOutputDigest") != output_digest
+            or digest_pair in accepted_digest_pairs
+        ):
+            raise EvidenceError(f"{entry_context} invocation is not bound")
+        bound_groups = normalized_groups
+        previous_recovery_index = recovery_index
+        previous_pair_attempt = binding["attemptOrdinal"]
+    return tuple(entry["recoveryLevel"] for entry in value)
+
+
+def _validate_recovery_density_closure(
+    matcher_attempts: list[Any],
+    rejected_recovery_levels: tuple[str, ...],
+) -> None:
+    context = "runtime recovery density closure"
+    level_index = {"normal": 0, "expanded": 1, "maximum": 2}
+    if not matcher_attempts:
+        raise EvidenceError(f"{context} is empty")
+    attempt_levels = [
+        level_index.get(
+            _mapping(attempt, f"{context}.attempts[{index}]").get("recoveryLevel")
+        )
+        for index, attempt in enumerate(matcher_attempts)
+    ]
+    rejected_levels = [level_index.get(level) for level in rejected_recovery_levels]
+    if (
+        any(level is None for level in attempt_levels)
+        or any(level is None for level in rejected_levels)
+        or rejected_levels != sorted(set(rejected_levels))
+    ):
+        raise EvidenceError(f"{context} is invalid")
+    missing_levels = set(range(attempt_levels[0]))
+    for previous, current in zip(attempt_levels, attempt_levels[1:]):
+        if current < previous:
+            raise EvidenceError(f"{context} regressed")
+        missing_levels.update(range(previous + 1, current))
+    if missing_levels != set(rejected_levels):
+        raise EvidenceError(
+            f"{context} does not authenticate every skipped retrieval density"
+        )
+
+
+def _validate_pair_execution_bindings(
+    artifact: Mapping[str, Any],
+    *,
+    matcher_attempts: list[Any],
+    accepted_pair_list_digest: str,
+) -> None:
+    matching_invocations = artifact["matchingInvocations"]
+    if len(matching_invocations) != len(matcher_attempts):
+        raise EvidenceError(
+            "runtime matcher execution does not bind every pair-graph attempt"
+        )
+    matching_bindings: dict[int, Mapping[str, Any]] = {}
+    for index, (attempt, invocation) in enumerate(
+        zip(matcher_attempts, matching_invocations)
+    ):
+        attempt = _mapping(attempt, f"geometry matcherAttempts[{index}]")
+        binding = _mapping(
+            invocation["pairExecution"],
+            f"runtime matchingInvocations[{index}].pairExecution",
+        )
+        attempt_ordinal = binding["attemptOrdinal"]
+        if (
+            attempt_ordinal != attempt["attemptNumber"]
+            or binding["descriptorMatcher"] != attempt["matcher"]
+            or binding.get("scheduledPairCount") != attempt["scheduledPairCount"]
+            or binding.get("exactRecoveryReason")
+            != attempt.get("exactRecoveryReason")
+            or attempt_ordinal in matching_bindings
+        ):
+            raise EvidenceError(
+                "runtime matcher execution does not match its pair-graph attempt"
+            )
+        if attempt["outcome"] == "completed" and not invocation["succeeded"]:
+            raise EvidenceError(
+                "completed pair-graph attempt lacks successful matcher execution"
+            )
+        matching_bindings[attempt_ordinal] = binding
+        if attempt["matcher"] == "exact":
+            if index == 0:
+                raise EvidenceError("runtime exact matcher lacks its FAISS predecessor")
+            previous_attempt = _mapping(
+                matcher_attempts[index - 1],
+                f"geometry matcherAttempts[{index - 1}]",
+            )
+            previous_invocation = matching_invocations[index - 1]
+            previous_binding = _mapping(
+                previous_invocation["pairExecution"],
+                f"runtime matchingInvocations[{index - 1}].pairExecution",
+            )
+            reason = attempt.get("exactRecoveryReason")
+            predecessor_status_is_bound = (
+                reason in ("faissCrash", "faissUnsupportedOperation")
+                and not previous_invocation["succeeded"]
+            ) or (
+                reason == "faissGeometryRejectedAfterRetries"
+                and previous_invocation["succeeded"]
+            )
+            if (
+                previous_attempt["matcher"] != "faiss"
+                or binding.get("pairListDigest")
+                != previous_binding.get("pairListDigest")
+                or binding.get("scheduledPairCount")
+                != previous_binding.get("scheduledPairCount")
+                or not predecessor_status_is_bound
+            ):
+                raise EvidenceError(
+                    "runtime exact matcher is not bound to its FAISS predecessor"
+                )
+    accepted_binding = matching_bindings[matcher_attempts[-1]["attemptNumber"]]
+    if accepted_binding.get("pairListDigest") != accepted_pair_list_digest:
+        raise EvidenceError(
+            "accepted matcher execution does not bind the published pair list"
+        )
+
+    seen_retrieval_attempts: set[int] = set()
+    for index, invocation in enumerate(artifact["vocabularyRetrievalInvocations"]):
+        binding = _mapping(
+            invocation["pairExecution"],
+            f"runtime vocabularyRetrievalInvocations[{index}].pairExecution",
+        )
+        attempt_ordinal = binding["attemptOrdinal"]
+        matcher_binding = matching_bindings.get(attempt_ordinal)
+        if (
+            matcher_binding is None
+            or attempt_ordinal in seen_retrieval_attempts
+            or binding["descriptorMatcher"] != matcher_binding["descriptorMatcher"]
+            or binding.get("retrievalRequestDigest")
+            != matcher_binding.get("retrievalRequestDigest")
+            or binding.get("retrievalOutputDigest")
+            != matcher_binding.get("retrievalOutputDigest")
+        ):
+            raise EvidenceError(
+                "runtime vocabulary retrieval does not bind its matcher attempt"
+            )
+        seen_retrieval_attempts.add(attempt_ordinal)
+
+
+def _validate_unmeasured_matching_history(
+    invocations: list[Any],
+) -> None:
+    if not 1 <= len(invocations) <= 2:
+        raise EvidenceError(
+            "unmeasured seeded geometry has invalid matching history"
+        )
+    first = invocations[0]
+    first_binding = _mapping(
+        first["pairExecution"],
+        "unmeasured seeded geometry FAISS pair execution",
+    )
+    scheduled_pair_count = first_binding.get("scheduledPairCount")
+    pair_list_digest = first_binding.get("pairListDigest")
+    if (
+        first_binding["attemptOrdinal"] != 1
+        or first_binding["descriptorMatcher"] != "faiss"
+        or first_binding.get("exactRecoveryReason") is not None
+        or type(scheduled_pair_count) is not int
+        or scheduled_pair_count <= 0
+        or not isinstance(pair_list_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", pair_list_digest) is None
+    ):
+        raise EvidenceError(
+            "unmeasured seeded geometry must begin with bound FAISS matching"
+        )
+    if len(invocations) == 1:
+        if not first["succeeded"]:
+            raise EvidenceError(
+                "unmeasured seeded geometry lacks successful matching"
+            )
+        return
+
+    exact = invocations[1]
+    exact_binding = _mapping(
+        exact["pairExecution"],
+        "unmeasured seeded geometry exact pair execution",
+    )
+    if (
+        first["succeeded"]
+        or not exact["succeeded"]
+        or exact_binding["attemptOrdinal"] != 2
+        or exact_binding["descriptorMatcher"] != "exact"
+        or exact_binding.get("scheduledPairCount") != scheduled_pair_count
+        or exact_binding.get("pairListDigest") != pair_list_digest
+        or exact_binding.get("exactRecoveryReason")
+        not in ("faissCrash", "faissUnsupportedOperation")
+        or scheduled_pair_count > MAXIMUM_EXACT_RECOVERY_PAIR_COUNT
+    ):
+        raise EvidenceError(
+            "unmeasured seeded exact recovery is not bound to failed FAISS matching"
+        )
 
 
 def _load_runtime_json_artifact(
@@ -1877,6 +5375,29 @@ def _load_runtime_json_artifact(
     label: str,
     maximum_bytes: int,
 ) -> Any:
+    encoded = _load_runtime_artifact_bytes(
+        artifact_root,
+        relative_path,
+        expected_sha256,
+        label,
+        maximum_bytes,
+    )
+    try:
+        decoded = _decode_json_text(encoded.decode("utf-8"), label)
+    except UnicodeError as error:
+        raise EvidenceError(f"{label} is not valid UTF-8 JSON") from error
+    if encoded != canonical_json_bytes(decoded):
+        raise EvidenceError(f"{label} is not canonical JSON")
+    return decoded
+
+
+def _load_runtime_artifact_bytes(
+    artifact_root: Path,
+    relative_path: PurePosixPath,
+    expected_sha256: str,
+    label: str,
+    maximum_bytes: int,
+) -> bytes:
     descriptor = _open_render_artifact(artifact_root, relative_path, label)
     try:
         before = os.fstat(descriptor)
@@ -1920,39 +5441,776 @@ def _load_runtime_json_artifact(
     encoded = b"".join(chunks)
     if sha256_bytes(encoded) != expected_sha256:
         raise EvidenceError(f"{label} digest changed after artifact attestation")
+    return encoded
+
+
+_COLMAP_CAMERA_PARAMETER_COUNTS = {
+    "SIMPLE_PINHOLE": 3,
+    "PINHOLE": 4,
+    "SIMPLE_RADIAL": 4,
+    "RADIAL": 5,
+    "OPENCV": 8,
+    "OPENCV_FISHEYE": 8,
+    "FULL_OPENCV": 12,
+    "FOV": 5,
+    "SIMPLE_RADIAL_FISHEYE": 4,
+    "RADIAL_FISHEYE": 5,
+    "THIN_PRISM_FISHEYE": 12,
+    "RAD_TAN_THIN_PRISM_FISHEYE": 16,
+    "SIMPLE_DIVISION": 4,
+    "DIVISION": 5,
+    "SIMPLE_FISHEYE": 3,
+    "FISHEYE": 4,
+    "EUCM": 6,
+    "EQUIRECTANGULAR": 0,
+}
+
+_COLMAP_DUAL_FOCAL_CAMERA_MODELS = {
+    "PINHOLE",
+    "OPENCV",
+    "OPENCV_FISHEYE",
+    "FULL_OPENCV",
+    "FOV",
+    "THIN_PRISM_FISHEYE",
+    "RAD_TAN_THIN_PRISM_FISHEYE",
+    "DIVISION",
+    "FISHEYE",
+    "EUCM",
+}
+
+
+def _parse_colmap_cameras_text(contents: bytes, label: str) -> list[dict[str, Any]]:
     try:
-        decoded = _decode_json_text(encoded.decode("utf-8"), label)
+        text = contents.decode("utf-8")
     except UnicodeError as error:
-        raise EvidenceError(f"{label} is not valid UTF-8 JSON") from error
-    if encoded != canonical_json_bytes(decoded):
-        raise EvidenceError(f"{label} is not canonical JSON")
-    return decoded
+        raise EvidenceError(f"{label} is not valid UTF-8") from error
+    cameras: list[dict[str, Any]] = []
+    camera_ids: set[int] = set()
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) < 4:
+            raise EvidenceError(f"{label} line {line_number} is malformed")
+        integer_pattern = r"[+-]?[0-9]+"
+        floating_pattern = (
+            r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+            r"(?:[eE][+-]?[0-9]+)?"
+        )
+        if (
+            any(
+                re.fullmatch(integer_pattern, fields[index]) is None
+                for index in (0, 2, 3)
+            )
+            or any(
+                re.fullmatch(floating_pattern, value) is None
+                for value in fields[4:]
+            )
+        ):
+            raise EvidenceError(f"{label} line {line_number} is malformed")
+        try:
+            camera_id = int(fields[0], 10)
+            width = int(fields[2], 10)
+            height = int(fields[3], 10)
+            parameters = [float(value) for value in fields[4:]]
+        except ValueError as error:
+            raise EvidenceError(f"{label} line {line_number} is malformed") from error
+        model = fields[1]
+        expected_count = _COLMAP_CAMERA_PARAMETER_COUNTS.get(model)
+        if (
+            camera_id <= 0
+            or camera_id > (1 << 63) - 1
+            or camera_id in camera_ids
+            or width <= 0
+            or width > (1 << 63) - 1
+            or height <= 0
+            or height > (1 << 63) - 1
+            or expected_count is None
+            or len(parameters) != expected_count
+            or any(not math.isfinite(value) for value in parameters)
+        ):
+            raise EvidenceError(f"{label} line {line_number} is invalid")
+        focal_count = (
+            0
+            if model == "EQUIRECTANGULAR"
+            else 2
+            if model in _COLMAP_DUAL_FOCAL_CAMERA_MODELS
+            else 1
+        )
+        if any(parameters[index] <= 0 for index in range(focal_count)):
+            raise EvidenceError(
+                f"{label} line {line_number} has a nonpositive focal length"
+            )
+        camera_ids.add(camera_id)
+        cameras.append(
+            {
+                "camera_id": camera_id,
+                "model": model,
+                "width": width,
+                "height": height,
+                "parameters": parameters,
+            }
+        )
+    if not cameras:
+        raise EvidenceError(f"{label} contains no cameras")
+    return cameras
+
+
+def _resolved_camera_model(candidate_configuration: Mapping[str, Any]) -> str:
+    projection = candidate_configuration["lens_projection"]
+    detail = candidate_configuration["detail_profile"]
+    capture = candidate_configuration["capture_path"]
+    if projection == "fisheye":
+        return "OPENCV_FISHEYE"
+    if projection == "perspective":
+        return "OPENCV" if detail == "high_detail" else "SIMPLE_RADIAL"
+    if projection == "automatic":
+        return (
+            "OPENCV"
+            if detail == "high_detail"
+            and capture in {"through_space", "large_area"}
+            else "SIMPLE_RADIAL"
+        )
+    raise EvidenceError("camera initialization lens projection is invalid")
+
+
+def _resolved_camera_grouping(
+    requested_grouping: Any,
+    request: Mapping[str, Any],
+) -> str:
+    if requested_grouping == "same_camera_and_lens":
+        return "sameCameraAndLens"
+    if requested_grouping != "automatic":
+        raise EvidenceError("camera grouping request is invalid")
+    return (
+        "sameCameraAndLens"
+        if request["input_kind"] == "video"
+        and request["video_source_count"] == 1
+        else "mixedCamerasOrLenses"
+    )
+
+
+def _validate_geometry_camera_contract(
+    geometry: Mapping[str, Any],
+    cameras: list[dict[str, Any]],
+    candidate_configuration: Mapping[str, Any],
+    request: Mapping[str, Any],
+    selection: SelectionManifestSources,
+    context: str,
+) -> None:
+    requested_grouping = candidate_configuration["camera_grouping"]
+    expected_geometry_grouping = _resolved_camera_grouping(
+        requested_grouping, request
+    )
+    expected_camera_model = _resolved_camera_model(candidate_configuration)
+    if geometry["cameraGrouping"] != expected_geometry_grouping:
+        raise EvidenceError(f"{context} camera grouping contradicts the request")
+    if (
+        geometry["cameraModel"] != expected_camera_model
+        or any(camera["model"] != expected_camera_model for camera in cameras)
+    ):
+        raise EvidenceError(f"{context} camera model contradicts the request")
+
+    receipt = _mapping(
+        geometry.get("cameraGroupingReceipt"),
+        f"{context}.cameraGroupingReceipt",
+    )
+    _exact_keys(
+        receipt,
+        {
+            "mode",
+            "cameraCountBefore",
+            "cameraCountAfter",
+            "groupedVideoSourceCount",
+            "groups",
+        },
+        f"{context}.cameraGroupingReceipt",
+    )
+    groups_value = receipt["groups"]
+    if not isinstance(groups_value, list):
+        raise EvidenceError(f"{context} camera grouping receipt is invalid")
+    groups: list[Mapping[str, Any]] = []
+    for index, value in enumerate(groups_value):
+        group_context = f"{context}.cameraGroupingReceipt.groups[{index}]"
+        group = _mapping(value, group_context)
+        _exact_keys(
+            group,
+            {"sourceGroupID", "memberCount", "canonicalCameraID"},
+            group_context,
+        )
+        groups.append(group)
+    count_fields = (
+        "cameraCountBefore",
+        "cameraCountAfter",
+        "groupedVideoSourceCount",
+    )
+    camera_ids = {camera["camera_id"] for camera in cameras}
+    registered_view_count = geometry.get(
+        "registeredViewCount", geometry["totalViewCount"]
+    )
+    if (
+        type(geometry["totalViewCount"]) is not int
+        or not 1 <= geometry["totalViewCount"] <= (1 << 63) - 1
+        or type(registered_view_count) is not int
+        or not 1 <= registered_view_count <= geometry["totalViewCount"]
+        or len(cameras) > registered_view_count
+        or any(
+            type(receipt[field]) is not int
+            or not 0 <= receipt[field] <= (1 << 63) - 1
+            for field in count_fields
+        )
+        or receipt["cameraCountBefore"] < 1
+        or receipt["cameraCountAfter"] != len(cameras)
+        or receipt["cameraCountAfter"] > receipt["cameraCountBefore"]
+        or receipt["groupedVideoSourceCount"] < 0
+        or any(
+            not isinstance(group["sourceGroupID"], str)
+            or not group["sourceGroupID"]
+            or type(group["memberCount"]) is not int
+            or not 0 < group["memberCount"] <= (1 << 63) - 1
+            or type(group["canonicalCameraID"]) is not int
+            or not 0 < group["canonicalCameraID"] <= (1 << 63) - 1
+            or group["canonicalCameraID"] not in camera_ids
+            for group in groups
+        )
+        or len({group["sourceGroupID"] for group in groups}) != len(groups)
+        or len({group["canonicalCameraID"] for group in groups}) != len(groups)
+    ):
+        raise EvidenceError(f"{context} camera grouping receipt is invalid")
+
+    mode = receipt["mode"]
+    has_video = "video" in selection.source_kinds
+    expected_mode = (
+        "allSelectedImagesShared"
+        if expected_geometry_grouping == "sameCameraAndLens"
+        else "videoSourceGroups"
+        if has_video
+        else "preserveExisting"
+    )
+    if mode != expected_mode:
+        raise EvidenceError(f"{context} camera grouping receipt contradicts the request")
+    if mode == "preserveExisting":
+        valid_grouping = (
+            receipt["cameraCountBefore"] == receipt["cameraCountAfter"]
+            and receipt["groupedVideoSourceCount"] == 0
+            and not groups
+        )
+    elif mode == "videoSourceGroups":
+        expected_video_groups: dict[str, int] = {}
+        for clip_id, source_kind in zip(
+            selection.clip_ids, selection.source_kinds, strict=True
+        ):
+            if source_kind == "video":
+                expected_video_groups[clip_id] = (
+                    expected_video_groups.get(clip_id, 0) + 1
+                )
+        actual_video_groups = {
+            group["sourceGroupID"]: group["memberCount"] for group in groups
+        }
+        valid_grouping = (
+            receipt["groupedVideoSourceCount"] == len(expected_video_groups)
+            and actual_video_groups == expected_video_groups
+            and [group["sourceGroupID"] for group in groups]
+            == sorted(expected_video_groups)
+            and receipt["cameraCountAfter"] >= len(groups)
+        )
+    elif mode == "allSelectedImagesShared":
+        valid_grouping = (
+            len(cameras) == 1
+            and receipt["cameraCountAfter"] == 1
+            and receipt["groupedVideoSourceCount"] == request["video_source_count"]
+            and len(groups) == 1
+            and groups[0]["sourceGroupID"] == "all-selected-images"
+            and groups[0]["memberCount"] == geometry["totalViewCount"]
+            and groups[0]["canonicalCameraID"] == cameras[0]["camera_id"]
+        )
+    else:
+        valid_grouping = False
+    if not valid_grouping:
+        raise EvidenceError(f"{context} camera grouping receipt is invalid")
+
+    initialization_context = f"{context}.cameraInitializationReceipt"
+    initialization = _mapping(
+        geometry.get("cameraInitializationReceipt"), initialization_context
+    )
+    _exact_keys(
+        initialization,
+        {
+            "recipe",
+            "cameraModel",
+            "singleCamera",
+            "pixelWidth",
+            "pixelHeight",
+            "diagonalFieldOfViewDegrees",
+            "cameraParameters",
+            "priorFocalLength",
+        },
+        initialization_context,
+    )
+    initialization_model = initialization["cameraModel"]
+    if (
+        not isinstance(initialization_model, str)
+        or initialization_model != expected_camera_model
+        or type(initialization["singleCamera"]) is not bool
+        or initialization["singleCamera"] != (mode == "allSelectedImagesShared")
+        or type(initialization["priorFocalLength"]) is not bool
+    ):
+        raise EvidenceError(f"{context} camera initialization receipt is invalid")
+    expected_recipe = (
+        "sharedOpenCVFisheyeEquidistantDiagonal150V1"
+        if geometry["cameraModel"] == "OPENCV_FISHEYE"
+        and mode == "allSelectedImagesShared"
+        else "colmapAutomatic"
+    )
+    if initialization["recipe"] != expected_recipe:
+        raise EvidenceError(f"{initialization_context} recipe is invalid")
+    synthetic_fields = (
+        "pixelWidth",
+        "pixelHeight",
+        "diagonalFieldOfViewDegrees",
+        "cameraParameters",
+    )
+    if expected_recipe == "colmapAutomatic":
+        if (
+            any(initialization[field] is not None for field in synthetic_fields)
+            or initialization["priorFocalLength"]
+        ):
+            raise EvidenceError(f"{initialization_context} automatic prior is invalid")
+        return
+
+    parameters = initialization["cameraParameters"]
+    width = initialization["pixelWidth"]
+    height = initialization["pixelHeight"]
+    if (
+        initialization_model != "OPENCV_FISHEYE"
+        or initialization_model != geometry["cameraModel"]
+        or type(width) is not int
+        or not 1 <= width <= 1_000_000
+        or type(height) is not int
+        or not 1 <= height <= 1_000_000
+        or len(cameras) != 1
+        or width != cameras[0]["width"]
+        or height != cameras[0]["height"]
+        or not _finite_number(initialization["diagonalFieldOfViewDegrees"])
+        or initialization["diagonalFieldOfViewDegrees"] != 150
+        or not isinstance(parameters, list)
+        or len(parameters) != 8
+        or not all(_finite_number(parameter) for parameter in parameters)
+        or not initialization["priorFocalLength"]
+    ):
+        raise EvidenceError(f"{initialization_context} shared fisheye prior is invalid")
+    half_width = width / 2
+    half_height = height / 2
+    expected_focal = math.hypot(half_width, half_height) / (75 * math.pi / 180)
+    tolerance = max(1, abs(expected_focal)) * 1e-12
+    if (
+        abs(parameters[0] - expected_focal) > tolerance
+        or abs(parameters[1] - expected_focal) > tolerance
+        or parameters[2] != half_width
+        or parameters[3] != half_height
+        or any(parameter != 0 for parameter in parameters[4:])
+    ):
+        raise EvidenceError(f"{initialization_context} shared fisheye prior is invalid")
+
+
+def _finite_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def _validate_unit_direction(value: Any, context: str) -> None:
+    direction = _mapping(value, context)
+    _exact_keys(direction, {"x", "y", "z"}, context)
+    components = [direction[field] for field in ("x", "y", "z")]
+    if not all(
+        _finite_number(component) for component in components
+    ) or not math.isclose(
+        sum(float(component) ** 2 for component in components),
+        1.0,
+        rel_tol=0,
+        abs_tol=1e-6,
+    ):
+        raise EvidenceError(f"{context} is invalid")
+
+
+def _validate_orientation_evidence(
+    value: Any,
+    *,
+    registered_view_count: int,
+    context: str,
+) -> None:
+    orientation_evidence = _mapping(value, context)
+    required_fields = {
+        "supportCount",
+        "eigenvalue0",
+        "eigenvalue1",
+        "eigenvalue2",
+        "eigengap",
+        "medianResidualDegrees",
+        "p90ResidualDegrees",
+        "bootstrapP95VariationDegrees",
+    }
+    optional_fields = {
+        "medianAbsoluteImageUpAgreement",
+        "signAgreement",
+        "trajectoryPlaneAgreementDegrees",
+        "trajectoryLineConcentration",
+        "cameraUpConcentration",
+        "cameraUpMedianSpreadDegrees",
+        "cameraUpP90SpreadDegrees",
+    }
+    missing = required_fields - set(orientation_evidence)
+    extra = set(orientation_evidence) - required_fields - optional_fields
+    if missing or extra:
+        raise EvidenceError(f"{context} fields are invalid")
+    support_count = orientation_evidence["supportCount"]
+    finite_fields = required_fields - {"supportCount"}
+    if (
+        type(support_count) is not int
+        or not 0 < support_count <= registered_view_count
+        or any(
+            not _finite_number(orientation_evidence[field]) for field in finite_fields
+        )
+    ):
+        raise EvidenceError(f"{context} values are invalid")
+    eigenvalues = [
+        float(orientation_evidence[field])
+        for field in ("eigenvalue0", "eigenvalue1", "eigenvalue2")
+    ]
+    if (
+        not 0 <= eigenvalues[0] <= eigenvalues[1] <= eigenvalues[2]
+        or not math.isclose(sum(eigenvalues), 1.0, rel_tol=0, abs_tol=1e-6)
+        or float(orientation_evidence["eigengap"]) < 0
+        or float(orientation_evidence["medianResidualDegrees"]) < 0
+        or float(orientation_evidence["p90ResidualDegrees"])
+        < float(orientation_evidence["medianResidualDegrees"])
+        or float(orientation_evidence["bootstrapP95VariationDegrees"]) < 0
+    ):
+        raise EvidenceError(f"{context} values are invalid")
+    unit_interval_fields = {
+        "medianAbsoluteImageUpAgreement",
+        "signAgreement",
+        "trajectoryLineConcentration",
+        "cameraUpConcentration",
+    }
+    degree_fields = {
+        "trajectoryPlaneAgreementDegrees",
+        "cameraUpMedianSpreadDegrees",
+        "cameraUpP90SpreadDegrees",
+    }
+    for field in optional_fields:
+        optional_value = orientation_evidence.get(field)
+        if optional_value is None:
+            continue
+        if not _finite_number(optional_value):
+            raise EvidenceError(f"{context}.{field} is invalid")
+        number = float(optional_value)
+        if (field in unit_interval_fields and not 0 <= number <= 1) or (
+            field in degree_fields and not 0 <= number <= 180
+        ):
+            raise EvidenceError(f"{context}.{field} is invalid")
+
+
+def _validate_canonical_orientation_artifact(
+    value: Any,
+    *,
+    registered_view_count: int,
+) -> None:
+    context = "geometry manifest canonical orientation"
+    orientation = _mapping(value, context)
+    required_fields = {"status", "canonicalOpeningViewDirection"}
+    optional_fields = {
+        "method",
+        "sourceToCanonicalQuaternionWXYZ",
+        "evidence",
+    }
+    missing = required_fields - set(orientation)
+    extra = set(orientation) - required_fields - optional_fields
+    if missing or extra:
+        raise EvidenceError(f"{context} fields are invalid")
+    status = orientation["status"]
+    if status not in {"verified", "axisAlignedSignUnverified", "unresolved"}:
+        raise EvidenceError(f"{context} status is invalid")
+    _validate_unit_direction(
+        orientation["canonicalOpeningViewDirection"],
+        f"{context}.canonicalOpeningViewDirection",
+    )
+    method = orientation.get("method")
+    quaternion_value = orientation.get("sourceToCanonicalQuaternionWXYZ")
+    orientation_evidence = orientation.get("evidence")
+    if method is not None and method not in {
+        "cameraRightNullspace",
+        "cameraUpConsensus",
+    }:
+        raise EvidenceError(f"{context} method is invalid")
+    if status == "unresolved":
+        if quaternion_value is not None or (method is None) != (
+            orientation_evidence is None
+        ):
+            raise EvidenceError(f"{context} unresolved shape is invalid")
+        if orientation_evidence is not None:
+            _validate_orientation_evidence(
+                orientation_evidence,
+                registered_view_count=registered_view_count,
+                context=f"{context}.evidence",
+            )
+        return
+    if method is None or quaternion_value is None or orientation_evidence is None:
+        raise EvidenceError(f"{context} resolved shape is invalid")
+    quaternion = _mapping(
+        quaternion_value, f"{context}.sourceToCanonicalQuaternionWXYZ"
+    )
+    _exact_keys(
+        quaternion,
+        {"w", "x", "y", "z"},
+        f"{context}.sourceToCanonicalQuaternionWXYZ",
+    )
+    components = [quaternion[field] for field in ("w", "x", "y", "z")]
+    if not all(
+        _finite_number(component) for component in components
+    ) or not math.isclose(
+        sum(float(component) ** 2 for component in components),
+        1.0,
+        rel_tol=0,
+        abs_tol=1e-6,
+    ):
+        raise EvidenceError(f"{context} quaternion is invalid")
+    first_nonzero = next(
+        (float(component) for component in components if float(component) != 0),
+        0.0,
+    )
+    if first_nonzero <= 0:
+        raise EvidenceError(f"{context} quaternion is not canonical")
+    _validate_orientation_evidence(
+        orientation_evidence,
+        registered_view_count=registered_view_count,
+        context=f"{context}.evidence",
+    )
+
+
+def _validate_geometry_conditioning_artifact(
+    value: Any,
+    *,
+    registered_view_count: int,
+    point_count: int,
+    observation_count: int,
+    model_hashes: Mapping[str, str],
+) -> None:
+    context = "geometry manifest conditioning"
+    conditioning = _mapping(value, context)
+    _exact_keys(
+        conditioning,
+        {
+            "schemaVersion",
+            "measurementProvenance",
+            "acceptancePolicy",
+            "maximumRayPairEvaluations",
+            "sourceModelClosureSHA256",
+            "measurement",
+        },
+        context,
+    )
+    if (
+        type(conditioning["schemaVersion"]) is not int
+        or conditioning["schemaVersion"] != GEOMETRY_CONDITIONING_SCHEMA_VERSION
+    ):
+        raise EvidenceError("geometry manifest conditioning schema is invalid")
+    if (
+        conditioning["measurementProvenance"] != GEOMETRY_CONDITIONING_PROVENANCE
+        or conditioning["acceptancePolicy"] != GEOMETRY_CONDITIONING_ACCEPTANCE_POLICY
+        or type(conditioning["maximumRayPairEvaluations"]) is not int
+        or conditioning["maximumRayPairEvaluations"]
+        != GEOMETRY_CONDITIONING_MAXIMUM_RAY_PAIR_EVALUATIONS
+        or conditioning["sourceModelClosureSHA256"]
+        != geometry_model_closure_digest(model_hashes)
+    ):
+        raise EvidenceError("geometry manifest conditioning identity is invalid")
+
+    measurement_context = f"{context} measurement"
+    measurement = _mapping(conditioning["measurement"], measurement_context)
+    integer_fields = {
+        "pointCount",
+        "observationCount",
+        "positiveDepthObservationCount",
+        "stronglyMeasuredViewCount",
+        "registeredViewCount",
+        "perViewObservationMinimum",
+        "perViewObservationP10",
+        "perViewObservationP90",
+        "distinctTrackLengthMinimum",
+        "distinctTrackLengthP10",
+        "distinctTrackLengthP90",
+        "pointsAtLeast1Point5Degrees",
+        "pointsAtLeast2Degrees",
+        "pointsAtLeast3Degrees",
+        "observationsAtLeast1Point5Degrees",
+        "observationsAtLeast2Degrees",
+        "observationsAtLeast3Degrees",
+        "effectiveCameraCenterCount",
+        "largestCameraCenterClusterSize",
+        "numericallyConditionedPointCount",
+        "numericallyConditionedObservationCount",
+        "cameraPairEvaluationCount",
+        "rayPairEvaluationCount",
+    }
+    numeric_fields = {
+        "perViewObservationMedian",
+        "distinctTrackLengthMedian",
+        "medianObservedDepth",
+        "cameraBaselineToMedianDepthRatio",
+        "cameraCenterMergeToleranceToMedianDepthRatio",
+        "adaptiveParallaxThresholdMedianDegrees",
+        "adaptiveParallaxThresholdP90Degrees",
+    }
+    eigenvalue_fields = {"cameraCenterEigenvalues", "pointEigenvalues"}
+    _exact_keys(
+        measurement,
+        integer_fields | numeric_fields | eigenvalue_fields,
+        measurement_context,
+    )
+    if any(
+        type(measurement[field]) is not int or measurement[field] < 0
+        for field in integer_fields
+    ) or any(not _finite_number(measurement[field]) for field in numeric_fields):
+        raise EvidenceError(f"{measurement_context} values are invalid")
+    for field in eigenvalue_fields:
+        values = measurement[field]
+        if (
+            not isinstance(values, list)
+            or len(values) != 3
+            or not all(_finite_number(item) for item in values)
+        ):
+            raise EvidenceError(f"{measurement_context}.{field} is invalid")
+        normalized = [float(item) for item in values]
+        if not 0 <= normalized[0] <= normalized[1] <= normalized[
+            2
+        ] <= 1 or not math.isclose(sum(normalized), 1.0, rel_tol=0, abs_tol=1e-9):
+            raise EvidenceError(f"{measurement_context}.{field} is invalid")
+
+    registered_pairs = registered_view_count * (registered_view_count - 1) // 2
+    effective_count = measurement["effectiveCameraCenterCount"]
+    effective_pairs = effective_count * (effective_count - 1) // 2
+    expected_camera_pairs = registered_pairs
+    if measurement["largestCameraCenterClusterSize"] > 1:
+        expected_camera_pairs += effective_pairs
+    total_pair_evaluations = (
+        measurement["cameraPairEvaluationCount"] + measurement["rayPairEvaluationCount"]
+    )
+    if (
+        measurement["registeredViewCount"] != registered_view_count
+        or measurement["pointCount"] != point_count
+        or measurement["observationCount"] != observation_count
+        or measurement["positiveDepthObservationCount"] != observation_count
+        or not 0 <= measurement["stronglyMeasuredViewCount"] <= registered_view_count
+        or not 0
+        <= measurement["perViewObservationMinimum"]
+        <= measurement["perViewObservationP10"]
+        <= float(measurement["perViewObservationMedian"])
+        <= measurement["perViewObservationP90"]
+        <= observation_count
+        or not 2
+        <= measurement["distinctTrackLengthMinimum"]
+        <= measurement["distinctTrackLengthP10"]
+        <= float(measurement["distinctTrackLengthMedian"])
+        <= measurement["distinctTrackLengthP90"]
+        <= registered_view_count
+        or not 0
+        <= measurement["pointsAtLeast3Degrees"]
+        <= measurement["pointsAtLeast2Degrees"]
+        <= measurement["pointsAtLeast1Point5Degrees"]
+        <= point_count
+        or not 0
+        <= measurement["observationsAtLeast3Degrees"]
+        <= measurement["observationsAtLeast2Degrees"]
+        <= measurement["observationsAtLeast1Point5Degrees"]
+        <= observation_count
+        or not min(3, registered_view_count) <= effective_count <= registered_view_count
+        or not 0
+        < measurement["largestCameraCenterClusterSize"]
+        <= registered_view_count
+        or float(measurement["cameraCenterMergeToleranceToMedianDepthRatio"]) != 1e-5
+        or not point_count // 2 + point_count % 2
+        <= measurement["numericallyConditionedPointCount"]
+        <= point_count
+        or not 0
+        < measurement["numericallyConditionedObservationCount"]
+        <= observation_count
+        or float(measurement["medianObservedDepth"]) <= 0
+        or float(measurement["cameraBaselineToMedianDepthRatio"])
+        <= float(measurement["cameraCenterMergeToleranceToMedianDepthRatio"])
+        or float(measurement["adaptiveParallaxThresholdMedianDegrees"]) < 0.05 - 1e-12
+        or float(measurement["adaptiveParallaxThresholdP90Degrees"])
+        < float(measurement["adaptiveParallaxThresholdMedianDegrees"])
+        or measurement["cameraPairEvaluationCount"] != expected_camera_pairs
+        or measurement["rayPairEvaluationCount"] <= 0
+        or total_pair_evaluations > conditioning["maximumRayPairEvaluations"]
+    ):
+        raise EvidenceError(f"{measurement_context} is invalid")
 
 
 def _validate_pair_graph_artifact(
     value: Any,
     *,
     total_view_count: int,
-) -> tuple[str, bool]:
+    candidate_configuration: Mapping[str, Any],
+    requires_cross_clip_retrieval: bool = False,
+) -> tuple[str, bool, bool]:
     context = "geometry manifest pair graph"
     pair_graph = _mapping(value, context)
     _exact_keys(
         pair_graph,
-        {"status", "measurement", "usedLocalVocabularyRetrieval"},
+        {
+            "status",
+            "measurement",
+            "requiresCrossClipRetrieval",
+            "retrievalWasScheduled",
+            "usedLocalVocabularyRetrieval",
+        },
         context,
     )
     status = pair_graph["status"]
+    recorded_cross_clip_requirement = pair_graph["requiresCrossClipRetrieval"]
+    retrieval_was_scheduled = pair_graph["retrievalWasScheduled"]
     retrieval_used = pair_graph["usedLocalVocabularyRetrieval"]
     if (
         not isinstance(status, str)
         or status not in {"measured", "notEvaluated"}
+        or type(recorded_cross_clip_requirement) is not bool
+        or recorded_cross_clip_requirement != requires_cross_clip_retrieval
+        or type(retrieval_was_scheduled) is not bool
         or type(retrieval_used) is not bool
+        or (retrieval_used and not retrieval_was_scheduled)
     ):
         raise EvidenceError(f"{context} is invalid")
     if status == "notEvaluated":
-        if pair_graph["measurement"] is not None or retrieval_used:
+        if (
+            pair_graph["measurement"] is not None
+            or recorded_cross_clip_requirement
+            or retrieval_was_scheduled
+            or retrieval_used
+        ):
             raise EvidenceError(f"{context} is invalid")
-        return status, retrieval_used
+        return status, retrieval_was_scheduled, retrieval_used
+
+    retrieval_required = (
+        _retrieval_required_by_plan(
+            candidate_configuration,
+            total_view_count=total_view_count,
+        )
+        or requires_cross_clip_retrieval
+    )
+    if retrieval_was_scheduled != retrieval_required:
+        if retrieval_required:
+            raise EvidenceError(
+                f"{context} omitted vocabulary retrieval required by the resolved plan"
+            )
+        raise EvidenceError(
+            f"{context} scheduled vocabulary retrieval outside the resolved plan"
+        )
 
     measurement = _mapping(pair_graph["measurement"], f"{context} measurement")
     measurement_fields = {
@@ -2025,17 +6283,33 @@ def _validate_pair_graph_artifact(
         + measurement["loopRevisitPairCount"]
     )
     component_counts = measurement["componentViewCounts"]
+    measured_isolated_view_count = (
+        sum(count == 1 for count in component_counts)
+        if isinstance(component_counts, list)
+        else -1
+    )
+    has_minor_verified_component = (
+        any(count > 1 for count in component_counts[1:])
+        if isinstance(component_counts, list)
+        else False
+    )
+    required_dominant_fraction = (
+        0.95 if has_minor_verified_component else 0.90
+    )
     if (
         not 0 <= verified <= raw_matched <= attempted <= scheduled
         or role_count != scheduled
         or not isinstance(component_counts, list)
         or not component_counts
         or any(type(count) is not int or count <= 0 for count in component_counts)
-        or sum(component_counts)
-        + measurement["isolatedViewCount"]
-        + measurement["descriptorlessViewCount"]
-        != total_view_count
+        or component_counts != sorted(component_counts, reverse=True)
+        or sum(component_counts) != total_view_count
+        or measured_isolated_view_count != measurement["isolatedViewCount"]
+        or measurement["descriptorlessViewCount"]
+        > measurement["isolatedViewCount"]
         or measurement["connectedComponentCount"] != len(component_counts)
+        or component_counts[0] < 2
+        or component_counts[0] / total_view_count < required_dominant_fraction
         or measurement["degreeP10"] > measurement["degreeMedian"]
         or measurement["degreeMedian"] > measurement["degreeP90"]
         or measurement["degreeP90"] >= max(component_counts)
@@ -2058,7 +6332,7 @@ def _validate_pair_graph_artifact(
         or duration < 0
         or not isinstance(attempts, list)
         or not attempts
-        or len(attempts) > 4
+        or len(attempts) > MAXIMUM_PAIR_GRAPH_MATCHER_ATTEMPTS
     ):
         raise EvidenceError(f"{context} measurement is invalid")
     attempt_fields = {
@@ -2072,10 +6346,14 @@ def _validate_pair_graph_artifact(
         "spatiallyVerifiedPairCount",
         "durationSeconds",
     }
+    optional_attempt_fields = {"exactRecoveryReason"}
     measured_duration = 0.0
     for index, raw_attempt in enumerate(attempts, start=1):
         attempt = _mapping(raw_attempt, f"{context} matcher attempt {index}")
-        _exact_keys(attempt, attempt_fields, f"{context} matcher attempt {index}")
+        if not attempt_fields.issubset(attempt) or not set(attempt).issubset(
+            attempt_fields | optional_attempt_fields
+        ):
+            raise EvidenceError(f"{context} matcher attempt has invalid fields")
         attempt_duration = attempt["durationSeconds"]
         attempt_counts = [
             attempt["scheduledPairCount"],
@@ -2087,10 +6365,16 @@ def _validate_pair_graph_artifact(
             type(attempt["attemptNumber"]) is not int
             or attempt["attemptNumber"] != index
             or attempt["matcher"] not in {"faiss", "exact"}
+            or (attempt["matcher"] == "exact")
+            != _valid_exact_recovery_reason(attempt.get("exactRecoveryReason"))
             or attempt["recoveryLevel"] not in {"normal", "expanded", "maximum"}
             or attempt["outcome"] not in {"completed", "rejected", "failed"}
             or any(type(count) is not int or count < 0 for count in attempt_counts)
-            or not 0 <= attempt_counts[3] <= attempt_counts[2] <= attempt_counts[1] <= attempt_counts[0]
+            or not 0
+            <= attempt_counts[3]
+            <= attempt_counts[2]
+            <= attempt_counts[1]
+            <= attempt_counts[0]
             or (
                 attempt["outcome"] != "failed"
                 and attempt["attemptedPairCount"] != attempt["scheduledPairCount"]
@@ -2105,16 +6389,161 @@ def _validate_pair_graph_artifact(
     accepted_attempt = attempts[-1]
     if (
         attempts[0]["matcher"] != "faiss"
-        or attempts[0]["recoveryLevel"] != "normal"
         or accepted_attempt["outcome"] != "completed"
         or accepted_attempt["scheduledPairCount"] != scheduled
         or accepted_attempt["attemptedPairCount"] != attempted
         or accepted_attempt["rawMatchedPairCount"] != raw_matched
         or accepted_attempt["spatiallyVerifiedPairCount"] != verified
-        or not math.isclose(measured_duration, float(duration), rel_tol=1e-12, abs_tol=1e-12)
+        or not math.isclose(
+            measured_duration, float(duration), rel_tol=1e-12, abs_tol=1e-12
+        )
     ):
         raise EvidenceError(f"{context} measurement is invalid")
-    return status, retrieval_used
+    _validate_matcher_recovery_history(
+        attempts,
+        total_view_count=total_view_count,
+        pairing_policy=measurement["pairingPolicy"],
+    )
+    return status, retrieval_was_scheduled, retrieval_used
+
+
+def _retrieval_required_by_plan(
+    candidate_configuration: Mapping[str, Any],
+    *,
+    total_view_count: int,
+) -> bool:
+    policy = candidate_configuration["pairing_policy"]
+    if policy == "generic_continuous":
+        return total_view_count >= 120
+    if policy == "object_orbit":
+        return True
+    if policy == "unordered_exhaustive":
+        return False
+    return policy in {
+        "walkthrough",
+        "large_area",
+        "segmented_mixed",
+        "unordered_retrieval",
+    }
+
+
+def _requires_cross_clip_retrieval(
+    request: Mapping[str, Any],
+    candidate_configuration: Mapping[str, Any],
+) -> bool:
+    return (
+        request["input_kind"] == "multi_video"
+        and candidate_configuration["input_topology"]
+        in {"continuous", "segmented_mixed"}
+    )
+
+
+def _validate_matcher_recovery_history(
+    attempts: list[Any],
+    *,
+    total_view_count: int,
+    pairing_policy: str,
+    fallback_reason_count: int | None = None,
+) -> None:
+    level_index = {"normal": 0, "expanded": 1, "maximum": 2}
+    if (
+        not attempts
+        or attempts[0]["matcher"] != "faiss"
+        or attempts[0].get("exactRecoveryReason") is not None
+    ):
+        raise EvidenceError("pair-graph recovery must begin with FAISS")
+    unordered_small_exhaustive = (
+        pairing_policy == "unorderedRetrieval" and 2 <= total_view_count <= 60
+    )
+    if fallback_reason_count is not None and (
+        type(fallback_reason_count) is not int or fallback_reason_count < 0
+    ):
+        raise EvidenceError("pair-graph fallback evidence is invalid")
+    first_level = level_index[attempts[0]["recoveryLevel"]]
+    maximum_initial_level = (
+        2 if fallback_reason_count is None else min(2, fallback_reason_count)
+    )
+    if first_level > maximum_initial_level:
+        raise EvidenceError("pair-graph recovery skipped unauthenticated densities")
+    for index in range(1, len(attempts)):
+        previous = attempts[index - 1]
+        current = attempts[index]
+        previous_level = level_index[previous["recoveryLevel"]]
+        current_level = level_index[current["recoveryLevel"]]
+        maximum_step = (
+            2
+            if fallback_reason_count is None
+            else min(2, max(1, fallback_reason_count))
+        )
+        if (
+            current_level < previous_level
+            or current_level - previous_level > maximum_step
+        ):
+            raise EvidenceError("pair-graph recovery skipped unauthenticated densities")
+
+        if current["matcher"] == "exact":
+            reason = current.get("exactRecoveryReason")
+            if (
+                not _valid_exact_recovery_reason(reason)
+                or not 1
+                <= current["scheduledPairCount"]
+                <= MAXIMUM_EXACT_RECOVERY_PAIR_COUNT
+            ):
+                raise EvidenceError(
+                    "pair-graph exact recovery is untyped or exceeds the 256-pair limit"
+                )
+            exhaustive_pair_count = total_view_count * (total_view_count - 1) // 2
+            faiss_exhausted = previous["outcome"] == "rejected" and (
+                previous_level == level_index["maximum"]
+                or (
+                unordered_small_exhaustive
+                and previous_level == level_index["normal"]
+                and previous["scheduledPairCount"] == exhaustive_pair_count
+                )
+            )
+            reason_is_bound = (
+                reason in ("faissCrash", "faissUnsupportedOperation")
+                and previous["outcome"] == "failed"
+            ) or (
+                reason == "faissGeometryRejectedAfterRetries" and faiss_exhausted
+            )
+            if (
+                previous["matcher"] != "faiss"
+                or current_level != previous_level
+                or current["scheduledPairCount"] != previous["scheduledPairCount"]
+                or not reason_is_bound
+            ):
+                raise EvidenceError("pair-graph exact recovery was premature")
+            continue
+
+        if current.get("exactRecoveryReason") is not None:
+            raise EvidenceError("pair-graph FAISS attempt claims exact recovery")
+        if previous["matcher"] != "faiss":
+            raise EvidenceError("pair-graph recovery has an invalid matcher history")
+        if current_level == previous_level:
+            if (
+                previous["outcome"] == "completed"
+                or current["scheduledPairCount"] != previous["scheduledPairCount"]
+            ):
+                raise EvidenceError(
+                    "pair-graph same-level recovery changed its schedule"
+                )
+            continue
+        if unordered_small_exhaustive:
+            raise EvidenceError(
+                "pair-graph recovery expanded an already exhaustive graph"
+            )
+        repeated_planning_failure = (
+            current["outcome"] == "failed"
+            and current["attemptedPairCount"] == 0
+            and current["rawMatchedPairCount"] == 0
+            and current["spatiallyVerifiedPairCount"] == 0
+        )
+        if (
+            current["scheduledPairCount"] == previous["scheduledPairCount"]
+            and not repeated_planning_failure
+        ):
+            raise EvidenceError("pair-graph recovery did not expand its FAISS schedule")
 
 
 def _validate_runtime_worker_evidence(
@@ -2128,6 +6557,7 @@ def _validate_runtime_worker_evidence(
     used_artifacts: set[str],
     context: str,
     pipeline_metrics: Mapping[str, Any] | None,
+    selection_sources: SelectionManifestSources | None = None,
 ) -> dict[str, Any]:
     receipt = _mapping(value, context)
     _exact_keys(
@@ -2137,6 +6567,8 @@ def _validate_runtime_worker_evidence(
             "artifact_sha256",
             "geometry_manifest_name",
             "geometry_manifest_sha256",
+            "canonical_cameras_name",
+            "canonical_cameras_sha256",
             "geometry_input_digest",
             "selected_frames_digest",
         },
@@ -2154,6 +6586,14 @@ def _validate_runtime_worker_evidence(
     geometry_digest = _digest(
         receipt["geometry_manifest_sha256"],
         f"{context}.geometry_manifest_sha256",
+    )
+    canonical_cameras_name = _token(
+        receipt["canonical_cameras_name"],
+        f"{context}.canonical_cameras_name",
+    )
+    canonical_cameras_digest = _digest(
+        receipt["canonical_cameras_sha256"],
+        f"{context}.canonical_cameras_sha256",
     )
     geometry_input_digest = _digest(
         receipt["geometry_input_digest"],
@@ -2189,19 +6629,49 @@ def _validate_runtime_worker_evidence(
         raise EvidenceError(
             "runtime geometry selected-frame digest does not match the protected selected frames"
         )
-    if artifact_name == geometry_name:
-        raise EvidenceError("worker and geometry artifacts must use distinct descriptors")
-    if artifact_name in used_artifacts or geometry_name in used_artifacts:
+    if not isinstance(selection_sources, SelectionManifestSources):
+        selection_descriptor = _mapping(
+            descriptors.get("selection_manifest"),
+            "artifacts.selection_manifest",
+        )
+        _exact_keys(
+            selection_descriptor,
+            {"path", "sha256", "bytes"},
+            "artifacts.selection_manifest",
+        )
+        if (
+            selection_descriptor["sha256"]
+            != reference_artifacts["selection_manifest_sha256"]
+        ):
+            raise EvidenceError(
+                "selection manifest does not match the protected reference"
+            )
+        selection_sources = _validate_selection_manifest_sources(
+            artifact_root / selection_descriptor["path"],
+            requested_scale=request["binding"]["scale"],
+            input_kind=request["input_kind"],
+            expected_video_source_count=request["video_source_count"],
+        )
+    artifact_tokens = {artifact_name, geometry_name, canonical_cameras_name}
+    if len(artifact_tokens) != 3:
+        raise EvidenceError(
+            "worker, geometry, and canonical-camera artifacts must use distinct descriptors"
+        )
+    if artifact_tokens & used_artifacts:
         raise EvidenceError("runtime worker artifact cannot be reused across runs")
-    used_artifacts.update({artifact_name, geometry_name})
+    used_artifacts.update(artifact_tokens)
     descriptor = _mapping(
         descriptors.get(artifact_name),
         f"artifacts.{artifact_name}",
     )
     _exact_keys(descriptor, {"path", "sha256", "bytes"}, f"artifacts.{artifact_name}")
-    expected_path = f"worker-runs/{run_id}/SfM/worker_execution.json"
+    expected_path = (
+        f"worker-runs/{run_id}/project.easysplatproj/SfM/worker_execution.json"
+    )
     if descriptor["path"] != expected_path:
-        raise EvidenceError("runtime worker artifact path does not match its execution run")
+        raise EvidenceError(
+            "runtime worker artifact path does not match its execution run"
+        )
     if descriptor["sha256"] != receipt_digest:
         raise EvidenceError("runtime worker artifact digest does not match its receipt")
     if (
@@ -2230,7 +6700,9 @@ def _validate_runtime_worker_evidence(
         {"path", "sha256", "bytes"},
         f"artifacts.{geometry_name}",
     )
-    expected_geometry_path = f"worker-runs/{run_id}/SfM/geometry_manifest.json"
+    expected_geometry_path = (
+        f"worker-runs/{run_id}/project.easysplatproj/SfM/geometry_manifest.json"
+    )
     if geometry_descriptor["path"] != expected_geometry_path:
         raise EvidenceError("geometry manifest path does not match its execution run")
     if geometry_descriptor["sha256"] != geometry_digest:
@@ -2253,26 +6725,68 @@ def _validate_runtime_worker_evidence(
     geometry_context = f"geometry manifest {run_id}"
     required_geometry_fields = {
         "schemaVersion",
+        "solverVersion",
+        "runtimeVersion",
+        "modelVersion",
         "inputDigest",
         "selectedFramesDigest",
         "orderedImageNames",
         "orderedImageTimestamps",
+        "sourceModelPath",
+        "poseConvention",
+        "quaternionOrder",
+        "handedness",
+        "scaleType",
+        "cameraModel",
+        "cameraGrouping",
+        "registeredViewCount",
         "totalViewCount",
+        "observationCount",
+        "pointCount",
+        "residualProvenance",
+        "medianPixelResidual",
+        "p90PixelResidual",
+        "conditioning",
+        "timings",
+        "peakMemoryBytes",
+        "modelHashes",
+        "provenance",
         "pairGraph",
         "mapping",
         "workerExecution",
+        "canonicalOrientation",
+        "cameraGroupingReceipt",
+        "cameraInitializationReceipt",
+        "featureDatabaseDigest",
+    }
+    optional_geometry_fields = {
+        "fallbackReason",
+        "learnedPointInitializer",
     }
     missing_geometry_fields = required_geometry_fields - set(geometry)
-    if missing_geometry_fields:
+    extra_geometry_fields = (
+        set(geometry) - required_geometry_fields - optional_geometry_fields
+    )
+    if missing_geometry_fields or extra_geometry_fields:
+        details = []
+        if missing_geometry_fields:
+            details.append("missing " + ", ".join(sorted(missing_geometry_fields)))
+        if extra_geometry_fields:
+            details.append("extra " + ", ".join(sorted(extra_geometry_fields)))
         raise EvidenceError(
-            f"{geometry_context} is missing required fields: "
-            + ", ".join(sorted(missing_geometry_fields))
+            f"{geometry_context} fields are invalid: " + "; ".join(details)
         )
     if (
         type(geometry["schemaVersion"]) is not int
         or geometry["schemaVersion"] != GEOMETRY_ARTIFACT_SCHEMA_VERSION
     ):
         raise EvidenceError("geometry manifest schema is invalid")
+    feature_database_digest = geometry["featureDatabaseDigest"]
+    if (
+        not isinstance(feature_database_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", feature_database_digest) is None
+    ):
+        raise EvidenceError("geometry manifest feature database digest is invalid")
     input_digest = geometry["inputDigest"]
     if (
         not isinstance(input_digest, str)
@@ -2305,6 +6819,7 @@ def _validate_runtime_worker_evidence(
             for name in image_names
         )
         or len(set(image_names)) != total_view_count
+        or tuple(image_names) != selection_sources.image_names
         or not isinstance(image_timestamps, list)
         or len(image_timestamps) != total_view_count
         or any(
@@ -2319,16 +6834,136 @@ def _validate_runtime_worker_evidence(
         )
     ):
         raise EvidenceError("geometry manifest selected-frame identity is invalid")
-    if canonical_json_bytes(geometry["workerExecution"]) != canonical_json_bytes(artifact):
+    registered_view_count = geometry["registeredViewCount"]
+    observation_count = geometry["observationCount"]
+    point_count = geometry["pointCount"]
+    median_residual = geometry["medianPixelResidual"]
+    p90_residual = geometry["p90PixelResidual"]
+    version_fields = ("solverVersion", "runtimeVersion", "modelVersion")
+    timings = _mapping(geometry["timings"], f"{geometry_context}.timings")
+    if (
+        any(
+            not isinstance(geometry[field], str)
+            or not geometry[field].strip()
+            or len(geometry[field].encode("utf-8")) > 1_024
+            for field in version_fields
+        )
+        or geometry["sourceModelPath"] != "SfM/colmap/sparse/0"
+        or geometry["poseConvention"] != "world-to-camera"
+        or geometry["quaternionOrder"] != "wxyz"
+        or geometry["handedness"] != "right-handed"
+        or geometry["scaleType"] != "arbitrary-sim3"
+        or not isinstance(geometry["cameraModel"], str)
+        or not geometry["cameraModel"].strip()
+        or geometry["cameraGrouping"]
+        not in {"automatic", "sameCameraAndLens", "mixedCamerasOrLenses"}
+        or type(registered_view_count) is not int
+        or not 0 < registered_view_count <= total_view_count
+        or type(observation_count) is not int
+        or observation_count <= 0
+        or type(point_count) is not int
+        or point_count <= 0
+        or geometry["residualProvenance"] != "colmap-text-tracks-v1"
+        or not _finite_number(median_residual)
+        or not _finite_number(p90_residual)
+        or not 0 <= float(median_residual) <= float(p90_residual)
+        or type(geometry["peakMemoryBytes"]) is not int
+        or geometry["peakMemoryBytes"] <= 0
+        or not timings
+        or "orientation_estimation_seconds" not in timings
+        or any(
+            not isinstance(name, str)
+            or not name.strip()
+            or not _finite_number(duration)
+            or float(duration) < 0
+            for name, duration in timings.items()
+        )
+    ):
+        raise EvidenceError("geometry manifest production fields are invalid")
+    if canonical_json_bytes(geometry["workerExecution"]) != canonical_json_bytes(
+        artifact
+    ):
         raise EvidenceError(
             "geometry manifest embedded worker execution does not match the standalone artifact"
         )
+
+    canonical_model_hashes = _mapping(
+        geometry["modelHashes"],
+        f"{geometry_context}.modelHashes",
+    )
+    _exact_keys(
+        canonical_model_hashes,
+        {"cameras.txt", "images.txt", "points3D.txt"},
+        f"{geometry_context}.modelHashes",
+    )
+    if any(
+        not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for digest in canonical_model_hashes.values()
+    ):
+        raise EvidenceError("geometry manifest model hashes are invalid")
+    if canonical_cameras_digest != "sha256:" + canonical_model_hashes["cameras.txt"]:
+        raise EvidenceError(
+            "canonical cameras digest does not match the geometry model hash"
+        )
+    cameras_descriptor = _mapping(
+        descriptors.get(canonical_cameras_name),
+        f"artifacts.{canonical_cameras_name}",
+    )
+    _exact_keys(
+        cameras_descriptor,
+        {"path", "sha256", "bytes"},
+        f"artifacts.{canonical_cameras_name}",
+    )
+    expected_cameras_path = (
+        f"worker-runs/{run_id}/project.easysplatproj/"
+        "SfM/colmap/sparse/0/cameras.txt"
+    )
+    if cameras_descriptor["path"] != expected_cameras_path:
+        raise EvidenceError("canonical cameras path does not match its execution run")
+    if cameras_descriptor["sha256"] != canonical_cameras_digest:
+        raise EvidenceError("canonical cameras digest does not match its receipt")
+    if (
+        type(cameras_descriptor["bytes"]) is not int
+        or not 0 < cameras_descriptor["bytes"] <= MAX_CANONICAL_CAMERAS_BYTES
+    ):
+        raise EvidenceError("canonical cameras artifact exceeds its size limit")
+    cameras = _parse_colmap_cameras_text(
+        _load_runtime_artifact_bytes(
+            artifact_root,
+            PurePosixPath(expected_cameras_path),
+            canonical_cameras_digest,
+            f"canonical cameras {run_id}",
+            MAX_CANONICAL_CAMERAS_BYTES,
+        ),
+        f"canonical cameras {run_id}",
+    )
+    _validate_geometry_camera_contract(
+        geometry,
+        cameras,
+        candidate_configuration,
+        request,
+        selection_sources,
+        geometry_context,
+    )
+    _validate_geometry_conditioning_artifact(
+        geometry["conditioning"],
+        registered_view_count=registered_view_count,
+        point_count=point_count,
+        observation_count=observation_count,
+        model_hashes=canonical_model_hashes,
+    )
+    _validate_canonical_orientation_artifact(
+        geometry["canonicalOrientation"],
+        registered_view_count=registered_view_count,
+    )
     artifact_fields = {
         "schemaVersion",
+        "colmapRuntimeClosure",
         "resolvedBudget",
         "featureExtractionInvocations",
         "matchingInvocations",
         "vocabularyRetrievalInvocations",
+        "rejectedVocabularyRetrievalInvocations",
         "mappingAndRefinementInvocations",
         "videoSourceAnalysis",
     }
@@ -2338,6 +6973,154 @@ def _validate_runtime_worker_evidence(
         or artifact["schemaVersion"] != GEOMETRY_WORKER_EXECUTION_SCHEMA_VERSION
     ):
         raise EvidenceError("runtime worker artifact schema is invalid")
+
+    runtime_closure = _mapping(
+        artifact["colmapRuntimeClosure"],
+        f"runtime worker artifact {run_id}.colmapRuntimeClosure",
+    )
+    _exact_keys(
+        runtime_closure,
+        {"components", "closureSHA256"},
+        f"runtime worker artifact {run_id}.colmapRuntimeClosure",
+    )
+    raw_components = runtime_closure["components"]
+    if not isinstance(raw_components, list) or len(raw_components) != len(
+        COLMAP_RUNTIME_COMPONENT_PATHS
+    ):
+        raise EvidenceError("runtime worker COLMAP closure is invalid")
+    components: list[tuple[str, str]] = []
+    for index, raw_component in enumerate(raw_components):
+        component = _mapping(
+            raw_component,
+            f"runtime worker artifact {run_id}.colmapRuntimeClosure.components[{index}]",
+        )
+        _exact_keys(
+            component,
+            {"toolchainRelativePath", "sha256"},
+            f"runtime worker artifact {run_id}.colmapRuntimeClosure.components[{index}]",
+        )
+        path = component["toolchainRelativePath"]
+        digest = component["sha256"]
+        if (
+            path != COLMAP_RUNTIME_COMPONENT_PATHS[index]
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise EvidenceError("runtime worker COLMAP closure component is invalid")
+        components.append((path, digest))
+    closure_digest = runtime_closure["closureSHA256"]
+    if not isinstance(
+        closure_digest, str
+    ) or closure_digest != colmap_runtime_closure_digest(components):
+        raise EvidenceError("runtime worker COLMAP closure digest is invalid")
+    provenance = _mapping(geometry["provenance"], f"{geometry_context}.provenance")
+    _exact_keys(
+        provenance,
+        {"toolchainVersion", "solver", "runtime", "model"},
+        f"{geometry_context}.provenance",
+    )
+    provenance_component_fields = {
+        "identifier",
+        "version",
+        "revision",
+        "payloadSHA256",
+    }
+
+    def validated_provenance_component(value: Any, component: str) -> Mapping[str, Any]:
+        component_context = f"{geometry_context}.provenance.{component}"
+        result = _mapping(value, component_context)
+        _exact_keys(result, provenance_component_fields, component_context)
+        if (
+            any(
+                not isinstance(result[field], str)
+                or not result[field].strip()
+                or len(result[field].encode("utf-8")) > 1_024
+                for field in ("identifier", "version", "revision")
+            )
+            or not isinstance(result["payloadSHA256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", result["payloadSHA256"]) is None
+        ):
+            raise EvidenceError("geometry manifest provenance is invalid")
+        return result
+
+    toolchain_version = provenance["toolchainVersion"]
+    if (
+        not isinstance(toolchain_version, str)
+        or not toolchain_version.strip()
+        or len(toolchain_version.encode("utf-8")) > 1_024
+    ):
+        raise EvidenceError("geometry manifest provenance is invalid")
+    solver = validated_provenance_component(provenance["solver"], "solver")
+    if solver["identifier"] != "colmap" or solver["payloadSHA256"] != closure_digest:
+        raise EvidenceError(
+            "geometry solver provenance does not bind the COLMAP closure"
+        )
+    expected_solver_suffix = (
+        f"COLMAP {solver['version']} (git {solver['revision'][:7]})"
+    )
+    if not geometry["solverVersion"].endswith(expected_solver_suffix):
+        raise EvidenceError("geometry manifest provenance is invalid")
+    raw_runtime = provenance["runtime"]
+    raw_model = provenance["model"]
+    if (raw_runtime is None) != (raw_model is None):
+        raise EvidenceError("geometry manifest provenance is invalid")
+    if raw_runtime is None:
+        if (
+            geometry["modelVersion"] != "none"
+            or geometry["runtimeVersion"] != f"toolchain {toolchain_version}"
+        ):
+            raise EvidenceError("geometry manifest provenance is invalid")
+        model = None
+    else:
+        runtime = validated_provenance_component(raw_runtime, "runtime")
+        model = validated_provenance_component(raw_model, "model")
+        if (
+            runtime["identifier"] != "da3_mps"
+            or model["identifier"] not in {"DA3-BASE", "DA3-SMALL"}
+            or geometry["runtimeVersion"]
+            != (
+                f"toolchain {toolchain_version}; {runtime['identifier']} "
+                f"{runtime['version']} (git {runtime['revision'][:7]})"
+            )
+            or geometry["modelVersion"]
+            != f"{model['identifier']}@{model['revision']}"
+        ):
+            raise EvidenceError("geometry manifest provenance is invalid")
+
+    fallback_reason = geometry.get("fallbackReason")
+    if fallback_reason is not None and (
+        not isinstance(fallback_reason, str)
+        or not fallback_reason.strip()
+        or fallback_reason != fallback_reason.strip()
+        or len(fallback_reason.encode("utf-8")) > 4_096
+        or any(
+            ord(character) < 32 or 127 <= ord(character) <= 159
+            for character in fallback_reason
+        )
+    ):
+        raise EvidenceError("geometry manifest fallback reason is invalid")
+
+    learned_initializer = geometry.get("learnedPointInitializer")
+    if model is None:
+        if learned_initializer is not None:
+            raise EvidenceError("geometry manifest learned point initializer is invalid")
+    else:
+        initializer_context = f"{geometry_context}.learnedPointInitializer"
+        initializer = _mapping(learned_initializer, initializer_context)
+        _exact_keys(
+            initializer,
+            {"path", "sha256", "pointCount"},
+            initializer_context,
+        )
+        if (
+            initializer["path"]
+            != "SfM/colmap/seed/0/learned_points3D.txt"
+            or not isinstance(initializer["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", initializer["sha256"]) is None
+            or type(initializer["pointCount"]) is not int
+            or not 0 < initializer["pointCount"] <= (1 << 63) - 1
+        ):
+            raise EvidenceError("geometry manifest learned point initializer is invalid")
 
     budget_fields = {
         "featureExtractionWorkers": "feature_extraction_workers",
@@ -2398,6 +7181,14 @@ def _validate_runtime_worker_evidence(
         expects_mapping_attempt_ordinal=False,
         required=False,
     )
+    rejected_recovery_levels = _validate_rejected_vocabulary_retrieval_history(
+        artifact["rejectedVocabularyRetrievalInvocations"],
+        accepted_invocations=artifact["vocabularyRetrievalInvocations"],
+        expected_worker_count=expected_budget["vocabularyRetrievalWorkers"],
+        candidate_configuration=candidate_configuration,
+        request=request,
+        image_names=image_names,
+    )
     _validate_worker_invocations(
         artifact["mappingAndRefinementInvocations"],
         context=f"{artifact_context}.mappingAndRefinementInvocations",
@@ -2415,20 +7206,48 @@ def _validate_runtime_worker_evidence(
         expects_mapping_attempt_ordinal=True,
         required=True,
     )
+    colmap_executable_sha256 = components[0][1]
+    for invocation in artifact["mappingAndRefinementInvocations"]:
+        conversion = invocation["modelConversion"]
+        if (
+            conversion is not None
+            and conversion["executableSHA256"] != colmap_executable_sha256
+        ):
+            raise EvidenceError(
+                "model converter executable does not bind the COLMAP closure leaf"
+            )
     for invocations in (
         artifact["featureExtractionInvocations"],
         artifact["matchingInvocations"],
         artifact["mappingAndRefinementInvocations"],
     ):
         if invocations and not any(item["succeeded"] for item in invocations):
-            raise EvidenceError(
-                "required worker stage has no successful invocation"
-            )
+            raise EvidenceError("required worker stage has no successful invocation")
 
-    pair_graph_status, retrieval_used = _validate_pair_graph_artifact(
+    (
+        pair_graph_status,
+        retrieval_was_scheduled,
+        retrieval_used,
+    ) = _validate_pair_graph_artifact(
         geometry["pairGraph"],
         total_view_count=total_view_count,
+        candidate_configuration=candidate_configuration,
+        requires_cross_clip_retrieval=_requires_cross_clip_retrieval(
+            request,
+            candidate_configuration,
+        ),
     )
+    pair_graph_measurement: Mapping[str, Any] | None = None
+    if pair_graph_status == "measured":
+        pair_graph = _mapping(
+            geometry["pairGraph"], f"{geometry_context}.pairGraph"
+        )
+        pair_graph_measurement = _mapping(
+            pair_graph["measurement"], f"{geometry_context}.pairGraph.measurement"
+        )
+        _validate_recovery_density_closure(
+            pair_graph_measurement["matcherAttempts"], rejected_recovery_levels
+        )
     if pair_graph_status == "measured" and (
         not any(item["succeeded"] for item in artifact["featureExtractionInvocations"])
         or not any(item["succeeded"] for item in artifact["matchingInvocations"])
@@ -2436,26 +7255,66 @@ def _validate_runtime_worker_evidence(
         raise EvidenceError(
             "measured COLMAP geometry requires successful feature and matching execution"
         )
-    successful_retrieval = any(
-        item["command"] == "localVocabularyRetriever" and item["succeeded"]
-        for item in artifact["vocabularyRetrievalInvocations"]
-    )
+    vocabulary_retrieval_invocations = artifact["vocabularyRetrievalInvocations"]
     retrieval_configured = (
         candidate_configuration["vocabulary_candidate_count"] > 0
-        and candidate_configuration["vocabulary_verified_neighbor_count"] > 0
+        and candidate_configuration["vocabulary_returned_neighbor_count"] > 0
     )
     if pair_graph_status == "measured":
-        if retrieval_used != retrieval_configured:
+        if retrieval_was_scheduled and not retrieval_configured:
             raise EvidenceError(
                 "runtime vocabulary retrieval does not match the resolved retrieval policy"
             )
-        if successful_retrieval != retrieval_used:
-            if successful_retrieval:
-                raise EvidenceError("runtime vocabulary retrieval was unscheduled")
+        if not retrieval_was_scheduled and vocabulary_retrieval_invocations:
+            raise EvidenceError("runtime vocabulary retrieval was unscheduled")
+        assert pair_graph_measurement is not None
+        accepted_attempt_number = pair_graph_measurement["matcherAttempts"][-1][
+            "attemptNumber"
+        ]
+        accepted_matcher_invocations = [
+            invocation
+            for invocation in artifact["matchingInvocations"]
+            if invocation["succeeded"]
+            and invocation["pairExecution"]["attemptOrdinal"]
+            == accepted_attempt_number
+        ]
+        if len(accepted_matcher_invocations) != 1:
+            raise EvidenceError(
+                "accepted pair graph lacks one successful matcher invocation"
+            )
+        accepted_binding = accepted_matcher_invocations[0]["pairExecution"]
+        accepted_request_digest = accepted_binding.get("retrievalRequestDigest")
+        accepted_output_digest = accepted_binding.get("retrievalOutputDigest")
+        if (accepted_request_digest is None) != (accepted_output_digest is None):
+            raise EvidenceError(
+                "accepted matcher has an incomplete vocabulary retrieval binding"
+            )
+        accepted_uses_retrieval_receipt = accepted_request_digest is not None
+        if retrieval_used != accepted_uses_retrieval_receipt:
             raise EvidenceError(
                 "runtime vocabulary retrieval disagrees with the accepted pair graph"
             )
-    elif retrieval_used or successful_retrieval:
+        if accepted_uses_retrieval_receipt and not any(
+            invocation["succeeded"]
+            and invocation["pairExecution"].get("retrievalRequestDigest")
+            == accepted_request_digest
+            and invocation["pairExecution"].get("retrievalOutputDigest")
+            == accepted_output_digest
+            for invocation in vocabulary_retrieval_invocations
+        ):
+            raise EvidenceError(
+                "runtime vocabulary retrieval does not bind its matcher attempt"
+            )
+        if retrieval_was_scheduled and not retrieval_used:
+            accepted_attempt = pair_graph_measurement["matcherAttempts"][-1]
+            if not (
+                accepted_attempt["recoveryLevel"] == "maximum"
+                and total_view_count <= 250
+            ):
+                raise EvidenceError(
+                    "scheduled runtime vocabulary retrieval was omitted outside exhaustive recovery"
+                )
+    elif retrieval_was_scheduled or retrieval_used or vocabulary_retrieval_invocations:
         raise EvidenceError(
             "unmeasured seeded geometry cannot claim vocabulary retrieval execution"
         )
@@ -2463,10 +7322,12 @@ def _validate_runtime_worker_evidence(
     accepted_matcher: str | None = None
     pair_list_digest: str | None = None
     if pair_graph_status == "measured":
-        pair_measurement = _mapping(
-            geometry["pairGraph"]["measurement"],
-            "geometry manifest pair graph measurement",
-        )
+        assert pair_graph_measurement is not None
+        pair_measurement = pair_graph_measurement
+        if feature_database_digest != pair_measurement["featureDatabaseDigest"]:
+            raise EvidenceError(
+                "geometry manifest feature database digest is invalid"
+            )
         expected_pairing_policy = {
             "generic_continuous": "orderedContinuous",
             "object_orbit": "orderedOrbit",
@@ -2499,7 +7360,9 @@ def _validate_runtime_worker_evidence(
         }
         if pipeline_metrics is not None:
             for manifest_field, metric_field in metric_fields.items():
-                if pair_measurement[manifest_field] != pipeline_metrics.get(metric_field):
+                if pair_measurement[manifest_field] != pipeline_metrics.get(
+                    metric_field
+                ):
                     raise EvidenceError(
                         f"geometry pair graph {manifest_field} does not match pipeline evidence"
                     )
@@ -2515,6 +7378,13 @@ def _validate_runtime_worker_evidence(
         accepted_attempt = pair_measurement["matcherAttempts"][-1]
         accepted_matcher = accepted_attempt["matcher"]
         pair_list_digest = "sha256:" + pair_measurement["pairListDigest"]
+        _validate_pair_execution_bindings(
+            artifact,
+            matcher_attempts=pair_measurement["matcherAttempts"],
+            accepted_pair_list_digest=pair_measurement["pairListDigest"],
+        )
+    else:
+        _validate_unmeasured_matching_history(artifact["matchingInvocations"])
 
     mapping_context = "geometry manifest mapping"
     mapping = _mapping(geometry["mapping"], mapping_context)
@@ -2529,7 +7399,10 @@ def _validate_runtime_worker_evidence(
             "acceptedMappingAttemptOrdinal",
             "acceptedRefinementKind",
             "acceptedRefinementInvocationCount",
+            "plannedIncrementalCadence",
             "incrementalCadence",
+            "cadenceFallbackTrigger",
+            "canonicalModelPublication",
             "fallbackReason",
         },
         mapping_context,
@@ -2552,6 +7425,11 @@ def _validate_runtime_worker_evidence(
     accepted_mapping_attempt_ordinal = mapping["acceptedMappingAttemptOrdinal"]
     refinement_count = mapping["acceptedRefinementInvocationCount"]
     fallback_reason = mapping["fallbackReason"]
+    cadence_fallback_trigger = mapping["cadenceFallbackTrigger"]
+    if cadence_fallback_trigger is not None and (
+        cadence_fallback_trigger not in MAPPING_CADENCE_FALLBACK_TRIGGERS
+    ):
+        raise EvidenceError("geometry mapper cadence fallback trigger is invalid")
     if refinement_count < 0:
         raise EvidenceError("geometry has an invalid accepted refinement count")
     if (
@@ -2561,9 +7439,7 @@ def _validate_runtime_worker_evidence(
         or second_model < 0
         or second_model > largest_model
         or mapping["attemptCount"] < 1
-        or not 1
-        <= accepted_mapping_attempt_ordinal
-        <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
+        or not 1 <= accepted_mapping_attempt_ordinal <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
         or (
             fallback_reason is not None
             and (
@@ -2610,53 +7486,76 @@ def _validate_runtime_worker_evidence(
             for item in accepted_invocations
         )
 
+    publication = _mapping(
+        mapping["canonicalModelPublication"],
+        "geometry manifest canonical model publication",
+    )
+    _exact_keys(
+        publication,
+        {"kind", "sourceModelHashes", "conversion"},
+        "geometry manifest canonical model publication",
+    )
+    source_hashes = _mapping(
+        publication["sourceModelHashes"],
+        "geometry manifest canonical source hashes",
+    )
+    if any(
+        not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        for digest in source_hashes.values()
+    ):
+        raise EvidenceError("geometry canonical model publication is invalid")
+    publication_kind = publication["kind"]
+    raw_conversion = publication["conversion"]
+    converter_invocations = [
+        item for item in accepted_invocations if item["command"] == "modelConverter"
+    ]
+    if publication_kind == "convertedFromBinary":
+        conversion = _mapping(
+            raw_conversion,
+            "geometry manifest canonical model conversion",
+        )
+        _exact_keys(
+            conversion,
+            {"invocationOrdinal", "workerEvidence"},
+            "geometry manifest canonical model conversion",
+        )
+        converter_ordinal = conversion["invocationOrdinal"]
+        if (
+            set(source_hashes) != {"cameras.bin", "images.bin", "points3D.bin"}
+            or type(converter_ordinal) is not int
+            or converter_ordinal < 1
+            or converter_ordinal > len(converter_invocations)
+            or not converter_invocations[converter_ordinal - 1]["succeeded"]
+            or conversion["workerEvidence"]
+            != converter_invocations[converter_ordinal - 1]["modelConversion"]
+        ):
+            raise EvidenceError(
+                "binary canonical publication lacks its successful model converter"
+            )
+    elif publication_kind in {"directText", "resumedCanonicalText"}:
+        if (
+            dict(source_hashes) != dict(canonical_model_hashes)
+            or raw_conversion is not None
+        ):
+            raise EvidenceError("direct canonical text publication source is invalid")
+    else:
+        raise EvidenceError("geometry canonical model publication kind is invalid")
+
     if refinement_kind == "incrementalGlobal":
         if pair_graph_status != "measured":
-            raise EvidenceError(
-                "incremental geometry has an invalid pair graph"
-            )
+            raise EvidenceError("incremental geometry has an invalid pair graph")
         cadence = _mapping(
             mapping["incrementalCadence"],
             "geometry manifest mapping incremental cadence",
         )
-        cadence_fields = {
-            "localMaxRefinements",
-            "globalFramesRatio",
-            "globalPointsRatio",
-            "globalMaxRefinements",
-            "localMaxNumIterations",
-            "localFunctionTolerance",
-            "globalFunctionTolerance",
-            "localImageCount",
-        }
-        _exact_keys(
+        cadence = _mapper_cadence(
             cadence,
-            cadence_fields,
             "geometry manifest mapping incremental cadence",
         )
-        for field in (
-            "localMaxRefinements",
-            "globalMaxRefinements",
-            "localMaxNumIterations",
-            "localImageCount",
-        ):
-            if type(cadence[field]) is not int or cadence[field] <= 0:
-                raise EvidenceError("geometry manifest mapping cadence is invalid")
-        for field in (
-            "globalFramesRatio",
-            "globalPointsRatio",
-            "localFunctionTolerance",
-            "globalFunctionTolerance",
-        ):
-            value = cadence[field]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or value <= 0
-                or (field in {"globalFramesRatio", "globalPointsRatio"} and value <= 1)
-            ):
-                raise EvidenceError("geometry manifest mapping cadence is invalid")
+        _mapper_cadence(
+            mapping["plannedIncrementalCadence"],
+            "geometry manifest mapping planned incremental cadence",
+        )
         accepted_mapper_invocations = [
             item for item in accepted_invocations if item["command"] == "mapper"
         ]
@@ -2676,7 +7575,9 @@ def _validate_runtime_worker_evidence(
             pair_graph_status != "notEvaluated"
             or refinement_count != 1
             or model_count != 1
+            or mapping["plannedIncrementalCadence"] is not None
             or mapping["incrementalCadence"] is not None
+            or cadence_fallback_trigger is not None
         ):
             raise EvidenceError(
                 "seeded geometry has an invalid pair graph or accepted refinement count"
@@ -2687,9 +7588,7 @@ def _validate_runtime_worker_evidence(
             if item["command"] == "pointTriangulator"
         ]
         accepted_adjuster_invocations = [
-            item
-            for item in accepted_invocations
-            if item["command"] == "bundleAdjuster"
+            item for item in accepted_invocations if item["command"] == "bundleAdjuster"
         ]
         if (
             not accepted_commands.issubset(
@@ -2706,8 +7605,7 @@ def _validate_runtime_worker_evidence(
             or not accepted_adjuster_invocations[0]["succeeded"]
             or successful_accepted_count("modelAnalyzer") < 1
             or not any(
-                item["succeeded"]
-                for item in artifact["featureExtractionInvocations"]
+                item["succeeded"] for item in artifact["featureExtractionInvocations"]
             )
             or not any(item["succeeded"] for item in artifact["matchingInvocations"])
         ):
@@ -2716,6 +7614,42 @@ def _validate_runtime_worker_evidence(
             )
     else:
         raise EvidenceError("geometry manifest accepted refinement kind is invalid")
+
+    successful_mapper_records = [
+        item
+        for item in mapping_invocations
+        if item["command"] == "mapper" and item["succeeded"]
+    ]
+    normalized_mapper_records: list[dict[str, Any]] = []
+    for index, invocation in enumerate(successful_mapper_records):
+        execution = _mapping(
+            invocation["mapperExecution"],
+            f"successful mapper invocation {index}.mapperExecution",
+        )
+        evaluation = _mapping(
+            execution["evaluation"],
+            f"successful mapper invocation {index}.evaluation",
+        )
+        normalized_mapper_records.append(
+            {
+                "mapping_attempt_ordinal": invocation["mappingAttemptOrdinal"],
+                "incremental_cadence": dict(execution["incrementalCadence"]),
+                "global_max_num_iterations": execution["globalMaxNumIterations"],
+                "random_seed": execution["randomSeed"],
+                "refine_focal_length": execution["refineFocalLength"],
+                "minimum_pair_inlier_count": execution["minimumPairInlierCount"],
+                "pair_graph_attempt_ordinal": execution["pairGraphAttemptOrdinal"],
+                "pair_list_digest": "sha256:" + execution["pairListDigest"],
+                "descriptor_matcher": execution["descriptorMatcher"],
+                "matching_database_digest": (
+                    "sha256:" + execution["matchingDatabaseDigest"]
+                ),
+                "evaluation": {
+                    "status": evaluation["status"],
+                    "fallback_trigger": evaluation["fallbackTrigger"],
+                },
+            }
+        )
 
     video = _mapping(
         artifact["videoSourceAnalysis"],
@@ -2743,16 +7677,24 @@ def _validate_runtime_worker_evidence(
     source_count = video["videoSourceCount"]
     task_count = video["startedAnalysisTaskCount"]
     observed_concurrency = video["peakInFlightAnalysisTaskCount"]
-    expected_source_count = request["video_source_count"]
+    expected_source_count = selection_sources.video_source_count
+    if request["video_source_count"] != expected_source_count:
+        raise EvidenceError(
+            "protected request video source count does not match the selection manifest"
+        )
     if source_count != expected_source_count:
-        raise EvidenceError("runtime video source count does not match the protected request")
+        raise EvidenceError(
+            "runtime video source count does not match the authenticated selection manifest"
+        )
     if expected_source_count == 0:
         if (source_count, task_count, observed_concurrency) != (0, 0, 0):
             raise EvidenceError("photo input cannot claim video-analysis execution")
     elif (
         source_count < 1
         or not source_count <= task_count <= source_count * 2
-        or not 1 <= observed_concurrency <= min(
+        or not 1
+        <= observed_concurrency
+        <= min(
             source_count,
             expected_budget["maximumConcurrentVideoSourceAnalysisTasks"],
         )
@@ -2761,9 +7703,22 @@ def _validate_runtime_worker_evidence(
     return {
         "refinement_kind": refinement_kind,
         "accepted_mapping_attempt_ordinal": accepted_mapping_attempt_ordinal,
+        "planned_incremental_cadence": mapping["plannedIncrementalCadence"],
         "incremental_cadence": mapping["incrementalCadence"],
+        "cadence_fallback_trigger": cadence_fallback_trigger,
         "pair_list_digest": pair_list_digest,
         "accepted_matcher": accepted_matcher,
+        "accepted_pair_graph_attempt_ordinal": (
+            pair_measurement["matcherAttempts"][-1]["attemptNumber"]
+            if pair_measurement is not None
+            else None
+        ),
+        "matching_database_digest": (
+            "sha256:" + pair_measurement["matchingDatabaseDigest"]
+            if pair_measurement is not None
+            else None
+        ),
+        "mapper_invocations": normalized_mapper_records,
         "successful_mapper_attempt_ordinals": successful_mapper_attempt_ordinals,
     }
 
@@ -2780,6 +7735,7 @@ def _validate_execution_receipts(
     published_output_sha256: str | None,
     pipeline_metrics: Mapping[str, Any] | None,
     expected_pair_list_digest: str | None,
+    selection_sources: SelectionManifestSources | None,
 ) -> list[dict[str, Any]]:
     if not isinstance(commands, list) or not commands:
         raise EvidenceError("observations.commands must be a nonempty receipt array")
@@ -2809,6 +7765,9 @@ def _validate_execution_receipts(
         "variant",
         "argv",
         "mapper_invocations",
+        "planned_mapper_cadence",
+        "accepted_mapper_cadence",
+        "cadence_fallback_trigger",
         "runtime_worker_evidence",
         "started_monotonic_seconds",
         "ended_monotonic_seconds",
@@ -2835,7 +7794,9 @@ def _validate_execution_receipts(
             raise EvidenceError("execution receipt published_output must be boolean")
         for field in ("run_id", "phase", "variant"):
             if receipt[field] != expected[field]:
-                raise EvidenceError(f"commands[{index}].{field} does not match its timing record")
+                raise EvidenceError(
+                    f"commands[{index}].{field} does not match its timing record"
+                )
         started = receipt["started_monotonic_seconds"]
         ended = receipt["ended_monotonic_seconds"]
         if (
@@ -2862,10 +7823,11 @@ def _validate_execution_receipts(
                 f"commands[{index}].process_cpu_microseconds",
             )
         except EvidenceError as error:
-            raise EvidenceError("execution receipt process CPU fields are invalid") from error
+            raise EvidenceError(
+                "execution receipt process CPU fields are invalid"
+            ) from error
         if any(
-            type(process_cpu[field]) is not int
-            or not 0 <= process_cpu[field] < 1 << 64
+            type(process_cpu[field]) is not int or not 0 <= process_cpu[field] < 1 << 64
             for field in ("user", "system")
         ):
             raise EvidenceError("execution receipt process CPU time is outside UInt64")
@@ -2875,13 +7837,22 @@ def _validate_execution_receipts(
             rel_tol=0,
             abs_tol=1e-6,
         ):
-            raise EvidenceError("execution receipt duration does not match its timing record")
+            raise EvidenceError(
+                "execution receipt duration does not match its timing record"
+            )
         expected_exit = 0 if valid_outcome else actual["exit_code"]
-        if type(receipt["exit_code"]) is not int or receipt["exit_code"] != expected_exit:
-            raise EvidenceError("execution receipt exit code does not match the run outcome")
-        checkout, toolchain, configuration_digest, prefixes = _expected_variant_identity(
-            receipt["variant"],
-            request,
+        if (
+            type(receipt["exit_code"]) is not int
+            or receipt["exit_code"] != expected_exit
+        ):
+            raise EvidenceError(
+                "execution receipt exit code does not match the run outcome"
+            )
+        checkout, toolchain, configuration_digest, prefixes = (
+            _expected_variant_identity(
+                receipt["variant"],
+                request,
+            )
         )
         if receipt["checkout_commit"] != checkout:
             raise EvidenceError("execution receipt checkout commit is invalid")
@@ -2901,7 +7872,9 @@ def _validate_execution_receipts(
                     }
                 )
             if receipt["published_output"] and pipeline_metrics is None:
-                raise EvidenceError("candidate worker evidence requires pipeline metrics")
+                raise EvidenceError(
+                    "candidate worker evidence requires pipeline metrics"
+                )
             geometry_execution = _validate_runtime_worker_evidence(
                 receipt["runtime_worker_evidence"],
                 configuration,
@@ -2913,12 +7886,12 @@ def _validate_execution_receipts(
                 used_worker_artifacts,
                 f"commands[{index}].runtime_worker_evidence",
                 pipeline_metrics if receipt["published_output"] else None,
+                selection_sources,
             )
             if (
                 receipt["published_output"]
                 and expected_pair_list_digest is not None
-                and geometry_execution["pair_list_digest"]
-                != expected_pair_list_digest
+                and geometry_execution["pair_list_digest"] != expected_pair_list_digest
             ):
                 raise EvidenceError(
                     "published geometry pair-list digest does not match protected pair evidence"
@@ -2940,11 +7913,18 @@ def _validate_execution_receipts(
         _digest(receipt["output_sha256"], f"commands[{index}].output_sha256")
         if receipt["published_output"]:
             published_receipts += 1
-            if published_output_sha256 is None or receipt["output_sha256"] != published_output_sha256:
-                raise EvidenceError("published execution receipt does not match output_ply")
+            if (
+                published_output_sha256 is None
+                or receipt["output_sha256"] != published_output_sha256
+            ):
+                raise EvidenceError(
+                    "published execution receipt does not match output_ply"
+                )
         argv = receipt["argv"]
         if not isinstance(argv, list) or not argv:
-            raise EvidenceError("execution receipt argv must be a nonempty argument array")
+            raise EvidenceError(
+                "execution receipt argv must be a nonempty argument array"
+            )
         for argument in argv:
             if (
                 not isinstance(argument, str)
@@ -2953,17 +7933,27 @@ def _validate_execution_receipts(
                 or "/home/" in argument
             ):
                 raise EvidenceError("execution receipt argv must use redacted paths")
-        if any(not any(argument.startswith(prefix) for argument in argv) for prefix in prefixes):
-            raise EvidenceError("execution receipt argv does not identify its variant closure")
+        if any(
+            not any(argument.startswith(prefix) for argument in argv)
+            for prefix in prefixes
+        ):
+            raise EvidenceError(
+                "execution receipt argv does not identify its variant closure"
+            )
         _validate_mapper_invocations(
             receipt["mapper_invocations"],
             receipt["variant"],
             request,
             valid_outcome=valid_outcome,
+            planned_mapper_cadence=receipt["planned_mapper_cadence"],
+            accepted_mapper_cadence=receipt["accepted_mapper_cadence"],
+            cadence_fallback_trigger=receipt["cadence_fallback_trigger"],
             geometry_execution=geometry_execution,
         )
     if valid_outcome and published_receipts != 1:
-        raise EvidenceError("valid evidence requires exactly one receipt for the published output")
+        raise EvidenceError(
+            "valid evidence requires exactly one receipt for the published output"
+        )
     if not valid_outcome and published_receipts:
         raise EvidenceError("invalid evidence cannot claim a published output receipt")
     return expected_runs
@@ -2990,6 +7980,9 @@ def _validate_prepared_execution_receipts(
         "variant",
         "argv",
         "mapper_invocations",
+        "planned_mapper_cadence",
+        "accepted_mapper_cadence",
+        "cadence_fallback_trigger",
         "runtime_worker_evidence",
         "started_monotonic_seconds",
         "ended_monotonic_seconds",
@@ -3026,7 +8019,9 @@ def _validate_prepared_execution_receipts(
 
     if artifact_root is not None:
         if descriptors is None:
-            raise EvidenceError("prepared runtime validation requires artifact descriptors")
+            raise EvidenceError(
+                "prepared runtime validation requires artifact descriptors"
+            )
         command_descriptor = _mapping(
             descriptors.get("command_log"),
             "attestation.artifacts.command_log",
@@ -3038,7 +8033,9 @@ def _validate_prepared_execution_receipts(
             ).parts
         )
         if _read_command_log(command_path) != commands:
-            raise EvidenceError("command_log does not match the prepared execution receipts")
+            raise EvidenceError(
+                "command_log does not match the prepared execution receipts"
+            )
 
     seen_run_ids: set[str] = set()
     used_worker_artifacts: set[str] = set()
@@ -3055,7 +8052,9 @@ def _validate_prepared_execution_receipts(
         phase = receipt["phase"]
         variant = receipt["variant"]
         if phase not in allowed_phases or variant not in allowed_phases[phase]:
-            raise EvidenceError("prepared execution receipt phase or variant is invalid")
+            raise EvidenceError(
+                "prepared execution receipt phase or variant is invalid"
+            )
         started = receipt["started_monotonic_seconds"]
         ended = receipt["ended_monotonic_seconds"]
         if (
@@ -3069,7 +8068,9 @@ def _validate_prepared_execution_receipts(
             or ended <= started
             or started < previous_end
         ):
-            raise EvidenceError("prepared execution receipt timestamps are invalid or overlap")
+            raise EvidenceError(
+                "prepared execution receipt timestamps are invalid or overlap"
+            )
         previous_end = float(ended)
         process_cpu = _mapping(
             receipt["process_cpu_microseconds"],
@@ -3081,17 +8082,23 @@ def _validate_prepared_execution_receipts(
             f"{context}.process_cpu_microseconds",
         )
         if any(
-            type(process_cpu[field]) is not int
-            or not 0 <= process_cpu[field] < 1 << 64
+            type(process_cpu[field]) is not int or not 0 <= process_cpu[field] < 1 << 64
             for field in ("user", "system")
         ):
-            raise EvidenceError("prepared execution receipt process CPU time is invalid")
+            raise EvidenceError(
+                "prepared execution receipt process CPU time is invalid"
+            )
         expected_exit = 0 if valid_outcome else actual["exit_code"]
-        if type(receipt["exit_code"]) is not int or receipt["exit_code"] != expected_exit:
+        if (
+            type(receipt["exit_code"]) is not int
+            or receipt["exit_code"] != expected_exit
+        ):
             raise EvidenceError("prepared execution receipt exit code is invalid")
-        checkout, toolchain, configuration_digest, prefixes = _expected_variant_identity(
-            variant,
-            request,
+        checkout, toolchain, configuration_digest, prefixes = (
+            _expected_variant_identity(
+                variant,
+                request,
+            )
         )
         if (
             receipt["checkout_commit"] != checkout
@@ -3110,14 +8117,18 @@ def _validate_prepared_execution_receipts(
                 raise EvidenceError(f"prepared execution receipt {field} is invalid")
         _digest(receipt["output_sha256"], f"{context}.output_sha256")
         if type(receipt["published_output"]) is not bool:
-            raise EvidenceError("prepared execution receipt published_output must be boolean")
+            raise EvidenceError(
+                "prepared execution receipt published_output must be boolean"
+            )
         if receipt["published_output"]:
             published_count += 1
             if (
                 published_output_sha256 is None
                 or receipt["output_sha256"] != published_output_sha256
             ):
-                raise EvidenceError("prepared published receipt does not match output_ply")
+                raise EvidenceError(
+                    "prepared published receipt does not match output_ply"
+                )
         argv = receipt["argv"]
         if (
             not isinstance(argv, list)
@@ -3149,6 +8160,8 @@ def _validate_prepared_execution_receipts(
                     "artifact_sha256",
                     "geometry_manifest_name",
                     "geometry_manifest_sha256",
+                    "canonical_cameras_name",
+                    "canonical_cameras_sha256",
                     "geometry_input_digest",
                     "selected_frames_digest",
                 },
@@ -3162,11 +8175,18 @@ def _validate_prepared_execution_receipts(
                 worker_receipt["geometry_manifest_name"],
                 f"{context}.runtime_worker_evidence.geometry_manifest_name",
             )
-            if artifact_name == geometry_name:
-                raise EvidenceError("prepared worker and geometry artifacts must be distinct")
+            cameras_name = _token(
+                worker_receipt["canonical_cameras_name"],
+                f"{context}.runtime_worker_evidence.canonical_cameras_name",
+            )
+            if len({artifact_name, geometry_name, cameras_name}) != 3:
+                raise EvidenceError(
+                    "prepared worker, geometry, and camera artifacts must be distinct"
+                )
             for field in (
                 "artifact_sha256",
                 "geometry_manifest_sha256",
+                "canonical_cameras_sha256",
                 "geometry_input_digest",
                 "selected_frames_digest",
             ):
@@ -3217,13 +8237,18 @@ def _validate_prepared_execution_receipts(
                 variant,
                 request,
                 valid_outcome=valid_outcome,
+                planned_mapper_cadence=receipt["planned_mapper_cadence"],
+                accepted_mapper_cadence=receipt["accepted_mapper_cadence"],
+                cadence_fallback_trigger=receipt["cadence_fallback_trigger"],
                 geometry_execution=geometry_execution,
             )
         elif valid_outcome and variant in {"candidate", "fast_candidate"}:
             mapper_invocations = receipt["mapper_invocations"]
             accepted_count = (
                 sum(
-                    isinstance(item, Mapping) and item.get("outcome") == "accepted"
+                    isinstance(item, Mapping)
+                    and isinstance(item.get("evaluation"), Mapping)
+                    and item["evaluation"].get("status") == "accepted"
                     for item in mapper_invocations
                 )
                 if isinstance(mapper_invocations, list)
@@ -3246,6 +8271,9 @@ def _validate_prepared_execution_receipts(
                 variant,
                 request,
                 valid_outcome=True,
+                planned_mapper_cadence=receipt["planned_mapper_cadence"],
+                accepted_mapper_cadence=receipt["accepted_mapper_cadence"],
+                cadence_fallback_trigger=receipt["cadence_fallback_trigger"],
                 geometry_execution=seeded_hint,
             )
         else:
@@ -3254,12 +8282,17 @@ def _validate_prepared_execution_receipts(
                 variant,
                 request,
                 valid_outcome=valid_outcome,
+                planned_mapper_cadence=receipt["planned_mapper_cadence"],
+                accepted_mapper_cadence=receipt["accepted_mapper_cadence"],
+                cadence_fallback_trigger=receipt["cadence_fallback_trigger"],
             )
     if valid_outcome and published_count != 1:
         raise EvidenceError("prepared valid evidence requires one published receipt")
     if not valid_outcome:
         if len(commands) != 1 or published_count:
-            raise EvidenceError("prepared invalid evidence has an invalid receipt closure")
+            raise EvidenceError(
+                "prepared invalid evidence has an invalid receipt closure"
+            )
 
 
 def _host_state_snapshot(value: Any, label: str) -> dict[str, Any]:
@@ -3345,7 +8378,9 @@ def measurement_environment_rejections(
         "measurement environment monitor executable sha256",
     )
     if environment["monitor_executable_sha256"] != expected_monitor_executable_sha256:
-        raise EvidenceError("measurement environment monitor executable is not approved")
+        raise EvidenceError(
+            "measurement environment monitor executable is not approved"
+        )
     monitor_path = supervisor_path.parent / "host-monitor.json"
     try:
         metadata = monitor_path.lstat()
@@ -3367,7 +8402,9 @@ def measurement_environment_rejections(
         "measurement environment sample interval",
     )
     if interval > 1.0:
-        raise EvidenceError("measurement environment sample interval exceeds one second")
+        raise EvidenceError(
+            "measurement environment sample interval exceeds one second"
+        )
     sample_count = environment["sample_count"]
     if type(sample_count) is not int or not 2 <= sample_count <= 100_000:
         raise EvidenceError("measurement environment sample count is invalid")
@@ -3392,10 +8429,15 @@ def measurement_environment_rejections(
         or supervisor_started - first > maximum_gap + 0.05
         or last - supervisor_ended > maximum_gap + 0.05
     ):
-        raise EvidenceError("measurement environment does not bracket the supervisor window")
+        raise EvidenceError(
+            "measurement environment does not bracket the supervisor window"
+        )
 
     state_change_events = environment["state_change_events"]
-    if not isinstance(state_change_events, list) or len(state_change_events) > sample_count:
+    if (
+        not isinstance(state_change_events, list)
+        or len(state_change_events) > sample_count
+    ):
         raise EvidenceError("measurement environment state-change events are invalid")
     previous_event_key: tuple[float, str] | None = None
     for index, raw_event in enumerate(state_change_events):
@@ -3422,7 +8464,9 @@ def measurement_environment_rejections(
             raise EvidenceError("measurement environment state-change event is invalid")
         event_key = (timestamp, kind)
         if previous_event_key is not None and event_key < previous_event_key:
-            raise EvidenceError("measurement environment state-change events are not canonical")
+            raise EvidenceError(
+                "measurement environment state-change events are not canonical"
+            )
         previous_event_key = event_key
     if state_change_events:
         rejections = ["host_state_change"]
@@ -3480,14 +8524,23 @@ def measurement_environment_rejections(
     if type(logical_cpus) is not int or logical_cpus <= 0:
         raise EvidenceError("measurement logical CPU count is unavailable")
     command_environment = environment["commands"]
-    if not isinstance(command_environment, list) or len(command_environment) != len(commands):
+    if not isinstance(command_environment, list) or len(command_environment) != len(
+        commands
+    ):
         raise EvidenceError("measurement environment command closure is incomplete")
     process_cpu_total = 0
-    for index, (raw, command) in enumerate(zip(command_environment, commands, strict=True)):
+    for index, (raw, command) in enumerate(
+        zip(command_environment, commands, strict=True)
+    ):
         item = _mapping(raw, f"measurement environment commands[{index}]")
         _exact_keys(
             item,
-            {"run_id", "host_busy_fraction", "process_cpu_fraction", "external_cpu_fraction"},
+            {
+                "run_id",
+                "host_busy_fraction",
+                "process_cpu_fraction",
+                "external_cpu_fraction",
+            },
             f"measurement environment commands[{index}]",
         )
         if item["run_id"] != command["run_id"]:
@@ -3514,20 +8567,30 @@ def measurement_environment_rejections(
             f"measurement environment commands[{index}].external_cpu_fraction",
         )
         if host_busy > 1 + 1e-12 or process_fraction > 1.05 + 1e-12:
-            raise EvidenceError("measurement environment CPU fraction is outside its domain")
-        if not math.isclose(process_fraction, expected_process_fraction, rel_tol=0, abs_tol=1e-9):
-            raise EvidenceError("measurement environment process CPU fraction is inconsistent")
+            raise EvidenceError(
+                "measurement environment CPU fraction is outside its domain"
+            )
+        if not math.isclose(
+            process_fraction, expected_process_fraction, rel_tol=0, abs_tol=1e-9
+        ):
+            raise EvidenceError(
+                "measurement environment process CPU fraction is inconsistent"
+            )
         if not math.isclose(
             external_fraction,
             max(0.0, host_busy - process_fraction),
             rel_tol=0,
             abs_tol=1e-9,
         ):
-            raise EvidenceError("measurement environment external CPU fraction is inconsistent")
+            raise EvidenceError(
+                "measurement environment external CPU fraction is inconsistent"
+            )
         if external_fraction > MAX_EXTERNAL_CPU_FRACTION + 1e-12:
             rejections.append("external_cpu")
     outer_cpu_total = child_cpu["user"] + child_cpu["system"]
-    if process_cpu_total > outer_cpu_total + max(100_000, math.ceil(outer_cpu_total * 0.01)):
+    if process_cpu_total > outer_cpu_total + max(
+        100_000, math.ceil(outer_cpu_total * 0.01)
+    ):
         raise EvidenceError("measurement command CPU exceeds outer child CPU")
     supervisor_duration = supervisor_ended - supervisor_started
     supervisor_host_busy = _nonnegative_number(
@@ -3574,7 +8637,9 @@ def measurement_environment_rejections(
             abs_tol=1e-9,
         )
     ):
-        raise EvidenceError("measurement environment supervisor CPU accounting is inconsistent")
+        raise EvidenceError(
+            "measurement environment supervisor CPU accounting is inconsistent"
+        )
     if supervisor_external_fraction > MAX_EXTERNAL_CPU_FRACTION + 1e-12:
         rejections.append("supervisor_external_cpu")
     if unattributed_child_fraction > MAX_UNATTRIBUTED_CHILD_CPU_FRACTION + 1e-12:
@@ -3660,7 +8725,9 @@ def _validate_supervisor_run(
     }
     for field, expected in expected_bindings.items():
         if receipt[field] != expected:
-            raise EvidenceError(f"supervisor_run {field} does not match the protected request")
+            raise EvidenceError(
+                f"supervisor_run {field} does not match the protected request"
+            )
     started = receipt["started_monotonic_seconds"]
     ended = receipt["ended_monotonic_seconds"]
     if (
@@ -3675,8 +8742,12 @@ def _validate_supervisor_run(
     ):
         raise EvidenceError("supervisor_run monotonic timestamps are invalid")
     argv = receipt["argv"]
-    if not isinstance(argv, list) or any(not isinstance(item, str) or not item for item in argv):
-        raise EvidenceError("supervisor_run argv must be a nonempty redacted argument array")
+    if not isinstance(argv, list) or any(
+        not isinstance(item, str) or not item for item in argv
+    ):
+        raise EvidenceError(
+            "supervisor_run argv must be a nonempty redacted argument array"
+        )
     expected_tokens = {
         f"scene://{binding['scene_id']}",
         f"scale://{binding['scale']}",
@@ -3688,7 +8759,9 @@ def _validate_supervisor_run(
         f"runner://{runner_identity['sha256']}",
     }
     if not expected_tokens.issubset(set(argv)):
-        raise EvidenceError("supervisor_run argv is not bound to the protected execution")
+        raise EvidenceError(
+            "supervisor_run argv is not bound to the protected execution"
+        )
     supervisor_start = float(started)
     supervisor_end = float(ended)
     intervals = sorted(
@@ -3703,7 +8776,9 @@ def _validate_supervisor_run(
             internal_start < supervisor_start - MONOTONIC_TIMESTAMP_TOLERANCE_SECONDS
             or internal_end > supervisor_end + MONOTONIC_TIMESTAMP_TOLERANCE_SECONDS
         ):
-            raise EvidenceError("execution receipt falls outside the supervisor monotonic window")
+            raise EvidenceError(
+                "execution receipt falls outside the supervisor monotonic window"
+            )
 
     covered_seconds = 0.0
     merged_start, merged_end = intervals[0]
@@ -3737,7 +8812,9 @@ def _validate_supervisor_run(
         )
     unattributed_seconds = supervisor_span - covered_seconds
     if unattributed_seconds > max(2.0, supervisor_span * 0.1):
-        raise EvidenceError("execution receipts leave too much supervisor time unattributed")
+        raise EvidenceError(
+            "execution receipts leave too much supervisor time unattributed"
+        )
 
 
 def _validate_render_supervisor(
@@ -3816,8 +8893,12 @@ def _validate_render_supervisor(
     ):
         raise EvidenceError("render_supervisor monotonic timestamps are invalid")
     argv = receipt["argv"]
-    if not isinstance(argv, list) or any(not isinstance(item, str) or not item for item in argv):
-        raise EvidenceError("render_supervisor argv must be a nonempty redacted argument array")
+    if not isinstance(argv, list) or any(
+        not isinstance(item, str) or not item for item in argv
+    ):
+        raise EvidenceError(
+            "render_supervisor argv must be a nonempty redacted argument array"
+        )
     expected_tokens = {
         "approved-rendering-driver",
         f"renderer-closure://{renderer_identity['sha256']}",
@@ -3828,7 +8909,9 @@ def _validate_render_supervisor(
     if not expected_tokens.issubset(set(argv)) or any(
         "/Users/" in argument or "/home/" in argument for argument in argv
     ):
-        raise EvidenceError("render_supervisor argv is not bound to the protected rendering process")
+        raise EvidenceError(
+            "render_supervisor argv is not bound to the protected rendering process"
+        )
 
 
 def _single_link_artifact_descriptor(
@@ -3974,7 +9057,9 @@ def _validate_orientation_supervisor(
         "orientation metrics index",
     )
     if supervisor["metrics_index_sha256"] != metrics_index_descriptor["sha256"]:
-        raise EvidenceError("orientation supervisor metrics index digest does not match")
+        raise EvidenceError(
+            "orientation supervisor metrics index digest does not match"
+        )
     aggregate = _mapping(
         _load_bounded_json(metrics_index_path, "orientation-metrics.json"),
         "orientation metrics index",
@@ -3989,11 +9074,31 @@ def _validate_orientation_supervisor(
 
     candidate_records, candidate_run_ids = _orientation_candidate_records(observations)
     scoring_run_id = _orientation_scoring_run_id(observations, candidate_run_ids)
+    commands = observations.get("commands")
+    if not isinstance(commands, list):
+        raise EvidenceError("orientation evidence requires execution receipts")
+    execution_by_run: dict[str, Mapping[str, Any]] = {}
+    for raw_command in commands:
+        if not isinstance(raw_command, Mapping):
+            continue
+        run_id = raw_command.get("run_id")
+        if (
+            run_id in candidate_run_ids
+            and raw_command.get("phase") == "ordinary"
+            and raw_command.get("variant") == "candidate"
+        ):
+            if run_id in execution_by_run:
+                raise EvidenceError("orientation execution run ids must be unique")
+            execution_by_run[str(run_id)] = raw_command
+    if set(execution_by_run) != set(candidate_run_ids):
+        raise EvidenceError("orientation evidence is missing authenticated executions")
     if (
         supervisor["scoring_run_id"] != scoring_run_id
         or aggregate["scoring_run_id"] != scoring_run_id
     ):
-        raise EvidenceError("orientation scoring run does not match the published output")
+        raise EvidenceError(
+            "orientation scoring run does not match the published output"
+        )
     raw_receipts = supervisor["runs"]
     aggregate_runs = aggregate["runs"]
     if (
@@ -4032,7 +9137,9 @@ def _validate_orientation_supervisor(
         receipt = _mapping(raw_receipt, f"orientation supervisor runs[{index}]")
         _exact_keys(receipt, receipt_fields, f"orientation supervisor runs[{index}]")
         if receipt["run_id"] != run_id:
-            raise EvidenceError("orientation supervisor runs are not in candidate timing order")
+            raise EvidenceError(
+                "orientation supervisor runs are not in candidate timing order"
+            )
         aggregate_run = _mapping(
             raw_aggregate,
             f"orientation metrics index runs[{index}]",
@@ -4043,7 +9150,9 @@ def _validate_orientation_supervisor(
             f"orientation metrics index runs[{index}]",
         )
         if aggregate_run["run_id"] != run_id:
-            raise EvidenceError("orientation metrics runs are not in candidate timing order")
+            raise EvidenceError(
+                "orientation metrics runs are not in candidate timing order"
+            )
 
         relative_root = PurePosixPath("orientation-runs") / run_id
         expected_paths = {
@@ -4076,10 +9185,41 @@ def _validate_orientation_supervisor(
                 raise EvidenceError(
                     f"orientation {descriptor_name} digest does not match for {run_id}"
                 )
-            dynamic_descriptors[f"orientation_{descriptor_name}_{index:02d}"] = descriptor
+            dynamic_descriptors[f"orientation_{descriptor_name}_{index:02d}"] = (
+                descriptor
+            )
+
+        execution = execution_by_run[run_id]
+        runtime = _mapping(
+            execution.get("runtime_worker_evidence"),
+            f"orientation runtime worker evidence for {run_id}",
+        )
+        if runtime.get("geometry_manifest_sha256") != receipt[
+            "geometry_manifest_sha256"
+        ]:
+            raise EvidenceError(
+                f"orientation geometry for {run_id} does not match the authenticated execution"
+            )
+        geometry_path = artifact_root / Path(*expected_paths["geometry_manifest_path"].parts)
+        geometry = _mapping(
+            _load_bounded_json(geometry_path, f"orientation geometry for {run_id}"),
+            f"orientation geometry for {run_id}",
+        )
+        model_hashes = _mapping(
+            geometry.get("modelHashes"),
+            f"orientation geometry model hashes for {run_id}",
+        )
+        if model_hashes.get("images.txt") != receipt[
+            "candidate_images_sha256"
+        ].removeprefix("sha256:"):
+            raise EvidenceError(
+                f"orientation images for {run_id} do not match the authenticated geometry"
+            )
 
         if aggregate_run["metrics_path"] != receipt["metrics_path"]:
-            raise EvidenceError("orientation metrics index path does not match its receipt")
+            raise EvidenceError(
+                "orientation metrics index path does not match its receipt"
+            )
         metrics_path = artifact_root / Path(*expected_paths["metrics_path"].parts)
         metrics = validate_orientation_metrics(
             _load_bounded_json(metrics_path, f"orientation metrics for {run_id}"),
@@ -4090,7 +9230,9 @@ def _validate_orientation_supervisor(
                 f"orientation alignment support for {run_id} exceeds the selected scale"
             )
         if aggregate_run["metrics"] != metrics:
-            raise EvidenceError("orientation metrics index does not match the driver output")
+            raise EvidenceError(
+                "orientation metrics index does not match the driver output"
+            )
         started = receipt["started_monotonic_seconds"]
         ended = receipt["ended_monotonic_seconds"]
         if (
@@ -4105,7 +9247,9 @@ def _validate_orientation_supervisor(
             or receipt["exit_code"] != 0
             or receipt["timed_out"] is not False
         ):
-            raise EvidenceError(f"orientation supervisor execution for {run_id} is invalid")
+            raise EvidenceError(
+                f"orientation supervisor execution for {run_id} is invalid"
+            )
         _digest(
             receipt["actual_argv_sha256"],
             f"orientation supervisor actual argv digest for {run_id}",
@@ -4117,8 +9261,12 @@ def _validate_orientation_supervisor(
             "extract-orientation",
             "--geometry-manifest",
             f"evidence://{expected_paths['geometry_manifest_path'].as_posix()}",
+            "--geometry-manifest-sha256",
+            receipt["geometry_manifest_sha256"],
             "--candidate-images",
             f"evidence://{expected_paths['candidate_images_path'].as_posix()}",
+            "--candidate-images-sha256",
+            receipt["candidate_images_sha256"],
             "--ground-truth-poses",
             "evidence://ground-truth-poses.json",
             "--ground-truth-poses-sha256",
@@ -4166,7 +9314,8 @@ def _memory_metrics(
     candidate_runs = {
         run["run_id"]: run
         for run in expected_runs
-        if run["variant"] in {"candidate", "fast_candidate"} and run["duration"] is not None
+        if run["variant"] in {"candidate", "fast_candidate"}
+        and run["duration"] is not None
     }
     samples = memory["samples"]
     if not isinstance(samples, list) or not samples:
@@ -4189,7 +9338,9 @@ def _memory_metrics(
         rss = sample["process_tree_resident_bytes"]
         metal = sample["metal_allocated_bytes"]
         if run_id not in candidate_runs:
-            raise EvidenceError("memory sample is not bound to a candidate execution receipt")
+            raise EvidenceError(
+                "memory sample is not bound to a candidate execution receipt"
+            )
         if (
             isinstance(elapsed, bool)
             or not isinstance(elapsed, (int, float))
@@ -4203,29 +9354,40 @@ def _memory_metrics(
             raise EvidenceError("memory sample values are invalid")
         by_run.setdefault(run_id, []).append((float(elapsed), rss, metal))
     if set(by_run) != set(candidate_runs):
-        raise EvidenceError("memory samples do not cover every candidate execution receipt")
+        raise EvidenceError(
+            "memory samples do not cover every candidate execution receipt"
+        )
     for run_id, run in candidate_runs.items():
         duration = float(run["duration"])
         run_samples = by_run[run_id]
         elapsed_values = [sample[0] for sample in run_samples]
-        if elapsed_values != sorted(elapsed_values) or len(elapsed_values) != len(set(elapsed_values)):
-            raise EvidenceError("memory sample timestamps must be strictly increasing per run")
+        if elapsed_values != sorted(elapsed_values) or len(elapsed_values) != len(
+            set(elapsed_values)
+        ):
+            raise EvidenceError(
+                "memory sample timestamps must be strictly increasing per run"
+            )
         if not math.isclose(elapsed_values[0], 0, abs_tol=1e-6) or not math.isclose(
             elapsed_values[-1], duration, rel_tol=0, abs_tol=1e-6
         ):
-            raise EvidenceError("memory samples must span each candidate run from launch to exit")
+            raise EvidenceError(
+                "memory samples must span each candidate run from launch to exit"
+            )
         if any(
             later - earlier > interval * 1.25 + 1e-6
             for earlier, later in zip(elapsed_values, elapsed_values[1:], strict=False)
         ):
             raise EvidenceError("memory sampling cadence has an uncovered gap")
-        if run["phase"] != "phase" and max(sample[2] for sample in run_samples) <= 0:
-            raise EvidenceError("end-to-end candidate runs must report positive Metal allocation")
+        # macOS exposes process-tree RSS but no stable public cross-process Metal
+        # allocation counter. Zero preserves that unavailable measurement without
+        # inventing a GPU-memory value; unified-memory release gates use RSS.
     physical_memory = machine.get("physical_memory_bytes")
     if type(physical_memory) is not int or physical_memory <= 0:
         raise EvidenceError("machine physical memory is unavailable")
     return {
-        "peak_memory_bytes": measured(max(sample[1] for samples in by_run.values() for sample in samples)),
+        "peak_memory_bytes": measured(
+            max(sample[1] for samples in by_run.values() for sample in samples)
+        ),
         "peak_metal_allocated_bytes": measured(
             max(sample[2] for samples in by_run.values() for sample in samples)
         ),
@@ -4245,7 +9407,9 @@ def _validate_resolved_compute(
     candidate_configuration: Mapping[str, Any],
 ) -> dict[str, Any]:
     compute = _mapping(value, "observations.resolved_compute")
-    _exact_keys(compute, {"stages", "cpu_only_reasons"}, "observations.resolved_compute")
+    _exact_keys(
+        compute, {"stages", "cpu_only_reasons"}, "observations.resolved_compute"
+    )
     stages = _mapping(compute["stages"], "observations.resolved_compute.stages")
     stage_names = {"feature_extraction", "matching", "mapping", "training", "rendering"}
     _exact_keys(stages, stage_names, "observations.resolved_compute.stages")
@@ -4273,7 +9437,9 @@ def _validate_resolved_compute(
         "observations.resolved_compute.cpu_only_reasons",
     )
     if dict(reasons) != expected_reasons:
-        raise EvidenceError("CPU-only stage reasons do not match the supported backend closure")
+        raise EvidenceError(
+            "CPU-only stage reasons do not match the supported backend closure"
+        )
     if candidate_configuration.get("compute_policy") != "metal_for_supported_stages":
         raise EvidenceError("resolved compute does not match the bound compute policy")
     return {"stages": dict(stages), "cpu_only_reasons": dict(reasons)}
@@ -4298,7 +9464,9 @@ def _validate_actual(
             "corrupt_ply": False,
         }
         if dict(actual) != expected:
-            raise EvidenceError("valid evidence must report one clean successful process outcome")
+            raise EvidenceError(
+                "valid evidence must report one clean successful process outcome"
+            )
     else:
         if (
             type(actual["exit_code"]) is not int
@@ -4308,7 +9476,9 @@ def _validate_actual(
             or actual["failure_type"] != expected_outcome["failure_type"]
             or actual["corrupt_ply"] is not False
         ):
-            raise EvidenceError("invalid-input evidence must report the expected clean rejection")
+            raise EvidenceError(
+                "invalid-input evidence must report the expected clean rejection"
+            )
     return dict(actual)
 
 
@@ -4317,7 +9487,9 @@ def _toolchain_scenario_metrics(
     binding: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
     if not isinstance(value, list) or len(value) != len(TOOLCHAIN_SCENARIO_SPECS):
-        raise EvidenceError("toolchain_scenarios must contain the complete scenario closure")
+        raise EvidenceError(
+            "toolchain_scenarios must contain the complete scenario closure"
+        )
     expected_names = list(TOOLCHAIN_SCENARIO_SPECS)
     actual_names: list[str] = []
     metrics: dict[str, dict[str, Any]] = {}
@@ -4344,12 +9516,21 @@ def _toolchain_scenario_metrics(
         spec = TOOLCHAIN_SCENARIO_SPECS[name]
         if record["schema_version"] != 1:
             raise EvidenceError("toolchain scenario schema_version must be 1")
-        if record["fault"] != spec["fault"] or record["network_mode"] != spec["network_mode"]:
-            raise EvidenceError("toolchain scenario fault injection does not match its name")
+        if (
+            record["fault"] != spec["fault"]
+            or record["network_mode"] != spec["network_mode"]
+        ):
+            raise EvidenceError(
+                "toolchain scenario fault injection does not match its name"
+            )
         if record["toolchain_identity"] != binding["toolchain_identity"]:
-            raise EvidenceError("toolchain scenario is not bound to the requested toolchain")
+            raise EvidenceError(
+                "toolchain scenario is not bound to the requested toolchain"
+            )
         if record["input_digest"] != binding["input_digest"]:
-            raise EvidenceError("toolchain scenario is not bound to the requested input")
+            raise EvidenceError(
+                "toolchain scenario is not bound to the requested input"
+            )
         argv = record["argv"]
         required_arguments = {
             f"toolchain-scenario://{name}",
@@ -4372,7 +9553,10 @@ def _toolchain_scenario_metrics(
             and type(record["retry_exit_code"]) is not int
         ):
             raise EvidenceError("toolchain scenario exit codes must be integers")
-        if not isinstance(record["result"], str) or type(record["post_state_verified"]) is not bool:
+        if (
+            not isinstance(record["result"], str)
+            or type(record["post_state_verified"]) is not bool
+        ):
             raise EvidenceError("toolchain scenario outcome is invalid")
         passed = (
             record["initial_exit_code"] == spec["initial_exit_code"]
@@ -4414,7 +9598,9 @@ def _verify_toolchain_manifest_signature(manifest: Mapping[str, Any]) -> None:
     unsigned = dict(manifest)
     unsigned["signatureEd25519"] = ""
     published_at = unsigned.get("publishedAt")
-    if isinstance(published_at, bool) or not isinstance(published_at, (int, float, str)):
+    if isinstance(published_at, bool) or not isinstance(
+        published_at, (int, float, str)
+    ):
         raise EvidenceError("toolchain manifest publication date is invalid")
     if isinstance(published_at, (int, float)):
         if not math.isfinite(float(published_at)):
@@ -4427,7 +9613,9 @@ def _verify_toolchain_manifest_signature(manifest: Mapping[str, Any]) -> None:
         try:
             published_date = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
         except ValueError as error:
-            raise EvidenceError("toolchain manifest publication date is invalid") from error
+            raise EvidenceError(
+                "toolchain manifest publication date is invalid"
+            ) from error
         if published_date.tzinfo is None:
             raise EvidenceError("toolchain manifest publication date is invalid")
         published_date = published_date.astimezone(timezone.utc)
@@ -4450,7 +9638,12 @@ def _validated_toolchain_install_state(
     state = _mapping(_load_bounded_json(path, label), label)
     _exact_keys(
         state,
-        {"schemaVersion", "installedArtifacts", "installedCapabilities", "signedManifest"},
+        {
+            "schemaVersion",
+            "installedArtifacts",
+            "installedCapabilities",
+            "signedManifest",
+        },
         label,
     )
     if state["schemaVersion"] != 2:
@@ -4502,6 +9695,7 @@ def _validated_toolchain_install_state(
         "sha256",
         "sizeBytes",
         "expandedSizeBytes",
+        "expandedClosureSHA256",
         "contents",
         "criticalFileHashes",
         "dependencies",
@@ -4547,6 +9741,8 @@ def _validated_toolchain_install_state(
             or component["sizeBytes"] <= 0
             or type(component["expandedSizeBytes"]) is not int
             or component["expandedSizeBytes"] < component["sizeBytes"]
+            or not isinstance(component["expandedClosureSHA256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", component["expandedClosureSHA256"]) is None
             or component["requirement"] not in {"required", "optional"}
         ):
             raise EvidenceError(f"{label} manifest component is invalid")
@@ -4561,25 +9757,38 @@ def _validated_toolchain_install_state(
             ):
                 raise EvidenceError(f"{label} manifest content path is unsafe")
         for relative, digest in critical_hashes.items():
-            if relative not in contents or not isinstance(digest, str) or re.fullmatch(
-                r"[0-9a-f]{64}", digest
-            ) is None:
+            if (
+                relative not in contents
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
                 raise EvidenceError(f"{label} manifest critical file is invalid")
         components_by_name[name] = component
     for name, component in components_by_name.items():
-        if any(dependency not in components_by_name for dependency in component["dependencies"]):
+        if any(
+            dependency not in components_by_name
+            for dependency in component["dependencies"]
+        ):
             raise EvidenceError(f"{label} component dependency is unknown: {name}")
 
-    installed_artifacts = _mapping(state["installedArtifacts"], f"{label}.installedArtifacts")
+    installed_artifacts = _mapping(
+        state["installedArtifacts"], f"{label}.installedArtifacts"
+    )
     installed_names = set(installed_artifacts)
-    if "macos-arm64-core" not in installed_names or not installed_names.issubset(components_by_name):
+    if "macos-arm64-core" not in installed_names or not installed_names.issubset(
+        components_by_name
+    ):
         raise EvidenceError(f"{label} installed component closure is invalid")
     for name, digest in installed_artifacts.items():
         if digest != components_by_name[name]["sha256"]:
-            raise EvidenceError(f"{label} installed component digest is invalid: {name}")
+            raise EvidenceError(
+                f"{label} installed component digest is invalid: {name}"
+            )
         missing = set(components_by_name[name]["dependencies"]) - installed_names
         if missing:
-            raise EvidenceError(f"{label} installed component is missing dependencies: {name}")
+            raise EvidenceError(
+                f"{label} installed component is missing dependencies: {name}"
+            )
     installed_capabilities = state["installedCapabilities"]
     expected_capabilities = sorted(
         capability
@@ -4591,7 +9800,9 @@ def _validated_toolchain_install_state(
 
     normalized_components = [
         {field: component[field] for field in component_fields}
-        for component in sorted(components_by_name.values(), key=lambda value: value["name"])
+        for component in sorted(
+            components_by_name.values(), key=lambda value: value["name"]
+        )
     ]
     closure = {
         "schema_version": 2,
@@ -4648,9 +9859,16 @@ def _validate_component_archive(
         with zipfile.ZipFile(handle) as component_archive:
             files = _safe_zip_files(component_archive, label)
             if set(files) != set(component["contents"]):
-                raise EvidenceError(f"{label} contents do not match the signed manifest")
-            if sum(member.file_size for member in files.values()) > component["expandedSizeBytes"]:
-                raise EvidenceError(f"{label} expanded size exceeds the signed manifest")
+                raise EvidenceError(
+                    f"{label} contents do not match the signed manifest"
+                )
+            if (
+                sum(member.file_size for member in files.values())
+                > component["expandedSizeBytes"]
+            ):
+                raise EvidenceError(
+                    f"{label} expanded size exceeds the signed manifest"
+                )
             for relative, expected_digest in component["criticalFileHashes"].items():
                 hasher = hashlib.sha256()
                 with component_archive.open(files[relative]) as source:
@@ -4675,7 +9893,9 @@ def _validate_toolchain_closure_archive(
             files = _safe_zip_files(closure_archive, label)
             expected_members = {f"{name}.zip" for name in installed_names}
             if set(files) != expected_members:
-                raise EvidenceError(f"{label} component closure does not match its install receipt")
+                raise EvidenceError(
+                    f"{label} component closure does not match its install receipt"
+                )
             total_bytes = 0
             for name in sorted(installed_names):
                 component = components_by_name[name]
@@ -4690,8 +9910,13 @@ def _validate_toolchain_closure_archive(
                             copied += len(chunk)
                             hasher.update(chunk)
                             component_file.write(chunk)
-                    if copied != component["sizeBytes"] or hasher.hexdigest() != component["sha256"]:
-                        raise EvidenceError(f"{label} component archive digest is invalid: {name}")
+                    if (
+                        copied != component["sizeBytes"]
+                        or hasher.hexdigest() != component["sha256"]
+                    ):
+                        raise EvidenceError(
+                            f"{label} component archive digest is invalid: {name}"
+                        )
                     component_file.seek(0)
                     _validate_component_archive(
                         component_file,
@@ -4709,20 +9934,30 @@ def _validate_toolchain_package_evidence(
     descriptors: Mapping[str, Mapping[str, Any]],
     bound_toolchain_identity: str,
 ) -> dict[str, int]:
-    normal_manifest, normal_components, normal_names, _ = _validated_toolchain_install_state(
-        artifact_root / descriptors["normal_photo_toolchain_state"]["path"],
-        "normal photo toolchain install state",
+    normal_manifest, normal_components, normal_names, _ = (
+        _validated_toolchain_install_state(
+            artifact_root / descriptors["normal_photo_toolchain_state"]["path"],
+            "normal photo toolchain install state",
+        )
     )
-    large_manifest, large_components, large_names, large_identity = _validated_toolchain_install_state(
-        artifact_root / descriptors["large_area_toolchain_state"]["path"],
-        "large area toolchain install state",
+    large_manifest, large_components, large_names, large_identity = (
+        _validated_toolchain_install_state(
+            artifact_root / descriptors["large_area_toolchain_state"]["path"],
+            "large area toolchain install state",
+        )
     )
     if canonical_json_bytes(normal_manifest) != canonical_json_bytes(large_manifest):
-        raise EvidenceError("toolchain package closures do not use the same signed manifest")
+        raise EvidenceError(
+            "toolchain package closures do not use the same signed manifest"
+        )
     if large_identity != bound_toolchain_identity:
-        raise EvidenceError("large area toolchain closure does not match the bound toolchain identity")
+        raise EvidenceError(
+            "large area toolchain closure does not match the bound toolchain identity"
+        )
     if not normal_names.issubset(large_names):
-        raise EvidenceError("normal photo toolchain closure is not contained in large area closure")
+        raise EvidenceError(
+            "normal photo toolchain closure is not contained in large area closure"
+        )
     normal_capabilities = {
         capability
         for name in normal_names
@@ -4753,14 +9988,22 @@ def _validate_toolchain_package_evidence(
         == descriptors["large_area_toolchain"]["sha256"]
     )
     if normal_has_streaming:
-        raise EvidenceError("normal photo toolchain closure unexpectedly selects streaming")
+        raise EvidenceError(
+            "normal photo toolchain closure unexpectedly selects streaming"
+        )
     if large_has_streaming and normal_names == large_names:
-        raise EvidenceError("streaming toolchain closure must add its signed components")
+        raise EvidenceError(
+            "streaming toolchain closure must add its signed components"
+        )
     if normal_names == large_names:
         if not same_archive:
-            raise EvidenceError("identical toolchain component closures must use the same archive")
+            raise EvidenceError(
+                "identical toolchain component closures must use the same archive"
+            )
     elif same_archive:
-        raise EvidenceError("distinct toolchain component closures cannot share one archive")
+        raise EvidenceError(
+            "distinct toolchain component closures cannot share one archive"
+        )
     normal_bytes = _validate_toolchain_closure_archive(
         artifact_root / descriptors["normal_photo_toolchain"]["path"],
         "normal_photo_toolchain",
@@ -4811,7 +10054,9 @@ def derive_metrics(
     }
     if not valid_outcome:
         return metrics
-    raw_pipeline = _mapping(observations.get("pipeline_metrics"), "observations.pipeline_metrics")
+    raw_pipeline = _mapping(
+        observations.get("pipeline_metrics"), "observations.pipeline_metrics"
+    )
     orientation_required = lane == LANE_REFERENCE and "scene_quality" in scopes
     if not orientation_required:
         unexpected_orientation = sorted(
@@ -4881,15 +10126,17 @@ def derive_metrics(
                     "raster_exact_buffer_bytes_added",
                     "raster_replay_elapsed_seconds",
                     "raster_peak_exact_intersection_capacity",
-                    "maximum_tile_intersections",
                 }
             )
         if "suite_performance" in scopes:
             required_pipeline.update({"bundle_adjustment_cycles"})
-        missing_pipeline = sorted(name for name in required_pipeline if raw_pipeline.get(name) is None)
+        missing_pipeline = sorted(
+            name for name in required_pipeline if raw_pipeline.get(name) is None
+        )
         if missing_pipeline:
             raise EvidenceError(
-                "required pipeline metrics are not measured: " + ", ".join(missing_pipeline)
+                "required pipeline metrics are not measured: "
+                + ", ".join(missing_pipeline)
             )
         if "scene_quality" in scopes:
             scheduled = raw_pipeline["scheduled_pairs"]
@@ -4929,15 +10176,27 @@ def derive_metrics(
         return metrics
 
     if "scene_quality" in scopes:
-        registration = _mapping(observations.get("registration"), "observations.registration")
-        _exact_keys(registration, {"candidate", "colmap", "baseline"}, "observations.registration")
-        candidate_registered = _booleans(registration.get("candidate"), "registration.candidate")
+        registration = _mapping(
+            observations.get("registration"), "observations.registration"
+        )
+        _exact_keys(
+            registration,
+            {"candidate", "colmap", "baseline"},
+            "observations.registration",
+        )
+        candidate_registered = _booleans(
+            registration.get("candidate"), "registration.candidate"
+        )
         colmap_registered = _booleans(registration.get("colmap"), "registration.colmap")
-        baseline_registered = _booleans(registration.get("baseline"), "registration.baseline")
+        baseline_registered = _booleans(
+            registration.get("baseline"), "registration.baseline"
+        )
         if len(candidate_registered) != len(colmap_registered):
             raise EvidenceError("registration sample counts must match")
         if len(candidate_registered) != len(baseline_registered):
-            raise EvidenceError("baseline registration sample count must match the candidate")
+            raise EvidenceError(
+                "baseline registration sample count must match the candidate"
+            )
         if len(candidate_registered) != requested_scale:
             raise EvidenceError(
                 f"registration sample count must equal requested scale {requested_scale}"
@@ -4959,15 +10218,22 @@ def derive_metrics(
             candidate_registered,
             colmap_registered,
         )
-        colmap_rms = math.sqrt(sum(value * value for value in colmap_ate) / len(colmap_ate))
+        colmap_rms = math.sqrt(
+            sum(value * value for value in colmap_ate) / len(colmap_ate)
+        )
         if colmap_rms == 0:
             raise EvidenceError("COLMAP ATE reference must be nonzero")
-        candidate_rms = math.sqrt(sum(value * value for value in candidate_ate) / len(candidate_ate))
+        candidate_rms = math.sqrt(
+            sum(value * value for value in candidate_ate) / len(candidate_ate)
+        )
         if rendering_evidence is None:
             raise EvidenceError("scene quality requires rendered pixel evidence")
         balanced_records = rendering_evidence.balanced
         fast_records = rendering_evidence.fast
-        if not isinstance(balanced_records, list) or len(balanced_records) != holdout_count:
+        if (
+            not isinstance(balanced_records, list)
+            or len(balanced_records) != holdout_count
+        ):
             raise EvidenceError(
                 f"rendering.balanced must contain exactly {holdout_count} held-out views"
             )
@@ -5007,31 +10273,52 @@ def derive_metrics(
                 "residual_p90_pixels": measured(_percentile(residuals, 0.90)),
                 "ate_colmap_ratio": measured(candidate_rms / colmap_rms),
                 "rotation_rpe_delta_degrees": measured(
-                    max(0.0, statistics.median(candidate_rotation) - statistics.median(colmap_rotation))
+                    max(
+                        0.0,
+                        statistics.median(candidate_rotation)
+                        - statistics.median(colmap_rotation),
+                    )
                 ),
                 "translation_rpe_delta_percentage_points": measured(
                     max(
                         0.0,
-                        statistics.median(candidate_translation) - statistics.median(colmap_translation),
+                        statistics.median(candidate_translation)
+                        - statistics.median(colmap_translation),
                     )
                 ),
-                "balanced_median_psnr_loss_db": measured(statistics.median(balanced_psnr)),
+                "balanced_median_psnr_loss_db": measured(
+                    statistics.median(balanced_psnr)
+                ),
                 "balanced_median_ssim_loss": measured(statistics.median(balanced_ssim)),
-                "balanced_median_lpips_increase": measured(statistics.median(balanced_lpips)),
-                "balanced_scene_psnr_loss_db": measured(statistics.median(balanced_psnr)),
+                "balanced_median_lpips_increase": measured(
+                    statistics.median(balanced_lpips)
+                ),
+                "balanced_scene_psnr_loss_db": measured(
+                    statistics.median(balanced_psnr)
+                ),
                 "balanced_scene_ssim_loss": measured(statistics.median(balanced_ssim)),
-                "balanced_scene_lpips_increase": measured(statistics.median(balanced_lpips)),
+                "balanced_scene_lpips_increase": measured(
+                    statistics.median(balanced_lpips)
+                ),
                 "fast_scene_psnr_loss_db": measured(statistics.median(fast_psnr)),
                 "fast_scene_ssim_loss": measured(statistics.median(fast_ssim)),
                 "fast_scene_lpips_increase": measured(statistics.median(fast_lpips)),
-                "paired_balanced_scene_psnr_loss_db": measured(statistics.median(paired_psnr)),
-                "paired_balanced_scene_ssim_loss": measured(statistics.median(paired_ssim)),
-                "paired_balanced_scene_lpips_increase": measured(statistics.median(paired_lpips)),
+                "paired_balanced_scene_psnr_loss_db": measured(
+                    statistics.median(paired_psnr)
+                ),
+                "paired_balanced_scene_ssim_loss": measured(
+                    statistics.median(paired_ssim)
+                ),
+                "paired_balanced_scene_lpips_increase": measured(
+                    statistics.median(paired_lpips)
+                ),
             }
         )
 
     if "long_sequence" in scopes:
-        long_sequence = _mapping(observations.get("long_sequence"), "observations.long_sequence")
+        long_sequence = _mapping(
+            observations.get("long_sequence"), "observations.long_sequence"
+        )
         _exact_keys(
             long_sequence,
             {"processed_frames", "analysis_seconds", "rss_windows"},
@@ -5040,20 +10327,31 @@ def derive_metrics(
         frames = long_sequence.get("processed_frames")
         seconds = long_sequence.get("analysis_seconds")
         if type(frames) is not int or frames <= 0:
-            raise EvidenceError("long_sequence.processed_frames must be a positive integer")
+            raise EvidenceError(
+                "long_sequence.processed_frames must be a positive integer"
+            )
         if (
             isinstance(seconds, bool)
             or not isinstance(seconds, (int, float))
             or not math.isfinite(seconds)
             or seconds <= 0
         ):
-            raise EvidenceError("long_sequence.analysis_seconds must be positive and finite")
+            raise EvidenceError(
+                "long_sequence.analysis_seconds must be positive and finite"
+            )
         if frames != requested_scale:
-            raise EvidenceError("long_sequence.processed_frames must equal the requested scale")
+            raise EvidenceError(
+                "long_sequence.processed_frames must equal the requested scale"
+            )
         raw_windows = long_sequence.get("rss_windows")
         expected_window_count = math.ceil(frames / 500)
-        if not isinstance(raw_windows, list) or len(raw_windows) != expected_window_count:
-            raise EvidenceError("long_sequence.rss_windows must cover every 500-frame window")
+        if (
+            not isinstance(raw_windows, list)
+            or len(raw_windows) != expected_window_count
+        ):
+            raise EvidenceError(
+                "long_sequence.rss_windows must cover every 500-frame window"
+            )
         windows: list[float] = []
         for index, raw_window in enumerate(raw_windows):
             window = _mapping(raw_window, f"long_sequence.rss_windows[{index}]")
@@ -5064,14 +10362,23 @@ def derive_metrics(
             )
             expected_start = index * 500
             expected_end = min(frames - 1, expected_start + 499)
-            if window["start_frame"] != expected_start or window["end_frame"] != expected_end:
-                raise EvidenceError("long_sequence.rss_windows frame coverage is not contiguous")
+            if (
+                window["start_frame"] != expected_start
+                or window["end_frame"] != expected_end
+            ):
+                raise EvidenceError(
+                    "long_sequence.rss_windows frame coverage is not contiguous"
+                )
             rss = window["rss_bytes"]
             if type(rss) is not int or rss <= 0:
-                raise EvidenceError("long_sequence.rss_windows rss_bytes must be positive")
+                raise EvidenceError(
+                    "long_sequence.rss_windows rss_bytes must be positive"
+                )
             windows.append(float(rss))
         if len(windows) < 2:
-            raise EvidenceError("long_sequence.rss_windows must include a second window")
+            raise EvidenceError(
+                "long_sequence.rss_windows must include a second window"
+            )
         growth = max(0.0, (windows[-1] - windows[1]) / windows[1])
         metrics["long_sequence_analysis_fps"] = measured(frames / float(seconds))
         metrics["long_sequence_frames"] = measured(frames)
@@ -5082,7 +10389,9 @@ def derive_metrics(
         _exact_keys(stability, {"runs"}, "observations.stability")
         stability_runs = stability.get("runs")
         if not isinstance(stability_runs, list) or len(stability_runs) != 50:
-            raise EvidenceError("observations.stability.runs must contain exactly 50 runs")
+            raise EvidenceError(
+                "observations.stability.runs must contain exactly 50 runs"
+            )
         crashes = 0
         corrupt_outputs = 0
         categories: set[str] = set()
@@ -5106,9 +10415,8 @@ def derive_metrics(
                 },
                 f"stability.runs[{index}]",
             )
-            if (
-                not isinstance(sample["crashed"], bool)
-                or not isinstance(sample["corrupt_output"], bool)
+            if not isinstance(sample["crashed"], bool) or not isinstance(
+                sample["corrupt_output"], bool
             ):
                 raise EvidenceError("stability flags must be boolean")
             if sample["category"] not in {
@@ -5129,16 +10437,26 @@ def derive_metrics(
                 "finish",
             }:
                 raise EvidenceError("stability interruption stage is invalid")
-            if sample["recovery_action"] not in {"none", "cancel_resume", "relaunch_resume"}:
+            if sample["recovery_action"] not in {
+                "none",
+                "cancel_resume",
+                "relaunch_resume",
+            }:
                 raise EvidenceError("stability recovery action is invalid")
             is_uninterrupted = sample["interruption_stage"] == "none"
             if is_uninterrupted != (sample["recovery_action"] == "none"):
-                raise EvidenceError("stability interruption none must pair only with recovery none")
+                raise EvidenceError(
+                    "stability interruption none must pair only with recovery none"
+                )
             if is_uninterrupted:
                 if sample["recovery_succeeded"] is not None:
-                    raise EvidenceError("uninterrupted stability runs must not report recovery")
+                    raise EvidenceError(
+                        "uninterrupted stability runs must not report recovery"
+                    )
             elif type(sample["recovery_succeeded"]) is not bool:
-                raise EvidenceError("interrupted stability runs must report recovery success")
+                raise EvidenceError(
+                    "interrupted stability runs must report recovery success"
+                )
             crashes += sample["crashed"]
             corrupt_outputs += sample["corrupt_output"]
             categories.add(sample["category"])
@@ -5157,20 +10475,30 @@ def derive_metrics(
             "large_area_exterior",
             "low_light",
         }:
-            raise EvidenceError("stability runs must cover every valid capture category")
+            raise EvidenceError(
+                "stability runs must cover every valid capture category"
+            )
         if profiles != {"fast", "balanced", "high_detail"}:
             raise EvidenceError("stability runs must cover every detail profile")
-        if not {"prepare", "reconstruct", "train", "finish"}.issubset(interruption_stages):
-            raise EvidenceError("stability runs must cover every durable interruption stage")
+        if not {"prepare", "reconstruct", "train", "finish"}.issubset(
+            interruption_stages
+        ):
+            raise EvidenceError(
+                "stability runs must cover every durable interruption stage"
+            )
         if not {"cancel_resume", "relaunch_resume"}.issubset(recovery_actions):
-            raise EvidenceError("stability runs must cover cancel and relaunch recovery")
+            raise EvidenceError(
+                "stability runs must cover cancel and relaunch recovery"
+            )
         required_pairs = {
             (stage, action)
             for stage in ("prepare", "reconstruct", "train", "finish")
             for action in ("cancel_resume", "relaunch_resume")
         }
         if not required_pairs.issubset(stage_recovery_pairs):
-            raise EvidenceError("stability runs must cover every durable stage and recovery pair")
+            raise EvidenceError(
+                "stability runs must cover every durable stage and recovery pair"
+            )
         metrics.update(
             {
                 "repeat_runs": measured(len(stability_runs)),
@@ -5184,9 +10512,15 @@ def derive_metrics(
         required_size_artifacts = {"normal_photo_toolchain", "large_area_toolchain"}
         missing_sizes = required_size_artifacts - set(artifact_sizes)
         if missing_sizes:
-            raise EvidenceError("missing toolchain size artifacts: " + ", ".join(sorted(missing_sizes)))
-        metrics["normal_photo_toolchain_bytes"] = measured(artifact_sizes["normal_photo_toolchain"])
-        metrics["large_area_toolchain_bytes"] = measured(artifact_sizes["large_area_toolchain"])
+            raise EvidenceError(
+                "missing toolchain size artifacts: " + ", ".join(sorted(missing_sizes))
+            )
+        metrics["normal_photo_toolchain_bytes"] = measured(
+            artifact_sizes["normal_photo_toolchain"]
+        )
+        metrics["large_area_toolchain_bytes"] = measured(
+            artifact_sizes["large_area_toolchain"]
+        )
         metrics.update(
             _toolchain_scenario_metrics(
                 observations.get("toolchain_scenarios"),
@@ -5199,7 +10533,9 @@ def derive_metrics(
 def collect_machine_metadata() -> dict[str, Any]:
     def command(argv: list[str]) -> str:
         try:
-            return subprocess.run(argv, check=True, capture_output=True, text=True, timeout=20).stdout.strip()
+            return subprocess.run(
+                argv, check=True, capture_output=True, text=True, timeout=20
+            ).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             return "not_available"
 
@@ -5212,16 +10548,27 @@ def collect_machine_metadata() -> dict[str, Any]:
         except ValueError:
             return None
 
+    clang_version = command(["/usr/bin/xcrun", "clang", "--version"]).splitlines()[0]
+    swift_version = command(["/usr/bin/xcrun", "swift", "--version"]).splitlines()[0]
+    metal_version = command(["/usr/bin/xcrun", "metal", "--version"]).splitlines()[0]
     return {
         "architecture": platform.machine(),
         "chip": sysctl("machdep.cpu.brand_string"),
+        "clang_version": clang_version,
         "hardware_model": sysctl("hw.model"),
         "logical_cpus": integer_sysctl("hw.logicalcpu"),
         "macos_build": command(["/usr/bin/sw_vers", "-buildVersion"]),
         "macos_version": command(["/usr/bin/sw_vers", "-productVersion"]),
+        "macos_sdk_build": command(
+            ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-build-version"]
+        ),
+        "macos_sdk_version": command(
+            ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version"]
+        ),
+        "metal_version": metal_version,
         "physical_cpus": integer_sysctl("hw.physicalcpu"),
         "physical_memory_bytes": integer_sysctl("hw.memsize"),
-        "swift_version": command(["/usr/bin/xcrun", "swift", "--version"]),
+        "swift_version": swift_version,
         "xcode_version": command(["/usr/bin/xcodebuild", "-version"]),
     }
 
@@ -5230,10 +10577,14 @@ def validate_machine_lane(machine: Mapping[str, Any], lane: str) -> None:
     required = {
         "architecture",
         "chip",
+        "clang_version",
         "hardware_model",
         "logical_cpus",
         "macos_build",
         "macos_version",
+        "macos_sdk_build",
+        "macos_sdk_version",
+        "metal_version",
         "physical_cpus",
         "physical_memory_bytes",
         "swift_version",
@@ -5242,21 +10593,22 @@ def validate_machine_lane(machine: Mapping[str, Any], lane: str) -> None:
     _exact_keys(machine, required, "machine")
     if machine["architecture"] != "arm64":
         raise EvidenceError("release evidence must be measured on Apple Silicon")
-    version = machine["macos_version"]
-    if not isinstance(version, str) or not re.fullmatch(r"\d+(?:\.\d+){1,2}", version):
-        raise EvidenceError("machine macOS version is unavailable")
-    if int(version.split(".", 1)[0]) < 15:
-        raise EvidenceError("release evidence requires macOS 15 or newer")
-    xcode_version = machine["xcode_version"]
-    if not isinstance(xcode_version, str) or xcode_version.splitlines()[:1] != ["Xcode 16.4"]:
-        raise EvidenceError("release evidence requires Xcode 16.4")
+    if any(
+        machine.get(field) != expected
+        for field, expected in SHIPPING_MACHINE_SOFTWARE.items()
+    ):
+        raise EvidenceError(
+            "release evidence requires the exact shipping compiler, SDK, and Metal tuple"
+        )
     memory = machine["physical_memory_bytes"]
     if type(memory) is not int:
         raise EvidenceError("machine physical memory is unavailable")
     gib = 1024**3
     if lane == LANE_REFERENCE:
         if "M4 Max" not in str(machine["chip"]) or memory != 48 * gib:
-            raise EvidenceError("reference lane requires an M4 Max with exactly 48 GiB memory")
+            raise EvidenceError(
+                "reference lane requires an M4 Max with exactly 48 GiB memory"
+            )
     elif lane == LANE_CONSTRAINED:
         if not 14 * gib <= memory <= 17 * gib:
             raise EvidenceError("constrained lane requires a 14-16 GiB Mac")
@@ -5333,9 +10685,16 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         value["baseline_run_configuration"],
         "request.baseline_run_configuration",
     )
-    if sha256_bytes(canonical_json_bytes(baseline_configuration)) != binding["baseline_configuration_digest"]:
-        raise EvidenceError("request baseline_run_configuration does not match its digest")
-    if not isinstance(binding["git_commit"], str) or not re.fullmatch(r"[0-9a-f]{40}", binding["git_commit"]):
+    if (
+        sha256_bytes(canonical_json_bytes(baseline_configuration))
+        != binding["baseline_configuration_digest"]
+    ):
+        raise EvidenceError(
+            "request baseline_run_configuration does not match its digest"
+        )
+    if not isinstance(binding["git_commit"], str) or not re.fullmatch(
+        r"[0-9a-f]{40}", binding["git_commit"]
+    ):
         raise EvidenceError("request.binding.git_commit is invalid")
     if not isinstance(binding["baseline_git_commit"], str) or not re.fullmatch(
         r"[0-9a-f]{40}", binding["baseline_git_commit"]
@@ -5360,10 +10719,15 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         or not capture_traits
         or capture_traits != sorted(capture_traits)
         or len(capture_traits) != len(set(capture_traits))
-        or any(not isinstance(trait, str) or not SAFE_TOKEN_PATTERN.fullmatch(trait) for trait in capture_traits)
+        or any(
+            not isinstance(trait, str) or not SAFE_TOKEN_PATTERN.fullmatch(trait)
+            for trait in capture_traits
+        )
     ):
-        raise EvidenceError("request.capture_traits must be a sorted unique token array")
-    if value["input_kind"] not in {"video", "photos", "mixed"}:
+        raise EvidenceError(
+            "request.capture_traits must be a sorted unique token array"
+        )
+    if value["input_kind"] not in {"video", "multi_video", "photos", "mixed"}:
         raise EvidenceError("request.input_kind is invalid")
     video_source_count = value["video_source_count"]
     if type(video_source_count) is not int or video_source_count < 0:
@@ -5372,6 +10736,8 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         raise EvidenceError("photo input must bind zero video sources")
     if value["input_kind"] == "video" and video_source_count != 1:
         raise EvidenceError("video input must bind exactly one video source")
+    if value["input_kind"] == "multi_video" and video_source_count < 2:
+        raise EvidenceError("multi-video input must bind at least two video sources")
     if value["input_kind"] == "mixed" and video_source_count < 1:
         raise EvidenceError("mixed input must bind at least one video source")
     expected = _mapping(value["expected_outcome"], "request.expected_outcome")
@@ -5404,12 +10770,16 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         if value["input_kind"] == "video" and holdout_indices != list(
             range(4, binding["scale"], 5)
         ):
-            raise EvidenceError("video holdout indices must contain every fifth selected frame")
+            raise EvidenceError(
+                "video holdout indices must contain every fifth selected frame"
+            )
     elif holdout_indices != []:
         raise EvidenceError("invalid requests must not declare rendering holdouts")
     if value["timing_basis"] != "selected_view_count":
         raise EvidenceError("request timing_basis must be selected_view_count")
-    reference_artifacts = _mapping(value["reference_artifacts"], "request.reference_artifacts")
+    reference_artifacts = _mapping(
+        value["reference_artifacts"], "request.reference_artifacts"
+    )
     reference_digest_fields = {
         "selection_manifest_sha256",
         "ground_truth_poses_sha256",
@@ -5429,9 +10799,10 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         )
         for field in reference_digest_fields:
             _digest(reference_artifacts[field], f"request.reference_artifacts.{field}")
-        if reference_artifacts["orientation_expected_status"] not in PIPELINE_ENUM_METRICS[
-            "orientation_status"
-        ]:
+        if (
+            reference_artifacts["orientation_expected_status"]
+            not in PIPELINE_ENUM_METRICS["orientation_status"]
+        ):
             raise EvidenceError("request orientation_expected_status is invalid")
         selected_frames_digests = _mapping(
             reference_artifacts["selected_frames_digests"],
@@ -5450,7 +10821,9 @@ def validate_request(request: Any) -> Mapping[str, Any]:
     else:
         _exact_keys(reference_artifacts, {"status"}, "request.reference_artifacts")
         if reference_artifacts["status"] != "not_applicable":
-            raise EvidenceError("invalid requests must mark reference artifacts not_applicable")
+            raise EvidenceError(
+                "invalid requests must mark reference artifacts not_applicable"
+            )
     candidate_configuration = _mapping(
         value["candidate_run_configuration"],
         "request.candidate_run_configuration",
@@ -5470,7 +10843,7 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "temporal_pairing",
             "temporal_offsets",
             "vocabulary_candidate_count",
-            "vocabulary_verified_neighbor_count",
+            "vocabulary_returned_neighbor_count",
             "vocabulary_query_stride",
             "descriptor_matcher",
             "ba_global_frames_ratio",
@@ -5492,15 +10865,59 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         "request.candidate_run_configuration",
     )
     expected_detail = "balanced" if binding["lane"] == LANE_REFERENCE else "fast"
-    expected_resource = "automatic" if binding["lane"] == LANE_REFERENCE else "conserve_memory"
+    expected_resource = (
+        "automatic" if binding["lane"] == LANE_REFERENCE else "conserve_memory"
+    )
     if candidate_configuration["detail_profile"] != expected_detail:
         raise EvidenceError("candidate detail profile does not match its hardware lane")
     if candidate_configuration["resource_policy"] != expected_resource:
-        raise EvidenceError("candidate resource policy does not match its hardware lane")
+        raise EvidenceError(
+            "candidate resource policy does not match its hardware lane"
+        )
     if candidate_configuration["compute_policy"] != "metal_for_supported_stages":
-        raise EvidenceError("candidate compute policy must prefer Metal where supported")
+        raise EvidenceError(
+            "candidate compute policy must prefer Metal where supported"
+        )
     if candidate_configuration["selected_frame_count"] != binding["scale"]:
-        raise EvidenceError("candidate selected frame count does not match request scale")
+        raise EvidenceError(
+            "candidate selected frame count does not match request scale"
+        )
+    homogeneous_fisheye_photos = (
+        value["input_kind"] == "photos"
+        and "fisheye" in capture_traits
+        and "mixed_intrinsics" not in capture_traits
+    )
+    expected_camera_grouping = (
+        "same_camera_and_lens" if homogeneous_fisheye_photos else "automatic"
+    )
+    expected_lens_projection = (
+        "fisheye" if "fisheye" in capture_traits else "automatic"
+    )
+    if candidate_configuration["camera_grouping"] != expected_camera_grouping:
+        raise EvidenceError(
+            "candidate camera grouping does not match the protected input traits"
+        )
+    if candidate_configuration["lens_projection"] != expected_lens_projection:
+        raise EvidenceError(
+            "candidate lens projection does not match the protected input traits"
+        )
+    topology = candidate_configuration["input_topology"]
+    if topology == "segmented_mixed":
+        expected_capture_path = (
+            "large_area" if value["category"] == "large_area_exterior" else "automatic"
+        )
+    elif topology == "unordered":
+        expected_capture_path = "automatic"
+    else:
+        expected_capture_path = {
+            "object_orbit": "around_subject",
+            "interior_walkthrough": "through_space",
+            "large_area_exterior": "large_area",
+        }.get(value["category"], "automatic")
+    if candidate_configuration["capture_path"] != expected_capture_path:
+        raise EvidenceError(
+            "candidate capture path does not match its category and input topology"
+        )
     if candidate_configuration["descriptor_matcher"] != "faiss":
         raise EvidenceError("candidate descriptor matcher must be faiss")
     worker_fields = (
@@ -5550,13 +10967,19 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         or len(gate_scopes) != len(set(gate_scopes))
         or gate_scopes != sorted(gate_scopes)
     ):
-        raise EvidenceError("request.gate_scopes must be a nonempty sorted list of supported scopes")
+        raise EvidenceError(
+            "request.gate_scopes must be a nonempty sorted list of supported scopes"
+        )
     if expected["kind"] == "invalid" and gate_scopes != ["invalid_input"]:
-        raise EvidenceError("invalid requests must use only the invalid_input gate scope")
+        raise EvidenceError(
+            "invalid requests must use only the invalid_input gate scope"
+        )
     if expected["kind"] == "valid" and "invalid_input" in gate_scopes:
         raise EvidenceError("valid requests cannot use the invalid_input gate scope")
     if "long_sequence" in gate_scopes and binding["scale"] != 3000:
-        raise EvidenceError("long_sequence evidence must be bound to the 3000-frame scale")
+        raise EvidenceError(
+            "long_sequence evidence must be bound to the 3000-frame scale"
+        )
     return value
 
 
@@ -5577,8 +11000,14 @@ def _validate_lane_outcome_payload(value: Any) -> dict[str, Any]:
             if type(exit_code) is not int or not -255 <= exit_code <= 255:
                 raise EvidenceError("timeout outcome requires a bounded exit code")
         elif reason == "nonzero_exit":
-            if type(exit_code) is not int or exit_code == 0 or not -255 <= exit_code <= 255:
-                raise EvidenceError("nonzero outcome requires a bounded nonzero exit code")
+            if (
+                type(exit_code) is not int
+                or exit_code == 0
+                or not -255 <= exit_code <= 255
+            ):
+                raise EvidenceError(
+                    "nonzero outcome requires a bounded nonzero exit code"
+                )
         elif reason == "invalid_output":
             if exit_code != 0:
                 raise EvidenceError("invalid output outcome requires exit code zero")
@@ -5602,14 +11031,8 @@ def _validate_lane_outcome_payload(value: Any) -> dict[str, Any]:
                 "host_monitor_failed": "host_monitor",
                 "postprocessing_failed": "postprocessing",
             }.get(reason)
-            or (
-                reason == "host_monitor_failed"
-                and exit_code not in {None, 0}
-            )
-            or (
-                reason == "postprocessing_failed"
-                and exit_code != 0
-            )
+            or (reason == "host_monitor_failed" and exit_code not in {None, 0})
+            or (reason == "postprocessing_failed" and exit_code != 0)
         ):
             raise EvidenceError("infrastructure lane outcome is invalid")
     else:
@@ -5665,7 +11088,9 @@ def _validate_environment_rejection_receipt(
         request["rendering_driver_identity"]["executable_sha256"],
     )
     if not rejections:
-        raise EvidenceError("environment lane outcome does not prove a policy rejection")
+        raise EvidenceError(
+            "environment lane outcome does not prove a policy rejection"
+        )
 
 
 def derive_lane_outcome(
@@ -5877,7 +11302,9 @@ def _render_camera(value: Any, label: str) -> dict[str, Any]:
         or not 64 <= height <= 16_384
         or width * height > 4_194_304
     ):
-        raise EvidenceError(f"{label} dimensions exceed the 4,194,304-pixel render limit")
+        raise EvidenceError(
+            f"{label} dimensions exceed the 4,194,304-pixel render limit"
+        )
     for field in (
         "projection_matrix_column_major",
         "world_to_camera_matrix_column_major",
@@ -5907,9 +11334,7 @@ def _open_render_artifact(root: Path, relative: PurePosixPath, label: str) -> in
         | getattr(os, "O_NOFOLLOW", 0)
     )
     file_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
         directory = os.open(root, directory_flags)
@@ -5965,7 +11390,9 @@ def _load_render_image(
                     break
                 total += len(chunk)
                 if total > maximum_bytes:
-                    raise EvidenceError(f"{label} is larger than its bound dimensions allow")
+                    raise EvidenceError(
+                        f"{label} is larger than its bound dimensions allow"
+                    )
                 chunks.append(chunk)
             after = os.fstat(descriptor)
         except EvidenceError:
@@ -5995,7 +11422,9 @@ def _load_render_image(
                 if image.format != "PNG" or image.mode != "RGB":
                     raise EvidenceError(f"{label} must be an 8-bit RGB PNG")
                 if image.size != (expected_width, expected_height):
-                    raise EvidenceError(f"{label} dimensions do not match its bound camera")
+                    raise EvidenceError(
+                        f"{label} dimensions do not match its bound camera"
+                    )
                 image.load()
                 pixels = numpy.asarray(image, dtype=numpy.float32) / 255.0
     except EvidenceError:
@@ -6007,7 +11436,10 @@ def _load_render_image(
         Image.DecompressionBombWarning,
     ) as error:
         raise EvidenceError(f"{label} is not a readable PNG") from error
-    if pixels.shape != (expected_height, expected_width, 3) or not numpy.isfinite(pixels).all():
+    if (
+        pixels.shape != (expected_height, expected_width, 3)
+        or not numpy.isfinite(pixels).all()
+    ):
         raise EvidenceError(f"{label} pixel data is invalid")
     return pixels, {
         "path": relative_path.as_posix(),
@@ -6036,18 +11468,24 @@ def _separable_gaussian_blur(image: Any) -> Any:
         dtype=numpy.float32,
     )
     radius = len(kernel) // 2
-    horizontal_source = numpy.pad(image, ((0, 0), (radius, radius), (0, 0)), mode="reflect")
+    horizontal_source = numpy.pad(
+        image, ((0, 0), (radius, radius), (0, 0)), mode="reflect"
+    )
     horizontal = numpy.zeros_like(image)
     for offset, weight in enumerate(kernel):
         horizontal += horizontal_source[:, offset : offset + image.shape[1], :] * weight
-    vertical_source = numpy.pad(horizontal, ((radius, radius), (0, 0), (0, 0)), mode="reflect")
+    vertical_source = numpy.pad(
+        horizontal, ((radius, radius), (0, 0), (0, 0)), mode="reflect"
+    )
     result = numpy.zeros_like(image)
     for offset, weight in enumerate(kernel):
         result += vertical_source[offset : offset + image.shape[0], :, :] * weight
     return result
 
 
-def _pixel_metrics(candidate: Any, target: Any, lpips_distance: Any) -> tuple[float, float, float]:
+def _pixel_metrics(
+    candidate: Any, target: Any, lpips_distance: Any
+) -> tuple[float, float, float]:
     import numpy
 
     if candidate.shape != target.shape:
@@ -6066,15 +11504,12 @@ def _pixel_metrics(candidate: Any, target: Any, lpips_distance: Any) -> tuple[fl
         0,
         _separable_gaussian_blur(target * target) - mu_target * mu_target,
     )
-    covariance = (
-        _separable_gaussian_blur(candidate * target) - mu_candidate * mu_target
-    )
+    covariance = _separable_gaussian_blur(candidate * target) - mu_candidate * mu_target
     c1 = 0.01**2
     c2 = 0.03**2
     numerator = (2 * mu_candidate * mu_target + c1) * (2 * covariance + c2)
-    denominator = (
-        (mu_candidate * mu_candidate + mu_target * mu_target + c1)
-        * (variance_candidate + variance_target + c2)
+    denominator = (mu_candidate * mu_candidate + mu_target * mu_target + c1) * (
+        variance_candidate + variance_target + c2
     )
     ssim = float(numpy.mean(numerator / denominator, dtype=numpy.float64))
     lpips_value = lpips_distance(candidate, target)
@@ -6102,12 +11537,12 @@ def _verify_lpips_calibration(
     if set(calibration_state) != LPIPS_CALIBRATION_HEAD_KEYS:
         raise EvidenceError("the LPIPS calibration linear heads are invalid")
     model_head_keys = {
-        key
-        for key in model_state
-        if re.fullmatch(r"lin\d+\.model\.\d+\.weight", key)
+        key for key in model_state if re.fullmatch(r"lin\d+\.model\.\d+\.weight", key)
     }
     if model_head_keys != LPIPS_CALIBRATION_HEAD_KEYS:
-        raise EvidenceError("the constructed LPIPS linear heads do not match the calibration")
+        raise EvidenceError(
+            "the constructed LPIPS linear heads do not match the calibration"
+        )
     if any(
         not tensors_equal(model_state[key], calibration_state[key])
         for key in LPIPS_CALIBRATION_HEAD_KEYS
@@ -6124,7 +11559,9 @@ def _lpips_distance(candidate: Any, target: Any) -> float:
     try:
         backbone_sha256 = sha256_file(backbone)
     except OSError as error:
-        raise EvidenceError("the pinned LPIPS SqueezeNet backbone is unavailable") from error
+        raise EvidenceError(
+            "the pinned LPIPS SqueezeNet backbone is unavailable"
+        ) from error
     if backbone_sha256 != LPIPS_SQUEEZENET_BACKBONE_SHA256:
         raise EvidenceError("the LPIPS SqueezeNet backbone digest is invalid")
     try:
@@ -6139,7 +11576,9 @@ def _lpips_distance(candidate: Any, target: Any) -> float:
         ) from error
     for package, expected_version in RENDER_SCORING_PACKAGE_VERSIONS.items():
         if importlib.metadata.version(package) != expected_version:
-            raise EvidenceError(f"render scoring package {package} is not the pinned version")
+            raise EvidenceError(
+                f"render scoring package {package} is not the pinned version"
+            )
     if _LPIPS_MODEL is None:
         calibration = (
             Path(inspect.getfile(lpips.LPIPS)).resolve().parent
@@ -6156,7 +11595,9 @@ def _lpips_distance(candidate: Any, target: Any) -> float:
                 weights_only=True,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
-            raise EvidenceError("the LPIPS calibration could not be loaded safely") from error
+            raise EvidenceError(
+                "the LPIPS calibration could not be loaded safely"
+            ) from error
         if not isinstance(calibration_state, Mapping):
             raise EvidenceError("the LPIPS calibration is invalid")
         with tempfile.TemporaryDirectory() as directory:
@@ -6203,12 +11644,16 @@ def _lpips_distance(candidate: Any, target: Any) -> float:
         model = model.to(device).eval()
         _LPIPS_MODEL = (model, device)
     model, device = _LPIPS_MODEL
-    candidate_tensor = torch.from_numpy(
-        numpy.ascontiguousarray(candidate.transpose(2, 0, 1))
-    ).unsqueeze(0).to(device)
-    target_tensor = torch.from_numpy(
-        numpy.ascontiguousarray(target.transpose(2, 0, 1))
-    ).unsqueeze(0).to(device)
+    candidate_tensor = (
+        torch.from_numpy(numpy.ascontiguousarray(candidate.transpose(2, 0, 1)))
+        .unsqueeze(0)
+        .to(device)
+    )
+    target_tensor = (
+        torch.from_numpy(numpy.ascontiguousarray(target.transpose(2, 0, 1)))
+        .unsqueeze(0)
+        .to(device)
+    )
     with torch.inference_mode():
         value = model(candidate_tensor, target_tensor, normalize=True)
     return float(value.detach().to("cpu").item())
@@ -6344,7 +11789,9 @@ def _validate_ground_truth_preparation(
     ):
         raise EvidenceError("ground-truth preparation native decoder is unsupported")
     for field in ("executable_sha256", "metallib_sha256", "trainer_build_digest"):
-        _digest(native_decoder[field], f"ground-truth preparation.native_decoder.{field}")
+        _digest(
+            native_decoder[field], f"ground-truth preparation.native_decoder.{field}"
+        )
     for field in ("executable_bytes", "metallib_bytes"):
         if type(native_decoder[field]) is not int or native_decoder[field] <= 0:
             raise EvidenceError(
@@ -6381,7 +11828,9 @@ def _validate_ground_truth_preparation(
             label,
         )
         if view["holdout_index"] != holdout_index:
-            raise EvidenceError("ground-truth preparation views are not in holdout order")
+            raise EvidenceError(
+                "ground-truth preparation views are not in holdout order"
+            )
         unsigned_view = dict(view)
         supplied_view_digest = unsigned_view.pop("preparation_view_sha256")
         _digest(supplied_view_digest, f"{label}.preparation_view_sha256")
@@ -6413,7 +11862,9 @@ def _validate_ground_truth_preparation(
             )
             path = _render_relative_path(image["path"], f"{label}.{kind}.path")
             if path in paths:
-                raise EvidenceError("ground-truth preparation image paths must be unique")
+                raise EvidenceError(
+                    "ground-truth preparation image paths must be unique"
+                )
             paths.add(path)
             _digest(image["sha256"], f"{label}.{kind}.sha256")
             _digest(image["pixel_sha256"], f"{label}.{kind}.pixel_sha256")
@@ -6453,7 +11904,9 @@ def _validate_ground_truth_preparation(
 
         def camera_record(kind: str) -> Mapping[str, Any]:
             camera = _mapping(view[kind], f"{label}.{kind}")
-            _exact_keys(camera, {"model", "width", "height", "parameters"}, f"{label}.{kind}")
+            _exact_keys(
+                camera, {"model", "width", "height", "parameters"}, f"{label}.{kind}"
+            )
             model = camera["model"]
             expected_parameter_count = {
                 "PINHOLE": 4,
@@ -6471,8 +11924,14 @@ def _validate_ground_truth_preparation(
                     or not math.isfinite(value)
                     for value in parameters
                 )
-                or camera["width"] != image_records["source" if kind == "source_camera" else "target"]["width"]
-                or camera["height"] != image_records["source" if kind == "source_camera" else "target"]["height"]
+                or camera["width"]
+                != image_records["source" if kind == "source_camera" else "target"][
+                    "width"
+                ]
+                or camera["height"]
+                != image_records["source" if kind == "source_camera" else "target"][
+                    "height"
+                ]
             ):
                 raise EvidenceError(f"{label}.{kind} is invalid")
             return camera
@@ -6480,7 +11939,9 @@ def _validate_ground_truth_preparation(
         source_camera = camera_record("source_camera")
         target_camera = camera_record("target_camera")
         if target_camera["model"] != "PINHOLE":
-            raise EvidenceError("ground-truth preparation target camera must be PINHOLE")
+            raise EvidenceError(
+                "ground-truth preparation target camera must be PINHOLE"
+            )
         transform = _mapping(view["transform"], f"{label}.transform")
         _exact_keys(transform, {"kind", "roi"}, f"{label}.transform")
         roi = transform["roi"]
@@ -6510,7 +11971,9 @@ def _validate_ground_truth_preparation(
                     ">I", struct.pack(">f", source_camera["parameters"][3])
                 )[0]
             except (OverflowError, struct.error) as error:
-                raise EvidenceError(f"{label}.source radial coefficient is outside Float32") from error
+                raise EvidenceError(
+                    f"{label}.source radial coefficient is outside Float32"
+                ) from error
             radial_is_nonzero_float32 = radial_bits & 0x7FFF_FFFF != 0
         if transform["kind"] == "identity" and (
             radial_is_nonzero_float32
@@ -6556,7 +12019,9 @@ def validate_and_score_rendering(
 ) -> RenderingEvidence:
     if lpips_distance is None:
         lpips_distance = LPIPS_DISTANCE_OVERRIDE or _lpips_distance
-    manifest = _mapping(_load_bounded_json(manifest_path, "rendering manifest"), "rendering manifest")
+    manifest = _mapping(
+        _load_bounded_json(manifest_path, "rendering manifest"), "rendering manifest"
+    )
     _exact_keys(
         manifest,
         {
@@ -6608,7 +12073,9 @@ def validate_and_score_rendering(
         raise EvidenceError("rendering request scale or holdouts are invalid")
     expected_training = [index for index in range(scale) if index not in set(holdouts)]
     if manifest["training_view_indices"] != expected_training:
-        raise EvidenceError("held-out views must be excluded from the training selection")
+        raise EvidenceError(
+            "held-out views must be excluded from the training selection"
+        )
 
     preparation_records, preparation_artifacts = _validate_ground_truth_preparation(
         artifact_root=artifact_root,
@@ -6654,7 +12121,10 @@ def validate_and_score_rendering(
     selected_sources = select_render_source_receipts(commands, source_specs)
     render_operations = manifest["render_operations"]
     expected_render_operation_count = len(holdouts) * len(RENDER_VARIANTS)
-    if not isinstance(render_operations, list) or len(render_operations) != expected_render_operation_count:
+    if (
+        not isinstance(render_operations, list)
+        or len(render_operations) != expected_render_operation_count
+    ):
         raise EvidenceError("render operations must cover every holdout and variant")
     render_operation_fields = {
         "operation_id",
@@ -6707,7 +12177,9 @@ def validate_and_score_rendering(
             or started < previous_render_end
             or ended <= started
         ):
-            raise EvidenceError("render operations are not in canonical source-major order")
+            raise EvidenceError(
+                "render operations are not in canonical source-major order"
+            )
         previous_render_end = float(ended)
         render_operations_by_key[(holdout_index, variant)] = operation
 
@@ -6724,7 +12196,13 @@ def validate_and_score_rendering(
             reference_views[position],
             f"accurate rendering reference.views[{position}]",
         )
-        view_fields = {"holdout_index", "camera", "camera_digest", "ground_truth", "renders"}
+        view_fields = {
+            "holdout_index",
+            "camera",
+            "camera_digest",
+            "ground_truth",
+            "renders",
+        }
         reference_fields = {
             "holdout_index",
             "camera",
@@ -6738,9 +12216,16 @@ def validate_and_score_rendering(
             reference_fields,
             f"accurate rendering reference.views[{position}]",
         )
-        if view["holdout_index"] != holdout_index or reference_view["holdout_index"] != holdout_index:
-            raise EvidenceError("rendering views must be ordered by bound holdout index")
-        camera = _render_camera(view["camera"], f"rendering manifest.views[{position}].camera")
+        if (
+            view["holdout_index"] != holdout_index
+            or reference_view["holdout_index"] != holdout_index
+        ):
+            raise EvidenceError(
+                "rendering views must be ordered by bound holdout index"
+            )
+        camera = _render_camera(
+            view["camera"], f"rendering manifest.views[{position}].camera"
+        )
         reference_camera = _render_camera(
             reference_view["camera"],
             f"accurate rendering reference.views[{position}].camera",
@@ -6764,7 +12249,9 @@ def validate_and_score_rendering(
             or reference_view["preparation_view_sha256"]
             != preparation_view["preparation_view_sha256"]
         ):
-            raise EvidenceError("render camera does not match the pinned holdout camera")
+            raise EvidenceError(
+                "render camera does not match the pinned holdout camera"
+            )
         if any(
             not math.isclose(projection[index], expected, rel_tol=1e-6, abs_tol=1e-6)
             for index, expected in expected_projection.items()
@@ -6790,7 +12277,9 @@ def validate_and_score_rendering(
             f"rendering manifest.views[{position}].ground_truth",
         )
         if ground_truth["input_digest"] != binding["input_digest"]:
-            raise EvidenceError("ground-truth image is not bound to the requested input")
+            raise EvidenceError(
+                "ground-truth image is not bound to the requested input"
+            )
         if (
             ground_truth["path"] != preparation_view["target"]["path"]
             or ground_truth["sha256"] != preparation_view["target"]["sha256"]
@@ -6799,7 +12288,9 @@ def validate_and_score_rendering(
             or ground_truth["preparation_view_sha256"]
             != preparation_view["preparation_view_sha256"]
         ):
-            raise EvidenceError("ground-truth image does not match its preparation receipt")
+            raise EvidenceError(
+                "ground-truth image does not match its preparation receipt"
+            )
         ground_truth_relative = _render_relative_path(
             ground_truth["path"],
             f"rendering manifest.views[{position}].ground_truth.path",
@@ -6809,7 +12300,9 @@ def validate_and_score_rendering(
         image_paths.add(ground_truth_relative)
         _digest(ground_truth["sha256"], "ground-truth image digest")
         if ground_truth["sha256"] != reference_view["ground_truth_sha256"]:
-            raise EvidenceError("ground-truth image digest does not match its pinned reference")
+            raise EvidenceError(
+                "ground-truth image digest does not match its pinned reference"
+            )
         ground_truth_pixels, ground_truth_descriptor = _load_render_image(
             artifact_root=artifact_root,
             relative_path=ground_truth_relative,
@@ -6821,7 +12314,9 @@ def validate_and_score_rendering(
         artifacts[f"render_ground_truth_{holdout_index:06d}"] = ground_truth_descriptor
 
         render_records = view["renders"]
-        if not isinstance(render_records, list) or len(render_records) != len(RENDER_VARIANTS):
+        if not isinstance(render_records, list) or len(render_records) != len(
+            RENDER_VARIANTS
+        ):
             raise EvidenceError("rendering variants are incomplete")
         measured: dict[str, tuple[float, float, float]] = {}
         for variant_position, variant in enumerate(RENDER_VARIANTS):
@@ -6846,10 +12341,9 @@ def validate_and_score_rendering(
             )
             render_operation = render_operations_by_key[(holdout_index, variant)]
             source = selected_sources[variant]
-            if (
-                render["source_run_id"] != source.get("run_id")
-                or render_operation["source_run_id"] != source.get("run_id")
-            ):
+            if render["source_run_id"] != source.get("run_id") or render_operation[
+                "source_run_id"
+            ] != source.get("run_id"):
                 if variant == "candidate_balanced":
                     raise EvidenceError(
                         "candidate_balanced must bind the sole published output receipt"
@@ -6865,7 +12359,9 @@ def validate_and_score_rendering(
                 or render["renderer"] != "MetalSplatter"
                 or render["renderer_executable_sha256"] != renderer_executable_sha256
             ):
-                raise EvidenceError(f"{variant} render is not bound to its camera and source PLY")
+                raise EvidenceError(
+                    f"{variant} render is not bound to its camera and source PLY"
+                )
             render_relative = _render_relative_path(
                 render["path"],
                 f"rendering manifest.views[{position}].renders[{variant_position}].path",
@@ -6886,18 +12382,24 @@ def validate_and_score_rendering(
                 render_operation["operation_id"] != render["render_operation_id"]
                 or render_operation["holdout_index"] != holdout_index
                 or render_operation["variant"] != variant
-                or render_operation["renderer_executable_sha256"] != renderer_executable_sha256
+                or render_operation["renderer_executable_sha256"]
+                != renderer_executable_sha256
                 or render_operation["source_run_id"] != source.get("run_id")
-                or render_operation["source_checkout_commit"] != source.get("checkout_commit")
-                or render_operation["source_toolchain_identity"] != source.get("toolchain_identity")
-                or render_operation["source_executable_sha256"] != source.get("executable_sha256")
+                or render_operation["source_checkout_commit"]
+                != source.get("checkout_commit")
+                or render_operation["source_toolchain_identity"]
+                != source.get("toolchain_identity")
+                or render_operation["source_executable_sha256"]
+                != source.get("executable_sha256")
                 or render_operation["input_ply_sha256"] != source.get("output_sha256")
                 or render_operation["camera_digest"] != camera_digest
                 or render_operation["output_sha256"] != descriptor["sha256"]
             ):
                 raise EvidenceError(f"{variant} render operation receipt is invalid")
             artifacts[f"render_{variant}_{holdout_index:06d}"] = descriptor
-            measured[variant] = _pixel_metrics(pixels, ground_truth_pixels, lpips_distance)
+            measured[variant] = _pixel_metrics(
+                pixels, ground_truth_pixels, lpips_distance
+            )
 
         reference_metrics = measured["accurate_reference"]
         baseline_metrics = measured["paired_baseline"]
@@ -6949,23 +12451,32 @@ def select_render_source_receipts(
         _mapping(command, f"rendering source receipt[{index}]")
         for index, command in enumerate(commands)
     ]
-    published = [receipt for receipt in receipts if receipt.get("published_output") is True]
+    published = [
+        receipt for receipt in receipts if receipt.get("published_output") is True
+    ]
     if len(published) != 1:
-        raise EvidenceError("candidate_balanced must bind the sole published output receipt")
+        raise EvidenceError(
+            "candidate_balanced must bind the sole published output receipt"
+        )
 
     selected: dict[str, Mapping[str, Any]] = {}
     for render_variant, (phase, execution_variant) in source_specs.items():
         matching = [
             receipt
             for receipt in receipts
-            if receipt.get("phase") == phase and receipt.get("variant") == execution_variant
+            if receipt.get("phase") == phase
+            and receipt.get("variant") == execution_variant
         ]
         if not matching:
-            raise EvidenceError(f"{render_variant} source execution receipt is unavailable")
+            raise EvidenceError(
+                f"{render_variant} source execution receipt is unavailable"
+            )
         if render_variant == "candidate_balanced":
             source = published[0]
             if source not in matching:
-                raise EvidenceError("candidate_balanced must bind the sole published output receipt")
+                raise EvidenceError(
+                    "candidate_balanced must bind the sole published output receipt"
+                )
         else:
             # Execution receipts are already validated against their bound timing
             # order. The final receipt is therefore deterministic and independent
@@ -7038,7 +12549,11 @@ def _validate_splat_ply(path: Path) -> int:
                     continue
                 fields = line.split()
                 if fields[0] == "format":
-                    if len(fields) != 3 or fields[2] != "1.0" or format_name is not None:
+                    if (
+                        len(fields) != 3
+                        or fields[2] != "1.0"
+                        or format_name is not None
+                    ):
                         raise EvidenceError("output_ply format declaration is invalid")
                     format_name = fields[1]
                 elif fields[0] == "element":
@@ -7047,13 +12562,17 @@ def _validate_splat_ply(path: Path) -> int:
                     try:
                         count = int(fields[2])
                     except ValueError as error:
-                        raise EvidenceError("output_ply element count is invalid") from error
+                        raise EvidenceError(
+                            "output_ply element count is invalid"
+                        ) from error
                     if count < 0:
                         raise EvidenceError("output_ply element count is invalid")
                     active_element = fields[1]
                     if active_element == "vertex":
                         if vertex_count is not None:
-                            raise EvidenceError("output_ply declares vertex more than once")
+                            raise EvidenceError(
+                                "output_ply declares vertex more than once"
+                            )
                         vertex_count = count
                     else:
                         other_element_count += count
@@ -7061,7 +12580,9 @@ def _validate_splat_ply(path: Path) -> int:
                     if active_element != "vertex":
                         continue
                     if len(fields) != 3 or fields[1] == "list":
-                        raise EvidenceError("output_ply has an unsupported vertex property")
+                        raise EvidenceError(
+                            "output_ply has an unsupported vertex property"
+                        )
                     property_type = fields[1].lower()
                     property_name = fields[2].lower()
                     if property_type not in scalar_types or any(
@@ -7070,7 +12591,9 @@ def _validate_splat_ply(path: Path) -> int:
                         raise EvidenceError("output_ply has an invalid vertex property")
                     vertex_properties.append((property_name, property_type))
                 else:
-                    raise EvidenceError("output_ply header contains an unsupported declaration")
+                    raise EvidenceError(
+                        "output_ply header contains an unsupported declaration"
+                    )
 
             body_offset = handle.tell()
             if format_name not in {"ascii", "binary_little_endian"}:
@@ -7082,7 +12605,9 @@ def _validate_splat_ply(path: Path) -> int:
             property_names = {name for name, _ in vertex_properties}
             missing = sorted(required_properties - property_names)
             if missing:
-                raise EvidenceError("output_ply is missing Gaussian properties: " + ", ".join(missing))
+                raise EvidenceError(
+                    "output_ply is missing Gaussian properties: " + ", ".join(missing)
+                )
 
             if format_name == "ascii":
                 try:
@@ -7091,29 +12616,42 @@ def _validate_splat_ply(path: Path) -> int:
                     raise EvidenceError("output_ply ASCII body is invalid") from error
                 rows = [line for line in body.splitlines() if line.strip()]
                 if len(rows) != vertex_count:
-                    raise EvidenceError("output_ply ASCII vertex count does not match its body")
+                    raise EvidenceError(
+                        "output_ply ASCII vertex count does not match its body"
+                    )
                 for row in rows:
                     values = row.split()
                     if len(values) != len(vertex_properties):
                         raise EvidenceError("output_ply ASCII vertex stride is invalid")
-                    for value, (_, property_type) in zip(values, vertex_properties, strict=True):
+                    for value, (_, property_type) in zip(
+                        values, vertex_properties, strict=True
+                    ):
                         code, is_float = scalar_types[property_type]
                         try:
                             number = float(value) if is_float else int(value, 10)
                         except ValueError as error:
-                            raise EvidenceError("output_ply contains an invalid numeric value") from error
+                            raise EvidenceError(
+                                "output_ply contains an invalid numeric value"
+                            ) from error
                         if is_float and not math.isfinite(number):
                             raise EvidenceError("output_ply contains a nonfinite value")
                         if not is_float:
                             try:
                                 struct.pack("<" + code, number)
                             except struct.error as error:
-                                raise EvidenceError("output_ply integer value is out of range") from error
+                                raise EvidenceError(
+                                    "output_ply integer value is out of range"
+                                ) from error
             else:
-                record = struct.Struct("<" + "".join(scalar_types[kind][0] for _, kind in vertex_properties))
+                record = struct.Struct(
+                    "<"
+                    + "".join(scalar_types[kind][0] for _, kind in vertex_properties)
+                )
                 expected_size = body_offset + record.size * vertex_count
                 if size != expected_size:
-                    raise EvidenceError("output_ply binary payload size does not match its header")
+                    raise EvidenceError(
+                        "output_ply binary payload size does not match its header"
+                    )
                 floating_indices = [
                     index
                     for index, (_, kind) in enumerate(vertex_properties)
@@ -7123,13 +12661,503 @@ def _validate_splat_ply(path: Path) -> int:
                     body = memoryview(mapped)[body_offset:]
                     try:
                         for values in record.iter_unpack(body):
-                            if any(not math.isfinite(values[index]) for index in floating_indices):
-                                raise EvidenceError("output_ply contains a nonfinite value")
+                            if any(
+                                not math.isfinite(values[index])
+                                for index in floating_indices
+                            ):
+                                raise EvidenceError(
+                                    "output_ply contains a nonfinite value"
+                                )
                     finally:
                         body.release()
     except OSError as error:
         raise EvidenceError("output_ply could not be read") from error
     return vertex_count
+
+
+def _exact_keys_with_optional(
+    value: Mapping[str, Any],
+    required: Iterable[str],
+    optional: Iterable[str],
+    label: str,
+) -> None:
+    required_set = set(required)
+    allowed_set = required_set | set(optional)
+    missing = sorted(required_set - set(value))
+    extra = sorted(set(value) - allowed_set)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if extra:
+            details.append("unknown " + ", ".join(extra))
+        raise EvidenceError(f"{label} has invalid fields: {'; '.join(details)}")
+
+
+def _shipping_training_uint(
+    value: Any,
+    label: str,
+    *,
+    maximum: int = (1 << 64) - 1,
+) -> int:
+    if type(value) is not int or not 0 <= value <= maximum:
+        raise EvidenceError(f"{label} must be an unsigned integer")
+    return value
+
+
+def _shipping_training_digest(value: Any, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise EvidenceError(f"{label} is not a SHA-256 digest")
+    return value
+
+
+def _validate_training_dataset_derivation(
+    value: Any,
+    *,
+    input_digest: str,
+    geometry_digest: str,
+) -> None:
+    derivation = _mapping(value, "training manifest datasetDerivation")
+    _exact_keys(
+        derivation,
+        {
+            "schemaVersion",
+            "sourceGeometryManifestSHA256",
+            "sourceSelectedFramesDigest",
+            "preparationKind",
+            "maximumImageDimension",
+            "toolchainVersion",
+            "colmapProvenance",
+            "registeredImageNames",
+            "datasetInputDigest",
+            "datasetGeometryDigest",
+        },
+        "training manifest datasetDerivation",
+    )
+    if type(derivation["schemaVersion"]) is not int or derivation["schemaVersion"] != 1:
+        raise EvidenceError("training manifest datasetDerivation is not schema 1")
+    for field in (
+        "sourceGeometryManifestSHA256",
+        "sourceSelectedFramesDigest",
+        "datasetInputDigest",
+        "datasetGeometryDigest",
+    ):
+        _shipping_training_digest(
+            derivation[field],
+            f"training manifest datasetDerivation {field}",
+        )
+    if not isinstance(derivation["preparationKind"], str) or derivation[
+        "preparationKind"
+    ] not in {"direct", "undistorted"}:
+        raise EvidenceError("training manifest dataset preparation kind is invalid")
+    maximum_dimension = derivation["maximumImageDimension"]
+    if type(maximum_dimension) is not int or not 0 < maximum_dimension <= (1 << 63) - 1:
+        raise EvidenceError(
+            "training manifest dataset maximum image dimension is invalid"
+        )
+    toolchain_version = derivation["toolchainVersion"]
+    if not isinstance(toolchain_version, str) or not toolchain_version.strip():
+        raise EvidenceError("training manifest dataset toolchain version is invalid")
+
+    provenance = _mapping(
+        derivation["colmapProvenance"],
+        "training manifest datasetDerivation colmapProvenance",
+    )
+    _exact_keys(
+        provenance,
+        {"identifier", "version", "revision", "payloadSHA256"},
+        "training manifest datasetDerivation colmapProvenance",
+    )
+    if provenance["identifier"] != "colmap":
+        raise EvidenceError("training manifest dataset COLMAP identifier is invalid")
+    for field in ("version", "revision"):
+        if not isinstance(provenance[field], str) or not provenance[field].strip():
+            raise EvidenceError(f"training manifest dataset COLMAP {field} is invalid")
+    _shipping_training_digest(
+        provenance["payloadSHA256"],
+        "training manifest dataset COLMAP payload digest",
+    )
+
+    image_names = derivation["registeredImageNames"]
+    if (
+        not isinstance(image_names, list)
+        or not image_names
+        or any(not isinstance(name, str) for name in image_names)
+        or len(image_names) != len(set(image_names))
+    ):
+        raise EvidenceError("training manifest registered image names are invalid")
+    for name in image_names:
+        path = PurePosixPath(name)
+        if (
+            not name
+            or name in {".", ".."}
+            or path.name != name
+            or path.suffix.lower() not in {".jpg", ".jpeg", ".png"}
+        ):
+            raise EvidenceError("training manifest registered image name is unsafe")
+    if derivation["datasetInputDigest"] != input_digest:
+        raise EvidenceError("training manifest dataset input digest is inconsistent")
+    if derivation["datasetGeometryDigest"] != geometry_digest:
+        raise EvidenceError("training manifest dataset geometry digest is inconsistent")
+
+
+def _training_scaled_bytes(value: int, numerator: int, denominator: int) -> int:
+    return (value // denominator) * numerator + (
+        value % denominator
+    ) * numerator // denominator
+
+
+def _validate_training_resource_admission(
+    value: Any,
+    *,
+    memory_budget_bytes: int,
+    candidate_configuration: Mapping[str, Any],
+) -> None:
+    label = "training manifest resource admission"
+    admission = _mapping(value, label)
+    _exact_keys_with_optional(
+        admission,
+        {
+            "schema_version",
+            "observation",
+            "resource_policy",
+            "policy_headroom_bytes",
+            "policy_capacity_bytes",
+            "host_headroom_bytes",
+            "host_capacity_bytes",
+            "allowed_trainer_bytes",
+        },
+        {"metal_headroom_bytes", "metal_capacity_bytes"},
+        label,
+    )
+    if type(admission["schema_version"]) is not int or admission["schema_version"] != 2:
+        raise EvidenceError("training manifest resource admission is not schema-2")
+
+    observation = _mapping(
+        admission["observation"],
+        "training manifest resource observation",
+    )
+    _exact_keys_with_optional(
+        observation,
+        {
+            "clock",
+            "installed_memory_bytes",
+            "available_host_memory_bytes",
+            "available_host_memory_source",
+            "host_pages",
+            "memory_pressure",
+            "memory_pressure_source",
+        },
+        {
+            "kernel_available_memory_percentage",
+            "metal_recommended_working_set_bytes",
+            "metal_current_allocated_bytes",
+        },
+        "training manifest resource observation",
+    )
+    clock = _mapping(
+        observation["clock"],
+        "training manifest resource clock",
+    )
+    _exact_keys(
+        clock,
+        {
+            "wall_clock",
+            "monotonic_ticks",
+            "mach_timebase_numerator",
+            "mach_timebase_denominator",
+            "boot_time_seconds",
+            "boot_time_microseconds",
+        },
+        "training manifest resource clock",
+    )
+    wall_clock = clock["wall_clock"]
+    try:
+        wall_clock_is_finite = (
+            not isinstance(wall_clock, bool)
+            and isinstance(wall_clock, (int, float))
+            and math.isfinite(wall_clock)
+        )
+    except OverflowError:
+        wall_clock_is_finite = False
+    if not wall_clock_is_finite:
+        raise EvidenceError("training manifest resource admission clock is invalid")
+    if (
+        _shipping_training_uint(
+            clock["monotonic_ticks"],
+            "training manifest resource admission monotonic ticks",
+        )
+        == 0
+    ):
+        raise EvidenceError("training manifest resource admission clock is invalid")
+    for field in ("mach_timebase_numerator", "mach_timebase_denominator"):
+        if (
+            _shipping_training_uint(
+                clock[field],
+                f"training manifest resource admission {field}",
+                maximum=(1 << 32) - 1,
+            )
+            == 0
+        ):
+            raise EvidenceError("training manifest resource admission clock is invalid")
+    boot_seconds = clock["boot_time_seconds"]
+    boot_microseconds = clock["boot_time_microseconds"]
+    if (
+        type(boot_seconds) is not int
+        or not 0 < boot_seconds <= (1 << 63) - 1
+        or type(boot_microseconds) is not int
+        or not 0 <= boot_microseconds < 1_000_000
+    ):
+        raise EvidenceError("training manifest resource admission clock is invalid")
+
+    installed_bytes = _shipping_training_uint(
+        observation["installed_memory_bytes"],
+        "training manifest resource admission installed memory",
+    )
+    available_bytes = _shipping_training_uint(
+        observation["available_host_memory_bytes"],
+        "training manifest resource admission available host memory",
+    )
+    if installed_bytes == 0 or available_bytes > installed_bytes:
+        raise EvidenceError(
+            "training manifest resource admission memory evidence is invalid"
+        )
+
+    pages = _mapping(
+        observation["host_pages"],
+        "training manifest resource host pages",
+    )
+    page_fields = {
+        "page_size_bytes",
+        "free_page_count",
+        "inactive_page_count",
+        "speculative_page_count",
+        "purgeable_page_count",
+        "compressed_page_count",
+    }
+    _exact_keys(pages, page_fields, "training manifest resource host pages")
+    page_values = {
+        field: _shipping_training_uint(
+            pages[field],
+            f"training manifest resource admission host pages {field}",
+        )
+        for field in page_fields
+    }
+    page_size = page_values["page_size_bytes"]
+    if (
+        page_size == 0
+        or page_values["speculative_page_count"] > page_values["free_page_count"]
+    ):
+        raise EvidenceError(
+            "training manifest resource admission host page evidence is invalid"
+        )
+    free_and_inactive = (
+        page_values["free_page_count"] + page_values["inactive_page_count"]
+    )
+    if free_and_inactive > (1 << 64) - 1:
+        raise EvidenceError(
+            "training manifest resource admission host page evidence is invalid"
+        )
+    fallback_bytes = free_and_inactive * page_size
+    if fallback_bytes > (1 << 64) - 1 or fallback_bytes > installed_bytes:
+        raise EvidenceError(
+            "training manifest resource admission host page evidence is invalid"
+        )
+    for field in (
+        "speculative_page_count",
+        "purgeable_page_count",
+        "compressed_page_count",
+    ):
+        evidence_bytes = page_values[field] * page_size
+        if evidence_bytes > (1 << 64) - 1 or evidence_bytes > installed_bytes:
+            raise EvidenceError(
+                "training manifest resource admission host page evidence is invalid"
+            )
+
+    available_source = observation["available_host_memory_source"]
+    percentage = observation.get("kernel_available_memory_percentage")
+    if available_source == "kernel_memorystatus_percentage":
+        percentage = _shipping_training_uint(
+            percentage,
+            "training manifest resource admission kernel memory percentage",
+            maximum=(1 << 32) - 1,
+        )
+        if percentage > 100:
+            raise EvidenceError(
+                "training manifest resource admission available host memory is inconsistent"
+            )
+        expected_available = (installed_bytes // 100) * percentage + (
+            installed_bytes % 100
+        ) * percentage // 100
+    elif available_source == "mach_vm_free_inactive":
+        if percentage is not None:
+            raise EvidenceError(
+                "training manifest resource admission available host memory is inconsistent"
+            )
+        expected_available = fallback_bytes
+    else:
+        raise EvidenceError(
+            "training manifest resource admission available host memory source is invalid"
+        )
+    if available_bytes != expected_available:
+        raise EvidenceError(
+            "training manifest resource admission available host memory is inconsistent"
+        )
+
+    pressure = observation["memory_pressure"]
+    pressure_source = observation["memory_pressure_source"]
+    if not isinstance(pressure, str) or pressure not in {
+        "normal",
+        "warning",
+        "critical",
+        "unknown",
+    }:
+        raise EvidenceError(
+            "training manifest resource admission memory pressure is invalid"
+        )
+    if not isinstance(pressure_source, str):
+        raise EvidenceError(
+            "training manifest resource admission memory pressure source is invalid"
+        )
+    if (pressure_source == "kernel_memorystatus" and pressure == "unknown") or (
+        pressure_source == "unavailable" and pressure != "unknown"
+    ):
+        raise EvidenceError(
+            "training manifest resource admission memory pressure is inconsistent"
+        )
+    if pressure_source not in {"kernel_memorystatus", "unavailable"}:
+        raise EvidenceError(
+            "training manifest resource admission memory pressure source is invalid"
+        )
+
+    metal_recommended = observation.get("metal_recommended_working_set_bytes")
+    metal_allocated = observation.get("metal_current_allocated_bytes")
+    if metal_recommended is None and metal_allocated is None:
+        resolved_metal_recommended = None
+        resolved_metal_allocated = None
+    elif metal_recommended is not None and metal_allocated is not None:
+        resolved_metal_recommended = _shipping_training_uint(
+            metal_recommended,
+            "training manifest resource admission Metal recommendation",
+        )
+        resolved_metal_allocated = _shipping_training_uint(
+            metal_allocated,
+            "training manifest resource admission Metal allocation",
+        )
+        if (
+            resolved_metal_recommended == 0
+            or resolved_metal_recommended > installed_bytes
+            or resolved_metal_allocated > installed_bytes
+        ):
+            raise EvidenceError(
+                "training manifest resource admission Metal evidence is invalid"
+            )
+    else:
+        raise EvidenceError(
+            "training manifest resource admission Metal evidence is unpaired"
+        )
+
+    requested_policy = admission["resource_policy"]
+    if not isinstance(requested_policy, str) or requested_policy not in {
+        "automatic",
+        "conserveMemory",
+        "maximumPerformance",
+    }:
+        raise EvidenceError("training manifest resource admission policy is invalid")
+    expected_policy = {
+        "automatic": "automatic",
+        "conserve_memory": "conserveMemory",
+        "maximum_performance": "maximumPerformance",
+    }.get(candidate_configuration.get("resource_policy"))
+    if expected_policy is None or requested_policy != expected_policy:
+        raise EvidenceError(
+            "training manifest resource admission policy does not match request"
+        )
+
+    gibibyte = 1_073_741_824
+    mebibyte = 1_048_576
+    policy_headroom = min(
+        installed_bytes,
+        max(2 * gibibyte, installed_bytes // 20),
+    )
+    policy_base = max(0, installed_bytes - policy_headroom)
+    effective_policy = requested_policy
+    if (
+        requested_policy == "maximumPerformance"
+        and installed_bytes <= 33 * gibibyte // 2
+    ):
+        effective_policy = "automatic"
+    numerator, denominator = {
+        "conserveMemory": (3, 5),
+        "automatic": (9, 10),
+        "maximumPerformance": (49, 50),
+    }[effective_policy]
+    policy_capacity = _training_scaled_bytes(policy_base, numerator, denominator)
+    if installed_bytes <= 33 * gibibyte // 2:
+        policy_capacity = min(policy_capacity, 12 * gibibyte)
+
+    host_headroom = min(
+        available_bytes,
+        max(2 * gibibyte, installed_bytes // 20),
+    )
+    unpressured_host_capacity = max(0, available_bytes - host_headroom)
+    host_numerator, host_denominator = {
+        "normal": (1, 1),
+        "warning": (3, 5),
+        "critical": (1, 3),
+        "unknown": (4, 5),
+    }[pressure]
+    host_capacity = _training_scaled_bytes(
+        unpressured_host_capacity,
+        host_numerator,
+        host_denominator,
+    )
+
+    if resolved_metal_recommended is None:
+        metal_headroom = None
+        metal_capacity = None
+    else:
+        metal_headroom = min(
+            resolved_metal_recommended,
+            max(512 * mebibyte, resolved_metal_recommended // 20),
+        )
+        unallocated_metal = max(
+            0,
+            resolved_metal_recommended - resolved_metal_allocated,
+        )
+        metal_capacity = max(0, unallocated_metal - metal_headroom)
+    allowed_trainer_bytes = min(policy_capacity, host_capacity)
+    if metal_capacity is not None:
+        allowed_trainer_bytes = min(allowed_trainer_bytes, metal_capacity)
+
+    expected_fields = {
+        "policy_headroom_bytes": policy_headroom,
+        "policy_capacity_bytes": policy_capacity,
+        "host_headroom_bytes": host_headroom,
+        "host_capacity_bytes": host_capacity,
+        "metal_headroom_bytes": metal_headroom,
+        "metal_capacity_bytes": metal_capacity,
+        "allowed_trainer_bytes": allowed_trainer_bytes,
+    }
+    for field, expected in expected_fields.items():
+        actual = admission.get(field)
+        if expected is not None:
+            actual = _shipping_training_uint(
+                actual,
+                f"training manifest resource admission {field}",
+            )
+        elif actual is not None:
+            raise EvidenceError(
+                "training manifest resource admission derived capacities are inconsistent"
+            )
+        if actual != expected:
+            raise EvidenceError(
+                "training manifest resource admission derived capacities are inconsistent"
+            )
+    if memory_budget_bytes > allowed_trainer_bytes:
+        raise EvidenceError(
+            "training manifest memory budget exceeds admitted trainer bytes"
+        )
 
 
 def _validate_training_manifest(
@@ -7139,12 +13167,43 @@ def _validate_training_manifest(
     pipeline_metrics: Mapping[str, Any],
     candidate_configuration: Mapping[str, Any],
     maximum_training_seconds: float,
+    *,
+    training_split_path: Path | None = None,
+    training_split_descriptor: Mapping[str, Any] | None = None,
+    geometry_manifest_descriptor: Mapping[str, Any] | None = None,
+    request: Mapping[str, Any] | None = None,
 ) -> None:
     manifest = _mapping(
         _load_bounded_json(path, "training manifest", maximum_bytes=1024 * 1024),
         "training manifest",
     )
-    _exact_keys(
+    if "schema_version" in manifest:
+        if (
+            training_split_path is None
+            or training_split_descriptor is None
+            or geometry_manifest_descriptor is None
+            or request is None
+        ):
+            raise EvidenceError("measurement training manifest lacks bound artifacts")
+        _validate_measurement_training_manifest(
+            manifest,
+            output_descriptor=output_descriptor,
+            output_splat_count=output_splat_count,
+            pipeline_metrics=pipeline_metrics,
+            candidate_configuration=candidate_configuration,
+            maximum_training_seconds=maximum_training_seconds,
+            training_split_path=training_split_path,
+            training_split_descriptor=training_split_descriptor,
+            geometry_manifest_descriptor=geometry_manifest_descriptor,
+            request=request,
+        )
+        return
+    if (
+        manifest.get("schemaVersion") != 7
+        or manifest.get("completionStatus") != "completed"
+    ):
+        raise EvidenceError("training manifest is not a completed schema-7 artifact")
+    _exact_keys_with_optional(
         manifest,
         {
             "schemaVersion",
@@ -7153,6 +13212,7 @@ def _validate_training_manifest(
             "trainerBuildDigest",
             "inputDigest",
             "geometryDigest",
+            "datasetDerivation",
             "detailProfile",
             "iterationLimit",
             "plateauWindow",
@@ -7165,6 +13225,7 @@ def _validate_training_manifest(
             "elapsedSeconds",
             "peakMemoryBytes",
             "memoryBudgetBytes",
+            "resourceAdmission",
             "rasterFallbackCount",
             "rasterExactFallbackElapsedSeconds",
             "rasterExactBufferGrowthCount",
@@ -7175,16 +13236,19 @@ def _validate_training_manifest(
             "sceneBounds",
             "completionStatus",
         },
+        {"checkpointPath", "checkpointDigest"},
         "training manifest",
     )
-    if manifest["schemaVersion"] != 5 or manifest["completionStatus"] != "completed":
-        raise EvidenceError("training manifest is not a completed schema-5 artifact")
+    if (
+        manifest.get("checkpointPath") is not None
+        or manifest.get("checkpointDigest") is not None
+    ):
+        raise EvidenceError("completed training manifest contains checkpoint evidence")
     if manifest["runtimeVersion"] != "native-metal-cli-v2":
         raise EvidenceError("training manifest runtime contract is unsupported")
-    if (
-        not isinstance(manifest["detailProfile"], str)
-        or manifest["detailProfile"] not in {"fast", "balanced", "highDetail"}
-    ):
+    if not isinstance(manifest["detailProfile"], str) or manifest[
+        "detailProfile"
+    ] not in {"fast", "balanced", "highDetail"}:
         raise EvidenceError("training manifest detail profile is invalid")
     expected_profile = candidate_configuration["detail_profile"]
     if manifest["detailProfile"] != expected_profile:
@@ -7225,7 +13289,9 @@ def _validate_training_manifest(
             or manifest[name] < 0
             or manifest[name] > (1 << 63) - 1
         ):
-            raise EvidenceError(f"training manifest {name} must be a nonnegative integer")
+            raise EvidenceError(
+                f"training manifest {name} must be a nonnegative integer"
+            )
     if (
         type(manifest["cameraOrderSeed"]) is not int
         or not 0 <= manifest["cameraOrderSeed"] <= (1 << 64) - 1
@@ -7260,14 +13326,18 @@ def _validate_training_manifest(
             or not math.isfinite(value)
             or value < 0
         ):
-            raise EvidenceError(f"training manifest {name} must be finite and nonnegative")
+            raise EvidenceError(
+                f"training manifest {name} must be finite and nonnegative"
+            )
     if manifest["rasterPeakExactIntersectionCapacity"] > (1 << 32) - 1:
         raise EvidenceError("training manifest raster peak capacity exceeds UInt32")
     if (
         manifest["rasterExactBufferBytesAdded"]
         > manifest["rasterExactBufferGrowthCount"] * manifest["memoryBudgetBytes"]
     ):
-        raise EvidenceError("training manifest raster allocation evidence exceeds its budget")
+        raise EvidenceError(
+            "training manifest raster allocation evidence exceeds its budget"
+        )
     if manifest["rasterFallbackCount"] == 0 and any(
         manifest[name] != 0
         for name in (
@@ -7278,7 +13348,9 @@ def _validate_training_manifest(
             "rasterPeakExactIntersectionCapacity",
         )
     ):
-        raise EvidenceError("training manifest zero raster fallbacks have recovery evidence")
+        raise EvidenceError(
+            "training manifest zero raster fallbacks have recovery evidence"
+        )
     if manifest["rasterFallbackCount"] > 0 and (
         manifest["rasterExactFallbackElapsedSeconds"] <= 0
         or manifest["rasterExactBufferGrowthCount"] <= 0
@@ -7291,7 +13363,9 @@ def _validate_training_manifest(
         manifest["rasterExactBufferBytesAdded"] != 0
         or manifest["rasterPeakExactIntersectionCapacity"] != 0
     ):
-        raise EvidenceError("training manifest zero raster growth has allocation evidence")
+        raise EvidenceError(
+            "training manifest zero raster growth has allocation evidence"
+        )
     if manifest["rasterExactBufferGrowthCount"] > 0 and (
         manifest["rasterExactBufferBytesAdded"] == 0
         or manifest["rasterPeakExactIntersectionCapacity"] <= 2_048
@@ -7300,20 +13374,36 @@ def _validate_training_manifest(
     if manifest["outputBytes"] != output_descriptor["bytes"]:
         raise EvidenceError("training manifest output size does not match output_ply")
     if manifest["gaussianCount"] != output_splat_count:
-        raise EvidenceError("training manifest Gaussian count does not match output_ply")
+        raise EvidenceError(
+            "training manifest Gaussian count does not match output_ply"
+        )
     if manifest["droppedIntersectionCount"] != 0:
         raise EvidenceError("training manifest reports dropped raster intersections")
     if (
         manifest["rasterExactFallbackElapsedSeconds"] > manifest["elapsedSeconds"]
         or manifest["rasterReplayElapsedSeconds"] > manifest["elapsedSeconds"]
     ):
-        raise EvidenceError("training manifest raster elapsed time exceeds training time")
+        raise EvidenceError(
+            "training manifest raster elapsed time exceeds training time"
+        )
     if manifest["elapsedSeconds"] > maximum_training_seconds + 1e-6:
-        raise EvidenceError("training manifest elapsed time exceeds its published timing run")
+        raise EvidenceError(
+            "training manifest elapsed time exceeds its published timing run"
+        )
     for name in ("trainerBuildDigest", "inputDigest", "geometryDigest"):
         digest = manifest[name]
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise EvidenceError(f"training manifest {name} is not a SHA-256 digest")
+    _validate_training_dataset_derivation(
+        manifest["datasetDerivation"],
+        input_digest=manifest["inputDigest"],
+        geometry_digest=manifest["geometryDigest"],
+    )
+    _validate_training_resource_admission(
+        manifest["resourceAdmission"],
+        memory_budget_bytes=manifest["memoryBudgetBytes"],
+        candidate_configuration=candidate_configuration,
+    )
     for name in ("trainerVersion", "runtimeVersion"):
         if not isinstance(manifest[name], str) or not manifest[name]:
             raise EvidenceError(f"training manifest {name} is invalid")
@@ -7351,6 +13441,289 @@ def _validate_training_manifest(
             raise EvidenceError(
                 f"training manifest {manifest_name} does not match pipeline metrics"
             )
+
+
+def _validate_measurement_training_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    output_descriptor: Mapping[str, Any],
+    output_splat_count: int,
+    pipeline_metrics: Mapping[str, Any],
+    candidate_configuration: Mapping[str, Any],
+    maximum_training_seconds: float,
+    training_split_path: Path,
+    training_split_descriptor: Mapping[str, Any],
+    geometry_manifest_descriptor: Mapping[str, Any],
+    request: Mapping[str, Any],
+) -> None:
+    _exact_keys(
+        manifest,
+        {
+            "schema_version",
+            "training_split_digest",
+            "training_split_manifest_sha256",
+            "training_image_digest",
+            "dataset_input_digest",
+            "dataset_geometry_digest",
+            "source_model_digest",
+            "filtered_model_digest",
+            "geometry_manifest_sha256",
+            "output_sha256",
+            "output_bytes",
+            "profile",
+            "seed",
+            "iteration_limit",
+            "plateau_window",
+            "completed_iteration",
+            "gaussian_count",
+            "elapsed_seconds",
+            "input_digest",
+            "geometry_digest",
+            "trainer_build_digest",
+            "completion_status",
+            "training_split_manifest",
+            "peak_memory_bytes",
+            "memory_budget_bytes",
+            "raster_fallback_count",
+            "raster_exact_fallback_elapsed_seconds",
+            "raster_exact_buffer_growth_count",
+            "raster_exact_buffer_bytes_added",
+            "raster_replay_elapsed_seconds",
+            "raster_peak_exact_intersection_capacity",
+            "dropped_intersection_count",
+            "scene_bounds",
+        },
+        "measurement training manifest",
+    )
+    if manifest["schema_version"] != 1 or manifest["completion_status"] != "completed":
+        raise EvidenceError("measurement training manifest is not completed schema 1")
+    if manifest["training_split_manifest"] != "training-split.json":
+        raise EvidenceError("measurement training manifest split path is not canonical")
+
+    digest_fields = (
+        "training_split_digest",
+        "training_split_manifest_sha256",
+        "training_image_digest",
+        "dataset_input_digest",
+        "dataset_geometry_digest",
+        "source_model_digest",
+        "filtered_model_digest",
+        "geometry_manifest_sha256",
+        "output_sha256",
+        "input_digest",
+        "geometry_digest",
+        "trainer_build_digest",
+    )
+    for name in digest_fields:
+        value = manifest[name]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise EvidenceError(f"measurement training manifest {name} is not SHA-256")
+    if (
+        "sha256:" + manifest["training_split_manifest_sha256"]
+        != training_split_descriptor["sha256"]
+    ):
+        raise EvidenceError("measurement training manifest split digest is stale")
+    if (
+        "sha256:" + manifest["geometry_manifest_sha256"]
+        != geometry_manifest_descriptor["sha256"]
+    ):
+        raise EvidenceError(
+            "measurement training manifest geometry model was substituted"
+        )
+    if "sha256:" + manifest["output_sha256"] != output_descriptor["sha256"]:
+        raise EvidenceError("measurement training manifest PLY was substituted")
+
+    split = _mapping(
+        _load_bounded_json(
+            training_split_path, "training split", maximum_bytes=1024 * 1024
+        ),
+        "training split",
+    )
+    _exact_keys(
+        split,
+        {
+            "schema_version",
+            "selected_image_names",
+            "training_view_indices",
+            "holdout_view_indices",
+            "training_image_names",
+            "holdout_image_names",
+            "dataset_image_names",
+            "training_image_digest",
+            "closure_digest",
+        },
+        "training split",
+    )
+    if split["schema_version"] != 1:
+        raise EvidenceError("training split schema is unsupported")
+    scale = request["binding"]["scale"]
+    selected = split["selected_image_names"]
+    training_indices = split["training_view_indices"]
+    holdout_indices = split["holdout_view_indices"]
+    training_names = split["training_image_names"]
+    holdout_names = split["holdout_image_names"]
+    dataset_names = split["dataset_image_names"]
+    arrays = (
+        selected,
+        training_indices,
+        holdout_indices,
+        training_names,
+        holdout_names,
+        dataset_names,
+    )
+    if any(not isinstance(value, list) for value in arrays):
+        raise EvidenceError("training split arrays are invalid")
+    if (
+        len(selected) != scale
+        or len(set(selected)) != len(selected)
+        or any(not isinstance(name, str) or not name for name in selected)
+    ):
+        raise EvidenceError("training split selected image order is invalid")
+    expected_holdouts = request["holdout_indices"]
+    expected_training = [
+        index for index in range(scale) if index not in set(expected_holdouts)
+    ]
+    if holdout_indices != expected_holdouts or training_indices != expected_training:
+        raise EvidenceError("training split does not match the bound holdouts")
+    if training_names != [selected[index] for index in expected_training]:
+        raise EvidenceError("training split training image order was substituted")
+    if holdout_names != [selected[index] for index in expected_holdouts]:
+        raise EvidenceError("training split holdout image order was substituted")
+    if dataset_names != training_names:
+        raise EvidenceError(
+            "training dataset contains a holdout or changed image order"
+        )
+    if set(training_names).intersection(holdout_names):
+        raise EvidenceError("training and holdout image sets overlap")
+    if split["training_image_digest"] != manifest["training_image_digest"]:
+        raise EvidenceError("measurement training image digest is stale")
+
+    unsigned_split = {
+        key: split[key]
+        for key in (
+            "schema_version",
+            "selected_image_names",
+            "training_view_indices",
+            "holdout_view_indices",
+            "training_image_names",
+            "holdout_image_names",
+            "dataset_image_names",
+            "training_image_digest",
+        )
+    }
+    closure_digest = hashlib.sha256(canonical_json_bytes(unsigned_split)).hexdigest()
+    if (
+        split["closure_digest"] != closure_digest
+        or manifest["training_split_digest"] != closure_digest
+    ):
+        raise EvidenceError("training split closure digest is stale")
+
+    expected_profile = candidate_configuration["detail_profile"]
+    if manifest["profile"] != expected_profile:
+        raise EvidenceError("measurement training profile does not match request")
+    expected_contract = {
+        "iteration_limit": candidate_configuration["trainer_iterations"],
+        "plateau_window": candidate_configuration["trainer_plateau_window"],
+        "seed": candidate_configuration["run_seed"],
+    }
+    for name, expected in expected_contract.items():
+        if manifest[name] != expected:
+            raise EvidenceError(f"measurement training {name} does not match request")
+    integer_fields = (
+        "iteration_limit",
+        "plateau_window",
+        "completed_iteration",
+        "gaussian_count",
+        "output_bytes",
+        "peak_memory_bytes",
+        "memory_budget_bytes",
+        "raster_fallback_count",
+        "raster_exact_buffer_growth_count",
+        "raster_exact_buffer_bytes_added",
+        "raster_peak_exact_intersection_capacity",
+        "dropped_intersection_count",
+    )
+    for name in integer_fields:
+        value = manifest[name]
+        if type(value) is not int or not 0 <= value <= (1 << 63) - 1:
+            raise EvidenceError(
+                f"measurement training {name} must be a nonnegative integer"
+            )
+    if not 0 < manifest["completed_iteration"] <= manifest["iteration_limit"]:
+        raise EvidenceError("measurement training completion iteration is invalid")
+    if (
+        manifest["plateau_window"] == 0
+        or manifest["plateau_window"] > manifest["iteration_limit"]
+    ):
+        raise EvidenceError("measurement training plateau window is invalid")
+    if (
+        manifest["output_bytes"] != output_descriptor["bytes"]
+        or manifest["gaussian_count"] != output_splat_count
+    ):
+        raise EvidenceError("measurement training output identity is invalid")
+    if manifest["peak_memory_bytes"] == 0 or manifest["memory_budget_bytes"] == 0:
+        raise EvidenceError("measurement training memory evidence is invalid")
+    if manifest["dropped_intersection_count"] != 0:
+        raise EvidenceError("measurement training reports dropped intersections")
+
+    for name in (
+        "elapsed_seconds",
+        "raster_exact_fallback_elapsed_seconds",
+        "raster_replay_elapsed_seconds",
+    ):
+        value = manifest[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise EvidenceError(
+                f"measurement training {name} must be finite and nonnegative"
+            )
+    if manifest["elapsed_seconds"] > maximum_training_seconds + 1e-6:
+        raise EvidenceError(
+            "measurement training elapsed time exceeds its published timing run"
+        )
+    if (
+        manifest["raster_exact_fallback_elapsed_seconds"] > manifest["elapsed_seconds"]
+        or manifest["raster_replay_elapsed_seconds"] > manifest["elapsed_seconds"]
+    ):
+        raise EvidenceError("measurement training raster time exceeds training time")
+    manifest_to_pipeline = {
+        "raster_fallback_count": "raster_fallback_count",
+        "raster_exact_fallback_elapsed_seconds": "raster_exact_fallback_elapsed_seconds",
+        "raster_exact_buffer_growth_count": "raster_exact_buffer_growth_count",
+        "raster_exact_buffer_bytes_added": "raster_exact_buffer_bytes_added",
+        "raster_replay_elapsed_seconds": "raster_replay_elapsed_seconds",
+        "raster_peak_exact_intersection_capacity": "raster_peak_exact_intersection_capacity",
+        "dropped_intersection_count": "dropped_intersection_count",
+    }
+    for receipt_name, pipeline_name in manifest_to_pipeline.items():
+        if manifest[receipt_name] != pipeline_metrics.get(pipeline_name):
+            raise EvidenceError(
+                f"measurement training {receipt_name} does not match pipeline metrics"
+            )
+    bounds = _mapping(manifest["scene_bounds"], "measurement training scene_bounds")
+    _exact_keys(bounds, {"center", "radius"}, "measurement training scene_bounds")
+    center = _mapping(bounds["center"], "measurement training scene center")
+    _exact_keys(center, {"x", "y", "z"}, "measurement training scene center")
+    coordinates = [center[axis] for axis in ("x", "y", "z")]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in coordinates
+    ):
+        raise EvidenceError("measurement training scene center is invalid")
+    radius = bounds["radius"]
+    if (
+        isinstance(radius, bool)
+        or not isinstance(radius, (int, float))
+        or not math.isfinite(radius)
+        or radius <= 0
+    ):
+        raise EvidenceError("measurement training scene radius is invalid")
 
 
 def _load_bounded_json(
@@ -7455,13 +13828,28 @@ def _biconnected_robustness(adjacency: list[set[int]]) -> dict[str, int]:
     }
 
 
-def _validate_pair_list(
-    pair_list_path: Path,
+@dataclass(frozen=True)
+class SelectionManifestSources:
+    image_names: tuple[str, ...]
+    clip_ids: tuple[str, ...]
+    source_kinds: tuple[str, ...]
+    video_source_count: int
+
+
+def _validate_selection_manifest_sources(
     selection_manifest_path: Path,
+    *,
     requested_scale: int,
-    candidate_configuration: Mapping[str, Any],
-    pipeline_metrics: Mapping[str, Any],
-) -> str:
+    input_kind: str,
+    expected_video_source_count: int,
+) -> SelectionManifestSources:
+    """Validate selected-view source identity.
+
+    In selection schema 2, ``clip_id`` identifies one original input source. It
+    must stay stable across every selected view from that source; decode chunks
+    and analysis segments do not receive new IDs. Cross-checking the distinct
+    video IDs with worker evidence prevents either splitting or merging inputs.
+    """
     selection = _mapping(
         _load_bounded_json(selection_manifest_path, "selection_manifest"),
         "selection_manifest",
@@ -7474,9 +13862,11 @@ def _validate_pair_list(
         raise EvidenceError(
             f"selection_manifest must cover the requested scale {requested_scale}"
         )
+
     clip_ids: list[str] = []
     image_names: list[str] = []
     source_kinds: list[str] = []
+    clip_source_kinds: dict[str, str] = {}
     for index, raw_view in enumerate(raw_views):
         view = _mapping(raw_view, f"selection_manifest.views[{index}]")
         _exact_keys(
@@ -7497,22 +13887,618 @@ def _validate_pair_list(
             or image_name in {".", ".."}
         ):
             raise EvidenceError("selection_manifest image name is invalid")
-        image_names.append(image_name)
-        clip_ids.append(_token(view["clip_id"], f"selection_manifest.views[{index}].clip_id"))
-        if view["source_kind"] not in {"video", "photo"}:
+        clip_id = _token(
+            view["clip_id"],
+            f"selection_manifest.views[{index}].clip_id",
+        )
+        source_kind = view["source_kind"]
+        if source_kind not in {"video", "photo"}:
             raise EvidenceError("selection_manifest source kind is invalid")
-        source_kinds.append(view["source_kind"])
+        prior_source_kind = clip_source_kinds.setdefault(clip_id, source_kind)
+        if prior_source_kind != source_kind:
+            raise EvidenceError(
+                "selection_manifest clip IDs cannot span multiple source kinds"
+            )
+        image_names.append(image_name)
+        clip_ids.append(clip_id)
+        source_kinds.append(source_kind)
     if len(set(image_names)) != len(image_names):
         raise EvidenceError("selection_manifest image names must be unique")
+
+    represented_source_kinds = set(source_kinds)
+    allowed_source_kind_sets = {
+        "video": ({"video"},),
+        "multi_video": ({"video"},),
+        "photos": ({"photo"},),
+        "mixed": ({"video"}, {"video", "photo"}),
+    }.get(input_kind)
+    if (
+        allowed_source_kind_sets is None
+        or represented_source_kinds not in allowed_source_kind_sets
+    ):
+        raise EvidenceError(
+            "selection_manifest source representation does not match the input kind"
+        )
+    video_source_count = len(
+        {
+            clip_id
+            for clip_id, source_kind in zip(clip_ids, source_kinds, strict=True)
+            if source_kind == "video"
+        }
+    )
+    if video_source_count != expected_video_source_count:
+        raise EvidenceError(
+            "selection_manifest video source count does not match the protected request"
+        )
+    return SelectionManifestSources(
+        image_names=tuple(image_names),
+        clip_ids=tuple(clip_ids),
+        source_kinds=tuple(source_kinds),
+        video_source_count=video_source_count,
+    )
+
+
+def _validate_pair_list(
+    pair_list_path: Path,
+    requested_scale: int,
+    selection: SelectionManifestSources,
+    candidate_configuration: Mapping[str, Any],
+    pipeline_metrics: Mapping[str, Any],
+    *,
+    requires_cross_clip_retrieval: bool | None = None,
+) -> str:
+    image_names = list(selection.image_names)
+    clip_ids = list(selection.clip_ids)
+    source_kinds = list(selection.source_kinds)
 
     pair_list = _mapping(_load_bounded_json(pair_list_path, "pair_list"), "pair_list")
     _exact_keys(
         pair_list,
-        {"schema_version", "selected_frame_count", "pairs", "retrieval"},
+        {
+            "schema_version",
+            "selected_frame_count",
+            "accepted_attempt_number",
+            "pairs",
+            "attempts",
+            "fallback_reasons",
+        },
         "pair_list",
     )
-    if pair_list["schema_version"] != 2 or pair_list["selected_frame_count"] != requested_scale:
+    if (
+        pair_list["schema_version"] != 5
+        or pair_list["selected_frame_count"] != requested_scale
+    ):
         raise EvidenceError("pair_list does not match the bound selected frame count")
+
+    topology = candidate_configuration["input_topology"]
+    pairing_policy = candidate_configuration["pairing_policy"]
+    normal_offsets = set(candidate_configuration["temporal_offsets"])
+    views_by_clip: dict[str, list[int]] = {}
+    source_kind_by_clip: dict[str, str] = {}
+    for view_index, (clip_id, source_kind) in enumerate(
+        zip(clip_ids, source_kinds, strict=True)
+    ):
+        views_by_clip.setdefault(clip_id, []).append(view_index)
+        source_kind_by_clip[clip_id] = source_kind
+    is_video_only_multi_clip = (
+        selection.video_source_count > 1
+        and len(views_by_clip) == selection.video_source_count
+        and all(
+            source_kind == "video"
+            for source_kind in source_kind_by_clip.values()
+        )
+    )
+    if requires_cross_clip_retrieval is None:
+        requires_cross_clip_retrieval = (
+            topology in {"continuous", "segmented_mixed"}
+            and is_video_only_multi_clip
+        )
+    elif type(requires_cross_clip_retrieval) is not bool:
+        raise EvidenceError("pair_list cross-clip requirement is invalid")
+    if requires_cross_clip_retrieval and (
+        topology not in {"continuous", "segmented_mixed"}
+        or not is_video_only_multi_clip
+    ):
+        raise EvidenceError(
+            "pair_list cross-clip requirement does not match the selected input"
+        )
+    if topology == "continuous":
+        if requires_cross_clip_retrieval:
+            if len(views_by_clip) <= 1 or any(
+                source_kind != "video" for source_kind in source_kind_by_clip.values()
+            ):
+                raise EvidenceError(
+                    "pair_list cross-clip continuous input must contain video clips"
+                )
+        elif len(views_by_clip) != 1:
+            raise EvidenceError("pair_list continuous input must use one clip")
+
+    def local_edges_for_recovery(recovery_index: int) -> set[tuple[int, int]]:
+        if topology not in {"continuous", "segmented_mixed"}:
+            return set()
+        offsets = set(normal_offsets)
+        if recovery_index != 0 and pairing_policy != "segmented_mixed":
+            offsets.update(range(1, 13))
+        temporal_groups = [
+            views
+            for clip_id, views in views_by_clip.items()
+            if pairing_policy != "segmented_mixed"
+            or source_kind_by_clip[clip_id] == "video"
+        ]
+        return {
+            (clip_views[left], clip_views[right])
+            for clip_views in temporal_groups
+            for left in range(len(clip_views))
+            for right in range(left + 1, len(clip_views))
+            if right - left in offsets
+        }
+
+    candidate_limit = candidate_configuration["vocabulary_candidate_count"]
+    neighbor_limit = candidate_configuration["vocabulary_returned_neighbor_count"]
+    configured_retrieval = candidate_limit > 0 and neighbor_limit > 0
+    if (candidate_limit > 0) != (neighbor_limit > 0):
+        raise EvidenceError(
+            "pair_list retrieval policy has inconsistent candidate and neighbor limits"
+        )
+    stride = candidate_configuration["vocabulary_query_stride"]
+    distance_minimum = (
+        0
+        if requires_cross_clip_retrieval or topology != "continuous"
+        else max(12, requested_scale // 10)
+    )
+    expected_query_views = (
+        [
+            view
+            for clip_views in views_by_clip.values()
+            for view in clip_views[::stride]
+        ]
+        if requires_cross_clip_retrieval
+        else list(range(0, requested_scale, stride))
+    )
+
+    def receipt_digest(fields: list[str]) -> str:
+        hasher = hashlib.sha256()
+        for field in fields:
+            encoded = field.encode("utf-8")
+            hasher.update(f"{len(encoded)}:".encode("utf-8"))
+            hasher.update(encoded)
+        return "sha256:" + hasher.hexdigest()
+
+    raw_attempts = pair_list["attempts"]
+    if not isinstance(raw_attempts, list) or not raw_attempts:
+        raise EvidenceError("pair_list attempts must be a non-empty list")
+    fallback_reasons = pair_list["fallback_reasons"]
+    if (
+        not isinstance(fallback_reasons, list)
+        or len(fallback_reasons) != len(set(fallback_reasons))
+        or any(
+            not isinstance(reason, str)
+            or not reason
+            or reason != reason.strip()
+            or len(reason.encode("utf-8")) > 512
+            for reason in fallback_reasons
+        )
+    ):
+        raise EvidenceError("pair_list fallback reasons are invalid")
+    accepted_attempt_number = pair_list["accepted_attempt_number"]
+    if type(
+        accepted_attempt_number
+    ) is not int or not 1 <= accepted_attempt_number <= len(raw_attempts):
+        raise EvidenceError("pair_list accepted attempt number is invalid")
+
+    attempt_fields = {
+        "attempt_number",
+        "matcher_used",
+        "exact_recovery_reason",
+        "recovery_level",
+        "outcome",
+        "scheduled_pair_count",
+        "attempted_pair_count",
+        "raw_matched_pair_count",
+        "spatially_verified_pair_count",
+        "retrieval",
+    }
+    retrieval_fields = {
+        "engine",
+        "query_views",
+        "query_stride",
+        "candidate_count",
+        "returned_neighbor_count",
+        "minimum_frame_separation",
+        "candidate_policy",
+        "image_group_list_digest",
+        "executed",
+        "query_outcomes",
+        "directed_pairs",
+        "request_digest",
+        "output_digest",
+    }
+    query_outcome_fields = {"query_view", "status", "ranked_neighbor_views"}
+    directed_pair_fields = {"query_view", "target_view"}
+    attempts: list[Mapping[str, Any]] = []
+    exhaustive_attempts: list[bool] = []
+    local_edges_by_attempt: list[set[tuple[int, int]]] = []
+    prior_recovery_index = 0
+    for index, raw_attempt in enumerate(raw_attempts):
+        attempt = _mapping(raw_attempt, f"pair_list.attempts[{index}]")
+        _exact_keys(attempt, attempt_fields, f"pair_list.attempts[{index}]")
+        counts = [
+            attempt["scheduled_pair_count"],
+            attempt["attempted_pair_count"],
+            attempt["raw_matched_pair_count"],
+            attempt["spatially_verified_pair_count"],
+        ]
+        if (
+            attempt["attempt_number"] != index + 1
+            or attempt["matcher_used"] not in {"faiss", "exact"}
+            or (attempt["matcher_used"] == "exact")
+            != _valid_exact_recovery_reason(attempt["exact_recovery_reason"])
+            or attempt["recovery_level"] not in {"normal", "expanded", "maximum"}
+            or attempt["outcome"] not in {"completed", "rejected", "failed"}
+            or any(type(count) is not int or count < 0 for count in counts)
+            or not counts[0] >= counts[1] >= counts[2] >= counts[3]
+        ):
+            raise EvidenceError("pair_list attempt fields or counts are invalid")
+        recovery_index = {"normal": 0, "expanded": 1, "maximum": 2}[
+            attempt["recovery_level"]
+        ]
+        maximum_recovery_step = (
+            min(2, len(fallback_reasons))
+            if index == 0
+            else min(2, max(1, len(fallback_reasons)))
+        )
+        if (
+            recovery_index < prior_recovery_index
+            or recovery_index - prior_recovery_index > maximum_recovery_step
+        ):
+            raise EvidenceError("pair_list attempt recovery order is invalid")
+        prior_recovery_index = recovery_index
+
+        raw_retrieval = attempt["retrieval"]
+        uses_exhaustive = (
+            candidate_configuration["pairing_policy"] == "unordered_exhaustive"
+            and requested_scale <= 60
+        ) or (recovery_index == 2 and requested_scale <= 250)
+        attempt_local_edges = local_edges_for_recovery(recovery_index)
+        retrieval_is_scheduled = requires_cross_clip_retrieval or (
+            pairing_policy == "generic_continuous" and requested_scale >= 120
+        ) or pairing_policy in {
+            "object_orbit",
+            "walkthrough",
+            "large_area",
+            "segmented_mixed",
+            "unordered_retrieval",
+        }
+        retrieval_is_required = (
+            configured_retrieval and retrieval_is_scheduled and not uses_exhaustive
+        )
+        expected_attempt_schedule_count = (
+            requested_scale * (requested_scale - 1) // 2
+            if uses_exhaustive
+            else len(attempt_local_edges)
+        )
+        if not retrieval_is_required:
+            if raw_retrieval is not None:
+                raise EvidenceError(
+                    "pair_list records retrieval when disabled or exhaustive pairing is active"
+                )
+        else:
+            retrieval = _mapping(
+                raw_retrieval, f"pair_list.attempts[{index}].retrieval"
+            )
+            _exact_keys(
+                retrieval, retrieval_fields, f"pair_list.attempts[{index}].retrieval"
+            )
+            expected_queries = expected_query_views
+            if recovery_index == 0:
+                expected_candidate_limit = candidate_limit
+                expected_neighbor_limit = neighbor_limit
+            elif recovery_index == 1 and pairing_policy in {
+                "segmented_mixed",
+                "unordered_retrieval",
+            }:
+                expected_candidate_limit = 40
+                expected_neighbor_limit = 16
+            elif recovery_index == 2:
+                expected_candidate_limit = 80
+                expected_neighbor_limit = 32
+            else:
+                expected_candidate_limit = candidate_limit
+                expected_neighbor_limit = neighbor_limit
+            if (
+                retrieval["engine"] != "localSiftVocabularyV2"
+                or retrieval["query_views"] != expected_queries
+                or retrieval["query_stride"] != stride
+                or retrieval["candidate_count"] != expected_candidate_limit
+                or retrieval["returned_neighbor_count"] != expected_neighbor_limit
+                or retrieval["minimum_frame_separation"] != distance_minimum
+                or type(retrieval["executed"]) is not bool
+            ):
+                raise EvidenceError("pair_list retrieval request does not match policy")
+            expected_group_digest: str | None = None
+            if requires_cross_clip_retrieval:
+                group_index_by_clip = {
+                    clip_id: group_index
+                    for group_index, clip_id in enumerate(views_by_clip)
+                }
+                canonical_group_lines = sorted(
+                    (
+                        f"{image_names[view_index]}\t{group_index_by_clip[clip_ids[view_index]]}"
+                        for view_index in range(requested_scale)
+                    ),
+                    key=lambda line: line.encode("utf-8"),
+                )
+                expected_group_digest = receipt_digest(
+                    ["crossGroupV1", *canonical_group_lines]
+                )
+                if (
+                    retrieval["candidate_policy"] != "crossGroupV1"
+                    or retrieval["image_group_list_digest"]
+                    != expected_group_digest
+                ):
+                    raise EvidenceError(
+                        "pair_list cross-clip candidate policy is invalid"
+                    )
+            elif (
+                retrieval["candidate_policy"] is not None
+                or retrieval["image_group_list_digest"] is not None
+            ):
+                raise EvidenceError(
+                    "pair_list non-cross-clip retrieval declares a group policy"
+                )
+            request_digest_fields = [
+                retrieval["engine"],
+                str(retrieval["query_stride"]),
+                str(retrieval["candidate_count"]),
+                str(retrieval["returned_neighbor_count"]),
+                str(retrieval["minimum_frame_separation"]),
+            ]
+            if expected_group_digest is not None:
+                request_digest_fields.extend(
+                    ["crossGroupV1", expected_group_digest.removeprefix("sha256:")]
+                )
+            expected_request_digest = receipt_digest(
+                request_digest_fields
+                + [image_names[query] for query in expected_queries]
+            )
+            if retrieval["request_digest"] != expected_request_digest:
+                raise EvidenceError("pair_list retrieval request digest is invalid")
+            raw_query_outcomes = retrieval["query_outcomes"]
+            if (
+                not isinstance(raw_query_outcomes, list)
+                or len(raw_query_outcomes) != len(expected_queries)
+            ):
+                raise EvidenceError("pair_list retrieval query outcomes are invalid")
+            query_outcomes: list[Mapping[str, Any]] = []
+            expected_directed_pairs: list[dict[str, int]] = []
+            seen_retrieval_edges: set[tuple[int, int]] = set()
+            for outcome_index, raw_outcome in enumerate(raw_query_outcomes):
+                outcome = _mapping(
+                    raw_outcome,
+                    (
+                        f"pair_list.attempts[{index}].retrieval."
+                        f"query_outcomes[{outcome_index}]"
+                    ),
+                )
+                _exact_keys(
+                    outcome,
+                    query_outcome_fields,
+                    (
+                        f"pair_list.attempts[{index}].retrieval."
+                        f"query_outcomes[{outcome_index}]"
+                    ),
+                )
+                query_view = outcome["query_view"]
+                neighbors = outcome["ranked_neighbor_views"]
+                if (
+                    query_view != expected_queries[outcome_index]
+                    or outcome["status"] not in {"ranked", "noRankedNeighbors"}
+                    or not isinstance(neighbors, list)
+                    or len(neighbors) != len(set(neighbors))
+                    or any(
+                        type(target) is not int
+                        or not 0 <= target < requested_scale
+                        or target == query_view
+                        for target in neighbors
+                    )
+                    or neighbors
+                    != sorted(neighbors, key=lambda target: image_names[target].encode("utf-8"))
+                    or (outcome["status"] == "ranked") != bool(neighbors)
+                ):
+                    raise EvidenceError("pair_list retrieval query outcome is invalid")
+                retained_neighbor_count = 0
+                for target_view in neighbors:
+                    if (
+                        requires_cross_clip_retrieval
+                        and clip_ids[query_view] == clip_ids[target_view]
+                    ):
+                        raise EvidenceError(
+                            "pair_list cross-clip retrieval retained a same-clip neighbor"
+                        )
+                    edge = (
+                        min(query_view, target_view),
+                        max(query_view, target_view),
+                    )
+                    if edge in attempt_local_edges:
+                        raise EvidenceError(
+                            "pair_list retrieval outcome contains an excluded base edge"
+                        )
+                    if abs(query_view - target_view) < distance_minimum:
+                        raise EvidenceError(
+                            "pair_list retrieval neighbor violates minimum separation"
+                        )
+                    retained_neighbor_count += 1
+                    if retained_neighbor_count > expected_neighbor_limit:
+                        raise EvidenceError(
+                            "pair_list retrieval retained too many neighbors"
+                        )
+                    if edge not in seen_retrieval_edges:
+                        seen_retrieval_edges.add(edge)
+                        expected_directed_pairs.append(
+                            {"query_view": query_view, "target_view": target_view}
+                        )
+                query_outcomes.append(outcome)
+            expected_directed_pairs.sort(
+                key=lambda pair: (
+                    f"{image_names[pair['query_view']]} "
+                    f"{image_names[pair['target_view']]}"
+                ).encode("utf-8")
+            )
+            expected_attempt_schedule_count += len(expected_directed_pairs)
+            raw_directed_pairs = retrieval["directed_pairs"]
+            if not isinstance(raw_directed_pairs, list):
+                raise EvidenceError("pair_list retrieval directed pairs are invalid")
+            directed_edges: set[tuple[int, int]] = set()
+            directed_lines: list[str] = []
+            for pair_index, raw_directed_pair in enumerate(raw_directed_pairs):
+                directed_pair = _mapping(
+                    raw_directed_pair,
+                    f"pair_list.attempts[{index}].retrieval.directed_pairs[{pair_index}]",
+                )
+                _exact_keys(
+                    directed_pair,
+                    directed_pair_fields,
+                    f"pair_list.attempts[{index}].retrieval.directed_pairs[{pair_index}]",
+                )
+                query_view = directed_pair["query_view"]
+                target_view = directed_pair["target_view"]
+                if (
+                    type(query_view) is not int
+                    or type(target_view) is not int
+                    or query_view not in expected_queries
+                    or not 0 <= target_view < requested_scale
+                    or query_view == target_view
+                    or (
+                        min(query_view, target_view),
+                        max(query_view, target_view),
+                    )
+                    in attempt_local_edges
+                    or abs(query_view - target_view) < distance_minimum
+                    or (
+                        requires_cross_clip_retrieval
+                        and clip_ids[query_view] == clip_ids[target_view]
+                    )
+                    or (query_view, target_view) in directed_edges
+                ):
+                    raise EvidenceError(
+                        "pair_list retrieval directed pair is invalid or duplicated"
+                    )
+                directed_edges.add((query_view, target_view))
+                directed_lines.append(
+                    f"{image_names[query_view]} {image_names[target_view]}"
+                )
+            if raw_directed_pairs != expected_directed_pairs:
+                raise EvidenceError(
+                    "pair_list retrieval directed pairs do not match ranked outcomes"
+                )
+            contract_header = [
+                (
+                    "EASYSPLAT_RETRIEVAL_OUTCOMES_V3"
+                    if expected_group_digest is not None
+                    else "EASYSPLAT_RETRIEVAL_OUTCOMES_V2"
+                ),
+                retrieval["engine"],
+                str(retrieval["query_stride"]),
+                str(retrieval["candidate_count"]),
+                str(retrieval["returned_neighbor_count"]),
+                str(retrieval["minimum_frame_separation"]),
+            ]
+            if expected_group_digest is not None:
+                contract_header.extend(
+                    ["crossGroupV1", expected_group_digest.removeprefix("sha256:")]
+                )
+            contract_header.extend(
+                [
+                    str(len(expected_queries)),
+                    expected_request_digest.removeprefix("sha256:"),
+                ]
+            )
+            contract_lines = [" ".join(contract_header)]
+            contract_lines.extend(
+                " ".join(
+                    [
+                        "Q",
+                        outcome["status"],
+                        image_names[outcome["query_view"]],
+                        str(len(outcome["ranked_neighbor_views"])),
+                        *(
+                            image_names[target]
+                            for target in outcome["ranked_neighbor_views"]
+                        ),
+                    ]
+                )
+                for outcome in query_outcomes
+            )
+            contract_lines.extend(f"P {line}" for line in directed_lines)
+            if retrieval["output_digest"] != receipt_digest(contract_lines):
+                raise EvidenceError("pair_list retrieval output digest is invalid")
+        if attempt["scheduled_pair_count"] != expected_attempt_schedule_count:
+            raise EvidenceError(
+                "pair_list attempt schedule count does not match its authenticated policy"
+            )
+        attempts.append(attempt)
+        exhaustive_attempts.append(uses_exhaustive)
+        local_edges_by_attempt.append(attempt_local_edges)
+
+    for index, attempt in enumerate(attempts[1:], start=1):
+        if attempt["matcher_used"] == "exact":
+            predecessor = attempts[index - 1]
+            current_retrieval = attempt["retrieval"]
+            previous_retrieval = predecessor["retrieval"]
+            retrieval_identity_matches = (
+                current_retrieval is None and previous_retrieval is None
+            ) or (
+                isinstance(current_retrieval, Mapping)
+                and isinstance(previous_retrieval, Mapping)
+                and {key: value for key, value in current_retrieval.items() if key != "executed"}
+                == {
+                    key: value
+                    for key, value in previous_retrieval.items()
+                    if key != "executed"
+                }
+                and previous_retrieval["executed"] is True
+                and current_retrieval["executed"] is False
+            )
+            if (
+                attempt["scheduled_pair_count"]
+                != predecessor["scheduled_pair_count"]
+                or not retrieval_identity_matches
+            ):
+                raise EvidenceError(
+                    "pair_list exact recovery changed its authenticated schedule"
+                )
+
+    normalized_attempts = [
+        {
+            "attemptNumber": attempt["attempt_number"],
+            "matcher": attempt["matcher_used"],
+            "exactRecoveryReason": attempt["exact_recovery_reason"],
+            "recoveryLevel": attempt["recovery_level"],
+            "outcome": attempt["outcome"],
+            "scheduledPairCount": attempt["scheduled_pair_count"],
+            "attemptedPairCount": attempt["attempted_pair_count"],
+            "rawMatchedPairCount": attempt["raw_matched_pair_count"],
+            "spatiallyVerifiedPairCount": attempt["spatially_verified_pair_count"],
+            "durationSeconds": 0.0,
+        }
+        for attempt in attempts
+    ]
+    _validate_matcher_recovery_history(
+        normalized_attempts,
+        total_view_count=requested_scale,
+        pairing_policy=(
+            "unorderedRetrieval"
+            if candidate_configuration["pairing_policy"] == "unordered_exhaustive"
+            else candidate_configuration["pairing_policy"]
+        ),
+        fallback_reason_count=len(fallback_reasons),
+    )
+
+    accepted_attempt = attempts[accepted_attempt_number - 1]
+    accepted_uses_exhaustive = exhaustive_attempts[accepted_attempt_number - 1]
+    accepted_local_edges = local_edges_by_attempt[accepted_attempt_number - 1]
+    if accepted_attempt["outcome"] != "completed":
+        raise EvidenceError("pair_list accepted attempt did not complete")
     raw_pairs = pair_list["pairs"]
     if not isinstance(raw_pairs, list) or not raw_pairs:
         raise EvidenceError("pair_list must contain scheduled pairs")
@@ -7525,10 +14511,16 @@ def _validate_pair_list(
     raw_matched_count = 0
     verified_count = 0
     adjacency = [set() for _ in range(requested_scale)]
-    retrieval_targets_by_query: dict[int, set[int]] = {}
-    verified_retrieval_by_query: dict[int, set[int]] = {}
-    topology = candidate_configuration["input_topology"]
-    distance_minimum = max(12, requested_scale // 10)
+    accepted_retrieval = accepted_attempt["retrieval"]
+    accepted_directed_edges = (
+        {
+            (pair["query_view"], pair["target_view"])
+            for pair in accepted_retrieval["directed_pairs"]
+        }
+        if isinstance(accepted_retrieval, Mapping)
+        else set()
+    )
+    observed_directed_edges: set[tuple[int, int]] = set()
     for index, raw_pair in enumerate(raw_pairs):
         pair = _mapping(raw_pair, f"pair_list.pairs[{index}]")
         pair_type = pair.get("pair_type")
@@ -7589,271 +14581,77 @@ def _validate_pair_list(
                     "pair_list retrieval vocabulary pair role does not match the resolved topology"
                 )
             if query_view not in edge:
-                raise EvidenceError("pair_list retrieval pair has an invalid query view")
-            if query_view % candidate_configuration["vocabulary_query_stride"] != 0:
-                raise EvidenceError("pair_list retrieval query violates the resolved stride")
-            if topology == "continuous" and view_b - view_a < distance_minimum:
+                raise EvidenceError(
+                    "pair_list retrieval pair has an invalid query view"
+                )
+            if not isinstance(accepted_retrieval, Mapping) or query_view not in set(
+                accepted_retrieval["query_views"]
+            ):
+                raise EvidenceError(
+                    "pair_list retrieval query violates the resolved stride"
+                )
+            if view_b - view_a < distance_minimum:
                 raise EvidenceError("pair_list retrieval neighbor is not distant")
             target_view = view_b if query_view == view_a else view_a
-            if pair["attempted"]:
-                retrieval_targets_by_query.setdefault(query_view, set()).add(target_view)
-            if pair["spatially_verified"]:
-                verified_retrieval_by_query.setdefault(query_view, set()).add(target_view)
+            if (
+                requires_cross_clip_retrieval
+                and clip_ids[query_view] == clip_ids[target_view]
+            ):
+                raise EvidenceError(
+                    "pair_list cross-clip retrieval pair stays inside one clip"
+                )
+            if not pair["attempted"]:
+                raise EvidenceError(
+                    "pair_list scheduled retrieval pair was not attempted"
+                )
+            observed_directed_edges.add((query_view, target_view))
         else:
             if (
-                topology != "unordered"
-                or candidate_configuration["pairing_policy"] != "unordered_exhaustive"
-                or candidate_configuration["vocabulary_candidate_count"] != 0
-                or candidate_configuration["vocabulary_verified_neighbor_count"] != 0
-                or requested_scale > 60
+                not accepted_uses_exhaustive
                 or query_view is not None
-                or pair["matcher_used"] != "faiss"
+                or pair["matcher_used"] != accepted_attempt["matcher_used"]
                 or not pair["attempted"]
-                or any(source_kind != "photo" for source_kind in source_kinds)
             ):
-                raise EvidenceError("pair_list exhaustive pair is invalid for the resolved route")
+                raise EvidenceError(
+                    "pair_list exhaustive pair is invalid for the resolved route"
+                )
             exhaustive_pairs.add(edge)
 
-    offsets = set(candidate_configuration["temporal_offsets"])
-    expected_local: set[tuple[int, int]] = set()
-    if topology == "continuous":
-        if len(set(clip_ids)) != 1:
-            raise EvidenceError("pair_list continuous input must use one clip")
-        expected_local = {
-            (view_a, view_b)
-            for view_a in range(requested_scale)
-            for view_b in range(view_a + 1, requested_scale)
-            if view_b - view_a in offsets
-        }
-    elif topology == "segmented_mixed":
-        views_by_clip: dict[str, list[int]] = {}
-        for view_index, clip_id in enumerate(clip_ids):
-            views_by_clip.setdefault(clip_id, []).append(view_index)
-        for clip_views in views_by_clip.values():
-            expected_local.update(
-                (clip_views[left], clip_views[right])
-                for left in range(len(clip_views))
-                for right in range(left + 1, len(clip_views))
-                if right - left in offsets
-            )
-    if local_pairs != expected_local:
-        raise EvidenceError("pair_list local edges do not match the resolved temporal policy")
+    if local_pairs != (set() if accepted_uses_exhaustive else accepted_local_edges):
+        raise EvidenceError(
+            "pair_list local edges do not match the resolved temporal policy"
+        )
     expected_exhaustive = (
         {
             (view_a, view_b)
             for view_a in range(requested_scale)
             for view_b in range(view_a + 1, requested_scale)
         }
-        if candidate_configuration["pairing_policy"] == "unordered_exhaustive"
+        if accepted_uses_exhaustive
         else set()
     )
     if exhaustive_pairs != expected_exhaustive:
-        raise EvidenceError("pair_list exhaustive edges do not form the exact all-pairs closure")
-
-    candidate_limit = candidate_configuration["vocabulary_candidate_count"]
-    neighbor_limit = candidate_configuration["vocabulary_verified_neighbor_count"]
-    configured_retrieval = candidate_limit > 0 and neighbor_limit > 0
-    if (candidate_limit > 0) != (neighbor_limit > 0):
-        raise EvidenceError("pair_list retrieval policy has inconsistent candidate and neighbor limits")
-
-    eligible_targets_by_query: dict[int, set[int]] = {}
-    if configured_retrieval:
-        stride = candidate_configuration["vocabulary_query_stride"]
-        for query_view in range(0, requested_scale, stride):
-            eligible_targets: set[int] = set()
-            for target_view in range(requested_scale):
-                if target_view == query_view:
-                    continue
-                edge = (min(query_view, target_view), max(query_view, target_view))
-                if edge in expected_local:
-                    continue
-                if topology == "continuous" and abs(target_view - query_view) < distance_minimum:
-                    continue
-                if topology == "segmented_mixed" and (
-                    clip_ids[target_view] == clip_ids[query_view]
-                    and source_kinds[target_view] == source_kinds[query_view] == "video"
-                ):
-                    continue
-                eligible_targets.add(target_view)
-            if eligible_targets:
-                eligible_targets_by_query[query_view] = eligible_targets
-
-    retrieval = _mapping(pair_list["retrieval"], "pair_list.retrieval")
-    _exact_keys(
-        retrieval,
-        {"eligible_query_count", "queries"},
-        "pair_list.retrieval",
-    )
-    eligible_query_count = retrieval["eligible_query_count"]
-    if type(eligible_query_count) is not int or eligible_query_count < 0:
-        raise EvidenceError("pair_list retrieval eligible query count is invalid")
-    if eligible_query_count != len(eligible_targets_by_query):
-        raise EvidenceError("pair_list retrieval eligible query count does not match policy")
-    raw_queries = retrieval["queries"]
-    if not isinstance(raw_queries, list) or len(raw_queries) != eligible_query_count:
-        raise EvidenceError("pair_list retrieval queries do not cover every eligible query")
-
-    query_fields = {
-        "query_view",
-        "eligible_target_count",
-        "attempted_candidate_count",
-        "attempted_targets",
-        "verified_retained_neighbors",
-        "retry_outcome",
-        "matcher_used",
-        "fallback_reason",
-    }
-    allowed_retry_outcomes = {
-        "not_needed",
-        "normal_faiss_exhausted",
-        "denser_faiss_retained",
-        "denser_faiss_exhausted",
-        "expanded_faiss_retained",
-        "expanded_faiss_exhausted",
-        "exhaustive_faiss_retained",
-        "exhaustive_faiss_exhausted",
-        "exact_recovery_retained",
-        "exact_recovery_exhausted",
-    }
-    observed_queries: list[int] = []
-    for index, raw_query in enumerate(raw_queries):
-        query = _mapping(raw_query, f"pair_list.retrieval.queries[{index}]")
-        _exact_keys(query, query_fields, f"pair_list.retrieval.queries[{index}]")
-        query_view = query["query_view"]
-        if type(query_view) is not int or query_view not in eligible_targets_by_query:
-            raise EvidenceError("pair_list retrieval query is not eligible under the resolved policy")
-        observed_queries.append(query_view)
-        eligible_targets = eligible_targets_by_query[query_view]
-        if query["eligible_target_count"] != len(eligible_targets):
-            raise EvidenceError("pair_list retrieval eligible target count is incorrect")
-        attempted_targets = query["attempted_targets"]
-        retained_neighbors = query["verified_retained_neighbors"]
-        for name, targets in (
-            ("attempted targets", attempted_targets),
-            ("verified retained neighbors", retained_neighbors),
-        ):
-            if (
-                not isinstance(targets, list)
-                or targets != sorted(targets)
-                or len(targets) != len(set(targets))
-                or any(type(target) is not int or target not in eligible_targets for target in targets)
-            ):
-                raise EvidenceError(f"pair_list retrieval {name} are invalid")
-        if (
-            type(query["attempted_candidate_count"]) is not int
-            or query["attempted_candidate_count"] != len(attempted_targets)
-            or not attempted_targets
-        ):
-            raise EvidenceError("pair_list retrieval attempted candidate count is invalid")
-        if not set(retained_neighbors).issubset(attempted_targets):
-            raise EvidenceError("pair_list retrieval retained neighbor was not attempted")
-        if set(attempted_targets) != retrieval_targets_by_query.get(query_view, set()):
-            raise EvidenceError("pair_list retrieval attempts do not match scheduled retrieval pairs")
-        if set(retained_neighbors) != verified_retrieval_by_query.get(query_view, set()):
-            raise EvidenceError("pair_list retrieval retained neighbors do not match verified pairs")
-
-        retry_outcome = query["retry_outcome"]
-        if retry_outcome not in allowed_retry_outcomes:
-            raise EvidenceError("pair_list retrieval retry outcome is invalid")
-        matcher_used = query["matcher_used"]
-        fallback_reason = query["fallback_reason"]
-        exact_recovery = retry_outcome.startswith("exact_recovery_")
-        if exact_recovery:
-            if matcher_used != "exact" or fallback_reason not in {
-                "faiss_crash",
-                "faiss_unsupported_operation",
-                "faiss_geometry_rejected_after_retries",
-            }:
-                raise EvidenceError(
-                    "pair_list retrieval exact matcher fallback reason is invalid"
-                )
-        elif retry_outcome == "not_needed":
-            if matcher_used != "faiss" or fallback_reason is not None:
-                raise EvidenceError("pair_list retrieval normal matcher outcome is invalid")
-        elif retry_outcome == "normal_faiss_exhausted":
-            if matcher_used != "faiss" or fallback_reason != "insufficient_verified_neighbors":
-                raise EvidenceError("pair_list retrieval normal exhausted outcome is invalid")
-        elif matcher_used != "faiss" or fallback_reason not in {
-            "verified_graph_disconnected",
-            "geometry_acceptance_failed",
-            "insufficient_verified_neighbors",
-        }:
-            raise EvidenceError("pair_list retrieval FAISS retry fallback reason is invalid")
-        normal_attempt_limit = min(candidate_limit, len(eligible_targets))
-        denser_attempt_limit = min(max(40, candidate_limit * 2), len(eligible_targets))
-        expanded_attempt_limit = min(80, len(eligible_targets))
-        query_attempted_count = len(attempted_targets)
-        if retry_outcome == "not_needed":
-            if query_attempted_count > normal_attempt_limit:
-                raise EvidenceError("pair_list retrieval normal attempt closure is incomplete")
-        elif retry_outcome == "normal_faiss_exhausted":
-            if (
-                query_attempted_count != normal_attempt_limit
-                or normal_attempt_limit != len(eligible_targets)
-            ):
-                raise EvidenceError("pair_list retrieval normal exhaustion is incomplete")
-        elif retry_outcome.startswith("denser_faiss_"):
-            if (
-                query_attempted_count <= normal_attempt_limit
-                or query_attempted_count > denser_attempt_limit
-            ):
-                raise EvidenceError("pair_list retrieval denser retry attempt count is invalid")
-            if (
-                retry_outcome.endswith("_exhausted")
-                and query_attempted_count != denser_attempt_limit
-            ):
-                raise EvidenceError("pair_list retrieval denser retry exhaustion is incomplete")
-        elif retry_outcome.startswith("expanded_faiss_"):
-            if (
-                requested_scale <= 250
-                or query_attempted_count <= denser_attempt_limit
-                or query_attempted_count > expanded_attempt_limit
-            ):
-                raise EvidenceError("pair_list retrieval expanded retry attempt count is invalid")
-            if (
-                retry_outcome.endswith("_exhausted")
-                and query_attempted_count != expanded_attempt_limit
-            ):
-                raise EvidenceError("pair_list retrieval expanded retry exhaustion is incomplete")
-        elif retry_outcome.startswith("exhaustive_faiss_"):
-            if requested_scale > 250 or query_attempted_count != len(eligible_targets):
-                raise EvidenceError("pair_list retrieval exhaustive fallback is incomplete")
-        else:
-            required_exact_closure = (
-                len(eligible_targets)
-                if requested_scale <= 250
-                else min(80, len(eligible_targets))
-            )
-            if query_attempted_count != required_exact_closure:
-                raise EvidenceError(
-                    "pair_list retrieval exact recovery lacks the preceding FAISS closure"
-                )
-
-        resolved_neighbor_limit = (
-            max(32, neighbor_limit * 4)
-            if retry_outcome.startswith("expanded_")
-            else max(16, neighbor_limit * 2)
-            if retry_outcome.startswith(("denser_", "exhaustive_", "exact_"))
-            else neighbor_limit
+        raise EvidenceError(
+            "pair_list exhaustive edges do not form the exact all-pairs closure"
         )
-        retained_target = min(resolved_neighbor_limit, len(eligible_targets))
-        successful_outcome = retry_outcome == "not_needed" or retry_outcome.endswith(
-            "_retained"
+
+    if observed_directed_edges != accepted_directed_edges:
+        raise EvidenceError(
+            "pair_list accepted retrieval output does not match scheduled pairs"
         )
-        if successful_outcome and len(retained_neighbors) != retained_target:
-            raise EvidenceError(
-                "pair_list retrieval retained neighbor target is incomplete"
-            )
-        if not successful_outcome and len(retained_neighbors) >= retained_target:
-            raise EvidenceError(
-                "pair_list retrieval exhausted outcome already satisfies its neighbor target"
-            )
-    if observed_queries != sorted(eligible_targets_by_query):
-        raise EvidenceError("pair_list retrieval queries do not use canonical complete order")
-    if not configured_retrieval and (
-        eligible_query_count != 0 or raw_queries or retrieval_targets_by_query
-    ):
-        raise EvidenceError("pair_list contains retrieval work when retrieval is disabled")
+    accepted_counts = [
+        accepted_attempt["scheduled_pair_count"],
+        accepted_attempt["attempted_pair_count"],
+        accepted_attempt["raw_matched_pair_count"],
+        accepted_attempt["spatially_verified_pair_count"],
+    ]
+    if accepted_counts != [
+        len(raw_pairs),
+        attempted_count,
+        raw_matched_count,
+        verified_count,
+    ]:
+        raise EvidenceError("pair_list accepted attempt count/list disagreement")
     if len(raw_pairs) != pipeline_metrics.get("scheduled_pairs"):
         raise EvidenceError("pair_list scheduled_pairs does not match pipeline metrics")
     derived_counts = {
@@ -7884,9 +14682,13 @@ def _validate_pair_list(
                     visited.add(neighbor)
                     stack.append(neighbor)
     if pipeline_metrics.get("connected_components") != connected_components:
-        raise EvidenceError("pair_list connected component count does not match pipeline metrics")
+        raise EvidenceError(
+            "pair_list connected component count does not match pipeline metrics"
+        )
     if pipeline_metrics.get("isolated_views") != isolated_views:
-        raise EvidenceError("pair_list isolated view count does not match pipeline metrics")
+        raise EvidenceError(
+            "pair_list isolated view count does not match pipeline metrics"
+        )
     for name, count in _biconnected_robustness(adjacency).items():
         if pipeline_metrics.get(name) != count:
             raise EvidenceError(f"pair_list {name} does not match pipeline metrics")
@@ -7907,6 +14709,8 @@ def derive_attestation(
     machine: Mapping[str, Any] | None = None,
     *,
     enforce_environment_policy: bool = True,
+    photo_permutation_gh_executable: Path | None = None,
+    expected_photo_permutation_gh_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Validate raw benchmark artifacts and derive an unsigned attestation."""
     request = validate_request(request)
@@ -7930,7 +14734,9 @@ def derive_attestation(
     observation_keys = set(common_observation_keys)
     scopes = set(request["gate_scopes"])
     if request["expected_outcome"]["kind"] == "valid":
-        observation_keys.update({"timing", "memory", "resolved_compute", "pipeline_metrics"})
+        observation_keys.update(
+            {"timing", "memory", "resolved_compute", "pipeline_metrics"}
+        )
     if lane == LANE_REFERENCE and request["expected_outcome"]["kind"] == "valid":
         if "scene_quality" in scopes:
             observation_keys.update({"registration", "residual_pixels", "pose"})
@@ -7940,6 +14746,26 @@ def derive_attestation(
             observation_keys.add("stability")
         if "toolchain" in scopes:
             observation_keys.add("toolchain_scenarios")
+    photo_permutation = observations.get("photo_permutation")
+    photo_permutation_receipt = observations.get("photo_permutation_execution_receipt")
+    if (photo_permutation is None) != (photo_permutation_receipt is None):
+        raise EvidenceError(
+            "photo permutation evidence and execution receipt must be supplied together"
+        )
+    if photo_permutation is not None:
+        if lane != LANE_REFERENCE or request["expected_outcome"]["kind"] != "valid":
+            raise EvidenceError(
+                "photo permutation evidence is restricted to the valid reference lane"
+            )
+        observation_keys.update(
+            {"photo_permutation", "photo_permutation_execution_receipt"}
+        )
+        validate_photo_permutation_group(
+            photo_permutation,
+            request,
+            formal_release=request["binding"]["profile"] == "release",
+            execution_receipt=photo_permutation_receipt,
+        )
     _exact_keys(observations, observation_keys, "observations")
     if observations["schema_version"] != 3:
         raise EvidenceError("observations.schema_version must be 3")
@@ -7986,6 +14812,8 @@ def derive_attestation(
         "stderr_log": "stderr.log",
         "output_ply": "splat.ply",
         "training_manifest": "training-manifest.json",
+        "training_split": "training-split.json",
+        "geometry_manifest": "geometry-manifest.json",
         "pair_list": "pair-list.json",
         "selection_manifest": "selection-manifest.json",
         "ground_truth_poses": "ground-truth-poses.json",
@@ -7993,6 +14821,16 @@ def derive_attestation(
         "accurate_rendering_reference": "accurate-rendering-reference.json",
         "ground_truth_preparation": "ground-truth-preparation.json",
         "paired_baseline_rendering_reference": "paired-baseline-rendering-reference.json",
+        "photo_permutation_execution_receipt": (
+            "photo-permutation-execution-receipt.json"
+        ),
+        "photo_permutation_attestation_bundle": ("photo-permutation-attestation.jsonl"),
+        "photo_permutation_source_authorization": (
+            "photo-permutation-source-authorization.json"
+        ),
+        "photo_permutation_source_authorization_attestation_bundle": (
+            "photo-permutation-source-authorization-attestation.jsonl"
+        ),
         "orientation_label": "orientation-label.json",
         "orientation_metrics": "orientation-metrics.json",
         "orientation_supervisor": "orientation-supervisor.json",
@@ -8011,11 +14849,19 @@ def derive_attestation(
     for name, raw_path in raw_artifacts.items():
         _token(name, f"observations.artifacts.{name}")
         if not isinstance(raw_path, str):
-            raise EvidenceError(f"observations.artifacts.{name} must be a relative path")
+            raise EvidenceError(
+                f"observations.artifacts.{name} must be a relative path"
+            )
         relative = PurePosixPath(raw_path)
-        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts) or "\\" in raw_path:
+        if (
+            relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or "\\" in raw_path
+        ):
             raise EvidenceError(f"unsafe artifact path: {raw_path}")
-        descriptors[name] = _artifact_descriptor(artifact_root / Path(*relative.parts), artifact_root)
+        descriptors[name] = _artifact_descriptor(
+            artifact_root / Path(*relative.parts), artifact_root
+        )
 
     observation_path = artifact_root / "observations.json"
     if observation_path.is_symlink() or not observation_path.is_file():
@@ -8033,7 +14879,16 @@ def derive_attestation(
         "observations",
     }
     if request["expected_outcome"]["kind"] == "valid":
-        required.update({"output_ply", "training_manifest"})
+        required.update({"output_ply", "training_manifest", "selection_manifest"})
+    if photo_permutation is not None:
+        required.update(
+            {
+                "photo_permutation_execution_receipt",
+                "photo_permutation_attestation_bundle",
+                "photo_permutation_source_authorization",
+                "photo_permutation_source_authorization_attestation_bundle",
+            }
+        )
     if lane == LANE_REFERENCE and "toolchain" in scopes:
         required.update(
             {
@@ -8045,7 +14900,6 @@ def derive_attestation(
             }
         )
     reference_descriptor_fields = {
-        "selection_manifest": "selection_manifest_sha256",
         "ground_truth_poses": "ground_truth_poses_sha256",
         "accurate_colmap_model": "accurate_colmap_model_sha256",
         "accurate_rendering_reference": "accurate_rendering_reference_sha256",
@@ -8069,9 +14923,63 @@ def derive_attestation(
         )
     missing = required - set(descriptors)
     if missing:
-        raise EvidenceError("missing required evidence artifacts: " + ", ".join(sorted(missing)))
+        raise EvidenceError(
+            "missing required evidence artifacts: " + ", ".join(sorted(missing))
+        )
     if request["expected_outcome"]["kind"] == "invalid" and "output_ply" in descriptors:
         raise EvidenceError("invalid evidence must not publish output_ply")
+    photo_permutation_source_authorization: dict[str, Any] | None = None
+    photo_permutation_supervisor_provenance: dict[str, Any] | None = None
+    if photo_permutation is not None:
+        source_authorization_descriptor = descriptors[
+            "photo_permutation_source_authorization"
+        ]
+        photo_permutation_source_authorization = (
+            validate_photo_permutation_source_authorization(
+                _load_bounded_json(
+                    artifact_root / source_authorization_descriptor["path"],
+                    "photo permutation source authorization",
+                    maximum_bytes=MAX_ATTESTATION_BYTES,
+                ),
+                photo_permutation_receipt,
+                request,
+            )
+        )
+        photo_permutation_supervisor_provenance = (
+            verify_photo_permutation_github_attestations(
+                photo_permutation_receipt,
+                artifact_root
+                / descriptors["photo_permutation_execution_receipt"]["path"],
+                artifact_root
+                / descriptors["photo_permutation_attestation_bundle"]["path"],
+                photo_permutation_source_authorization,
+                artifact_root
+                / descriptors["photo_permutation_source_authorization"]["path"],
+                artifact_root
+                / descriptors[
+                    "photo_permutation_source_authorization_attestation_bundle"
+                ]["path"],
+                request,
+                gh_executable=photo_permutation_gh_executable,
+                expected_gh_sha256=expected_photo_permutation_gh_sha256,
+            )
+        )
+    selection_sources: SelectionManifestSources | None = None
+    if request["expected_outcome"]["kind"] == "valid":
+        selection_descriptor = descriptors["selection_manifest"]
+        if (
+            selection_descriptor["sha256"]
+            != request["reference_artifacts"]["selection_manifest_sha256"]
+        ):
+            raise EvidenceError(
+                "selection_manifest does not match the pinned reference artifact digest"
+            )
+        selection_sources = _validate_selection_manifest_sources(
+            artifact_root / selection_descriptor["path"],
+            requested_scale=request["binding"]["scale"],
+            input_kind=request["input_kind"],
+            expected_video_source_count=request["video_source_count"],
+        )
     toolchain_package_sizes: dict[str, int] | None = None
     if lane == LANE_REFERENCE and "toolchain" in scopes:
         toolchain_package_sizes = _validate_toolchain_package_evidence(
@@ -8089,13 +14997,66 @@ def derive_attestation(
     protected_pair_list_digest: str | None = None
     if lane == LANE_REFERENCE and "scene_quality" in scopes:
         for artifact_name, request_field in reference_descriptor_fields.items():
-            if descriptors[artifact_name]["sha256"] != request["reference_artifacts"][request_field]:
+            if (
+                descriptors[artifact_name]["sha256"]
+                != request["reference_artifacts"][request_field]
+            ):
                 raise EvidenceError(
                     f"{artifact_name} does not match the pinned reference artifact digest"
                 )
         _validate_orientation_label(
             artifact_root / descriptors["orientation_label"]["path"]
         )
+        assert selection_sources is not None
+        protected_pair_list_digest = _validate_pair_list(
+            artifact_root / descriptors["pair_list"]["path"],
+            request["binding"]["scale"],
+            selection_sources,
+            request["candidate_run_configuration"],
+            _mapping(
+                observations.get("pipeline_metrics"), "observations.pipeline_metrics"
+            ),
+            requires_cross_clip_retrieval=_requires_cross_clip_retrieval(
+                request,
+                request["candidate_run_configuration"],
+            ),
+        )
+    actual = _validate_actual(
+        observations.get("actual"),
+        request["expected_outcome"],
+    )
+    if request["expected_outcome"]["kind"] == "valid":
+        _timing_metrics(
+            _mapping(observations.get("timing"), "observations.timing"),
+            lane,
+            scopes,
+        )
+    commands = observations.get("commands")
+    _validate_execution_receipts(
+        commands,
+        artifact_root / descriptors["command_log"]["path"],
+        artifact_root,
+        descriptors,
+        request,
+        runner_identity,
+        (
+            _mapping(observations.get("timing"), "observations.timing")
+            if request["expected_outcome"]["kind"] == "valid"
+            else None
+        ),
+        actual,
+        descriptors.get("output_ply", {}).get("sha256"),
+        (
+            _mapping(
+                observations.get("pipeline_metrics"), "observations.pipeline_metrics"
+            )
+            if request["expected_outcome"]["kind"] == "valid"
+            else None
+        ),
+        protected_pair_list_digest,
+        selection_sources,
+    )
+    if lane == LANE_REFERENCE and "scene_quality" in scopes:
         orientation_descriptors = _validate_orientation_supervisor(
             artifact_root / descriptors["orientation_supervisor"]["path"],
             artifact_root / descriptors["orientation_metrics"]["path"],
@@ -8107,19 +15068,15 @@ def derive_attestation(
         for name, descriptor in orientation_descriptors.items():
             existing = descriptors.get(name)
             if existing is not None and existing != descriptor:
-                raise EvidenceError(f"orientation artifact descriptor conflicts with {name}")
+                raise EvidenceError(
+                    f"orientation artifact descriptor conflicts with {name}"
+                )
             descriptors[name] = descriptor
-        protected_pair_list_digest = _validate_pair_list(
-            artifact_root / descriptors["pair_list"]["path"],
-            artifact_root / descriptors["selection_manifest"]["path"],
-            request["binding"]["scale"],
-            request["candidate_run_configuration"],
-            _mapping(observations.get("pipeline_metrics"), "observations.pipeline_metrics"),
-        )
         rendering_evidence = validate_and_score_rendering(
             artifact_root=artifact_root,
             manifest_path=artifact_root / descriptors["rendering_manifest"]["path"],
-            reference_path=artifact_root / descriptors["accurate_rendering_reference"]["path"],
+            reference_path=artifact_root
+            / descriptors["accurate_rendering_reference"]["path"],
             preparation_path=artifact_root
             / descriptors["ground_truth_preparation"]["path"],
             request=request,
@@ -8138,7 +15095,9 @@ def derive_attestation(
         for name, descriptor in rendering_evidence.artifacts.items():
             existing = descriptors.get(name)
             if existing is not None and existing != descriptor:
-                raise EvidenceError(f"rendering artifact descriptor conflicts with {name}")
+                raise EvidenceError(
+                    f"rendering artifact descriptor conflicts with {name}"
+                )
             descriptors[name] = descriptor
     output_splat_count: int | None = None
     if "output_ply" in descriptors:
@@ -8148,19 +15107,27 @@ def derive_attestation(
             artifact_root / descriptors["training_manifest"]["path"],
             descriptors["output_ply"],
             output_splat_count,
-            _mapping(observations.get("pipeline_metrics"), "observations.pipeline_metrics"),
+            _mapping(
+                observations.get("pipeline_metrics"), "observations.pipeline_metrics"
+            ),
             request["candidate_run_configuration"],
             _published_training_duration(
                 observations.get("commands"),
                 _mapping(observations.get("timing"), "observations.timing"),
             ),
+            training_split_path=(
+                artifact_root / descriptors["training_split"]["path"]
+                if "training_split" in descriptors
+                else None
+            ),
+            training_split_descriptor=descriptors.get("training_split"),
+            geometry_manifest_descriptor=descriptors.get("geometry_manifest"),
+            request=request,
         )
 
-    actual = _validate_actual(
-        observations.get("actual"),
-        request["expected_outcome"],
-    )
-    artifact_sizes = {name: descriptor["bytes"] for name, descriptor in descriptors.items()}
+    artifact_sizes = {
+        name: descriptor["bytes"] for name, descriptor in descriptors.items()
+    }
     if toolchain_package_sizes is not None:
         artifact_sizes.update(toolchain_package_sizes)
     metrics = derive_metrics(
@@ -8179,28 +15146,6 @@ def derive_attestation(
         ),
         request_binding=request["binding"],
         rendering_evidence=rendering_evidence,
-    )
-    commands = observations.get("commands")
-    _validate_execution_receipts(
-        commands,
-        artifact_root / descriptors["command_log"]["path"],
-        artifact_root,
-        descriptors,
-        request,
-        runner_identity,
-        (
-            _mapping(observations.get("timing"), "observations.timing")
-            if request["expected_outcome"]["kind"] == "valid"
-            else None
-        ),
-        actual,
-        descriptors.get("output_ply", {}).get("sha256"),
-        (
-            _mapping(observations.get("pipeline_metrics"), "observations.pipeline_metrics")
-            if request["expected_outcome"]["kind"] == "valid"
-            else None
-        ),
-        protected_pair_list_digest,
     )
     _validate_supervisor_run(
         artifact_root / descriptors["supervisor_run"]["path"],
@@ -8223,7 +15168,9 @@ def derive_attestation(
     producer_path = Path(__file__).resolve()
     root = producer_path.parents[2]
     if producer_path != root / PRODUCER_RELATIVE_PATH:
-        raise EvidenceError("protected producer is not running from the repository path")
+        raise EvidenceError(
+            "protected producer is not running from the repository path"
+        )
     unsigned = {
         "schema_version": ATTESTATION_SCHEMA_VERSION,
         "binding": dict(request["binding"]),
@@ -8259,6 +15206,15 @@ def derive_attestation(
         "metrics": metrics,
         "artifacts": descriptors,
     }
+    if photo_permutation is not None:
+        unsigned["photo_permutation"] = photo_permutation
+        unsigned["photo_permutation_execution_receipt"] = photo_permutation_receipt
+        unsigned["photo_permutation_source_authorization"] = (
+            photo_permutation_source_authorization
+        )
+        unsigned["photo_permutation_supervisor_provenance"] = (
+            photo_permutation_supervisor_provenance
+        )
     return unsigned
 
 
@@ -8289,6 +15245,9 @@ def validate_prepared_attestation_file(
     expected_request: Mapping[str, Any],
     expected_lane: str,
     expected_measurement_runner: Mapping[str, Any],
+    *,
+    photo_permutation_gh_executable: Path | None = None,
+    expected_photo_permutation_gh_sha256: str | None = None,
 ) -> Mapping[str, Any]:
     try:
         metadata = attestation_path.lstat()
@@ -8308,36 +15267,50 @@ def validate_prepared_attestation_file(
         maximum_bytes=MAX_ATTESTATION_BYTES,
     )
     attestation = _mapping(value, "attestation")
-    _exact_keys(
-        attestation,
-        {
-            "schema_version",
-            "binding",
-            "baseline_run_configuration",
-            "candidate_run_configuration",
-            "category",
-            "capture_traits",
-            "holdout_indices",
-            "reference_artifacts",
-            "timing_basis",
-            "expected_outcome",
-            "input_kind",
-            "video_source_count",
-            "gate_scopes",
-            "rendering_driver_identity",
-            "scoring_runtime",
-            "lane",
-            "machine",
-            "producer",
-            "measurement_runner",
-            "commands",
-            "resolved_compute",
-            "actual",
-            "metrics",
-            "artifacts",
-        },
-        "attestation",
-    )
+    attestation_fields = {
+        "schema_version",
+        "binding",
+        "baseline_run_configuration",
+        "candidate_run_configuration",
+        "category",
+        "capture_traits",
+        "holdout_indices",
+        "reference_artifacts",
+        "timing_basis",
+        "expected_outcome",
+        "input_kind",
+        "video_source_count",
+        "gate_scopes",
+        "rendering_driver_identity",
+        "scoring_runtime",
+        "lane",
+        "machine",
+        "producer",
+        "measurement_runner",
+        "commands",
+        "resolved_compute",
+        "actual",
+        "metrics",
+        "artifacts",
+    }
+    if "photo_permutation" in attestation:
+        attestation_fields.update(
+            {
+                "photo_permutation",
+                "photo_permutation_execution_receipt",
+                "photo_permutation_source_authorization",
+                "photo_permutation_supervisor_provenance",
+            }
+        )
+    elif {
+        "photo_permutation_execution_receipt",
+        "photo_permutation_source_authorization",
+        "photo_permutation_supervisor_provenance",
+    } & set(attestation):
+        raise EvidenceError(
+            "photo permutation execution proof has no permutation evidence"
+        )
+    _exact_keys(attestation, attestation_fields, "attestation")
     if (
         attestation["schema_version"] != ATTESTATION_SCHEMA_VERSION
         or attestation["lane"] != expected_lane
@@ -8377,21 +15350,63 @@ def validate_prepared_attestation_file(
             request["candidate_run_configuration"],
         )
     elif attestation["resolved_compute"] != {"status": "not_applicable"}:
-        raise EvidenceError("invalid evidence must mark resolved compute not_applicable")
+        raise EvidenceError(
+            "invalid evidence must mark resolved compute not_applicable"
+        )
+    if "photo_permutation" in attestation:
+        if (
+            expected_lane != LANE_REFERENCE
+            or request["expected_outcome"]["kind"] != "valid"
+        ):
+            raise EvidenceError(
+                "prepared photo permutation evidence is restricted to the valid reference lane"
+            )
+        validate_photo_permutation_group(
+            attestation["photo_permutation"],
+            request,
+            formal_release=request["binding"]["profile"] == "release",
+            execution_receipt=attestation["photo_permutation_execution_receipt"],
+        )
+        validated_source_authorization = (
+            validate_photo_permutation_source_authorization(
+                attestation["photo_permutation_source_authorization"],
+                attestation["photo_permutation_execution_receipt"],
+                request,
+            )
+        )
+        validate_photo_permutation_supervisor_provenance(
+            attestation["photo_permutation_supervisor_provenance"],
+            attestation["photo_permutation_execution_receipt"],
+            request,
+            validated_source_authorization,
+        )
 
     producer = _mapping(attestation["producer"], "attestation.producer")
-    _exact_keys(producer, {"protocol_version", "version", "executable", "sha256"}, "attestation.producer")
-    if producer["protocol_version"] != PROTOCOL_VERSION or producer["version"] != PRODUCER_VERSION:
+    _exact_keys(
+        producer,
+        {"protocol_version", "version", "executable", "sha256"},
+        "attestation.producer",
+    )
+    if (
+        producer["protocol_version"] != PROTOCOL_VERSION
+        or producer["version"] != PRODUCER_VERSION
+    ):
         raise EvidenceError("attestation producer version is not supported")
     if producer["executable"] != PRODUCER_RELATIVE_PATH:
         raise EvidenceError("attestation was not made by the protected producer")
     producer_path = Path(__file__).resolve()
     if producer["sha256"] != sha256_file(producer_path):
         raise EvidenceError("attestation producer digest does not match this checkout")
-    expected_runner = validate_runner_identity(expected_measurement_runner, expected_lane)
-    actual_runner = validate_runner_identity(attestation["measurement_runner"], expected_lane)
+    expected_runner = validate_runner_identity(
+        expected_measurement_runner, expected_lane
+    )
+    actual_runner = validate_runner_identity(
+        attestation["measurement_runner"], expected_lane
+    )
     if actual_runner != expected_runner:
-        raise EvidenceError("attestation measurement runner does not match the approved request index")
+        raise EvidenceError(
+            "attestation measurement runner does not match the approved request index"
+        )
 
     machine = _mapping(attestation["machine"], "attestation.machine")
     validate_machine_lane(machine, expected_lane)
@@ -8400,27 +15415,80 @@ def validate_prepared_attestation_file(
     for name, raw_descriptor in artifacts.items():
         _token(name, f"attestation.artifacts.{name}")
         descriptor = _mapping(raw_descriptor, f"attestation.artifacts.{name}")
-        _exact_keys(descriptor, {"path", "sha256", "bytes"}, f"attestation.artifacts.{name}")
+        _exact_keys(
+            descriptor, {"path", "sha256", "bytes"}, f"attestation.artifacts.{name}"
+        )
         raw_path = descriptor["path"]
         if not isinstance(raw_path, str):
             raise EvidenceError("artifact path must be relative")
         relative = PurePosixPath(raw_path)
-        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts) or "\\" in raw_path:
+        if (
+            relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or "\\" in raw_path
+        ):
             raise EvidenceError(f"unsafe attestation artifact path: {raw_path}")
         path = attestation_path.parent / Path(*relative.parts)
         try:
             resolved = path.resolve(strict=True)
         except OSError as error:
-            raise EvidenceError(f"attestation artifact is missing: {raw_path}") from error
+            raise EvidenceError(
+                f"attestation artifact is missing: {raw_path}"
+            ) from error
         if resolved.parent != root and root not in resolved.parents:
             raise EvidenceError(f"attestation artifact escapes its root: {raw_path}")
         if path.is_symlink() or not path.is_file():
-            raise EvidenceError(f"attestation artifact must be a regular file: {raw_path}")
-        if type(descriptor["bytes"]) is not int or descriptor["bytes"] != path.stat().st_size:
+            raise EvidenceError(
+                f"attestation artifact must be a regular file: {raw_path}"
+            )
+        if (
+            type(descriptor["bytes"]) is not int
+            or descriptor["bytes"] != path.stat().st_size
+        ):
             raise EvidenceError(f"attestation artifact size mismatch: {raw_path}")
         _digest(descriptor["sha256"], f"attestation.artifacts.{name}.sha256")
         if descriptor["sha256"] != sha256_file(path):
             raise EvidenceError(f"attestation artifact digest mismatch: {raw_path}")
+    if "photo_permutation" in attestation:
+        try:
+            receipt_descriptor = _mapping(
+                artifacts["photo_permutation_execution_receipt"],
+                "attestation photo permutation execution receipt descriptor",
+            )
+            bundle_descriptor = _mapping(
+                artifacts["photo_permutation_attestation_bundle"],
+                "attestation photo permutation bundle descriptor",
+            )
+            source_authorization_descriptor = _mapping(
+                artifacts["photo_permutation_source_authorization"],
+                "attestation photo permutation source authorization descriptor",
+            )
+            source_authorization_bundle_descriptor = _mapping(
+                artifacts["photo_permutation_source_authorization_attestation_bundle"],
+                "attestation photo permutation source authorization bundle descriptor",
+            )
+        except KeyError as error:
+            raise EvidenceError(
+                "attestation is missing photo permutation trust artifacts"
+            ) from error
+        verified_provenance = verify_photo_permutation_github_attestations(
+            attestation["photo_permutation_execution_receipt"],
+            attestation_path.parent / receipt_descriptor["path"],
+            attestation_path.parent / bundle_descriptor["path"],
+            attestation["photo_permutation_source_authorization"],
+            attestation_path.parent / source_authorization_descriptor["path"],
+            attestation_path.parent / source_authorization_bundle_descriptor["path"],
+            request,
+            gh_executable=photo_permutation_gh_executable,
+            expected_gh_sha256=expected_photo_permutation_gh_sha256,
+        )
+        if (
+            verified_provenance
+            != attestation["photo_permutation_supervisor_provenance"]
+        ):
+            raise EvidenceError(
+                "photo permutation supervisor provenance changed after preparation"
+            )
     output_descriptor = artifacts.get("output_ply")
     _validate_prepared_execution_receipts(
         attestation["commands"],

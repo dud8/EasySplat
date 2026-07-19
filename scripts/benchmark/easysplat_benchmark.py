@@ -113,7 +113,8 @@ ALLOWED_GATE_SCOPES = {
 }
 ALLOWED_SCALE_LANES = {30, 120, 250, 500, 3_000}
 ALLOWED_ADAPTERS = {"fixture", "protected-evidence"}
-APP_VERSION = "0.2.0-beta.1"
+APP_VERSION = "0.2.0"
+REQUEST_INDEX_SCHEMA_VERSION = 3
 APPROVED_PAIRED_BASELINE = {
     "git_commit": "4f3c11735ad15e1318ee2043ce351e185c225d30",
     "toolchain_identity": "sha256:bd32d5868c5cb6a06a2ae5822d87753f08daf050ea7299c9e373c174be49116b",
@@ -153,7 +154,7 @@ APPROVED_PAIRED_BASELINE = {
 }
 MAX_TOOLCHAIN_INSTALL_STATE_BYTES = 16 * 1024 * 1024
 PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = ROOT / "EasySplatApp/Resources/public_key_ed25519.txt"
-PUBLIC_BETA_TOOLCHAIN_COMPONENTS = frozenset(
+RELEASE_TOOLCHAIN_COMPONENTS = frozenset(
     {"macos-arm64-core", "geometry-da3-base", "geometry-da3-small"}
 )
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -619,7 +620,7 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
 
         input_info = _require_mapping(scene["input"], f"{label}.input")
         _require_exact_keys(input_info, {"kind", "media_path", "supplied"}, f"{label}.input")
-        if input_info["kind"] not in {"video", "photos", "mixed"}:
+        if input_info["kind"] not in {"video", "multi_video", "photos", "mixed"}:
             raise ConfigError(f"{label}.input.kind is unsupported")
         _safe_relative_path(input_info["media_path"], "media path")
         if not isinstance(input_info["supplied"], bool):
@@ -736,8 +737,12 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
                 _require_exact_keys(
                     pinned,
                     digest_fields
-                    | {"orientation_expected_status", "selected_frames_digests"},
+                    | {"artifact_path", "orientation_expected_status", "selected_frames_digests"},
                     f"{label}.reference.{scale}",
+                )
+                _safe_relative_path(
+                    pinned["artifact_path"],
+                    f"{label}.reference.{scale}.artifact_path",
                 )
                 for field in digest_fields:
                     if not isinstance(pinned[field], str) or not SHA256_PATTERN.fullmatch(pinned[field]):
@@ -1222,6 +1227,12 @@ def collect_machine_metadata(
         platform_data = {
             "macos_version": command_runner(["/usr/bin/sw_vers", "-productVersion"]),
             "macos_build": command_runner(["/usr/bin/sw_vers", "-buildVersion"]),
+            "macos_sdk_version": command_runner(
+                ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version"]
+            ),
+            "macos_sdk_build": command_runner(
+                ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-build-version"]
+            ),
             "hardware_model": _sysctl_value("hw.model"),
             "chip": _sysctl_value("machdep.cpu.brand_string"),
             "logical_cpus": integer_sysctl("hw.logicalcpu"),
@@ -1231,6 +1242,8 @@ def collect_machine_metadata(
     allowed = {
         "macos_version",
         "macos_build",
+        "macos_sdk_version",
+        "macos_sdk_build",
         "hardware_model",
         "chip",
         "logical_cpus",
@@ -1240,7 +1253,15 @@ def collect_machine_metadata(
     metadata = {key: platform_data.get(key) for key in sorted(allowed)}
     metadata["architecture"] = platform.machine()
     metadata["xcode_version"] = command_runner(["/usr/bin/xcodebuild", "-version"])
-    metadata["swift_version"] = command_runner(["/usr/bin/xcrun", "swift", "--version"])
+    metadata["swift_version"] = command_runner(
+        ["/usr/bin/xcrun", "swift", "--version"]
+    ).splitlines()[0]
+    metadata["clang_version"] = command_runner(
+        ["/usr/bin/xcrun", "clang", "--version"]
+    ).splitlines()[0]
+    metadata["metal_version"] = command_runner(
+        ["/usr/bin/xcrun", "metal", "--version"]
+    ).splitlines()[0]
     return metadata
 
 
@@ -1417,8 +1438,8 @@ def _video_source_count(path: Path, input_kind: str) -> int:
         if path.is_symlink() or not path.is_file():
             raise ConfigError("video benchmark input must be one regular file")
         return 1
-    if input_kind != "mixed" or path.is_symlink() or not path.is_dir():
-        raise ConfigError("mixed benchmark input must be a real directory")
+    if input_kind not in {"multi_video", "mixed"} or path.is_symlink() or not path.is_dir():
+        raise ConfigError("multi-source benchmark input must be a real directory")
     video_extensions = {
         ".3gp",
         ".avi",
@@ -1438,8 +1459,11 @@ def _video_source_count(path: Path, input_kind: str) -> int:
             raise ConfigError("benchmark input tree must not contain symlinks")
         if candidate.is_file() and candidate.suffix.lower() in video_extensions:
             count += 1
-    if count == 0:
-        raise ConfigError("mixed benchmark input contains no supported video files")
+    minimum_count = 2 if input_kind == "multi_video" else 1
+    if count < minimum_count:
+        raise ConfigError(
+            f"{input_kind} benchmark input contains fewer than {minimum_count} supported video files"
+        )
     return count
 
 
@@ -1726,6 +1750,7 @@ def _validated_toolchain_closure(
             "sha256",
             "sizeBytes",
             "expandedSizeBytes",
+            "expandedClosureSHA256",
             "contents",
             "criticalFileHashes",
             "dependencies",
@@ -1734,6 +1759,7 @@ def _validated_toolchain_closure(
         name = component.get("name")
         capabilities = component.get("capabilities")
         digest = component.get("sha256")
+        expanded_closure_digest = component.get("expandedClosureSHA256")
         critical_hashes = component.get("criticalFileHashes")
         contents = component.get("contents")
         dependencies = component.get("dependencies")
@@ -1748,6 +1774,8 @@ def _validated_toolchain_closure(
             or not all(isinstance(value, str) and SAFE_TOKEN_PATTERN.fullmatch(value) for value in capabilities)
             or not isinstance(digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(expanded_closure_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expanded_closure_digest) is None
             or not isinstance(critical_hashes, dict)
             or not critical_hashes
             or not isinstance(contents, list)
@@ -1825,6 +1853,7 @@ def _validated_toolchain_closure(
                     "sha256",
                     "sizeBytes",
                     "expandedSizeBytes",
+                    "expandedClosureSHA256",
                     "contents",
                     "criticalFileHashes",
                     "dependencies",
@@ -1918,13 +1947,13 @@ def resolved_toolchain_identity(
     return evidence.toolchain_identity_from_closure(closure)
 
 
-def resolved_public_beta_toolchain_identity(
+def resolved_release_toolchain_identity(
     toolchain_root: Path,
     *,
     public_key_base64: str | None = None,
 ) -> str:
     if not toolchain_root.is_dir() or toolchain_root.is_symlink():
-        raise ConfigError("public-beta toolchain root is unavailable or unsafe")
+        raise ConfigError("release toolchain root is unavailable or unsafe")
     if public_key_base64 is None:
         try:
             public_key_base64 = PINNED_TOOLCHAIN_PUBLIC_KEY_PATH.read_text(
@@ -1934,15 +1963,15 @@ def resolved_public_beta_toolchain_identity(
             raise ConfigError("pinned toolchain public key is unavailable") from error
     closure = _validated_toolchain_closure(toolchain_root, public_key_base64)
     if closure is None:
-        raise ConfigError("public-beta toolchain install state is unavailable")
+        raise ConfigError("release toolchain install state is unavailable")
     manifest_names = {component["name"] for component in closure["components"]}
     installed_names = set(closure["installed_artifacts"])
     if (
-        manifest_names != PUBLIC_BETA_TOOLCHAIN_COMPONENTS
-        or installed_names != PUBLIC_BETA_TOOLCHAIN_COMPONENTS
+        manifest_names != RELEASE_TOOLCHAIN_COMPONENTS
+        or installed_names != RELEASE_TOOLCHAIN_COMPONENTS
     ):
         raise ConfigError(
-            "public-beta component closure must install exactly core, DA3 Base, and DA3 Small"
+            "release component closure must install exactly core, DA3 Base, and DA3 Small"
         )
     return evidence.toolchain_identity_from_closure(closure)
 
@@ -2090,7 +2119,7 @@ def validate_request_index(
         "request index",
     )
     expected = {
-        "schema_version": 2,
+        "schema_version": REQUEST_INDEX_SCHEMA_VERSION,
         "producer_protocol": evidence.PROTOCOL_VERSION,
         "producer_version": evidence.PRODUCER_VERSION,
         "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),
@@ -2138,6 +2167,7 @@ def validate_request_index(
                 "request",
                 "media_path",
                 "evidence_path",
+                "reference_artifact_path",
                 "producer_command",
             },
             label,
@@ -2161,6 +2191,13 @@ def validate_request_index(
             raise ConfigError(f"{label}.media_path does not match the corpus")
         if entry["evidence_path"] != scene["adapter"]["evidence_path"]:
             raise ConfigError(f"{label}.evidence_path does not match the corpus")
+        expected_reference_path = (
+            scene["reference"]["by_scale"][str(scale)]["artifact_path"]
+            if scene["reference"]["status"] == "pinned"
+            else None
+        )
+        if entry["reference_artifact_path"] != expected_reference_path:
+            raise ConfigError(f"{label}.reference_artifact_path does not match the corpus")
         if not isinstance(entry["producer_command"], list) or not entry["producer_command"]:
             raise ConfigError(f"{label}.producer_command is invalid")
         for argument in entry["producer_command"]:
@@ -2354,10 +2391,14 @@ def validate_suite_result(result: Any) -> None:
     machine_keys = {
         "architecture",
         "chip",
+        "clang_version",
         "hardware_model",
         "logical_cpus",
         "macos_build",
         "macos_version",
+        "macos_sdk_build",
+        "macos_sdk_version",
+        "metal_version",
         "physical_cpus",
         "physical_memory_bytes",
         "swift_version",
@@ -2417,7 +2458,7 @@ def validate_suite_result(result: Any) -> None:
             raise ConfigError(f"{label}.aggregate_scale is invalid")
         if scene["adapter"] not in ALLOWED_ADAPTERS or scene["status"] not in {"passed", "failed", "blocked"}:
             raise ConfigError(f"{label} adapter or status is invalid")
-        if scene["input_kind"] not in {"video", "photos", "mixed"}:
+        if scene["input_kind"] not in {"video", "multi_video", "photos", "mixed"}:
             raise ConfigError(f"{label}.input_kind is invalid")
         gate_scopes = scene["gate_scopes"]
         if (
@@ -2830,18 +2871,20 @@ def _evidence_request(
         vocabulary_candidates = 0 if scale <= 60 else 20
         vocabulary_neighbors = 0 if scale <= 60 else 8
         vocabulary_stride = 1
-        ba_ratio = 1.1
+        ba_ratio = 1.4
         ba_local_max_refinements = 2
-    elif input_kind == "mixed" or "segmented" in traits:
+    elif input_kind in {"multi_video", "mixed"} or "segmented" in traits:
         topology = "segmented_mixed"
-        capture_path = "automatic"
+        capture_path = (
+            "large_area" if scene["category"] == "large_area_exterior" else "automatic"
+        )
         temporal_pairing = "linear"
         temporal_offsets = [1, 2, 3, 4, 5, 6]
         pairing_policy = "segmented_mixed"
         vocabulary_candidates = 20
         vocabulary_neighbors = 8
         vocabulary_stride = 1
-        ba_ratio = 1.1
+        ba_ratio = 1.4
         ba_local_max_refinements = 2
     elif scene["category"] == "object_orbit":
         topology = "continuous"
@@ -2849,8 +2892,8 @@ def _evidence_request(
         temporal_pairing = "multiscale"
         temporal_offsets = [offset for offset in (1, 2, 4, 8, 16, 32, 64, 128) if offset < scale]
         pairing_policy = "object_orbit"
-        vocabulary_candidates = 20 if scale >= 120 else 0
-        vocabulary_neighbors = 2 if scale >= 120 else 0
+        vocabulary_candidates = 20
+        vocabulary_neighbors = 2
         vocabulary_stride = 5
         ba_ratio = 4.0
         ba_local_max_refinements = 1
@@ -2911,13 +2954,23 @@ def _evidence_request(
         if split.get("status") != "pinned" or references.get("status") != "pinned":
             raise ConfigError(f"{scene['id']} cannot emit protected evidence with pending references")
         holdout_indices = list(split["holdout_by_scale"][str(scale)])
-        reference_artifacts = dict(references["by_scale"][str(scale)])
+        reference_artifacts = {
+            key: value
+            for key, value in references["by_scale"][str(scale)].items()
+            if key != "artifact_path"
+        }
     candidate_configuration = {
         "detail_profile": detail_profile,
         "selected_frame_count": scale,
         "capture_path": capture_path,
         "input_topology": topology,
-        "camera_grouping": "automatic",
+        "camera_grouping": (
+            "same_camera_and_lens"
+            if input_kind == "photos"
+            and "fisheye" in traits
+            and "mixed_intrinsics" not in traits
+            else "automatic"
+        ),
         "lens_projection": "fisheye" if "fisheye" in traits else "automatic",
         "resource_policy": "automatic" if lane == evidence.LANE_REFERENCE else "conserve_memory",
         "compute_policy": "metal_for_supported_stages",
@@ -2925,7 +2978,7 @@ def _evidence_request(
         "temporal_pairing": temporal_pairing,
         "temporal_offsets": temporal_offsets,
         "vocabulary_candidate_count": vocabulary_candidates,
-        "vocabulary_verified_neighbor_count": vocabulary_neighbors,
+        "vocabulary_returned_neighbor_count": vocabulary_neighbors,
         "vocabulary_query_stride": vocabulary_stride,
         "descriptor_matcher": "faiss",
         "ba_global_frames_ratio": ba_ratio,
@@ -3338,7 +3391,7 @@ def emit_evidence_requests(
         approved_runners = evidence.validate_runner_identities(runner_identities)
     except evidence.EvidenceError as error:
         raise ConfigError(f"cannot emit requests without complete runner identities: {error}") from error
-    toolchain_identity = resolved_public_beta_toolchain_identity(toolchain_root)
+    toolchain_identity = resolved_release_toolchain_identity(toolchain_root)
     git = collect_git_state()
     if git["dirty"]:
         raise ConfigError("cannot emit release evidence requests from a dirty Git worktree")
@@ -3392,6 +3445,11 @@ def emit_evidence_requests(
                         "request": relative.as_posix(),
                         "media_path": scene["input"]["media_path"],
                         "evidence_path": scene["adapter"]["evidence_path"],
+                        "reference_artifact_path": (
+                            scene["reference"]["by_scale"][str(scale)]["artifact_path"]
+                            if scene["reference"]["status"] == "pinned"
+                            else None
+                        ),
                         "producer_command": [
                             "python3",
                             "scripts/benchmark/prepare_evidence.py",
@@ -3409,7 +3467,7 @@ def emit_evidence_requests(
                     }
                 )
     index = {
-        "schema_version": 2,
+        "schema_version": REQUEST_INDEX_SCHEMA_VERSION,
         "producer_protocol": evidence.PROTOCOL_VERSION,
         "producer_version": evidence.PRODUCER_VERSION,
         "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),

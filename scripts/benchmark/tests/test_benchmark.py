@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import base64
 import hashlib
@@ -9,6 +10,7 @@ import json
 import math
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -39,37 +41,181 @@ evidence = benchmark.evidence
 from scripts.benchmark import run_lane as lane_runner  # noqa: E402
 
 
-FIXTURE_SELECTION_MANIFEST = benchmark.canonical_json_bytes(
-    {
-        "schema_version": 2,
-        "views": [
+FIXTURE_SELECTION_MANIFEST = (
+    benchmark.canonical_json_bytes(
+        {
+            "schema_version": 2,
+            "views": [
+                {
+                    "view_index": index,
+                    "image_name": f"frame-{index:06d}.jpg",
+                    "clip_id": "clip-0",
+                    "source_kind": "video",
+                }
+                for index in range(30)
+            ],
+        }
+    )
+    + b"\n"
+)
+
+
+def fixture_mixed_selection_manifest() -> bytes:
+    return (
+        evidence.canonical_json_bytes(
+            {
+                "schema_version": 2,
+                "views": [
+                    {
+                        "view_index": index,
+                        "image_name": f"frame-{index:06d}.jpg",
+                        "clip_id": (
+                            "clip-a"
+                            if index < 10
+                            else "clip-b"
+                            if index < 20
+                            else f"photo-{index}"
+                        ),
+                        "source_kind": "video" if index < 20 else "photo",
+                    }
+                    for index in range(30)
+                ],
+            }
+        )
+        + b"\n"
+    )
+
+
+def fixture_video_selection_manifest(scale: int) -> bytes:
+    return (
+        evidence.canonical_json_bytes(
+            {
+                "schema_version": 2,
+                "views": [
+                    {
+                        "view_index": index,
+                        "image_name": f"frame-{index:06d}.jpg",
+                        "clip_id": "clip-0",
+                        "source_kind": "video",
+                    }
+                    for index in range(scale)
+                ],
+            }
+        )
+        + b"\n"
+    )
+
+
+def fixture_multi_video_selection_manifest(
+    scale: int, video_source_count: int = 2
+) -> bytes:
+    if video_source_count < 2:
+        raise ValueError("multi-video fixtures require at least two video sources")
+    return (
+        evidence.canonical_json_bytes(
+            {
+                "schema_version": 2,
+                "views": [
+                    {
+                        "view_index": index,
+                        "image_name": f"frame-{index:06d}.jpg",
+                        "clip_id": (
+                            f"clip-{min(video_source_count - 1, index * video_source_count // scale)}"
+                        ),
+                        "source_kind": "video",
+                    }
+                    for index in range(scale)
+                ],
+            }
+        )
+        + b"\n"
+    )
+
+
+def fixture_selection_manifest_for_request(request: dict[str, object]) -> bytes:
+    scale = int(request["binding"]["scale"])
+    input_kind = str(request["input_kind"])
+    video_source_count = int(request["video_source_count"])
+    if input_kind == "video":
+        return fixture_video_selection_manifest(scale)
+    if input_kind == "multi_video":
+        return fixture_multi_video_selection_manifest(scale, video_source_count)
+    if input_kind == "photos":
+        views = [
             {
                 "view_index": index,
                 "image_name": f"frame-{index:06d}.jpg",
-                "clip_id": "clip-0",
-                "source_kind": "video",
+                "clip_id": f"photo-{index}",
+                "source_kind": "photo",
             }
-            for index in range(30)
-        ],
-    }
-) + b"\n"
-FIXTURE_GROUND_TRUTH_POSES = benchmark.canonical_json_bytes(
-    {
-        "schema_version": 1,
-        "pose_convention": "world_to_camera",
-        "quaternion_order": "wxyz",
-        "handedness": "right_handed",
-        "coordinate_space": "ground_truth_world",
-        "image_coordinates": "normalized_display_pixels",
-        "poses": [
+            for index in range(scale)
+        ]
+    elif scale == 30 and video_source_count == 2:
+        return fixture_mixed_selection_manifest()
+    else:
+        video_view_count = scale - 1
+        views = []
+        for index in range(scale):
+            if index == scale - 1:
+                clip_id = "photo-0"
+                source_kind = "photo"
+            else:
+                clip_index = min(
+                    video_source_count - 1,
+                    index * video_source_count // video_view_count,
+                )
+                clip_id = f"clip-{clip_index}"
+                source_kind = "video"
+            views.append(
+                {
+                    "view_index": index,
+                    "image_name": f"frame-{index:06d}.jpg",
+                    "clip_id": clip_id,
+                    "source_kind": source_kind,
+                }
+            )
+    return evidence.canonical_json_bytes({"schema_version": 2, "views": views}) + b"\n"
+
+
+def selection_sources_for_request(
+    request: dict[str, object],
+) -> evidence.SelectionManifestSources:
+    manifest = json.loads(fixture_selection_manifest_for_request(request))
+    views = manifest["views"]
+    return evidence.SelectionManifestSources(
+        image_names=tuple(view["image_name"] for view in views),
+        clip_ids=tuple(view["clip_id"] for view in views),
+        source_kinds=tuple(view["source_kind"] for view in views),
+        video_source_count=len(
             {
-                "image_name": f"frame {index:04d}.jpg",
-                "rcw_wxyz": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
+                view["clip_id"]
+                for view in views
+                if view["source_kind"] == "video"
             }
-            for index in range(30)
-        ],
-    }
-) + b"\n"
+        ),
+    )
+
+
+FIXTURE_GROUND_TRUTH_POSES = (
+    benchmark.canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "pose_convention": "world_to_camera",
+            "quaternion_order": "wxyz",
+            "handedness": "right_handed",
+            "coordinate_space": "ground_truth_world",
+            "image_coordinates": "normalized_display_pixels",
+            "poses": [
+                {
+                    "image_name": f"frame {index:04d}.jpg",
+                    "rcw_wxyz": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
+                }
+                for index in range(30)
+            ],
+        }
+    )
+    + b"\n"
+)
 FIXTURE_HOST_MONITOR = b"{}\n"
 
 
@@ -78,16 +224,40 @@ def fixture_render_camera(index: int) -> dict[str, object]:
         "width": 64,
         "height": 64,
         "projection_matrix_column_major": [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
         ],
         "world_to_camera_matrix_column_major": [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            float(index), 0.0, 0.0, 1.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            float(index),
+            0.0,
+            0.0,
+            1.0,
         ],
     }
 
@@ -100,8 +270,7 @@ def fixture_png(value: int) -> bytes:
 
 FIXTURE_HOLDOUTS = list(range(4, 30, 5))
 FIXTURE_GROUND_TRUTH_IMAGES = {
-    index: fixture_png(80 + position)
-    for position, index in enumerate(FIXTURE_HOLDOUTS)
+    index: fixture_png(80 + position) for position, index in enumerate(FIXTURE_HOLDOUTS)
 }
 FIXTURE_PREPARATION_VIEWS = []
 for position, index in enumerate(FIXTURE_HOLDOUTS):
@@ -112,9 +281,7 @@ for position, index in enumerate(FIXTURE_HOLDOUTS):
         "source": {
             "path": f"rendering/source/{index:06d}.png",
             "sha256": evidence.sha256_bytes(image_bytes),
-            "pixel_sha256": evidence.sha256_bytes(
-                bytes([80 + position]) * 64 * 64 * 3
-            ),
+            "pixel_sha256": evidence.sha256_bytes(bytes([80 + position]) * 64 * 64 * 3),
             "format": "png_rgb8",
             "width": 64,
             "height": 64,
@@ -133,9 +300,7 @@ for position, index in enumerate(FIXTURE_HOLDOUTS):
         "target": {
             "path": f"rendering/ground-truth/{index:06d}.png",
             "sha256": evidence.sha256_bytes(image_bytes),
-            "pixel_sha256": evidence.sha256_bytes(
-                bytes([80 + position]) * 64 * 64 * 3
-            ),
+            "pixel_sha256": evidence.sha256_bytes(bytes([80 + position]) * 64 * 64 * 3),
             "format": "png_rgb8",
             "width": 64,
             "height": 64,
@@ -152,85 +317,97 @@ for position, index in enumerate(FIXTURE_HOLDOUTS):
         evidence.canonical_json_bytes(view)
     )
     FIXTURE_PREPARATION_VIEWS.append(view)
-FIXTURE_GROUND_TRUTH_PREPARATION = benchmark.canonical_json_bytes(
-    {
-        "schema_version": 2,
-        "input_digest": "sha256:" + "1" * 64,
-        "selection_manifest": {
-            "path": "selection-manifest.json",
-            "sha256": evidence.sha256_bytes(FIXTURE_SELECTION_MANIFEST),
-        },
-        "source_spec": {
-            "path": "render-target-spec.json",
-            "sha256": "sha256:" + "9" * 64,
-        },
-        "algorithm": {
-            "id": "native_msplat_decode_brown_conrady_alpha0",
-            "version": 2,
-            "float_precision": "float32",
-            "inverse_iterations": 20,
-            "boundary_samples": 200,
-            "interpolation": "bilinear",
-            "boundary_mode": "clamp",
-        },
-        "producer": {
-            "path": "scripts/benchmark/prepare_render_targets.py",
-            "sha256": evidence.sha256_file(
-                ROOT / "scripts" / "benchmark" / "prepare_render_targets.py"
-            ),
-            "runtime": {
-                "implementation": "cpython",
-                "python_version": "fixture",
-                "numpy_version": "fixture",
-                "pillow_version": "fixture",
+FIXTURE_GROUND_TRUTH_PREPARATION = (
+    benchmark.canonical_json_bytes(
+        {
+            "schema_version": 2,
+            "input_digest": "sha256:" + "1" * 64,
+            "selection_manifest": {
+                "path": "selection-manifest.json",
+                "sha256": evidence.sha256_bytes(FIXTURE_SELECTION_MANIFEST),
             },
-        },
-        "native_decoder": {
-            "contract": "native_coregraphics_imageio_srgb8_v2",
-            "mode_version": 2,
-            "executable_bytes": 1,
-            "executable_sha256": "sha256:" + "2" * 64,
-            "metallib_bytes": 1,
-            "metallib_sha256": "sha256:" + "3" * 64,
-            "trainer_build_digest": "sha256:" + "4" * 64,
-            "msplat_source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
-        },
-        "views": FIXTURE_PREPARATION_VIEWS,
-    }
-) + b"\n"
+            "source_spec": {
+                "path": "render-target-spec.json",
+                "sha256": "sha256:" + "9" * 64,
+            },
+            "algorithm": {
+                "id": "native_msplat_decode_brown_conrady_alpha0",
+                "version": 2,
+                "float_precision": "float32",
+                "inverse_iterations": 20,
+                "boundary_samples": 200,
+                "interpolation": "bilinear",
+                "boundary_mode": "clamp",
+            },
+            "producer": {
+                "path": "scripts/benchmark/prepare_render_targets.py",
+                "sha256": evidence.sha256_file(
+                    ROOT / "scripts" / "benchmark" / "prepare_render_targets.py"
+                ),
+                "runtime": {
+                    "implementation": "cpython",
+                    "python_version": "fixture",
+                    "numpy_version": "fixture",
+                    "pillow_version": "fixture",
+                },
+            },
+            "native_decoder": {
+                "contract": "native_coregraphics_imageio_srgb8_v2",
+                "mode_version": 2,
+                "executable_bytes": 1,
+                "executable_sha256": "sha256:" + "2" * 64,
+                "metallib_bytes": 1,
+                "metallib_sha256": "sha256:" + "3" * 64,
+                "trainer_build_digest": "sha256:" + "4" * 64,
+                "msplat_source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
+            },
+            "views": FIXTURE_PREPARATION_VIEWS,
+        }
+    )
+    + b"\n"
+)
 FIXTURE_GROUND_TRUTH_PREPARATION_SHA256 = evidence.sha256_bytes(
     FIXTURE_GROUND_TRUTH_PREPARATION
 )
-FIXTURE_ACCURATE_RENDERING_REFERENCE = benchmark.canonical_json_bytes(
-    {
-        "schema_version": 2,
-        "ground_truth_preparation_sha256": FIXTURE_GROUND_TRUTH_PREPARATION_SHA256,
-        "views": [
-            {
-                "holdout_index": index,
-                "camera": fixture_render_camera(index),
-                "camera_digest": evidence.render_camera_digest(
-                    fixture_render_camera(index)
-                ),
-                "ground_truth_sha256": evidence.sha256_bytes(
-                    FIXTURE_GROUND_TRUTH_IMAGES[index]
-                ),
-                "preparation_view_sha256": FIXTURE_PREPARATION_VIEWS[position][
-                    "preparation_view_sha256"
-                ],
-            }
-            for position, index in enumerate(FIXTURE_HOLDOUTS)
-        ],
-    }
-) + b"\n"
+FIXTURE_ACCURATE_RENDERING_REFERENCE = (
+    benchmark.canonical_json_bytes(
+        {
+            "schema_version": 2,
+            "ground_truth_preparation_sha256": FIXTURE_GROUND_TRUTH_PREPARATION_SHA256,
+            "views": [
+                {
+                    "holdout_index": index,
+                    "camera": fixture_render_camera(index),
+                    "camera_digest": evidence.render_camera_digest(
+                        fixture_render_camera(index)
+                    ),
+                    "ground_truth_sha256": evidence.sha256_bytes(
+                        FIXTURE_GROUND_TRUTH_IMAGES[index]
+                    ),
+                    "preparation_view_sha256": FIXTURE_PREPARATION_VIEWS[position][
+                        "preparation_view_sha256"
+                    ],
+                }
+                for position, index in enumerate(FIXTURE_HOLDOUTS)
+            ],
+        }
+    )
+    + b"\n"
+)
 
 REFERENCE_ARTIFACT_CONTENTS = {
-    "selection_manifest_sha256": ("selection-manifest.json", FIXTURE_SELECTION_MANIFEST),
+    "selection_manifest_sha256": (
+        "selection-manifest.json",
+        FIXTURE_SELECTION_MANIFEST,
+    ),
     "ground_truth_poses_sha256": (
         "ground-truth-poses.json",
         FIXTURE_GROUND_TRUTH_POSES,
     ),
-    "accurate_colmap_model_sha256": ("accurate-colmap-model.json", b"accurate COLMAP\n"),
+    "accurate_colmap_model_sha256": (
+        "accurate-colmap-model.json",
+        b"accurate COLMAP\n",
+    ),
     "accurate_rendering_reference_sha256": (
         "accurate-rendering-reference.json",
         FIXTURE_ACCURATE_RENDERING_REFERENCE,
@@ -300,10 +477,14 @@ TEST_TOOLCHAIN_PUBLIC_KEY = TEST_TOOLCHAIN_PRIVATE_KEY.public_key().public_bytes
     encoding=serialization.Encoding.Raw,
     format=serialization.PublicFormat.Raw,
 )
-TEST_TOOLCHAIN_PUBLIC_KEY_BASE64 = base64.b64encode(TEST_TOOLCHAIN_PUBLIC_KEY).decode("ascii")
+TEST_TOOLCHAIN_PUBLIC_KEY_BASE64 = base64.b64encode(TEST_TOOLCHAIN_PUBLIC_KEY).decode(
+    "ascii"
+)
 TEST_TOOLCHAIN_COMPONENT_ARCHIVES = {
     "macos-arm64-core": deterministic_zip("bin/easysplat-train", b"metal trainer\n"),
-    "geometry-large-area": deterministic_zip("models/large-area.safetensors", b"weights\n"),
+    "geometry-large-area": deterministic_zip(
+        "models/large-area.safetensors", b"weights\n"
+    ),
 }
 
 
@@ -335,8 +516,11 @@ def make_toolchain_manifest() -> dict[str, object]:
                 "sha256": hashlib.sha256(archive).hexdigest(),
                 "sizeBytes": len(archive),
                 "expandedSizeBytes": max(len(archive), len(content)),
+                "expandedClosureSHA256": hashlib.sha256(content).hexdigest(),
                 "contents": [content_path],
-                "criticalFileHashes": {content_path: hashlib.sha256(content).hexdigest()},
+                "criticalFileHashes": {
+                    content_path: hashlib.sha256(content).hexdigest()
+                },
                 "dependencies": dependencies,
                 "requirement": "required" if name == "macos-arm64-core" else "optional",
             }
@@ -347,7 +531,7 @@ def make_toolchain_manifest() -> dict[str, object]:
         "keyID": hashlib.sha256(TEST_TOOLCHAIN_PUBLIC_KEY).hexdigest(),
         "version": "2.0.0",
         "publishedAt": "2026-07-01T00:00:00Z",
-        "appVersionRange": {"minimum": "0.2.0-beta.1"},
+        "appVersionRange": {"minimum": "0.2.0"},
         "components": components,
         "signatureEd25519": "",
     }
@@ -359,10 +543,7 @@ def make_toolchain_manifest() -> dict[str, object]:
 
 def make_toolchain_state(component_names: list[str]) -> dict[str, object]:
     manifest = make_toolchain_manifest()
-    components = {
-        component["name"]: component
-        for component in manifest["components"]
-    }
+    components = {component["name"]: component for component in manifest["components"]}
     selected = [components[name] for name in component_names]
     return {
         "schemaVersion": 2,
@@ -370,7 +551,9 @@ def make_toolchain_state(component_names: list[str]) -> dict[str, object]:
             component["name"]: component["sha256"] for component in selected
         },
         "installedCapabilities": sorted(
-            capability for component in selected for capability in component["capabilities"]
+            capability
+            for component in selected
+            for capability in component["capabilities"]
         ),
         "signedManifest": manifest,
     }
@@ -393,7 +576,10 @@ def toolchain_identity_for_state(state: dict[str, object]) -> str:
         "installed_capabilities": sorted(state["installedCapabilities"]),
     }
     hasher = hashlib.sha256()
-    for value in (b"easysplat-benchmark-toolchain-v2", evidence.canonical_json_bytes(closure)):
+    for value in (
+        b"easysplat-benchmark-toolchain-v2",
+        evidence.canonical_json_bytes(closure),
+    ):
         hasher.update(len(value).to_bytes(8, "big"))
         hasher.update(value)
     return "sha256:" + hasher.hexdigest()
@@ -469,6 +655,7 @@ def valid_scene(
             "status": "pinned",
             "by_scale": {
                 str(scale): {
+                    "artifact_path": f"external/{scene_id}.references/{scale}",
                     **{
                         name: evidence.sha256_bytes(content)
                         for name, (_, content) in REFERENCE_ARTIFACT_CONTENTS.items()
@@ -519,7 +706,9 @@ def release_corpus() -> dict[str, object]:
     for category, count in counts.items():
         scenarios = sorted(benchmark.RELEASE_CATEGORY_SCENARIOS[category])
         for index in range(1, count + 1):
-            scene = valid_scene(f"{category}-{index:02d}", category, "protected-evidence")
+            scene = valid_scene(
+                f"{category}-{index:02d}", category, "protected-evidence"
+            )
             scene["scenario"] = scenarios[index - 1]
             scene["split"] = {"status": "pending"}
             scene["reference"] = {"status": "pending"}
@@ -529,7 +718,11 @@ def release_corpus() -> dict[str, object]:
                 "authorization_status": "pending",
                 "authorization_sha256": None,
             }
-            scene["gate_scopes"] = ["scene_performance", "scene_quality", "suite_performance"]
+            scene["gate_scopes"] = [
+                "scene_performance",
+                "scene_quality",
+                "suite_performance",
+            ]
             if category == "object_orbit" and index == count:
                 scene["scale_lanes"] = [3000]
             elif category == "object_orbit" and index == 3:
@@ -803,14 +996,20 @@ def evidence_machine(lane: str) -> dict[str, object]:
     return {
         "architecture": "arm64",
         "chip": "Apple M4 Max" if lane == evidence.LANE_REFERENCE else "Apple M4",
+        "clang_version": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
         "hardware_model": "Mac16,5",
         "logical_cpus": 16,
-        "macos_build": "24F74",
-        "macos_version": "15.5",
+        "macos_build": "25F84",
+        "macos_version": "26.5.2",
+        "macos_sdk_build": "25F70",
+        "macos_sdk_version": "26.5",
+        "metal_version": "Apple metal version 32023.883 (metalfe-32023.883)",
         "physical_cpus": 12,
         "physical_memory_bytes": memory,
-        "swift_version": "Swift 6.1",
-        "xcode_version": "Xcode 16.4",
+        "swift_version": (
+            "Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 clang-2100.1.1.101)"
+        ),
+        "xcode_version": "Xcode 26.6\nBuild version 17F113",
     }
 
 
@@ -836,7 +1035,9 @@ def runner_identity(lane: str, digest_character: str = "a") -> dict[str, object]
 def runner_identities() -> dict[str, dict[str, object]]:
     names = evidence.RELEASE_LANES | {evidence.RENDERING_DRIVER_IDENTITY}
     return {
-        name: runner_identity(name, "e" if name == evidence.RENDERING_DRIVER_IDENTITY else "a")
+        name: runner_identity(
+            name, "e" if name == evidence.RENDERING_DRIVER_IDENTITY else "a"
+        )
         for name in sorted(names)
     }
 
@@ -882,10 +1083,10 @@ def evidence_request(
         corpus_digest="sha256:" + "2" * 64,
         thresholds_digest="sha256:" + "3" * 64,
         git_commit="4" * 40,
-        app_version="0.2.0-beta.1",
+        app_version="0.2.0",
         toolchain_identity=TEST_TOOLCHAIN_IDENTITY,
     )
-    return benchmark._evidence_request(
+    request = benchmark._evidence_request(
         scene,
         scale,
         lane,
@@ -894,6 +1095,11 @@ def evidence_request(
         runner_identity(evidence.RENDERING_DRIVER_IDENTITY, "e"),
         "sha256:" + "9" * 64,
     )
+    if request["expected_outcome"]["kind"] == "valid":
+        request["reference_artifacts"]["selection_manifest_sha256"] = (
+            evidence.sha256_bytes(fixture_selection_manifest_for_request(request))
+        )
+    return request
 
 
 def candidate_timing(seconds: float) -> dict[str, object]:
@@ -927,18 +1133,20 @@ def paired_timing() -> dict[str, object]:
             "end_to_end_seconds": 101.0,
             "geometry_seconds": 41.0,
             "training_seconds": 60.0,
-        }
+        },
     ]
     for pair_index, (
         baseline_end,
         candidate_end,
         baseline_geometry,
         candidate_geometry,
-    ) in enumerate((
-        (249.0, 99.0, 99.0, 39.0),
-        (250.0, 100.0, 100.0, 40.0),
-        (251.0, 101.0, 101.0, 41.0),
-    )):
+    ) in enumerate(
+        (
+            (249.0, 99.0, 99.0, 39.0),
+            (250.0, 100.0, 100.0, 40.0),
+            (251.0, 101.0, 101.0, 41.0),
+        )
+    ):
         pair = [
             {
                 "variant": "baseline",
@@ -968,20 +1176,22 @@ def paired_timing() -> dict[str, object]:
             "discarded": True,
             "matcher_seconds": 13.0,
             "mapping_seconds": 21.0,
-        }
+        },
     ]
     for pair_index, (
         baseline_matcher,
         candidate_matcher,
         baseline_mapping,
         candidate_mapping,
-    ) in enumerate((
-        (123.0, 12.3, 28.0, 18.0),
-        (124.0, 12.4, 29.0, 19.0),
-        (125.0, 12.5, 30.0, 20.0),
-        (126.0, 12.6, 31.0, 21.0),
-        (127.0, 12.7, 32.0, 22.0),
-    )):
+    ) in enumerate(
+        (
+            (123.0, 12.3, 28.0, 18.0),
+            (124.0, 12.4, 29.0, 19.0),
+            (125.0, 12.5, 30.0, 20.0),
+            (126.0, 12.6, 31.0, 21.0),
+            (127.0, 12.7, 32.0, 22.0),
+        )
+    ):
         pair = [
             {
                 "variant": "baseline",
@@ -1007,7 +1217,7 @@ def paired_timing() -> dict[str, object]:
             "variant": "fast_candidate",
             "discarded": True,
             "end_to_end_seconds": 101.0,
-        }
+        },
     ]
     for pair_index, (reference_seconds, fast_seconds) in enumerate(
         ((199.0, 99.0), (200.0, 100.0), (201.0, 101.0))
@@ -1051,7 +1261,9 @@ def stability_runs() -> list[dict[str, object]]:
     ]
     runs = []
     for index in range(50):
-        stage, action = ("none", "none") if index % 5 == 4 else matrix[index % len(matrix)]
+        stage, action = (
+            ("none", "none") if index % 5 == 4 else matrix[index % len(matrix)]
+        )
         runs.append(
             {
                 "category": (
@@ -1087,16 +1299,41 @@ def fixture_pair_list() -> dict[str, object]:
                     "spatially_verified": True,
                 }
             )
-    return {
-        "schema_version": 2,
-        "selected_frame_count": 30,
-        "pairs": pairs,
-        "retrieval": {"eligible_query_count": 0, "queries": []},
-    }
+    return lossless_pair_list_fixture(
+        {
+            "schema_version": 2,
+            "selected_frame_count": 30,
+            "pairs": pairs,
+            "retrieval": {"eligible_query_count": 0, "queries": []},
+        },
+        {
+            "input_topology": "continuous",
+            "vocabulary_candidate_count": 0,
+            "vocabulary_returned_neighbor_count": 0,
+            "vocabulary_query_stride": 1,
+        },
+    )
 
 
 def fixture_pair_list_with_retrieval(*, ordered: bool = True) -> dict[str, object]:
-    pair_list = fixture_pair_list()
+    pair_list = {
+        "schema_version": 2,
+        "selected_frame_count": 30,
+        "pairs": [
+            {
+                "view_a": view_a,
+                "view_b": view_a + offset,
+                "pair_type": "local",
+                "query_view": None,
+                "attempted": True,
+                "raw_matched": True,
+                "spatially_verified": True,
+            }
+            for offset in (1, 2, 4, 8, 16)
+            for view_a in range(30 - offset)
+        ],
+        "retrieval": {"eligible_query_count": 0, "queries": []},
+    }
     retrieval_targets = {0: [13, 14], 10: [23, 24], 20: [7, 8]}
     for query, targets in retrieval_targets.items():
         for target in targets:
@@ -1146,64 +1383,497 @@ def fixture_pair_list_with_retrieval(*, ordered: bool = True) -> dict[str, objec
             },
         ],
     }
-    return pair_list
+    return lossless_pair_list_fixture(
+        pair_list,
+        {
+            "input_topology": "continuous" if ordered else "segmented_mixed",
+            "vocabulary_candidate_count": 20,
+            "vocabulary_returned_neighbor_count": 2,
+            "vocabulary_query_stride": 10,
+        },
+    )
+
+
+def fixture_retrieval_receipt(
+    *,
+    image_names: list[str],
+    query_views: list[int],
+    query_stride: int,
+    candidate_count: int,
+    neighbor_count: int,
+    minimum_frame_separation: int,
+    directed_pairs: list[dict[str, int]],
+    executed: bool = True,
+    image_group_indices: list[int] | None = None,
+) -> dict[str, object]:
+    def digest(fields: list[str]) -> str:
+        payload = b"".join(
+            f"{len(field.encode('utf-8'))}:".encode("utf-8") + field.encode("utf-8")
+            for field in fields
+        )
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    normalized_pairs = sorted(
+        (dict(pair) for pair in directed_pairs),
+        key=lambda pair: (
+            f"{image_names[pair['query_view']]} "
+            f"{image_names[pair['target_view']]}"
+        ).encode("utf-8"),
+    )
+    targets_by_query = {query: [] for query in query_views}
+    for pair in normalized_pairs:
+        targets_by_query[pair["query_view"]].append(pair["target_view"])
+    for query in query_views:
+        targets_by_query[query].sort(key=lambda target: image_names[target].encode("utf-8"))
+    outcomes = [
+        {
+            "query_view": query,
+            "status": "ranked" if targets_by_query[query] else "noRankedNeighbors",
+            "ranked_neighbor_views": targets_by_query[query],
+        }
+        for query in query_views
+    ]
+    candidate_policy = None
+    image_group_list_digest = None
+    request_fields = [
+        "localSiftVocabularyV2",
+        str(query_stride),
+        str(candidate_count),
+        str(neighbor_count),
+        str(minimum_frame_separation),
+    ]
+    if image_group_indices is not None:
+        if len(image_group_indices) != len(image_names):
+            raise AssertionError("fixture image groups must cover every image")
+        candidate_policy = "crossGroupV1"
+        group_lines = sorted(
+            (
+                f"{image_name}\t{image_group_indices[index]}"
+                for index, image_name in enumerate(image_names)
+            ),
+            key=lambda line: line.encode("utf-8"),
+        )
+        image_group_list_digest = digest([candidate_policy, *group_lines])
+        request_fields.extend(
+            [candidate_policy, image_group_list_digest.removeprefix("sha256:")]
+        )
+    request_digest = digest(
+        request_fields + [image_names[index] for index in query_views]
+    )
+    contract_lines = [
+        " ".join(
+            [
+                (
+                    "EASYSPLAT_RETRIEVAL_OUTCOMES_V3"
+                    if candidate_policy is not None
+                    else "EASYSPLAT_RETRIEVAL_OUTCOMES_V2"
+                ),
+                "localSiftVocabularyV2",
+                str(query_stride),
+                str(candidate_count),
+                str(neighbor_count),
+                str(minimum_frame_separation),
+                *(
+                    [
+                        candidate_policy,
+                        image_group_list_digest.removeprefix("sha256:"),
+                    ]
+                    if candidate_policy is not None
+                    and image_group_list_digest is not None
+                    else []
+                ),
+                str(len(query_views)),
+                request_digest.removeprefix("sha256:"),
+            ]
+        )
+    ]
+    contract_lines.extend(
+        " ".join(
+            [
+                "Q",
+                outcome["status"],
+                image_names[outcome["query_view"]],
+                str(len(outcome["ranked_neighbor_views"])),
+                *(
+                    image_names[target]
+                    for target in outcome["ranked_neighbor_views"]
+                ),
+            ]
+        )
+        for outcome in outcomes
+    )
+    contract_lines.extend(
+        f"P {image_names[pair['query_view']]} {image_names[pair['target_view']]}"
+        for pair in normalized_pairs
+    )
+    return {
+        "engine": "localSiftVocabularyV2",
+        "query_views": query_views,
+        "query_stride": query_stride,
+        "candidate_count": candidate_count,
+        "returned_neighbor_count": neighbor_count,
+        "minimum_frame_separation": minimum_frame_separation,
+        "candidate_policy": candidate_policy,
+        "image_group_list_digest": image_group_list_digest,
+        "executed": executed,
+        "query_outcomes": outcomes,
+        "directed_pairs": normalized_pairs,
+        "request_digest": request_digest,
+        "output_digest": digest(contract_lines),
+    }
+
+
+def fixture_lossless_pair_list_with_zero_result_query() -> dict[str, object]:
+    pair_list = fixture_pair_list_with_retrieval()
+    query_views = [0, 10, 20]
+    directed_pairs = [
+        {
+            "query_view": pair["query_view"],
+            "target_view": (
+                pair["view_b"]
+                if pair["query_view"] == pair["view_a"]
+                else pair["view_a"]
+            ),
+        }
+        for pair in pair_list["pairs"]
+        if pair["pair_type"] == "loop" and pair["query_view"] != 20
+    ]
+    pair_list["pairs"] = [
+        pair
+        for pair in pair_list["pairs"]
+        if pair["pair_type"] != "loop" or pair["query_view"] != 20
+    ]
+    image_names = [f"frame-{index:06d}.jpg" for index in range(30)]
+    attempted = sum(pair["attempted"] for pair in pair_list["pairs"])
+    raw_matched = sum(pair["raw_matched"] for pair in pair_list["pairs"])
+    verified = sum(pair["spatially_verified"] for pair in pair_list["pairs"])
+    return {
+        "schema_version": 5,
+        "selected_frame_count": 30,
+        "accepted_attempt_number": 1,
+        "pairs": pair_list["pairs"],
+        "attempts": [
+            {
+                "attempt_number": 1,
+                "matcher_used": "faiss",
+                "exact_recovery_reason": None,
+                "recovery_level": "normal",
+                "outcome": "completed",
+                "scheduled_pair_count": len(pair_list["pairs"]),
+                "attempted_pair_count": attempted,
+                "raw_matched_pair_count": raw_matched,
+                "spatially_verified_pair_count": verified,
+                "retrieval": fixture_retrieval_receipt(
+                    image_names=image_names,
+                    query_views=query_views,
+                    query_stride=10,
+                    candidate_count=20,
+                    neighbor_count=2,
+                    minimum_frame_separation=12,
+                    directed_pairs=directed_pairs,
+                ),
+            }
+        ],
+        "fallback_reasons": [],
+    }
 
 
 def fixture_unordered_exhaustive_pair_list() -> dict[str, object]:
-    return {
-        "schema_version": 2,
-        "selected_frame_count": 30,
-        "pairs": [
+    return lossless_pair_list_fixture(
+        {
+            "schema_version": 2,
+            "selected_frame_count": 30,
+            "pairs": [
+                {
+                    "view_a": view_a,
+                    "view_b": view_b,
+                    "pair_type": "exhaustive",
+                    "query_view": None,
+                    "attempted": True,
+                    "raw_matched": True,
+                    "spatially_verified": True,
+                    "matcher_used": "faiss",
+                }
+                for view_a in range(30)
+                for view_b in range(view_a + 1, 30)
+            ],
+            "retrieval": {"eligible_query_count": 0, "queries": []},
+        },
+        {
+            "input_topology": "unordered",
+            "vocabulary_candidate_count": 0,
+            "vocabulary_returned_neighbor_count": 0,
+            "vocabulary_query_stride": 1,
+        },
+    )
+
+
+def lossless_pair_list_fixture(
+    legacy: dict[str, object],
+    configuration: dict[str, object],
+) -> dict[str, object]:
+    pairs = legacy["pairs"]
+    selected_frame_count = int(legacy["selected_frame_count"])
+    image_names = [f"frame-{index:06d}.jpg" for index in range(selected_frame_count)]
+    candidate_count = int(configuration["vocabulary_candidate_count"])
+    neighbor_count = int(configuration["vocabulary_returned_neighbor_count"])
+    query_stride = int(configuration["vocabulary_query_stride"])
+    retrieval = None
+    if candidate_count > 0 and neighbor_count > 0:
+        query_views = list(range(0, selected_frame_count, query_stride))
+        directed_pairs = [
             {
-                "view_a": view_a,
-                "view_b": view_b,
-                "pair_type": "exhaustive",
-                "query_view": None,
-                "attempted": True,
-                "raw_matched": True,
-                "spatially_verified": True,
-                "matcher_used": "faiss",
+                "query_view": pair["query_view"],
+                "target_view": (
+                    pair["view_b"]
+                    if pair["query_view"] == pair["view_a"]
+                    else pair["view_a"]
+                ),
             }
-            for view_a in range(30)
-            for view_b in range(view_a + 1, 30)
+            for pair in pairs
+            if pair["pair_type"] in {"retrieval", "loop"}
+        ]
+        minimum_frame_separation = (
+            max(12, selected_frame_count // 10)
+            if configuration["input_topology"] == "continuous"
+            else 0
+        )
+
+        retrieval = fixture_retrieval_receipt(
+            image_names=image_names,
+            query_views=query_views,
+            query_stride=query_stride,
+            candidate_count=candidate_count,
+            neighbor_count=neighbor_count,
+            minimum_frame_separation=minimum_frame_separation,
+            directed_pairs=directed_pairs,
+        )
+    counts = {
+        "scheduled_pair_count": len(pairs),
+        "attempted_pair_count": sum(pair["attempted"] for pair in pairs),
+        "raw_matched_pair_count": sum(pair["raw_matched"] for pair in pairs),
+        "spatially_verified_pair_count": sum(
+            pair["spatially_verified"] for pair in pairs
+        ),
+    }
+    return {
+        "schema_version": 5,
+        "selected_frame_count": selected_frame_count,
+        "accepted_attempt_number": 1,
+        "pairs": pairs,
+        "attempts": [
+            {
+                "attempt_number": 1,
+                "matcher_used": "faiss",
+                "exact_recovery_reason": None,
+                "recovery_level": "normal",
+                "outcome": "completed",
+                **counts,
+                "retrieval": retrieval,
+            }
         ],
-        "retrieval": {"eligible_query_count": 0, "queries": []},
+        "fallback_reasons": [],
     }
 
 
 def fixture_pair_plan_digest(pair_list: dict[str, object]) -> str:
     pairs = sorted(
-        (int(pair["view_a"]), int(pair["view_b"]))
-        for pair in pair_list["pairs"]
+        (int(pair["view_a"]), int(pair["view_b"])) for pair in pair_list["pairs"]
     )
     serialized = "".join(
-        f"frame-{view_a:06d}.jpg frame-{view_b:06d}.jpg\n"
-        for view_a, view_b in pairs
+        f"frame-{view_a:06d}.jpg frame-{view_b:06d}.jpg\n" for view_a, view_b in pairs
     ).encode("utf-8")
     return evidence.sha256_bytes(serialized)
 
 
-def fixture_pair_list_for_configuration(
-    configuration: dict[str, object],
+def fixture_pair_list_metrics(
+    pair_list: dict[str, object], selected_frame_count: int
+) -> dict[str, int]:
+    pairs = pair_list["pairs"]
+    adjacency = [set() for _ in range(selected_frame_count)]
+    for pair in pairs:
+        if pair["spatially_verified"]:
+            adjacency[pair["view_a"]].add(pair["view_b"])
+            adjacency[pair["view_b"]].add(pair["view_a"])
+    visited: set[int] = set()
+    connected_components = 0
+    for start in range(selected_frame_count):
+        if start in visited:
+            continue
+        connected_components += 1
+        stack = [start]
+        visited.add(start)
+        while stack:
+            current = stack.pop()
+            for neighbor in adjacency[current]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+    return {
+        "scheduled_pairs": len(pairs),
+        "attempted_pairs": sum(pair["attempted"] for pair in pairs),
+        "raw_matched_pairs": sum(pair["raw_matched"] for pair in pairs),
+        "spatially_verified_pairs": sum(
+            pair["spatially_verified"] for pair in pairs
+        ),
+        "local_pairs": sum(pair["pair_type"] == "local" for pair in pairs),
+        "retrieval_pairs": sum(
+            pair["pair_type"] in {"retrieval", "exhaustive"} for pair in pairs
+        ),
+        "loop_pairs": sum(pair["pair_type"] == "loop" for pair in pairs),
+        "connected_components": connected_components,
+        "isolated_views": sum(not neighbors for neighbors in adjacency),
+        **evidence._biconnected_robustness(adjacency),
+    }
+
+
+def fixture_pair_list_for_request(
+    request: dict[str, object],
 ) -> dict[str, object]:
+    configuration = request["candidate_run_configuration"]
+    selected_frame_count = int(configuration["selected_frame_count"])
     if configuration["pairing_policy"] == "unordered_exhaustive":
-        return fixture_unordered_exhaustive_pair_list()
-    if (
-        int(configuration["vocabulary_candidate_count"]) > 0
-        and int(configuration["vocabulary_verified_neighbor_count"]) > 0
-    ):
-        return fixture_pair_list_with_retrieval(
-            ordered=configuration["input_topology"] == "continuous"
+        return lossless_pair_list_fixture(
+            {
+                "schema_version": 2,
+                "selected_frame_count": selected_frame_count,
+                "pairs": [
+                    {
+                        "view_a": view_a,
+                        "view_b": view_b,
+                        "pair_type": "exhaustive",
+                        "query_view": None,
+                        "attempted": True,
+                        "raw_matched": True,
+                        "spatially_verified": True,
+                        "matcher_used": "faiss",
+                    }
+                    for view_a in range(selected_frame_count)
+                    for view_b in range(view_a + 1, selected_frame_count)
+                ],
+                "retrieval": {"eligible_query_count": 0, "queries": []},
+            },
+            configuration,
         )
-    return fixture_pair_list()
+
+    selection = json.loads(fixture_selection_manifest_for_request(request))
+    views = selection["views"]
+    clip_ids = [str(view["clip_id"]) for view in views]
+    source_kinds = [str(view["source_kind"]) for view in views]
+    topology = str(configuration["input_topology"])
+    offsets = {int(offset) for offset in configuration["temporal_offsets"]}
+    local_edges: set[tuple[int, int]] = set()
+    if topology == "continuous":
+        local_edges = {
+            (view_a, view_b)
+            for view_a in range(selected_frame_count)
+            for view_b in range(view_a + 1, selected_frame_count)
+            if view_b - view_a in offsets
+        }
+    elif topology == "segmented_mixed":
+        views_by_clip: dict[str, list[int]] = {}
+        for view_index, clip_id in enumerate(clip_ids):
+            views_by_clip.setdefault(clip_id, []).append(view_index)
+        for clip_views in views_by_clip.values():
+            local_edges.update(
+                (clip_views[left], clip_views[right])
+                for left in range(len(clip_views))
+                for right in range(left + 1, len(clip_views))
+                if right - left in offsets
+            )
+
+    pairs: list[dict[str, object]] = [
+        {
+            "view_a": view_a,
+            "view_b": view_b,
+            "pair_type": "local",
+            "query_view": None,
+            "attempted": True,
+            "raw_matched": True,
+            "spatially_verified": True,
+        }
+        for view_a, view_b in sorted(local_edges)
+    ]
+    scheduled_edges = set(local_edges)
+    candidate_limit = int(configuration["vocabulary_candidate_count"])
+    neighbor_limit = int(configuration["vocabulary_returned_neighbor_count"])
+    retrieval_queries: list[dict[str, object]] = []
+    if candidate_limit > 0 and neighbor_limit > 0:
+        distance_minimum = max(12, selected_frame_count // 10)
+        stride = int(configuration["vocabulary_query_stride"])
+        for query_view in range(0, selected_frame_count, stride):
+            eligible_targets = []
+            for target_view in range(selected_frame_count):
+                if target_view == query_view:
+                    continue
+                edge = (min(query_view, target_view), max(query_view, target_view))
+                if edge in local_edges:
+                    continue
+                if (
+                    topology == "continuous"
+                    and abs(target_view - query_view) < distance_minimum
+                ):
+                    continue
+                if topology == "segmented_mixed" and (
+                    clip_ids[target_view] == clip_ids[query_view]
+                    and source_kinds[target_view] == source_kinds[query_view] == "video"
+                ):
+                    continue
+                eligible_targets.append(target_view)
+            if not eligible_targets:
+                continue
+            attempted_targets = [
+                target
+                for target in eligible_targets
+                if (min(query_view, target), max(query_view, target))
+                not in scheduled_edges
+            ][: min(neighbor_limit, len(eligible_targets))]
+            if not attempted_targets:
+                continue
+            for target_view in attempted_targets:
+                edge = (min(query_view, target_view), max(query_view, target_view))
+                scheduled_edges.add(edge)
+                pairs.append(
+                    {
+                        "view_a": edge[0],
+                        "view_b": edge[1],
+                        "pair_type": "loop"
+                        if topology == "continuous"
+                        else "retrieval",
+                        "query_view": query_view,
+                        "attempted": True,
+                        "raw_matched": True,
+                        "spatially_verified": True,
+                    }
+                )
+            retrieval_queries.append(
+                {
+                    "query_view": query_view,
+                    "eligible_target_count": len(eligible_targets),
+                    "attempted_candidate_count": len(attempted_targets),
+                    "attempted_targets": sorted(attempted_targets),
+                    "verified_retained_neighbors": sorted(attempted_targets),
+                    "retry_outcome": "not_needed",
+                    "matcher_used": "faiss",
+                    "fallback_reason": None,
+                }
+            )
+    return lossless_pair_list_fixture(
+        {
+            "schema_version": 2,
+            "selected_frame_count": selected_frame_count,
+            "pairs": pairs,
+            "retrieval": {
+                "eligible_query_count": len(retrieval_queries),
+                "queries": retrieval_queries,
+            },
+        },
+        configuration,
+    )
 
 
 def _timing_records(timing: dict[str, object]) -> list[tuple[str, dict[str, object]]]:
-    return [
-        (phase, record)
-        for phase, records in timing.items()
-        for record in records
-    ]
+    return [(phase, record) for phase, records in timing.items() for record in records]
 
 
 def mapper_argv_for_cadence(
@@ -1238,6 +1908,14 @@ def mapper_argv_for_cadence(
         "1e-06",
         "--Mapper.ba_local_num_images",
         "6",
+        "--Mapper.ba_global_max_num_iterations",
+        "75",
+        "--Mapper.random_seed",
+        "42",
+        "--Mapper.min_num_matches",
+        "15",
+        "--Mapper.ba_refine_focal_length",
+        "1",
     ]
 
 
@@ -1250,14 +1928,58 @@ def mapper_invocation(
     matching_attempt: int,
     digest_character: str,
     descriptor_matcher: str,
+    matching_database_digest_character: str = "c",
+    fallback_trigger: str | None = None,
 ) -> dict[str, object]:
+    if variant in {"baseline", "accurate_reference"}:
+        return {
+            "argv": mapper_argv_for_cadence(variant, cadence),
+            "outcome": outcome,
+            "mapping_attempt_ordinal": mapping_attempt_ordinal,
+            "matching_attempt": matching_attempt,
+            "pair_list_digest": "sha256:" + digest_character * 64,
+            "descriptor_matcher": descriptor_matcher,
+        }
+    assert cadence is not None
+    cadence_payload = {
+        "localMaxRefinements": cadence[3],
+        "globalFramesRatio": cadence[0],
+        "globalPointsRatio": cadence[1],
+        "globalMaxRefinements": cadence[2],
+        "localMaxNumIterations": 10,
+        "localFunctionTolerance": 0.001,
+        "globalFunctionTolerance": 0.000001,
+        "localImageCount": 6,
+    }
     return {
         "argv": mapper_argv_for_cadence(variant, cadence),
-        "outcome": outcome,
         "mapping_attempt_ordinal": mapping_attempt_ordinal,
-        "matching_attempt": matching_attempt,
+        "incremental_cadence": cadence_payload,
+        "global_max_num_iterations": 75,
+        "random_seed": 42,
+        "refine_focal_length": True,
+        "minimum_pair_inlier_count": 15,
+        "pair_graph_attempt_ordinal": matching_attempt,
         "pair_list_digest": "sha256:" + digest_character * 64,
         "descriptor_matcher": descriptor_matcher,
+        "matching_database_digest": (
+            "sha256:" + matching_database_digest_character * 64
+        ),
+        "evaluation": {
+            "status": (
+                "rejected" if outcome == "rejected_geometry_gate" else outcome
+            ),
+            "fallback_trigger": (
+                fallback_trigger
+                if fallback_trigger is not None
+                else (
+                    "insufficientViewSupport"
+                    if outcome == "rejected_geometry_gate"
+                    and mapping_attempt_ordinal == 1
+                    else None
+                )
+            ),
+        },
     }
 
 
@@ -1283,7 +2005,7 @@ def mapper_invocations_for_variant(
         return [
             mapper_invocation(
                 variant,
-                (1.1, 1.1, 5, 2),
+                (1.4, 1.4, 5, 2),
                 "accepted",
                 matching_attempt=1,
                 digest_character="a",
@@ -1319,6 +2041,8 @@ def worker_execution_artifact(
     input_kind: str,
     video_source_count: int | None = None,
     mapping_attempt_count: int = 1,
+    pair_list_digest: str = "a" * 64,
+    scheduled_pair_count: int | None = None,
 ) -> dict[str, object]:
     budget = {
         "featureExtractionWorkers": configuration["feature_extraction_workers"],
@@ -1334,6 +2058,9 @@ def worker_execution_artifact(
         policy: str,
         worker_count: int | None,
         mapping_attempt_ordinal: int | None = None,
+        pair_execution: dict[str, object] | None = None,
+        mapper_execution: dict[str, object] | None = None,
+        model_conversion: dict[str, object] | None = None,
     ) -> dict[str, object]:
         environment = (
             {
@@ -1354,25 +2081,103 @@ def worker_execution_artifact(
                 evidence.COLMAP_THREAD_ENVIRONMENT_KEYS_SHA256
             ),
             "effectiveSanitizedThreadEnvironment": dict(environment),
+            "pairExecution": pair_execution,
+            "mapperExecution": mapper_execution,
+            "modelConversion": model_conversion,
             "exitStatus": 0,
             "succeeded": True,
         }
 
-    retrieval_scheduled = (
-        int(configuration["vocabulary_candidate_count"]) > 0
-        and int(configuration["vocabulary_verified_neighbor_count"]) > 0
+    retrieval_scheduled = evidence._retrieval_required_by_plan(
+        configuration,
+        total_view_count=int(configuration["selected_frame_count"]),
     )
     if video_source_count is None:
         video_source_count = 0 if input_kind == "photos" else 1
-    mapping_invocations = [
-        invocation("mapper", "nativeAuto", None, ordinal)
-        for ordinal in range(1, mapping_attempt_count + 1)
-    ]
+    retrieval_request_digest = "1" * 64 if retrieval_scheduled else None
+    retrieval_output_digest = "2" * 64 if retrieval_scheduled else None
+    if scheduled_pair_count is None:
+        selected_frame_count = int(configuration["selected_frame_count"])
+        scheduled_pair_count = max(
+            1,
+            sum(
+                selected_frame_count - int(offset)
+                for offset in configuration["temporal_offsets"]
+                if int(offset) < selected_frame_count
+            ) + (1 if retrieval_scheduled else 0),
+        )
+    matching_pair_execution = {
+        "attemptOrdinal": 1,
+        "descriptorMatcher": "faiss",
+        "scheduledPairCount": scheduled_pair_count,
+        "pairListDigest": pair_list_digest,
+        "exactRecoveryReason": None,
+        "retrievalRequestDigest": retrieval_request_digest,
+        "retrievalOutputDigest": retrieval_output_digest,
+    }
+    planned_cadence = {
+        "localMaxRefinements": configuration["ba_local_max_refinements"],
+        "globalFramesRatio": configuration["ba_global_frames_ratio"],
+        "globalPointsRatio": configuration["ba_global_points_ratio"],
+        "globalMaxRefinements": configuration["ba_global_max_refinements"],
+        "localMaxNumIterations": 10,
+        "localFunctionTolerance": 0.001,
+        "globalFunctionTolerance": 0.000001,
+        "localImageCount": 6,
+    }
+    fallback_cadence = {
+        **planned_cadence,
+        "localMaxRefinements": 2,
+        "globalFramesRatio": (
+            1.4 if configuration["input_topology"] == "continuous" else 1.1
+        ),
+        "globalPointsRatio": (
+            1.4 if configuration["input_topology"] == "continuous" else 1.1
+        ),
+    }
+    mapping_invocations = []
+    for ordinal in range(1, mapping_attempt_count + 1):
+        fallback = mapping_attempt_count > 1 and ordinal > 1
+        pair_graph_attempt = 1 if ordinal <= 2 else ordinal - 1
+        mapping_invocations.append(
+            invocation(
+                "mapper",
+                "nativeAuto",
+                None,
+                ordinal,
+                mapper_execution={
+                    "incrementalCadence": (
+                        fallback_cadence if fallback else planned_cadence
+                    ),
+                    "globalMaxNumIterations": 75,
+                    "randomSeed": 42,
+                    "refineFocalLength": True,
+                    "minimumPairInlierCount": 15,
+                    "pairGraphAttemptOrdinal": pair_graph_attempt,
+                    "pairListDigest": pair_list_digest,
+                    "descriptorMatcher": "faiss",
+                    "matchingDatabaseDigest": "c" * 64,
+                    "evaluation": {
+                        "status": (
+                            "accepted"
+                            if ordinal == mapping_attempt_count
+                            else "rejected"
+                        ),
+                        "fallbackTrigger": (
+                            "insufficientViewSupport"
+                            if mapping_attempt_count > 1 and ordinal == 1
+                            else None
+                        ),
+                    },
+                },
+            )
+        )
     mapping_invocations.append(
         invocation("modelAnalyzer", "nativeAuto", None, mapping_attempt_count)
     )
     return {
         "schemaVersion": evidence.GEOMETRY_WORKER_EXECUTION_SCHEMA_VERSION,
+        "colmapRuntimeClosure": colmap_runtime_closure_fixture(),
         "resolvedBudget": budget,
         "featureExtractionInvocations": [
             invocation(
@@ -1386,6 +2191,7 @@ def worker_execution_artifact(
                 "matchesImporter",
                 "bounded",
                 int(configuration["coupled_matching_workers"]),
+                pair_execution=matching_pair_execution,
             )
         ],
         "vocabularyRetrievalInvocations": (
@@ -1394,11 +2200,17 @@ def worker_execution_artifact(
                     "localVocabularyRetriever",
                     "bounded",
                     int(configuration["vocabulary_retrieval_workers"]),
+                    pair_execution={
+                        **matching_pair_execution,
+                        "scheduledPairCount": None,
+                        "pairListDigest": None,
+                    },
                 )
             ]
             if retrieval_scheduled
             else []
         ),
+        "rejectedVocabularyRetrievalInvocations": [],
         "mappingAndRefinementInvocations": mapping_invocations,
         "videoSourceAnalysis": {
             "videoSourceCount": video_source_count,
@@ -1411,13 +2223,236 @@ def worker_execution_artifact(
     }
 
 
+def fixture_requires_cross_clip_retrieval(
+    configuration: dict[str, object],
+    input_kind: str,
+    video_source_count: int,
+) -> bool:
+    return (
+        input_kind == "multi_video"
+        and video_source_count > 1
+        and configuration["input_topology"]
+        in {"continuous", "segmented_mixed"}
+    )
+
+
+def model_conversion_fixture(*, succeeded: bool) -> dict[str, object]:
+    return {
+        "executableComponentPath": "bin/colmap",
+        "executableSHA256": "0" * 64,
+        "candidateProjectRelativePath": "SfM/candidates/attempt-1/0",
+        "inputProjectRelativePath": "SfM/candidates/attempt-1/0",
+        "outputProjectRelativePath": "SfM/canonical-staging/attempt-1",
+        "sourceModelDigest": "1" * 64,
+        "convertedModelDigest": "2" * 64 if succeeded else None,
+        "candidateIdentitySHA256": "3" * 64,
+    }
+
+
+def retrieval_invocation_from_matching(
+    matching_invocation: dict[str, object],
+    *,
+    succeeded: bool = True,
+) -> dict[str, object]:
+    invocation = copy.deepcopy(matching_invocation)
+    pair_execution = invocation["pairExecution"]
+    pair_execution.update(
+        {
+            "scheduledPairCount": None,
+            "pairListDigest": None,
+            "exactRecoveryReason": None,
+            "retrievalRequestDigest": pair_execution["retrievalRequestDigest"]
+            or "1" * 64,
+            "retrievalOutputDigest": pair_execution["retrievalOutputDigest"]
+            or "2" * 64,
+        }
+    )
+    invocation.update(
+        {
+            "command": "localVocabularyRetriever",
+            "exitStatus": 0 if succeeded else 1,
+            "succeeded": succeeded,
+        }
+    )
+    return invocation
+
+
+def rejected_vocabulary_retrieval_entry(
+    request: dict[str, object],
+    *,
+    all_ranked_disconnected: bool = False,
+) -> dict[str, object]:
+    configuration = request["candidate_run_configuration"]
+    image_names = [
+        f"frame-{index:06d}.jpg"
+        for index in range(int(configuration["selected_frame_count"]))
+    ]
+    query_stride = int(configuration["vocabulary_query_stride"])
+    query_names = image_names[::query_stride]
+    minimum_separation = (
+        0
+        if configuration["pairing_policy"]
+        in {"segmented_mixed", "unordered_exhaustive", "unordered_retrieval"}
+        else max(12, len(image_names) // 10)
+    )
+    if all_ranked_disconnected:
+        outcomes = []
+        directed_lines = []
+        for query_name in query_names:
+            query_index = image_names.index(query_name)
+            neighbor_name = image_names[
+                query_index + 1 if query_index % 2 == 0 else query_index - 1
+            ]
+            outcomes.append(
+                {
+                    "queryImageName": query_name,
+                    "status": "ranked",
+                    "rankedNeighborImageNames": [neighbor_name],
+                }
+            )
+            if query_index % 2 == 0:
+                directed_lines.append(f"{query_name} {neighbor_name}")
+        directed_lines.sort(key=lambda line: line.encode("utf-8"))
+    else:
+        outcomes = [
+            {
+                "queryImageName": name,
+                "status": "noRankedNeighbors",
+                "rankedNeighborImageNames": [],
+            }
+            for name in query_names
+        ]
+        directed_lines = []
+    request_digest = evidence._canonical_string_digest(
+        [
+            "localSiftVocabularyV2",
+            str(query_stride),
+            str(configuration["vocabulary_candidate_count"]),
+            str(configuration["vocabulary_returned_neighbor_count"]),
+            str(minimum_separation),
+            *query_names,
+        ]
+    )
+    contract_lines = [
+        " ".join(
+            [
+                "EASYSPLAT_RETRIEVAL_OUTCOMES_V2",
+                "localSiftVocabularyV2",
+                str(query_stride),
+                str(configuration["vocabulary_candidate_count"]),
+                str(configuration["vocabulary_returned_neighbor_count"]),
+                str(minimum_separation),
+                str(len(query_names)),
+                request_digest,
+            ]
+        ),
+        *(
+            " ".join(
+                [
+                    "Q",
+                    outcome["status"],
+                    outcome["queryImageName"],
+                    str(len(outcome["rankedNeighborImageNames"])),
+                    *outcome["rankedNeighborImageNames"],
+                ]
+            )
+            for outcome in outcomes
+        ),
+        *(f"P {line}" for line in directed_lines),
+    ]
+    output_digest = evidence._canonical_string_digest(contract_lines)
+    worker = worker_execution_artifact(
+        configuration,
+        str(request["input_kind"]),
+        int(request["video_source_count"]),
+    )
+    invocation = copy.deepcopy(worker["vocabularyRetrievalInvocations"][0])
+    invocation["pairExecution"].update(
+        {
+            "retrievalRequestDigest": request_digest,
+            "retrievalOutputDigest": output_digest,
+        }
+    )
+    pairing_policy = {
+        "generic_continuous": "orderedContinuous",
+        "object_orbit": "orderedOrbit",
+        "walkthrough": "orderedWalkthrough",
+        "large_area": "orderedLargeArea",
+        "segmented_mixed": "segmentedMixed",
+        "unordered_exhaustive": "unorderedRetrieval",
+        "unordered_retrieval": "unorderedRetrieval",
+    }[configuration["pairing_policy"]]
+    return {
+        "retrievalAttemptOrdinal": 1,
+        "pairingPolicy": pairing_policy,
+        "planBinding": {
+            "pairingPolicy": pairing_policy,
+            "geometryBackend": "colmap",
+            "modelIdentifier": "none",
+            "temporalPairing": configuration["temporal_pairing"],
+            "temporalOffsets": configuration["temporal_offsets"],
+            "retrievalEngine": "localSiftVocabularyV2",
+            "retrievalCandidateCount": configuration["vocabulary_candidate_count"],
+            "retrievalNeighborCount": configuration[
+                "vocabulary_returned_neighbor_count"
+            ],
+            "retrievalQueryStride": query_stride,
+            "requiresCrossClipRetrieval": False,
+            "normalDescriptorMatcher": "faiss",
+            "cameraInitializationRecipe": "colmapAutomatic",
+            "runSeed": configuration["run_seed"],
+        },
+        "recoveryLevel": "normal",
+        "imageNames": image_names,
+        "groups": [
+            {
+                "imageNames": image_names,
+                "isVideo": int(request["video_source_count"]) == 1,
+            }
+        ],
+        "invocation": invocation,
+        "retrieval": {
+            "engine": "localSiftVocabularyV2",
+            "queryImageNames": query_names,
+            "queryStride": query_stride,
+            "candidateCount": configuration["vocabulary_candidate_count"],
+            "returnedNeighborCount": configuration[
+                "vocabulary_returned_neighbor_count"
+            ],
+            "minimumFrameSeparation": minimum_separation,
+            "queryOutcomes": outcomes,
+            "directedPairLines": directed_lines,
+            "outputDigest": output_digest,
+        },
+        "durationSeconds": 0.25,
+    }
+
+
+def colmap_runtime_closure_fixture() -> dict[str, object]:
+    components = [
+        {"toolchainRelativePath": "bin/colmap", "sha256": "0" * 64},
+        {"toolchainRelativePath": "lib/libomp.dylib", "sha256": "4" * 64},
+    ]
+    return {
+        "components": components,
+        "closureSHA256": evidence.colmap_runtime_closure_digest(
+            [
+                (component["toolchainRelativePath"], component["sha256"])
+                for component in components
+            ]
+        ),
+    }
+
+
 def worker_execution_artifact_name(run_id: str) -> str:
     digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:20]
     return f"worker_execution_{digest}"
 
 
 def worker_execution_artifact_path(run_id: str) -> str:
-    return f"worker-runs/{run_id}/SfM/worker_execution.json"
+    return (
+        f"worker-runs/{run_id}/project.easysplatproj/SfM/worker_execution.json"
+    )
 
 
 def geometry_manifest_artifact_name(run_id: str) -> str:
@@ -1426,7 +2461,225 @@ def geometry_manifest_artifact_name(run_id: str) -> str:
 
 
 def geometry_manifest_artifact_path(run_id: str) -> str:
-    return f"worker-runs/{run_id}/SfM/geometry_manifest.json"
+    return (
+        f"worker-runs/{run_id}/project.easysplatproj/SfM/geometry_manifest.json"
+    )
+
+
+def canonical_cameras_artifact_name(run_id: str) -> str:
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:20]
+    return f"canonical_cameras_{digest}"
+
+
+def canonical_cameras_artifact_path(run_id: str) -> str:
+    return (
+        f"worker-runs/{run_id}/project.easysplatproj/"
+        "SfM/colmap/sparse/0/cameras.txt"
+    )
+
+
+def fixture_selection_sources(
+    configuration: dict[str, object],
+    input_kind: str,
+    video_source_count: int,
+) -> evidence.SelectionManifestSources:
+    return selection_sources_for_request(
+        {
+            "binding": {"scale": int(configuration["selected_frame_count"])},
+            "input_kind": input_kind,
+            "video_source_count": video_source_count,
+        }
+    )
+
+
+def resolved_camera_model_fixture(configuration: dict[str, object]) -> str:
+    projection = configuration["lens_projection"]
+    if projection == "fisheye":
+        return "OPENCV_FISHEYE"
+    if projection == "perspective":
+        return (
+            "OPENCV"
+            if configuration["detail_profile"] == "high_detail"
+            else "SIMPLE_RADIAL"
+        )
+    return (
+        "OPENCV"
+        if configuration["detail_profile"] == "high_detail"
+        and configuration["capture_path"] in {"through_space", "large_area"}
+        else "SIMPLE_RADIAL"
+    )
+
+
+def resolved_camera_grouping_fixture(
+    configuration: dict[str, object],
+    input_kind: str,
+    selection: evidence.SelectionManifestSources,
+) -> str:
+    if configuration["camera_grouping"] == "same_camera_and_lens":
+        return "sameCameraAndLens"
+    return (
+        "sameCameraAndLens"
+        if input_kind == "video" and selection.video_source_count == 1
+        else "mixedCamerasOrLenses"
+    )
+
+
+def fixture_camera_count_after(
+    grouping: str,
+    selection: evidence.SelectionManifestSources,
+) -> int:
+    if grouping == "sameCameraAndLens":
+        return 1
+    video_groups = {
+        clip_id
+        for clip_id, source_kind in zip(
+            selection.clip_ids, selection.source_kinds, strict=True
+        )
+        if source_kind == "video"
+    }
+    # The fixture's photos share one complete synthetic EXIF signature, so
+    # COLMAP's automatic ImageReader legitimately reuses one photo camera.
+    photo_camera_count = 1 if "photo" in selection.source_kinds else 0
+    return len(video_groups) + photo_camera_count
+
+
+def canonical_cameras_fixture(
+    configuration: dict[str, object],
+    input_kind: str = "photos",
+    video_source_count: int = 0,
+) -> bytes:
+    selection = fixture_selection_sources(
+        configuration, input_kind, video_source_count
+    )
+    grouping = resolved_camera_grouping_fixture(
+        configuration, input_kind, selection
+    )
+    camera_count = fixture_camera_count_after(grouping, selection)
+    model = resolved_camera_model_fixture(configuration)
+    if model == "OPENCV_FISHEYE":
+        lines = [
+            f"{camera_id} OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0 0\n"
+            for camera_id in range(1, camera_count + 1)
+        ]
+    elif model == "OPENCV":
+        lines = [
+            f"{camera_id} OPENCV 64 64 50 50 32 32 0 0 0 0\n"
+            for camera_id in range(1, camera_count + 1)
+        ]
+    else:
+        lines = [
+            f"{camera_id} SIMPLE_RADIAL 64 64 50 32 32 0\n"
+            for camera_id in range(1, camera_count + 1)
+        ]
+    return ("# Camera list\n" + "".join(lines)).encode("ascii")
+
+
+def camera_grouping_receipt_fixture(
+    configuration: dict[str, object],
+    input_kind: str,
+    video_source_count: int,
+    selected_frame_count: int,
+) -> dict[str, object]:
+    selection = fixture_selection_sources(
+        configuration, input_kind, video_source_count
+    )
+    grouping = resolved_camera_grouping_fixture(
+        configuration, input_kind, selection
+    )
+    camera_count_after = fixture_camera_count_after(grouping, selection)
+    if grouping == "sameCameraAndLens":
+        return {
+            "mode": "allSelectedImagesShared",
+            "cameraCountBefore": selected_frame_count,
+            "cameraCountAfter": 1,
+            "groupedVideoSourceCount": selection.video_source_count,
+            "groups": [
+                {
+                    "sourceGroupID": "all-selected-images",
+                    "memberCount": selected_frame_count,
+                    "canonicalCameraID": 1,
+                }
+            ],
+        }
+    if "video" not in selection.source_kinds:
+        return {
+            "mode": "preserveExisting",
+            "cameraCountBefore": camera_count_after,
+            "cameraCountAfter": camera_count_after,
+            "groupedVideoSourceCount": 0,
+            "groups": [],
+        }
+    video_member_counts: dict[str, int] = {}
+    for clip_id, source_kind in zip(
+        selection.clip_ids, selection.source_kinds, strict=True
+    ):
+        if source_kind == "video":
+            video_member_counts[clip_id] = video_member_counts.get(clip_id, 0) + 1
+    return {
+        "mode": "videoSourceGroups",
+        "cameraCountBefore": selected_frame_count,
+        "cameraCountAfter": camera_count_after,
+        "groupedVideoSourceCount": len(video_member_counts),
+        "groups": [
+            {
+                "sourceGroupID": source_group_id,
+                "memberCount": video_member_counts[source_group_id],
+                "canonicalCameraID": index + 1,
+            }
+            for index, source_group_id in enumerate(sorted(video_member_counts))
+        ],
+    }
+
+
+def camera_initialization_receipt_fixture(
+    configuration: dict[str, object],
+    input_kind: str,
+    video_source_count: int,
+) -> dict[str, object]:
+    grouping = camera_grouping_receipt_fixture(
+        configuration,
+        input_kind,
+        video_source_count,
+        int(configuration["selected_frame_count"]),
+    )
+    camera_model = resolved_camera_model_fixture(configuration)
+    shared_fisheye = (
+        camera_model == "OPENCV_FISHEYE"
+        and grouping["mode"] == "allSelectedImagesShared"
+    )
+    if not shared_fisheye:
+        return {
+            "recipe": "colmapAutomatic",
+            "cameraModel": camera_model,
+            "singleCamera": grouping["mode"] == "allSelectedImagesShared",
+            "pixelWidth": None,
+            "pixelHeight": None,
+            "diagonalFieldOfViewDegrees": None,
+            "cameraParameters": None,
+            "priorFocalLength": False,
+        }
+    width = 512
+    height = 512
+    focal = math.hypot(width / 2, height / 2) / (75 * math.pi / 180)
+    return {
+        "recipe": "sharedOpenCVFisheyeEquidistantDiagonal150V1",
+        "cameraModel": "OPENCV_FISHEYE",
+        "singleCamera": True,
+        "pixelWidth": width,
+        "pixelHeight": height,
+        "diagonalFieldOfViewDegrees": 150.0,
+        "cameraParameters": [
+            focal,
+            focal,
+            width / 2,
+            height / 2,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        "priorFocalLength": True,
+    }
 
 
 def geometry_manifest_artifact(
@@ -1441,9 +2694,14 @@ def geometry_manifest_artifact(
 ) -> dict[str, object]:
     selected_frame_count = int(configuration["selected_frame_count"])
     ordered_names = [f"frame-{index:06d}.jpg" for index in range(selected_frame_count)]
-    retrieval_used = (
-        int(configuration["vocabulary_candidate_count"]) > 0
-        and int(configuration["vocabulary_verified_neighbor_count"]) > 0
+    requires_cross_clip_retrieval = fixture_requires_cross_clip_retrieval(
+        configuration,
+        input_kind,
+        video_source_count,
+    )
+    retrieval_used = evidence._retrieval_required_by_plan(
+        configuration,
+        total_view_count=selected_frame_count,
     )
     local_pair_count = sum(
         selected_frame_count - int(offset)
@@ -1495,17 +2753,129 @@ def geometry_manifest_artifact(
         "unordered_exhaustive": "unorderedRetrieval",
         "unordered_retrieval": "unorderedRetrieval",
     }[configuration["pairing_policy"]]
-    recovered_continuous_mapping = (
-        mapping_attempt_count > 1
-        and configuration["input_topology"] == "continuous"
-    )
+    recovered_mapping = mapping_attempt_count > 1
+    planned_cadence = {
+        "localMaxRefinements": configuration["ba_local_max_refinements"],
+        "globalFramesRatio": configuration["ba_global_frames_ratio"],
+        "globalPointsRatio": configuration["ba_global_points_ratio"],
+        "globalMaxRefinements": configuration["ba_global_max_refinements"],
+        "localMaxNumIterations": 10,
+        "localFunctionTolerance": 0.001,
+        "globalFunctionTolerance": 0.000001,
+        "localImageCount": 6,
+    }
+    accepted_cadence = {
+        **planned_cadence,
+        "localMaxRefinements": 2,
+        "globalFramesRatio": (
+            1.4 if configuration["input_topology"] == "continuous" else 1.1
+        ),
+        "globalPointsRatio": (
+            1.4 if configuration["input_topology"] == "continuous" else 1.1
+        ),
+    } if recovered_mapping else planned_cadence
+    canonical_model_hashes = {
+        "cameras.txt": hashlib.sha256(
+            canonical_cameras_fixture(
+                configuration, input_kind, video_source_count
+            )
+        ).hexdigest(),
+        "images.txt": "e" * 64,
+        "points3D.txt": "f" * 64,
+    }
+    point_count = selected_frame_count * 10
+    observation_count = point_count * 3
+    conditioning_measurement = {
+        "pointCount": point_count,
+        "observationCount": observation_count,
+        "positiveDepthObservationCount": observation_count,
+        "stronglyMeasuredViewCount": selected_frame_count,
+        "registeredViewCount": selected_frame_count,
+        "perViewObservationMinimum": 10,
+        "perViewObservationP10": 10,
+        "perViewObservationMedian": 10.0,
+        "perViewObservationP90": 10,
+        "distinctTrackLengthMinimum": 2,
+        "distinctTrackLengthP10": 2,
+        "distinctTrackLengthMedian": 3.0,
+        "distinctTrackLengthP90": 3,
+        "pointsAtLeast1Point5Degrees": point_count,
+        "pointsAtLeast2Degrees": point_count,
+        "pointsAtLeast3Degrees": point_count,
+        "observationsAtLeast1Point5Degrees": observation_count,
+        "observationsAtLeast2Degrees": observation_count,
+        "observationsAtLeast3Degrees": observation_count,
+        "medianObservedDepth": 10.0,
+        "cameraBaselineToMedianDepthRatio": 0.1,
+        "effectiveCameraCenterCount": selected_frame_count,
+        "largestCameraCenterClusterSize": 1,
+        "cameraCenterMergeToleranceToMedianDepthRatio": 1e-5,
+        "numericallyConditionedPointCount": point_count,
+        "numericallyConditionedObservationCount": observation_count,
+        "adaptiveParallaxThresholdMedianDegrees": 0.1,
+        "adaptiveParallaxThresholdP90Degrees": 0.2,
+        "cameraCenterEigenvalues": [0.1, 0.3, 0.6],
+        "pointEigenvalues": [0.1, 0.3, 0.6],
+        "cameraPairEvaluationCount": (
+            selected_frame_count * (selected_frame_count - 1) // 2
+        ),
+        "rayPairEvaluationCount": point_count,
+    }
     return {
         "schemaVersion": evidence.GEOMETRY_ARTIFACT_SCHEMA_VERSION,
+        "solverVersion": "colmap; COLMAP 4.1.1 (git benchma)",
+        "runtimeVersion": "toolchain 2.0.0",
+        "modelVersion": "none",
         "inputDigest": geometry_input_digest.removeprefix("sha256:"),
         "selectedFramesDigest": selected_frames_digest.removeprefix("sha256:"),
         "orderedImageNames": ordered_names,
-        "orderedImageTimestamps": [float(index) for index in range(selected_frame_count)],
+        "orderedImageTimestamps": [
+            float(index) for index in range(selected_frame_count)
+        ],
+        "sourceModelPath": "SfM/colmap/sparse/0",
+        "poseConvention": "world-to-camera",
+        "quaternionOrder": "wxyz",
+        "handedness": "right-handed",
+        "scaleType": "arbitrary-sim3",
+        "cameraModel": resolved_camera_model_fixture(configuration),
+        "cameraGrouping": resolved_camera_grouping_fixture(
+            configuration,
+            input_kind,
+            fixture_selection_sources(
+                configuration, input_kind, video_source_count
+            ),
+        ),
+        "registeredViewCount": selected_frame_count,
         "totalViewCount": selected_frame_count,
+        "observationCount": observation_count,
+        "pointCount": point_count,
+        "residualProvenance": "colmap-text-tracks-v1",
+        "medianPixelResidual": 0.25,
+        "p90PixelResidual": 0.5,
+        "conditioning": {
+            "schemaVersion": 2,
+            "measurementProvenance": "colmap-text-conditioning-v2",
+            "acceptancePolicy": "capture-agnostic-conditioning-v2",
+            "maximumRayPairEvaluations": 100_000_000,
+            "sourceModelClosureSHA256": evidence.geometry_model_closure_digest(
+                canonical_model_hashes
+            ),
+            "measurement": conditioning_measurement,
+        },
+        "timings": {"orientation_estimation_seconds": 0.001},
+        "peakMemoryBytes": 1_024,
+        "modelHashes": canonical_model_hashes,
+        "provenance": {
+            "toolchainVersion": "2.0.0",
+            "solver": {
+                "identifier": "colmap",
+                "version": "4.1.1",
+                "revision": "benchmark-fixture",
+                "payloadSHA256": colmap_runtime_closure_fixture()["closureSHA256"],
+            },
+            "runtime": None,
+            "model": None,
+        },
         "pairGraph": {
             "status": "measured",
             "measurement": {
@@ -1532,6 +2902,7 @@ def geometry_manifest_artifact(
                     {
                         "attemptNumber": 1,
                         "matcher": "faiss",
+                        "exactRecoveryReason": None,
                         "recoveryLevel": "normal",
                         "outcome": "completed",
                         "scheduledPairCount": scheduled_pair_count,
@@ -1546,6 +2917,8 @@ def geometry_manifest_artifact(
                 "matchingDatabaseDigest": "c" * 64,
                 "matchingDurationSeconds": matching_duration_seconds,
             },
+            "requiresCrossClipRetrieval": requires_cross_clip_retrieval,
+            "retrievalWasScheduled": retrieval_used,
             "usedLocalVocabularyRetrieval": retrieval_used,
         },
         "mapping": {
@@ -1557,27 +2930,15 @@ def geometry_manifest_artifact(
             "acceptedMappingAttemptOrdinal": mapping_attempt_count,
             "acceptedRefinementKind": "incrementalGlobal",
             "acceptedRefinementInvocationCount": 1,
-            "incrementalCadence": {
-                "localMaxRefinements": (
-                    2
-                    if recovered_continuous_mapping
-                    else configuration["ba_local_max_refinements"]
-                ),
-                "globalFramesRatio": (
-                    1.4
-                    if recovered_continuous_mapping
-                    else configuration["ba_global_frames_ratio"]
-                ),
-                "globalPointsRatio": (
-                    1.4
-                    if recovered_continuous_mapping
-                    else configuration["ba_global_points_ratio"]
-                ),
-                "globalMaxRefinements": configuration["ba_global_max_refinements"],
-                "localMaxNumIterations": 10,
-                "localFunctionTolerance": 0.001,
-                "globalFunctionTolerance": 0.000001,
-                "localImageCount": 6,
+            "plannedIncrementalCadence": planned_cadence,
+            "incrementalCadence": accepted_cadence,
+            "cadenceFallbackTrigger": (
+                "insufficientViewSupport" if recovered_mapping else None
+            ),
+            "canonicalModelPublication": {
+                "kind": "directText",
+                "sourceModelHashes": canonical_model_hashes,
+                "conversion": None,
             },
             "fallbackReason": (
                 "mapper_recovery" if mapping_attempt_count > 1 else None
@@ -1588,7 +2949,25 @@ def geometry_manifest_artifact(
             input_kind,
             video_source_count,
             mapping_attempt_count,
+            pair_list_digest,
+            scheduled_pair_count,
         ),
+        "canonicalOrientation": {
+            "status": "unresolved",
+            "canonicalOpeningViewDirection": {"x": 0.0, "y": 0.0, "z": 1.0},
+        },
+        "cameraGroupingReceipt": camera_grouping_receipt_fixture(
+            configuration,
+            input_kind,
+            video_source_count,
+            selected_frame_count,
+        ),
+        "cameraInitializationReceipt": camera_initialization_receipt_fixture(
+            configuration,
+            input_kind,
+            video_source_count,
+        ),
+        "featureDatabaseDigest": "b" * 64,
     }
 
 
@@ -1622,6 +3001,12 @@ def runtime_worker_evidence(
         "geometry_manifest_name": geometry_manifest_artifact_name(run_id),
         "geometry_manifest_sha256": evidence.sha256_bytes(
             evidence.canonical_json_bytes(geometry)
+        ),
+        "canonical_cameras_name": canonical_cameras_artifact_name(run_id),
+        "canonical_cameras_sha256": evidence.sha256_bytes(
+            canonical_cameras_fixture(
+                configuration, input_kind, video_source_count
+            )
         ),
         "geometry_input_digest": "sha256:" + geometry["inputDigest"],
         "selected_frames_digest": "sha256:" + geometry["selectedFramesDigest"],
@@ -1657,7 +3042,10 @@ def execution_receipts(
         "baseline": ["baseline://4f3c117", "baseline-toolchain://2.0.0"],
         "candidate": ["candidate://prepared-commit", "toolchain://resolved"],
         "fast_candidate": ["fast-candidate://prepared-commit", "toolchain://resolved"],
-        "accurate_reference": ["accurate-reference://full-ba-30k", "toolchain://resolved"],
+        "accurate_reference": [
+            "accurate-reference://full-ba-30k",
+            "toolchain://resolved",
+        ],
     }
     receipts = []
     cursor = 0.0
@@ -1665,20 +3053,44 @@ def execution_receipts(
     publishable_indices = [
         index
         for index, (phase, record) in enumerate(timing_records)
-        if phase in {"ordinary_runs", "candidate_runs"} and record["variant"] == "candidate"
+        if phase in {"ordinary_runs", "candidate_runs"}
+        and record["variant"] == "candidate"
     ]
     published_index = publishable_indices[-1]
     for record_index, (phase, record) in enumerate(timing_records):
         duration = float(record["end_to_end_seconds"])
         variant = str(record["variant"])
         published_output = record_index == published_index
+        mapper_history = mapper_invocations_for_variant(variant, request)
+        candidate_mapper = variant in {"candidate", "fast_candidate"}
         receipts.append(
             {
                 "run_id": record["run_id"],
                 "phase": phase.removesuffix("_runs"),
                 "variant": variant,
-                "argv": ["easysplat-benchmark", *prefixes[variant], "corpus://orbit-01"],
-                "mapper_invocations": mapper_invocations_for_variant(variant, request),
+                "argv": [
+                    "easysplat-benchmark",
+                    *prefixes[variant],
+                    "corpus://orbit-01",
+                ],
+                "mapper_invocations": mapper_history,
+                "planned_mapper_cadence": (
+                    mapper_history[0]["incremental_cadence"]
+                    if candidate_mapper
+                    else None
+                ),
+                "accepted_mapper_cadence": (
+                    mapper_history[-1]["incremental_cadence"]
+                    if candidate_mapper
+                    else None
+                ),
+                "cadence_fallback_trigger": (
+                    mapper_history[0]["evaluation"]["fallback_trigger"]
+                    if candidate_mapper
+                    and mapper_history[0]["incremental_cadence"]
+                    != mapper_history[-1]["incremental_cadence"]
+                    else None
+                ),
                 "runtime_worker_evidence": (
                     runtime_worker_evidence(
                         str(record["run_id"]),
@@ -1716,7 +3128,9 @@ def execution_receipts(
                 "output_sha256": (
                     evidence.sha256_bytes(VALID_SPLAT_PLY.encode("utf-8"))
                     if published_output
-                    else evidence.sha256_bytes(f"{lane}:{record['run_id']}".encode("utf-8"))
+                    else evidence.sha256_bytes(
+                        f"{lane}:{record['run_id']}".encode("utf-8")
+                    )
                 ),
                 "scene_id": request["binding"]["scene_id"],
                 "input_digest": request["binding"]["input_digest"],
@@ -1756,7 +3170,9 @@ def memory_observation(
                     "run_id": record["run_id"],
                     "elapsed_seconds": elapsed,
                     "process_tree_resident_bytes": rss,
-                    "metal_allocated_bytes": 0 if phase == "phase_runs" else 1_000_000_000,
+                    "metal_allocated_bytes": 0
+                    if phase == "phase_runs"
+                    else 1_000_000_000,
                 }
             )
     return {"sample_interval_seconds": interval, "samples": samples}
@@ -1774,6 +3190,9 @@ def invalid_execution_receipt(
             "variant": "candidate",
             "argv": ["candidate://invalid-input", "toolchain://current"],
             "mapper_invocations": [],
+            "planned_mapper_cadence": None,
+            "accepted_mapper_cadence": None,
+            "cadence_fallback_trigger": None,
             "runtime_worker_evidence": None,
             "started_monotonic_seconds": 0.0,
             "ended_monotonic_seconds": 1.0,
@@ -1943,22 +3362,15 @@ def raw_observations(
     request = request or evidence_request(lane=lane)
     configuration = request["candidate_run_configuration"]
     selected_frame_count = int(configuration["selected_frame_count"])
-    local_pair_count = sum(
-        selected_frame_count - int(offset)
-        for offset in configuration["temporal_offsets"]
-        if int(offset) < selected_frame_count
-    )
-    retrieval_used = (
-        int(configuration["vocabulary_candidate_count"]) > 0
-        and int(configuration["vocabulary_verified_neighbor_count"]) > 0
-    )
-    retrieval_pair_count = (
-        1 if retrieval_used and configuration["input_topology"] != "continuous" else 0
-    )
-    loop_pair_count = (
-        1 if retrieval_used and configuration["input_topology"] == "continuous" else 0
-    )
-    scheduled_pair_count = local_pair_count + retrieval_pair_count + loop_pair_count
+    protected_pair_list = fixture_pair_list_for_request(request)
+    role_counts = {
+        role: sum(pair["pair_type"] == role for pair in protected_pair_list["pairs"])
+        for role in ("local", "retrieval", "loop", "exhaustive")
+    }
+    local_pair_count = role_counts["local"]
+    retrieval_pair_count = role_counts["retrieval"] + role_counts["exhaustive"]
+    loop_pair_count = role_counts["loop"]
+    scheduled_pair_count = len(protected_pair_list["pairs"])
     timing = (
         paired_timing()
         if lane == evidence.LANE_REFERENCE
@@ -1974,6 +3386,7 @@ def raw_observations(
             "stderr_log": "stderr.log",
             "output_ply": "splat.ply",
             "training_manifest": "training-manifest.json",
+            "selection_manifest": "selection-manifest.json",
         },
         "commands": execution_receipts(timing, lane, request),
         "actual": successful_actual(),
@@ -1981,7 +3394,9 @@ def raw_observations(
             "git_commit": "4f3c11735ad15e1318ee2043ce351e185c225d30",
             "toolchain_identity": "sha256:bd32d5868c5cb6a06a2ae5822d87753f08daf050ea7299c9e373c174be49116b",
             "configuration_digest": benchmark.sha256_json(
-                valid_reference_config()["references"]["paired_baseline"]["run_configuration"]
+                valid_reference_config()["references"]["paired_baseline"][
+                    "run_configuration"
+                ]
             ),
         },
         "timing": timing,
@@ -2074,7 +3489,11 @@ def raw_observations(
                 ],
                 "pose": {
                     "absolute": [
-                        {"view_index": view_index, "candidate_ate": 1.0, "colmap_ate": 1.0}
+                        {
+                            "view_index": view_index,
+                            "candidate_ate": 1.0,
+                            "colmap_ate": 1.0,
+                        }
                         for view_index in range(30)
                     ],
                     "relative": [
@@ -2144,9 +3563,7 @@ def write_orientation_evidence_artifacts(
 ) -> None:
     timing = observations["timing"]
     candidate_runs = [
-        record
-        for record in timing["ordinary_runs"]
-        if record["variant"] == "candidate"
+        record for record in timing["ordinary_runs"] if record["variant"] == "candidate"
     ]
     published = [
         receipt
@@ -2175,72 +3592,30 @@ def write_orientation_evidence_artifacts(
             )
         ).encode("utf-8")
         candidate_images.write_bytes(candidate_data)
-        pipeline = observations["pipeline_metrics"]
-        status = pipeline["orientation_status"]
-        fixture_status = (
-            status
-            if status in {"verified", "axis_aligned_sign_unverified", "unresolved"}
-            else "verified"
+        command = next(
+            item for item in observations["commands"] if item["run_id"] == run_id
         )
-        manifest_status = {
-            "verified": "verified",
-            "axis_aligned_sign_unverified": "axisAlignedSignUnverified",
-            "unresolved": "unresolved",
-        }[fixture_status]
-        orientation: dict[str, object] = {"status": manifest_status}
-        if fixture_status != "unresolved":
-            error_degrees = float(
-                pipeline["orientation_physical_up_error_degrees"] or 0.0
-            )
-            half_angle = math.radians(error_degrees) / 2
-            orientation["sourceToCanonicalQuaternionWXYZ"] = {
-                "w": math.cos(half_angle),
-                "x": math.sin(half_angle),
-                "y": 0.0,
-                "z": 0.0,
-            }
-        geometry_manifest.write_bytes(
-            evidence.canonical_json_bytes(
-                {
-                    "canonicalOrientation": orientation,
-                    "handedness": "right-handed",
-                    "modelHashes": {
-                        "cameras.txt": "1" * 64,
-                        "images.txt": hashlib.sha256(candidate_data).hexdigest(),
-                        "points3D.txt": "2" * 64,
-                    },
-                    "mapping": {
-                        "acceptedRefinementInvocationCount": 1,
-                        "acceptedMappingAttemptOrdinal": 1,
-                        "acceptedRefinementKind": "incrementalGlobal",
-                        "attemptCount": 1,
-                        "incrementalCadence": {
-                            "globalFramesRatio": 1.4,
-                            "globalMaxRefinements": 5,
-                            "globalPointsRatio": 1.4,
-                            "localMaxRefinements": 2,
-                        },
-                        "largestModelRegisteredViewCount": 30,
-                        "modelCount": 1,
-                        "secondLargestModelRegisteredViewCount": 0,
-                        "unionRegisteredViewCount": 30,
-                    },
-                    "poseConvention": "world-to-camera",
-                    "quaternionOrder": "wxyz",
-                    "pairGraph": {
-                        "status": "measured",
-                        "measurement": {"fixture": True},
-                        "usedLocalVocabularyRetrieval": False,
-                    },
-                    "schemaVersion": evidence.GEOMETRY_ARTIFACT_SCHEMA_VERSION,
-                    "workerExecution": worker_execution_artifact(
-                        request["candidate_run_configuration"],
-                        str(request["input_kind"]),
-                    ),
-                }
-            )
-            + b"\n"
+        runtime = command["runtime_worker_evidence"]
+        authenticated_geometry_path = root / geometry_manifest_artifact_path(run_id)
+        authenticated_geometry = json.loads(
+            authenticated_geometry_path.read_text(encoding="utf-8")
         )
+        candidate_digest = hashlib.sha256(candidate_data).hexdigest()
+        authenticated_geometry["modelHashes"]["images.txt"] = candidate_digest
+        authenticated_geometry["mapping"]["canonicalModelPublication"][
+            "sourceModelHashes"
+        ]["images.txt"] = candidate_digest
+        authenticated_geometry["conditioning"]["sourceModelClosureSHA256"] = (
+            evidence.geometry_model_closure_digest(
+                authenticated_geometry["modelHashes"]
+            )
+        )
+        geometry_bytes = evidence.canonical_json_bytes(authenticated_geometry)
+        authenticated_geometry_path.write_bytes(geometry_bytes)
+        runtime["geometry_manifest_sha256"] = evidence.sha256_file(
+            authenticated_geometry_path
+        )
+        geometry_manifest.write_bytes(geometry_bytes)
         metrics = orientation_metrics_for_observations(observations, index * 0.01)
         metrics_path.write_bytes(evidence.canonical_json_bytes(metrics) + b"\n")
         stdout_path.write_text(f"orientation complete: {run_id}\n", encoding="utf-8")
@@ -2263,8 +3638,12 @@ def write_orientation_evidence_artifacts(
                     "extract-orientation",
                     "--geometry-manifest",
                     f"evidence://{(relative_root / 'geometry-manifest.json').as_posix()}",
+                    "--geometry-manifest-sha256",
+                    evidence.sha256_file(geometry_manifest),
                     "--candidate-images",
                     f"evidence://{(relative_root / 'candidate-images.txt').as_posix()}",
+                    "--candidate-images-sha256",
+                    evidence.sha256_file(candidate_images),
                     "--ground-truth-poses",
                     "evidence://ground-truth-poses.json",
                     "--ground-truth-poses-sha256",
@@ -2286,9 +3665,7 @@ def write_orientation_evidence_artifacts(
                     relative_root / "geometry-manifest.json"
                 ).as_posix(),
                 "geometry_manifest_sha256": evidence.sha256_file(geometry_manifest),
-                "metrics_path": (
-                    relative_root / "orientation-metrics.json"
-                ).as_posix(),
+                "metrics_path": (relative_root / "orientation-metrics.json").as_posix(),
                 "metrics_sha256": evidence.sha256_file(metrics_path),
                 "run_id": run_id,
                 "started_monotonic_seconds": float(index),
@@ -2341,18 +3718,136 @@ def write_orientation_evidence_artifacts(
     )
 
 
+def training_resource_admission_for_configuration(
+    candidate_configuration: dict[str, object],
+) -> dict[str, object]:
+    gibibyte = 1_073_741_824
+    mebibyte = 1_048_576
+    installed_bytes = 48 * gibibyte
+    kernel_available_percentage = 81
+    available_bytes = (installed_bytes // 100) * kernel_available_percentage + (
+        installed_bytes % 100
+    ) * kernel_available_percentage // 100
+    metal_recommended_bytes = 40 * gibibyte
+    metal_allocated_bytes = 2 * gibibyte
+    page_size_bytes = 16_384
+    resource_policy = {
+        "automatic": "automatic",
+        "conserve_memory": "conserveMemory",
+        "maximum_performance": "maximumPerformance",
+    }[str(candidate_configuration["resource_policy"])]
+
+    def scaled(value: int, numerator: int, denominator: int) -> int:
+        return (value // denominator) * numerator + (
+            value % denominator
+        ) * numerator // denominator
+
+    policy_headroom_bytes = min(
+        installed_bytes,
+        max(2 * gibibyte, installed_bytes // 20),
+    )
+    policy_base_bytes = max(0, installed_bytes - policy_headroom_bytes)
+    effective_policy = resource_policy
+    if (
+        resource_policy == "maximumPerformance"
+        and installed_bytes <= 33 * gibibyte // 2
+    ):
+        effective_policy = "automatic"
+    policy_scale = {
+        "conserveMemory": (3, 5),
+        "automatic": (9, 10),
+        "maximumPerformance": (49, 50),
+    }[effective_policy]
+    policy_capacity_bytes = scaled(policy_base_bytes, *policy_scale)
+    if installed_bytes <= 33 * gibibyte // 2:
+        policy_capacity_bytes = min(policy_capacity_bytes, 12 * gibibyte)
+
+    host_headroom_bytes = min(
+        available_bytes,
+        max(2 * gibibyte, installed_bytes // 20),
+    )
+    host_capacity_bytes = available_bytes - host_headroom_bytes
+    metal_headroom_bytes = min(
+        metal_recommended_bytes,
+        max(512 * mebibyte, metal_recommended_bytes // 20),
+    )
+    metal_capacity_bytes = max(
+        0,
+        metal_recommended_bytes - metal_allocated_bytes - metal_headroom_bytes,
+    )
+    allowed_trainer_bytes = min(
+        policy_capacity_bytes,
+        host_capacity_bytes,
+        metal_capacity_bytes,
+    )
+    return {
+        "schema_version": 2,
+        "observation": {
+            "clock": {
+                "wall_clock": 742_927_367.0,
+                "monotonic_ticks": 123_456_789,
+                "mach_timebase_numerator": 125,
+                "mach_timebase_denominator": 3,
+                "boot_time_seconds": 1_721_200_000,
+                "boot_time_microseconds": 123_456,
+            },
+            "installed_memory_bytes": installed_bytes,
+            "available_host_memory_bytes": available_bytes,
+            "available_host_memory_source": "kernel_memorystatus_percentage",
+            "kernel_available_memory_percentage": kernel_available_percentage,
+            "host_pages": {
+                "page_size_bytes": page_size_bytes,
+                "free_page_count": 30 * gibibyte // page_size_bytes,
+                "inactive_page_count": 0,
+                "speculative_page_count": 0,
+                "purgeable_page_count": 4,
+                "compressed_page_count": 5,
+            },
+            "memory_pressure": "normal",
+            "memory_pressure_source": "kernel_memorystatus",
+            "metal_recommended_working_set_bytes": metal_recommended_bytes,
+            "metal_current_allocated_bytes": metal_allocated_bytes,
+        },
+        "resource_policy": resource_policy,
+        "policy_headroom_bytes": policy_headroom_bytes,
+        "policy_capacity_bytes": policy_capacity_bytes,
+        "host_headroom_bytes": host_headroom_bytes,
+        "host_capacity_bytes": host_capacity_bytes,
+        "metal_headroom_bytes": metal_headroom_bytes,
+        "metal_capacity_bytes": metal_capacity_bytes,
+        "allowed_trainer_bytes": allowed_trainer_bytes,
+    }
+
+
 def training_manifest_for_observations(
     observations: dict[str, object],
     candidate_configuration: dict[str, object],
 ) -> dict[str, object]:
     pipeline = observations["pipeline_metrics"]
     return {
-        "schemaVersion": 5,
+        "schemaVersion": 7,
         "trainerVersion": "1.1.3 (git 106499b)",
         "runtimeVersion": "native-metal-cli-v2",
         "trainerBuildDigest": "3" * 64,
         "inputDigest": "1" * 64,
         "geometryDigest": "2" * 64,
+        "datasetDerivation": {
+            "schemaVersion": 1,
+            "sourceGeometryManifestSHA256": "4" * 64,
+            "sourceSelectedFramesDigest": "5" * 64,
+            "preparationKind": "direct",
+            "maximumImageDimension": 1_600,
+            "toolchainVersion": "test-toolchain",
+            "colmapProvenance": {
+                "identifier": "colmap",
+                "version": "3.13.0",
+                "revision": "test-revision",
+                "payloadSHA256": "6" * 64,
+            },
+            "registeredImageNames": ["frame-000000.jpg"],
+            "datasetInputDigest": "1" * 64,
+            "datasetGeometryDigest": "2" * 64,
+        },
         "detailProfile": candidate_configuration["detail_profile"],
         "iterationLimit": candidate_configuration["trainer_iterations"],
         "plateauWindow": candidate_configuration["trainer_plateau_window"],
@@ -2365,6 +3860,9 @@ def training_manifest_for_observations(
         "elapsedSeconds": 5.0,
         "peakMemoryBytes": 536_870_912,
         "memoryBudgetBytes": 8_589_934_592,
+        "resourceAdmission": training_resource_admission_for_configuration(
+            candidate_configuration
+        ),
         "rasterFallbackCount": pipeline["raster_fallback_count"],
         "rasterExactFallbackElapsedSeconds": pipeline[
             "raster_exact_fallback_elapsed_seconds"
@@ -2403,9 +3901,7 @@ def write_evidence_artifacts(
     else:
         artifact_request = render_request
     candidate_configuration = artifact_request["candidate_run_configuration"]
-    protected_pair_list = fixture_pair_list_for_configuration(
-        candidate_configuration
-    )
+    protected_pair_list = fixture_pair_list_for_request(artifact_request)
     protected_pair_list_digest = fixture_pair_plan_digest(protected_pair_list)
     for receipt in observations["commands"]:
         if receipt.get("variant") not in {"candidate", "fast_candidate"}:
@@ -2432,9 +3928,7 @@ def write_evidence_artifacts(
             )
         mapper_history = receipt.get("mapper_invocations")
         mapping_attempt_count = (
-            max(1, len(mapper_history))
-            if isinstance(mapper_history, list)
-            else 1
+            max(1, len(mapper_history)) if isinstance(mapper_history, list) else 1
         )
         artifact_path = worker_execution_artifact_path(run_id)
         output = root / artifact_path
@@ -2446,6 +3940,8 @@ def write_evidence_artifacts(
                     str(artifact_request["input_kind"]),
                     int(artifact_request["video_source_count"]),
                     mapping_attempt_count,
+                    protected_pair_list_digest.removeprefix("sha256:"),
+                    int(observations["pipeline_metrics"]["scheduled_pairs"]),
                 )
             )
         )
@@ -2461,11 +3957,13 @@ def write_evidence_artifacts(
                 geometry_manifest_artifact(
                     configuration,
                     str(artifact_request["input_kind"]),
-                    str(artifact_request["reference_artifacts"]["geometry_input_digest"]),
                     str(
-                        artifact_request["reference_artifacts"]["selected_frames_digests"][
-                            receipt["variant"]
-                        ]
+                        artifact_request["reference_artifacts"]["geometry_input_digest"]
+                    ),
+                    str(
+                        artifact_request["reference_artifacts"][
+                            "selected_frames_digests"
+                        ][receipt["variant"]]
                     ),
                     int(artifact_request["video_source_count"]),
                     observations["pipeline_metrics"],
@@ -2477,6 +3975,22 @@ def write_evidence_artifacts(
         runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_file(
             geometry_output
         )
+        cameras_name = runtime_receipt.get("canonical_cameras_name")
+        if isinstance(cameras_name, str):
+            cameras_path = canonical_cameras_artifact_path(run_id)
+            cameras_output = root / cameras_path
+            cameras_output.parent.mkdir(parents=True, exist_ok=True)
+            cameras_output.write_bytes(
+                canonical_cameras_fixture(
+                    configuration,
+                    str(artifact_request["input_kind"]),
+                    int(artifact_request["video_source_count"]),
+                )
+            )
+            runtime_receipt["canonical_cameras_sha256"] = evidence.sha256_file(
+                cameras_output
+            )
+            observations["artifacts"][cameras_name] = cameras_path
         if isinstance(mapper_history, list):
             for mapper_invocation in mapper_history:
                 if (
@@ -2494,9 +4008,8 @@ def write_evidence_artifacts(
         ("splat.ply", VALID_SPLAT_PLY),
     ):
         (root / name).write_text(content, encoding="utf-8")
-    if (
-        "pipeline_metrics" in observations
-        and "output_ply" in observations.get("artifacts", {})
+    if "pipeline_metrics" in observations and "output_ply" in observations.get(
+        "artifacts", {}
     ):
         (root / "training-manifest.json").write_bytes(
             evidence.canonical_json_bytes(
@@ -2519,12 +4032,6 @@ def write_evidence_artifacts(
     (root / "large-area-toolchain-state.json").write_bytes(
         evidence.canonical_json_bytes(TEST_LARGE_AREA_TOOLCHAIN_STATE) + b"\n"
     )
-    (root / "command.jsonl").write_bytes(
-        b"".join(
-            evidence.canonical_json_bytes(receipt) + b"\n"
-            for receipt in observations["commands"]
-        )
-    )
     (root / "host-monitor.json").write_bytes(FIXTURE_HOST_MONITOR)
     (root / "supervisor-run.json").write_bytes(
         evidence.canonical_json_bytes(supervisor_run(observations)) + b"\n"
@@ -2535,13 +4042,19 @@ def write_evidence_artifacts(
                 evidence.canonical_json_bytes(record) + b"\n"
                 for record in observations["toolchain_scenarios"]
             )
-            )
+        )
     if "registration" in observations:
         write_orientation_evidence_artifacts(
             root,
             observations,
             artifact_request,
         )
+    (root / "command.jsonl").write_bytes(
+        b"".join(
+            evidence.canonical_json_bytes(receipt) + b"\n"
+            for receipt in observations["commands"]
+        )
+    )
     if (
         "registration" in observations
         and observations.get("artifacts", {}).get("rendering_manifest")
@@ -2579,7 +4092,9 @@ def write_evidence_artifacts(
             source_path = Path(preparation_view["source"]["path"])
             (root / source_path).parent.mkdir(parents=True, exist_ok=True)
             (root / source_path).write_bytes(ground_truth)
-            ground_truth_path = Path("rendering/ground-truth") / f"{holdout_index:06d}.png"
+            ground_truth_path = (
+                Path("rendering/ground-truth") / f"{holdout_index:06d}.png"
+            )
             (root / ground_truth_path).parent.mkdir(parents=True, exist_ok=True)
             (root / ground_truth_path).write_bytes(ground_truth)
             camera = fixture_render_camera(holdout_index)
@@ -2671,9 +4186,9 @@ def write_evidence_artifacts(
             "pixel_format": "png_rgb8",
             "renderer_closure_sha256": renderer_closure_digest,
             "renderer_executable_sha256": renderer_digest,
-            "ground_truth_preparation_sha256": render_request[
-                "reference_artifacts"
-            ]["ground_truth_preparation_sha256"],
+            "ground_truth_preparation_sha256": render_request["reference_artifacts"][
+                "ground_truth_preparation_sha256"
+            ],
             "render_operations": render_operations,
             "views": manifest_views,
         }
@@ -2690,12 +4205,14 @@ def write_evidence_artifacts(
             "lane": render_request["binding"]["lane"],
             "request_sha256": manifest["request_digest"],
             "candidate_checkout_commit": render_request["binding"]["git_commit"],
-            "baseline_checkout_commit": render_request["binding"]["baseline_git_commit"],
+            "baseline_checkout_commit": render_request["binding"][
+                "baseline_git_commit"
+            ],
             "renderer_closure_sha256": renderer_identity["sha256"],
             "renderer_executable_sha256": renderer_identity["executable_sha256"],
-            "ground_truth_preparation_sha256": render_request[
-                "reference_artifacts"
-            ]["ground_truth_preparation_sha256"],
+            "ground_truth_preparation_sha256": render_request["reference_artifacts"][
+                "ground_truth_preparation_sha256"
+            ],
             "job_sha256": evidence.sha256_file(root / "render-job.json"),
             "manifest_sha256": evidence.sha256_file(root / "rendering-manifest.json"),
             "stdout_sha256": evidence.sha256_file(root / "renderer-stdout.log"),
@@ -2723,10 +4240,16 @@ def write_evidence_artifacts(
         )
     for _, (name, content) in REFERENCE_ARTIFACT_CONTENTS.items():
         (root / name).write_bytes(content)
+    if artifact_request["expected_outcome"]["kind"] == "valid":
+        (root / "selection-manifest.json").write_bytes(
+            fixture_selection_manifest_for_request(artifact_request)
+        )
     (root / "pair-list.json").write_bytes(
         evidence.canonical_json_bytes(protected_pair_list) + b"\n"
     )
-    (root / "observations.json").write_bytes(evidence.canonical_json_bytes(observations) + b"\n")
+    (root / "observations.json").write_bytes(
+        evidence.canonical_json_bytes(observations) + b"\n"
+    )
 
 
 def rewrite_worker_execution_artifact(
@@ -2755,6 +4278,11 @@ def rewrite_worker_execution_artifact(
         runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
             geometry_bytes
         )
+        synchronize_orientation_geometry_copy(
+            root,
+            receipt,
+            geometry_bytes,
+        )
     (root / "command.jsonl").write_bytes(
         b"".join(
             evidence.canonical_json_bytes(command) + b"\n"
@@ -2764,6 +4292,33 @@ def rewrite_worker_execution_artifact(
     (root / "observations.json").write_bytes(
         evidence.canonical_json_bytes(observations) + b"\n"
     )
+
+
+def synchronize_orientation_geometry_copy(
+    root: Path,
+    receipt: dict[str, object],
+    geometry_bytes: bytes,
+) -> None:
+    if receipt.get("phase") != "ordinary" or receipt.get("variant") != "candidate":
+        return
+    run_id = receipt["run_id"]
+    orientation_path = root / "orientation-runs" / run_id / "geometry-manifest.json"
+    supervisor_path = root / "orientation-supervisor.json"
+    if not orientation_path.is_file() or not supervisor_path.is_file():
+        return
+    orientation_path.write_bytes(geometry_bytes)
+    supervisor = json.loads(supervisor_path.read_text(encoding="utf-8"))
+    orientation_receipt = next(
+        item for item in supervisor["runs"] if item["run_id"] == run_id
+    )
+    orientation_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
+        geometry_bytes
+    )
+    orientation_argv = orientation_receipt["argv"]
+    orientation_argv[
+        orientation_argv.index("--geometry-manifest-sha256") + 1
+    ] = orientation_receipt["geometry_manifest_sha256"]
+    supervisor_path.write_bytes(evidence.canonical_json_bytes(supervisor) + b"\n")
 
 
 def rewrite_geometry_manifest_artifact(
@@ -2780,6 +4335,71 @@ def rewrite_geometry_manifest_artifact(
     artifact_bytes = evidence.canonical_json_bytes(artifact)
     artifact_path.write_bytes(artifact_bytes)
     runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(artifact_bytes)
+    synchronize_orientation_geometry_copy(root, receipt, artifact_bytes)
+    (root / "command.jsonl").write_bytes(
+        b"".join(
+            evidence.canonical_json_bytes(command) + b"\n"
+            for command in observations["commands"]
+        )
+    )
+    (root / "observations.json").write_bytes(
+        evidence.canonical_json_bytes(observations) + b"\n"
+    )
+
+
+def rewrite_candidate_as_seeded_route(
+    root: Path,
+    observations: dict[str, object],
+    candidate: dict[str, object],
+    geometry_mutation: Callable[[dict[str, object]], None] | None = None,
+) -> None:
+    runtime_receipt = candidate["runtime_worker_evidence"]
+    worker_path = root / observations["artifacts"][runtime_receipt["artifact_name"]]
+    geometry_path = (
+        root / observations["artifacts"][runtime_receipt["geometry_manifest_name"]]
+    )
+    worker = json.loads(worker_path.read_text(encoding="utf-8"))
+    template = worker["mappingAndRefinementInvocations"][0]
+    worker["vocabularyRetrievalInvocations"] = []
+    worker["mappingAndRefinementInvocations"] = [
+        {**template, "command": command, "mapperExecution": None}
+        for command in ("pointTriangulator", "bundleAdjuster", "modelAnalyzer")
+    ]
+    geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+    geometry["mapping"].update(
+        {
+            "acceptedRefinementKind": "seededBundleAdjustment",
+            "acceptedRefinementInvocationCount": 1,
+            "plannedIncrementalCadence": None,
+            "incrementalCadence": None,
+            "cadenceFallbackTrigger": None,
+        }
+    )
+    geometry["pairGraph"].update(
+        {
+            "status": "notEvaluated",
+            "measurement": None,
+            "requiresCrossClipRetrieval": False,
+            "retrievalWasScheduled": False,
+            "usedLocalVocabularyRetrieval": False,
+        }
+    )
+    if geometry_mutation is not None:
+        geometry_mutation(geometry)
+    geometry["workerExecution"] = worker
+    worker_bytes = evidence.canonical_json_bytes(worker)
+    geometry_bytes = evidence.canonical_json_bytes(geometry)
+    worker_path.write_bytes(worker_bytes)
+    geometry_path.write_bytes(geometry_bytes)
+    runtime_receipt["artifact_sha256"] = evidence.sha256_bytes(worker_bytes)
+    runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
+        geometry_bytes
+    )
+    synchronize_orientation_geometry_copy(root, candidate, geometry_bytes)
+    candidate["mapper_invocations"] = []
+    candidate["planned_mapper_cadence"] = None
+    candidate["accepted_mapper_cadence"] = None
+    candidate["cadence_fallback_trigger"] = None
     (root / "command.jsonl").write_bytes(
         b"".join(
             evidence.canonical_json_bytes(command) + b"\n"
@@ -2826,16 +4446,28 @@ def external_envelope(
 
 class ConfigurationValidationTests(unittest.TestCase):
     def test_tracked_release_contract_is_valid_and_complete(self) -> None:
-        corpus = json.loads((ROOT / "scripts/benchmark/corpus.json").read_text(encoding="utf-8"))
-        config = json.loads((ROOT / "scripts/benchmark/reference-config.json").read_text(encoding="utf-8"))
+        corpus = json.loads(
+            (ROOT / "scripts/benchmark/corpus.json").read_text(encoding="utf-8")
+        )
+        config = json.loads(
+            (ROOT / "scripts/benchmark/reference-config.json").read_text(
+                encoding="utf-8"
+            )
+        )
         benchmark.validate_corpus(corpus, expected_profile="release")
         benchmark.validate_reference_config(config)
         self.assertEqual(config["schema_version"], 2)
-        baseline_configuration = config["references"]["paired_baseline"]["run_configuration"]
+        baseline_configuration = config["references"]["paired_baseline"][
+            "run_configuration"
+        ]
         self.assertEqual(baseline_configuration["run_seed"], 42)
         self.assertNotIn("deterministic_seed", baseline_configuration)
-        self.assertTrue(config["thresholds"]["stability"]["durable_state_recovery_required"])
-        self.assertNotIn("deterministic_restart_required", config["thresholds"]["stability"])
+        self.assertTrue(
+            config["thresholds"]["stability"]["durable_state_recovery_required"]
+        )
+        self.assertNotIn(
+            "deterministic_restart_required", config["thresholds"]["stability"]
+        )
         self.assertEqual(len(corpus["scenes"]), 26)
         contract = benchmark.benchmark_contract(corpus)
         self.assertEqual(len(contract["scenes"]), 26)
@@ -2855,7 +4487,9 @@ class ConfigurationValidationTests(unittest.TestCase):
         changed_contract["scenes"][0]["aggregate_scale"] = 120
         with self.assertRaisesRegex(benchmark.ConfigError, "public structure"):
             benchmark.validate_tracked_benchmark_contract(changed_contract)
-        self.assertTrue(all(scene["input"]["supplied"] is False for scene in corpus["scenes"]))
+        self.assertTrue(
+            all(scene["input"]["supplied"] is False for scene in corpus["scenes"])
+        )
         self.assertTrue(
             all(
                 scene["reference"]
@@ -2881,7 +4515,10 @@ class ConfigurationValidationTests(unittest.TestCase):
             "release slots must distinguish pending splits from invalid-scene nonrequirements",
         )
         self.assertTrue(
-            all(scene["adapter"]["type"] == "protected-evidence" for scene in corpus["scenes"]),
+            all(
+                scene["adapter"]["type"] == "protected-evidence"
+                for scene in corpus["scenes"]
+            ),
             "release slots must never use a metrics fixture or geometry-only adapter",
         )
         self.assertEqual(
@@ -2910,7 +4547,12 @@ class ConfigurationValidationTests(unittest.TestCase):
 
     def test_capture_traits_are_closed_sorted_and_nonempty(self) -> None:
         corpus = valid_corpus()
-        for replacement in ([], ["ordered", "ordered"], ["unordered", "ordered"], ["unknown"]):
+        for replacement in (
+            [],
+            ["ordered", "ordered"],
+            ["unordered", "ordered"],
+            ["unknown"],
+        ):
             corpus["scenes"][0]["capture_traits"] = replacement
             with self.subTest(replacement=replacement):
                 with self.assertRaisesRegex(benchmark.ConfigError, "capture_traits"):
@@ -2919,12 +4561,31 @@ class ConfigurationValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(benchmark.ConfigError, "capture_traits"):
             benchmark.validate_corpus(corpus, expected_profile="smoke")
 
+    def test_pinned_scene_quality_references_require_a_safe_artifact_root(self) -> None:
+        corpus = valid_corpus()
+        del corpus["scenes"][0]["reference"]["by_scale"]["30"]["artifact_path"]
+        with self.assertRaisesRegex(benchmark.ConfigError, "artifact_path"):
+            benchmark.validate_corpus(corpus, expected_profile="smoke")
+
+        corpus = valid_corpus()
+        corpus["scenes"][0]["reference"]["by_scale"]["30"]["artifact_path"] = (
+            "../escape"
+        )
+        with self.assertRaisesRegex(benchmark.ConfigError, "artifact_path"):
+            benchmark.validate_corpus(corpus, expected_profile="smoke")
+
     def test_large_area_release_slots_cover_ground_route_aerial_and_nadir(self) -> None:
         corpus = release_corpus()
         benchmark.validate_corpus(corpus, expected_profile="release")
-        large_area = [scene for scene in corpus["scenes"] if scene["category"] == "large_area_exterior"]
+        large_area = [
+            scene
+            for scene in corpus["scenes"]
+            if scene["category"] == "large_area_exterior"
+        ]
         self.assertEqual(len(large_area), 4)
-        self.assertTrue(all(scene["input"]["supplied"] is False for scene in large_area))
+        self.assertTrue(
+            all(scene["input"]["supplied"] is False for scene in large_area)
+        )
         self.assertEqual(
             [scene["capture_traits"] for scene in large_area],
             [
@@ -2971,7 +4632,9 @@ class ConfigurationValidationTests(unittest.TestCase):
     def test_release_manifest_cannot_omit_core_or_suite_level_gates(self) -> None:
         corpus = release_corpus()
         valid_scene_entry = next(
-            scene for scene in corpus["scenes"] if scene["expected_outcome"] == {"kind": "valid"}
+            scene
+            for scene in corpus["scenes"]
+            if scene["expected_outcome"] == {"kind": "valid"}
         )
         valid_scene_entry["gate_scopes"] = sorted(
             set(valid_scene_entry["gate_scopes"]) - {"scene_quality"}
@@ -2980,8 +4643,12 @@ class ConfigurationValidationTests(unittest.TestCase):
             benchmark.validate_corpus(corpus, expected_profile="release")
 
         corpus = release_corpus()
-        long_scene = next(scene for scene in corpus["scenes"] if 3000 in scene["scale_lanes"])
-        long_scene["gate_scopes"] = sorted(set(long_scene["gate_scopes"]) - {"long_sequence"})
+        long_scene = next(
+            scene for scene in corpus["scenes"] if 3000 in scene["scale_lanes"]
+        )
+        long_scene["gate_scopes"] = sorted(
+            set(long_scene["gate_scopes"]) - {"long_sequence"}
+        )
         with self.assertRaisesRegex(benchmark.ConfigError, "long_sequence"):
             benchmark.validate_corpus(corpus, expected_profile="release")
 
@@ -2991,9 +4658,12 @@ class ConfigurationValidationTests(unittest.TestCase):
                 scene["gate_scopes"] = [
                     scope for scope in scene["gate_scopes"] if scope != required_scope
                 ]
-            with self.subTest(required_scope=required_scope), self.assertRaisesRegex(
-                benchmark.ConfigError,
-                required_scope,
+            with (
+                self.subTest(required_scope=required_scope),
+                self.assertRaisesRegex(
+                    benchmark.ConfigError,
+                    required_scope,
+                ),
             ):
                 benchmark.validate_corpus(corpus, expected_profile="release")
 
@@ -3005,7 +4675,9 @@ class ConfigurationValidationTests(unittest.TestCase):
             baseline["git_commit"],
             "4f3c11735ad15e1318ee2043ce351e185c225d30",
         )
-        self.assertEqual(baseline["run_configuration"]["descriptor_matcher"], "exact_cpu_brute_force")
+        self.assertEqual(
+            baseline["run_configuration"]["descriptor_matcher"], "exact_cpu_brute_force"
+        )
         self.assertEqual(baseline["run_configuration"]["mapper"], "incremental")
         self.assertEqual(
             baseline["run_configuration"]["bundle_adjustment_max_iterations"],
@@ -3022,12 +4694,16 @@ class ConfigurationValidationTests(unittest.TestCase):
                 with self.assertRaisesRegex(benchmark.ConfigError, "paired_baseline"):
                     benchmark.validate_reference_config(changed)
         changed = valid_reference_config()
-        changed["references"]["paired_baseline"]["run_configuration"]["descriptor_matcher"] = "faiss"
+        changed["references"]["paired_baseline"]["run_configuration"][
+            "descriptor_matcher"
+        ] = "faiss"
         with self.assertRaisesRegex(benchmark.ConfigError, "paired_baseline"):
             benchmark.validate_reference_config(changed)
 
     def test_result_schema_closes_top_level_and_scene_contracts(self) -> None:
-        schema = json.loads((ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8"))
+        schema = json.loads(
+            (ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8")
+        )
         self.assertEqual(schema["properties"]["schema_version"], {"const": 2})
         self.assertIs(schema["additionalProperties"], False)
         self.assertIs(schema["$defs"]["sceneResult"]["additionalProperties"], False)
@@ -3084,11 +4760,18 @@ class ConfigurationValidationTests(unittest.TestCase):
         ):
             self.assertNotIn(name, schema["$defs"]["metrics"]["properties"])
         evidence_schema = json.loads(
-            (ROOT / "scripts/benchmark/evidence.schema.json").read_text(encoding="utf-8")
+            (ROOT / "scripts/benchmark/evidence.schema.json").read_text(
+                encoding="utf-8"
+            )
         )
-        self.assertEqual(evidence_schema["properties"]["schema_version"], {"const": 7})
+        self.assertEqual(evidence_schema["properties"]["schema_version"], {"const": 13})
         self.assertIs(evidence_schema["additionalProperties"], False)
-        self.assertIs(evidence_schema["properties"]["artifacts"]["additionalProperties"]["additionalProperties"], False)
+        self.assertIs(
+            evidence_schema["properties"]["artifacts"]["additionalProperties"][
+                "additionalProperties"
+            ],
+            False,
+        )
         self.assertIn("measurement_runner", evidence_schema["required"])
         self.assertIn("gate_scopes", evidence_schema["required"])
         cpu_schema = evidence_schema["properties"]["commands"]["items"]["properties"][
@@ -3096,27 +4779,36 @@ class ConfigurationValidationTests(unittest.TestCase):
         ]["properties"]
         self.assertEqual(cpu_schema["user"]["maximum"], (1 << 64) - 1)
         self.assertEqual(cpu_schema["system"]["maximum"], (1 << 64) - 1)
-        self.assertIn("measurement_runner", schema["$defs"]["evidenceRecord"]["required"])
+        self.assertIn(
+            "measurement_runner", schema["$defs"]["evidenceRecord"]["required"]
+        )
         self.assertIn(
             "collector_status_digest",
             schema["$defs"]["evidenceRecord"]["required"],
         )
         self.assertEqual(
             schema["$defs"]["producer"]["properties"]["protocol_version"],
-            {"const": 8},
+            {"const": evidence.PROTOCOL_VERSION},
         )
         self.assertEqual(
             schema["$defs"]["producer"]["properties"]["version"],
-            {"const": "8.0.0"},
+            {"const": evidence.PRODUCER_VERSION},
         )
 
     def test_result_schema_reserves_exit_code_130_for_cancellation(self) -> None:
-        schema = json.loads((ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8"))
+        schema = json.loads(
+            (ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8")
+        )
         exit_rules = schema["$defs"]["sceneResult"]["properties"]["exit"]["allOf"]
         self.assertIn(
             {
                 "if": {"properties": {"code": {"const": 130}}, "required": ["code"]},
-                "then": {"properties": {"reason": {"const": "cancelled"}, "cancelled": {"const": True}}},
+                "then": {
+                    "properties": {
+                        "reason": {"const": "cancelled"},
+                        "cancelled": {"const": True},
+                    }
+                },
             },
             exit_rules,
         )
@@ -3159,9 +4851,12 @@ class ConfigurationValidationTests(unittest.TestCase):
         cases.append((missing_consent, "documented consent requires"))
 
         for corpus, expected in cases:
-            with self.subTest(expected=expected), self.assertRaisesRegex(
-                benchmark.ConfigError,
-                expected,
+            with (
+                self.subTest(expected=expected),
+                self.assertRaisesRegex(
+                    benchmark.ConfigError,
+                    expected,
+                ),
             ):
                 benchmark.validate_corpus(corpus, expected_profile="smoke")
 
@@ -3294,7 +4989,9 @@ class GateEvaluationTests(unittest.TestCase):
 
     def test_every_threshold_accepts_the_exact_boundary(self) -> None:
         evaluation = benchmark.evaluate_gates(passing_metrics(), self.thresholds)
-        self.assertEqual(evaluation, {"status": "passed", "blocking_reasons": [], "failures": []})
+        self.assertEqual(
+            evaluation, {"status": "passed", "blocking_reasons": [], "failures": []}
+        )
 
     def test_gate_scopes_only_require_their_own_metrics(self) -> None:
         metrics = passing_metrics()
@@ -3320,7 +5017,9 @@ class GateEvaluationTests(unittest.TestCase):
         metrics["registered_views"] = measured(94)
         evaluation = benchmark.evaluate_gates(metrics, self.thresholds)
         self.assertEqual(evaluation["status"], "failed")
-        self.assertTrue(any("colmap_relative" in item for item in evaluation["failures"]))
+        self.assertTrue(
+            any("colmap_relative" in item for item in evaluation["failures"])
+        )
 
     def test_each_threshold_miss_fails(self) -> None:
         misses = {
@@ -3352,7 +5051,10 @@ class GateEvaluationTests(unittest.TestCase):
             with self.subTest(metric=key):
                 metrics = passing_metrics()
                 metrics[key] = value
-                self.assertEqual(benchmark.evaluate_gates(metrics, self.thresholds)["status"], "failed")
+                self.assertEqual(
+                    benchmark.evaluate_gates(metrics, self.thresholds)["status"],
+                    "failed",
+                )
 
     def test_geometry_speedup_is_evaluated_across_the_suite_not_per_scene(self) -> None:
         metrics = passing_metrics()
@@ -3385,7 +5087,9 @@ class GateEvaluationTests(unittest.TestCase):
                 status = benchmark.evaluate_gates(metrics, self.thresholds)["status"]
                 self.assertEqual(status, "passed" if should_pass else "failed")
 
-    def test_unified_memory_gate_uses_the_larger_of_rss_and_metal_allocation(self) -> None:
+    def test_unified_memory_gate_uses_the_larger_of_rss_and_metal_allocation(
+        self,
+    ) -> None:
         metrics = passing_metrics()
         metrics["memory_lane"] = measured("larger")
         metrics["machine_memory_bytes"] = measured(48_000_000_000)
@@ -3419,7 +5123,12 @@ class GateEvaluationTests(unittest.TestCase):
         metrics["residual_median_pixels"] = unavailable()
         evaluation = benchmark.evaluate_gates(metrics, self.thresholds)
         self.assertEqual(evaluation["status"], "blocked")
-        self.assertTrue(any("residual_median_pixels" in item for item in evaluation["blocking_reasons"]))
+        self.assertTrue(
+            any(
+                "residual_median_pixels" in item
+                for item in evaluation["blocking_reasons"]
+            )
+        )
 
     def test_non_real_residual_provenance_fails(self) -> None:
         metrics = passing_metrics()
@@ -3445,7 +5154,10 @@ class GateEvaluationTests(unittest.TestCase):
             with self.subTest(case=label):
                 metrics = passing_metrics()
                 metrics.update(replacements)
-                self.assertEqual(benchmark.evaluate_gates(metrics, self.thresholds)["status"], "failed")
+                self.assertEqual(
+                    benchmark.evaluate_gates(metrics, self.thresholds)["status"],
+                    "failed",
+                )
 
     def test_unavailable_metric_reason_is_a_controlled_code(self) -> None:
         metrics = passing_metrics()
@@ -3457,7 +5169,9 @@ class GateEvaluationTests(unittest.TestCase):
         self.assertEqual(evaluation["status"], "failed")
         self.assertTrue(any("reason" in failure for failure in evaluation["failures"]))
 
-    def test_valid_geometry_requires_connected_graph_and_lossless_rasterization(self) -> None:
+    def test_valid_geometry_requires_connected_graph_and_lossless_rasterization(
+        self,
+    ) -> None:
         cases = {
             "missing graph": {"connected_components": unavailable()},
             "disconnected graph": {"connected_components": measured(2)},
@@ -3504,19 +5218,23 @@ class GateEvaluationTests(unittest.TestCase):
             }
 
         def complete(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-            return rows + [
-                scene(f"ordered-{scale}", "low_light", ["ordered"], scale=scale)
-                for scale in (250, 500)
-            ] + [
-                scene(
-                    f"unordered-{scale}",
-                    "professional_photos",
-                    ["unordered"],
-                    mapping=1.0,
-                    scale=scale,
-                )
-                for scale in (250, 500)
-            ]
+            return (
+                rows
+                + [
+                    scene(f"ordered-{scale}", "low_light", ["ordered"], scale=scale)
+                    for scale in (250, 500)
+                ]
+                + [
+                    scene(
+                        f"unordered-{scale}",
+                        "professional_photos",
+                        ["unordered"],
+                        mapping=1.0,
+                        scale=scale,
+                    )
+                    for scale in (250, 500)
+                ]
+            )
 
         passing = complete(
             [
@@ -3545,7 +5263,9 @@ class GateEvaluationTests(unittest.TestCase):
             ],
             "matching regression": [
                 scene("ordered", "object_orbit", ["ordered"], matching=0.99),
-                scene("unordered", "professional_photos", ["unordered"], matching=101.1),
+                scene(
+                    "unordered", "professional_photos", ["unordered"], matching=101.1
+                ),
             ],
             "ordered mapping": [
                 scene("ordered", "object_orbit", ["ordered"], mapping=1.49),
@@ -3564,7 +5284,9 @@ class GateEvaluationTests(unittest.TestCase):
         for label, scenes in failures.items():
             with self.subTest(case=label):
                 self.assertEqual(
-                    benchmark.evaluate_suite_performance(complete(scenes), self.thresholds)["status"],
+                    benchmark.evaluate_suite_performance(
+                        complete(scenes), self.thresholds
+                    )["status"],
                     "failed",
                 )
 
@@ -3575,7 +5297,9 @@ class GateEvaluationTests(unittest.TestCase):
             "blocked",
         )
 
-    def test_suite_rendering_medians_pass_globally_and_per_capture_category(self) -> None:
+    def test_suite_rendering_medians_pass_globally_and_per_capture_category(
+        self,
+    ) -> None:
         def scene(
             scene_id: str,
             category: str,
@@ -3601,7 +5325,9 @@ class GateEvaluationTests(unittest.TestCase):
             scene("orbit", "object_orbit", psnr_loss=0.6),
             scene("photos", "professional_photos", psnr_loss=0.1),
         ]
-        evaluation = benchmark.evaluate_suite_quality(category_regression, self.thresholds)
+        evaluation = benchmark.evaluate_suite_quality(
+            category_regression, self.thresholds
+        )
         self.assertEqual(evaluation["status"], "failed")
         self.assertTrue(any("object_orbit" in item for item in evaluation["failures"]))
 
@@ -3617,7 +5343,9 @@ class GateEvaluationTests(unittest.TestCase):
         ]
         evaluation = benchmark.evaluate_suite_quality(missing_primary, self.thresholds)
         self.assertEqual(evaluation["status"], "failed")
-        self.assertTrue(any("primary" in item for item in evaluation["blocking_reasons"]))
+        self.assertTrue(
+            any("primary" in item for item in evaluation["blocking_reasons"])
+        )
         self.assertTrue(evaluation["failures"])
 
 
@@ -3631,14 +5359,21 @@ class InvalidSceneTests(unittest.TestCase):
             "failure_type": "disconnected_input",
             "corrupt_ply": False,
         }
-        self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "passed")
+        self.assertEqual(
+            benchmark.evaluate_invalid_scene(expected, actual)["status"], "passed"
+        )
 
     def test_wrong_failure_or_corrupt_ply_fails(self) -> None:
         expected = {"kind": "invalid", "failure_type": "disconnected_input"}
         for actual in (
             {**successful_actual(), "failure_type": None},
             {**successful_actual(), "exit_code": 2, "failure_type": "other"},
-            {**successful_actual(), "exit_code": 2, "failure_type": "disconnected_input", "corrupt_ply": True},
+            {
+                **successful_actual(),
+                "exit_code": 2,
+                "failure_type": "disconnected_input",
+                "corrupt_ply": True,
+            },
             {
                 **successful_actual(),
                 "exit_code": 130,
@@ -3648,19 +5383,31 @@ class InvalidSceneTests(unittest.TestCase):
             },
         ):
             with self.subTest(actual=actual):
-                self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "failed")
+                self.assertEqual(
+                    benchmark.evaluate_invalid_scene(expected, actual)["status"],
+                    "failed",
+                )
 
     def test_missing_failure_type_blocks(self) -> None:
         expected = {"kind": "invalid", "failure_type": "disconnected_input"}
         actual = {**successful_actual(), "exit_code": 2, "failure_type": None}
-        self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
+        self.assertEqual(
+            benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked"
+        )
 
     def test_missing_or_noninteger_exit_blocks(self) -> None:
         expected = {"kind": "invalid", "failure_type": "disconnected_input"}
         for exit_code in (None, "2", True):
-            actual = {**successful_actual(), "exit_code": exit_code, "failure_type": "disconnected_input"}
+            actual = {
+                **successful_actual(),
+                "exit_code": exit_code,
+                "failure_type": "disconnected_input",
+            }
             with self.subTest(exit_code=exit_code):
-                self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
+                self.assertEqual(
+                    benchmark.evaluate_invalid_scene(expected, actual)["status"],
+                    "blocked",
+                )
 
     def test_contradictory_termination_evidence_blocks(self) -> None:
         expected = {"kind": "invalid", "failure_type": "disconnected_input"}
@@ -3682,7 +5429,10 @@ class InvalidSceneTests(unittest.TestCase):
         )
         for actual in contradictory_cases:
             with self.subTest(actual=actual):
-                self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
+                self.assertEqual(
+                    benchmark.evaluate_invalid_scene(expected, actual)["status"],
+                    "blocked",
+                )
 
 
 class MetadataAndPersistenceTests(unittest.TestCase):
@@ -3698,7 +5448,9 @@ class MetadataAndPersistenceTests(unittest.TestCase):
                 benchmark._load_json(path, "fixture")
 
     def test_machine_metadata_does_not_include_machine_identity(self) -> None:
-        with mock.patch.dict(os.environ, {"USER": "private-user", "HOME": "/Users/private-user"}):
+        with mock.patch.dict(
+            os.environ, {"USER": "private-user", "HOME": "/Users/private-user"}
+        ):
             metadata = benchmark.collect_machine_metadata(
                 command_runner=lambda argv: "fixture-value",
                 platform_data={
@@ -3712,7 +5464,14 @@ class MetadataAndPersistenceTests(unittest.TestCase):
                 },
             )
         encoded = json.dumps(metadata).lower()
-        for forbidden in ("private-user", "/users/", "hostname", "serial", "username", "home"):
+        for forbidden in (
+            "private-user",
+            "/users/",
+            "hostname",
+            "serial",
+            "username",
+            "home",
+        ):
             self.assertNotIn(forbidden, encoded)
 
     def test_atomic_write_preserves_previous_result_when_interrupted(self) -> None:
@@ -3724,7 +5483,9 @@ class MetadataAndPersistenceTests(unittest.TestCase):
                 raise RuntimeError("simulated interruption")
 
             with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
-                benchmark.atomic_write_json(path, {"new": True}, before_replace=interrupt)
+                benchmark.atomic_write_json(
+                    path, {"new": True}, before_replace=interrupt
+                )
             self.assertEqual(path.read_text(encoding="utf-8"), '{"old":true}\n')
             self.assertEqual(list(path.parent.glob(".suite.json.*.tmp")), [])
 
@@ -3738,7 +5499,7 @@ class EvidenceProtocolTests(unittest.TestCase):
     def test_request_pins_the_current_render_target_contract(self) -> None:
         request = evidence_request()
 
-        self.assertEqual(request["schema_version"], 8)
+        self.assertEqual(request["schema_version"], 11)
         configuration = request["candidate_run_configuration"]
         self.assertEqual(configuration["run_seed"], 42)
         self.assertEqual(configuration["feature_extraction_workers"], 12)
@@ -3815,6 +5576,88 @@ class EvidenceProtocolTests(unittest.TestCase):
         ):
             evidence.validate_request(mismatched)
 
+    def test_fisheye_photo_request_pins_shared_camera_calibration(self) -> None:
+        request = evidence_request(
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["fisheye", "unordered"],
+        )
+        configuration = request["candidate_run_configuration"]
+        self.assertEqual(configuration["camera_grouping"], "same_camera_and_lens")
+        self.assertEqual(configuration["lens_projection"], "fisheye")
+        evidence.validate_request(request)
+
+        for field, replacement in (
+            ("camera_grouping", "automatic"),
+            ("lens_projection", "automatic"),
+        ):
+            with self.subTest(field=field):
+                mutated = copy.deepcopy(request)
+                mutated["candidate_run_configuration"][field] = replacement
+                with self.assertRaisesRegex(evidence.EvidenceError, field.replace("_", " ")):
+                    evidence.validate_request(mutated)
+
+        mixed = evidence_request(
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["fisheye", "mixed_intrinsics", "unordered"],
+        )
+        self.assertEqual(
+            mixed["candidate_run_configuration"]["camera_grouping"], "automatic"
+        )
+        evidence.validate_request(mixed)
+        video = evidence_request(capture_traits=["fisheye", "ordered"])
+        self.assertEqual(
+            video["candidate_run_configuration"]["camera_grouping"], "automatic"
+        )
+        self.assertEqual(
+            video["candidate_run_configuration"]["lens_projection"], "fisheye"
+        )
+        evidence.validate_request(video)
+
+        schema = json.loads(
+            (ROOT / "scripts/benchmark/evidence.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        candidate_schema = schema["$defs"]["candidateRunConfiguration"]
+        self.assertEqual(
+            candidate_schema["properties"]["camera_grouping"]["enum"],
+            ["automatic", "same_camera_and_lens"],
+        )
+        worker_schema = schema["$defs"]["runtimeWorkerEvidence"]
+        self.assertIn("canonical_cameras_name", worker_schema["required"])
+        self.assertIn("canonical_cameras_sha256", worker_schema["required"])
+
+    def test_colmap_camera_parser_rejects_malformed_calibration(self) -> None:
+        valid = b"# Camera list\n1 OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0 0\n"
+        self.assertEqual(
+            evidence._parse_colmap_cameras_text(valid, "fixture cameras")[0]["model"],
+            "OPENCV_FISHEYE",
+        )
+        self.assertEqual(
+            evidence._parse_colmap_cameras_text(
+                b"2 EQUIRECTANGULAR 1024 512\n", "fixture cameras"
+            )[0]["parameters"],
+            [],
+        )
+        invalid_cases = (
+            b"1 OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0\n",
+            b"1 OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0 0 0\n",
+            b"1 OPENCV_FISHEYE 512 512 nan 191 255 256 0 0 0 0\n",
+            b"1 OPENCV_FISHEYE 512 512 0 191 255 256 0 0 0 0\n",
+            b"9223372036854775808 SIMPLE_RADIAL 64 64 50 32 32 0\n",
+            b"1 SIMPLE_RADIAL 9223372036854775808 64 50 32 32 0\n",
+            b"1 SIMPLE_RADIAL 64 9223372036854775808 50 32 32 0\n",
+            b"1_0 SIMPLE_RADIAL 5_12 512 1_00 256 256 0\n",
+            "١ SIMPLE_RADIAL 512 512 100 256 256 0\n".encode(),
+            valid + b"1 OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0 0\n",
+        )
+        for contents in invalid_cases:
+            with self.subTest(contents=contents):
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence._parse_colmap_cameras_text(contents, "fixture cameras")
+
     def test_request_rejects_retired_determinism_contract_names(self) -> None:
         request = evidence_request()
         configuration = request["candidate_run_configuration"]
@@ -3835,7 +5678,9 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations, evidence_request())
-            with self.assertRaisesRegex(evidence.EvidenceError, "stability.*invalid fields"):
+            with self.assertRaisesRegex(
+                evidence.EvidenceError, "stability.*invalid fields"
+            ):
                 evidence.derive_attestation(
                     evidence_request(),
                     observations,
@@ -3846,7 +5691,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_lane_outcome_distinguishes_execution_failure_from_environment(self) -> None:
+    def test_lane_outcome_distinguishes_execution_failure_from_environment(
+        self,
+    ) -> None:
         request = evidence_request()
         runner = runner_identity(evidence.LANE_REFERENCE)
         machine = evidence_machine(evidence.LANE_REFERENCE)
@@ -3856,7 +5703,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             ("timed_out", 0),
             ("nonzero_exit", 23),
         ):
-            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(reason=reason),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 path = Path(directory) / "lane-outcome.json"
                 receipt = evidence.derive_lane_outcome(
                     request,
@@ -3881,7 +5731,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             ("host_monitor_failed", "host_monitor", 0),
             ("postprocessing_failed", "postprocessing", 0),
         ):
-            with self.subTest(reason=reason, exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(reason=reason, exit_code=exit_code),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 path = Path(directory) / "lane-outcome.json"
                 receipt = evidence.derive_lane_outcome(
                     request,
@@ -3925,9 +5778,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                             "started_monotonic_seconds"
                         ],
                         "ended_monotonic_seconds": command["ended_monotonic_seconds"],
-                        "process_cpu_microseconds": command[
-                            "process_cpu_microseconds"
-                        ],
+                        "process_cpu_microseconds": command["process_cpu_microseconds"],
                     }
                     for command in observations["commands"]
                 ],
@@ -3988,10 +5839,16 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         cases = (
             ("invalid fields", {**receipt, "unexpected": True}),
-            ("invalid fields", {key: value for key, value in receipt.items() if key != "outcome"}),
+            (
+                "invalid fields",
+                {key: value for key, value in receipt.items() if key != "outcome"},
+            ),
         )
         for expected, changed in cases:
-            with self.subTest(case=expected), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(case=expected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 path = Path(directory) / "lane-outcome.json"
                 path.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
@@ -4004,7 +5861,9 @@ class EvidenceProtocolTests(unittest.TestCase):
 
         for reason, exit_code in (("timed_out", 256), ("nonzero_exit", -256)):
             with self.subTest(reason=reason, exit_code=exit_code):
-                expected = "bounded exit code" if reason == "timed_out" else "bounded nonzero"
+                expected = (
+                    "bounded exit code" if reason == "timed_out" else "bounded nonzero"
+                )
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
                     evidence.derive_lane_outcome(
                         request,
@@ -4077,7 +5936,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             (b"[" * 2_000 + b"0" + b"]" * 2_000, "must be an object"),
         )
         for payload, expected in cases:
-            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(expected=expected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 path = Path(directory) / "lane-outcome.json"
                 path.write_bytes(payload)
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
@@ -4249,14 +6111,18 @@ class EvidenceProtocolTests(unittest.TestCase):
                 validate_attestation_schema(schema_invalid)
             self.assertEqual(metrics["registered_views"], measured(30))
             self.assertEqual(metrics["repeat_runs"], measured(50))
-            self.assertEqual(metrics["durable_state_recovery_succeeded"], measured(True))
+            self.assertEqual(
+                metrics["durable_state_recovery_succeeded"], measured(True)
+            )
             self.assertEqual(metrics["m4_max_p50_seconds"], measured(100.0))
             self.assertEqual(metrics["fast_end_to_end_speedup"], measured(2.0))
-            self.assertEqual(metrics["scheduled_pairs"], measured(119))
+            self.assertEqual(metrics["scheduled_pairs"], measured(131))
             self.assertEqual(metrics["matching_speedup"], measured(10.0))
             self.assertEqual(metrics["mapping_speedup"], measured(1.5))
             self.assertEqual(metrics["orientation_status"], measured("verified"))
-            self.assertEqual(metrics["orientation_physical_up_error_degrees"], measured(0.75))
+            self.assertEqual(
+                metrics["orientation_physical_up_error_degrees"], measured(0.75)
+            )
             self.assertEqual(
                 attestation["measurement_runner"],
                 runner_identity(evidence.LANE_REFERENCE),
@@ -4269,7 +6135,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             )
             self.assertEqual(verified["metrics"], metrics)
 
-    def test_invalid_attestation_does_not_require_quality_or_timing_references(self) -> None:
+    def test_invalid_attestation_does_not_require_quality_or_timing_references(
+        self,
+    ) -> None:
         scene = valid_scene(scene_id="invalid-01")
         scene["category"] = "invalid"
         scene["capture_traits"] = ["segmented"]
@@ -4285,7 +6153,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             corpus_digest="sha256:" + "2" * 64,
             thresholds_digest="sha256:" + "3" * 64,
             git_commit="4" * 40,
-            app_version="0.2.0-beta.1",
+            app_version="0.2.0",
             toolchain_identity=TEST_TOOLCHAIN_IDENTITY,
         )
         request = benchmark._evidence_request(
@@ -4309,7 +6177,13 @@ class EvidenceProtocolTests(unittest.TestCase):
             key: value
             for key, value in observations["artifacts"].items()
             if key
-            in {"command_log", "supervisor_run", "host_monitor", "stdout_log", "stderr_log"}
+            in {
+                "command_log",
+                "supervisor_run",
+                "host_monitor",
+                "stdout_log",
+                "stderr_log",
+            }
         }
         observations["actual"] = {
             "exit_code": 2,
@@ -4404,7 +6278,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_scene_quality_rejects_self_reported_rendering_without_pixel_artifacts(self) -> None:
+    def test_scene_quality_rejects_self_reported_rendering_without_pixel_artifacts(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4429,7 +6305,9 @@ class EvidenceProtocolTests(unittest.TestCase):
         observations = raw_observations(evidence.LANE_REFERENCE)
         mutations = {
             "duplicate": lambda value: value["pairs"].append(dict(value["pairs"][0])),
-            "wrong temporal edge": lambda value: value["pairs"][0].update({"view_b": 3}),
+            "wrong temporal edge": lambda value: value["pairs"][0].update(
+                {"view_b": 3}
+            ),
             "false verified count": lambda value: value["pairs"][0].update(
                 {"spatially_verified": False}
             ),
@@ -4462,12 +6340,17 @@ class EvidenceProtocolTests(unittest.TestCase):
             "largest_biconnected_block_views",
             "second_largest_biconnected_block_views",
         ):
-            with self.subTest(metric=metric), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(metric=metric),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 changed = json.loads(json.dumps(observations))
                 changed["pipeline_metrics"][metric] += 1
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
-                with self.assertRaisesRegex(evidence.EvidenceError, f"pair_list {metric}"):
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError, f"pair_list {metric}"
+                ):
                     evidence.derive_attestation(
                         evidence_request(),
                         changed,
@@ -4478,12 +6361,59 @@ class EvidenceProtocolTests(unittest.TestCase):
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
 
+    def test_lossless_retrieval_evidence_preserves_zero_result_queries(self) -> None:
+        pair_list = fixture_lossless_pair_list_with_zero_result_query()
+        metrics = {
+            "scheduled_pairs": len(pair_list["pairs"]),
+            "attempted_pairs": len(pair_list["pairs"]),
+            "raw_matched_pairs": len(pair_list["pairs"]),
+            "spatially_verified_pairs": len(pair_list["pairs"]),
+            "local_pairs": sum(
+                pair["pair_type"] == "local" for pair in pair_list["pairs"]
+            ),
+            "retrieval_pairs": 0,
+            "loop_pairs": sum(
+                pair["pair_type"] == "loop" for pair in pair_list["pairs"]
+            ),
+            "connected_components": 1,
+            "isolated_views": 0,
+            "articulation_views": 0,
+            "biconnected_blocks": 1,
+            "largest_biconnected_block_views": 30,
+            "second_largest_biconnected_block_views": 0,
+        }
+        selection = evidence.SelectionManifestSources(
+            image_names=tuple(f"frame-{index:06d}.jpg" for index in range(30)),
+            clip_ids=tuple("clip-0" for _ in range(30)),
+            source_kinds=tuple("video" for _ in range(30)),
+            video_source_count=1,
+        )
+        configuration = {
+            "input_topology": "continuous",
+            "pairing_policy": "walkthrough",
+            "temporal_offsets": [1, 2, 4, 8, 16],
+            "vocabulary_candidate_count": 20,
+            "vocabulary_returned_neighbor_count": 2,
+            "vocabulary_query_stride": 10,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pair-list.json"
+            path.write_bytes(evidence.canonical_json_bytes(pair_list) + b"\n")
+            evidence._validate_pair_list(
+                path,
+                30,
+                selection,
+                configuration,
+                metrics,
+            )
+
     def test_configured_retrieval_requires_query_level_closure(self) -> None:
         request = evidence_request()
         request["candidate_run_configuration"].update(
             {
+                "pairing_policy": "walkthrough",
                 "vocabulary_candidate_count": 20,
-                "vocabulary_verified_neighbor_count": 2,
+                "vocabulary_returned_neighbor_count": 2,
                 "vocabulary_query_stride": 10,
             }
         )
@@ -4505,7 +6435,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             (root / "pair-list.json").write_bytes(
                 evidence.canonical_json_bytes(fixture_pair_list()) + b"\n"
             )
-            with self.assertRaisesRegex(evidence.EvidenceError, "retrieval.*quer"):
+            with self.assertRaisesRegex(evidence.EvidenceError, "retrieval"):
                 evidence.derive_attestation(
                     request,
                     observations,
@@ -4516,177 +6446,569 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_retrieval_query_closure_binds_attempts_neighbors_and_retry_outcome(self) -> None:
-        request = evidence_request()
-        request["candidate_run_configuration"].update(
-            {
-                "vocabulary_candidate_count": 20,
-                "vocabulary_verified_neighbor_count": 2,
-                "vocabulary_query_stride": 10,
-            }
+    def test_lossless_retrieval_receipts_reject_hostile_mutations(self) -> None:
+        base = fixture_lossless_pair_list_with_zero_result_query()
+        metrics = {
+            "scheduled_pairs": len(base["pairs"]),
+            "attempted_pairs": len(base["pairs"]),
+            "raw_matched_pairs": len(base["pairs"]),
+            "spatially_verified_pairs": len(base["pairs"]),
+            "local_pairs": sum(pair["pair_type"] == "local" for pair in base["pairs"]),
+            "retrieval_pairs": 0,
+            "loop_pairs": sum(pair["pair_type"] == "loop" for pair in base["pairs"]),
+            "connected_components": 1,
+            "isolated_views": 0,
+            "articulation_views": 0,
+            "biconnected_blocks": 1,
+            "largest_biconnected_block_views": 30,
+            "second_largest_biconnected_block_views": 0,
+        }
+        selection = evidence.SelectionManifestSources(
+            image_names=tuple(f"frame-{index:06d}.jpg" for index in range(30)),
+            clip_ids=tuple("clip-0" for _ in range(30)),
+            source_kinds=tuple("video" for _ in range(30)),
+            video_source_count=1,
         )
-        observations = raw_observations(evidence.LANE_REFERENCE)
-        observations["commands"] = execution_receipts(
-            observations["timing"],
-            evidence.LANE_REFERENCE,
-            request,
-        )
-        observations["pipeline_metrics"].update(
-            {
-                "scheduled_pairs": 125,
-                "attempted_pairs": 125,
-                "raw_matched_pairs": 125,
-                "spatially_verified_pairs": 125,
-                "retrieval_pairs": 0,
-                "loop_pairs": 6,
-            }
-        )
+        configuration = {
+            "input_topology": "continuous",
+            "pairing_policy": "walkthrough",
+            "temporal_offsets": [1, 2, 4, 8, 16],
+            "vocabulary_candidate_count": 20,
+            "vocabulary_returned_neighbor_count": 2,
+            "vocabulary_query_stride": 10,
+        }
+
+        def replace_with_edge_only_digest(value: dict[str, object]) -> None:
+            retrieval = value["attempts"][0]["retrieval"]
+            lines = [
+                (
+                    f"frame-{pair['query_view']:06d}.jpg "
+                    f"frame-{pair['target_view']:06d}.jpg"
+                )
+                for pair in retrieval["directed_pairs"]
+            ]
+            payload = b"".join(
+                f"{len(line.encode('utf-8'))}:".encode("utf-8")
+                + line.encode("utf-8")
+                for line in lines
+            )
+            retrieval["output_digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
+
+        def replace_with_excluded_base_edge(value: dict[str, object]) -> None:
+            value["attempts"][0]["retrieval"] = fixture_retrieval_receipt(
+                image_names=[f"frame-{index:06d}.jpg" for index in range(30)],
+                query_views=[0, 10, 20],
+                query_stride=10,
+                candidate_count=20,
+                neighbor_count=2,
+                minimum_frame_separation=12,
+                directed_pairs=[
+                    {"query_view": 0, "target_view": 1},
+                    {"query_view": 0, "target_view": 13},
+                    {"query_view": 10, "target_view": 23},
+                ],
+            )
+
         mutations = {
-            "valid": lambda value: None,
-            "wrong ordered role": lambda value: value["pairs"][-1].update(
-                {"pair_type": "retrieval"}
+            "relabel edge": lambda value: value["pairs"][-1].update(
+                pair_type="retrieval"
             ),
-            "missing query": lambda value: value["retrieval"]["queries"].pop(),
-            "unbounded attempt": lambda value: value["retrieval"]["queries"][0].update(
-                {
-                    "attempted_candidate_count": 21,
-                    "attempted_targets": list(range(12, 30)) + [3, 5, 6],
-                }
-            ),
-            "unretained verified neighbor": lambda value: value["retrieval"]["queries"][0][
-                "verified_retained_neighbors"
-            ].append(15),
-            "false retry outcome": lambda value: value["retrieval"]["queries"][0].update(
-                {"retry_outcome": "denser_faiss_exhausted"}
-            ),
-            "exact recovery without preceding closure": lambda value: value["retrieval"][
-                "queries"
-            ][0].update(
-                {
-                    "retry_outcome": "exact_recovery_retained",
-                    "matcher_used": "exact",
-                    "fallback_reason": "faiss_geometry_rejected_after_retries",
-                }
+            "remove zero-result query": lambda value: value["attempts"][0]["retrieval"][
+                "query_views"
+            ].pop(),
+            "change configured limit": lambda value: value["attempts"][0][
+                "retrieval"
+            ].update(candidate_count=21),
+            "duplicate directed edge": lambda value: value["attempts"][0]["retrieval"][
+                "directed_pairs"
+            ].append(dict(value["attempts"][0]["retrieval"]["directed_pairs"][0])),
+            "edge-only digest": replace_with_edge_only_digest,
+            "contradictory query outcome": lambda value: value["attempts"][0][
+                "retrieval"
+            ]["query_outcomes"][0]["ranked_neighbor_views"].clear(),
+            "excluded base edge in ranked outcome": replace_with_excluded_base_edge,
+            "count list disagreement": lambda value: value["attempts"][0].update(
+                scheduled_pair_count=len(value["pairs"]) - 1
             ),
         }
         for label, mutate in mutations.items():
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                write_evidence_artifacts(root, observations, request)
-                pair_list = fixture_pair_list_with_retrieval()
-                mutate(pair_list)
-                (root / "pair-list.json").write_bytes(
-                    evidence.canonical_json_bytes(pair_list) + b"\n"
-                )
-                if label == "valid":
-                    evidence.derive_attestation(
-                        request,
-                        observations,
-                        root,
-                        root / "attestation.json",
-                        evidence.LANE_REFERENCE,
-                        runner_identity(evidence.LANE_REFERENCE),
-                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                changed = copy.deepcopy(base)
+                mutate(changed)
+                path = Path(directory) / "pair-list.json"
+                path.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+                with self.assertRaisesRegex(evidence.EvidenceError, "pair_list"):
+                    evidence._validate_pair_list(
+                        path,
+                        30,
+                        selection,
+                        configuration,
+                        metrics,
                     )
-                else:
-                    with self.assertRaisesRegex(evidence.EvidenceError, "retrieval"):
-                        evidence.derive_attestation(
-                            request,
-                            observations,
-                            root,
-                            root / "attestation.json",
-                            evidence.LANE_REFERENCE,
-                            runner_identity(evidence.LANE_REFERENCE),
-                            machine=evidence_machine(evidence.LANE_REFERENCE),
+
+    def test_pair_list_accepts_multi_clip_continuous_queries_per_clip(self) -> None:
+        selected_frame_count = 8
+        image_names = [f"frame-{index:06d}.jpg" for index in range(selected_frame_count)]
+        clip_ids = ("clip-a",) * 3 + ("clip-b",) * 5
+        local_edges = [(0, 1), (1, 2), (3, 4), (4, 5), (5, 6), (6, 7)]
+        query_views = [0, 2, 3, 5, 7]
+        retrieval = fixture_retrieval_receipt(
+            image_names=image_names,
+            query_views=query_views,
+            query_stride=2,
+            candidate_count=20,
+            neighbor_count=2,
+            minimum_frame_separation=0,
+            directed_pairs=[{"query_view": 0, "target_view": 3}],
+            image_group_indices=[0] * 3 + [1] * 5,
+        )
+        pairs = [
+            {
+                "view_a": first,
+                "view_b": second,
+                "pair_type": "local",
+                "query_view": None,
+                "attempted": True,
+                "raw_matched": True,
+                "spatially_verified": True,
+            }
+            for first, second in local_edges
+        ] + [
+            {
+                "view_a": 0,
+                "view_b": 3,
+                "pair_type": "loop",
+                "query_view": 0,
+                "attempted": True,
+                "raw_matched": True,
+                "spatially_verified": True,
+            }
+        ]
+        pair_list = {
+            "schema_version": 5,
+            "selected_frame_count": selected_frame_count,
+            "accepted_attempt_number": 1,
+            "pairs": pairs,
+            "attempts": [
+                {
+                    "attempt_number": 1,
+                    "matcher_used": "faiss",
+                    "exact_recovery_reason": None,
+                    "recovery_level": "normal",
+                    "outcome": "completed",
+                    "scheduled_pair_count": len(pairs),
+                    "attempted_pair_count": len(pairs),
+                    "raw_matched_pair_count": len(pairs),
+                    "spatially_verified_pair_count": len(pairs),
+                    "retrieval": retrieval,
+                }
+            ],
+            "fallback_reasons": [],
+        }
+        selection = evidence.SelectionManifestSources(
+            image_names=tuple(image_names),
+            clip_ids=clip_ids,
+            source_kinds=("video",) * selected_frame_count,
+            video_source_count=2,
+        )
+        configuration = {
+            "input_topology": "continuous",
+            "pairing_policy": "generic_continuous",
+            "temporal_offsets": [1],
+            "vocabulary_candidate_count": 20,
+            "vocabulary_returned_neighbor_count": 2,
+            "vocabulary_query_stride": 2,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pair-list.json"
+            path.write_bytes(evidence.canonical_json_bytes(pair_list) + b"\n")
+            evidence._validate_pair_list(
+                path,
+                selected_frame_count,
+                selection,
+                configuration,
+                fixture_pair_list_metrics(pair_list, selected_frame_count),
+            )
+
+            segmented_pair_list = copy.deepcopy(pair_list)
+            segmented_pair_list["pairs"][-1]["pair_type"] = "retrieval"
+            segmented_configuration = {
+                **configuration,
+                "input_topology": "segmented_mixed",
+                "pairing_policy": "segmented_mixed",
+            }
+            path.unlink()
+            path.write_bytes(
+                evidence.canonical_json_bytes(segmented_pair_list) + b"\n"
+            )
+            evidence._validate_pair_list(
+                path,
+                selected_frame_count,
+                selection,
+                segmented_configuration,
+                fixture_pair_list_metrics(segmented_pair_list, selected_frame_count),
+            )
+
+            changed = copy.deepcopy(pair_list)
+            changed["attempts"][0]["retrieval"] = fixture_retrieval_receipt(
+                image_names=image_names,
+                query_views=[0, 2, 4, 6],
+                query_stride=2,
+                candidate_count=20,
+                neighbor_count=2,
+                minimum_frame_separation=0,
+                directed_pairs=[{"query_view": 0, "target_view": 3}],
+                image_group_indices=[0] * 3 + [1] * 5,
+            )
+            path.unlink()
+            path.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "retrieval request"):
+                evidence._validate_pair_list(
+                    path,
+                    selected_frame_count,
+                    selection,
+                    configuration,
+                    fixture_pair_list_metrics(pair_list, selected_frame_count),
+                )
+
+            for label, mutate in (
+                (
+                    "group digest",
+                    lambda value: value["attempts"][0]["retrieval"].update(
+                        image_group_list_digest="sha256:" + "0" * 64
+                    ),
+                ),
+                (
+                    "group policy",
+                    lambda value: value["attempts"][0]["retrieval"].update(
+                        candidate_policy="allImagesV1"
+                    ),
+                ),
+                (
+                    "same-group neighbor",
+                    lambda value: value["attempts"][0].update(
+                        retrieval=fixture_retrieval_receipt(
+                            image_names=image_names,
+                            query_views=query_views,
+                            query_stride=2,
+                            candidate_count=20,
+                            neighbor_count=2,
+                            minimum_frame_separation=0,
+                            directed_pairs=[{"query_view": 0, "target_view": 2}],
+                            image_group_indices=[0] * 3 + [1] * 5,
+                        )
+                    ),
+                ),
+            ):
+                with self.subTest(case=label):
+                    changed = copy.deepcopy(pair_list)
+                    mutate(changed)
+                    path.unlink()
+                    path.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+                    with self.assertRaisesRegex(evidence.EvidenceError, "pair_list"):
+                        evidence._validate_pair_list(
+                            path,
+                            selected_frame_count,
+                            selection,
+                            configuration,
+                            fixture_pair_list_metrics(pair_list, selected_frame_count),
                         )
 
-    def test_retrieval_retained_outcome_requires_the_resolved_neighbor_target(self) -> None:
-        request = evidence_request()
-        request["candidate_run_configuration"].update(
-            {
-                "vocabulary_candidate_count": 20,
-                "vocabulary_verified_neighbor_count": 2,
-                "vocabulary_query_stride": 10,
-            }
-        )
-        observations = raw_observations(evidence.LANE_REFERENCE)
-        observations["commands"] = execution_receipts(
-            observations["timing"],
-            evidence.LANE_REFERENCE,
-            request,
-        )
-        observations["pipeline_metrics"].update(
-            {
-                "scheduled_pairs": 125,
-                "attempted_pairs": 125,
-                "raw_matched_pairs": 125,
-                "spatially_verified_pairs": 124,
-                "retrieval_pairs": 0,
-                "loop_pairs": 6,
-            }
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_evidence_artifacts(root, observations, request)
-            pair_list = fixture_pair_list_with_retrieval()
-            pair_list["retrieval"]["queries"][0]["verified_retained_neighbors"] = [13]
-            for pair in pair_list["pairs"]:
-                if (
-                    pair["pair_type"] == "loop"
-                    and pair["query_view"] == 0
-                    and 14 in {pair["view_a"], pair["view_b"]}
-                ):
-                    pair["spatially_verified"] = False
-            (root / "pair-list.json").write_bytes(
-                evidence.canonical_json_bytes(pair_list) + b"\n"
+    def test_pair_list_binds_ordered_recovery_base_graph_and_limits(self) -> None:
+        def recovery_fixture(
+            selected_frame_count: int, recovery_level: str
+        ) -> tuple[
+            dict[str, object],
+            evidence.SelectionManifestSources,
+            dict[str, object],
+        ]:
+            image_names = [
+                f"frame-{index:06d}.jpg" for index in range(selected_frame_count)
+            ]
+            local_edges = [
+                (first, second)
+                for first in range(selected_frame_count)
+                for second in range(first + 1, selected_frame_count)
+                if 1 <= second - first <= 12
+            ]
+            candidate_count, neighbor_count = (
+                (40, 16) if recovery_level == "expanded-segmented" else (20, 2)
             )
-            with self.assertRaisesRegex(evidence.EvidenceError, "retained neighbor target"):
-                evidence.derive_attestation(
-                    request,
-                    observations,
-                    root,
-                    root / "attestation.json",
-                    evidence.LANE_REFERENCE,
-                    runner_identity(evidence.LANE_REFERENCE),
-                    machine=evidence_machine(evidence.LANE_REFERENCE),
+            if recovery_level == "maximum":
+                candidate_count, neighbor_count = 80, 32
+            level = recovery_level.removesuffix("-segmented")
+            retrieval = fixture_retrieval_receipt(
+                image_names=image_names,
+                query_views=[0],
+                query_stride=selected_frame_count,
+                candidate_count=candidate_count,
+                neighbor_count=neighbor_count,
+                minimum_frame_separation=max(12, selected_frame_count // 10),
+                directed_pairs=[
+                    {"query_view": 0, "target_view": selected_frame_count - 1}
+                ],
+            )
+            pairs = [
+                {
+                    "view_a": first,
+                    "view_b": second,
+                    "pair_type": "local",
+                    "query_view": None,
+                    "attempted": True,
+                    "raw_matched": True,
+                    "spatially_verified": True,
+                }
+                for first, second in local_edges
+            ] + [
+                {
+                    "view_a": 0,
+                    "view_b": selected_frame_count - 1,
+                    "pair_type": "loop",
+                    "query_view": 0,
+                    "attempted": True,
+                    "raw_matched": True,
+                    "spatially_verified": True,
+                }
+            ]
+            pair_list = {
+                "schema_version": 5,
+                "selected_frame_count": selected_frame_count,
+                "accepted_attempt_number": 1,
+                "pairs": pairs,
+                "attempts": [
+                    {
+                        "attempt_number": 1,
+                        "matcher_used": "faiss",
+                        "exact_recovery_reason": None,
+                        "recovery_level": level,
+                        "outcome": "completed",
+                        "scheduled_pair_count": len(pairs),
+                        "attempted_pair_count": len(pairs),
+                        "raw_matched_pair_count": len(pairs),
+                        "spatially_verified_pair_count": len(pairs),
+                        "retrieval": retrieval,
+                    }
+                ],
+                "fallback_reasons": (
+                    ["normal graph rejected"]
+                    if level == "expanded"
+                    else ["normal graph rejected", "expanded graph rejected"]
+                ),
+            }
+            selection = evidence.SelectionManifestSources(
+                image_names=tuple(image_names),
+                clip_ids=("clip-0",) * selected_frame_count,
+                source_kinds=("video",) * selected_frame_count,
+                video_source_count=1,
+            )
+            configuration = {
+                "input_topology": "continuous",
+                "pairing_policy": "walkthrough",
+                "temporal_offsets": [1],
+                "vocabulary_candidate_count": 20,
+                "vocabulary_returned_neighbor_count": 2,
+                "vocabulary_query_stride": selected_frame_count,
+            }
+            return pair_list, selection, configuration
+
+        for selected_frame_count, recovery_level in ((15, "expanded"), (251, "maximum")):
+            with self.subTest(recovery=recovery_level), tempfile.TemporaryDirectory() as directory:
+                pair_list, selection, configuration = recovery_fixture(
+                    selected_frame_count, recovery_level
+                )
+                path = Path(directory) / "pair-list.json"
+                path.write_bytes(evidence.canonical_json_bytes(pair_list) + b"\n")
+                evidence._validate_pair_list(
+                    path,
+                    selected_frame_count,
+                    selection,
+                    configuration,
+                    fixture_pair_list_metrics(pair_list, selected_frame_count),
                 )
 
-    def test_unordered_small_photo_route_requires_exact_exhaustive_faiss_closure(self) -> None:
+    def test_pair_list_accepts_mapping_driven_normal_to_maximum_recovery(self) -> None:
+        image_names = [f"frame-{index:06d}.jpg" for index in range(4)]
+        normal_retrieval = fixture_retrieval_receipt(
+            image_names=image_names,
+            query_views=[0, 2],
+            query_stride=2,
+            candidate_count=20,
+            neighbor_count=2,
+            minimum_frame_separation=12,
+            directed_pairs=[],
+        )
+        pairs = [
+            {
+                "view_a": first,
+                "view_b": second,
+                "pair_type": "exhaustive",
+                "query_view": None,
+                "attempted": True,
+                "raw_matched": True,
+                "spatially_verified": True,
+                "matcher_used": "faiss",
+            }
+            for first in range(4)
+            for second in range(first + 1, 4)
+        ]
+        pair_list = {
+            "schema_version": 5,
+            "selected_frame_count": 4,
+            "accepted_attempt_number": 2,
+            "pairs": pairs,
+            "attempts": [
+                {
+                    "attempt_number": 1,
+                    "matcher_used": "faiss",
+                    "exact_recovery_reason": None,
+                    "recovery_level": "normal",
+                    "outcome": "completed",
+                    "scheduled_pair_count": 3,
+                    "attempted_pair_count": 3,
+                    "raw_matched_pair_count": 3,
+                    "spatially_verified_pair_count": 3,
+                    "retrieval": normal_retrieval,
+                },
+                {
+                    "attempt_number": 2,
+                    "matcher_used": "faiss",
+                    "exact_recovery_reason": None,
+                    "recovery_level": "maximum",
+                    "outcome": "completed",
+                    "scheduled_pair_count": 6,
+                    "attempted_pair_count": 6,
+                    "raw_matched_pair_count": 6,
+                    "spatially_verified_pair_count": 6,
+                    "retrieval": None,
+                },
+            ],
+            "fallback_reasons": [
+                "normal mapping rejected",
+                "expanded retrieval graph disconnected",
+            ],
+        }
+        selection = evidence.SelectionManifestSources(
+            image_names=tuple(image_names),
+            clip_ids=("clip-0",) * 4,
+            source_kinds=("video",) * 4,
+            video_source_count=1,
+        )
+        configuration = {
+            "input_topology": "continuous",
+            "pairing_policy": "walkthrough",
+            "temporal_offsets": [1],
+            "vocabulary_candidate_count": 20,
+            "vocabulary_returned_neighbor_count": 2,
+            "vocabulary_query_stride": 2,
+        }
+        metrics = fixture_pair_list_metrics(pair_list, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pair-list.json"
+            path.write_bytes(evidence.canonical_json_bytes(pair_list) + b"\n")
+            evidence._validate_pair_list(path, 4, selection, configuration, metrics)
+
+            changed = copy.deepcopy(pair_list)
+            changed["fallback_reasons"].pop()
+            path.unlink()
+            path.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "recovery"):
+                evidence._validate_pair_list(path, 4, selection, configuration, metrics)
+
+    def test_pair_list_exact_recovery_reuses_receipt_without_reexecuting_retrieval(
+        self,
+    ) -> None:
+        pair_list = fixture_lossless_pair_list_with_zero_result_query()
+        completed = pair_list["attempts"][0]
+        failed = copy.deepcopy(completed)
+        failed.update(
+            {
+                "outcome": "failed",
+                "attempted_pair_count": 0,
+                "raw_matched_pair_count": 0,
+                "spatially_verified_pair_count": 0,
+            }
+        )
+        exact = copy.deepcopy(completed)
+        exact.update(
+            {
+                "attempt_number": 2,
+                "matcher_used": "exact",
+                "exact_recovery_reason": "faissCrash",
+            }
+        )
+        exact["retrieval"]["executed"] = False
+        pair_list["attempts"] = [failed, exact]
+        pair_list["accepted_attempt_number"] = 2
+        pair_list["fallback_reasons"] = ["FAISS crashed"]
+        selection = evidence.SelectionManifestSources(
+            image_names=tuple(f"frame-{index:06d}.jpg" for index in range(30)),
+            clip_ids=("clip-0",) * 30,
+            source_kinds=("video",) * 30,
+            video_source_count=1,
+        )
+        configuration = {
+            "input_topology": "continuous",
+            "pairing_policy": "walkthrough",
+            "temporal_offsets": [1, 2, 4, 8, 16],
+            "vocabulary_candidate_count": 20,
+            "vocabulary_returned_neighbor_count": 2,
+            "vocabulary_query_stride": 10,
+        }
+        metrics = fixture_pair_list_metrics(pair_list, 30)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pair-list.json"
+            path.write_bytes(evidence.canonical_json_bytes(pair_list) + b"\n")
+            evidence._validate_pair_list(path, 30, selection, configuration, metrics)
+
+            changed = copy.deepcopy(pair_list)
+            changed["attempts"][1]["retrieval"]["executed"] = True
+            path.unlink()
+            path.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "exact recovery"):
+                evidence._validate_pair_list(path, 30, selection, configuration, metrics)
+
+    def test_unordered_small_photo_route_requires_exact_exhaustive_faiss_closure(
+        self,
+    ) -> None:
         request = evidence_request()
         request["input_kind"] = "photos"
         request["video_source_count"] = 0
         request["capture_traits"] = ["unordered"]
         request["candidate_run_configuration"].update(
             {
+                "capture_path": "automatic",
                 "input_topology": "unordered",
                 "pairing_policy": "unordered_exhaustive",
                 "temporal_pairing": "none",
                 "temporal_offsets": [],
                 "vocabulary_candidate_count": 0,
-                "vocabulary_verified_neighbor_count": 0,
+                "vocabulary_returned_neighbor_count": 0,
                 "vocabulary_query_stride": 1,
                 "maximum_concurrent_video_source_analysis_tasks": 1,
-                "ba_global_frames_ratio": 1.1,
-                "ba_global_points_ratio": 1.1,
+                "ba_global_frames_ratio": 1.4,
+                "ba_global_points_ratio": 1.4,
                 "ba_local_max_refinements": 2,
             }
         )
-        selection = evidence.canonical_json_bytes(
-            {
-                "schema_version": 2,
-                "views": [
-                    {
-                        "view_index": index,
-                        "image_name": f"frame-{index:06d}.jpg",
-                        "clip_id": f"photo-{index}",
-                        "source_kind": "photo",
-                    }
-                    for index in range(30)
-                ],
-            }
-        ) + b"\n"
-        request["reference_artifacts"]["selection_manifest_sha256"] = evidence.sha256_bytes(
-            selection
+        selection = (
+            evidence.canonical_json_bytes(
+                {
+                    "schema_version": 2,
+                    "views": [
+                        {
+                            "view_index": index,
+                            "image_name": f"frame-{index:06d}.jpg",
+                            "clip_id": f"photo-{index}",
+                            "source_kind": "photo",
+                        }
+                        for index in range(30)
+                    ],
+                }
+            )
+            + b"\n"
+        )
+        request["reference_artifacts"]["selection_manifest_sha256"] = (
+            evidence.sha256_bytes(selection)
         )
         preparation = json.loads(FIXTURE_GROUND_TRUTH_PREPARATION)
         preparation["selection_manifest"]["sha256"] = request["reference_artifacts"][
@@ -4749,9 +7071,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed_observations, request)
                 (root / "selection-manifest.json").write_bytes(selection)
-                (root / "ground-truth-preparation.json").write_bytes(
-                    preparation_bytes
-                )
+                (root / "ground-truth-preparation.json").write_bytes(preparation_bytes)
                 (root / "accurate-rendering-reference.json").write_bytes(
                     rendering_reference_bytes
                 )
@@ -4769,7 +7089,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
                 else:
-                    with self.assertRaisesRegex(evidence.EvidenceError, "exhaustive|duplicate"):
+                    with self.assertRaisesRegex(
+                        evidence.EvidenceError, "exhaustive|duplicate"
+                    ):
                         evidence.derive_attestation(
                             request,
                             changed_observations,
@@ -4780,12 +7102,364 @@ class EvidenceProtocolTests(unittest.TestCase):
                             machine=evidence_machine(evidence.LANE_REFERENCE),
                         )
 
+    def test_unordered_exhaustive_pair_list_rejects_unbounded_exact_recovery(self) -> None:
+        pair_list = fixture_unordered_exhaustive_pair_list()
+        completed = pair_list["attempts"][0]
+        completed["attempt_number"] = 2
+        completed["matcher_used"] = "exact"
+        completed["exact_recovery_reason"] = "faissUnsupportedOperation"
+        failed = copy.deepcopy(completed)
+        failed.update(
+            {
+                "attempt_number": 1,
+                "matcher_used": "faiss",
+                "exact_recovery_reason": None,
+                "outcome": "failed",
+                "attempted_pair_count": 0,
+                "raw_matched_pair_count": 0,
+                "spatially_verified_pair_count": 0,
+            }
+        )
+        pair_list["attempts"] = [failed, completed]
+        pair_list["accepted_attempt_number"] = 2
+        pair_list["fallback_reasons"] = ["faiss reported an unsupported operation"]
+        for pair in pair_list["pairs"]:
+            pair["matcher_used"] = "exact"
+        selection = evidence.SelectionManifestSources(
+            image_names=tuple(f"frame-{index:06d}.jpg" for index in range(30)),
+            clip_ids=tuple(f"photo-{index}" for index in range(30)),
+            source_kinds=tuple("photo" for _ in range(30)),
+            video_source_count=0,
+        )
+        configuration = {
+            "input_topology": "unordered",
+            "pairing_policy": "unordered_exhaustive",
+            "temporal_offsets": [],
+            "vocabulary_candidate_count": 0,
+            "vocabulary_returned_neighbor_count": 0,
+            "vocabulary_query_stride": 1,
+        }
+        metrics = {
+            "scheduled_pairs": 435,
+            "attempted_pairs": 435,
+            "raw_matched_pairs": 435,
+            "spatially_verified_pairs": 435,
+            "local_pairs": 0,
+            "retrieval_pairs": 435,
+            "loop_pairs": 0,
+            "connected_components": 1,
+            "isolated_views": 0,
+            "articulation_views": 0,
+            "biconnected_blocks": 1,
+            "largest_biconnected_block_views": 30,
+            "second_largest_biconnected_block_views": 0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pair-list.json"
+            path.write_bytes(evidence.canonical_json_bytes(pair_list) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "exact recovery"):
+                evidence._validate_pair_list(path, 30, selection, configuration, metrics)
+
+    def test_pair_graph_exact_recovery_accepts_256_and_rejects_257_pairs(
+        self,
+    ) -> None:
+        def attempts(pair_count: int, faiss_outcome: str) -> list[dict[str, object]]:
+            return [
+                {
+                    "attemptNumber": 1,
+                    "matcher": "faiss",
+                    "exactRecoveryReason": None,
+                    "recoveryLevel": "maximum",
+                    "outcome": faiss_outcome,
+                    "scheduledPairCount": pair_count,
+                    "attemptedPairCount": 0 if faiss_outcome == "failed" else pair_count,
+                    "rawMatchedPairCount": 0,
+                    "spatiallyVerifiedPairCount": 0,
+                    "durationSeconds": 1.0,
+                },
+                {
+                    "attemptNumber": 2,
+                    "matcher": "exact",
+                    "exactRecoveryReason": (
+                        "faissUnsupportedOperation"
+                        if faiss_outcome == "failed"
+                        else "faissGeometryRejectedAfterRetries"
+                    ),
+                    "recoveryLevel": "maximum",
+                    "outcome": "completed",
+                    "scheduledPairCount": pair_count,
+                    "attemptedPairCount": pair_count,
+                    "rawMatchedPairCount": pair_count,
+                    "spatiallyVerifiedPairCount": pair_count,
+                    "durationSeconds": 1.0,
+                },
+            ]
+
+        for faiss_outcome in ("failed", "rejected"):
+            evidence._validate_matcher_recovery_history(
+                attempts(256, faiss_outcome),
+                total_view_count=500,
+                pairing_policy="orderedContinuous",
+            )
+            with self.assertRaisesRegex(evidence.EvidenceError, "exact recovery"):
+                evidence._validate_matcher_recovery_history(
+                    attempts(257, faiss_outcome),
+                    total_view_count=500,
+                    pairing_policy="orderedContinuous",
+                )
+
+    def test_pair_graph_accepts_the_complete_five_attempt_recovery_protocol(
+        self,
+    ) -> None:
+        def attempt(
+            number: int,
+            *,
+            matcher: str,
+            level: str,
+            outcome: str,
+            scheduled: int,
+            attempted: int,
+            verified: int,
+            reason: str | None = None,
+        ) -> dict[str, object]:
+            return {
+                "attemptNumber": number,
+                "matcher": matcher,
+                "exactRecoveryReason": reason,
+                "recoveryLevel": level,
+                "outcome": outcome,
+                "scheduledPairCount": scheduled,
+                "attemptedPairCount": attempted,
+                "rawMatchedPairCount": verified,
+                "spatiallyVerifiedPairCount": verified,
+                "durationSeconds": 1.0,
+            }
+
+        attempts = [
+            attempt(
+                1,
+                matcher="faiss",
+                level="normal",
+                outcome="failed",
+                scheduled=40,
+                attempted=0,
+                verified=0,
+            ),
+            attempt(
+                2,
+                matcher="faiss",
+                level="normal",
+                outcome="rejected",
+                scheduled=40,
+                attempted=40,
+                verified=20,
+            ),
+            attempt(
+                3,
+                matcher="faiss",
+                level="expanded",
+                outcome="rejected",
+                scheduled=80,
+                attempted=80,
+                verified=40,
+            ),
+            attempt(
+                4,
+                matcher="faiss",
+                level="maximum",
+                outcome="rejected",
+                scheduled=190,
+                attempted=190,
+                verified=100,
+            ),
+            attempt(
+                5,
+                matcher="exact",
+                level="maximum",
+                outcome="completed",
+                scheduled=190,
+                attempted=190,
+                verified=190,
+                reason="faissGeometryRejectedAfterRetries",
+            ),
+        ]
+        pair_graph = {
+            "status": "measured",
+            "measurement": {
+                "pairingPolicy": "orderedOrbit",
+                "scheduledPairCount": 190,
+                "attemptedPairCount": 190,
+                "rawMatchedPairCount": 190,
+                "spatiallyVerifiedPairCount": 190,
+                "localPairCount": 0,
+                "retrievalPairCount": 0,
+                "loopRevisitPairCount": 190,
+                "connectedComponentCount": 1,
+                "isolatedViewCount": 0,
+                "descriptorlessViewCount": 0,
+                "componentViewCounts": [20],
+                "articulationViewCount": 0,
+                "biconnectedBlockCount": 1,
+                "largestBiconnectedBlockViewCount": 20,
+                "secondLargestBiconnectedBlockViewCount": 0,
+                "degreeP10": 19,
+                "degreeMedian": 19,
+                "degreeP90": 19,
+                "matcherAttempts": attempts,
+                "pairListDigest": "a" * 64,
+                "featureDatabaseDigest": "b" * 64,
+                "matchingDatabaseDigest": "c" * 64,
+                "matchingDurationSeconds": 5.0,
+            },
+            "requiresCrossClipRetrieval": False,
+            "retrievalWasScheduled": True,
+            "usedLocalVocabularyRetrieval": False,
+        }
+
+        evidence._validate_pair_graph_artifact(
+            pair_graph,
+            total_view_count=20,
+            candidate_configuration={"pairing_policy": "object_orbit"},
+        )
+
+    def test_pair_graph_component_counts_include_singletons_once(self) -> None:
+        pair_graph = {
+            "status": "measured",
+            "measurement": {
+                "pairingPolicy": "orderedContinuous",
+                "scheduledPairCount": 8,
+                "attemptedPairCount": 8,
+                "rawMatchedPairCount": 8,
+                "spatiallyVerifiedPairCount": 8,
+                "localPairCount": 8,
+                "retrievalPairCount": 0,
+                "loopRevisitPairCount": 0,
+                "connectedComponentCount": 2,
+                "isolatedViewCount": 1,
+                "descriptorlessViewCount": 1,
+                "componentViewCounts": [9, 1],
+                "articulationViewCount": 0,
+                "biconnectedBlockCount": 1,
+                "largestBiconnectedBlockViewCount": 9,
+                "secondLargestBiconnectedBlockViewCount": 0,
+                "degreeP10": 0,
+                "degreeMedian": 1,
+                "degreeP90": 2,
+                "matcherAttempts": [
+                    {
+                        "attemptNumber": 1,
+                        "matcher": "faiss",
+                        "exactRecoveryReason": None,
+                        "recoveryLevel": "normal",
+                        "outcome": "completed",
+                        "scheduledPairCount": 8,
+                        "attemptedPairCount": 8,
+                        "rawMatchedPairCount": 8,
+                        "spatiallyVerifiedPairCount": 8,
+                        "durationSeconds": 1.0,
+                    }
+                ],
+                "pairListDigest": "a" * 64,
+                "featureDatabaseDigest": "b" * 64,
+                "matchingDatabaseDigest": "c" * 64,
+                "matchingDurationSeconds": 1.0,
+            },
+            "requiresCrossClipRetrieval": False,
+            "retrievalWasScheduled": False,
+            "usedLocalVocabularyRetrieval": False,
+        }
+
+        evidence._validate_pair_graph_artifact(
+            pair_graph,
+            total_view_count=10,
+            candidate_configuration={"pairing_policy": "generic_continuous"},
+        )
+
+    def test_ordered_maximum_recovery_accepts_exhaustive_faiss_closure(self) -> None:
+        pairs = [
+            {
+                "view_a": view_a,
+                "view_b": view_b,
+                "pair_type": "exhaustive",
+                "query_view": None,
+                "attempted": True,
+                "raw_matched": True,
+                "spatially_verified": True,
+                "matcher_used": "faiss",
+            }
+            for view_a in range(4)
+            for view_b in range(view_a + 1, 4)
+        ]
+        pair_list = {
+            "schema_version": 5,
+            "selected_frame_count": 4,
+            "accepted_attempt_number": 1,
+            "pairs": pairs,
+            "attempts": [
+                {
+                    "attempt_number": 1,
+                    "matcher_used": "faiss",
+                    "exact_recovery_reason": None,
+                    "recovery_level": "maximum",
+                    "outcome": "completed",
+                    "scheduled_pair_count": 6,
+                    "attempted_pair_count": 6,
+                    "raw_matched_pair_count": 6,
+                    "spatially_verified_pair_count": 6,
+                    "retrieval": None,
+                }
+            ],
+            "fallback_reasons": [
+                "normal graph was disconnected",
+                "expanded graph was disconnected",
+            ],
+        }
+        selection = evidence.SelectionManifestSources(
+            image_names=tuple(f"frame-{index:06d}.jpg" for index in range(4)),
+            clip_ids=("clip-0",) * 4,
+            source_kinds=("video",) * 4,
+            video_source_count=1,
+        )
+        configuration = {
+            "input_topology": "continuous",
+            "pairing_policy": "walkthrough",
+            "temporal_offsets": [1],
+            "vocabulary_candidate_count": 20,
+            "vocabulary_returned_neighbor_count": 2,
+            "vocabulary_query_stride": 2,
+        }
+        metrics = {
+            "scheduled_pairs": 6,
+            "attempted_pairs": 6,
+            "raw_matched_pairs": 6,
+            "spatially_verified_pairs": 6,
+            "local_pairs": 0,
+            "retrieval_pairs": 6,
+            "loop_pairs": 0,
+            "connected_components": 1,
+            "isolated_views": 0,
+            "articulation_views": 0,
+            "biconnected_blocks": 1,
+            "largest_biconnected_block_views": 4,
+            "second_largest_biconnected_block_views": 0,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pair-list.json"
+            path.write_bytes(evidence.canonical_json_bytes(pair_list) + b"\n")
+            evidence._validate_pair_list(path, 4, selection, configuration, metrics)
+
     def test_raw_pipeline_metrics_are_closed_nullable_and_typed(self) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         cases = (
             ({**observations["pipeline_metrics"], "unknown": 1}, "unknown"),
-            ({**observations["pipeline_metrics"], "scheduled_pairs": -1}, "scheduled_pairs"),
-            ({**observations["pipeline_metrics"], "orientation_status": "guessed"}, "orientation_status"),
+            (
+                {**observations["pipeline_metrics"], "scheduled_pairs": -1},
+                "scheduled_pairs",
+            ),
+            (
+                {**observations["pipeline_metrics"], "orientation_status": "guessed"},
+                "orientation_status",
+            ),
             (
                 {
                     **observations["pipeline_metrics"],
@@ -4861,7 +7535,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             ),
         )
         for raw_metrics, expected in cases:
-            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(expected=expected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 changed = json.loads(json.dumps(observations))
                 changed["pipeline_metrics"] = raw_metrics
                 root = Path(directory)
@@ -4877,7 +7554,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
 
-    def test_training_manifest_binds_raster_recovery_metrics_to_published_output(self) -> None:
+    def test_training_manifest_binds_raster_recovery_metrics_to_published_output(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         observations["artifacts"]["training_manifest"] = "training-manifest.json"
         observations["pipeline_metrics"].update(
@@ -4947,11 +7626,15 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         for field, value in cases:
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
-                manifest = training_manifest_for_observations(observations, configuration)
+                manifest = training_manifest_for_observations(
+                    observations, configuration
+                )
                 manifest[field] = value
                 path = Path(directory) / "training-manifest.json"
                 path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
-                with self.assertRaisesRegex(evidence.EvidenceError, "does not match request"):
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError, "does not match request"
+                ):
                     evidence._validate_training_manifest(
                         path,
                         descriptor,
@@ -4975,6 +7658,441 @@ class EvidenceProtocolTests(unittest.TestCase):
                     configuration,
                     60.0,
                 )
+
+    def test_training_manifest_accepts_current_shipping_schema(self) -> None:
+        request = evidence_request(lane=evidence.LANE_REFERENCE)
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        configuration = request["candidate_run_configuration"]
+        output_bytes = VALID_SPLAT_PLY.encode("utf-8")
+        descriptor = {
+            "bytes": len(output_bytes),
+            "sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "training-manifest.json"
+            path.write_bytes(
+                evidence.canonical_json_bytes(
+                    training_manifest_for_observations(observations, configuration)
+                )
+                + b"\n"
+            )
+
+            evidence._validate_training_manifest(
+                path,
+                descriptor,
+                1,
+                observations["pipeline_metrics"],
+                configuration,
+                60.0,
+            )
+
+    def test_training_manifest_rejects_legacy_shipping_schema(self) -> None:
+        request = evidence_request(lane=evidence.LANE_REFERENCE)
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        configuration = request["candidate_run_configuration"]
+        output_bytes = VALID_SPLAT_PLY.encode("utf-8")
+        descriptor = {
+            "bytes": len(output_bytes),
+            "sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
+        }
+        manifest = training_manifest_for_observations(observations, configuration)
+        manifest["schemaVersion"] = 5
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "training-manifest.json"
+            path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "completed schema-7"):
+                evidence._validate_training_manifest(
+                    path,
+                    descriptor,
+                    1,
+                    observations["pipeline_metrics"],
+                    configuration,
+                    60.0,
+                )
+
+    def test_training_manifest_rejects_unknown_nested_shipping_fields(self) -> None:
+        request = evidence_request(lane=evidence.LANE_REFERENCE)
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        configuration = request["candidate_run_configuration"]
+        output_bytes = VALID_SPLAT_PLY.encode("utf-8")
+        descriptor = {
+            "bytes": len(output_bytes),
+            "sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
+        }
+        cases = (
+            (
+                "dataset derivation",
+                "datasetDerivation",
+                "datasetDerivation has invalid fields",
+            ),
+            (
+                "resource admission",
+                "resourceAdmission",
+                "resource admission has invalid fields",
+            ),
+            (
+                "resource observation",
+                "observation",
+                "resource observation has invalid fields",
+            ),
+            ("resource clock", "clock", "resource clock has invalid fields"),
+            ("host page evidence", "host_pages", "host pages has invalid fields"),
+        )
+        for label, target, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                manifest = training_manifest_for_observations(
+                    observations, configuration
+                )
+                if target == "datasetDerivation":
+                    nested = manifest["datasetDerivation"]
+                elif target == "resourceAdmission":
+                    nested = manifest["resourceAdmission"]
+                elif target == "observation":
+                    nested = manifest["resourceAdmission"]["observation"]
+                elif target == "clock":
+                    nested = manifest["resourceAdmission"]["observation"]["clock"]
+                else:
+                    nested = manifest["resourceAdmission"]["observation"]["host_pages"]
+                nested["unexpected"] = "not-shipping-evidence"
+                path = Path(directory) / "training-manifest.json"
+                path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence._validate_training_manifest(
+                        path,
+                        descriptor,
+                        1,
+                        observations["pipeline_metrics"],
+                        configuration,
+                        60.0,
+                    )
+
+    def test_training_manifest_resource_admission_requires_consistent_raw_evidence(
+        self,
+    ) -> None:
+        request = evidence_request(lane=evidence.LANE_REFERENCE)
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        configuration = request["candidate_run_configuration"]
+        output_bytes = VALID_SPLAT_PLY.encode("utf-8")
+        descriptor = {
+            "bytes": len(output_bytes),
+            "sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
+        }
+        cases = (
+            ("legacy admission schema", ("schema_version",), 1),
+            (
+                "available bytes disagree with source",
+                ("observation", "available_host_memory_bytes"),
+                30 * 1_073_741_824 + 1,
+            ),
+            (
+                "speculative pages exceed free pages",
+                ("observation", "host_pages", "speculative_page_count"),
+                2_000_000,
+            ),
+            (
+                "pressure source contradicts state",
+                ("observation", "memory_pressure_source"),
+                "unavailable",
+            ),
+            (
+                "malformed pressure state",
+                ("observation", "memory_pressure"),
+                [],
+            ),
+            (
+                "oversized wall clock",
+                ("observation", "clock", "wall_clock"),
+                10**400,
+            ),
+            (
+                "unpaired Metal evidence",
+                ("observation", "metal_current_allocated_bytes"),
+                None,
+            ),
+            ("malformed resource policy", ("resource_policy",), []),
+        )
+        for label, field_path, value in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                manifest = training_manifest_for_observations(
+                    observations, configuration
+                )
+                target = manifest["resourceAdmission"]
+                for field in field_path[:-1]:
+                    target = target[field]
+                if label == "unpaired Metal evidence":
+                    del target[field_path[-1]]
+                else:
+                    target[field_path[-1]] = value
+                path = Path(directory) / "training-manifest.json"
+                path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError, "resource admission"
+                ):
+                    evidence._validate_training_manifest(
+                        path,
+                        descriptor,
+                        1,
+                        observations["pipeline_metrics"],
+                        configuration,
+                        60.0,
+                    )
+
+    def test_training_manifest_resource_admission_binds_capacity_budget_and_request(
+        self,
+    ) -> None:
+        request = evidence_request(lane=evidence.LANE_REFERENCE)
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        configuration = request["candidate_run_configuration"]
+        output_bytes = VALID_SPLAT_PLY.encode("utf-8")
+        descriptor = {
+            "bytes": len(output_bytes),
+            "sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
+        }
+        cases = []
+
+        tampered_capacity = training_manifest_for_observations(
+            observations, configuration
+        )
+        tampered_capacity["resourceAdmission"]["host_capacity_bytes"] += 1
+        cases.append(("derived capacity", tampered_capacity, "derived capacities"))
+
+        overcommitted = training_manifest_for_observations(observations, configuration)
+        overcommitted["memoryBudgetBytes"] = (
+            overcommitted["resourceAdmission"]["allowed_trainer_bytes"] + 1
+        )
+        cases.append(("overcommitted budget", overcommitted, "exceeds admitted"))
+
+        mismatched_configuration = dict(configuration)
+        mismatched_configuration["resource_policy"] = "conserve_memory"
+        mismatched_policy = training_manifest_for_observations(
+            observations,
+            mismatched_configuration,
+        )
+        cases.append(("request policy", mismatched_policy, "does not match request"))
+
+        for label, manifest, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "training-manifest.json"
+                path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence._validate_training_manifest(
+                        path,
+                        descriptor,
+                        1,
+                        observations["pipeline_metrics"],
+                        configuration,
+                        60.0,
+                    )
+
+    def test_training_manifest_dataset_derivation_binds_dataset_identity(self) -> None:
+        request = evidence_request(lane=evidence.LANE_REFERENCE)
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        configuration = request["candidate_run_configuration"]
+        output_bytes = VALID_SPLAT_PLY.encode("utf-8")
+        descriptor = {
+            "bytes": len(output_bytes),
+            "sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
+        }
+        manifest = training_manifest_for_observations(observations, configuration)
+        manifest["datasetDerivation"]["datasetInputDigest"] = "7" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "training-manifest.json"
+            path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "dataset input digest"):
+                evidence._validate_training_manifest(
+                    path,
+                    descriptor,
+                    1,
+                    observations["pipeline_metrics"],
+                    configuration,
+                    60.0,
+                )
+
+    def test_measurement_training_receipt_rejects_split_model_and_ply_substitution(
+        self,
+    ) -> None:
+        request = evidence_request(lane=evidence.LANE_CONSTRAINED)
+        configuration = request["candidate_run_configuration"]
+        observations = raw_observations(evidence.LANE_CONSTRAINED)
+        selected = [
+            f"frame-{index:06d}.jpg" for index in range(request["binding"]["scale"])
+        ]
+        holdouts = request["holdout_indices"]
+        training = [
+            index for index in range(len(selected)) if index not in set(holdouts)
+        ]
+        training_digest = "a" * 64
+        unsigned_split = {
+            "schema_version": 1,
+            "selected_image_names": selected,
+            "training_view_indices": training,
+            "holdout_view_indices": holdouts,
+            "training_image_names": [selected[index] for index in training],
+            "holdout_image_names": [selected[index] for index in holdouts],
+            "dataset_image_names": [selected[index] for index in training],
+            "training_image_digest": training_digest,
+        }
+        split = dict(unsigned_split)
+        split["closure_digest"] = hashlib.sha256(
+            evidence.canonical_json_bytes(unsigned_split)
+        ).hexdigest()
+        output_bytes = VALID_SPLAT_PLY.encode("utf-8")
+        output_descriptor = {
+            "bytes": len(output_bytes),
+            "sha256": "sha256:" + hashlib.sha256(output_bytes).hexdigest(),
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            split_path = root / "training-split.json"
+            split_path.write_bytes(evidence.canonical_json_bytes(split) + b"\n")
+            split_descriptor = {
+                "bytes": split_path.stat().st_size,
+                "sha256": "sha256:"
+                + hashlib.sha256(split_path.read_bytes()).hexdigest(),
+            }
+            geometry_bytes = b'{"schema_version":3}\n'
+            geometry_descriptor = {
+                "bytes": len(geometry_bytes),
+                "sha256": "sha256:" + hashlib.sha256(geometry_bytes).hexdigest(),
+            }
+            manifest = {
+                "schema_version": 1,
+                "training_split_digest": split["closure_digest"],
+                "training_split_manifest_sha256": split_descriptor[
+                    "sha256"
+                ].removeprefix("sha256:"),
+                "training_image_digest": training_digest,
+                "dataset_input_digest": "1" * 64,
+                "dataset_geometry_digest": "2" * 64,
+                "source_model_digest": "3" * 64,
+                "filtered_model_digest": "4" * 64,
+                "geometry_manifest_sha256": geometry_descriptor["sha256"].removeprefix(
+                    "sha256:"
+                ),
+                "output_sha256": output_descriptor["sha256"].removeprefix("sha256:"),
+                "output_bytes": output_descriptor["bytes"],
+                "profile": configuration["detail_profile"],
+                "seed": configuration["run_seed"],
+                "iteration_limit": configuration["trainer_iterations"],
+                "plateau_window": configuration["trainer_plateau_window"],
+                "completed_iteration": configuration["trainer_iterations"],
+                "gaussian_count": 1,
+                "elapsed_seconds": 5.0,
+                "input_digest": "5" * 64,
+                "geometry_digest": "6" * 64,
+                "trainer_build_digest": "7" * 64,
+                "completion_status": "completed",
+                "training_split_manifest": "training-split.json",
+                "peak_memory_bytes": 536_870_912,
+                "memory_budget_bytes": 8_589_934_592,
+                "raster_fallback_count": observations["pipeline_metrics"][
+                    "raster_fallback_count"
+                ],
+                "raster_exact_fallback_elapsed_seconds": observations[
+                    "pipeline_metrics"
+                ]["raster_exact_fallback_elapsed_seconds"],
+                "raster_exact_buffer_growth_count": observations["pipeline_metrics"][
+                    "raster_exact_buffer_growth_count"
+                ],
+                "raster_exact_buffer_bytes_added": observations["pipeline_metrics"][
+                    "raster_exact_buffer_bytes_added"
+                ],
+                "raster_replay_elapsed_seconds": observations["pipeline_metrics"][
+                    "raster_replay_elapsed_seconds"
+                ],
+                "raster_peak_exact_intersection_capacity": observations[
+                    "pipeline_metrics"
+                ]["raster_peak_exact_intersection_capacity"],
+                "dropped_intersection_count": 0,
+                "scene_bounds": {
+                    "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "radius": 2.5,
+                },
+            }
+
+            def validate(
+                receipt: dict[str, object],
+                *,
+                split_descriptor_override: dict[str, object] | None = None,
+                geometry_descriptor_override: dict[str, object] | None = None,
+                output_descriptor_override: dict[str, object] | None = None,
+            ) -> None:
+                manifest_path = root / "measurement-training.json"
+                manifest_path.write_bytes(
+                    evidence.canonical_json_bytes(receipt) + b"\n"
+                )
+                evidence._validate_training_manifest(
+                    manifest_path,
+                    output_descriptor_override or output_descriptor,
+                    1,
+                    observations["pipeline_metrics"],
+                    configuration,
+                    60.0,
+                    training_split_path=split_path,
+                    training_split_descriptor=split_descriptor_override
+                    or split_descriptor,
+                    geometry_manifest_descriptor=geometry_descriptor_override
+                    or geometry_descriptor,
+                    request=request,
+                )
+
+            validate(manifest)
+            cases = (
+                (
+                    "stale split",
+                    {**manifest, "training_split_manifest_sha256": "8" * 64},
+                    {},
+                    "split digest is stale",
+                ),
+                (
+                    "model substitution",
+                    manifest,
+                    {
+                        "geometry_descriptor_override": {
+                            "bytes": 2,
+                            "sha256": "sha256:" + "9" * 64,
+                        }
+                    },
+                    "geometry model was substituted",
+                ),
+                (
+                    "PLY substitution",
+                    manifest,
+                    {
+                        "output_descriptor_override": {
+                            "bytes": 2,
+                            "sha256": "sha256:" + "b" * 64,
+                        }
+                    },
+                    "PLY was substituted",
+                ),
+            )
+            for label, changed, overrides, expected in cases:
+                with (
+                    self.subTest(label=label),
+                    self.assertRaisesRegex(evidence.EvidenceError, expected),
+                ):
+                    validate(changed, **overrides)
+
+            changed_split = json.loads(json.dumps(split))
+            changed_split["dataset_image_names"] = changed_split["dataset_image_names"][
+                ::-1
+            ]
+            split_path.write_bytes(evidence.canonical_json_bytes(changed_split) + b"\n")
+            changed_descriptor = {
+                "bytes": split_path.stat().st_size,
+                "sha256": "sha256:"
+                + hashlib.sha256(split_path.read_bytes()).hexdigest(),
+            }
+            changed_manifest = dict(manifest)
+            changed_manifest["training_split_manifest_sha256"] = changed_descriptor[
+                "sha256"
+            ].removeprefix("sha256:")
+            with self.assertRaisesRegex(
+                evidence.EvidenceError, "holdout or changed image order"
+            ):
+                validate(changed_manifest, split_descriptor_override=changed_descriptor)
 
     def test_training_manifest_mirrors_swift_integer_and_resource_guards(self) -> None:
         request = evidence_request(lane=evidence.LANE_REFERENCE)
@@ -5010,7 +8128,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 {"rasterFallbackCount": 1},
                 "fallback evidence",
             ),
-            ("signed integer overflow", {"peakMemoryBytes": 1 << 63}, "nonnegative integer"),
+            (
+                "signed integer overflow",
+                {"peakMemoryBytes": 1 << 63},
+                "nonnegative integer",
+            ),
             ("seed overflow", {"cameraOrderSeed": 1 << 64}, "outside UInt64"),
             (
                 "malformed exact duration",
@@ -5042,7 +8164,9 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         for label, changes, expected in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
-                manifest = training_manifest_for_observations(observations, configuration)
+                manifest = training_manifest_for_observations(
+                    observations, configuration
+                )
                 manifest.update(changes)
                 path = Path(directory) / "training-manifest.json"
                 path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
@@ -5056,7 +8180,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         60.0,
                     )
 
-    def test_timing_requires_warmup_alternation_and_declared_repetition_counts(self) -> None:
+    def test_timing_requires_warmup_alternation_and_declared_repetition_counts(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         cases = []
         missing_warmup = json.loads(json.dumps(observations["timing"]))
@@ -5078,7 +8204,10 @@ class EvidenceProtocolTests(unittest.TestCase):
         impossible_phase_sum["ordinary_runs"][2]["end_to_end_seconds"] = 1
         cases.append((impossible_phase_sum, "phase sum"))
         for timing, expected in cases:
-            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(expected=expected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 changed = json.loads(json.dumps(observations))
                 changed["timing"] = timing
                 root = Path(directory)
@@ -5096,7 +8225,10 @@ class EvidenceProtocolTests(unittest.TestCase):
 
     def test_timing_repeatability_rejects_contaminated_measured_runs(self) -> None:
         for variant in ("baseline", "candidate"):
-            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(variant=variant),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 observations = raw_observations(evidence.LANE_REFERENCE)
                 measured_runs = [
                     record
@@ -5156,9 +8288,12 @@ class EvidenceProtocolTests(unittest.TestCase):
 
     def test_timing_repeatability_rejects_unstable_short_measurements(self) -> None:
         for values in ((0.01, 2.0, 2.0), (0.01, 0.01, 2.0), (0.01, 0.04, 0.05)):
-            with self.subTest(values=values), self.assertRaisesRegex(
-                evidence.EvidenceError,
-                "repeatability",
+            with (
+                self.subTest(values=values),
+                self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "repeatability",
+                ),
             ):
                 evidence._validate_timing_repeatability(
                     {"candidate": [{"matcher_seconds": value} for value in values]},
@@ -5481,9 +8616,12 @@ class EvidenceProtocolTests(unittest.TestCase):
             ),
         )
         for expected, report, outer_cpu in cases:
-            with self.subTest(case=expected), self.assertRaisesRegex(
-                evidence.EvidenceError,
-                expected,
+            with (
+                self.subTest(case=expected),
+                self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    expected,
+                ),
             ):
                 lane_runner._summarize_host_monitor(
                     report,
@@ -5520,13 +8658,17 @@ class EvidenceProtocolTests(unittest.TestCase):
             ),
             (
                 "scene binding",
-                lambda value: value["commands"][0].update({"scene_id": "different-scene"}),
+                lambda value: value["commands"][0].update(
+                    {"scene_id": "different-scene"}
+                ),
                 "scene_id",
             ),
             (
                 "published output",
                 lambda value: next(
-                    receipt for receipt in value["commands"] if receipt["published_output"]
+                    receipt
+                    for receipt in value["commands"]
+                    if receipt["published_output"]
                 ).update({"output_sha256": "sha256:" + "f" * 64}),
                 "does not match output_ply",
             ),
@@ -5541,14 +8683,6 @@ class EvidenceProtocolTests(unittest.TestCase):
                     ],
                 ),
                 "cover every candidate",
-            ),
-            (
-                "metal allocation",
-                lambda value: [
-                    sample.update({"metal_allocated_bytes": 0})
-                    for sample in value["memory"]["samples"]
-                ],
-                "positive Metal allocation",
             ),
             (
                 "metal route",
@@ -5574,6 +8708,26 @@ class EvidenceProtocolTests(unittest.TestCase):
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
+
+    def test_zero_cross_process_metal_attribution_retains_measured_process_rss(
+        self,
+    ) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        for sample in observations["memory"]["samples"]:
+            sample["metal_allocated_bytes"] = 0
+        expected_runs = evidence._execution_runs(
+            observations["timing"],
+            evidence.LANE_REFERENCE,
+            {"scene_quality", "scene_performance", "suite_performance"},
+        )
+        metrics = evidence._memory_metrics(
+            observations["memory"],
+            expected_runs,
+            evidence_machine(evidence.LANE_REFERENCE),
+            evidence.LANE_REFERENCE,
+        )
+        self.assertGreater(metrics["peak_memory_bytes"]["value"], 0)
+        self.assertEqual(metrics["peak_metal_allocated_bytes"]["value"], 0)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -5613,7 +8767,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             ("failure_type", "unexpected"),
             ("corrupt_ply", True),
         ):
-            with self.subTest(actual_field=field), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(actual_field=field),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 changed = json.loads(json.dumps(observations))
                 changed["actual"][field] = value
                 root = Path(directory)
@@ -5651,13 +8808,17 @@ class EvidenceProtocolTests(unittest.TestCase):
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
 
-    def test_published_training_duration_requires_candidate_end_to_end_run(self) -> None:
+    def test_published_training_duration_requires_candidate_end_to_end_run(
+        self,
+    ) -> None:
         for label, predicate in (
             ("baseline", lambda receipt: receipt["variant"] == "baseline"),
             (
                 "discarded warm-up",
-                lambda receipt: receipt["variant"] == "candidate"
-                and receipt["run_id"] == "ordinary-1",
+                lambda receipt: (
+                    receipt["variant"] == "candidate"
+                    and receipt["run_id"] == "ordinary-1"
+                ),
             ),
         ):
             with self.subTest(label=label):
@@ -5669,7 +8830,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                 )
                 published["published_output"] = False
                 wrong_run = next(
-                    receipt for receipt in observations["commands"] if predicate(receipt)
+                    receipt
+                    for receipt in observations["commands"]
+                    if predicate(receipt)
                 )
                 wrong_run["published_output"] = True
 
@@ -5685,6 +8848,10 @@ class EvidenceProtocolTests(unittest.TestCase):
     def test_long_sequence_samples_are_bound_to_the_3000_frame_request(self) -> None:
         request = evidence_request(scale=3000)
         request["gate_scopes"] = ["long_sequence"]
+        selection = fixture_video_selection_manifest(3000)
+        request["reference_artifacts"]["selection_manifest_sha256"] = (
+            evidence.sha256_bytes(selection)
+        )
         observations = raw_observations(
             evidence.LANE_REFERENCE,
             include_long_sequence=True,
@@ -5718,7 +8885,8 @@ class EvidenceProtocolTests(unittest.TestCase):
             observations["pipeline_metrics"][field] = None
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, observations)
+            write_evidence_artifacts(root, observations, request)
+            (root / "selection-manifest.json").write_bytes(selection)
             attestation = evidence.derive_attestation(
                 request,
                 observations,
@@ -5728,17 +8896,26 @@ class EvidenceProtocolTests(unittest.TestCase):
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
             )
-            self.assertEqual(attestation["metrics"]["long_sequence_frames"], measured(3000))
+            self.assertEqual(
+                attestation["metrics"]["long_sequence_frames"], measured(3000)
+            )
 
         for mutation, expected in (
             (("processed_frames", 2999), "requested scale"),
-            (("rss_windows", observations["long_sequence"]["rss_windows"][:-1]), "windows"),
+            (
+                ("rss_windows", observations["long_sequence"]["rss_windows"][:-1]),
+                "windows",
+            ),
         ):
             changed = json.loads(json.dumps(observations))
             changed["long_sequence"][mutation[0]] = mutation[1]
-            with self.subTest(field=mutation[0]), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(field=mutation[0]),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
-                write_evidence_artifacts(root, changed)
+                write_evidence_artifacts(root, changed, request)
+                (root / "selection-manifest.json").write_bytes(selection)
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
                     evidence.derive_attestation(
                         request,
@@ -5750,7 +8927,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
 
-    def test_toolchain_gates_are_derived_from_bound_scenario_receipts_and_real_archives(self) -> None:
+    def test_toolchain_gates_are_derived_from_bound_scenario_receipts_and_real_archives(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         failed = json.loads(json.dumps(observations))
         failed["toolchain_scenarios"][0]["post_state_verified"] = False
@@ -5787,7 +8966,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_toolchain_size_evidence_rejects_unrelated_or_aliased_archives(self) -> None:
+    def test_toolchain_size_evidence_rejects_unrelated_or_aliased_archives(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -5809,8 +8990,12 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations)
-            (root / "large-area.zip").write_bytes((root / "normal-photo.zip").read_bytes())
-            with self.assertRaisesRegex(evidence.EvidenceError, "toolchain.*distinct|closure"):
+            (root / "large-area.zip").write_bytes(
+                (root / "normal-photo.zip").read_bytes()
+            )
+            with self.assertRaisesRegex(
+                evidence.EvidenceError, "toolchain.*distinct|closure"
+            ):
                 evidence.derive_attestation(
                     evidence_request(),
                     observations,
@@ -5836,7 +9021,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_toolchain_size_evidence_accepts_exact_signed_component_closures(self) -> None:
+    def test_toolchain_size_evidence_accepts_exact_signed_component_closures(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -5859,7 +9046,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             measured(sum(map(len, TEST_TOOLCHAIN_COMPONENT_ARCHIVES.values()))),
         )
 
-    def test_toolchain_size_evidence_allows_one_colmap_closure_without_streaming(self) -> None:
+    def test_toolchain_size_evidence_allows_one_colmap_closure_without_streaming(
+        self,
+    ) -> None:
         request = evidence_request()
         request["binding"]["toolchain_identity"] = toolchain_identity_for_state(
             TEST_NORMAL_TOOLCHAIN_STATE
@@ -5884,7 +9073,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             (root / "large-area-toolchain-state.json").write_bytes(
                 evidence.canonical_json_bytes(TEST_NORMAL_TOOLCHAIN_STATE) + b"\n"
             )
-            (root / "large-area.zip").write_bytes((root / "normal-photo.zip").read_bytes())
+            (root / "large-area.zip").write_bytes(
+                (root / "normal-photo.zip").read_bytes()
+            )
             (root / "toolchain-scenarios.jsonl").write_bytes(
                 b"".join(
                     evidence.canonical_json_bytes(record) + b"\n"
@@ -5913,9 +9104,14 @@ class EvidenceProtocolTests(unittest.TestCase):
             measured(expected_bytes),
         )
 
-    def test_normal_toolchain_closure_requires_runnable_colmap_and_training_capabilities(self) -> None:
+    def test_normal_toolchain_closure_requires_runnable_colmap_and_training_capabilities(
+        self,
+    ) -> None:
         for removed_capability in ("geometry.colmap", "training.msplat"):
-            with self.subTest(capability=removed_capability), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(capability=removed_capability),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 observations = raw_observations(evidence.LANE_REFERENCE)
                 write_evidence_artifacts(root, observations)
@@ -5928,7 +9124,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                 core["capabilities"].remove(removed_capability)
                 manifest["signatureEd25519"] = ""
                 manifest["signatureEd25519"] = base64.b64encode(
-                    TEST_TOOLCHAIN_PRIVATE_KEY.sign(evidence.canonical_json_bytes(manifest))
+                    TEST_TOOLCHAIN_PRIVATE_KEY.sign(
+                        evidence.canonical_json_bytes(manifest)
+                    )
                 ).decode("ascii")
 
                 states = {}
@@ -5937,13 +9135,15 @@ class EvidenceProtocolTests(unittest.TestCase):
                     ("large", ["macos-arm64-core", "geometry-large-area"]),
                 ):
                     components = {
-                        component["name"]: component for component in manifest["components"]
+                        component["name"]: component
+                        for component in manifest["components"]
                     }
                     selected = [components[name] for name in component_names]
                     states[label] = {
                         "schemaVersion": 2,
                         "installedArtifacts": {
-                            component["name"]: component["sha256"] for component in selected
+                            component["name"]: component["sha256"]
+                            for component in selected
                         },
                         "installedCapabilities": sorted(
                             capability
@@ -5994,7 +9194,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                 (root / "supervisor-run.json").write_bytes(
                     evidence.canonical_json_bytes(receipt) + b"\n"
                 )
-                with self.assertRaisesRegex(evidence.EvidenceError, "supervisor.*window"):
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError, "supervisor.*window"
+                ):
                     evidence.derive_attestation(
                         evidence_request(),
                         observations,
@@ -6025,7 +9227,6 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-
     def test_stability_requires_each_stage_and_recovery_pair(self) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         invalid_none = json.loads(json.dumps(observations))
@@ -6049,7 +9250,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             (invalid_none, "none.*none"),
             (missing_pair, "stage and recovery"),
         ):
-            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(expected=expected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
@@ -6072,7 +9276,9 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             unresolved_request = evidence_request()
-            unresolved_request["reference_artifacts"]["orientation_expected_status"] = "unresolved"
+            unresolved_request["reference_artifacts"]["orientation_expected_status"] = (
+                "unresolved"
+            )
             write_evidence_artifacts(root, unresolved, unresolved_request)
             attestation = evidence.derive_attestation(
                 unresolved_request,
@@ -6083,9 +9289,13 @@ class EvidenceProtocolTests(unittest.TestCase):
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
             )
-        self.assertEqual(attestation["metrics"]["orientation_status"], measured("unresolved"))
+        self.assertEqual(
+            attestation["metrics"]["orientation_status"], measured("unresolved")
+        )
 
-    def test_axis_aligned_sign_unverified_uses_undirected_error_without_sign_evidence(self) -> None:
+    def test_axis_aligned_sign_unverified_uses_undirected_error_without_sign_evidence(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         observations["pipeline_metrics"]["orientation_status"] = (
             "axis_aligned_sign_unverified"
@@ -6137,15 +9347,17 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_orientation_label_uses_closed_ground_truth_world_physical_up_schema(self) -> None:
+    def test_orientation_label_uses_closed_ground_truth_world_physical_up_schema(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         request = evidence_request()
         malformed_label = (
             b'{"coordinate_space":"source_world","physical_up":{"x":0,"y":0,"z":0},'
             b'"schema_version":1}\n'
         )
-        request["reference_artifacts"]["orientation_label_sha256"] = evidence.sha256_bytes(
-            malformed_label
+        request["reference_artifacts"]["orientation_label_sha256"] = (
+            evidence.sha256_bytes(malformed_label)
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -6213,7 +9425,9 @@ class EvidenceProtocolTests(unittest.TestCase):
 
         timing = json.loads(json.dumps(observations["timing"]))
         candidate = next(
-            record for record in timing["ordinary_runs"] if record["variant"] == "candidate"
+            record
+            for record in timing["ordinary_runs"]
+            if record["variant"] == "candidate"
         )
         candidate["orientation_seconds"] = 0.0
         with self.assertRaisesRegex(evidence.EvidenceError, "unknown "):
@@ -6234,7 +9448,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             "orientation-stderr.log",
         )
         for filename in cases:
-            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(filename=filename),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 write_evidence_artifacts(root, observations, request)
                 first_run = next(
@@ -6245,7 +9462,8 @@ class EvidenceProtocolTests(unittest.TestCase):
                 second_run = next(
                     record["run_id"]
                     for record in observations["timing"]["ordinary_runs"]
-                    if record["variant"] == "candidate" and record["run_id"] != first_run
+                    if record["variant"] == "candidate"
+                    and record["run_id"] != first_run
                 )
                 first_path = root / "orientation-runs" / first_run / filename
                 second_path = root / "orientation-runs" / second_run / filename
@@ -6274,7 +9492,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             write_evidence_artifacts(root, observations, request)
             path = root / "orientation-supervisor.json"
             receipt = json.loads(path.read_text(encoding="utf-8"))
-            receipt["runs"][0], receipt["runs"][1] = receipt["runs"][1], receipt["runs"][0]
+            receipt["runs"][0], receipt["runs"][1] = (
+                receipt["runs"][1],
+                receipt["runs"][0],
+            )
             path.write_bytes(evidence.canonical_json_bytes(receipt) + b"\n")
             with self.assertRaisesRegex(
                 evidence.EvidenceError,
@@ -6290,11 +9511,90 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
+    def test_supervisor_orientation_rejects_an_unbound_driver_input_digest(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        request = evidence_request()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            path = root / "orientation-supervisor.json"
+            supervisor = json.loads(path.read_text(encoding="utf-8"))
+            argv = supervisor["runs"][0]["argv"]
+            digest_index = argv.index("--geometry-manifest-sha256") + 1
+            argv[digest_index] = "sha256:" + "0" * 64
+            path.write_bytes(evidence.canonical_json_bytes(supervisor) + b"\n")
+
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "orientation supervisor argv.*invalid",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_supervisor_orientation_rejects_an_internally_consistent_unbound_copy(
+        self,
+    ) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        request = evidence_request()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            run_id = next(
+                record["run_id"]
+                for record in observations["timing"]["ordinary_runs"]
+                if record["variant"] == "candidate"
+            )
+            run_root = root / "orientation-runs" / run_id
+            candidate_images = run_root / "candidate-images.txt"
+            candidate_images.write_text(
+                "# substituted canonical model\n",
+                encoding="utf-8",
+            )
+            geometry_path = run_root / "geometry-manifest.json"
+            geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+            geometry["modelHashes"]["images.txt"] = hashlib.sha256(
+                candidate_images.read_bytes()
+            ).hexdigest()
+            geometry_path.write_bytes(evidence.canonical_json_bytes(geometry) + b"\n")
+
+            supervisor_path = root / "orientation-supervisor.json"
+            supervisor = json.loads(supervisor_path.read_text(encoding="utf-8"))
+            receipt = next(
+                item for item in supervisor["runs"] if item["run_id"] == run_id
+            )
+            receipt["candidate_images_sha256"] = evidence.sha256_file(candidate_images)
+            receipt["geometry_manifest_sha256"] = evidence.sha256_file(geometry_path)
+            supervisor_path.write_bytes(evidence.canonical_json_bytes(supervisor) + b"\n")
+
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "orientation geometry.*authenticated execution",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
     def test_requested_scale_holdouts_and_pair_schedule_are_binding(self) -> None:
         request = evidence_request(scale=250)
         self.assertEqual(request["holdout_indices"], list(range(4, 250, 5)))
         self.assertEqual(
-            sum(250 - offset for offset in request["candidate_run_configuration"]["temporal_offsets"]),
+            sum(
+                250 - offset
+                for offset in request["candidate_run_configuration"]["temporal_offsets"]
+            ),
             1_745,
         )
         observations = raw_observations(evidence.LANE_REFERENCE)
@@ -6310,7 +9610,13 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
-            with self.assertRaisesRegex(evidence.EvidenceError, "requested scale 250"):
+            (root / "pair-list.json").write_bytes(
+                evidence.canonical_json_bytes(fixture_pair_list()) + b"\n"
+            )
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "bound selected frame count",
+            ):
                 evidence.derive_attestation(
                     request,
                     observations,
@@ -6328,33 +9634,108 @@ class EvidenceProtocolTests(unittest.TestCase):
 
     def test_mapper_cadence_is_derived_from_input_topology(self) -> None:
         cases = (
-            ("ordered", evidence_request(
-                category="object_orbit",
-                input_kind="video",
-                capture_traits=["ordered"],
-            ), 4.0, 1),
-            ("unordered", evidence_request(
-                category="professional_photos",
-                input_kind="photos",
-                capture_traits=["unordered"],
-            ), 1.1, 2),
-            ("segmented", evidence_request(
-                category="interior_walkthrough",
-                input_kind="mixed",
-                capture_traits=["segmented"],
-            ), 1.1, 2),
+            (
+                "ordered",
+                evidence_request(
+                    category="object_orbit",
+                    input_kind="video",
+                    capture_traits=["ordered"],
+                ),
+                4.0,
+                1,
+            ),
+            (
+                "unordered",
+                evidence_request(
+                    category="professional_photos",
+                    input_kind="photos",
+                    capture_traits=["unordered"],
+                ),
+                1.4,
+                2,
+            ),
+            (
+                "segmented",
+                evidence_request(
+                    category="interior_walkthrough",
+                    input_kind="mixed",
+                    capture_traits=["segmented"],
+                ),
+                1.4,
+                2,
+            ),
         )
         for label, request, global_ratio, local_refinements in cases:
             with self.subTest(topology=label):
                 configuration = request["candidate_run_configuration"]
                 self.assertEqual(configuration["ba_global_frames_ratio"], global_ratio)
                 self.assertEqual(configuration["ba_global_points_ratio"], global_ratio)
-                self.assertEqual(configuration["ba_local_max_refinements"], local_refinements)
+                self.assertEqual(
+                    configuration["ba_local_max_refinements"], local_refinements
+                )
                 self.assertEqual(configuration["ba_local_max_num_iterations"], 10)
                 self.assertEqual(configuration["ba_local_function_tolerance"], 0.001)
-                self.assertEqual(configuration["ba_global_function_tolerance"], 0.000001)
+                self.assertEqual(
+                    configuration["ba_global_function_tolerance"], 0.000001
+                )
                 self.assertEqual(configuration["ba_local_num_images"], 6)
                 evidence.validate_request(request)
+
+    def test_segmented_request_preserves_declared_capture_intent(self) -> None:
+        large_area = evidence_request(
+            category="large_area_exterior",
+            input_kind="multi_video",
+            video_source_count=4,
+            capture_traits=["ordered", "segmented"],
+        )
+        generic = evidence_request(
+            category="interior_walkthrough",
+            input_kind="multi_video",
+            video_source_count=2,
+            capture_traits=["ordered", "segmented"],
+        )
+
+        self.assertEqual(
+            large_area["candidate_run_configuration"]["input_topology"],
+            "segmented_mixed",
+        )
+        self.assertEqual(
+            large_area["candidate_run_configuration"]["pairing_policy"],
+            "segmented_mixed",
+        )
+        self.assertEqual(
+            large_area["candidate_run_configuration"]["capture_path"],
+            "large_area",
+        )
+        evidence.validate_request(large_area)
+
+        self.assertEqual(
+            generic["candidate_run_configuration"]["input_topology"],
+            "segmented_mixed",
+        )
+        self.assertEqual(
+            generic["candidate_run_configuration"]["pairing_policy"],
+            "segmented_mixed",
+        )
+        self.assertEqual(
+            generic["candidate_run_configuration"]["capture_path"],
+            "automatic",
+        )
+        evidence.validate_request(generic)
+
+        large_area["candidate_run_configuration"]["capture_path"] = "automatic"
+        with self.assertRaisesRegex(
+            evidence.EvidenceError,
+            "capture path does not match",
+        ):
+            evidence.validate_request(large_area)
+
+        generic["candidate_run_configuration"]["capture_path"] = "large_area"
+        with self.assertRaisesRegex(
+            evidence.EvidenceError,
+            "capture path does not match",
+        ):
+            evidence.validate_request(generic)
 
     def test_mapper_cadence_request_fails_closed(self) -> None:
         mutations = (
@@ -6365,7 +9746,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             ),
             (
                 "nonpositive local cadence",
-                lambda configuration: configuration.update({"ba_local_max_refinements": 0}),
+                lambda configuration: configuration.update(
+                    {"ba_local_max_refinements": 0}
+                ),
                 "ba_local_max_refinements.*positive integer",
             ),
             (
@@ -6381,17 +9764,23 @@ class EvidenceProtocolTests(unittest.TestCase):
             ),
             (
                 "wrong local iteration limit",
-                lambda configuration: configuration.update({"ba_local_max_num_iterations": 11}),
+                lambda configuration: configuration.update(
+                    {"ba_local_max_num_iterations": 11}
+                ),
                 "ba_local_max_num_iterations.*10",
             ),
             (
                 "wrong local tolerance",
-                lambda configuration: configuration.update({"ba_local_function_tolerance": 0.002}),
+                lambda configuration: configuration.update(
+                    {"ba_local_function_tolerance": 0.002}
+                ),
                 "ba_local_function_tolerance.*0.001",
             ),
             (
                 "wrong global tolerance",
-                lambda configuration: configuration.update({"ba_global_function_tolerance": 0.000002}),
+                lambda configuration: configuration.update(
+                    {"ba_global_function_tolerance": 0.000002}
+                ),
                 "ba_global_function_tolerance.*1e-06",
             ),
             (
@@ -6407,9 +9796,12 @@ class EvidenceProtocolTests(unittest.TestCase):
             configuration["ba_global_points_ratio"] = 4.0
             configuration["ba_local_max_refinements"] = 1
             mutate(configuration)
-            with self.subTest(case=label), self.assertRaisesRegex(
-                evidence.EvidenceError,
-                expected,
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    expected,
+                ),
             ):
                 evidence.validate_request(request)
 
@@ -6441,7 +9833,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             evidence.EvidenceError,
-            "unordered.*1.1.*local.*2",
+            "unordered.*1.4.*local.*2",
         ):
             evidence.validate_request(request)
 
@@ -6496,7 +9888,96 @@ class EvidenceProtocolTests(unittest.TestCase):
             valid_outcome=True,
         )
 
-    def test_first_mapper_invocation_accepts_proven_exact_matching_recovery(self) -> None:
+    def test_mapper_cadence_accepts_rematching_before_the_fixed_graph_transition(
+        self,
+    ) -> None:
+        request = evidence_request()
+        first = mapper_invocation(
+            "candidate",
+            (4.0, 4.0, 5, 1),
+            "rejected_geometry_gate",
+            mapping_attempt_ordinal=1,
+            matching_attempt=1,
+            digest_character="a",
+            descriptor_matcher="faiss",
+        )
+        first["evaluation"]["fallback_trigger"] = None
+        transition_source = mapper_invocation(
+            "candidate",
+            (4.0, 4.0, 5, 1),
+            "rejected_geometry_gate",
+            mapping_attempt_ordinal=2,
+            matching_attempt=2,
+            digest_character="b",
+            descriptor_matcher="faiss",
+            matching_database_digest_character="d",
+            fallback_trigger="insufficientViewSupport",
+        )
+        accepted = mapper_invocation(
+            "candidate",
+            (1.4, 1.4, 5, 2),
+            "accepted",
+            mapping_attempt_ordinal=3,
+            matching_attempt=2,
+            digest_character="b",
+            descriptor_matcher="faiss",
+            matching_database_digest_character="d",
+        )
+        evidence._validate_mapper_invocations(
+            [first, transition_source, accepted],
+            "candidate",
+            request,
+            valid_outcome=True,
+            planned_mapper_cadence=first["incremental_cadence"],
+            accepted_mapper_cadence=accepted["incremental_cadence"],
+            cadence_fallback_trigger="insufficientViewSupport",
+        )
+
+    def test_mapper_cadence_rejects_a_second_transition_after_rematching(self) -> None:
+        request = evidence_request()
+        invocations = [
+            mapper_invocation(
+                "candidate",
+                (4.0, 4.0, 5, 1),
+                "rejected_geometry_gate",
+                mapping_attempt_ordinal=1,
+                matching_attempt=1,
+                digest_character="a",
+                descriptor_matcher="faiss",
+            ),
+            mapper_invocation(
+                "candidate",
+                (1.4, 1.4, 5, 2),
+                "rejected_geometry_gate",
+                mapping_attempt_ordinal=2,
+                matching_attempt=1,
+                digest_character="a",
+                descriptor_matcher="faiss",
+            ),
+            mapper_invocation(
+                "candidate",
+                (4.0, 4.0, 5, 1),
+                "accepted",
+                mapping_attempt_ordinal=3,
+                matching_attempt=2,
+                digest_character="b",
+                descriptor_matcher="faiss",
+            ),
+        ]
+        with self.assertRaisesRegex(evidence.EvidenceError, "transition|cadence"):
+            evidence._validate_mapper_invocations(
+                invocations,
+                "candidate",
+                request,
+                valid_outcome=True,
+                planned_mapper_cadence=invocations[0]["incremental_cadence"],
+                accepted_mapper_cadence=invocations[-1]["incremental_cadence"],
+                cadence_fallback_trigger="insufficientViewSupport",
+            )
+
+    def test_first_mapper_invocation_accepts_proven_exact_matching_recovery(
+        self,
+    ) -> None:
         cases = (
             ("continuous", evidence_request(), (4.0, 4.0, 5, 1)),
             (
@@ -6506,7 +9987,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                     input_kind="mixed",
                     capture_traits=["segmented"],
                 ),
-                (1.1, 1.1, 5, 2),
+                (1.4, 1.4, 5, 2),
             ),
             (
                 "unordered",
@@ -6515,7 +9996,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                     input_kind="photos",
                     capture_traits=["unordered"],
                 ),
-                (1.1, 1.1, 5, 2),
+                (1.4, 1.4, 5, 2),
             ),
         )
         for topology, request, cadence in cases:
@@ -6546,7 +10027,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                     input_kind="mixed",
                     capture_traits=["segmented"],
                 ),
-                (1.1, 1.1, 5, 2),
+                (1.4, 1.4, 5, 2),
             ),
             (
                 "unordered",
@@ -6555,13 +10036,16 @@ class EvidenceProtocolTests(unittest.TestCase):
                     input_kind="photos",
                     capture_traits=["unordered"],
                 ),
-                (1.1, 1.1, 5, 2),
+                (1.4, 1.4, 5, 2),
             ),
         )
         for topology, request, cadence in cases:
-            with self.subTest(topology=topology), self.assertRaisesRegex(
-                evidence.EvidenceError,
-                "exact.*prior FAISS",
+            with (
+                self.subTest(topology=topology),
+                self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "exact.*prior FAISS",
+                ),
             ):
                 evidence._validate_mapper_invocations(
                     [
@@ -6579,7 +10063,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     valid_outcome=True,
                 )
 
-    def test_continuous_mapper_invocations_accept_exact_retry_of_same_pair_list(self) -> None:
+    def test_continuous_mapper_invocations_accept_exact_retry_of_same_pair_list(
+        self,
+    ) -> None:
         request = evidence_request()
         invocations = [
             mapper_invocation(
@@ -6629,7 +10115,8 @@ class EvidenceProtocolTests(unittest.TestCase):
         request = evidence_request()
         observations = raw_observations(evidence.LANE_REFERENCE)
         next(
-            receipt for receipt in observations["commands"]
+            receipt
+            for receipt in observations["commands"]
             if receipt["variant"] == "candidate"
         ).pop("mapper_invocations")
         with tempfile.TemporaryDirectory() as directory:
@@ -6649,7 +10136,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_candidate_receipts_bind_resolved_and_launched_worker_contracts(self) -> None:
+    def test_candidate_receipts_bind_resolved_and_launched_worker_contracts(
+        self,
+    ) -> None:
         cases = (
             (
                 "boolean schema",
@@ -6732,6 +10221,24 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "command belongs to another stage",
             ),
             (
+                "pair binding on feature extraction",
+                lambda artifact: artifact["featureExtractionInvocations"][0].update(
+                    {
+                        "pairExecution": copy.deepcopy(
+                            artifact["matchingInvocations"][0]["pairExecution"]
+                        )
+                    }
+                ),
+                "cannot claim pair execution",
+            ),
+            (
+                "incomplete matcher pair binding",
+                lambda artifact: artifact["matchingInvocations"][0][
+                    "pairExecution"
+                ].pop("attemptOrdinal"),
+                "pairExecution has invalid fields",
+            ),
+            (
                 "nonmapping attempt ordinal",
                 lambda artifact: artifact["featureExtractionInvocations"][0].update(
                     {"mappingAttemptOrdinal": 1}
@@ -6776,7 +10283,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                         ]
                     }
                 ),
-                "too many invocations",
+                "exceeds its size limit|too many invocations",
             ),
             (
                 "video concurrency",
@@ -6841,10 +10348,10 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
-                    )
+                )
 
     def test_unscheduled_retrieval_records_no_fake_worker_invocation(self) -> None:
-        request = evidence_request(scale=30)
+        request = evidence_request(scale=30, category="low_light")
         self.assertEqual(
             request["candidate_run_configuration"]["vocabulary_candidate_count"],
             0,
@@ -6854,7 +10361,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             str(request["input_kind"]),
         )
         self.assertEqual(artifact["vocabularyRetrievalInvocations"], [])
-        observations = raw_observations(evidence.LANE_REFERENCE)
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
@@ -6914,7 +10421,12 @@ class EvidenceProtocolTests(unittest.TestCase):
                 )
 
     def test_runtime_worker_receipt_rejects_digest_and_path_substitution(self) -> None:
-        for case in ("worker digest", "worker path", "geometry digest", "geometry path"):
+        for case in (
+            "worker digest",
+            "worker path",
+            "geometry digest",
+            "geometry path",
+        ):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 request = evidence_request()
                 observations = raw_observations(evidence.LANE_REFERENCE)
@@ -6932,7 +10444,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                 elif case == "worker path":
                     artifact_name = runtime_receipt["artifact_name"]
                     original = root / observations["artifacts"][artifact_name]
-                    substituted = root / "worker-runs/substituted/SfM/worker_execution.json"
+                    substituted = (
+                        root / "worker-runs/substituted/SfM/worker_execution.json"
+                    )
                     substituted.parent.mkdir(parents=True)
                     shutil.copyfile(original, substituted)
                     observations["artifacts"][artifact_name] = (
@@ -6940,9 +10454,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                     )
                     expected = "path does not match"
                 elif case == "geometry digest":
-                    runtime_receipt["geometry_manifest_sha256"] = (
-                        "sha256:" + "0" * 64
-                    )
+                    runtime_receipt["geometry_manifest_sha256"] = "sha256:" + "0" * 64
                     expected = "geometry manifest digest does not match"
                 else:
                     artifact_name = runtime_receipt["geometry_manifest_name"]
@@ -6976,7 +10488,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
 
-    def test_runtime_worker_sanitization_digest_matches_the_swift_launch_policy(self) -> None:
+    def test_runtime_worker_sanitization_digest_matches_the_swift_launch_policy(
+        self,
+    ) -> None:
         source = (
             ROOT
             / "EasySplatCore/Sources/EasySplatCore/Project/GeometryWorkerExecutionArtifact.swift"
@@ -6996,25 +10510,110 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         self.assertIn("SHA256.hash(data: Data(canonicalJSON.utf8))", source)
 
+    def test_runtime_worker_rejects_colmap_closure_and_solver_substitution(
+        self,
+    ) -> None:
+        def substitute_converter(
+            worker: dict[str, object], geometry: dict[str, object]
+        ) -> None:
+            del geometry
+            invocation = worker["mappingAndRefinementInvocations"][-1]
+            invocation["command"] = "modelConverter"
+            invocation["modelConversion"] = model_conversion_fixture(succeeded=True)
+            invocation["modelConversion"]["executableSHA256"] = "f" * 64
+
+        mutations = {
+            "component order": lambda worker, geometry: worker["colmapRuntimeClosure"][
+                "components"
+            ].reverse(),
+            "component digest": lambda worker, geometry: worker["colmapRuntimeClosure"][
+                "components"
+            ][1].update({"sha256": "f" * 64}),
+            "closure digest": lambda worker, geometry: worker[
+                "colmapRuntimeClosure"
+            ].update({"closureSHA256": "f" * 64}),
+            "solver binding": lambda worker, geometry: geometry["provenance"][
+                "solver"
+            ].update({"payloadSHA256": "f" * 64}),
+            "converter leaf": substitute_converter,
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(evidence.LANE_REFERENCE)
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                worker_name = candidate["runtime_worker_evidence"]["artifact_name"]
+                geometry_name = candidate["runtime_worker_evidence"][
+                    "geometry_manifest_name"
+                ]
+                worker_path = root / observations["artifacts"][worker_name]
+                geometry_path = root / observations["artifacts"][geometry_name]
+                worker = json.loads(worker_path.read_bytes())
+                geometry = json.loads(geometry_path.read_bytes())
+                mutate(worker, geometry)
+                geometry["workerExecution"] = worker
+                worker_path.write_bytes(evidence.canonical_json_bytes(worker))
+                geometry_path.write_bytes(evidence.canonical_json_bytes(geometry))
+                candidate["runtime_worker_evidence"]["artifact_sha256"] = (
+                    evidence.sha256_file(worker_path)
+                )
+                candidate["runtime_worker_evidence"]["geometry_manifest_sha256"] = (
+                    evidence.sha256_file(geometry_path)
+                )
+                descriptors = {
+                    name: evidence._artifact_descriptor(root / path, root)
+                    for name, path in observations["artifacts"].items()
+                }
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "COLMAP closure|solver|converter executable",
+                ):
+                    evidence._validate_runtime_worker_evidence(
+                        candidate["runtime_worker_evidence"],
+                        request["candidate_run_configuration"],
+                        request,
+                        "candidate",
+                        candidate["run_id"],
+                        root,
+                        descriptors,
+                        set(),
+                        "runtime_worker_evidence",
+                        observations["pipeline_metrics"],
+                    )
+
     def test_runtime_artifact_schema_versions_match_the_swift_contract(self) -> None:
         worker_source = (
             ROOT
             / "EasySplatCore/Sources/EasySplatCore/Project/GeometryWorkerExecutionArtifact.swift"
         ).read_text(encoding="utf-8")
         geometry_source = (
-            ROOT
-            / "EasySplatCore/Sources/EasySplatCore/Project/GeometryArtifact.swift"
+            ROOT / "EasySplatCore/Sources/EasySplatCore/Project/GeometryArtifact.swift"
         ).read_text(encoding="utf-8")
 
         worker_version = re.search(
             r"public static let currentSchemaVersion = (\d+)",
             worker_source,
         )
-        geometry_version = re.search(
+        conditioning_version = re.search(
+            r"public struct GeometryConditioningArtifact.*?"
             r"public static let currentSchemaVersion = (\d+)",
             geometry_source,
+            re.DOTALL,
+        )
+        geometry_version = re.search(
+            r"public struct GeometryArtifact.*?"
+            r"public static let currentSchemaVersion = (\d+)",
+            geometry_source,
+            re.DOTALL,
         )
         self.assertIsNotNone(worker_version)
+        self.assertIsNotNone(conditioning_version)
         self.assertIsNotNone(geometry_version)
         self.assertEqual(
             int(worker_version.group(1)),
@@ -7024,6 +10623,213 @@ class EvidenceProtocolTests(unittest.TestCase):
             int(geometry_version.group(1)),
             evidence.GEOMETRY_ARTIFACT_SCHEMA_VERSION,
         )
+        self.assertEqual(
+            int(conditioning_version.group(1)),
+            evidence.GEOMETRY_CONDITIONING_SCHEMA_VERSION,
+        )
+
+    def test_runtime_worker_requires_the_current_rejected_retrieval_ledger(
+        self,
+    ) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_worker_execution_artifact(
+                root,
+                observations,
+                candidate,
+                lambda worker: worker.pop("rejectedVocabularyRetrievalInvocations"),
+            )
+            descriptors = {
+                name: evidence._artifact_descriptor(root / path, root)
+                for name, path in observations["artifacts"].items()
+            }
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "runtime worker artifact.*invalid fields",
+            ):
+                evidence._validate_runtime_worker_evidence(
+                    candidate["runtime_worker_evidence"],
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    set(),
+                    "runtime_worker_evidence",
+                    observations["pipeline_metrics"],
+                )
+
+    def test_rejected_retrieval_ledger_is_fully_authenticated(self) -> None:
+        request = evidence_request(
+            scale=120,
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["unordered"],
+        )
+        configuration = request["candidate_run_configuration"]
+        entry = rejected_vocabulary_retrieval_entry(request)
+        image_names = entry["imageNames"]
+
+        def validate(
+            ledger: list[object],
+            accepted: list[object] | None = None,
+        ) -> None:
+            evidence._validate_rejected_vocabulary_retrieval_history(
+                ledger,
+                accepted_invocations=[] if accepted is None else accepted,
+                expected_worker_count=int(
+                    configuration["vocabulary_retrieval_workers"]
+                ),
+                candidate_configuration=configuration,
+                request=request,
+                image_names=image_names,
+            )
+
+        validate([entry])
+        invalid_ledgers = {
+            "malformed": [{"forged": True}],
+            "forged output": [
+                {
+                    **copy.deepcopy(entry),
+                    "retrieval": {
+                        **copy.deepcopy(entry["retrieval"]),
+                        "outputDigest": "f" * 64,
+                    },
+                }
+            ],
+            "unbound plan": [
+                {
+                    **copy.deepcopy(entry),
+                    "planBinding": {
+                        **copy.deepcopy(entry["planBinding"]),
+                        "retrievalCandidateCount": 21,
+                    },
+                }
+            ],
+            "boolean ordinal": [
+                {
+                    **copy.deepcopy(entry),
+                    "retrievalAttemptOrdinal": True,
+                }
+            ],
+            "numeric cross-clip flag": [
+                {
+                    **copy.deepcopy(entry),
+                    "planBinding": {
+                        **copy.deepcopy(entry["planBinding"]),
+                        "requiresCrossClipRetrieval": 0,
+                    },
+                }
+            ],
+            "camera initialization recipe": [
+                {
+                    **copy.deepcopy(entry),
+                    "planBinding": {
+                        **copy.deepcopy(entry["planBinding"]),
+                        "cameraInitializationRecipe": "unknown",
+                    },
+                }
+            ],
+            "missing group coverage": [
+                {
+                    **copy.deepcopy(entry),
+                    "groups": [
+                        {
+                            "imageNames": image_names[:-1],
+                            "isVideo": False,
+                        }
+                    ],
+                }
+            ],
+            "duplicate recovery": [entry, copy.deepcopy(entry)],
+        }
+        for label, ledger in invalid_ledgers.items():
+            with self.subTest(case=label), self.assertRaises(evidence.EvidenceError):
+                validate(ledger)
+        with self.assertRaisesRegex(evidence.EvidenceError, "not bound"):
+            validate([entry], [entry["invocation"]])
+
+    def test_recovery_density_closure_requires_rejected_retrievals_for_skipped_levels(
+        self,
+    ) -> None:
+        def attempt(level: str) -> dict[str, object]:
+            return {
+                "recoveryLevel": level,
+                "matcher": "faiss",
+                "outcome": "completed",
+            }
+
+        evidence._validate_recovery_density_closure(
+            [attempt("normal"), attempt("maximum")], ("expanded",)
+        )
+        evidence._validate_recovery_density_closure(
+            [attempt("maximum")], ("normal", "expanded")
+        )
+        for attempts, rejected in (
+            ([attempt("normal"), attempt("maximum")], ()),
+            ([attempt("maximum")], ("expanded",)),
+            ([attempt("maximum")], ("normal",)),
+            ([attempt("normal")], ("expanded",)),
+        ):
+            with self.subTest(attempts=attempts, rejected=rejected), self.assertRaisesRegex(
+                evidence.EvidenceError, "recovery density closure"
+            ):
+                evidence._validate_recovery_density_closure(attempts, rejected)
+
+    def test_rejected_retrieval_accepts_all_ranked_disconnected_schedule(
+        self,
+    ) -> None:
+        request = evidence_request(
+            scale=120,
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["unordered"],
+        )
+        configuration = request["candidate_run_configuration"]
+        entry = rejected_vocabulary_retrieval_entry(
+            request,
+            all_ranked_disconnected=True,
+        )
+
+        evidence._validate_rejected_vocabulary_retrieval_history(
+            [entry],
+            accepted_invocations=[],
+            expected_worker_count=int(
+                configuration["vocabulary_retrieval_workers"]
+            ),
+            candidate_configuration=configuration,
+            request=request,
+            image_names=entry["imageNames"],
+        )
+
+    def test_rejected_retrieval_rejects_connected_false_rejection(self) -> None:
+        request = evidence_request(scale=120, category="object_orbit")
+        configuration = request["candidate_run_configuration"]
+        entry = rejected_vocabulary_retrieval_entry(request)
+
+        with self.assertRaisesRegex(
+            evidence.EvidenceError,
+            "does not prove a disconnected merged schedule",
+        ):
+            evidence._validate_rejected_vocabulary_retrieval_history(
+                [entry],
+                accepted_invocations=[],
+                expected_worker_count=int(
+                    configuration["vocabulary_retrieval_workers"]
+                ),
+                candidate_configuration=configuration,
+                request=request,
+                image_names=entry["imageNames"],
+            )
 
     def test_python_accepts_the_exact_swift_worker_invocation_json_shape(self) -> None:
         source = (
@@ -7031,6 +10837,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             / "EasySplatCore/Sources/EasySplatCore/Project/GeometryWorkerExecutionArtifact.swift"
         ).read_text(encoding="utf-8")
         coding_keys = re.search(
+            r"public struct ColmapWorkerInvocationEvidence.*?"
             r"private enum CodingKeys: String, CodingKey, CaseIterable \{(.*?)\n    \}",
             source,
             re.DOTALL,
@@ -7038,7 +10845,9 @@ class EvidenceProtocolTests(unittest.TestCase):
         self.assertIsNotNone(coding_keys)
         swift_keys = {
             match.group(1)
-            for match in re.finditer(r"\bcase ([a-z][A-Za-z0-9]*)", coding_keys.group(1))
+            for match in re.finditer(
+                r"\bcase ([a-z][A-Za-z0-9]*)", coding_keys.group(1)
+            )
         }
         expected_keys = {
             "command",
@@ -7048,6 +10857,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             "explicitThreadEnvironment",
             "removedThreadEnvironmentKeysSHA256",
             "effectiveSanitizedThreadEnvironment",
+            "pairExecution",
+            "mapperExecution",
+            "modelConversion",
             "exitStatus",
             "succeeded",
         }
@@ -7063,8 +10875,12 @@ class EvidenceProtocolTests(unittest.TestCase):
         mapper_invocation = artifact["mappingAndRefinementInvocations"][0]
         self.assertEqual(set(feature_invocation), swift_keys)
         self.assertIsNone(feature_invocation["mappingAttemptOrdinal"])
+        self.assertIsNone(feature_invocation["pairExecution"])
+        self.assertIsNone(feature_invocation["modelConversion"])
         self.assertEqual(set(mapper_invocation), swift_keys)
         self.assertEqual(mapper_invocation["mappingAttemptOrdinal"], 1)
+        self.assertIsNone(mapper_invocation["pairExecution"])
+        self.assertIsNone(mapper_invocation["modelConversion"])
 
         evidence._validate_worker_invocations(
             [feature_invocation],
@@ -7084,8 +10900,103 @@ class EvidenceProtocolTests(unittest.TestCase):
             expects_mapping_attempt_ordinal=True,
             required=True,
         )
+        encoded_matching = copy.deepcopy(artifact["matchingInvocations"][0])
+        for field in (
+            "exactRecoveryReason",
+            "retrievalRequestDigest",
+            "retrievalOutputDigest",
+        ):
+            if encoded_matching["pairExecution"].get(field) is None:
+                encoded_matching["pairExecution"].pop(field, None)
+        evidence._validate_worker_invocations(
+            [encoded_matching],
+            context="matchingInvocations",
+            allowed_commands=frozenset({"matchesImporter"}),
+            expected_policy="bounded",
+            expected_worker_count=configuration["coupled_matching_workers"],
+            expects_mapping_attempt_ordinal=False,
+            required=True,
+        )
 
-    def test_worker_invocation_rejects_non_string_command_as_evidence_error(self) -> None:
+    def test_worker_pair_execution_binds_matcher_and_retrieval_to_pair_graph(
+        self,
+    ) -> None:
+        cases = (
+            (None, None),
+            (
+                lambda worker: worker["matchingInvocations"][0]["pairExecution"].update(
+                    {
+                        "descriptorMatcher": "exact",
+                        "exactRecoveryReason": "faissCrash",
+                    }
+                ),
+                "pair-list digest is invalid",
+            ),
+            (
+                lambda worker: worker["vocabularyRetrievalInvocations"][0][
+                    "pairExecution"
+                ].update({"retrievalRequestDigest": "3" * 64}),
+                "vocabulary retrieval does not bind its matcher attempt",
+            ),
+            (
+                lambda worker: worker["matchingInvocations"][0]["pairExecution"].update(
+                    {"pairListDigest": "4" * 64}
+                ),
+                "does not bind the published pair list",
+            ),
+        )
+        for mutation, expected in cases:
+            with (
+                self.subTest(expected=expected),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                request = evidence_request(scale=120, category="object_orbit")
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE,
+                    request=request,
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                if mutation is not None:
+                    rewrite_worker_execution_artifact(
+                        root,
+                        observations,
+                        candidate,
+                        mutation,
+                    )
+                descriptors = {
+                    name: evidence._artifact_descriptor(root / path, root)
+                    for name, path in observations["artifacts"].items()
+                }
+
+                def validate() -> None:
+                    evidence._validate_runtime_worker_evidence(
+                        candidate["runtime_worker_evidence"],
+                        request["candidate_run_configuration"],
+                        request,
+                        "candidate",
+                        candidate["run_id"],
+                        root,
+                        descriptors,
+                        set(),
+                        "runtime_worker_evidence",
+                        observations["pipeline_metrics"],
+                    )
+
+                if expected is None:
+                    validate()
+                else:
+                    with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                        validate()
+
+    def test_worker_invocation_rejects_non_string_command_as_evidence_error(
+        self,
+    ) -> None:
         invocation = worker_execution_artifact(
             evidence_request()["candidate_run_configuration"],
             "video",
@@ -7116,7 +11027,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             "8",
         )
 
-    def test_worker_invocations_retain_failed_optional_attempts_and_model_conversion(self) -> None:
+    def test_worker_invocations_retain_failed_optional_attempts_and_model_conversion(
+        self,
+    ) -> None:
         artifact = worker_execution_artifact(
             evidence_request()["candidate_run_configuration"],
             "video",
@@ -7125,7 +11038,21 @@ class EvidenceProtocolTests(unittest.TestCase):
         failed_analyzer.update({"exitStatus": 1, "succeeded": False})
         model_converter = dict(failed_analyzer)
         model_converter.update(
-            {"command": "modelConverter", "exitStatus": 0, "succeeded": True}
+            {
+                "command": "modelConverter",
+                "exitStatus": 0,
+                "succeeded": True,
+                "modelConversion": {
+                    "executableComponentPath": "bin/colmap",
+                    "executableSHA256": "0" * 64,
+                    "candidateProjectRelativePath": "SfM/candidates/attempt-1/0",
+                    "inputProjectRelativePath": "SfM/candidates/attempt-1/0",
+                    "outputProjectRelativePath": "SfM/canonical-staging/attempt-1",
+                    "sourceModelDigest": "1" * 64,
+                    "convertedModelDigest": "2" * 64,
+                    "candidateIdentitySHA256": "3" * 64,
+                },
+            }
         )
 
         evidence._validate_worker_invocations(
@@ -7150,8 +11077,67 @@ class EvidenceProtocolTests(unittest.TestCase):
             required=True,
         )
 
+        failed_converter = json.loads(json.dumps(model_converter))
+        failed_converter.update({"exitStatus": 1, "succeeded": False})
+        failed_converter["modelConversion"]["convertedModelDigest"] = None
+        evidence._validate_worker_invocations(
+            [failed_converter],
+            context="mappingAndRefinementInvocations",
+            allowed_commands=frozenset({"modelConverter"}),
+            expected_policy="nativeAuto",
+            expected_worker_count=None,
+            expects_mapping_attempt_ordinal=True,
+            required=True,
+        )
+        failed_converter["modelConversion"]["convertedModelDigest"] = "2" * 64
+        with self.assertRaisesRegex(
+            evidence.EvidenceError, "cannot claim an output digest"
+        ):
+            evidence._validate_worker_invocations(
+                [failed_converter],
+                context="mappingAndRefinementInvocations",
+                allowed_commands=frozenset({"modelConverter"}),
+                expected_policy="nativeAuto",
+                expected_worker_count=None,
+                expects_mapping_attempt_ordinal=True,
+                required=True,
+            )
+
+        stale_converter = json.loads(json.dumps(model_converter))
+        del stale_converter["modelConversion"]["executableSHA256"]
+        with self.assertRaisesRegex(evidence.EvidenceError, "invalid fields"):
+            evidence._validate_worker_invocations(
+                [stale_converter],
+                context="mappingAndRefinementInvocations",
+                allowed_commands=frozenset({"modelConverter"}),
+                expected_policy="nativeAuto",
+                expected_worker_count=None,
+                expects_mapping_attempt_ordinal=True,
+                required=True,
+            )
+
+        substituted_converter = json.loads(json.dumps(model_converter))
+        substituted_converter["modelConversion"]["executableComponentPath"] = (
+            "bin/other"
+        )
+        with self.assertRaisesRegex(evidence.EvidenceError, "executable path"):
+            evidence._validate_worker_invocations(
+                [substituted_converter],
+                context="mappingAndRefinementInvocations",
+                allowed_commands=frozenset({"modelConverter"}),
+                expected_policy="nativeAuto",
+                expected_worker_count=None,
+                expects_mapping_attempt_ordinal=True,
+                required=True,
+            )
+
     def test_evidence_request_binds_exact_video_source_count(self) -> None:
-        for input_kind, count in (("video", 1), ("photos", 0), ("mixed", 65)):
+        for input_kind, count in (
+            ("video", 1),
+            ("multi_video", 2),
+            ("photos", 0),
+            ("mixed", 65),
+        ):
             with self.subTest(input_kind=input_kind):
                 request = evidence_request(
                     input_kind=input_kind,
@@ -7160,23 +11146,217 @@ class EvidenceProtocolTests(unittest.TestCase):
                 self.assertEqual(request["video_source_count"], count)
                 evidence.validate_request(request)
 
-    def test_video_source_count_is_derived_from_the_benchmark_input(self) -> None:
+    def test_selection_manifest_binds_distinct_video_clips_and_input_kind(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            mixed = root / "mixed"
-            mixed.mkdir()
-            (mixed / "first.mov").write_bytes(b"video-one")
-            (mixed / "second.MP4").write_bytes(b"video-two")
-            (mixed / "still.jpg").write_bytes(b"photo")
-            nested = mixed / "nested"
-            nested.mkdir()
-            (nested / "third.m4v").write_bytes(b"video-three")
+            manifest_path = root / "selection-manifest.json"
+            manifest_path.write_bytes(fixture_mixed_selection_manifest())
 
-            self.assertEqual(benchmark._video_source_count(mixed, "mixed"), 3)
-            self.assertEqual(benchmark._video_source_count(mixed, "photos"), 0)
-            self.assertEqual(
-                benchmark._video_source_count(mixed / "first.mov", "video"),
-                1,
+            sources = evidence._validate_selection_manifest_sources(
+                manifest_path,
+                requested_scale=30,
+                input_kind="mixed",
+                expected_video_source_count=2,
+            )
+            self.assertEqual(sources.video_source_count, 2)
+            self.assertEqual(set(sources.source_kinds), {"video", "photo"})
+
+            with self.assertRaisesRegex(evidence.EvidenceError, "video source count"):
+                evidence._validate_selection_manifest_sources(
+                    manifest_path,
+                    requested_scale=30,
+                    input_kind="mixed",
+                    expected_video_source_count=1,
+                )
+            with self.assertRaisesRegex(evidence.EvidenceError, "input kind"):
+                evidence._validate_selection_manifest_sources(
+                    manifest_path,
+                    requested_scale=30,
+                    input_kind="video",
+                    expected_video_source_count=2,
+                )
+
+    def test_selection_manifest_accepts_two_video_input_without_photos(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "selection-manifest.json"
+            manifest_path.write_bytes(fixture_multi_video_selection_manifest(30))
+
+            sources = evidence._validate_selection_manifest_sources(
+                manifest_path,
+                requested_scale=30,
+                input_kind="multi_video",
+                expected_video_source_count=2,
+            )
+            self.assertEqual(sources.video_source_count, 2)
+            self.assertEqual(set(sources.source_kinds), {"video"})
+
+    def test_selection_manifest_keeps_mixed_route_when_photos_are_filtered_out(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "selection-manifest.json"
+            manifest_path.write_bytes(fixture_multi_video_selection_manifest(30))
+
+            sources = evidence._validate_selection_manifest_sources(
+                manifest_path,
+                requested_scale=30,
+                input_kind="mixed",
+                expected_video_source_count=2,
+            )
+            self.assertEqual(sources.video_source_count, 2)
+            self.assertEqual(set(sources.source_kinds), {"video"})
+
+    def test_multivideo_and_filtered_mixed_inputs_complete_honest_routing(self) -> None:
+        selection = fixture_multi_video_selection_manifest(30)
+        for input_kind in ("multi_video", "mixed"):
+            with (
+                self.subTest(input_kind=input_kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                request = evidence_request(
+                    lane=evidence.LANE_CONSTRAINED,
+                    input_kind=input_kind,
+                    video_source_count=2,
+                    capture_traits=["segmented"],
+                )
+                request["reference_artifacts"]["selection_manifest_sha256"] = (
+                    evidence.sha256_bytes(selection)
+                )
+                observations = raw_observations(
+                    evidence.LANE_CONSTRAINED,
+                    request=request,
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                (root / "selection-manifest.json").write_bytes(selection)
+                for receipt in observations["commands"]:
+                    if receipt["variant"] not in {"candidate", "fast_candidate"}:
+                        continue
+                    configuration = dict(request["candidate_run_configuration"])
+                    if receipt["variant"] == "fast_candidate":
+                        configuration.update(
+                            {
+                                "detail_profile": "fast",
+                                "trainer_iterations": 3000,
+                                "trainer_plateau_window": 400,
+                            }
+                        )
+                    runtime = receipt["runtime_worker_evidence"]
+                    cameras_bytes = canonical_cameras_fixture(
+                        configuration, "multi_video", 2
+                    )
+                    cameras_path = root / observations["artifacts"][
+                        runtime["canonical_cameras_name"]
+                    ]
+                    cameras_path.write_bytes(cameras_bytes)
+                    cameras_digest = evidence.sha256_bytes(cameras_bytes)
+                    runtime["canonical_cameras_sha256"] = cameras_digest
+
+                    def bind_filtered_selection(
+                        geometry: dict[str, object],
+                    ) -> None:
+                        geometry["cameraGroupingReceipt"] = (
+                            camera_grouping_receipt_fixture(
+                                configuration, "multi_video", 2, 30
+                            )
+                        )
+                        geometry["cameraInitializationReceipt"] = (
+                            camera_initialization_receipt_fixture(
+                                configuration, "multi_video", 2
+                            )
+                        )
+                        geometry["modelHashes"]["cameras.txt"] = (
+                            cameras_digest.removeprefix("sha256:")
+                        )
+                        geometry["mapping"]["canonicalModelPublication"][
+                            "sourceModelHashes"
+                        ]["cameras.txt"] = cameras_digest.removeprefix("sha256:")
+                        geometry["conditioning"][
+                            "sourceModelClosureSHA256"
+                        ] = evidence.geometry_model_closure_digest(
+                            geometry["modelHashes"]
+                        )
+
+                    rewrite_geometry_manifest_artifact(
+                        root, observations, receipt, bind_filtered_selection
+                    )
+
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_CONSTRAINED,
+                    runner_identity(evidence.LANE_CONSTRAINED),
+                    machine=evidence_machine(evidence.LANE_CONSTRAINED),
+                )
+
+    def test_nonreference_worker_count_is_bound_to_authenticated_selection(
+        self,
+    ) -> None:
+        request = evidence_request(
+            lane=evidence.LANE_CONSTRAINED,
+            input_kind="mixed",
+            video_source_count=1,
+        )
+        selection = fixture_mixed_selection_manifest()
+        request["reference_artifacts"]["selection_manifest_sha256"] = (
+            evidence.sha256_bytes(selection)
+        )
+        observations = raw_observations(
+            evidence.LANE_CONSTRAINED,
+            request=request,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            (root / "selection-manifest.json").write_bytes(selection)
+
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "selection_manifest video source count",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_CONSTRAINED,
+                    runner_identity(evidence.LANE_CONSTRAINED),
+                    machine=evidence_machine(evidence.LANE_CONSTRAINED),
+                )
+
+    def test_nonreference_multiclip_worker_matches_authenticated_selection(
+        self,
+    ) -> None:
+        request = evidence_request(
+            lane=evidence.LANE_CONSTRAINED,
+            input_kind="mixed",
+            video_source_count=2,
+        )
+        selection = fixture_mixed_selection_manifest()
+        request["reference_artifacts"]["selection_manifest_sha256"] = (
+            evidence.sha256_bytes(selection)
+        )
+        observations = raw_observations(
+            evidence.LANE_CONSTRAINED,
+            request=request,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            (root / "selection-manifest.json").write_bytes(selection)
+
+            evidence.derive_attestation(
+                request,
+                observations,
+                root,
+                root / "attestation.json",
+                evidence.LANE_CONSTRAINED,
+                runner_identity(evidence.LANE_CONSTRAINED),
+                machine=evidence_machine(evidence.LANE_CONSTRAINED),
             )
 
     def test_runtime_worker_evidence_is_bound_to_geometry_manifest(self) -> None:
@@ -7219,6 +11399,30 @@ class EvidenceProtocolTests(unittest.TestCase):
                 ),
                 "pair graph",
             ),
+            (
+                "missing conditioning",
+                lambda manifest: manifest.pop("conditioning"),
+                "geometry manifest.*conditioning",
+            ),
+            (
+                "conditioning schema",
+                lambda manifest: manifest["conditioning"].update({"schemaVersion": 1}),
+                "conditioning schema",
+            ),
+            (
+                "conditioning measurement shape",
+                lambda manifest: manifest["conditioning"]["measurement"].pop(
+                    "rayPairEvaluationCount"
+                ),
+                "conditioning measurement",
+            ),
+            (
+                "canonical orientation shape",
+                lambda manifest: manifest["canonicalOrientation"].pop(
+                    "canonicalOpeningViewDirection"
+                ),
+                "canonical orientation",
+            ),
         )
         for label, mutation, expected in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
@@ -7246,6 +11450,1034 @@ class EvidenceProtocolTests(unittest.TestCase):
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_shared_fisheye_runtime_authenticates_canonical_calibration(self) -> None:
+        request = evidence_request(
+            scale=120,
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["fisheye", "unordered"],
+        )
+
+        def validate_case(
+            *,
+            cameras: bytes | None = None,
+            mutate_geometry: Callable[[dict[str, object]], None] | None = None,
+            mutate_receipt: Callable[[dict[str, object]], None] | None = None,
+            wrong_path: bool = False,
+            preused_camera: bool = False,
+        ) -> None:
+            observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+            candidate = next(
+                receipt
+                for receipt in observations["commands"]
+                if receipt["variant"] == "candidate"
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                runtime = candidate["runtime_worker_evidence"]
+                camera_name = runtime["canonical_cameras_name"]
+                camera_path = root / observations["artifacts"][camera_name]
+                if cameras is not None:
+                    camera_path.write_bytes(cameras)
+                    camera_digest = evidence.sha256_file(camera_path)
+                    runtime["canonical_cameras_sha256"] = camera_digest
+
+                    def bind_camera_hash(geometry: dict[str, object]) -> None:
+                        raw_digest = camera_digest.removeprefix("sha256:")
+                        geometry["modelHashes"]["cameras.txt"] = raw_digest
+                        geometry["mapping"]["canonicalModelPublication"][
+                            "sourceModelHashes"
+                        ]["cameras.txt"] = raw_digest
+                        geometry["conditioning"]["sourceModelClosureSHA256"] = (
+                            evidence.geometry_model_closure_digest(
+                                geometry["modelHashes"]
+                            )
+                        )
+
+                    rewrite_geometry_manifest_artifact(
+                        root, observations, candidate, bind_camera_hash
+                    )
+                if mutate_geometry is not None:
+                    rewrite_geometry_manifest_artifact(
+                        root, observations, candidate, mutate_geometry
+                    )
+                if mutate_receipt is not None:
+                    mutate_receipt(runtime)
+                if wrong_path:
+                    wrong = root / f"worker-runs/{candidate['run_id']}/cameras.txt"
+                    wrong.parent.mkdir(parents=True, exist_ok=True)
+                    camera_path.replace(wrong)
+                    observations["artifacts"][camera_name] = wrong.relative_to(
+                        root
+                    ).as_posix()
+                descriptors = {
+                    name: evidence._artifact_descriptor(root / path, root)
+                    for name, path in observations["artifacts"].items()
+                }
+                used = {camera_name} if preused_camera else set()
+                evidence._validate_runtime_worker_evidence(
+                    runtime,
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    used,
+                    "runtime_worker_evidence",
+                    observations["pipeline_metrics"],
+                    0,
+                )
+
+        validate_case()
+        malformed_cameras = {
+            "per-image cameras": b"".join(
+                f"{camera_id} OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0 0\n".encode()
+                for camera_id in range(1, 121)
+            ),
+            "wrong model": b"1 SIMPLE_RADIAL 512 512 190 255 256 0\n",
+            "seven parameters": b"1 OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0\n",
+            "nine parameters": b"1 OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0 0 0\n",
+            "nonfinite": b"1 OPENCV_FISHEYE 512 512 inf 191 255 256 0 0 0 0\n",
+            "nonpositive focal": b"1 OPENCV_FISHEYE 512 512 -1 191 255 256 0 0 0 0\n",
+            "duplicate id": (
+                b"1 OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0 0\n"
+                b"1 OPENCV_FISHEYE 512 512 190 191 255 256 0 0 0 0\n"
+            ),
+        }
+        for label, cameras in malformed_cameras.items():
+            with self.subTest(case=label), self.assertRaises(evidence.EvidenceError):
+                validate_case(cameras=cameras)
+
+        geometry_mutations = {
+            "geometry model": lambda geometry: geometry.update(
+                {"cameraModel": "SIMPLE_RADIAL"}
+            ),
+            "receipt camera count": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ].update({"cameraCountAfter": 2}),
+            "receipt member count": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ]["groups"][0].update({"memberCount": 119}),
+            "receipt camera id": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ]["groups"][0].update({"canonicalCameraID": 2}),
+            "receipt mode": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ].update({"mode": "preserveExisting"}),
+        }
+        for label, mutation in geometry_mutations.items():
+            with self.subTest(case=label), self.assertRaises(evidence.EvidenceError):
+                validate_case(mutate_geometry=mutation)
+
+        with self.subTest(case="digest mismatch"), self.assertRaisesRegex(
+            evidence.EvidenceError, "canonical cameras digest"
+        ):
+            validate_case(
+                mutate_receipt=lambda receipt: receipt.update(
+                    {"canonical_cameras_sha256": "sha256:" + "0" * 64}
+                )
+            )
+        with self.subTest(case="wrong path"), self.assertRaisesRegex(
+            evidence.EvidenceError, "canonical cameras path"
+        ):
+            validate_case(wrong_path=True)
+        with self.subTest(case="one-use identity"), self.assertRaisesRegex(
+            evidence.EvidenceError, "cannot be reused"
+        ):
+            validate_case(preused_camera=True)
+
+    def test_camera_initialization_receipt_is_semantically_authenticated(self) -> None:
+        width = 512
+        height = 512
+        focal = math.hypot(width / 2, height / 2) / (75 * math.pi / 180)
+        request = evidence_request(
+            scale=120,
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["fisheye", "unordered"],
+        )
+        configuration = request["candidate_run_configuration"]
+        cameras = evidence._parse_colmap_cameras_text(
+            canonical_cameras_fixture(configuration, "photos", 0),
+            "fixture cameras",
+        )
+        selection = selection_sources_for_request(request)
+        receipt = {
+            "recipe": "sharedOpenCVFisheyeEquidistantDiagonal150V1",
+            "cameraModel": "OPENCV_FISHEYE",
+            "singleCamera": True,
+            "pixelWidth": width,
+            "pixelHeight": height,
+            "diagonalFieldOfViewDegrees": 150.0,
+            "cameraParameters": [
+                focal,
+                focal,
+                width / 2,
+                height / 2,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            "priorFocalLength": True,
+        }
+        grouping = {
+            "mode": "allSelectedImagesShared",
+            "cameraCountBefore": 120,
+            "cameraCountAfter": 1,
+            "groupedVideoSourceCount": 0,
+            "groups": [
+                {
+                    "sourceGroupID": "all-selected-images",
+                    "memberCount": 120,
+                    "canonicalCameraID": 1,
+                }
+            ],
+        }
+
+        def set_shared_dimensions(
+            geometry: dict[str, object], width: int, height: int
+        ) -> None:
+            changed_focal = math.hypot(width / 2, height / 2) / (
+                75 * math.pi / 180
+            )
+            geometry["cameraInitializationReceipt"].update(
+                {
+                    "pixelWidth": width,
+                    "pixelHeight": height,
+                    "cameraParameters": [
+                        changed_focal,
+                        changed_focal,
+                        width / 2,
+                        height / 2,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                }
+            )
+
+        def validate(
+            mutate: Callable[[dict[str, object]], None] | None = None,
+        ) -> None:
+            geometry = {
+                "cameraModel": "OPENCV_FISHEYE",
+                "cameraGrouping": "sameCameraAndLens",
+                "totalViewCount": 120,
+                "cameraGroupingReceipt": copy.deepcopy(grouping),
+                "cameraInitializationReceipt": copy.deepcopy(receipt),
+            }
+            if mutate is not None:
+                mutate(geometry)
+            evidence._validate_geometry_camera_contract(
+                geometry,
+                cameras,
+                configuration,
+                request,
+                selection,
+                "geometry",
+            )
+
+        validate()
+        invalid_cases = {
+            "missing grouping receipt": lambda geometry: geometry.pop(
+                "cameraGroupingReceipt"
+            ),
+            "missing receipt": lambda geometry: geometry.pop(
+                "cameraInitializationReceipt"
+            ),
+            "wrong recipe": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"recipe": "colmapAutomatic"}),
+            "wrong model": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"cameraModel": "SIMPLE_RADIAL"}),
+            "wrong single camera": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"singleCamera": False}),
+            "missing key": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].pop("pixelWidth"),
+            "extra key": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"unexpected": True}),
+            "nonfinite parameter": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ]["cameraParameters"].__setitem__(0, math.nan),
+            "wrong parameter count": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"cameraParameters": [focal] * 7}),
+            "wrong width": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"pixelWidth": 0}),
+            "wrong height": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"pixelHeight": 0}),
+            "width differs from canonical camera": lambda geometry: (
+                set_shared_dimensions(geometry, 513, 512)
+            ),
+            "height differs from canonical camera": lambda geometry: (
+                set_shared_dimensions(geometry, 512, 513)
+            ),
+            "dimension exceeds product bound": lambda geometry: (
+                set_shared_dimensions(geometry, 1_000_001, 512)
+            ),
+            "wrong fov": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"diagonalFieldOfViewDegrees": 149.0}),
+            "wrong focal": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ]["cameraParameters"].__setitem__(0, focal + 1e-6),
+            "wrong principal point": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ]["cameraParameters"].__setitem__(2, width / 2 + 1),
+            "wrong distortion": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ]["cameraParameters"].__setitem__(7, 1e-15),
+            "wrong prior flag": lambda geometry: geometry[
+                "cameraInitializationReceipt"
+            ].update({"priorFocalLength": False}),
+            "initialization grouping mismatch": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ].update({"mode": "preserveExisting"}),
+        }
+        for label, mutation in invalid_cases.items():
+            with self.subTest(case=label), self.assertRaises(evidence.EvidenceError):
+                validate(mutation)
+
+    def test_automatic_camera_initialization_has_no_synthetic_prior(self) -> None:
+        cameras = evidence._parse_colmap_cameras_text(
+            b"1 SIMPLE_RADIAL 64 64 50 32 32 0\n",
+            "fixture cameras",
+        )
+        request = evidence_request(input_kind="photos")
+        configuration = request["candidate_run_configuration"]
+        selection = selection_sources_for_request(request)
+        geometry = {
+            "cameraModel": "SIMPLE_RADIAL",
+            "cameraGrouping": "mixedCamerasOrLenses",
+            "totalViewCount": 30,
+            "cameraGroupingReceipt": {
+                "mode": "preserveExisting",
+                "cameraCountBefore": 1,
+                "cameraCountAfter": 1,
+                "groupedVideoSourceCount": 0,
+                "groups": [],
+            },
+            "cameraInitializationReceipt": {
+                "recipe": "colmapAutomatic",
+                "cameraModel": "SIMPLE_RADIAL",
+                "singleCamera": False,
+                "pixelWidth": None,
+                "pixelHeight": None,
+                "diagonalFieldOfViewDegrees": None,
+                "cameraParameters": None,
+                "priorFocalLength": False,
+            },
+        }
+        evidence._validate_geometry_camera_contract(
+            geometry, cameras, configuration, request, selection, "geometry"
+        )
+        invalid_mutations = {
+            "synthetic width": ("pixelWidth", 64),
+            "synthetic height": ("pixelHeight", 64),
+            "synthetic fov": ("diagonalFieldOfViewDegrees", 150.0),
+            "synthetic parameters": ("cameraParameters", [1.0] * 8),
+            "synthetic focal prior": ("priorFocalLength", True),
+            "unknown camera model": ("cameraModel", "UNKNOWN_MODEL"),
+        }
+        for label, (field, value) in invalid_mutations.items():
+            with self.subTest(case=label):
+                mutated = copy.deepcopy(geometry)
+                mutated["cameraInitializationReceipt"][field] = value
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence._validate_geometry_camera_contract(
+                        mutated,
+                        cameras,
+                        configuration,
+                        request,
+                        selection,
+                        "geometry",
+                    )
+
+        optimized_to_a_different_model = copy.deepcopy(geometry)
+        optimized_to_a_different_model["cameraModel"] = "PINHOLE"
+        different_cameras = evidence._parse_colmap_cameras_text(
+            b"1 PINHOLE 64 64 50 50 32 32\n",
+            "fixture cameras",
+        )
+        with self.assertRaisesRegex(evidence.EvidenceError, "camera model"):
+            evidence._validate_geometry_camera_contract(
+                optimized_to_a_different_model,
+                different_cameras,
+                configuration,
+                request,
+                selection,
+                "geometry",
+            )
+
+    def test_automatic_camera_initialization_rejects_wrong_resolved_model(self) -> None:
+        request = evidence_request(input_kind="photos")
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda geometry: geometry["cameraInitializationReceipt"].update(
+                    {"cameraModel": "PINHOLE"}
+                ),
+            )
+            with self.assertRaisesRegex(
+                evidence.EvidenceError, "camera initialization|camera model"
+            ):
+                descriptors = {
+                    name: evidence._artifact_descriptor(root / path, root)
+                    for name, path in observations["artifacts"].items()
+                }
+                evidence._validate_runtime_worker_evidence(
+                    candidate["runtime_worker_evidence"],
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    set(),
+                    "runtime_worker_evidence",
+                    observations["pipeline_metrics"],
+                    0,
+                )
+
+    def test_runtime_geometry_requires_feature_database_identity(self) -> None:
+        cases = {
+            "missing top-level digest": lambda geometry: geometry.pop(
+                "featureDatabaseDigest", None
+            ),
+            "mismatched top-level digest": lambda geometry: geometry.update(
+                {"featureDatabaseDigest": "d" * 64}
+            ),
+            "uppercase top-level digest": lambda geometry: geometry.update(
+                {"featureDatabaseDigest": "B" * 64}
+            ),
+        }
+        for label, mutation in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE, request=request
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                rewrite_geometry_manifest_artifact(
+                    root, observations, candidate, mutation
+                )
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "feature database digest|featureDatabaseDigest",
+                ):
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_seeded_geometry_still_requires_a_valid_feature_database_digest(
+        self,
+    ) -> None:
+        mutations = {
+            "boolean": True,
+            "uppercase": "B" * 64,
+            "malformed": "not-a-sha256",
+        }
+        for label, value in mutations.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE, request=request
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                rewrite_candidate_as_seeded_route(
+                    root,
+                    observations,
+                    candidate,
+                    lambda geometry: geometry.update(
+                        {"featureDatabaseDigest": value}
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError, "feature database digest"
+                ):
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_geometry_optional_and_nested_provenance_fields_are_typed(self) -> None:
+        cases = {
+            "fallback type": (
+                lambda geometry: geometry.update({"fallbackReason": True}),
+                "fallback reason",
+            ),
+            "fallback control": (
+                lambda geometry: geometry.update({"fallbackReason": "bad\nreason"}),
+                "fallback reason",
+            ),
+            "toolchain version": (
+                lambda geometry: geometry["provenance"].update(
+                    {"toolchainVersion": False}
+                ),
+                "provenance",
+            ),
+            "stale solver version": (
+                lambda geometry: geometry.update(
+                    {"solverVersion": "colmap; COLMAP 4.1.0"}
+                ),
+                "provenance",
+            ),
+            "stale runtime version": (
+                lambda geometry: geometry.update(
+                    {"runtimeVersion": "easysplat-core-v2"}
+                ),
+                "provenance",
+            ),
+            "solver identifier": (
+                lambda geometry: geometry["provenance"]["solver"].update(
+                    {"identifier": "not-colmap"}
+                ),
+                "provenance",
+            ),
+            "runtime without model": (
+                lambda geometry: geometry["provenance"].update(
+                    {
+                        "runtime": {
+                            "identifier": "da3_mps",
+                            "version": "v1",
+                            "revision": "rev",
+                            "payloadSHA256": "1" * 64,
+                        }
+                    }
+                ),
+                "provenance",
+            ),
+            "learned initializer without model": (
+                lambda geometry: geometry.update(
+                    {
+                        "learnedPointInitializer": {
+                            "path": "SfM/colmap/seed/0/learned_points3D.txt",
+                            "sha256": "1" * 64,
+                            "pointCount": 1,
+                        }
+                    }
+                ),
+                "learned point initializer",
+            ),
+            "learned initializer malformed digest": (
+                lambda geometry: (
+                    geometry["provenance"].update(
+                        {
+                            "runtime": {
+                                "identifier": "da3_mps",
+                                "version": "v1",
+                                "revision": "runtime-rev",
+                                "payloadSHA256": "1" * 64,
+                            },
+                            "model": {
+                                "identifier": "DA3-BASE",
+                                "version": "v1",
+                                "revision": "model-rev",
+                                "payloadSHA256": "2" * 64,
+                            },
+                        }
+                    ),
+                    geometry.update(
+                        {
+                            "modelVersion": "DA3-BASE@model-rev",
+                            "runtimeVersion": (
+                                "toolchain 2.0.0; da3_mps v1 (git runtime)"
+                            ),
+                            "learnedPointInitializer": {
+                                "path": "SfM/colmap/seed/0/learned_points3D.txt",
+                                "sha256": "Z" * 64,
+                                "pointCount": 1,
+                            },
+                        }
+                    ),
+                ),
+                "learned point initializer",
+            ),
+            "learned initializer point count overflow": (
+                lambda geometry: (
+                    geometry["provenance"].update(
+                        {
+                            "runtime": {
+                                "identifier": "da3_mps",
+                                "version": "v1",
+                                "revision": "runtime-rev",
+                                "payloadSHA256": "1" * 64,
+                            },
+                            "model": {
+                                "identifier": "DA3-BASE",
+                                "version": "v1",
+                                "revision": "model-rev",
+                                "payloadSHA256": "2" * 64,
+                            },
+                        }
+                    ),
+                    geometry.update(
+                        {
+                            "modelVersion": "DA3-BASE@model-rev",
+                            "runtimeVersion": (
+                                "toolchain 2.0.0; da3_mps v1 (git runtime)"
+                            ),
+                            "learnedPointInitializer": {
+                                "path": "SfM/colmap/seed/0/learned_points3D.txt",
+                                "sha256": "3" * 64,
+                                "pointCount": 1 << 63,
+                            },
+                        }
+                    ),
+                ),
+                "learned point initializer",
+            ),
+            "unsupported learned model": (
+                lambda geometry: (
+                    geometry["provenance"].update(
+                        {
+                            "runtime": {
+                                "identifier": "da3_mps",
+                                "version": "v1",
+                                "revision": "runtime-rev",
+                                "payloadSHA256": "1" * 64,
+                            },
+                            "model": {
+                                "identifier": "NOT-DA3",
+                                "version": "v1",
+                                "revision": "model-rev",
+                                "payloadSHA256": "2" * 64,
+                            },
+                        }
+                    ),
+                    geometry.update(
+                        {
+                            "modelVersion": "NOT-DA3@model-rev",
+                            "runtimeVersion": (
+                                "toolchain 2.0.0; da3_mps v1 (git runtime)"
+                            ),
+                            "learnedPointInitializer": {
+                                "path": "SfM/colmap/seed/0/learned_points3D.txt",
+                                "sha256": "3" * 64,
+                                "pointCount": 1,
+                            },
+                        }
+                    ),
+                ),
+                "provenance",
+            ),
+        }
+        for label, (mutation, expected) in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE, request=request
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                rewrite_geometry_manifest_artifact(
+                    root, observations, candidate, mutation
+                )
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_da3_provenance_and_learned_initializer_accept_resolved_input_groups(
+        self,
+    ) -> None:
+        for request in (
+            evidence_request(input_kind="video"),
+            evidence_request(input_kind="mixed", video_source_count=2),
+        ):
+            with (
+                self.subTest(input_kind=request["input_kind"]),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE, request=request
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+
+                def add_da3(geometry: dict[str, object]) -> None:
+                    geometry["modelVersion"] = "DA3-BASE@model-rev"
+                    geometry["runtimeVersion"] = (
+                        "toolchain 2.0.0; da3_mps v1 (git runtime)"
+                    )
+                    geometry["provenance"].update(
+                        {
+                            "runtime": {
+                                "identifier": "da3_mps",
+                                "version": "v1",
+                                "revision": "runtime-rev",
+                                "payloadSHA256": "1" * 64,
+                            },
+                            "model": {
+                                "identifier": "DA3-BASE",
+                                "version": "v1",
+                                "revision": "model-rev",
+                                "payloadSHA256": "2" * 64,
+                            },
+                        }
+                    )
+                    geometry["learnedPointInitializer"] = {
+                        "path": "SfM/colmap/seed/0/learned_points3D.txt",
+                        "sha256": "3" * 64,
+                        "pointCount": 10,
+                    }
+
+                rewrite_geometry_manifest_artifact(
+                    root, observations, candidate, add_da3
+                )
+                descriptors = {
+                    name: evidence._artifact_descriptor(root / path, root)
+                    for name, path in observations["artifacts"].items()
+                }
+                evidence._validate_runtime_worker_evidence(
+                    candidate["runtime_worker_evidence"],
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    set(),
+                    "runtime_worker_evidence",
+                    observations["pipeline_metrics"],
+                    request["video_source_count"],
+                )
+
+    def test_geometry_fixtures_include_camera_receipts_for_every_input_kind(self) -> None:
+        requests = (
+            (
+                evidence_request(input_kind="photos"),
+                "mixedCamerasOrLenses",
+                "preserveExisting",
+            ),
+            (
+                evidence_request(input_kind="video"),
+                "sameCameraAndLens",
+                "allSelectedImagesShared",
+            ),
+            (
+                evidence_request(input_kind="multi_video", video_source_count=2),
+                "mixedCamerasOrLenses",
+                "videoSourceGroups",
+            ),
+            (
+                evidence_request(input_kind="mixed", video_source_count=2),
+                "mixedCamerasOrLenses",
+                "videoSourceGroups",
+            ),
+            (
+                evidence_request(
+                    scale=120,
+                    input_kind="video",
+                    capture_traits=["fisheye", "ordered"],
+                ),
+                "sameCameraAndLens",
+                "allSelectedImagesShared",
+            ),
+        )
+        for request, expected_grouping, expected_mode in requests:
+            with self.subTest(
+                input_kind=request["input_kind"],
+                projection=request["candidate_run_configuration"]["lens_projection"],
+            ):
+                geometry = geometry_manifest_artifact(
+                    request["candidate_run_configuration"],
+                    request["input_kind"],
+                    "sha256:" + "d" * 64,
+                    "sha256:" + "e" * 64,
+                    request["video_source_count"],
+                )
+                self.assertIn("cameraGroupingReceipt", geometry)
+                self.assertIn("cameraInitializationReceipt", geometry)
+                self.assertEqual(geometry["cameraGrouping"], expected_grouping)
+                self.assertEqual(
+                    geometry["cameraGroupingReceipt"]["mode"], expected_mode
+                )
+                self.assertEqual(
+                    geometry["featureDatabaseDigest"],
+                    geometry["pairGraph"]["measurement"]["featureDatabaseDigest"],
+                )
+
+    def test_filtered_mixed_input_does_not_collapse_to_shared_camera_grouping(
+        self,
+    ) -> None:
+        request = evidence_request(input_kind="mixed", video_source_count=1)
+        configuration = request["candidate_run_configuration"]
+        selection = selection_sources_for_request(
+            evidence_request(input_kind="video", video_source_count=1)
+        )
+        cameras = evidence._parse_colmap_cameras_text(
+            b"1 SIMPLE_RADIAL 64 64 50 32 32 0\n",
+            "fixture cameras",
+        )
+        geometry = {
+            "cameraModel": "SIMPLE_RADIAL",
+            "cameraGrouping": "mixedCamerasOrLenses",
+            "totalViewCount": 30,
+            "cameraGroupingReceipt": {
+                "mode": "videoSourceGroups",
+                "cameraCountBefore": 30,
+                "cameraCountAfter": 1,
+                "groupedVideoSourceCount": 1,
+                "groups": [
+                    {
+                        "sourceGroupID": "clip-0",
+                        "memberCount": 30,
+                        "canonicalCameraID": 1,
+                    }
+                ],
+            },
+            "cameraInitializationReceipt": {
+                "recipe": "colmapAutomatic",
+                "cameraModel": "SIMPLE_RADIAL",
+                "singleCamera": False,
+                "pixelWidth": None,
+                "pixelHeight": None,
+                "diagonalFieldOfViewDegrees": None,
+                "cameraParameters": None,
+                "priorFocalLength": False,
+            },
+        }
+        evidence._validate_geometry_camera_contract(
+            geometry,
+            cameras,
+            configuration,
+            request,
+            selection,
+            "geometry",
+        )
+        geometry["cameraGrouping"] = "sameCameraAndLens"
+        with self.assertRaisesRegex(evidence.EvidenceError, "camera grouping"):
+            evidence._validate_geometry_camera_contract(
+                geometry,
+                cameras,
+                configuration,
+                request,
+                selection,
+                "geometry",
+            )
+
+    def test_video_grouping_receipt_requires_every_database_camera_in_final_model(
+        self,
+    ) -> None:
+        request = evidence_request(
+            input_kind="multi_video", video_source_count=2
+        )
+        geometry = geometry_manifest_artifact(
+            request["candidate_run_configuration"],
+            request["input_kind"],
+            "sha256:" + "d" * 64,
+            "sha256:" + "e" * 64,
+            request["video_source_count"],
+        )
+        cameras = evidence._parse_colmap_cameras_text(
+            b"1 SIMPLE_RADIAL 64 64 50 32 32 0\n",
+            "fixture cameras",
+        )
+        with self.assertRaisesRegex(evidence.EvidenceError, "camera grouping receipt"):
+            evidence._validate_geometry_camera_contract(
+                geometry,
+                cameras,
+                request["candidate_run_configuration"],
+                request,
+                selection_sources_for_request(request),
+                "geometry",
+            )
+
+    def test_canonical_camera_count_cannot_exceed_registered_views(self) -> None:
+        request = evidence_request(input_kind="photos")
+        configuration = request["candidate_run_configuration"]
+        geometry = geometry_manifest_artifact(
+            configuration,
+            "photos",
+            "sha256:" + "d" * 64,
+            "sha256:" + "e" * 64,
+            0,
+        )
+        geometry["registeredViewCount"] = 20
+        geometry["cameraGroupingReceipt"].update(
+            {"cameraCountBefore": 21, "cameraCountAfter": 21}
+        )
+        cameras = evidence._parse_colmap_cameras_text(
+            b"".join(
+                f"{camera_id} SIMPLE_RADIAL 64 64 50 32 32 0\n".encode()
+                for camera_id in range(1, 22)
+            ),
+            "fixture cameras",
+        )
+        with self.assertRaisesRegex(evidence.EvidenceError, "camera grouping receipt"):
+            evidence._validate_geometry_camera_contract(
+                geometry,
+                cameras,
+                configuration,
+                request,
+                selection_sources_for_request(request),
+                "geometry",
+            )
+
+    def test_automatic_camera_model_fixture_matches_resolved_swift_policy(self) -> None:
+        cases = (
+            ("fisheye", "fast", "automatic", "OPENCV_FISHEYE"),
+            ("perspective", "high_detail", "around_subject", "OPENCV"),
+            ("perspective", "balanced", "through_space", "SIMPLE_RADIAL"),
+            ("automatic", "high_detail", "through_space", "OPENCV"),
+            ("automatic", "high_detail", "large_area", "OPENCV"),
+            ("automatic", "high_detail", "around_subject", "SIMPLE_RADIAL"),
+            ("automatic", "balanced", "large_area", "SIMPLE_RADIAL"),
+        )
+        for lens, detail, capture, expected in cases:
+            with self.subTest(lens=lens, detail=detail, capture=capture):
+                request = evidence_request(input_kind="photos")
+                configuration = request["candidate_run_configuration"]
+                configuration.update(
+                    {
+                        "lens_projection": lens,
+                        "detail_profile": detail,
+                        "capture_path": capture,
+                    }
+                )
+                receipt = camera_initialization_receipt_fixture(
+                    configuration, "photos", 0
+                )
+                self.assertEqual(receipt["cameraModel"], expected)
+                self.assertEqual(
+                    evidence._resolved_camera_model(configuration), expected
+                )
+                geometry = geometry_manifest_artifact(
+                    configuration,
+                    "photos",
+                    "sha256:" + "d" * 64,
+                    "sha256:" + "e" * 64,
+                    0,
+                )
+                cameras = evidence._parse_colmap_cameras_text(
+                    canonical_cameras_fixture(configuration, "photos", 0),
+                    "fixture cameras",
+                )
+                evidence._validate_geometry_camera_contract(
+                    geometry,
+                    cameras,
+                    configuration,
+                    request,
+                    selection_sources_for_request(request),
+                    "geometry",
+                )
+
+    def test_video_grouping_receipt_is_bound_to_authenticated_selection_sources(
+        self,
+    ) -> None:
+        mutations = {
+            "fabricated group": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ]["groups"][0].update({"sourceGroupID": "fabricated-clip"}),
+            "wrong member count": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ]["groups"][0].update({"memberCount": 1}),
+            "missing canonical camera": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ]["groups"][0].update({"canonicalCameraID": 999}),
+            "wrong camera count": lambda geometry: geometry[
+                "cameraGroupingReceipt"
+            ].update({"cameraCountAfter": 3}),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request(
+                    input_kind="multi_video", video_source_count=2
+                )
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE, request=request
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                rewrite_geometry_manifest_artifact(
+                    root, observations, candidate, mutation
+                )
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError, "camera grouping receipt"
+                ):
+                    descriptors = {
+                        name: evidence._artifact_descriptor(root / path, root)
+                        for name, path in observations["artifacts"].items()
+                    }
+                    evidence._validate_runtime_worker_evidence(
+                        candidate["runtime_worker_evidence"],
+                        request["candidate_run_configuration"],
+                        request,
+                        "candidate",
+                        candidate["run_id"],
+                        root,
+                        descriptors,
+                        set(),
+                        "runtime_worker_evidence",
+                        observations["pipeline_metrics"],
+                        2,
                     )
 
     def test_runtime_worker_evidence_rejects_embedded_worker_mismatch(self) -> None:
@@ -7354,7 +12586,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_runtime_geometry_digests_are_bound_to_independent_request_evidence(self) -> None:
+    def test_runtime_geometry_digests_are_bound_to_independent_request_evidence(
+        self,
+    ) -> None:
         cases = (
             ("input", "inputDigest", "geometry_input_digest", "protected input"),
             (
@@ -7367,7 +12601,9 @@ class EvidenceProtocolTests(unittest.TestCase):
         for label, manifest_field, request_field, expected in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
                 request = evidence_request()
-                observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE, request=request
+                )
                 candidate = next(
                     receipt
                     for receipt in observations["commands"]
@@ -7376,9 +12612,12 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, observations, request)
                 runtime_receipt = candidate["runtime_worker_evidence"]
-                geometry_path = root / observations["artifacts"][
-                    runtime_receipt["geometry_manifest_name"]
-                ]
+                geometry_path = (
+                    root
+                    / observations["artifacts"][
+                        runtime_receipt["geometry_manifest_name"]
+                    ]
+                )
                 geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
                 request["reference_artifacts"][request_field] = (
                     "sha256:" + geometry[manifest_field]
@@ -7413,7 +12652,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         observations["pipeline_metrics"],
                     )
 
-    def test_runtime_geometry_rejects_pair_policy_that_contradicts_the_request(self) -> None:
+    def test_runtime_geometry_rejects_pair_policy_that_contradicts_the_request(
+        self,
+    ) -> None:
         request = evidence_request()
         observations = raw_observations(evidence.LANE_REFERENCE, request=request)
         candidate = next(
@@ -7451,7 +12692,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     observations["pipeline_metrics"],
                 )
 
-    def test_runtime_geometry_cadence_must_match_the_accepted_mapper_receipt(self) -> None:
+    def test_runtime_geometry_cadence_must_match_the_accepted_mapper_receipt(
+        self,
+    ) -> None:
         request = evidence_request()
         observations = raw_observations(evidence.LANE_REFERENCE, request=request)
         candidate = next(
@@ -7471,7 +12714,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                 ),
             )
 
-            with self.assertRaisesRegex(evidence.EvidenceError, "accepted mapper cadence"):
+            with self.assertRaisesRegex(
+                evidence.EvidenceError, "mapper receipt contradicts accepted geometry"
+            ):
                 evidence.derive_attestation(
                     request,
                     observations,
@@ -7482,7 +12727,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_published_geometry_pair_digest_is_bound_to_protected_pair_evidence(self) -> None:
+    def test_published_geometry_pair_digest_is_bound_to_protected_pair_evidence(
+        self,
+    ) -> None:
         request = evidence_request()
         observations = raw_observations(evidence.LANE_REFERENCE, request=request)
         candidate = next(
@@ -7492,7 +12739,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         substituted_digest = "sha256:" + "b" * 64
         for invocation in candidate["mapper_invocations"]:
-            if invocation["outcome"] == "accepted":
+            if invocation["evaluation"]["status"] == "accepted":
                 invocation["pair_list_digest"] = substituted_digest
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -7508,7 +12755,7 @@ class EvidenceProtocolTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 evidence.EvidenceError,
-                "protected pair evidence",
+                "published pair list|protected pair evidence",
             ):
                 evidence.derive_attestation(
                     request,
@@ -7556,13 +12803,19 @@ class EvidenceProtocolTests(unittest.TestCase):
 
     def test_vocabulary_execution_is_bound_to_the_resolved_schedule(self) -> None:
         cases = (
-            (30, True, False, "unscheduled"),
-            (120, False, False, "resolved retrieval policy"),
-            (120, False, True, None),
+            (30, "low_light", True, False, "unscheduled"),
+            (30, "object_orbit", False, False, "required by the resolved plan"),
+            (120, "object_orbit", False, False, "required by the resolved plan"),
+            (120, "object_orbit", False, True, None),
         )
-        for scale, inject, scheduled_empty, expected in cases:
-            with self.subTest(scale=scale, inject=inject, scheduled_empty=scheduled_empty):
-                request = evidence_request(scale=scale)
+        for scale, category, inject, scheduled_empty, expected in cases:
+            with self.subTest(
+                scale=scale,
+                category=category,
+                inject=inject,
+                scheduled_empty=scheduled_empty,
+            ):
+                request = evidence_request(scale=scale, category=category)
                 observations = raw_observations(
                     evidence.LANE_REFERENCE,
                     request=request,
@@ -7573,28 +12826,34 @@ class EvidenceProtocolTests(unittest.TestCase):
                     if receipt["variant"] == "candidate"
                 )
                 if scheduled_empty:
-                    for field in (
-                        "scheduled_pairs",
-                        "attempted_pairs",
-                        "raw_matched_pairs",
-                        "spatially_verified_pairs",
-                    ):
-                        observations["pipeline_metrics"][field] -= 1
                     role_field = (
                         "loop_pairs"
                         if request["candidate_run_configuration"]["input_topology"]
                         == "continuous"
                         else "retrieval_pairs"
                     )
+                    removed_pair_count = int(
+                        observations["pipeline_metrics"][role_field]
+                    )
+                    for field in (
+                        "scheduled_pairs",
+                        "attempted_pairs",
+                        "raw_matched_pairs",
+                        "spatially_verified_pairs",
+                    ):
+                        observations["pipeline_metrics"][field] -= removed_pair_count
                     observations["pipeline_metrics"][role_field] = 0
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     write_evidence_artifacts(root, observations, request)
                     if inject:
+
                         def mutate(worker: dict[str, object]) -> None:
-                            invocation = dict(worker["matchingInvocations"][0])
-                            invocation["command"] = "localVocabularyRetriever"
-                            worker["vocabularyRetrievalInvocations"] = [invocation]
+                            worker["vocabularyRetrievalInvocations"] = [
+                                retrieval_invocation_from_matching(
+                                    worker["matchingInvocations"][0]
+                                )
+                            ]
 
                         rewrite_worker_execution_artifact(
                             root,
@@ -7602,6 +12861,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                             candidate,
                             mutate,
                         )
+
                     elif not scheduled_empty:
                         rewrite_worker_execution_artifact(
                             root,
@@ -7616,13 +12876,17 @@ class EvidenceProtocolTests(unittest.TestCase):
                             observations,
                             candidate,
                             lambda geometry: geometry["pairGraph"].update(
-                                {"usedLocalVocabularyRetrieval": False}
+                                {
+                                    "retrievalWasScheduled": False,
+                                    "usedLocalVocabularyRetrieval": False,
+                                }
                             ),
                         )
                     descriptors = {
                         name: evidence._artifact_descriptor(root / path, root)
                         for name, path in observations["artifacts"].items()
                     }
+
                     def validate_runtime_worker() -> None:
                         evidence._validate_runtime_worker_evidence(
                             candidate["runtime_worker_evidence"],
@@ -7643,6 +12907,229 @@ class EvidenceProtocolTests(unittest.TestCase):
                         with self.assertRaisesRegex(evidence.EvidenceError, expected):
                             validate_runtime_worker()
 
+    def test_unmeasured_seeded_matching_is_faiss_first_bounded_and_one_shot(
+        self,
+    ) -> None:
+        configuration = evidence_request(scale=30)["candidate_run_configuration"]
+        worker = worker_execution_artifact(configuration, "video")
+        faiss = copy.deepcopy(worker["matchingInvocations"][0])
+        evidence._validate_unmeasured_matching_history([faiss])
+
+        faiss["exitStatus"] = 1
+        faiss["succeeded"] = False
+        exact = copy.deepcopy(faiss)
+        exact["exitStatus"] = 0
+        exact["succeeded"] = True
+        exact["pairExecution"].update(
+            {
+                "attemptOrdinal": 2,
+                "descriptorMatcher": "exact",
+                "exactRecoveryReason": "faissCrash",
+            }
+        )
+        evidence._validate_unmeasured_matching_history([faiss, exact])
+
+        invalid_histories = {
+            "successful FAISS followed by exact": [
+                {**faiss, "exitStatus": 0, "succeeded": True},
+                exact,
+            ],
+            "generic exact reason": [
+                faiss,
+                {
+                    **exact,
+                    "pairExecution": {
+                        **exact["pairExecution"],
+                        "exactRecoveryReason": "faissGeometryRejectedAfterRetries",
+                    },
+                },
+            ],
+            "changed schedule": [
+                faiss,
+                {
+                    **exact,
+                    "pairExecution": {
+                        **exact["pairExecution"],
+                        "pairListDigest": "f" * 64,
+                    },
+                },
+            ],
+            "repeated exact": [faiss, exact, copy.deepcopy(exact)],
+        }
+        for label, history in invalid_histories.items():
+            with self.subTest(case=label), self.assertRaises(evidence.EvidenceError):
+                evidence._validate_unmeasured_matching_history(history)
+
+    def test_pair_graph_rejects_skipped_and_premature_matcher_recovery(self) -> None:
+        request = evidence_request(scale=120)
+        configuration = request["candidate_run_configuration"]
+        geometry = geometry_manifest_artifact(
+            configuration,
+            "video",
+            "sha256:" + "d" * 64,
+            "sha256:" + "e" * 64,
+            1,
+        )
+        pair_graph = geometry["pairGraph"]
+
+        invalid_histories = {
+            "skipped maximum recovery": [
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "outcome": "rejected",
+                },
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "attemptNumber": 2,
+                    "recoveryLevel": "maximum",
+                },
+            ],
+            "premature exact recovery": [
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "outcome": "rejected",
+                },
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "attemptNumber": 2,
+                    "matcher": "exact",
+                    "exactRecoveryReason": "faissGeometryRejectedAfterRetries",
+                },
+            ],
+            "returned to faiss after exact": [
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "outcome": "failed",
+                },
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "attemptNumber": 2,
+                    "matcher": "exact",
+                    "exactRecoveryReason": "faissCrash",
+                    "outcome": "rejected",
+                },
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "attemptNumber": 3,
+                    "matcher": "faiss",
+                },
+            ],
+            "repeated exact after failure": [
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "outcome": "failed",
+                },
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "attemptNumber": 2,
+                    "matcher": "exact",
+                    "exactRecoveryReason": "faissCrash",
+                    "outcome": "failed",
+                },
+                {
+                    **pair_graph["measurement"]["matcherAttempts"][0],
+                    "attemptNumber": 3,
+                    "matcher": "exact",
+                    "exactRecoveryReason": "faissCrash",
+                },
+            ],
+        }
+        for label, history in invalid_histories.items():
+            with self.subTest(case=label):
+                changed = json.loads(json.dumps(pair_graph))
+                changed["measurement"]["matcherAttempts"] = history
+                changed["measurement"]["matchingDurationSeconds"] = sum(
+                    float(attempt["durationSeconds"]) for attempt in history
+                )
+                with self.assertRaisesRegex(evidence.EvidenceError, "recovery"):
+                    evidence._validate_pair_graph_artifact(
+                        changed,
+                        total_view_count=120,
+                        candidate_configuration=configuration,
+                    )
+
+    def test_binary_geometry_publication_binds_its_model_converter(self) -> None:
+        request = evidence_request()
+        publication = {
+            "kind": "convertedFromBinary",
+            "sourceModelHashes": {
+                "cameras.bin": "a" * 64,
+                "images.bin": "b" * 64,
+                "points3D.bin": "c" * 64,
+            },
+            "conversion": {
+                "invocationOrdinal": 1,
+                "workerEvidence": model_conversion_fixture(succeeded=True),
+            },
+        }
+        for include_converter in (False, True):
+            with self.subTest(include_converter=include_converter):
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE,
+                    request=request,
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_evidence_artifacts(root, observations, request)
+                    if include_converter:
+
+                        def add_converter(worker: dict[str, object]) -> None:
+                            converter = dict(
+                                worker["mappingAndRefinementInvocations"][-1]
+                            )
+                            converter["command"] = "modelConverter"
+                            converter["modelConversion"] = model_conversion_fixture(
+                                succeeded=True
+                            )
+                            worker["mappingAndRefinementInvocations"].append(converter)
+
+                        rewrite_worker_execution_artifact(
+                            root,
+                            observations,
+                            candidate,
+                            add_converter,
+                        )
+                    rewrite_geometry_manifest_artifact(
+                        root,
+                        observations,
+                        candidate,
+                        lambda geometry: geometry["mapping"].update(
+                            {"canonicalModelPublication": publication}
+                        ),
+                    )
+                    descriptors = {
+                        name: evidence._artifact_descriptor(root / path, root)
+                        for name, path in observations["artifacts"].items()
+                    }
+
+                    def validate() -> None:
+                        evidence._validate_runtime_worker_evidence(
+                            candidate["runtime_worker_evidence"],
+                            request["candidate_run_configuration"],
+                            request,
+                            "candidate",
+                            candidate["run_id"],
+                            root,
+                            descriptors,
+                            set(),
+                            "runtime_worker_evidence",
+                            observations["pipeline_metrics"],
+                        )
+
+                    if include_converter:
+                        validate()
+                    else:
+                        with self.assertRaisesRegex(
+                            evidence.EvidenceError,
+                            "successful model converter",
+                        ):
+                            validate()
+
     def test_seeded_geometry_cannot_claim_an_accepted_incremental_mapper(self) -> None:
         request = evidence_request()
         observations = raw_observations(evidence.LANE_REFERENCE, request=request)
@@ -7655,15 +13142,18 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
             runtime_receipt = candidate["runtime_worker_evidence"]
-            worker_path = root / observations["artifacts"][runtime_receipt["artifact_name"]]
-            geometry_path = root / observations["artifacts"][
-                runtime_receipt["geometry_manifest_name"]
-            ]
+            worker_path = (
+                root / observations["artifacts"][runtime_receipt["artifact_name"]]
+            )
+            geometry_path = (
+                root
+                / observations["artifacts"][runtime_receipt["geometry_manifest_name"]]
+            )
             worker = json.loads(worker_path.read_text(encoding="utf-8"))
             template = worker["mappingAndRefinementInvocations"][0]
             worker["vocabularyRetrievalInvocations"] = []
             worker["mappingAndRefinementInvocations"] = [
-                {**template, "command": command}
+                {**template, "command": command, "mapperExecution": None}
                 for command in ("pointTriangulator", "bundleAdjuster", "modelAnalyzer")
             ]
             geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
@@ -7671,13 +13161,16 @@ class EvidenceProtocolTests(unittest.TestCase):
                 {
                     "acceptedRefinementKind": "seededBundleAdjustment",
                     "acceptedRefinementInvocationCount": 1,
+                    "plannedIncrementalCadence": None,
                     "incrementalCadence": None,
+                    "cadenceFallbackTrigger": None,
                 }
             )
             geometry["pairGraph"].update(
                 {
                     "status": "notEvaluated",
                     "measurement": None,
+                    "retrievalWasScheduled": False,
                     "usedLocalVocabularyRetrieval": False,
                 }
             )
@@ -7702,7 +13195,7 @@ class EvidenceProtocolTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 evidence.EvidenceError,
-                "mapper invocation ordinals",
+                "seeded geometry cannot claim accepted mapper cadence",
             ):
                 evidence.derive_attestation(
                     request,
@@ -7714,7 +13207,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_mapping_attempt_identity_rejects_split_and_rollback_substitution(self) -> None:
+    def test_mapping_attempt_identity_rejects_split_and_rollback_substitution(
+        self,
+    ) -> None:
         cases = (
             (
                 "incremental split",
@@ -7754,16 +13249,19 @@ class EvidenceProtocolTests(unittest.TestCase):
                                     **worker["mappingAndRefinementInvocations"][0],
                                     "command": "pointTriangulator",
                                     "mappingAttemptOrdinal": 1,
+                                    "mapperExecution": None,
                                 },
                                 {
                                     **worker["mappingAndRefinementInvocations"][0],
                                     "command": "bundleAdjuster",
                                     "mappingAttemptOrdinal": 2,
+                                    "mapperExecution": None,
                                 },
                                 {
                                     **worker["mappingAndRefinementInvocations"][0],
                                     "command": "modelAnalyzer",
                                     "mappingAttemptOrdinal": 2,
+                                    "mapperExecution": None,
                                 },
                             ],
                         }
@@ -7772,6 +13270,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                         {
                             "status": "notEvaluated",
                             "measurement": None,
+                            "retrievalWasScheduled": False,
                             "usedLocalVocabularyRetrieval": False,
                         }
                     ),
@@ -7781,7 +13280,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                             "acceptedMappingAttemptOrdinal": 2,
                             "acceptedRefinementKind": "seededBundleAdjustment",
                             "acceptedRefinementInvocationCount": 1,
+                            "plannedIncrementalCadence": None,
                             "incrementalCadence": None,
+                            "cadenceFallbackTrigger": None,
                             "fallbackReason": "seeded_after_incremental_rejection",
                         }
                     ),
@@ -7799,6 +13300,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                         "command": "modelConverter",
                         "exitStatus": 1,
                         "succeeded": False,
+                        "modelConversion": model_conversion_fixture(succeeded=False),
                     }
                 ),
                 "final recorded attempt",
@@ -7819,12 +13321,15 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, observations, request)
                 runtime_receipt = candidate["runtime_worker_evidence"]
-                worker_path = root / observations["artifacts"][
-                    runtime_receipt["artifact_name"]
-                ]
-                geometry_path = root / observations["artifacts"][
-                    runtime_receipt["geometry_manifest_name"]
-                ]
+                worker_path = (
+                    root / observations["artifacts"][runtime_receipt["artifact_name"]]
+                )
+                geometry_path = (
+                    root
+                    / observations["artifacts"][
+                        runtime_receipt["geometry_manifest_name"]
+                    ]
+                )
                 worker = json.loads(worker_path.read_text(encoding="utf-8"))
                 geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
                 mutate(worker, geometry)
@@ -7926,16 +13431,19 @@ class EvidenceProtocolTests(unittest.TestCase):
                         **template,
                         "command": "pointTriangulator",
                         "mappingAttemptOrdinal": 2,
+                        "mapperExecution": None,
                     },
                     {
                         **template,
                         "command": "bundleAdjuster",
                         "mappingAttemptOrdinal": 2,
+                        "mapperExecution": None,
                     },
                     {
                         **template,
                         "command": "modelAnalyzer",
                         "mappingAttemptOrdinal": 2,
+                        "mapperExecution": None,
                     },
                 ]
 
@@ -7954,6 +13462,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                         {
                             "status": "notEvaluated",
                             "measurement": None,
+                            "retrievalWasScheduled": False,
                             "usedLocalVocabularyRetrieval": False,
                         }
                     ),
@@ -7963,13 +13472,18 @@ class EvidenceProtocolTests(unittest.TestCase):
                             "acceptedMappingAttemptOrdinal": 2,
                             "acceptedRefinementKind": "seededBundleAdjustment",
                             "acceptedRefinementInvocationCount": 1,
+                            "plannedIncrementalCadence": None,
                             "incrementalCadence": None,
+                            "cadenceFallbackTrigger": None,
                             "fallbackReason": "seeded_after_incremental_rejection",
                         }
                     ),
                 ),
             )
             candidate["mapper_invocations"] = []
+            candidate["planned_mapper_cadence"] = None
+            candidate["accepted_mapper_cadence"] = None
+            candidate["cadence_fallback_trigger"] = None
             (root / "command.jsonl").write_bytes(
                 b"".join(
                     evidence.canonical_json_bytes(command) + b"\n"
@@ -7982,7 +13496,7 @@ class EvidenceProtocolTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 evidence.EvidenceError,
-                "mapper invocation ordinals",
+                "candidate mapper evidence is missing|seeded mapper receipt",
             ):
                 evidence.derive_attestation(
                     request,
@@ -8002,13 +13516,13 @@ class EvidenceProtocolTests(unittest.TestCase):
                     invocations[0].update({"mapping_attempt_ordinal": 2}),
                     invocations[1].update({"mapping_attempt_ordinal": 1}),
                 ),
-                "strictly increase",
+                "ordinals are invalid",
             ),
             "substituted": (
                 lambda invocations: invocations[1].update(
                     {"mapping_attempt_ordinal": 3}
                 ),
-                "do not match successful worker",
+                "contradicts accepted geometry|successful worker",
             ),
         }
         for label, (mutate, expected) in mutations.items():
@@ -8027,6 +13541,15 @@ class EvidenceProtocolTests(unittest.TestCase):
                     "candidate",
                     request,
                     fallback=True,
+                )
+                candidate["planned_mapper_cadence"] = candidate[
+                    "mapper_invocations"
+                ][0]["incremental_cadence"]
+                candidate["accepted_mapper_cadence"] = candidate[
+                    "mapper_invocations"
+                ][-1]["incremental_cadence"]
+                candidate["cadence_fallback_trigger"] = (
+                    "insufficientViewSupport"
                 )
                 root = Path(directory)
                 write_evidence_artifacts(root, observations, request)
@@ -8061,7 +13584,10 @@ class EvidenceProtocolTests(unittest.TestCase):
                             runner_identity(evidence.LANE_REFERENCE),
                             machine=evidence_machine(evidence.LANE_REFERENCE),
                         )
-    def test_worker_publication_follows_geometry_route_and_retrieval_evidence(self) -> None:
+
+    def test_worker_publication_follows_geometry_route_and_retrieval_evidence(
+        self,
+    ) -> None:
         cases = (
             (
                 "incremental route validates refinement count",
@@ -8081,10 +13607,20 @@ class EvidenceProtocolTests(unittest.TestCase):
                                 **worker["mappingAndRefinementInvocations"][0],
                                 "exitStatus": 1,
                                 "succeeded": False,
+                                "mapperExecution": {
+                                    **worker["mappingAndRefinementInvocations"][0][
+                                        "mapperExecution"
+                                    ],
+                                    "evaluation": None,
+                                },
                             },
                             {
                                 **worker["mappingAndRefinementInvocations"][0],
                                 "command": "modelConverter",
+                                "mapperExecution": None,
+                                "modelConversion": model_conversion_fixture(
+                                    succeeded=True
+                                ),
                             },
                         ]
                     }
@@ -8099,6 +13635,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         {
                             "acceptedRefinementKind": "seededBundleAdjustment",
                             "acceptedRefinementInvocationCount": 0,
+                            "plannedIncrementalCadence": None,
+                            "incrementalCadence": None,
+                            "cadenceFallbackTrigger": None,
                         }
                     ),
                     worker.update(
@@ -8107,6 +13646,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                                 {
                                     **worker["mappingAndRefinementInvocations"][0],
                                     "command": command,
+                                    "mapperExecution": None,
                                 }
                                 for command in (
                                     "pointTriangulator",
@@ -8127,6 +13667,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                         {
                             "status": "notEvaluated",
                             "measurement": None,
+                            "retrievalWasScheduled": False,
                             "usedLocalVocabularyRetrieval": False,
                         }
                     ),
@@ -8134,7 +13675,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         {
                             "acceptedRefinementKind": "seededBundleAdjustment",
                             "acceptedRefinementInvocationCount": 2,
+                            "plannedIncrementalCadence": None,
                             "incrementalCadence": None,
+                            "cadenceFallbackTrigger": None,
                         }
                     ),
                     worker.update(
@@ -8144,6 +13687,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                                 {
                                     **worker["mappingAndRefinementInvocations"][0],
                                     "command": command,
+                                    "mapperExecution": None,
                                 }
                                 for command in (
                                     "pointTriangulator",
@@ -8164,7 +13708,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         {
                             "acceptedRefinementKind": "seededBundleAdjustment",
                             "acceptedRefinementInvocationCount": 1,
+                            "plannedIncrementalCadence": None,
                             "incrementalCadence": None,
+                            "cadenceFallbackTrigger": None,
                         }
                     ),
                     worker.update(
@@ -8173,6 +13719,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                                 {
                                     **worker["mappingAndRefinementInvocations"][0],
                                     "command": command,
+                                    "mapperExecution": None,
                                 }
                                 for command in (
                                     "pointTriangulator",
@@ -8193,6 +13740,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                         {
                             "status": "notEvaluated",
                             "measurement": None,
+                            "retrievalWasScheduled": False,
                             "usedLocalVocabularyRetrieval": False,
                         }
                     ),
@@ -8202,14 +13750,13 @@ class EvidenceProtocolTests(unittest.TestCase):
             ),
             (
                 "retrieval disabled rejects fake success",
-                evidence_request(scale=30),
+                evidence_request(scale=30, category="low_light"),
                 lambda worker, geometry: worker.update(
                     {
                         "vocabularyRetrievalInvocations": [
-                            {
-                                **worker["matchingInvocations"][0],
-                                "command": "localVocabularyRetriever",
-                            }
+                            retrieval_invocation_from_matching(
+                                worker["matchingInvocations"][0]
+                            )
                         ]
                     }
                 ),
@@ -8220,14 +13767,15 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence_request(scale=30),
                 lambda worker, geometry: (
                     geometry["pairGraph"].update(
-                        {"usedLocalVocabularyRetrieval": True}
+                        {
+                            "retrievalWasScheduled": True,
+                            "usedLocalVocabularyRetrieval": True,
+                        }
                     ),
                     geometry["pairGraph"]["measurement"].update(
                         {
                             "localPairCount": (
-                                geometry["pairGraph"]["measurement"][
-                                    "localPairCount"
-                                ]
+                                geometry["pairGraph"]["measurement"]["localPairCount"]
                                 - 1
                             ),
                             "retrievalPairCount": 1,
@@ -8236,12 +13784,10 @@ class EvidenceProtocolTests(unittest.TestCase):
                     worker.update(
                         {
                             "vocabularyRetrievalInvocations": [
-                                {
-                                    **worker["matchingInvocations"][0],
-                                    "command": "localVocabularyRetriever",
-                                    "exitStatus": 1,
-                                    "succeeded": False,
-                                }
+                                retrieval_invocation_from_matching(
+                                    worker["matchingInvocations"][0],
+                                    succeeded=False,
+                                )
                             ]
                         }
                     ),
@@ -8251,7 +13797,9 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         for label, request, mutation, expected in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
-                observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE, request=request
+                )
                 candidate = next(
                     receipt
                     for receipt in observations["commands"]
@@ -8260,10 +13808,15 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, observations, request)
                 runtime_receipt = candidate["runtime_worker_evidence"]
-                worker_path = root / observations["artifacts"][runtime_receipt["artifact_name"]]
-                geometry_path = root / observations["artifacts"][
-                    runtime_receipt["geometry_manifest_name"]
-                ]
+                worker_path = (
+                    root / observations["artifacts"][runtime_receipt["artifact_name"]]
+                )
+                geometry_path = (
+                    root
+                    / observations["artifacts"][
+                        runtime_receipt["geometry_manifest_name"]
+                    ]
+                )
                 worker = json.loads(worker_path.read_text(encoding="utf-8"))
                 geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
                 mutation(worker, geometry)
@@ -8296,12 +13849,15 @@ class EvidenceProtocolTests(unittest.TestCase):
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
 
-    def test_worker_publication_accepts_seeded_route_and_failed_optional_attempts(self) -> None:
+    def test_worker_publication_accepts_seeded_route_and_failed_optional_attempts(
+        self,
+    ) -> None:
         request = evidence_request()
         request["candidate_run_configuration"].update(
             {
+                "pairing_policy": "walkthrough",
                 "vocabulary_candidate_count": 20,
-                "vocabulary_verified_neighbor_count": 2,
+                "vocabulary_returned_neighbor_count": 2,
                 "vocabulary_query_stride": 10,
             }
         )
@@ -8325,29 +13881,27 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
             runtime_receipt = candidate["runtime_worker_evidence"]
-            worker_path = root / observations["artifacts"][runtime_receipt["artifact_name"]]
-            geometry_path = root / observations["artifacts"][
-                runtime_receipt["geometry_manifest_name"]
-            ]
+            worker_path = (
+                root / observations["artifacts"][runtime_receipt["artifact_name"]]
+            )
+            geometry_path = (
+                root
+                / observations["artifacts"][runtime_receipt["geometry_manifest_name"]]
+            )
             worker = json.loads(worker_path.read_text(encoding="utf-8"))
             template = worker["mappingAndRefinementInvocations"][0]
-            worker["vocabularyRetrievalInvocations"] = [
-                {
-                    **worker["matchingInvocations"][0],
-                    "command": "localVocabularyRetriever",
-                    "exitStatus": 1,
-                    "succeeded": False,
-                }
-            ]
+            worker["vocabularyRetrievalInvocations"] = []
             worker["mappingAndRefinementInvocations"] = [
-                {**template, "command": "pointTriangulator"},
-                {**template, "command": "bundleAdjuster"},
-                {**template, "command": "modelAnalyzer"},
+                {**template, "command": "pointTriangulator", "mapperExecution": None},
+                {**template, "command": "bundleAdjuster", "mapperExecution": None},
+                {**template, "command": "modelAnalyzer", "mapperExecution": None},
                 {
                     **template,
                     "command": "modelConverter",
+                    "mapperExecution": None,
                     "exitStatus": 1,
                     "succeeded": False,
+                    "modelConversion": model_conversion_fixture(succeeded=False),
                 },
             ]
             geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
@@ -8355,13 +13909,16 @@ class EvidenceProtocolTests(unittest.TestCase):
                 {
                     "acceptedRefinementKind": "seededBundleAdjustment",
                     "acceptedRefinementInvocationCount": 1,
+                    "plannedIncrementalCadence": None,
                     "incrementalCadence": None,
+                    "cadenceFallbackTrigger": None,
                 }
             )
             geometry["pairGraph"].update(
                 {
                     "status": "notEvaluated",
                     "measurement": None,
+                    "retrievalWasScheduled": False,
                     "usedLocalVocabularyRetrieval": False,
                 }
             )
@@ -8374,7 +13931,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
                 geometry_bytes
             )
+            synchronize_orientation_geometry_copy(root, candidate, geometry_bytes)
             candidate["mapper_invocations"] = []
+            candidate["planned_mapper_cadence"] = None
+            candidate["accepted_mapper_cadence"] = None
+            candidate["cadence_fallback_trigger"] = None
             (root / "command.jsonl").write_bytes(
                 b"".join(
                     evidence.canonical_json_bytes(command) + b"\n"
@@ -8397,9 +13958,14 @@ class EvidenceProtocolTests(unittest.TestCase):
 
     def test_seeded_worker_rejects_a_nonempty_all_failed_required_stage(self) -> None:
         for stage_name in ("featureExtractionInvocations", "matchingInvocations"):
-            with self.subTest(stage=stage_name), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(stage=stage_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 request = evidence_request()
-                observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE, request=request
+                )
                 candidate = next(
                     receipt
                     for receipt in observations["commands"]
@@ -8412,16 +13978,14 @@ class EvidenceProtocolTests(unittest.TestCase):
                     template = worker["mappingAndRefinementInvocations"][0]
                     worker["vocabularyRetrievalInvocations"] = []
                     worker["mappingAndRefinementInvocations"] = [
-                        {**template, "command": command}
+                        {**template, "command": command, "mapperExecution": None}
                         for command in (
                             "pointTriangulator",
                             "bundleAdjuster",
                             "modelAnalyzer",
                         )
                     ]
-                    worker[stage_name][0].update(
-                        {"exitStatus": 1, "succeeded": False}
-                    )
+                    worker[stage_name][0].update({"exitStatus": 1, "succeeded": False})
 
                 rewrite_worker_execution_artifact(
                     root,
@@ -8438,6 +14002,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                             {
                                 "status": "notEvaluated",
                                 "measurement": None,
+                                "retrievalWasScheduled": False,
                                 "usedLocalVocabularyRetrieval": False,
                             }
                         ),
@@ -8445,7 +14010,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                             {
                                 "acceptedRefinementKind": "seededBundleAdjustment",
                                 "acceptedRefinementInvocationCount": 1,
+                                "plannedIncrementalCadence": None,
                                 "incrementalCadence": None,
+                                "cadenceFallbackTrigger": None,
                             }
                         ),
                     ),
@@ -8505,6 +14072,137 @@ class EvidenceProtocolTests(unittest.TestCase):
                     observations["pipeline_metrics"],
                 )
 
+    def test_worker_rejects_successful_unscheduled_vocabulary_retrieval(self) -> None:
+        request = evidence_request(category="low_light")
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+
+            def add_unscheduled_retrieval(artifact: dict[str, object]) -> None:
+                invocation = retrieval_invocation_from_matching(
+                    artifact["matchingInvocations"][0]
+                )
+                invocation.update(
+                    {
+                        "argvWorkerCount": 8,
+                        "explicitThreadEnvironment": {
+                            "OMP_NUM_THREADS": "8",
+                            "OPENBLAS_NUM_THREADS": "8",
+                            "MKL_NUM_THREADS": "8",
+                        },
+                        "effectiveSanitizedThreadEnvironment": {
+                            "OMP_NUM_THREADS": "8",
+                            "OPENBLAS_NUM_THREADS": "8",
+                            "MKL_NUM_THREADS": "8",
+                        },
+                    }
+                )
+                artifact["vocabularyRetrievalInvocations"] = [invocation]
+
+            rewrite_worker_execution_artifact(
+                root,
+                observations,
+                candidate,
+                add_unscheduled_retrieval,
+            )
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda geometry: geometry["pairGraph"].update(
+                    {"retrievalWasScheduled": False}
+                ),
+            )
+            descriptors = {
+                name: evidence._artifact_descriptor(root / path, root)
+                for name, path in observations["artifacts"].items()
+            }
+            with self.assertRaisesRegex(evidence.EvidenceError, "unscheduled"):
+                evidence._validate_runtime_worker_evidence(
+                    candidate["runtime_worker_evidence"],
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    set(),
+                    "runtime_worker_evidence",
+                    None,
+                )
+
+    def test_worker_rejects_scheduled_vocabulary_retrieval_that_only_failed(
+        self,
+    ) -> None:
+        request = evidence_request(category="interior_walkthrough")
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+
+            def fail_retrieval_and_clear_accepted_binding(
+                artifact: dict[str, object],
+            ) -> None:
+                artifact["vocabularyRetrievalInvocations"][0].update(
+                    {"exitStatus": 1, "succeeded": False}
+                )
+                artifact["matchingInvocations"][0]["pairExecution"].update(
+                    {
+                        "retrievalRequestDigest": None,
+                        "retrievalOutputDigest": None,
+                    }
+                )
+
+            rewrite_worker_execution_artifact(
+                root,
+                observations,
+                candidate,
+                fail_retrieval_and_clear_accepted_binding,
+            )
+
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda geometry: geometry["pairGraph"].update(
+                    {
+                        "retrievalWasScheduled": True,
+                        "usedLocalVocabularyRetrieval": False,
+                    }
+                ),
+            )
+            descriptors = {
+                name: evidence._artifact_descriptor(root / path, root)
+                for name, path in observations["artifacts"].items()
+            }
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "omitted outside exhaustive recovery",
+            ):
+                evidence._validate_runtime_worker_evidence(
+                    candidate["runtime_worker_evidence"],
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    set(),
+                    "runtime_worker_evidence",
+                    None,
+                )
+
     def test_continuous_mapper_invocation_shapes_fail_closed(self) -> None:
         request = evidence_request()
         fast = mapper_invocations_for_variant("candidate", request)
@@ -8518,7 +14216,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             descriptor_matcher="faiss",
         )
         cases = (
-            ("fallback missing accepted second", recovered[:1], "exactly one accepted"),
+            ("fallback missing accepted second", recovered[:1], "accepted mapper"),
             (
                 "accepted fast followed by extra retry",
                 [
@@ -8526,17 +14224,23 @@ class EvidenceProtocolTests(unittest.TestCase):
                     {
                         **conservative,
                         "mapping_attempt_ordinal": 2,
-                        "outcome": "rejected_geometry_gate",
+                        "evaluation": {
+                            "status": "rejected",
+                            "fallback_trigger": None,
+                        },
                     },
                 ],
                 "accepted.*last",
             ),
-            ("conservative only", [conservative], "fast 4.0/1"),
+            ("conservative only", [conservative], "planned mapper cadence"),
         )
         for label, invocations, expected in cases:
-            with self.subTest(case=label), self.assertRaisesRegex(
-                evidence.EvidenceError,
-                expected,
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    expected,
+                ),
             ):
                 evidence._validate_mapper_invocations(
                     invocations,
@@ -8561,9 +14265,12 @@ class EvidenceProtocolTests(unittest.TestCase):
         equals[0]["argv"][index : index + 2] = [f"{option}=4.0"]
         cases["equals"] = equals
         for label, invocations in cases.items():
-            with self.subTest(case=label), self.assertRaisesRegex(
-                evidence.EvidenceError,
-                "cadence.*ba_global_frames_ratio",
+            with (
+                self.subTest(case=label),
+                self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "cadence.*ba_global_frames_ratio",
+                ),
             ):
                 evidence._validate_mapper_invocations(
                     invocations,
@@ -8572,7 +14279,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     valid_outcome=True,
                 )
 
-    def test_candidate_mapper_invocation_requires_promoted_convergence_arguments(self) -> None:
+    def test_candidate_mapper_invocation_requires_promoted_convergence_arguments(
+        self,
+    ) -> None:
         request = evidence_request()
         for option in (
             "--Mapper.ba_local_max_num_iterations",
@@ -8583,9 +14292,12 @@ class EvidenceProtocolTests(unittest.TestCase):
             invocations = mapper_invocations_for_variant("candidate", request)
             index = invocations[0]["argv"].index(option)
             del invocations[0]["argv"][index : index + 2]
-            with self.subTest(option=option), self.assertRaisesRegex(
-                evidence.EvidenceError,
-                option.removeprefix("--Mapper."),
+            with (
+                self.subTest(option=option),
+                self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    option.removeprefix("--Mapper."),
+                ),
             ):
                 evidence._validate_mapper_invocations(
                     invocations,
@@ -8602,9 +14314,12 @@ class EvidenceProtocolTests(unittest.TestCase):
         ):
             invocations = mapper_invocations_for_variant("candidate", request)
             invocations[0]["argv"][0] = executable
-            with self.subTest(executable=executable), self.assertRaisesRegex(
-                evidence.EvidenceError,
-                "canonical.*COLMAP",
+            with (
+                self.subTest(executable=executable),
+                self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "canonical.*COLMAP",
+                ),
             ):
                 evidence._validate_mapper_invocations(
                     invocations,
@@ -8613,7 +14328,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     valid_outcome=True,
                 )
 
-    def test_accurate_reference_mapper_receipt_rejects_production_cadence_options(self) -> None:
+    def test_accurate_reference_mapper_receipt_rejects_production_cadence_options(
+        self,
+    ) -> None:
         request = evidence_request()
         options = (
             "--Mapper.ba_global_frames_ratio",
@@ -8627,15 +14344,20 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         for option in options:
             for form in ("split", "equals"):
-                invocations = mapper_invocations_for_variant("accurate_reference", request)
+                invocations = mapper_invocations_for_variant(
+                    "accurate_reference", request
+                )
                 argv = invocations[0]["argv"]
                 if form == "split":
                     argv.extend((option, "1"))
                 else:
                     argv.append(f"{option}=1")
-                with self.subTest(option=option, form=form), self.assertRaisesRegex(
-                    evidence.EvidenceError,
-                    "accurate_reference.*production cadence",
+                with (
+                    self.subTest(option=option, form=form),
+                    self.assertRaisesRegex(
+                        evidence.EvidenceError,
+                        "accurate_reference.*production cadence",
+                    ),
                 ):
                     evidence._validate_mapper_invocations(
                         invocations,
@@ -8647,7 +14369,8 @@ class EvidenceProtocolTests(unittest.TestCase):
     def test_baseline_mapper_receipt_uses_frozen_implicit_defaults(self) -> None:
         request = evidence_request()
         baseline = next(
-            receipt for receipt in execution_receipts(
+            receipt
+            for receipt in execution_receipts(
                 paired_timing(), evidence.LANE_REFERENCE, request
             )
             if receipt["variant"] == "baseline"
@@ -8665,10 +14388,18 @@ class EvidenceProtocolTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(request["baseline_run_configuration"]["ba_global_frames_ratio"], 1.1)
-        self.assertEqual(request["baseline_run_configuration"]["ba_global_points_ratio"], 1.1)
-        self.assertEqual(request["baseline_run_configuration"]["ba_global_max_refinements"], 5)
-        self.assertEqual(request["baseline_run_configuration"]["ba_local_max_refinements"], 2)
+        self.assertEqual(
+            request["baseline_run_configuration"]["ba_global_frames_ratio"], 1.1
+        )
+        self.assertEqual(
+            request["baseline_run_configuration"]["ba_global_points_ratio"], 1.1
+        )
+        self.assertEqual(
+            request["baseline_run_configuration"]["ba_global_max_refinements"], 5
+        )
+        self.assertEqual(
+            request["baseline_run_configuration"]["ba_local_max_refinements"], 2
+        )
 
     def test_unordered_mapper_invocations_accept_denser_recovery_attempt(self) -> None:
         request = evidence_request(
@@ -8677,15 +14408,18 @@ class EvidenceProtocolTests(unittest.TestCase):
             capture_traits=["unordered"],
         )
         invocations = mapper_invocations_for_variant("candidate", request)
-        invocations[0]["outcome"] = "rejected_geometry_gate"
+        invocations[0]["evaluation"] = {
+            "status": "rejected",
+            "fallback_trigger": "insufficientViewSupport",
+        }
         invocations.append(
             mapper_invocation(
                 "candidate",
                 (1.1, 1.1, 5, 2),
                 "accepted",
                 mapping_attempt_ordinal=2,
-                matching_attempt=2,
-                digest_character="b",
+                matching_attempt=1,
+                digest_character="a",
                 descriptor_matcher="faiss",
             )
         )
@@ -8799,10 +14533,10 @@ class EvidenceProtocolTests(unittest.TestCase):
         request = evidence_request()
         cases = {}
         missing = mapper_invocations_for_variant("candidate", request)
-        missing[0].pop("matching_attempt")
+        missing[0].pop("pair_graph_attempt_ordinal")
         cases["missing"] = missing
         non_positive = mapper_invocations_for_variant("candidate", request)
-        non_positive[0]["matching_attempt"] = 0
+        non_positive[0]["pair_graph_attempt_ordinal"] = 0
         cases["non-positive attempt"] = non_positive
         invalid_digest = mapper_invocations_for_variant("candidate", request)
         invalid_digest[0]["pair_list_digest"] = "sha256:not-a-digest"
@@ -8819,11 +14553,14 @@ class EvidenceProtocolTests(unittest.TestCase):
                     valid_outcome=True,
                 )
 
-    def test_evidence_schema_accepts_unbounded_mapper_retries_with_graph_identity(self) -> None:
+    def test_evidence_schema_accepts_unbounded_mapper_retries_with_graph_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _, attestation = self.produce(Path(directory), evidence.LANE_REFERENCE)
         candidate = next(
-            receipt for receipt in attestation["commands"]
+            receipt
+            for receipt in attestation["commands"]
             if receipt["variant"] == "candidate"
         )
         candidate["mapper_invocations"] = [
@@ -8856,19 +14593,24 @@ class EvidenceProtocolTests(unittest.TestCase):
         ]
         validate_attestation_schema(attestation)
 
-    def test_evidence_schema_rejects_missing_or_invalid_mapper_graph_identity(self) -> None:
+    def test_evidence_schema_rejects_missing_or_invalid_mapper_graph_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _, attestation = self.produce(Path(directory), evidence.LANE_REFERENCE)
         cases = {
-            "missing": lambda item: item.pop("matching_attempt"),
-            "non-positive attempt": lambda item: item.update(matching_attempt=0),
+            "missing": lambda item: item.pop("pair_graph_attempt_ordinal"),
+            "non-positive attempt": lambda item: item.update(
+                pair_graph_attempt_ordinal=0
+            ),
             "invalid digest": lambda item: item.update(pair_list_digest="sha256:no"),
             "invalid matcher": lambda item: item.update(descriptor_matcher="flann"),
         }
         for label, mutate in cases.items():
             invalid = json.loads(json.dumps(attestation))
             invalid_candidate = next(
-                receipt for receipt in invalid["commands"]
+                receipt
+                for receipt in invalid["commands"]
                 if receipt["variant"] == "candidate"
             )
             mutate(invalid_candidate["mapper_invocations"][0])
@@ -8899,7 +14641,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             "failed",
         )
 
-    def test_supervisor_log_names_and_nested_artifact_paths_are_not_spoofable(self) -> None:
+    def test_supervisor_log_names_and_nested_artifact_paths_are_not_spoofable(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         observations["artifacts"]["command_log"] = "fake.jsonl"
         with tempfile.TemporaryDirectory() as directory:
@@ -8925,7 +14669,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             artifact_root = root / "artifacts"
             artifact_root.mkdir()
             (artifact_root / "nested").mkdir()
-            (artifact_root / "nested" / "link").symlink_to(outside, target_is_directory=True)
+            (artifact_root / "nested" / "link").symlink_to(
+                outside, target_is_directory=True
+            )
             with self.assertRaisesRegex(evidence.EvidenceError, "symlink"):
                 evidence._artifact_descriptor(
                     artifact_root / "nested" / "link" / "splat.ply",
@@ -8980,7 +14726,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             {"availability": "not_available", "reason": "not_measured"},
         )
 
-    def test_orientation_pipeline_claims_require_the_reference_scene_quality_lane(self) -> None:
+    def test_orientation_pipeline_claims_require_the_reference_scene_quality_lane(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_CONSTRAINED)
         observations["pipeline_metrics"].update(
             {
@@ -9007,7 +14755,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_CONSTRAINED),
                 )
 
-    def test_orientation_artifacts_require_the_reference_scene_quality_lane(self) -> None:
+    def test_orientation_artifacts_require_the_reference_scene_quality_lane(
+        self,
+    ) -> None:
         observations = raw_observations(evidence.LANE_CONSTRAINED)
         observations["artifacts"]["orientation_metrics"] = "orientation-metrics.json"
         request = evidence_request(lane=evidence.LANE_CONSTRAINED)
@@ -9070,7 +14820,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             changed = json.loads(json.dumps(attestation))
             changed["measurement_runner"]["sha256"] = "sha256:" + "f" * 64
             output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
-            with self.assertRaisesRegex(evidence.EvidenceError, "approved request index"):
+            with self.assertRaisesRegex(
+                evidence.EvidenceError, "approved request index"
+            ):
                 evidence.validate_prepared_attestation_file(
                     output,
                     evidence_request(),
@@ -9080,7 +14832,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             changed = json.loads(json.dumps(attestation))
             del changed["measurement_runner"]
             output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
-            with self.assertRaisesRegex(evidence.EvidenceError, "missing measurement_runner"):
+            with self.assertRaisesRegex(
+                evidence.EvidenceError, "missing measurement_runner"
+            ):
                 evidence.validate_prepared_attestation_file(
                     output,
                     evidence_request(),
@@ -9099,9 +14853,9 @@ class EvidenceProtocolTests(unittest.TestCase):
 
     def test_prepared_attestation_revalidates_mapper_and_worker_receipts(self) -> None:
         mutations = {
-            "invalid mapper digest": lambda candidate: candidate["mapper_invocations"][0].update(
-                {"pair_list_digest": "not-a-digest"}
-            ),
+            "invalid mapper digest": lambda candidate: candidate["mapper_invocations"][
+                0
+            ].update({"pair_list_digest": "not-a-digest"}),
             "missing runtime worker": lambda candidate: candidate.update(
                 {"runtime_worker_evidence": None}
             ),
@@ -9173,17 +14927,31 @@ class EvidenceProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(evidence.EvidenceError, "exactly 48 GiB"):
             evidence.validate_machine_lane(machine, evidence.LANE_REFERENCE)
 
-    def test_release_evidence_requires_xcode_16_4(self) -> None:
+    def test_release_evidence_requires_exact_shipping_compiler_and_sdk(self) -> None:
+        mutations = {
+            "Xcode": ("xcode_version", "Xcode 26.5\nBuild version 17F76"),
+            "Clang": ("clang_version", "Apple clang version 20.0.0"),
+            "Swift": ("swift_version", "Apple Swift version 6.3"),
+            "SDK version": ("macos_sdk_version", "26.4"),
+            "SDK build": ("macos_sdk_build", "25E5200"),
+            "Metal": ("metal_version", "Apple metal version 32023.1"),
+            "macOS version": ("macos_version", "26.5.1"),
+            "macOS build": ("macos_build", "25F80"),
+        }
         for lane in (
             evidence.LANE_REFERENCE,
             evidence.LANE_CONSTRAINED,
             evidence.LANE_EIGHT_GB,
         ):
-            with self.subTest(lane=lane):
-                machine = evidence_machine(lane)
-                machine["xcode_version"] = "Xcode 16.3\nBuild version 16E140"
-                with self.assertRaisesRegex(evidence.EvidenceError, "Xcode 16.4"):
-                    evidence.validate_machine_lane(machine, lane)
+            for label, (field, changed) in mutations.items():
+                with self.subTest(lane=lane, field=label):
+                    machine = evidence_machine(lane)
+                    machine[field] = changed
+                    with self.assertRaisesRegex(
+                        evidence.EvidenceError,
+                        "shipping compiler, SDK, and Metal tuple",
+                    ):
+                        evidence.validate_machine_lane(machine, lane)
 
     def test_release_scales_require_only_the_declared_hardware_lanes(self) -> None:
         self.assertEqual(
@@ -9196,21 +14964,35 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         self.assertEqual(
             benchmark.required_evidence_lanes(valid_scene(), 30),
-            (evidence.LANE_REFERENCE, evidence.LANE_CONSTRAINED, evidence.LANE_EIGHT_GB),
+            (
+                evidence.LANE_REFERENCE,
+                evidence.LANE_CONSTRAINED,
+                evidence.LANE_EIGHT_GB,
+            ),
         )
 
     def test_low_memory_timing_limits_are_scale_specific(self) -> None:
         scene = valid_scene()
         scene["gate_scopes"] = ["suite_performance"]
 
-        def attestation(lane: str, metric_name: str | None, seconds: float | None) -> dict[str, object]:
-            metrics = passing_metrics() if lane == evidence.LANE_REFERENCE else {
-                "memory_lane": measured(
-                    "constrained" if lane == evidence.LANE_CONSTRAINED else "eight_gb_fast"
-                ),
-                "machine_memory_bytes": measured(evidence_machine(lane)["physical_memory_bytes"]),
-                "peak_memory_bytes": measured(1_000_000_000),
-            }
+        def attestation(
+            lane: str, metric_name: str | None, seconds: float | None
+        ) -> dict[str, object]:
+            metrics = (
+                passing_metrics()
+                if lane == evidence.LANE_REFERENCE
+                else {
+                    "memory_lane": measured(
+                        "constrained"
+                        if lane == evidence.LANE_CONSTRAINED
+                        else "eight_gb_fast"
+                    ),
+                    "machine_memory_bytes": measured(
+                        evidence_machine(lane)["physical_memory_bytes"]
+                    ),
+                    "peak_memory_bytes": measured(1_000_000_000),
+                }
+            )
             if metric_name is not None:
                 metrics[metric_name] = measured(seconds)
             return {
@@ -9248,7 +15030,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             },
         )
         self.assertEqual(evaluation["status"], "failed")
-        self.assertTrue(any("constrained" in failure for failure in evaluation["failures"]))
+        self.assertTrue(
+            any("constrained" in failure for failure in evaluation["failures"])
+        )
 
         constrained_120 = attestation(
             evidence.LANE_CONSTRAINED,
@@ -9264,7 +15048,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             },
         )
         self.assertEqual(evaluation["status"], "failed")
-        self.assertTrue(any("constrained" in failure for failure in evaluation["failures"]))
+        self.assertTrue(
+            any("constrained" in failure for failure in evaluation["failures"])
+        )
 
         constrained_120["metrics"]["constrained_fast_p50_seconds"] = measured(600.0)
         evaluation, _ = benchmark._evaluate_protected_attestations(
@@ -9289,7 +15075,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             },
         )
         self.assertEqual(evaluation["status"], "failed")
-        self.assertTrue(any("eight_gb" in failure for failure in evaluation["failures"]))
+        self.assertTrue(
+            any("eight_gb" in failure for failure in evaluation["failures"])
+        )
 
     def test_protected_low_memory_lanes_gate_the_larger_of_rss_and_metal(self) -> None:
         scene = valid_scene()
@@ -9332,7 +15120,10 @@ class EvidenceProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(evaluation["status"], "failed")
                 self.assertTrue(
-                    any("unified memory" in failure for failure in evaluation["failures"])
+                    any(
+                        "unified memory" in failure
+                        for failure in evaluation["failures"]
+                    )
                 )
 
                 del attestation["metrics"]["peak_metal_allocated_bytes"]
@@ -9361,7 +15152,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             corpus_digest="sha256:" + "2" * 64,
             thresholds_digest="sha256:" + "3" * 64,
             git_commit="4" * 40,
-            app_version="0.2.0-beta.1",
+            app_version="0.2.0",
             toolchain_identity=TEST_TOOLCHAIN_IDENTITY,
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -9414,7 +15205,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "sha256:" + "9" * 64,
             )
             self.assertEqual(wrong_index["status"], "failed")
-            self.assertTrue(any("approved request index" in item for item in wrong_index["failures"]))
+            self.assertTrue(
+                any(
+                    "approved request index" in item for item in wrong_index["failures"]
+                )
+            )
             (scale_root / evidence.LANE_CONSTRAINED / "attestation.json").unlink()
             rejected = benchmark._copy_protected_evidence(
                 scene,
@@ -9431,7 +15226,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             self.assertTrue(
                 any("constrained" in item for item in rejected["blocking_reasons"])
             )
-            missing_attestation = scale_root / evidence.LANE_CONSTRAINED / "attestation.json"
+            missing_attestation = (
+                scale_root / evidence.LANE_CONSTRAINED / "attestation.json"
+            )
             missing_attestation.write_text("not-json\n", encoding="utf-8")
             malformed = benchmark._copy_protected_evidence(
                 scene,
@@ -9444,7 +15241,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "sha256:" + "9" * 64,
             )
             self.assertEqual(malformed["status"], "failed")
-            self.assertTrue(any("constrained" in item for item in malformed["failures"]))
+            self.assertTrue(
+                any("constrained" in item for item in malformed["failures"])
+            )
             missing_attestation.unlink()
             missing_attestation.symlink_to("absent-attestation.json")
             unsafe = benchmark._copy_protected_evidence(
@@ -9473,7 +15272,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             corpus_digest="sha256:" + "2" * 64,
             thresholds_digest="sha256:" + "3" * 64,
             git_commit="4" * 40,
-            app_version="0.2.0-beta.1",
+            app_version="0.2.0",
             toolchain_identity=TEST_TOOLCHAIN_IDENTITY,
         )
         input_digest = "sha256:" + "1" * 64
@@ -9501,10 +15300,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 corpus_root = Path(directory) / "corpus"
                 lane_root = (
-                    corpus_root
-                    / scene["adapter"]["evidence_path"]
-                    / "250"
-                    / lane
+                    corpus_root / scene["adapter"]["evidence_path"] / "250" / lane
                 )
                 if case == "symlinked_parent":
                     outside = Path(directory) / "outside"
@@ -9628,7 +15424,10 @@ class EvidenceProtocolTests(unittest.TestCase):
                     self.assertTrue(result["failures"])
                     if case == "symlinked_parent":
                         self.assertTrue(
-                            any("unsafe parent" in failure for failure in result["failures"])
+                            any(
+                                "unsafe parent" in failure
+                                for failure in result["failures"]
+                            )
                         )
 
     def test_request_emitter_binds_each_machine_job_to_one_run_identity(self) -> None:
@@ -9641,7 +15440,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             corpus_digest="sha256:" + "2" * 64,
             thresholds_digest="sha256:" + "3" * 64,
             git_commit="4" * 40,
-            app_version="0.2.0-beta.1",
+            app_version="0.2.0",
             toolchain_identity="sha256:" + "5" * 64,
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -9653,7 +15452,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     benchmark,
-                    "resolved_public_beta_toolchain_identity",
+                    "resolved_release_toolchain_identity",
                     return_value=identity.toolchain_identity,
                 ),
                 mock.patch.object(
@@ -9661,7 +15460,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     "collect_git_state",
                     return_value={"commit": identity.git_commit, "dirty": False},
                 ),
-                mock.patch.object(benchmark, "make_run_identity", return_value=identity),
+                mock.patch.object(
+                    benchmark, "make_run_identity", return_value=identity
+                ),
                 mock.patch.object(
                     benchmark,
                     "validate_tracked_benchmark_contract",
@@ -9683,9 +15484,13 @@ class EvidenceProtocolTests(unittest.TestCase):
                 set(benchmark.required_evidence_lanes(scene, 30)),
             )
             for item in index["requests"]:
-                request = json.loads((root / "requests" / item["request"]).read_text(encoding="utf-8"))
+                request = json.loads(
+                    (root / "requests" / item["request"]).read_text(encoding="utf-8")
+                )
                 self.assertEqual(request["binding"]["git_commit"], identity.git_commit)
-                self.assertEqual(request["binding"]["input_digest"], benchmark.digest_input(media))
+                self.assertEqual(
+                    request["binding"]["input_digest"], benchmark.digest_input(media)
+                )
                 lane = item["lane"]
                 self.assertEqual(
                     item["producer_command"],
@@ -9720,11 +15525,23 @@ class EvidenceProtocolTests(unittest.TestCase):
                     corpus,
                     valid_reference_config(),
                 )
+            stale_index = json.loads(json.dumps(index))
+            stale_index["schema_version"] = 2
+            with self.assertRaisesRegex(benchmark.ConfigError, "schema_version"):
+                benchmark.validate_request_index(
+                    stale_index,
+                    identity,
+                    corpus,
+                    valid_reference_config(),
+                )
 
     def test_lane_orchestrator_collects_raw_outputs_without_signing(self) -> None:
         scene = valid_scene(adapter="protected-evidence")
         scene["input"]["supplied"] = True
         scene["scale_lanes"] = [120]
+        scene["reference"]["by_scale"]["120"]["selection_manifest_sha256"] = (
+            evidence.sha256_bytes(fixture_video_selection_manifest(120))
+        )
         corpus = {"schema_version": 1, "manifest_profile": "release", "scenes": [scene]}
         config = valid_reference_config()
         identity = benchmark.RunIdentity(
@@ -9732,7 +15549,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             corpus_digest=benchmark.sha256_json(corpus),
             thresholds_digest=benchmark.sha256_json(config),
             git_commit="4" * 40,
-            app_version="0.2.0-beta.1",
+            app_version="0.2.0",
             toolchain_identity=TEST_TOOLCHAIN_IDENTITY,
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -9782,10 +15599,12 @@ class EvidenceProtocolTests(unittest.TestCase):
                 benchmark.canonical_json_bytes(config) + b"\n"
             )
             index = {
-                "schema_version": 2,
+                "schema_version": benchmark.REQUEST_INDEX_SCHEMA_VERSION,
                 "producer_protocol": evidence.PROTOCOL_VERSION,
                 "producer_version": evidence.PRODUCER_VERSION,
-                "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),
+                "producer_digest": evidence.sha256_file(
+                    ROOT / evidence.PRODUCER_RELATIVE_PATH
+                ),
                 "corpus_digest": identity.corpus_digest,
                 "thresholds_digest": identity.thresholds_digest,
                 "git_commit": identity.git_commit,
@@ -9820,6 +15639,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         "request": request_relative.as_posix(),
                         "media_path": scene["input"]["media_path"],
                         "evidence_path": scene["adapter"]["evidence_path"],
+                        "reference_artifact_path": scene["reference"]["by_scale"][
+                            "120"
+                        ]["artifact_path"],
                         "producer_command": ["fixture"],
                     }
                 ],
@@ -9866,6 +15688,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "shutil.copy2(source/'observations.json', root/'observations.json')\n"
                 "shutil.copy2(source/'splat.ply', root/'splat.ply')\n"
                 "shutil.copy2(source/'training-manifest.json', root/'training-manifest.json')\n"
+                "shutil.copy2(source/'selection-manifest.json', root/'selection-manifest.json')\n"
                 "shutil.copytree(source/'worker-runs', root/'worker-runs')\n",
                 encoding="utf-8",
             )
@@ -9877,9 +15700,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "sha256": evidence.sha256_file(runner),
             }
             for receipt in observations["commands"]:
-                receipt["executable_sha256"] = approved_runners[evidence.LANE_CONSTRAINED][
-                    "sha256"
-                ]
+                receipt["executable_sha256"] = approved_runners[
+                    evidence.LANE_CONSTRAINED
+                ]["sha256"]
             (source / "observations.json").write_bytes(
                 evidence.canonical_json_bytes(observations) + b"\n"
             )
@@ -9896,6 +15719,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     "request": reference_request.as_posix(),
                     "media_path": scene["input"]["media_path"],
                     "evidence_path": scene["adapter"]["evidence_path"],
+                    "reference_artifact_path": scene["reference"]["by_scale"]["120"][
+                        "artifact_path"
+                    ],
                     "producer_command": ["fixture"],
                 }
             )
@@ -9987,8 +15813,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     status["measurement_runner"],
-                    expected_runner
-                    or approved_runners[evidence.LANE_CONSTRAINED],
+                    expected_runner or approved_runners[evidence.LANE_CONSTRAINED],
                 )
                 self.assertEqual(
                     status["collector"],
@@ -9996,11 +15821,17 @@ class EvidenceProtocolTests(unittest.TestCase):
                         "protocol_version": evidence.PROTOCOL_VERSION,
                         "version": lane_runner._COLLECTOR_VERSION,
                         "executable": lane_runner._COLLECTOR_RELATIVE_PATH,
-                        "sha256": evidence.sha256_file(Path(lane_runner.__file__).resolve()),
+                        "sha256": evidence.sha256_file(
+                            Path(lane_runner.__file__).resolve()
+                        ),
                     },
                 )
                 if kind is None:
-                    self.assertEqual(status["disposition"], "attestation_candidate")
+                    self.assertEqual(
+                        status["disposition"],
+                        "attestation_candidate",
+                        status,
+                    )
                     self.assertIsNone(status["outcome"])
                 else:
                     self.assertEqual(status["disposition"], "lane_outcome")
@@ -10114,7 +15945,9 @@ class EvidenceProtocolTests(unittest.TestCase):
             )
             self.assertEqual(
                 collection["sha256"],
-                evidence.sha256_file(artifact_root(root / "evidence") / "collector-status.json"),
+                evidence.sha256_file(
+                    artifact_root(root / "evidence") / "collector-status.json"
+                ),
             )
             self.assertEqual(collection["scene_id"], scene["id"])
             self.assertEqual(collection["scale"], 120)
@@ -10163,7 +15996,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                     "measurement_runner",
                     "process_isolation_failed",
                     None,
-                    lane_runner.benchmark.ConfigError("fixture process isolation failure"),
+                    lane_runner.benchmark.ConfigError(
+                        "fixture process isolation failure"
+                    ),
                     "process isolation failed",
                 ),
                 (
@@ -10306,7 +16141,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                                 + b"\n"
                             )
                         elif case_name == "invalid-output-oversized":
-                            with (failure_artifact_root / "observations.json").open("wb") as handle:
+                            with (failure_artifact_root / "observations.json").open(
+                                "wb"
+                            ) as handle:
                                 handle.truncate(evidence.MAX_OBSERVATIONS_BYTES + 1)
                         elif case_name in {
                             "invalid-output-with-host-rejection",
@@ -10335,7 +16172,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                             )
                         return object()
 
-                    def summarize_failure_monitor(*args: object, **kwargs: object) -> object:
+                    def summarize_failure_monitor(
+                        *args: object, **kwargs: object
+                    ) -> object:
                         if case_name == "host-monitor-summary":
                             raise lane_runner.benchmark.ConfigError(
                                 "fixture host monitor summary failure"
@@ -10354,7 +16193,9 @@ class EvidenceProtocolTests(unittest.TestCase):
 
                     original_verify_runner = lane_runner._verify_runner_digest
 
-                    def verify_failure_runner(*args: object, **kwargs: object) -> object:
+                    def verify_failure_runner(
+                        *args: object, **kwargs: object
+                    ) -> object:
                         phase = args[2]
                         if (
                             case_name == "runner-integrity-after-process"
@@ -10367,7 +16208,9 @@ class EvidenceProtocolTests(unittest.TestCase):
 
                     original_verify_renderer = lane_runner._verify_renderer_closure
 
-                    def verify_failure_renderer(*args: object, **kwargs: object) -> object:
+                    def verify_failure_renderer(
+                        *args: object, **kwargs: object
+                    ) -> object:
                         phase = args[2]
                         if (
                             case_name == "renderer-integrity-before-monitor"
@@ -10396,7 +16239,10 @@ class EvidenceProtocolTests(unittest.TestCase):
                         mock.patch.object(
                             lane_runner.benchmark,
                             "collect_git_state",
-                            return_value={"commit": identity.git_commit, "dirty": False},
+                            return_value={
+                                "commit": identity.git_commit,
+                                "dirty": False,
+                            },
                         ),
                         mock.patch.object(
                             lane_runner.benchmark,
@@ -10539,7 +16385,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                         )["collections"],
                         failure_result["collections"],
                     )
-                    self.assertEqual(failure_status["outcome"]["reason"], outcome_reason)
+                    self.assertEqual(
+                        failure_status["outcome"]["reason"], outcome_reason
+                    )
 
             original_runner = runner.read_text(encoding="utf-8")
             original_candidate_validator = evidence.validate_attestation_candidate
@@ -10625,15 +16473,15 @@ class EvidenceProtocolTests(unittest.TestCase):
                     ],
                 ),
                 mock.patch.object(
-                lane_runner.evidence,
-                "validate_attestation_candidate",
-                side_effect=validate_then_mutate_runner,
-            ),
-            mock.patch.object(lane_runner, "_PROCESS_GROUP_DRAIN_SECONDS", 0.0),
-            self.assertRaisesRegex(
-                lane_runner.benchmark.ConfigError,
-                "digest mismatch before the first scene",
-            ),
+                    lane_runner.evidence,
+                    "validate_attestation_candidate",
+                    side_effect=validate_then_mutate_runner,
+                ),
+                mock.patch.object(lane_runner, "_PROCESS_GROUP_DRAIN_SECONDS", 0.0),
+                self.assertRaisesRegex(
+                    lane_runner.benchmark.ConfigError,
+                    "digest mismatch before the first scene",
+                ),
             ):
                 lane_runner.run_lane(
                     index_path,
@@ -10658,7 +16506,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                 exit_code=None,
             )
 
-            runner.write_text(original_runner + "\n# pre-run mutation\n", encoding="utf-8")
+            runner.write_text(
+                original_runner + "\n# pre-run mutation\n", encoding="utf-8"
+            )
             pre_run_mutation_output = root / "evidence-pre-run-mutation"
             with (
                 mock.patch.object(lane_runner.benchmark, "validate_corpus"),
@@ -10706,11 +16556,14 @@ class EvidenceProtocolTests(unittest.TestCase):
 
             self_mutation_output = root / "evidence-runner-self-mutation"
             runner.write_text(
-                original_runner + "\nwith open(__file__, 'a', encoding='utf-8') as handle: handle.write('# mutated')\n",
+                original_runner
+                + "\nwith open(__file__, 'a', encoding='utf-8') as handle: handle.write('# mutated')\n",
                 encoding="utf-8",
             )
             runner.chmod(0o755)
-            index["runner_identities"][evidence.LANE_CONSTRAINED]["sha256"] = evidence.sha256_file(runner)
+            index["runner_identities"][evidence.LANE_CONSTRAINED]["sha256"] = (
+                evidence.sha256_file(runner)
+            )
             index_path.write_bytes(benchmark.canonical_json_bytes(index) + b"\n")
             with (
                 mock.patch.object(lane_runner.benchmark, "validate_corpus"),
@@ -10792,19 +16645,89 @@ class EvidenceProtocolTests(unittest.TestCase):
             )
 
 
+def host_monitor_startup_error(
+    binary: Path,
+    environment: dict[str, str],
+) -> str | None:
+    ready_read, ready_write = os.pipe()
+    stop_read, stop_write = os.pipe()
+    process = subprocess.Popen(
+        [
+            str(binary),
+            "monitor-host-state",
+            "--sample-interval",
+            "0.05",
+            "--max-samples",
+            "2",
+            "--ready-fd",
+            str(ready_write),
+            "--stop-fd",
+            str(stop_read),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+        pass_fds=(ready_write, stop_read),
+    )
+    os.close(ready_write)
+    os.close(stop_read)
+    try:
+        readable, _, _ = select.select([ready_read], [], [], 2.0)
+        if readable and os.read(ready_read, 1) == b"\x01":
+            os.write(stop_write, b"\x01")
+            _, stderr = process.communicate(timeout=5.0)
+            if process.returncode == 0:
+                return None
+            return stderr.decode("utf-8", errors="replace").strip()
+        _, stderr = process.communicate(timeout=5.0)
+        return stderr.decode("utf-8", errors="replace").strip()
+    finally:
+        os.close(ready_read)
+        os.close(stop_write)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 class RunnerIntegrityTests(unittest.TestCase):
     def test_real_host_monitor_receipt_matches_python_evidence_contract(self) -> None:
+        swiftpm_root = ROOT / "build/.swiftpm"
+        swiftpm_environment = dict(os.environ)
+        swiftpm_environment.update(
+            {
+                "SWIFTPM_CACHE_PATH": str(swiftpm_root / "cache"),
+                "SWIFTPM_CONFIG_PATH": str(swiftpm_root / "configuration"),
+                "SWIFTPM_SECURITY_PATH": str(swiftpm_root / "security"),
+                "CLANG_MODULE_CACHE_PATH": str(swiftpm_root / "clang-module-cache"),
+            }
+        )
+        for key in (
+            "SWIFTPM_CACHE_PATH",
+            "SWIFTPM_CONFIG_PATH",
+            "SWIFTPM_SECURITY_PATH",
+            "CLANG_MODULE_CACHE_PATH",
+        ):
+            Path(swiftpm_environment[key]).mkdir(parents=True, exist_ok=True)
         build = subprocess.run(
-            ["swift", "build", "--product", "EasySplatBenchmarkDriver"],
+            [
+                "swift",
+                "build",
+                "--disable-sandbox",
+                "--product",
+                "EasySplatBenchmarkDriver",
+            ],
             cwd=ROOT,
+            env=swiftpm_environment,
             capture_output=True,
             text=True,
             check=False,
         )
         self.assertEqual(build.returncode, 0, build.stderr)
         binary_directory = subprocess.run(
-            ["swift", "build", "--show-bin-path"],
+            ["swift", "build", "--disable-sandbox", "--show-bin-path"],
             cwd=ROOT,
+            env=swiftpm_environment,
             capture_output=True,
             text=True,
             check=False,
@@ -10812,6 +16735,23 @@ class RunnerIntegrityTests(unittest.TestCase):
         self.assertEqual(binary_directory.returncode, 0, binary_directory.stderr)
         binary = Path(binary_directory.stdout.strip()) / "EasySplatBenchmarkDriver"
         self.assertTrue(binary.is_file())
+
+        with tempfile.TemporaryDirectory() as preflight_directory:
+            startup_error = host_monitor_startup_error(
+                binary,
+                lane_runner._isolated_environment(
+                    Path(preflight_directory),
+                    "monitor-contract-preflight",
+                ),
+            )
+        if startup_error == (
+            "EasySplat benchmark driver failed: "
+            "Host monitoring could not observe power-source changes."
+        ):
+            self.skipTest(
+                "The outer managed sandbox denies the power-source notification source."
+            )
+        self.assertIsNone(startup_error, startup_error)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -10821,8 +16761,12 @@ class RunnerIntegrityTests(unittest.TestCase):
                 2.0,
             )
             started = time.monotonic()
-            time.sleep(0.2)
+            spin_until = started + 1.1
+            spin_sink = 0
+            while time.monotonic() < spin_until:
+                spin_sink = (spin_sink * 1_664_525 + 1_013_904_223) & 0xFFFF_FFFF
             ended = time.monotonic()
+            self.assertIsInstance(spin_sink, int)
             report = lane_runner._finish_host_monitor(monitor)
             monitor_path = root / "host-monitor.json"
             monitor_path.write_bytes(evidence.canonical_json_bytes(report) + b"\n")
@@ -10869,6 +16813,8 @@ class RunnerIntegrityTests(unittest.TestCase):
     def _orientation_stage_fixture(
         self,
         root: Path,
+        *,
+        bind_execution_geometry: bool = True,
     ) -> tuple[
         dict[str, object],
         dict[str, object],
@@ -10888,9 +16834,15 @@ class RunnerIntegrityTests(unittest.TestCase):
                 continue
             run_root = root / "orientation-runs" / record["run_id"]
             run_root.mkdir(parents=True)
+            candidate_data = b"# fixture candidate images\n"
             (run_root / "geometry-manifest.json").write_bytes(
                 evidence.canonical_json_bytes(
                     {
+                        "modelHashes": {
+                            "cameras.txt": "1" * 64,
+                            "images.txt": hashlib.sha256(candidate_data).hexdigest(),
+                            "points3D.txt": "3" * 64,
+                        },
                         "mapping": {
                             "acceptedRefinementInvocationCount": 1,
                             "acceptedMappingAttemptOrdinal": 1,
@@ -10902,6 +16854,17 @@ class RunnerIntegrityTests(unittest.TestCase):
                                 "globalPointsRatio": 1.4,
                                 "localMaxRefinements": 2,
                             },
+                            "canonicalModelPublication": {
+                                "kind": "directText",
+                                "sourceModelHashes": {
+                                    "cameras.txt": "1" * 64,
+                                    "images.txt": hashlib.sha256(
+                                        candidate_data
+                                    ).hexdigest(),
+                                    "points3D.txt": "3" * 64,
+                                },
+                                "conversion": None,
+                            },
                             "largestModelRegisteredViewCount": 30,
                             "modelCount": 1,
                             "secondLargestModelRegisteredViewCount": 0,
@@ -10910,6 +16873,8 @@ class RunnerIntegrityTests(unittest.TestCase):
                         "pairGraph": {
                             "status": "measured",
                             "measurement": {"fixture": True},
+                            "requiresCrossClipRetrieval": False,
+                            "retrievalWasScheduled": False,
                             "usedLocalVocabularyRetrieval": False,
                         },
                         "schemaVersion": evidence.GEOMETRY_ARTIFACT_SCHEMA_VERSION,
@@ -10921,10 +16886,15 @@ class RunnerIntegrityTests(unittest.TestCase):
                 )
                 + b"\n"
             )
-            (run_root / "candidate-images.txt").write_text(
-                "# fixture candidate images\n",
-                encoding="utf-8",
-            )
+            (run_root / "candidate-images.txt").write_bytes(candidate_data)
+            if bind_execution_geometry:
+                command = next(
+                    item for item in observations["commands"]
+                    if item["run_id"] == record["run_id"]
+                )
+                command["runtime_worker_evidence"]["geometry_manifest_sha256"] = (
+                    evidence.sha256_file(run_root / "geometry-manifest.json")
+                )
         executable = root / "orientation-driver-source"
         executable.write_text(
             "#!/usr/bin/python3\n"
@@ -10945,7 +16915,9 @@ class RunnerIntegrityTests(unittest.TestCase):
         executable.chmod(0o755)
         bundle = root / "MetalSplatter_MetalSplatter.bundle"
         bundle.mkdir()
-        (bundle / "Shaders.metal").write_text("kernel void draw() {}\n", encoding="utf-8")
+        (bundle / "Shaders.metal").write_text(
+            "kernel void draw() {}\n", encoding="utf-8"
+        )
         closure = root / "renderer-closure"
         renderer_identity = lane_runner.renderer_closure.build_closure(
             executable,
@@ -10957,7 +16929,9 @@ class RunnerIntegrityTests(unittest.TestCase):
         request_path.write_bytes(evidence.canonical_json_bytes(request) + b"\n")
         return observations, request, request_path, renderer_identity, closure
 
-    def test_orientation_stage_invokes_the_approved_driver_for_every_candidate_run(self) -> None:
+    def test_orientation_stage_invokes_the_approved_driver_for_every_candidate_run(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             observations, request, request_path, renderer_identity, closure = (
@@ -10988,10 +16962,80 @@ class RunnerIntegrityTests(unittest.TestCase):
                 candidate_run_ids,
             )
             self.assertTrue((root / "orientation-supervisor.json").is_file())
+            supervisor = json.loads(
+                (root / "orientation-supervisor.json").read_text(encoding="utf-8")
+            )
+            for receipt in supervisor["runs"]:
+                argv = receipt["argv"]
+                self.assertEqual(
+                    argv[argv.index("--geometry-manifest-sha256") + 1],
+                    receipt["geometry_manifest_sha256"],
+                )
+                self.assertEqual(
+                    argv[argv.index("--candidate-images-sha256") + 1],
+                    receipt["candidate_images_sha256"],
+                )
             for run_id in candidate_run_ids:
                 self.assertTrue(
-                    (root / "orientation-runs" / run_id / "orientation-metrics.json").is_file()
+                    (
+                        root / "orientation-runs" / run_id / "orientation-metrics.json"
+                    ).is_file()
                 )
+
+    def test_orientation_stage_merges_only_its_authenticated_scoring_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observations, request, request_path, renderer_identity, closure = (
+                self._orientation_stage_fixture(root)
+            )
+            pipeline = observations["pipeline_metrics"]
+            for field in evidence.ORIENTATION_PIPELINE_FIELDS:
+                pipeline[field] = None
+
+            scoring_metrics = lane_runner._execute_orientation_stage(
+                artifact_root=root,
+                request=request,
+                request_path=request_path,
+                request_digest=evidence.sha256_file(request_path),
+                renderer_closure_path=closure,
+                renderer_identity=renderer_identity,
+                observations=observations,
+                commands=observations["commands"],
+                timeout_seconds=30.0,
+            )
+            lane_runner._merge_supervisor_orientation_metrics(
+                observations,
+                scoring_metrics,
+            )
+
+            aggregate = json.loads(
+                (root / "orientation-metrics.json").read_text(encoding="utf-8")
+            )
+            expected = next(
+                run["metrics"]
+                for run in aggregate["runs"]
+                if run["run_id"] == aggregate["scoring_run_id"]
+            )
+            self.assertEqual(
+                {field: pipeline[field] for field in evidence.ORIENTATION_PIPELINE_FIELDS},
+                {
+                    field: expected[field]
+                    for field in evidence.ORIENTATION_PIPELINE_FIELDS
+                },
+            )
+
+    def test_orientation_merge_rejects_runner_owned_labels(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        scoring_metrics = orientation_metrics_for_observations(observations)
+
+        with self.assertRaisesRegex(
+            lane_runner.benchmark.ConfigError,
+            "measurement runner cannot prelabel supervisor-owned orientation metrics",
+        ):
+            lane_runner._merge_supervisor_orientation_metrics(
+                observations,
+                scoring_metrics,
+            )
 
     def test_orientation_stage_rejects_precreated_supervisor_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -11004,7 +17048,9 @@ class RunnerIntegrityTests(unittest.TestCase):
                 for record in observations["timing"]["ordinary_runs"]
                 if record["variant"] == "candidate"
             )
-            precreated = root / "orientation-runs" / first_run_id / "orientation-metrics.json"
+            precreated = (
+                root / "orientation-runs" / first_run_id / "orientation-metrics.json"
+            )
             precreated.write_text("runner controlled\n", encoding="utf-8")
             with self.assertRaisesRegex(
                 lane_runner.benchmark.ConfigError,
@@ -11021,6 +17067,68 @@ class RunnerIntegrityTests(unittest.TestCase):
                     commands=observations["commands"],
                     timeout_seconds=30.0,
                 )
+
+    def test_orientation_stage_rejects_a_copy_unbound_from_the_execution_geometry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observations, request, request_path, renderer_identity, closure = (
+                self._orientation_stage_fixture(root, bind_execution_geometry=False)
+            )
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "orientation geometry.*authenticated execution",
+            ):
+                lane_runner._execute_orientation_stage(
+                    artifact_root=root,
+                    request=request,
+                    request_path=request_path,
+                    request_digest=evidence.sha256_file(request_path),
+                    renderer_closure_path=closure,
+                    renderer_identity=renderer_identity,
+                    observations=observations,
+                    commands=observations["commands"],
+                    timeout_seconds=30.0,
+                )
+
+    def test_release_workflows_bind_the_stable_application_identity(self) -> None:
+        benchmark_workflow = (
+            ROOT / ".github/workflows/benchmark-release.yml"
+        ).read_text(encoding="utf-8")
+        toolchain_workflow = (
+            ROOT / ".github/workflows/toolchain-build.yml"
+        ).read_text(encoding="utf-8")
+        evidence_schema = json.loads(
+            (ROOT / "scripts/benchmark/evidence.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        result_schema = json.loads(
+            (ROOT / "scripts/benchmark/result.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        smoke_fixture = json.loads(
+            (ROOT / "scripts/benchmark/fixtures/smoke-result.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(benchmark.APP_VERSION, "0.2.0")
+        self.assertEqual(benchmark_workflow.count('default: "0.2.0"'), 1)
+        self.assertEqual(toolchain_workflow.count('default: "0.2.0"'), 1)
+        self.assertEqual(
+            evidence_schema["properties"]["binding"]["properties"]["app_version"],
+            {"const": benchmark.APP_VERSION},
+        )
+        self.assertEqual(
+            result_schema["properties"]["app_version"],
+            {"const": benchmark.APP_VERSION},
+        )
+        self.assertEqual(smoke_fixture["app_version"], benchmark.APP_VERSION)
+        self.assertNotIn("0.2.0-beta.1", benchmark_workflow)
+        self.assertNotIn("0.2.0-beta.1", toolchain_workflow)
 
     def test_release_workflow_builds_and_distributes_the_renderer_closure(self) -> None:
         workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
@@ -11045,7 +17153,9 @@ class RunnerIntegrityTests(unittest.TestCase):
             ),
             3,
         )
-        self.assertEqual(workflow.count('--baseline-checkout-root "$BASELINE_CHECKOUT"'), 3)
+        self.assertEqual(
+            workflow.count('--baseline-checkout-root "$BASELINE_CHECKOUT"'), 3
+        )
         self.assertEqual(
             workflow.count('--baseline-toolchain-root "$BASELINE_TOOLCHAIN_ROOT"'),
             3,
@@ -11066,12 +17176,77 @@ class RunnerIntegrityTests(unittest.TestCase):
         self.assertIn("prepared_artifact_digest", aggregate_job)
         self.assertIn("actions/artifacts/$artifact_id", aggregate_job)
 
-    def test_release_measurement_jobs_pin_and_verify_xcode_16_4(self) -> None:
+    def test_release_workflow_builds_and_distributes_a_tracked_measurement_closure(
+        self,
+    ) -> None:
         workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
             encoding="utf-8"
         )
+
+        self.assertNotIn("EASYSPLAT_BENCHMARK_REFERENCE_RUNNER", workflow)
+        self.assertNotIn("EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER", workflow)
+        self.assertNotIn("EASYSPLAT_BENCHMARK_8GB_RUNNER", workflow)
+        self.assertIn("--product EasySplatMeasurementRunner", workflow)
+        self.assertIn("measurement_runner_closure.py build", workflow)
+        self.assertIn("measurement_runner_closure.py verify", workflow)
+        self.assertIn(
+            '--reference-adapter "$RUNNER_TEMP/measurement-adapters/AccurateReferenceMeasurementAdapter"',
+            workflow,
+        )
+        self.assertEqual(
+            workflow.count("name: easysplat-measurement-runner-${{ github.sha }}"),
+            1,
+            "prepare must upload one source-built runner closure",
+        )
+        self.assertEqual(
+            workflow.count(
+                '--runner "$RUNNER_TEMP/measurement-runner/closure/EasySplatMeasurementRunner"'
+            ),
+            3,
+            "every physical lane must execute the authenticated closure",
+        )
+        self.assertEqual(
+            workflow.count(
+                "artifact-ids: ${{ needs.prepare.outputs.measurement_runner_artifact_id }}"
+            ),
+            3,
+        )
+        self.assertEqual(
+            workflow.count(
+                "${{ needs.prepare.outputs.measurement_runner_artifact_digest }}"
+            ),
+            3,
+            "each lane must bind and verify the prepared artifact digest",
+        )
+
+    def test_release_measurement_jobs_pin_the_shipping_host_and_binary_minos(
+        self,
+    ) -> None:
+        workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
+            encoding="utf-8"
+        )
+        verifier_path = ROOT / "scripts/benchmark/verify_shipping_host.sh"
+        verifier = verifier_path.read_text(encoding="utf-8")
+        self.assertTrue(os.access(verifier_path, os.X_OK))
+        self.assertNotIn("--receipt", verifier)
+        self.assertNotIn("verify_ui_host_attestation.py", verifier)
+        self.assertNotIn("ui-runner-host.json", verifier)
+        for value in (
+            "26.5.2",
+            "25F84",
+            "Xcode 26.6",
+            "17F113",
+            "21.0.0",
+            "26.5",
+            "25F70",
+            "32023.883",
+            r"minos 15\.0",
+        ):
+            self.assertIn(value, verifier)
         sections = {
-            "prepare": workflow.split("  prepare:\n", 1)[1].split("  reference:\n", 1)[0],
+            "prepare": workflow.split("  prepare:\n", 1)[1].split("  reference:\n", 1)[
+                0
+            ],
             "reference": workflow.split("  reference:\n", 1)[1].split(
                 "  constrained:\n", 1
             )[0],
@@ -11085,22 +17260,38 @@ class RunnerIntegrityTests(unittest.TestCase):
         for name, section in sections.items():
             with self.subTest(job=name):
                 self.assertIn(
-                    "DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer",
+                    "DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer",
                     section,
                 )
-                self.assertIn("name: Verify Xcode 16.4", section)
-                self.assertIn(
-                    'test "$(xcodebuild -version | sed -n \'1p\')" = "Xcode 16.4"',
-                    section,
-                )
+                self.assertIn("name: Verify shipping host", section)
+                self.assertIn("./scripts/benchmark/verify_shipping_host.sh", section)
+        prepare = sections["prepare"]
+        self.assertIn('--binary "$RENDERER_BIN/EasySplatBenchmarkDriver"', prepare)
+        self.assertIn('--binary "$MEASUREMENT_BIN/EasySplatMeasurementRunner"', prepare)
+        for adapter in (
+            "PipelineMeasurementAdapter-current",
+            "PipelineMeasurementAdapter-baseline",
+            "AccurateReferenceMeasurementAdapter",
+        ):
+            self.assertIn(
+                f'--binary "$RUNNER_TEMP/measurement-adapters/{adapter}"', prepare
+            )
 
-    def test_release_workflow_installs_heavy_render_scoring_only_where_used(self) -> None:
+    def test_release_workflow_installs_heavy_render_scoring_only_where_used(
+        self,
+    ) -> None:
         workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
             encoding="utf-8"
         )
-        reference = workflow.split("  reference:\n", 1)[1].split("  constrained:\n", 1)[0]
-        constrained = workflow.split("  constrained:\n", 1)[1].split("  eight-gb:\n", 1)[0]
-        eight_gb = workflow.split("  eight-gb:\n", 1)[1].split("  derive-reference:\n", 1)[0]
+        reference = workflow.split("  reference:\n", 1)[1].split("  constrained:\n", 1)[
+            0
+        ]
+        constrained = workflow.split("  constrained:\n", 1)[1].split(
+            "  eight-gb:\n", 1
+        )[0]
+        eight_gb = workflow.split("  eight-gb:\n", 1)[1].split(
+            "  derive-reference:\n", 1
+        )[0]
         reference_derivation = workflow.split("  derive-reference:\n", 1)[1].split(
             "  derive-constrained:\n", 1
         )[0]
@@ -11118,11 +17309,15 @@ class RunnerIntegrityTests(unittest.TestCase):
         self.assertNotIn("render-requirements.txt", aggregate)
         self.assertNotIn("signing-requirements.txt", workflow)
 
-    def test_run_suite_requires_render_dependencies_only_when_verifying_evidence(self) -> None:
+    def test_run_suite_requires_render_dependencies_only_when_verifying_evidence(
+        self,
+    ) -> None:
         launcher = (ROOT / "scripts/benchmark/run_suite.sh").read_text(encoding="utf-8")
 
         self.assertIn('if [ -n "$EVIDENCE_ROOT" ]; then', launcher)
-        self.assertNotIn('if [ "$DRY_RUN" -eq 0 ]; then\n  dependency_locks+=', launcher)
+        self.assertNotIn(
+            'if [ "$DRY_RUN" -eq 0 ]; then\n  dependency_locks+=', launcher
+        )
         self.assertNotIn("--evidence-public-key-file", launcher)
         self.assertNotIn("EVIDENCE_PUBLIC_KEY_FILE", launcher)
 
@@ -11167,14 +17362,15 @@ class RunnerIntegrityTests(unittest.TestCase):
                 if mutate_preparation
                 else ""
             )
-            +
-            "raise SystemExit(status)\n",
+            + "raise SystemExit(status)\n",
             encoding="utf-8",
         )
         executable.chmod(0o755)
         bundle = root / "MetalSplatter_MetalSplatter.bundle"
         bundle.mkdir()
-        (bundle / "Shaders.metal").write_text("kernel void draw() {}\n", encoding="utf-8")
+        (bundle / "Shaders.metal").write_text(
+            "kernel void draw() {}\n", encoding="utf-8"
+        )
         closure = root / "renderer-closure"
         identity = lane_runner.renderer_closure.build_closure(
             executable,
@@ -11266,7 +17462,8 @@ class RunnerIntegrityTests(unittest.TestCase):
             },
             "holdout_indices": holdouts,
             "training_view_indices": [
-                index for index in range(request["binding"]["scale"])
+                index
+                for index in range(request["binding"]["scale"])
                 if index not in set(holdouts)
             ],
             "candidate_checkout": {
@@ -11299,12 +17496,22 @@ class RunnerIntegrityTests(unittest.TestCase):
                     "sources": [
                         {
                             "variant": render_variant,
-                            "run_id": command_by_render_variant[render_variant]["run_id"],
-                            "checkout_commit": command_by_render_variant[render_variant]["checkout_commit"],
-                            "toolchain_identity": command_by_render_variant[render_variant]["toolchain_identity"],
-                            "source_executable_sha256": command_by_render_variant[render_variant]["executable_sha256"],
+                            "run_id": command_by_render_variant[render_variant][
+                                "run_id"
+                            ],
+                            "checkout_commit": command_by_render_variant[
+                                render_variant
+                            ]["checkout_commit"],
+                            "toolchain_identity": command_by_render_variant[
+                                render_variant
+                            ]["toolchain_identity"],
+                            "source_executable_sha256": command_by_render_variant[
+                                render_variant
+                            ]["executable_sha256"],
                             "ply_path": f"sources/{render_variant}.ply",
-                            "ply_sha256": command_by_render_variant[render_variant]["output_sha256"],
+                            "ply_sha256": command_by_render_variant[render_variant][
+                                "output_sha256"
+                            ],
                             "output_path": f"rendering/{render_variant}/{holdout:06d}.png",
                         }
                         for render_variant in (
@@ -11348,7 +17555,9 @@ class RunnerIntegrityTests(unittest.TestCase):
             timeout_seconds=10.0,
         )
 
-    def test_rendering_stage_rejects_nonpublished_candidate_source_before_launch(self) -> None:
+    def test_rendering_stage_rejects_nonpublished_candidate_source_before_launch(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self._renderer_stage_fixture(Path(directory))
             alternate = {
@@ -11381,7 +17590,9 @@ class RunnerIntegrityTests(unittest.TestCase):
 
             artifact_root = fixture["artifact_root"]
             self.assertEqual(receipt["exit_code"], 0)
-            self.assertEqual(receipt["renderer_closure_sha256"], fixture["identity"]["sha256"])
+            self.assertEqual(
+                receipt["renderer_closure_sha256"], fixture["identity"]["sha256"]
+            )
             self.assertEqual(
                 receipt["manifest_sha256"],
                 evidence.sha256_file(artifact_root / "rendering-manifest.json"),
@@ -11407,7 +17618,9 @@ class RunnerIntegrityTests(unittest.TestCase):
             self.assertTrue((artifact_root / "renderer-stdout.log").is_file())
             self.assertTrue(fixture["invocation_marker"].is_file())
 
-    def test_rendering_stage_rejects_non_invocation_precreation_and_failure(self) -> None:
+    def test_rendering_stage_rejects_non_invocation_precreation_and_failure(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self._renderer_stage_fixture(Path(directory))
             (fixture["artifact_root"] / "render-job.json").unlink()
@@ -11437,10 +17650,15 @@ class RunnerIntegrityTests(unittest.TestCase):
                 "failed with exit 7",
             ):
                 self._run_renderer_stage(fixture)
-            self.assertFalse((fixture["artifact_root"] / "render-supervisor.json").exists())
+            self.assertFalse(
+                (fixture["artifact_root"] / "render-supervisor.json").exists()
+            )
 
         for log_name in ("renderer-stdout.log", "renderer-stderr.log"):
-            with self.subTest(log_name=log_name), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(log_name=log_name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 fixture = self._renderer_stage_fixture(Path(directory))
                 outside = Path(directory).resolve() / "outside.log"
                 outside.write_text("keep\n", encoding="utf-8")
@@ -11453,7 +17671,9 @@ class RunnerIntegrityTests(unittest.TestCase):
                 self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
                 self.assertFalse(fixture["invocation_marker"].exists())
 
-    def test_rendering_stage_rejects_renderer_closure_tampering_after_invocation(self) -> None:
+    def test_rendering_stage_rejects_renderer_closure_tampering_after_invocation(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self._renderer_stage_fixture(
                 Path(directory),
@@ -11467,7 +17687,9 @@ class RunnerIntegrityTests(unittest.TestCase):
                 self._run_renderer_stage(fixture)
             self.assertTrue(fixture["invocation_marker"].is_file())
 
-    def test_rendering_stage_rejects_preparation_mutation_after_invocation(self) -> None:
+    def test_rendering_stage_rejects_preparation_mutation_after_invocation(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self._renderer_stage_fixture(
                 Path(directory),
@@ -11481,7 +17703,9 @@ class RunnerIntegrityTests(unittest.TestCase):
                 self._run_renderer_stage(fixture)
             self.assertTrue(fixture["invocation_marker"].is_file())
 
-    def test_render_job_rejects_preparation_binding_drift_before_invocation(self) -> None:
+    def test_render_job_rejects_preparation_binding_drift_before_invocation(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = self._renderer_stage_fixture(Path(directory))
             job_path = fixture["artifact_root"] / "render-job.json"
@@ -11514,19 +17738,26 @@ class RunnerIntegrityTests(unittest.TestCase):
                 self._run_renderer_stage(fixture)
             self.assertFalse(fixture["invocation_marker"].exists())
 
-    def test_measurement_deadlines_are_scale_aware_bounded_and_strictly_parsed(self) -> None:
+    def test_measurement_deadlines_are_scale_aware_bounded_and_strictly_parsed(
+        self,
+    ) -> None:
         self.assertEqual(lane_runner._measurement_timeout_seconds(30), 7200.0)
         self.assertEqual(lane_runner._measurement_timeout_seconds(120), 10800.0)
         self.assertEqual(lane_runner._measurement_timeout_seconds(3000), 86400.0)
         self.assertEqual(lane_runner._measurement_timeout_seconds(30, "0.1"), 0.1)
         for value in ("nan", "inf", "0", "-1", "604801", "not-a-number"):
-            with self.subTest(value=value), self.assertRaisesRegex(
-                lane_runner.benchmark.ConfigError,
-                "EASYSPLAT_INTERNAL_BENCHMARK_TIMEOUT_SECONDS",
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    lane_runner.benchmark.ConfigError,
+                    "EASYSPLAT_INTERNAL_BENCHMARK_TIMEOUT_SECONDS",
+                ),
             ):
                 lane_runner._measurement_timeout_seconds(30, value)
 
-    def test_measurement_process_runs_in_a_session_and_terminates_its_group_on_timeout(self) -> None:
+    def test_measurement_process_runs_in_a_session_and_terminates_its_group_on_timeout(
+        self,
+    ) -> None:
         process = mock.Mock()
         process.wait.side_effect = subprocess.TimeoutExpired(["runner"], 1.0)
         environment = {"PATH": "/usr/bin"}
@@ -11534,8 +17765,12 @@ class RunnerIntegrityTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as directory,
             (Path(directory) / "stdout").open("wb") as stdout_handle,
             (Path(directory) / "stderr").open("wb") as stderr_handle,
-            mock.patch.object(lane_runner.subprocess, "Popen", return_value=process) as popen,
-            mock.patch.object(lane_runner, "_terminate_process_group", return_value=-9) as terminate,
+            mock.patch.object(
+                lane_runner.subprocess, "Popen", return_value=process
+            ) as popen,
+            mock.patch.object(
+                lane_runner, "_terminate_process_group", return_value=-9
+            ) as terminate,
         ):
             completed, timed_out = lane_runner._run_measurement_process(
                 ["runner"],
@@ -11563,27 +17798,27 @@ class RunnerIntegrityTests(unittest.TestCase):
         )
         terminate.assert_called_once_with(process)
 
-    def test_measurement_process_reaps_a_terminated_zombie_without_signalling_it_again(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with (
-                (root / "stdout").open("wb") as stdout_handle,
-                (root / "stderr").open("wb") as stderr_handle,
-                mock.patch.object(
-                    lane_runner,
-                    "_PROCESS_GROUP_TERMINATION_GRACE_SECONDS",
-                    0.05,
-                ),
-            ):
-                completed, timed_out = lane_runner._run_measurement_process(
-                    ["/bin/sleep", "2"],
-                    stdout_handle,
-                    stderr_handle,
-                    {"PATH": "/usr/bin:/bin"},
-                    0.1,
-                )
-        self.assertTrue(timed_out)
-        self.assertIn(completed.returncode, {-lane_runner.signal.SIGTERM, 0})
+    def test_measurement_process_reaps_a_terminated_zombie_without_signalling_it_again(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.wait.return_value = -lane_runner.signal.SIGTERM
+        with (
+            mock.patch.object(lane_runner, "_signal_process_group") as signal_group,
+            mock.patch.object(
+                lane_runner,
+                "_process_group_exists",
+                return_value=False,
+            ) as group_exists,
+            mock.patch.object(lane_runner.time, "sleep") as sleep,
+        ):
+            return_code = lane_runner._terminate_process_group(process, 0.05)
+
+        self.assertEqual(return_code, -lane_runner.signal.SIGTERM)
+        signal_group.assert_called_once_with(process, lane_runner.signal.SIGTERM)
+        group_exists.assert_called_once_with(process.pid)
+        sleep.assert_called_once_with(0.05)
+        process.wait.assert_called_once_with(timeout=0.05)
 
     def test_measurement_process_rejects_and_terminates_a_leaked_child(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -11617,7 +17852,9 @@ class RunnerIntegrityTests(unittest.TestCase):
             time.sleep(1.1)
             self.assertFalse(marker.exists())
 
-    def test_measurement_process_rejects_a_child_that_creates_a_new_session(self) -> None:
+    def test_measurement_process_rejects_a_child_that_creates_a_new_session(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             marker = root / "escaped-session-marker"
@@ -11653,7 +17890,9 @@ class RunnerIntegrityTests(unittest.TestCase):
             time.sleep(1.1)
             self.assertFalse(marker.exists())
 
-    def test_measurement_process_allows_a_child_to_finish_within_the_drain(self) -> None:
+    def test_measurement_process_allows_a_child_to_finish_within_the_drain(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             started = root / "drained-child-started"
@@ -11693,7 +17932,9 @@ class RunnerIntegrityTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(marker.read_text(encoding="utf-8"), "finished")
 
-    def test_measurement_process_rejects_an_immediately_reparented_session_child(self) -> None:
+    def test_measurement_process_rejects_an_immediately_reparented_session_child(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             marker = root / "immediate-escaped-session-marker"
@@ -11744,7 +17985,9 @@ class RunnerIntegrityTests(unittest.TestCase):
             ),
         ):
             lane_runner._reject_live_descendants(100, process_tree)
-        self.assertGreaterEqual(process_tree.refresh_reparented_descendants.call_count, 2)
+        self.assertGreaterEqual(
+            process_tree.refresh_reparented_descendants.call_count, 2
+        )
         process_tree.terminate_descendants.assert_called_once()
 
     def test_run_lane_import_does_not_load_libproc_off_macos(self) -> None:
@@ -11858,8 +18101,12 @@ with mock.patch.object(ctypes, 'CDLL', side_effect=AssertionError('libproc loade
                 capture_output=True,
                 text=True,
             ).stdout.strip()
-            self.assertEqual(lane_runner._verify_baseline_checkout(root, commit), root.resolve())
-            with self.assertRaisesRegex(lane_runner.benchmark.ConfigError, "approved commit"):
+            self.assertEqual(
+                lane_runner._verify_baseline_checkout(root, commit), root.resolve()
+            )
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError, "approved commit"
+            ):
                 lane_runner._verify_baseline_checkout(root, "0" * 40)
             (root / "untracked.txt").write_text("dirty\n", encoding="utf-8")
             with self.assertRaisesRegex(lane_runner.benchmark.ConfigError, "clean"):
@@ -11872,13 +18119,22 @@ with mock.patch.object(ctypes, 'CDLL', side_effect=AssertionError('libproc loade
             checkout.mkdir()
             subprocess.run(["git", "init", "-q", str(checkout)], check=True)
             (checkout / "fixture.txt").write_text("baseline\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(checkout), "add", "fixture.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(checkout), "add", "fixture.txt"], check=True
+            )
             subprocess.run(
                 [
-                    "git", "-C", str(checkout),
-                    "-c", "user.name=EasySplat Test",
-                    "-c", "user.email=test@easysplat.invalid",
-                    "commit", "-q", "-m", "test: baseline fixture",
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "-c",
+                    "user.name=EasySplat Test",
+                    "-c",
+                    "user.email=test@easysplat.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "test: baseline fixture",
                 ],
                 check=True,
             )
@@ -11905,8 +18161,12 @@ with mock.patch.object(ctypes, 'CDLL', side_effect=AssertionError('libproc loade
             runner = Path(directory) / "runner"
             runner.write_bytes(b"approved")
             approved = runner_identity(evidence.LANE_REFERENCE, "0")
-            with self.assertRaisesRegex(lane_runner.benchmark.ConfigError, "before the first scene"):
-                lane_runner._verify_runner_digest(runner, approved, "before the first scene")
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError, "before the first scene"
+            ):
+                lane_runner._verify_runner_digest(
+                    runner, approved, "before the first scene"
+                )
 
     def test_runner_mutation_between_or_after_runs_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -11916,11 +18176,19 @@ with mock.patch.object(ctypes, 'CDLL', side_effect=AssertionError('libproc loade
                 "label": evidence.RUNNER_LABELS[evidence.LANE_CONSTRAINED],
                 "sha256": evidence.sha256_file(runner),
             }
-            lane_runner._verify_runner_digest(runner, approved, "before subprocess launch")
+            lane_runner._verify_runner_digest(
+                runner, approved, "before subprocess launch"
+            )
             runner.write_bytes(b"mutated")
-            for phase in ("after subprocess completion", "before the next subprocess", "at lane completion"):
+            for phase in (
+                "after subprocess completion",
+                "before the next subprocess",
+                "at lane completion",
+            ):
                 with self.subTest(phase=phase):
-                    with self.assertRaisesRegex(lane_runner.benchmark.ConfigError, phase):
+                    with self.assertRaisesRegex(
+                        lane_runner.benchmark.ConfigError, phase
+                    ):
                         lane_runner._verify_runner_digest(runner, approved, phase)
 
 
@@ -11949,7 +18217,7 @@ class OrchestrationTests(unittest.TestCase):
             corpus_digest="sha256:" + "1" * 64,
             thresholds_digest="sha256:" + "2" * 64,
             git_commit="fixture",
-            app_version="0.2.0-beta.1",
+            app_version="0.2.0",
             toolchain_identity="fixture:smoke",
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -11979,11 +18247,15 @@ class OrchestrationTests(unittest.TestCase):
                 with self.subTest(identity_field=key):
                     changed = dict(payload)
                     changed[key] = mismatch
-                    result_path.write_bytes(benchmark.canonical_json_bytes(changed) + b"\n")
+                    result_path.write_bytes(
+                        benchmark.canonical_json_bytes(changed) + b"\n"
+                    )
                     with self.assertRaisesRegex(benchmark.ConfigError, key):
                         benchmark._copy_fixture_result(scene, 30, root, identity)
 
-    def test_failed_cancelled_or_identity_bearing_external_result_cannot_pass(self) -> None:
+    def test_failed_cancelled_or_identity_bearing_external_result_cannot_pass(
+        self,
+    ) -> None:
         scene = valid_scene()
         scene["input"]["supplied"] = True
         identity = benchmark.RunIdentity(
@@ -11991,7 +18263,7 @@ class OrchestrationTests(unittest.TestCase):
             corpus_digest="sha256:" + "1" * 64,
             thresholds_digest="sha256:" + "2" * 64,
             git_commit="fixture",
-            app_version="0.2.0-beta.1",
+            app_version="0.2.0",
             toolchain_identity="fixture:smoke",
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -12016,13 +18288,21 @@ class OrchestrationTests(unittest.TestCase):
             )
             for actual, expected_status in cases:
                 with self.subTest(actual=actual):
-                    payload = external_envelope(scene, 30, input_digest, identity, actual=actual)
-                    result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
+                    payload = external_envelope(
+                        scene, 30, input_digest, identity, actual=actual
+                    )
+                    result_path.write_bytes(
+                        benchmark.canonical_json_bytes(payload) + b"\n"
+                    )
                     self.assertEqual(
-                        benchmark._copy_fixture_result(scene, 30, root, identity)["status"],
+                        benchmark._copy_fixture_result(scene, 30, root, identity)[
+                            "status"
+                        ],
                         expected_status,
                     )
-            payload = external_envelope(scene, 30, input_digest, identity, route="/Users/private/model")
+            payload = external_envelope(
+                scene, 30, input_digest, identity, route="/Users/private/model"
+            )
             result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
             with self.assertRaisesRegex(benchmark.ConfigError, "route"):
                 benchmark._copy_fixture_result(scene, 30, root, identity)
@@ -12032,7 +18312,9 @@ class OrchestrationTests(unittest.TestCase):
                 "termination_reason": "cancelled",
                 "cancelled": False,
             }
-            payload = external_envelope(scene, 30, input_digest, identity, actual=contradictory)
+            payload = external_envelope(
+                scene, 30, input_digest, identity, actual=contradictory
+            )
             result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
             with self.assertRaisesRegex(benchmark.ConfigError, "termination"):
                 benchmark._copy_fixture_result(scene, 30, root, identity)
@@ -12045,7 +18327,9 @@ class OrchestrationTests(unittest.TestCase):
             with self.assertRaisesRegex(benchmark.ConfigError, "artifacts"):
                 benchmark._copy_fixture_result(scene, 30, root, identity)
 
-    def test_toolchain_identity_uses_complete_toolchain_manager_install_state(self) -> None:
+    def test_toolchain_identity_uses_complete_toolchain_manager_install_state(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             private_key = Ed25519PrivateKey.generate()
@@ -12062,7 +18346,10 @@ class OrchestrationTests(unittest.TestCase):
             components = []
             installed_artifacts = {}
             for index, (name, path) in enumerate(
-                zip(("macos-arm64-core", "geometry-da3-base", "geometry-da3-small"), files),
+                zip(
+                    ("macos-arm64-core", "geometry-da3-base", "geometry-da3-small"),
+                    files,
+                ),
                 start=1,
             ):
                 target = root / path
@@ -12079,6 +18366,9 @@ class OrchestrationTests(unittest.TestCase):
                         "sha256": archive_digest,
                         "sizeBytes": 100 + index,
                         "expandedSizeBytes": 200 + index,
+                        "expandedClosureSHA256": hashlib.sha256(
+                            files[path]
+                        ).hexdigest(),
                         "contents": [path],
                         "criticalFileHashes": {path: digest},
                         "dependencies": [] if index == 1 else ["macos-arm64-core"],
@@ -12091,7 +18381,7 @@ class OrchestrationTests(unittest.TestCase):
                 "keyID": hashlib.sha256(public_key).hexdigest(),
                 "version": "2.0.0",
                 "publishedAt": "2026-07-01T00:00:00Z",
-                "appVersionRange": {"minimum": "0.2.0-beta.1"},
+                "appVersionRange": {"minimum": "0.2.0"},
                 "components": components,
                 "signatureEd25519": "",
             }
@@ -12121,9 +18411,11 @@ class OrchestrationTests(unittest.TestCase):
             self.assertRegex(identity or "", r"^sha256:[0-9a-f]{64}$")
             closure = benchmark._validated_toolchain_closure(root, public_key_base64)
             self.assertIsNotNone(closure)
-            self.assertEqual(identity, evidence.toolchain_identity_from_closure(closure))
             self.assertEqual(
-                benchmark.resolved_public_beta_toolchain_identity(
+                identity, evidence.toolchain_identity_from_closure(closure)
+            )
+            self.assertEqual(
+                benchmark.resolved_release_toolchain_identity(
                     root,
                     public_key_base64=public_key_base64,
                 ),
@@ -12200,8 +18492,10 @@ class OrchestrationTests(unittest.TestCase):
                 public_key_base64=public_key_base64,
             )
             self.assertRegex(identity or "", r"^sha256:[0-9a-f]{64}$")
-            with self.assertRaisesRegex(benchmark.ConfigError, "public-beta component closure"):
-                benchmark.resolved_public_beta_toolchain_identity(
+            with self.assertRaisesRegex(
+                benchmark.ConfigError, "release component closure"
+            ):
+                benchmark.resolved_release_toolchain_identity(
                     root,
                     public_key_base64=public_key_base64,
                 )
@@ -12241,12 +18535,25 @@ class OrchestrationTests(unittest.TestCase):
     def test_dry_run_is_deterministic_and_never_launches_subprocesses(self) -> None:
         corpus = valid_corpus()
         config = valid_reference_config()
-        with mock.patch.object(benchmark.subprocess, "run", side_effect=AssertionError("subprocess launched")):
-            first = benchmark.build_dry_run_plan("smoke", corpus, config, Path("/toolchain"))
-            second = benchmark.build_dry_run_plan("smoke", corpus, config, Path("/toolchain"))
-        self.assertEqual(benchmark.canonical_json_bytes(first), benchmark.canonical_json_bytes(second))
+        with mock.patch.object(
+            benchmark.subprocess,
+            "run",
+            side_effect=AssertionError("subprocess launched"),
+        ):
+            first = benchmark.build_dry_run_plan(
+                "smoke", corpus, config, Path("/toolchain")
+            )
+            second = benchmark.build_dry_run_plan(
+                "smoke", corpus, config, Path("/toolchain")
+            )
+        self.assertEqual(
+            benchmark.canonical_json_bytes(first),
+            benchmark.canonical_json_bytes(second),
+        )
 
-    def test_missing_release_media_writes_blocked_result_and_returns_nonzero(self) -> None:
+    def test_missing_release_media_writes_blocked_result_and_returns_nonzero(
+        self,
+    ) -> None:
         corpus = release_corpus()
         config = valid_reference_config()
         with tempfile.TemporaryDirectory() as directory:
@@ -12272,7 +18579,9 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(result["blocking_reasons"])
         self.assertTrue(result["missing_requirements"]["media"])
         self.assertIn("toolchain", result["missing_requirements"])
-        self.assertEqual(result["missing_requirements"]["request_index"], "protected request index")
+        self.assertEqual(
+            result["missing_requirements"]["request_index"], "protected request index"
+        )
 
     def test_release_suite_keeps_failures_when_a_sibling_lane_is_missing(self) -> None:
         scene = valid_scene(adapter="protected-evidence")
@@ -12293,7 +18602,7 @@ class OrchestrationTests(unittest.TestCase):
             corpus_digest=benchmark.sha256_json(corpus),
             thresholds_digest=benchmark.sha256_json(config),
             git_commit="4" * 40,
-            app_version="0.2.0-beta.1",
+            app_version="0.2.0",
             toolchain_identity=TEST_TOOLCHAIN_IDENTITY,
         )
         identities = runner_identities()
@@ -12336,7 +18645,9 @@ class OrchestrationTests(unittest.TestCase):
                     "resolved_toolchain_identity",
                     return_value=identity.toolchain_identity,
                 ),
-                mock.patch.object(benchmark, "make_run_identity", return_value=identity),
+                mock.patch.object(
+                    benchmark, "make_run_identity", return_value=identity
+                ),
                 mock.patch.object(
                     benchmark,
                     "validate_request_index",
@@ -12366,7 +18677,10 @@ class OrchestrationTests(unittest.TestCase):
                 any("reference_m4_max" in failure for failure in failed["failures"])
             )
             self.assertTrue(
-                any("constrained_14_16gb" in reason for reason in failed["blocking_reasons"])
+                any(
+                    "constrained_14_16gb" in reason
+                    for reason in failed["blocking_reasons"]
+                )
             )
 
             malformed.unlink()
@@ -12387,7 +18701,9 @@ class OrchestrationTests(unittest.TestCase):
                     "resolved_toolchain_identity",
                     return_value=identity.toolchain_identity,
                 ),
-                mock.patch.object(benchmark, "make_run_identity", return_value=identity),
+                mock.patch.object(
+                    benchmark, "make_run_identity", return_value=identity
+                ),
                 mock.patch.object(
                     benchmark,
                     "validate_request_index",
@@ -12415,7 +18731,9 @@ class OrchestrationTests(unittest.TestCase):
             self.assertEqual(blocked["aggregates"]["blocked"], 1)
             self.assertEqual(blocked["failures"], [])
 
-    def test_final_suite_validation_rejects_unknown_metrics_and_private_paths(self) -> None:
+    def test_final_suite_validation_rejects_unknown_metrics_and_private_paths(
+        self,
+    ) -> None:
         config_path = ROOT / "scripts/benchmark/reference-config.json"
         corpus_path = ROOT / "scripts/benchmark/fixtures/smoke-corpus.json"
         with tempfile.TemporaryDirectory() as directory:
@@ -12484,7 +18802,9 @@ class OrchestrationTests(unittest.TestCase):
 
         omitted_scene_blocker = json.loads(json.dumps(passed))
         omitted_scene_blocker["scene_results"][0]["status"] = "blocked"
-        omitted_scene_blocker["scene_results"][0]["blocking_reasons"] = ["fixture unavailable"]
+        omitted_scene_blocker["scene_results"][0]["blocking_reasons"] = [
+            "fixture unavailable"
+        ]
         omitted_scene_blocker["aggregates"]["passed"] = 0
         omitted_scene_blocker["aggregates"]["blocked"] = 1
         with self.assertRaisesRegex(benchmark.ConfigError, "omit scene blockers"):

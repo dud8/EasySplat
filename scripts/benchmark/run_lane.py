@@ -1212,6 +1212,37 @@ def _orientation_required(request: Mapping[str, Any], lane: str) -> bool:
     return _rendering_required(request, lane)
 
 
+def _merge_supervisor_orientation_metrics(
+    observations: MutableMapping[str, Any],
+    scoring_metrics: Mapping[str, Any],
+) -> None:
+    pipeline = observations.get("pipeline_metrics")
+    if not isinstance(pipeline, dict):
+        raise benchmark.ConfigError("measurement runner pipeline metrics must be an object")
+    missing = evidence.ORIENTATION_PIPELINE_FIELDS - set(pipeline)
+    prelabelled = sorted(
+        field
+        for field in evidence.ORIENTATION_PIPELINE_FIELDS
+        if pipeline.get(field) is not None
+    )
+    if missing:
+        raise benchmark.ConfigError(
+            "measurement runner omitted supervisor-owned orientation metrics: "
+            + ", ".join(sorted(missing))
+        )
+    if prelabelled:
+        raise benchmark.ConfigError(
+            "measurement runner cannot prelabel supervisor-owned orientation metrics: "
+            + ", ".join(prelabelled)
+        )
+    validated = evidence.validate_orientation_metrics(
+        scoring_metrics,
+        "supervisor scoring orientation metrics",
+    )
+    for field in evidence.ORIENTATION_PIPELINE_FIELDS:
+        pipeline[field] = validated[field]
+
+
 def _require_single_link_artifact(
     path: Path,
     artifact_root: Path,
@@ -1308,6 +1339,48 @@ def _published_orientation_run_id(
             "orientation extraction requires one published candidate ordinary run"
         )
     return str(published[0]["run_id"])
+
+
+def _verify_orientation_execution_binding(
+    commands: Sequence[Mapping[str, Any]],
+    run_id: str,
+    geometry_manifest: Path,
+    candidate_images: Path,
+) -> None:
+    matching_commands = [
+        command
+        for command in commands
+        if command.get("run_id") == run_id
+        and command.get("phase") == "ordinary"
+        and command.get("variant") == "candidate"
+    ]
+    if len(matching_commands) != 1:
+        raise benchmark.ConfigError(
+            f"orientation run {run_id} does not identify one authenticated execution"
+        )
+    runtime = benchmark._require_mapping(
+        matching_commands[0].get("runtime_worker_evidence"),
+        f"orientation runtime worker evidence for {run_id}",
+    )
+    geometry_digest = evidence.sha256_file(geometry_manifest)
+    if runtime.get("geometry_manifest_sha256") != geometry_digest:
+        raise benchmark.ConfigError(
+            f"orientation geometry for {run_id} does not match the authenticated execution"
+        )
+    geometry = benchmark._require_mapping(
+        _load(geometry_manifest, f"orientation geometry for {run_id}"),
+        f"orientation geometry for {run_id}",
+    )
+    model_hashes = benchmark._require_mapping(
+        geometry.get("modelHashes"),
+        f"orientation geometry model hashes for {run_id}",
+    )
+    if model_hashes.get("images.txt") != evidence.sha256_file(
+        candidate_images
+    ).removeprefix("sha256:"):
+        raise benchmark.ConfigError(
+            f"orientation images for {run_id} do not match the authenticated geometry"
+        )
 
 
 def _write_exclusive_json(path: Path, value: Mapping[str, Any], label: str) -> None:
@@ -1775,6 +1848,12 @@ def _execute_orientation_stage(
             ground_truth_path: ground_truth_digest,
             orientation_label_path: label_digest,
         }
+        _verify_orientation_execution_binding(
+            commands,
+            run_id,
+            geometry_manifest,
+            candidate_images,
+        )
         relative_geometry = (relative_root / "geometry-manifest.json").as_posix()
         relative_images = (relative_root / "candidate-images.txt").as_posix()
         relative_metrics = (relative_root / "orientation-metrics.json").as_posix()
@@ -1785,8 +1864,12 @@ def _execute_orientation_stage(
             "extract-orientation",
             "--geometry-manifest",
             f"evidence://{relative_geometry}",
+            "--geometry-manifest-sha256",
+            immutable_digests[geometry_manifest],
             "--candidate-images",
             f"evidence://{relative_images}",
+            "--candidate-images-sha256",
+            immutable_digests[candidate_images],
             "--ground-truth-poses",
             "evidence://ground-truth-poses.json",
             "--ground-truth-poses-sha256",
@@ -1803,8 +1886,12 @@ def _execute_orientation_stage(
             "extract-orientation",
             "--geometry-manifest",
             str(geometry_manifest),
+            "--geometry-manifest-sha256",
+            immutable_digests[geometry_manifest],
             "--candidate-images",
             str(candidate_images),
+            "--candidate-images-sha256",
+            immutable_digests[candidate_images],
             "--ground-truth-poses",
             str(ground_truth_path),
             "--ground-truth-poses-sha256",
@@ -1926,7 +2013,17 @@ def _execute_orientation_stage(
         "scoring_run_id": scoring_run_id,
     }
     _write_exclusive_json(supervisor_path, supervisor, "orientation-supervisor.json")
-    return supervisor
+    scoring_metrics = next(
+        (
+            run["metrics"]
+            for run in aggregate_runs
+            if run["run_id"] == scoring_run_id
+        ),
+        None,
+    )
+    if scoring_metrics is None:
+        raise _PostprocessingFailure("orientation scoring metrics are missing")
+    return scoring_metrics
 
 
 def _validate_render_job(
@@ -2484,6 +2581,35 @@ def _run_lane_attempt(
             trusted_root=corpus_path.parent,
         ) != expected_input_digest:
             raise benchmark.ConfigError(f"{scene_id} input does not match the prepared request")
+        reference_artifact_root: Path | None = None
+        if (
+            lane == evidence.LANE_REFERENCE
+            and request["expected_outcome"]["kind"] == "valid"
+            and "scene_quality" in request["gate_scopes"]
+        ):
+            reference_relative = _relative(
+                entry.get("reference_artifact_path"),
+                "reference artifact path",
+            )
+            reference_artifact_root = corpus_path.parent / reference_relative
+            parent_error = benchmark._protected_evidence_parent_error(
+                reference_artifact_root / "closure.marker",
+                corpus_path.parent,
+            )
+            if parent_error is not None:
+                raise benchmark.ConfigError(
+                    f"{scene_id} reference artifact root is unsafe: {parent_error}"
+                )
+            try:
+                metadata = reference_artifact_root.lstat()
+            except OSError as error:
+                raise benchmark.ConfigError(
+                    f"{scene_id} reference artifact root is unavailable"
+                ) from error
+            if reference_artifact_root.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                raise benchmark.ConfigError(
+                    f"{scene_id} reference artifact root must be a plain directory"
+                )
 
         evidence_relative = _relative(entry.get("evidence_path"), "request evidence path")
         key = (scene_id, scale, lane)
@@ -2580,6 +2706,13 @@ def _run_lane_attempt(
             "--lane",
             lane,
         ]
+        if reference_artifact_root is not None:
+            redacted_command.extend(
+                ["--reference-artifact-root", "references://protected-scene-quality"]
+            )
+            command.extend(
+                ["--reference-artifact-root", str(reference_artifact_root)]
+            )
         started = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         supervisor_log.write_bytes(
             evidence.canonical_json_bytes({"event": "started", "at": started, "argv": redacted_command})
@@ -2995,7 +3128,7 @@ def _run_lane_attempt(
         rendered = _rendering_required(request, lane)
         try:
             if oriented:
-                _execute_orientation_stage(
+                scoring_orientation_metrics = _execute_orientation_stage(
                     artifact_root=artifact_root,
                     request=request,
                     request_path=request_path,
@@ -3005,6 +3138,10 @@ def _run_lane_attempt(
                     observations=observations,
                     commands=raw_receipts,
                     timeout_seconds=timeout_seconds,
+                )
+                _merge_supervisor_orientation_metrics(
+                    observations,
+                    scoring_orientation_metrics,
                 )
                 try:
                     _verify_candidate_checkout(index["git_commit"])

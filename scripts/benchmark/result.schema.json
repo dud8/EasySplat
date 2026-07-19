@@ -44,7 +44,7 @@
       ]
     },
     "machine": {"$ref": "#/$defs/machine"},
-    "app_version": {"const": "0.2.0-beta.1"},
+    "app_version": {"const": "0.2.0"},
     "toolchain_identity": {
       "oneOf": [
         {"type": "null"},
@@ -353,7 +353,7 @@
         "status": {"enum": ["passed", "failed", "blocked"]},
         "blocking_reasons": {"$ref": "#/$defs/stringArray"},
         "failures": {"$ref": "#/$defs/stringArray"},
-        "input_kind": {"enum": ["video", "photos", "mixed"]},
+        "input_kind": {"enum": ["video", "multi_video", "photos", "mixed"]},
         "expected_outcome": {
           "oneOf": [
             {
@@ -438,8 +438,8 @@
       "additionalProperties": false,
       "required": ["protocol_version", "version", "executable", "sha256"],
       "properties": {
-        "protocol_version": {"const": 8},
-        "version": {"const": "8.0.0"},
+        "protocol_version": {"const": 16},
+        "version": {"const": "16.0.0"},
         "executable": {"const": "scripts/benchmark/evidence_protocol.py"},
         "sha256": {"$ref": "#/$defs/sha256"}
       }
@@ -580,10 +580,14 @@
       "required": [
         "architecture",
         "chip",
+        "clang_version",
         "hardware_model",
         "logical_cpus",
         "macos_build",
         "macos_version",
+        "macos_sdk_build",
+        "macos_sdk_version",
+        "metal_version",
         "physical_cpus",
         "physical_memory_bytes",
         "swift_version",
@@ -592,10 +596,14 @@
       "properties": {
         "architecture": {"type": "string"},
         "chip": {"type": ["string", "null"]},
+        "clang_version": {"type": "string"},
         "hardware_model": {"type": ["string", "null"]},
         "logical_cpus": {"type": ["integer", "null"]},
         "macos_build": {"type": ["string", "null"]},
         "macos_version": {"type": ["string", "null"]},
+        "macos_sdk_build": {"type": "string"},
+        "macos_sdk_version": {"type": "string"},
+        "metal_version": {"type": "string"},
         "physical_cpus": {"type": ["integer", "null"]},
         "physical_memory_bytes": {"type": ["integer", "null"]},
         "swift_version": {"type": "string"},

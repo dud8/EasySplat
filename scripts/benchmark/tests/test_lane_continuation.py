@@ -88,10 +88,17 @@ class _RestartFixture:
         request_path = self.requests_root / request_relative
         request_path.parent.mkdir(parents=True)
         request_path.write_bytes(evidence.canonical_json_bytes(self.request) + b"\n")
+        reference_artifact_path = scene["reference"]["by_scale"]["30"][
+            "artifact_path"
+        ]
+        (self.corpus_path.parent / reference_artifact_path).mkdir(
+            parents=True,
+            exist_ok=False,
+        )
 
         baseline = benchmark.APPROVED_PAIRED_BASELINE
         self.index = {
-            "schema_version": 2,
+            "schema_version": benchmark.REQUEST_INDEX_SCHEMA_VERSION,
             "producer_protocol": evidence.PROTOCOL_VERSION,
             "producer_version": evidence.PRODUCER_VERSION,
             "producer_digest": evidence.sha256_file(
@@ -126,6 +133,7 @@ class _RestartFixture:
                     "request": request_relative.as_posix(),
                     "media_path": scene["input"]["media_path"],
                     "evidence_path": scene["adapter"]["evidence_path"],
+                    "reference_artifact_path": reference_artifact_path,
                     "producer_command": ["restart-fixture"],
                 }
             ],

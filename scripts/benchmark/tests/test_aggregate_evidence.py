@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +19,7 @@ from scripts.benchmark import aggregate_evidence as aggregate
 from scripts.benchmark import easysplat_benchmark as benchmark
 from scripts.benchmark import evidence_protocol as evidence
 from scripts.benchmark import prepare_evidence as prepare
+from scripts.release import verify_publication_bundle as publication
 from scripts.benchmark.tests.test_benchmark import (
     FIXTURE_HOST_MONITOR,
     evidence_machine,
@@ -565,7 +567,10 @@ class AggregateEvidenceTests(unittest.TestCase):
         self.assertIn("actions/artifacts/$artifact_id", combined)
 
         aggregate_job = workflow.split("  aggregate:\n", 1)[1]
-        self.assertIn('cp "$RUNNER_TEMP/verified-benchmark/suite.json" "$FINAL/suite.json"', aggregate_job)
+        self.assertIn(
+            'cp "$RUNNER_TEMP/verified-benchmark/suite.json" "$FINAL/verified-suite.json"',
+            aggregate_job,
+        )
         self.assertIn('"$FINAL/evidence/reference_m4_max"', aggregate_job)
         self.assertIn('"$FINAL/evidence/constrained_14_16gb"', aggregate_job)
         self.assertIn('"$FINAL/evidence/eight_gb_fast"', aggregate_job)
@@ -657,10 +662,17 @@ class AggregateEvidenceTests(unittest.TestCase):
                 mock.patch.object(aggregate, "_record_lookup", return_value={}),
                 mock.patch.object(aggregate, "_load_and_validate_requests", return_value=({}, {})),
                 mock.patch.object(aggregate, "_scene_result", return_value=(scene_result, [{"machine": evidence_machine(evidence.LANE_REFERENCE)}])),
+                mock.patch.object(
+                    evidence,
+                    "validate_photo_permutation_release_coverage",
+                    return_value={
+                        "source_kind": "native_photos",
+                        "small_exhaustive": {"scale": 30},
+                        "large_retrieval": {"scale": 120},
+                    },
+                ),
                 mock.patch.object(benchmark, "evaluate_suite_performance", return_value={"blocking_reasons": [], "failures": []}),
                 mock.patch.object(benchmark, "evaluate_suite_quality", return_value={"blocking_reasons": [], "failures": []}),
-                mock.patch.object(benchmark, "validate_suite_result"),
-                mock.patch.object(aggregate.Draft202012Validator, "validate"),
             )
 
             outputs = [base / "first", base / "second"]
@@ -682,6 +694,13 @@ class AggregateEvidenceTests(unittest.TestCase):
                 ],
                 2,
             )
+            validated = publication.validate_benchmark_suite(
+                outputs[0] / "suite.json",
+                app_version=benchmark.APP_VERSION,
+                source_commit=COMMIT,
+                toolchain_identity=DIGEST,
+            )
+            self.assertEqual(uuid.UUID(validated["run_id"]).version, 5)
 
 
 if __name__ == "__main__":

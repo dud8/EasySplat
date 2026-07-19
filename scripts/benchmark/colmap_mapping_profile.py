@@ -36,11 +36,12 @@ _TIMESTAMP_RE = re.compile(
     r"\S+ [^]]+\] ?(?P<message>.*)$"
 )
 _TIMESTAMP_LIKE_RE = re.compile(r"^[IWEF]\d{8}\s")
+_REGISTRATION_ATTEMPT_RE = re.compile(
+    r"^Registering image #\d+ \(num_reg_frames=\d+\)$"
+)
 _INTEGER_RE = re.compile(r"[+-]?\d+")
 _TERMINATION_RE = re.compile(r"[A-Za-z][A-Za-z_ -]*")
-_ELAPSED_MARKER_RE = re.compile(
-    r"^Elapsed time: (?:0|[1-9]\d*)(?:\.\d+)? \[minutes\]$"
-)
+_ELAPSED_MARKER_RE = re.compile(r"^Elapsed time: (?:0|[1-9]\d*)(?:\.\d+)? \[minutes\]$")
 _FIELD_PATTERNS = {
     "residuals": re.compile(r"^\s*Residuals\s*:\s*(\S+)\s*$"),
     "parameters": re.compile(r"^\s*Parameters\s*:\s*(\S+)\s*$"),
@@ -126,7 +127,9 @@ def _parse_nonnegative_float(token: str, line_number: int) -> float:
     try:
         value = float(token)
     except ValueError as error:
-        raise ProfileError(f"invalid numeric report field at line {line_number}") from error
+        raise ProfileError(
+            f"invalid numeric report field at line {line_number}"
+        ) from error
     if not math.isfinite(value):
         raise ProfileError(f"nonfinite report field at line {line_number}")
     if value < 0:
@@ -257,7 +260,7 @@ def parse_mapping_profile(
                     marker_counts["iterative_global_refinement_markers"] += 1
                 continue
 
-            if message.startswith("Registering image "):
+            if _REGISTRATION_ATTEMPT_RE.fullmatch(message):
                 marker_counts["registration_attempts"] += 1
                 if global_region_start is not None:
                     if current_global_marker_reported is False:
@@ -304,7 +307,9 @@ def parse_mapping_profile(
             if line.strip() in {POSE_REPORT_MARKER, BUNDLE_REPORT_MARKER} or any(
                 pattern.fullmatch(line) for pattern in _FIELD_PATTERNS.values()
             ):
-                raise ProfileError(f"report content outside a report at line {line_number}")
+                raise ProfileError(
+                    f"report content outside a report at line {line_number}"
+                )
             continue
 
         if not line.strip():
@@ -339,13 +344,9 @@ def parse_mapping_profile(
     bundle_solver_seconds = local_solver_seconds + global_solver_seconds
     all_solver_seconds = pose_solver_seconds + bundle_solver_seconds
 
-    if all_solver_seconds > (
-        mapper_wall_seconds + ROUNDING_TOLERANCE_SECONDS
-    ):
+    if all_solver_seconds > (mapper_wall_seconds + ROUNDING_TOLERANCE_SECONDS):
         raise ProfileError("reported solver time exceeds mapper wall time")
-    if global_solver_seconds > (
-        global_region_seconds + ROUNDING_TOLERANCE_SECONDS
-    ):
+    if global_solver_seconds > (global_region_seconds + ROUNDING_TOLERANCE_SECONDS):
         raise ProfileError("global solver time exceeds global refinement regions")
 
     bundle_solver_share = _share(
