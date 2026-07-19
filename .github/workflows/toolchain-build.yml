@@ -27,8 +27,252 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  policy-preflight:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: macos-15
+    timeout-minutes: 10
+    environment: toolchain-release
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Verify protected main policy before build
+        env:
+          # GitHub reveals ruleset bypass actors only to Administration-write authority.
+          # This job performs GET requests only and never checks out repository code.
+          GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_POLICY_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          test "$DEFAULT_BRANCH" = "main"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
+          POLICY_ROOT="$RUNNER_TEMP/easysplat-toolchain-policy-$GITHUB_JOB"
+          test ! -e "$POLICY_ROOT"
+          mkdir -m 0700 "$POLICY_ROOT"
+          umask 077
+          EFFECTIVE_RULES="$POLICY_ROOT/effective-rules.json"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" >"$EFFECTIVE_RULES"
+          RULESET_IDS="$(python3 - "$EFFECTIVE_RULES" <<'PY'
+          import json, os, stat, sys
+
+          path = sys.argv[1]
+          descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              metadata = os.fstat(descriptor)
+              if (
+                  not stat.S_ISREG(metadata.st_mode)
+                  or metadata.st_uid != os.getuid()
+                  or metadata.st_nlink != 1
+                  or stat.S_IMODE(metadata.st_mode) != 0o600
+                  or not 0 < metadata.st_size <= 8 * 1024 * 1024
+              ):
+                  raise SystemExit("effective main rules are not a bounded private regular file")
+              payload = os.read(descriptor, metadata.st_size + 1)
+              if len(payload) != metadata.st_size or os.read(descriptor, 1):
+                  raise SystemExit("effective main rules changed while reading")
+              rules = json.loads(payload.decode("utf-8"))
+          finally:
+              os.close(descriptor)
+          if not isinstance(rules, list) or not rules:
+              raise SystemExit("effective main rules are absent or invalid")
+          identifiers = set()
+          for rule in rules:
+              if not isinstance(rule, dict) or type(rule.get("ruleset_id")) is not int or rule["ruleset_id"] <= 0:
+                  raise SystemExit("effective main rule has no valid ruleset identity")
+              identifiers.add(rule["ruleset_id"])
+          print(*sorted(identifiers), sep="\n")
+          PY
+          )"
+          test -n "$RULESET_IDS"
+          for ruleset_id in $RULESET_IDS; do
+            gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=true" \
+              >"$POLICY_ROOT/ruleset-$ruleset_id.json"
+          done
+          python3 - "$POLICY_ROOT" <<'PY'
+          # BEGIN TOOLCHAIN PROTECTED MAIN POLICY CHECKER
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          EXPECTED_CHECKS = {
+              ("Swift · macOS 15 arm64 · Xcode 16.4", 15368),
+              ("Real 8 GB-class policy lane", 15368),
+              ("Native Metal trainer", 15368),
+              ("Repository contracts", 15368),
+              ("DA3 bridge · Python 3.12", 15368),
+              ("Actions and shell lint", 15368),
+              ("Python dependency audit", 15368),
+              ("Full-history secret scan", 15368),
+              ("Pull request dependency review", 15368),
+              ("Analyze swift", 15368),
+              ("Analyze python", 15368),
+              ("Analyze c-cpp", 15368),
+              ("Analyze actions", 15368),
+          }
+
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+
+          def read_private_json(path, maximum):
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  before = os.fstat(descriptor)
+                  identity = (
+                      before.st_dev,
+                      before.st_ino,
+                      before.st_mode,
+                      before.st_uid,
+                      before.st_nlink,
+                      before.st_size,
+                      before.st_mtime_ns,
+                      before.st_ctime_ns,
+                  )
+                  require(
+                      stat.S_ISREG(before.st_mode)
+                      and before.st_uid == os.getuid()
+                      and before.st_nlink == 1
+                      and stat.S_IMODE(before.st_mode) == 0o600
+                      and 0 < before.st_size <= maximum,
+                      f"policy response is not a bounded private regular file: {Path(path).name}",
+                  )
+                  payload = os.read(descriptor, before.st_size + 1)
+                  require(len(payload) == before.st_size, f"policy response changed while reading: {Path(path).name}")
+                  require(not os.read(descriptor, 1), f"policy response grew while reading: {Path(path).name}")
+                  after = os.fstat(descriptor)
+                  require(
+                      identity
+                      == (
+                          after.st_dev,
+                          after.st_ino,
+                          after.st_mode,
+                          after.st_uid,
+                          after.st_nlink,
+                          after.st_size,
+                          after.st_mtime_ns,
+                          after.st_ctime_ns,
+                      ),
+                      f"policy response identity changed: {Path(path).name}",
+                  )
+                  return json.loads(payload.decode("utf-8"))
+              finally:
+                  os.close(descriptor)
+
+
+          def validate(root_value):
+              root = Path(root_value)
+              metadata = root.lstat()
+              require(
+                  stat.S_ISDIR(metadata.st_mode)
+                  and not root.is_symlink()
+                  and metadata.st_uid == os.getuid()
+                  and stat.S_IMODE(metadata.st_mode) == 0o700,
+                  "toolchain policy directory is not private",
+              )
+              effective = read_private_json(root / "effective-rules.json", 8 * 1024 * 1024)
+              require(isinstance(effective, list) and effective, "effective main rules are absent or invalid")
+              identifiers = set()
+              for rule in effective:
+                  require(isinstance(rule, dict), "effective main rule is invalid")
+                  identifier = rule.get("ruleset_id")
+                  require(type(identifier) is int and identifier > 0, "effective main rule has no valid ruleset identity")
+                  identifiers.add(identifier)
+              expected_names = {"effective-rules.json"} | {
+                  f"ruleset-{identifier}.json" for identifier in identifiers
+              }
+              require(
+                  {path.name for path in root.iterdir()} == expected_names,
+                  "effective ruleset response closure is incomplete",
+              )
+              for identifier in identifiers:
+                  ruleset = read_private_json(root / f"ruleset-{identifier}.json", 2 * 1024 * 1024)
+                  require(isinstance(ruleset, dict), "ruleset policy response is invalid")
+                  require(ruleset.get("id") == identifier, "ruleset identity differs from effective rule")
+                  require(ruleset.get("target") == "branch", "effective ruleset does not target branches")
+                  require(ruleset.get("enforcement") == "active", "effective ruleset is not active")
+                  require("bypass_actors" in ruleset, "ruleset bypass actors were not disclosed")
+                  require(ruleset["bypass_actors"] == [], "effective main ruleset permits bypass actors")
+
+              by_type = {}
+              for rule in effective:
+                  rule_type = rule.get("type")
+                  require(isinstance(rule_type, str) and rule_type, "effective main rule type is invalid")
+                  by_type.setdefault(rule_type, []).append(rule)
+              for rule_type in ("deletion", "non_fast_forward", "required_linear_history"):
+                  require(rule_type in by_type, f"main protection is missing {rule_type}")
+
+              merge_methods = None
+              maximum_reviews = 0
+              dismiss_stale = False
+              approve_last_push = False
+              resolve_threads = False
+              for rule in by_type.get("pull_request", []):
+                  parameters = rule.get("parameters")
+                  require(isinstance(parameters, dict), "pull-request rule parameters are invalid")
+                  methods = parameters.get("allowed_merge_methods")
+                  require(
+                      isinstance(methods, list)
+                      and methods
+                      and all(method in {"merge", "squash", "rebase"} for method in methods),
+                      "pull-request merge methods are invalid",
+                  )
+                  current_methods = set(methods)
+                  merge_methods = current_methods if merge_methods is None else merge_methods & current_methods
+                  for name in (
+                      "dismiss_stale_reviews_on_push",
+                      "require_last_push_approval",
+                      "required_review_thread_resolution",
+                  ):
+                      require(type(parameters.get(name)) is bool, f"pull-request boolean is invalid: {name}")
+                  review_count = parameters.get("required_approving_review_count")
+                  require(type(review_count) is int and review_count >= 0, "required review count is invalid")
+                  maximum_reviews = max(maximum_reviews, review_count)
+                  dismiss_stale = dismiss_stale or parameters["dismiss_stale_reviews_on_push"]
+                  approve_last_push = approve_last_push or parameters["require_last_push_approval"]
+                  resolve_threads = resolve_threads or parameters["required_review_thread_resolution"]
+              require(merge_methods == {"squash"}, "effective pull-request merge method must be squash only")
+              require(maximum_reviews >= 1, "effective pull-request policy requires no approval")
+              require(dismiss_stale, "effective pull-request policy does not dismiss stale reviews")
+              require(approve_last_push, "effective pull-request policy does not require last-push approval")
+              require(resolve_threads, "effective pull-request policy does not resolve review threads")
+
+              status_checks = set()
+              strict_status_checks = False
+              for rule in by_type.get("required_status_checks", []):
+                  parameters = rule.get("parameters")
+                  require(isinstance(parameters, dict), "status-check rule parameters are invalid")
+                  strict = parameters.get("strict_required_status_checks_policy")
+                  require(type(strict) is bool, "strict status-check policy is invalid")
+                  strict_status_checks = strict_status_checks or strict
+                  checks = parameters.get("required_status_checks")
+                  require(isinstance(checks, list), "required status checks are invalid")
+                  for check in checks:
+                      require(isinstance(check, dict), "required status check is invalid")
+                      context = check.get("context")
+                      integration = check.get("integration_id")
+                      require(isinstance(context, str) and context, "required status-check context is invalid")
+                      require(type(integration) is int, "required status-check integration is invalid")
+                      status_checks.add((context, integration))
+              require(strict_status_checks, "effective status checks are not strict")
+              require(status_checks == EXPECTED_CHECKS, "effective required status checks differ from release policy")
+
+
+          validate(sys.argv[1])
+          # END TOOLCHAIN PROTECTED MAIN POLICY CHECKER
+          PY
+
   build:
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: github.ref == format('refs/heads/{0}', 'main') && github.event.repository.default_branch == 'main'
+    needs: policy-preflight
     runs-on: [self-hosted, macOS, ARM64, easysplat-ephemeral]
     timeout-minutes: 300
     permissions:
@@ -64,19 +308,22 @@ jobs:
           INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
         run: |
           set -euo pipefail
-          semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          test "$DEFAULT_BRANCH" = "main"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
           test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
+          source scripts/release/lib/strict_semver.sh
           test -z "$(git status --porcelain)"
-          if ! [[ "$INPUT_VERSION" =~ $semver_re ]]; then
-            echo "Invalid toolchain semantic version: $INPUT_VERSION" >&2
+          if ! easysplat_is_strict_semver_without_build_metadata "$INPUT_VERSION"; then
+            echo "Toolchain version must be strict semantic versioning without build metadata: $INPUT_VERSION" >&2
             exit 1
           fi
-          if ! [[ "$INPUT_APP_VERSION_MINIMUM" =~ $semver_re ]]; then
-            echo "Invalid minimum app semantic version: $INPUT_APP_VERSION_MINIMUM" >&2
+          if ! easysplat_is_strict_semver_without_build_metadata "$INPUT_APP_VERSION_MINIMUM"; then
+            echo "Minimum app version must be strict semantic versioning without build metadata: $INPUT_APP_VERSION_MINIMUM" >&2
             exit 1
           fi
-          if ! [[ "$INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE" =~ $semver_re ]]; then
-            echo "Invalid maximum app semantic version: $INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE" >&2
+          if ! easysplat_is_strict_semver_without_build_metadata "$INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE"; then
+            echo "Maximum app version must be strict semantic versioning without build metadata: $INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE" >&2
             exit 1
           fi
           {
@@ -173,8 +420,252 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  derive-signing-request:
+  policy-postflight:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
     needs: build
+    runs-on: macos-15
+    timeout-minutes: 10
+    environment: toolchain-release
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Reverify protected main policy after build
+        env:
+          # GitHub reveals ruleset bypass actors only to Administration-write authority.
+          # This job performs GET requests only and never checks out repository code.
+          GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_POLICY_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          test "$DEFAULT_BRANCH" = "main"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
+          POLICY_ROOT="$RUNNER_TEMP/easysplat-toolchain-policy-$GITHUB_JOB"
+          test ! -e "$POLICY_ROOT"
+          mkdir -m 0700 "$POLICY_ROOT"
+          umask 077
+          EFFECTIVE_RULES="$POLICY_ROOT/effective-rules.json"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/rules/branches/main?per_page=100" >"$EFFECTIVE_RULES"
+          RULESET_IDS="$(python3 - "$EFFECTIVE_RULES" <<'PY'
+          import json, os, stat, sys
+
+          path = sys.argv[1]
+          descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+          try:
+              metadata = os.fstat(descriptor)
+              if (
+                  not stat.S_ISREG(metadata.st_mode)
+                  or metadata.st_uid != os.getuid()
+                  or metadata.st_nlink != 1
+                  or stat.S_IMODE(metadata.st_mode) != 0o600
+                  or not 0 < metadata.st_size <= 8 * 1024 * 1024
+              ):
+                  raise SystemExit("effective main rules are not a bounded private regular file")
+              payload = os.read(descriptor, metadata.st_size + 1)
+              if len(payload) != metadata.st_size or os.read(descriptor, 1):
+                  raise SystemExit("effective main rules changed while reading")
+              rules = json.loads(payload.decode("utf-8"))
+          finally:
+              os.close(descriptor)
+          if not isinstance(rules, list) or not rules:
+              raise SystemExit("effective main rules are absent or invalid")
+          identifiers = set()
+          for rule in rules:
+              if not isinstance(rule, dict) or type(rule.get("ruleset_id")) is not int or rule["ruleset_id"] <= 0:
+                  raise SystemExit("effective main rule has no valid ruleset identity")
+              identifiers.add(rule["ruleset_id"])
+          print(*sorted(identifiers), sep="\n")
+          PY
+          )"
+          test -n "$RULESET_IDS"
+          for ruleset_id in $RULESET_IDS; do
+            gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=true" \
+              >"$POLICY_ROOT/ruleset-$ruleset_id.json"
+          done
+          python3 - "$POLICY_ROOT" <<'PY'
+          # BEGIN TOOLCHAIN PROTECTED MAIN POLICY CHECKER
+          import json
+          import os
+          from pathlib import Path
+          import stat
+          import sys
+
+          EXPECTED_CHECKS = {
+              ("Swift · macOS 15 arm64 · Xcode 16.4", 15368),
+              ("Real 8 GB-class policy lane", 15368),
+              ("Native Metal trainer", 15368),
+              ("Repository contracts", 15368),
+              ("DA3 bridge · Python 3.12", 15368),
+              ("Actions and shell lint", 15368),
+              ("Python dependency audit", 15368),
+              ("Full-history secret scan", 15368),
+              ("Pull request dependency review", 15368),
+              ("Analyze swift", 15368),
+              ("Analyze python", 15368),
+              ("Analyze c-cpp", 15368),
+              ("Analyze actions", 15368),
+          }
+
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+
+          def read_private_json(path, maximum):
+              descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+              try:
+                  before = os.fstat(descriptor)
+                  identity = (
+                      before.st_dev,
+                      before.st_ino,
+                      before.st_mode,
+                      before.st_uid,
+                      before.st_nlink,
+                      before.st_size,
+                      before.st_mtime_ns,
+                      before.st_ctime_ns,
+                  )
+                  require(
+                      stat.S_ISREG(before.st_mode)
+                      and before.st_uid == os.getuid()
+                      and before.st_nlink == 1
+                      and stat.S_IMODE(before.st_mode) == 0o600
+                      and 0 < before.st_size <= maximum,
+                      f"policy response is not a bounded private regular file: {Path(path).name}",
+                  )
+                  payload = os.read(descriptor, before.st_size + 1)
+                  require(len(payload) == before.st_size, f"policy response changed while reading: {Path(path).name}")
+                  require(not os.read(descriptor, 1), f"policy response grew while reading: {Path(path).name}")
+                  after = os.fstat(descriptor)
+                  require(
+                      identity
+                      == (
+                          after.st_dev,
+                          after.st_ino,
+                          after.st_mode,
+                          after.st_uid,
+                          after.st_nlink,
+                          after.st_size,
+                          after.st_mtime_ns,
+                          after.st_ctime_ns,
+                      ),
+                      f"policy response identity changed: {Path(path).name}",
+                  )
+                  return json.loads(payload.decode("utf-8"))
+              finally:
+                  os.close(descriptor)
+
+
+          def validate(root_value):
+              root = Path(root_value)
+              metadata = root.lstat()
+              require(
+                  stat.S_ISDIR(metadata.st_mode)
+                  and not root.is_symlink()
+                  and metadata.st_uid == os.getuid()
+                  and stat.S_IMODE(metadata.st_mode) == 0o700,
+                  "toolchain policy directory is not private",
+              )
+              effective = read_private_json(root / "effective-rules.json", 8 * 1024 * 1024)
+              require(isinstance(effective, list) and effective, "effective main rules are absent or invalid")
+              identifiers = set()
+              for rule in effective:
+                  require(isinstance(rule, dict), "effective main rule is invalid")
+                  identifier = rule.get("ruleset_id")
+                  require(type(identifier) is int and identifier > 0, "effective main rule has no valid ruleset identity")
+                  identifiers.add(identifier)
+              expected_names = {"effective-rules.json"} | {
+                  f"ruleset-{identifier}.json" for identifier in identifiers
+              }
+              require(
+                  {path.name for path in root.iterdir()} == expected_names,
+                  "effective ruleset response closure is incomplete",
+              )
+              for identifier in identifiers:
+                  ruleset = read_private_json(root / f"ruleset-{identifier}.json", 2 * 1024 * 1024)
+                  require(isinstance(ruleset, dict), "ruleset policy response is invalid")
+                  require(ruleset.get("id") == identifier, "ruleset identity differs from effective rule")
+                  require(ruleset.get("target") == "branch", "effective ruleset does not target branches")
+                  require(ruleset.get("enforcement") == "active", "effective ruleset is not active")
+                  require("bypass_actors" in ruleset, "ruleset bypass actors were not disclosed")
+                  require(ruleset["bypass_actors"] == [], "effective main ruleset permits bypass actors")
+
+              by_type = {}
+              for rule in effective:
+                  rule_type = rule.get("type")
+                  require(isinstance(rule_type, str) and rule_type, "effective main rule type is invalid")
+                  by_type.setdefault(rule_type, []).append(rule)
+              for rule_type in ("deletion", "non_fast_forward", "required_linear_history"):
+                  require(rule_type in by_type, f"main protection is missing {rule_type}")
+
+              merge_methods = None
+              maximum_reviews = 0
+              dismiss_stale = False
+              approve_last_push = False
+              resolve_threads = False
+              for rule in by_type.get("pull_request", []):
+                  parameters = rule.get("parameters")
+                  require(isinstance(parameters, dict), "pull-request rule parameters are invalid")
+                  methods = parameters.get("allowed_merge_methods")
+                  require(
+                      isinstance(methods, list)
+                      and methods
+                      and all(method in {"merge", "squash", "rebase"} for method in methods),
+                      "pull-request merge methods are invalid",
+                  )
+                  current_methods = set(methods)
+                  merge_methods = current_methods if merge_methods is None else merge_methods & current_methods
+                  for name in (
+                      "dismiss_stale_reviews_on_push",
+                      "require_last_push_approval",
+                      "required_review_thread_resolution",
+                  ):
+                      require(type(parameters.get(name)) is bool, f"pull-request boolean is invalid: {name}")
+                  review_count = parameters.get("required_approving_review_count")
+                  require(type(review_count) is int and review_count >= 0, "required review count is invalid")
+                  maximum_reviews = max(maximum_reviews, review_count)
+                  dismiss_stale = dismiss_stale or parameters["dismiss_stale_reviews_on_push"]
+                  approve_last_push = approve_last_push or parameters["require_last_push_approval"]
+                  resolve_threads = resolve_threads or parameters["required_review_thread_resolution"]
+              require(merge_methods == {"squash"}, "effective pull-request merge method must be squash only")
+              require(maximum_reviews >= 1, "effective pull-request policy requires no approval")
+              require(dismiss_stale, "effective pull-request policy does not dismiss stale reviews")
+              require(approve_last_push, "effective pull-request policy does not require last-push approval")
+              require(resolve_threads, "effective pull-request policy does not resolve review threads")
+
+              status_checks = set()
+              strict_status_checks = False
+              for rule in by_type.get("required_status_checks", []):
+                  parameters = rule.get("parameters")
+                  require(isinstance(parameters, dict), "status-check rule parameters are invalid")
+                  strict = parameters.get("strict_required_status_checks_policy")
+                  require(type(strict) is bool, "strict status-check policy is invalid")
+                  strict_status_checks = strict_status_checks or strict
+                  checks = parameters.get("required_status_checks")
+                  require(isinstance(checks, list), "required status checks are invalid")
+                  for check in checks:
+                      require(isinstance(check, dict), "required status check is invalid")
+                      context = check.get("context")
+                      integration = check.get("integration_id")
+                      require(isinstance(context, str) and context, "required status-check context is invalid")
+                      require(type(integration) is int, "required status-check integration is invalid")
+                      status_checks.add((context, integration))
+              require(strict_status_checks, "effective status checks are not strict")
+              require(status_checks == EXPECTED_CHECKS, "effective required status checks differ from release policy")
+
+
+          validate(sys.argv[1])
+          # END TOOLCHAIN PROTECTED MAIN POLICY CHECKER
+          PY
+
+  derive-signing-request:
+    needs: [build, policy-postflight]
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -258,6 +749,14 @@ jobs:
           if request.get("sourceRepository") != os.environ["GITHUB_REPOSITORY"] or request.get("sourceCommit") != os.environ["GITHUB_SHA"]:
               raise SystemExit("prepared signing request source identity is invalid")
           PY
+
+      - name: Reverify current main head before signing-request upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
 
       - name: Upload exact prepared signing request
         id: upload
