@@ -4805,6 +4805,35 @@ test -f "$signed_dmg_output/EasySplat-0.2.0.app-signing.json"
 test -f "$signed_dmg_output/EasySplat-0.2.0.app-notarization.json"
 test -f "$signed_dmg_output/EasySplat-0.2.0.dmg-signing.json"
 test -f "$signed_dmg_output/EasySplat-0.2.0.dmg-notarization.json"
+/usr/bin/python3 -I - \
+  "$signed_dmg_output/EasySplat-0.2.0-release-notes.txt" <<'PY'
+import sys
+from pathlib import Path
+
+expected = (
+    "EasySplat 0.2.0 is a Developer ID-signed and notarized release.\n"
+    "Install the Developer ID-signed, notarized, and stapled DMG on an Apple "
+    "Silicon Mac running macOS 15 or later.\n"
+    "\n"
+    "EasySplat turns video, photo folders, or mixed inputs into static 3D "
+    "Gaussian splats locally. Input media stays on your Mac. Capture-aware "
+    "native COLMAP reconstruction uses FAISS matching, and the native Metal "
+    "trainer writes a validated PLY. When the geometry is conclusive, "
+    "EasySplat aligns the scene upright. The viewer supports orbit, pan, zoom, "
+    "fit, reset, export, and system Share. Work can stop and resume at durable "
+    "stages. EasySplat has no cloud processing, telemetry, or analytics.\n"
+    "\n"
+    "One reconstruction runs at a time. PLY is the only export format. Moving "
+    "subjects, reflections, water, foliage, and large lighting changes can "
+    "leave artifacts.\n"
+    "\n"
+    "Release files include the DMG SHA-256 checksum, provenance record, SPDX "
+    "SBOM, third-party license bundle, and dSYM archive.\n"
+).encode("utf-8")
+actual = Path(sys.argv[1]).read_bytes()
+if actual != expected:
+    raise SystemExit("Production release notes differ from the stable contract.")
+PY
 grep -Fq 'Developer ID-signed and notarized release' \
   "$signed_dmg_output/EasySplat-0.2.0-release-notes.txt"
 if grep -Fqi 'production' \
@@ -4977,7 +5006,17 @@ grep -q '^create ' "$hdiutil_log"
 grep -q '^verify ' "$hdiutil_log"
 
 test -x "$ROOT/scripts/release/verify_release.sh"
-"$ROOT/scripts/release/verify_release.sh" --help | grep -F 'Usage: verify_release.sh' >/dev/null
+release_verifier_help="$TMP_DIR/verify-release-help.txt"
+"$ROOT/scripts/release/verify_release.sh" --help >"$release_verifier_help"
+grep -F 'Usage: verify_release.sh' "$release_verifier_help" >/dev/null
+grep -F 'Production artifact closure:' "$release_verifier_help" >/dev/null
+for production_flag in \
+  --release-manifest \
+  --core-archive \
+  --da3-base-archive \
+  --da3-small-archive; do
+  grep -F -- "$production_flag" "$release_verifier_help" >/dev/null
+done
 legacy_fixture_error="$TMP_DIR/legacy-release-fixture.stderr"
 if EASYSPLAT_RELEASE_FIXTURE="$TMP_DIR/untrusted-release-fixture" \
   "$ROOT/scripts/release/verify_release.sh" --help \

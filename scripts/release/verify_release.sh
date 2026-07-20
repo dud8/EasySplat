@@ -92,6 +92,17 @@ VERIFIED_EVIDENCE_DIRECTORY_IDENTITY=""
 
 usage() {
   echo "Usage: verify_release.sh --app <app> --dmg <dmg> --expected-version <semver> [--release-mode development-unsigned|production] [--app-signing-receipt <json> --app-notarization-receipt <json> --dmg-signing-receipt <json> --dmg-notarization-receipt <json>] --artifacts --packaged-app-smoke --source-url <https-url> --source-commit <sha> --fixture <generated-fixture-root> --manifest-url <https-url> --public-key-file <file> --toolchain-root <dir> --e2e-runner <executable> --offline-cache-root <dir> --offline-runner <executable> --cached-cache-root <dir> --cached-runner <executable> --evidence-dir <dir>"
+  /bin/cat <<'EOF'
+
+Production artifact closure:
+  --release-manifest <json>   Signed toolchain manifest to verify.
+  --core-archive <zip>        Native core archive named by the manifest.
+  --da3-base-archive <zip>    DA3 Base archive named by the manifest.
+  --da3-small-archive <zip>   DA3 Small archive named by the manifest.
+
+Use these four options with --artifacts to verify exact publication inputs.
+When omitted, the verifier uses the matching paths under Toolchains/.
+EOF
 }
 
 release_fixture_attestation() {

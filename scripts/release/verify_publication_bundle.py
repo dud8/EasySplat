@@ -3733,7 +3733,23 @@ def validate_release_notes(
     if release_mode == "production":
         expected = (
             f"EasySplat {app_version} is a Developer ID-signed and notarized release.\n"
-            "It runs locally on Apple Silicon Macs.\n"
+            "Install the Developer ID-signed, notarized, and stapled DMG on an Apple "
+            "Silicon Mac running macOS 15 or later.\n"
+            "\n"
+            "EasySplat turns video, photo folders, or mixed inputs into static 3D "
+            "Gaussian splats locally. Input media stays on your Mac. Capture-aware "
+            "native COLMAP reconstruction uses FAISS matching, and the native Metal "
+            "trainer writes a validated PLY. When the geometry is conclusive, "
+            "EasySplat aligns the scene upright. The viewer supports orbit, pan, zoom, "
+            "fit, reset, export, and system Share. Work can stop and resume at durable "
+            "stages. EasySplat has no cloud processing, telemetry, or analytics.\n"
+            "\n"
+            "One reconstruction runs at a time. PLY is the only export format. Moving "
+            "subjects, reflections, water, foliage, and large lighting changes can "
+            "leave artifacts.\n"
+            "\n"
+            "Release files include the DMG SHA-256 checksum, provenance record, SPDX "
+            "SBOM, third-party license bundle, and dSYM archive.\n"
         )
     else:
         expected = (
