@@ -29,3 +29,10 @@ condition = "AND"
 regexTarget = "line"
 regexes = ['''^[[:space:]]*"mixed_keypoints": "7bded7db318146a967b8476cb1d0b2fddf3e0c43d8f4aad05a2e951b5201e2d3",[[:space:]]*$''']
 paths = ['''^scripts/toolchain/tests/test_native_colmap_retriever\.py$''']
+
+[[rules.allowlists]]
+description = "Ephemeral Curve25519 test-key parameter defaults"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''^[[:space:]]*(signingKey|key): Curve25519\.Signing\.PrivateKey = \.init\(\),?[[:space:]]*$''']
+paths = ['''^EasySplatCore/Tests/EasySplatCoreTests/ToolchainManagerDownloadTests\.swift$''']
