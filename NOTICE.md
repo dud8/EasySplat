@@ -7,8 +7,9 @@ The `0.2.0` release set draws from:
 - MetalSplatter, MIT, based on upstream commit `c0f066fb7146d46d9b68e5c76d7d0a6154facc5e` with reviewed EasySplat compatibility changes
 - optional Depth Anything 3 source, DA3-BASE weights, and DA3-SMALL weights, Apache-2.0
 - msplat native trainer, Apache-2.0
-- COLMAP 4.1.1, Ceres Solver, SuiteSparse, and their pinned compiled dependencies
-- OpenImageIO 2.5.19.1 with only JPEG, PNG, TIFF, and OpenEXR format support
+- native COLMAP 4.1.1, BSD-3-Clause, built with pinned FAISS (MIT), PoseLib (BSD-3-Clause), and VLFeat (BSD-2-Clause)
+- Ceres Solver 2.2.0, BSD-3-Clause, compiled into COLMAP with Eigen 3.4.0 (MPL-2.0); SuiteSparse is disabled and is not redistributed
+- OpenImageIO 2.5.19.1 with only JPEG and PNG format support
 - an optional pinned Python runtime and the hashed packages in `Tools/Da3Sfm/requirements.txt`
 - the exact native-library closure required by the packaged executables
 

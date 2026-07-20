@@ -4,6 +4,10 @@ title: "feat: "
 labels:
   - enhancement
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not upload client or private media, project notes, unredacted diagnostics, home or removable-volume paths, or credential-bearing URLs or tokens. Review and redact diagnostics before posting. Attach samples only when they are intentionally public and you have the right to permit redistribution.
   - type: textarea
     id: problem
     attributes:

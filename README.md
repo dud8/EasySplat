@@ -104,22 +104,27 @@ Requirements:
 
 - macOS 15+
 - Apple Silicon
-- Xcode 16.4 with the Metal toolchain
-- Homebrew build dependencies for the native toolchain
+- Xcode 26.6 (build 17F113), selected as the active developer directory
+- the Xcode Metal toolchain
+- Homebrew `cmake`, `ninja`, `ripgrep`, and `zstd`
 
-Run the development app:
+From the repository root, prepare the release-equivalent build tools and run the development app with the allowed repository-local toolchain path:
 
 ```bash
-./scripts/run.sh
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+xcodebuild -downloadComponent MetalToolchain
+brew install cmake ninja ripgrep zstd
+./scripts/run.sh --toolchain-root "$PWD/Toolchains/dev/2.0.0"
 ```
 
 Useful variants:
 
 ```bash
-./scripts/run.sh --fast
-./scripts/run.sh --rebuild
-./scripts/run.sh --toolchain-root /absolute/path/to/toolchain
+./scripts/run.sh --fast --toolchain-root "$PWD/Toolchains/dev/2.0.0"
+./scripts/run.sh --rebuild --toolchain-root "$PWD/Toolchains/dev/2.0.0"
 ```
+
+`--fast` requires an existing valid core component and performs no build or download. `--rebuild` rebuilds the complete local capability set.
 
 The only supported development overrides are the local toolchain root, candidate route, stop-after stage, skip-training, and benchmark run seed. Product policy lives in typed run options and resolved plans, not backend-specific environment variables.
 
