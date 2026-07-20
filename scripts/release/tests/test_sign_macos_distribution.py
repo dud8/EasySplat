@@ -2433,6 +2433,10 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
         )
         self.assertIn('if [ -n "$PREPARED_RELEASE_ROOT" ]; then', source)
         self.assertIn('SOURCE_COMMIT="$SOURCE_COMMIT_OVERRIDE"', source)
+        self.assertIn(
+            "Production packaging requires a prepared release root", source
+        )
+        self.assertNotIn("build_app_args+=(\n      --production", source)
 
     def test_credentialed_packaging_reverifies_the_pinned_prepared_closure_before_copy(self) -> None:
         source = BUILD_DMG_SCRIPT.read_text(encoding="utf-8")

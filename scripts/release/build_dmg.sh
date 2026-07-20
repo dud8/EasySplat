@@ -203,7 +203,7 @@ done
 unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
 
 if [ -z "$APP_VERSION" ] || [ -z "$TOOLCHAIN_VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_dmg.sh --app-version <semver> --toolchain-version <semver> --manifest-url <https-url> --core-artifact-url <https-url> --da3-base-artifact-url <https-url> --da3-small-artifact-url <https-url> --use-existing-toolchain (--development-unsigned | --production --identity-fingerprint <sha1> --team-id <id> --notary-keychain-profile <name>) [--project-url <https-url>] [--build-root <absolute-path>] [--output-dir <absolute-path>] [--prepared-release-root <absolute-path> --prepared-manifest-sha256 <sha256> --source-commit <sha1> --manifest-tool-bin <trusted executable>]" >&2
+  echo "Usage: build_dmg.sh --app-version <semver> --toolchain-version <semver> --manifest-url <https-url> --core-artifact-url <https-url> --da3-base-artifact-url <https-url> --da3-small-artifact-url <https-url> --use-existing-toolchain (--development-unsigned | --production --identity-fingerprint <sha1> --team-id <id> --notary-keychain-profile <name> --prepared-release-root <absolute-path> --prepared-manifest-sha256 <sha256> --source-commit <sha1> --manifest-tool-bin <trusted executable>) [--project-url <https-url>] [--build-root <absolute-path>] [--output-dir <absolute-path>]" >&2
   exit 1
 fi
 if [ "$USE_EXISTING_TOOLCHAIN" -ne 1 ]; then
@@ -253,19 +253,19 @@ elif [ -n "$IDENTITY_FINGERPRINT" ] || [ -n "$TEAM_ID" ] \
   echo "Signing and notarization arguments require --production." >&2
   exit 1
 fi
-if [ -n "$PREPARED_RELEASE_ROOT" ] \
-    || [ -n "$PREPARED_MANIFEST_SHA256" ] \
-    || [ -n "$SOURCE_COMMIT_OVERRIDE" ]; then
-  if [ "$RELEASE_MODE" != production ] \
-      || [ -z "$PREPARED_RELEASE_ROOT" ] \
+if [ "$RELEASE_MODE" = production ]; then
+  if [ -z "$PREPARED_RELEASE_ROOT" ] \
       || ! [[ "$PREPARED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] \
       || ! [[ "$SOURCE_COMMIT_OVERRIDE" =~ ^[0-9a-f]{40}$ ]] \
       || [ "$MANIFEST_TOOL_BIN_SET" -ne 1 ]; then
-    echo "Prepared release inputs require production mode, an absolute prepared root, its lowercase SHA-256 manifest digest, a lowercase 40-hex source commit, and an independently trusted ManifestTool." >&2
+    echo "Production packaging requires a prepared release root, its lowercase SHA-256 manifest digest, a lowercase 40-hex source commit, and an independently trusted ManifestTool." >&2
     exit 1
   fi
-elif [ "$MANIFEST_TOOL_BIN_SET" -ne 0 ]; then
-  echo "--manifest-tool-bin is accepted only with a prepared release." >&2
+elif [ -n "$PREPARED_RELEASE_ROOT" ] \
+    || [ -n "$PREPARED_MANIFEST_SHA256" ] \
+    || [ -n "$SOURCE_COMMIT_OVERRIDE" ] \
+    || [ "$MANIFEST_TOOL_BIN_SET" -ne 0 ]; then
+  echo "Prepared release inputs require production mode." >&2
   exit 1
 fi
 
@@ -594,15 +594,7 @@ else
   if [ -n "$PROJECT_URL" ]; then
     build_app_args+=(--project-url "$PROJECT_URL")
   fi
-  if [ "$RELEASE_MODE" = production ]; then
-    build_app_args+=(
-      --production
-      --identity-fingerprint "$IDENTITY_FINGERPRINT"
-      --team-id "$TEAM_ID"
-    )
-  else
-    build_app_args+=(--development-unsigned)
-  fi
+  build_app_args+=(--development-unsigned)
   "$ROOT/scripts/release/build_app.sh" "${build_app_args[@]}"
 fi
 

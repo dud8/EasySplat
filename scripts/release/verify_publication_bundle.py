@@ -56,7 +56,7 @@ SEMVER = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?"
 )
-UTC_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z")
+UTC_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 UUID_LINE = re.compile(
     r"UUID: ([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}) "
     r"\(arm64\) .+"
@@ -342,8 +342,10 @@ def validate_release_timestamps(
     published_at = validate_utc_timestamp(
         manifest.get("publishedAt"), "toolchain manifest publishedAt"
     )
-    if created_at != published_at:
-        fail("release provenance and signed manifest timestamps differ")
+    created = datetime.fromisoformat(created_at[:-1] + "+00:00")
+    published = datetime.fromisoformat(published_at[:-1] + "+00:00")
+    if created < published:
+        fail("release provenance creation time predates the signed manifest")
 
 
 def require_regular_file(

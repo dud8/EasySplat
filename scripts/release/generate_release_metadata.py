@@ -13,6 +13,7 @@ import struct
 import sys
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NoReturn
 from urllib.parse import quote, urlparse
@@ -490,7 +491,7 @@ def validate_manifest(
     if manifest.get("version") != toolchain_version:
         fail("toolchain manifest version does not match the release")
     published_at = require_text(manifest.get("publishedAt"), "manifest publishedAt")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", published_at):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", published_at):
         fail("manifest publishedAt must be a UTC ISO-8601 timestamp")
     require_text(manifest.get("keyID"), "manifest keyID")
     require_text(manifest.get("signatureEd25519"), "manifest signature")
@@ -521,6 +522,28 @@ def validate_manifest(
         ):
             fail(f"manifest checksum or size mismatch for {component_name}")
     return published_at
+
+
+def parse_utc_timestamp(value: str, label: str) -> datetime:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        fail(f"{label} must be a UTC ISO-8601 timestamp")
+    try:
+        return datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        fail(f"{label} must be a UTC ISO-8601 timestamp: {error}")
+
+
+def release_created_at(
+    published_at: str, *, now: datetime | None = None
+) -> str:
+    published = parse_utc_timestamp(published_at, "manifest publishedAt")
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        fail("release metadata creation time must include a UTC offset")
+    current = current.astimezone(timezone.utc).replace(microsecond=0)
+    if current < published:
+        fail("release metadata creation time predates the toolchain manifest")
+    return current.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def artifact_row(path: Path, download_url: str) -> dict[str, Any]:
@@ -967,7 +990,8 @@ def specs_from_args(args: argparse.Namespace) -> dict[str, ArchiveSpec]:
 def generate(args: argparse.Namespace) -> None:
     specs = specs_from_args(args)
     closure = validate_archives(specs, args.toolchain_version)
-    created_at = validate_manifest(args.manifest, args.toolchain_version, specs)
+    published_at = validate_manifest(args.manifest, args.toolchain_version, specs)
+    created_at = release_created_at(published_at)
     provenance = build_provenance(
         app_version=args.app_version,
         toolchain_version=args.toolchain_version,
@@ -1005,7 +1029,11 @@ def verify(args: argparse.Namespace) -> None:
         fail("release provenance artifact download URLs are incomplete")
     specs = specs_from_args(args)
     closure = validate_archives(specs, args.toolchain_version)
-    created_at = validate_manifest(args.manifest, args.toolchain_version, specs)
+    published_at = validate_manifest(args.manifest, args.toolchain_version, specs)
+    created_at = require_text(provenance.get("createdAt"), "release provenance createdAt")
+    created = parse_utc_timestamp(created_at, "release provenance createdAt")
+    if created < parse_utc_timestamp(published_at, "manifest publishedAt"):
+        fail("release provenance creation time predates the toolchain manifest")
     expected_provenance = build_provenance(
         app_version=args.app_version,
         toolchain_version=args.toolchain_version,

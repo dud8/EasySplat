@@ -4379,30 +4379,72 @@ mkdir -p \
   "$signed_dmg_fixture/scripts/release/lib" \
   "$signed_dmg_fixture/EasySplatApp/Resources" \
   "$signed_dmg_fixture/ThirdParty/MetalSplatter" \
-  "$signed_dmg_fixture/Toolchains/out" \
+  "$signed_dmg_fixture/prepared/toolchain/out" \
+  "$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/MacOS" \
+  "$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/Resources" \
+  "$signed_dmg_fixture/prepared/product/EasySplat.app.dSYM/Contents/Resources/DWARF" \
   "$signed_dmg_fixture/mock-bin"
 cp "$ROOT/scripts/release/build_dmg.sh" \
   "$signed_dmg_fixture/scripts/release/build_dmg.sh"
 cp "$ROOT/scripts/release/publish_release_files.py" \
   "$signed_dmg_fixture/scripts/release/publish_release_files.py"
+cp "$ROOT/scripts/release/prepared_release.py" \
+  "$signed_dmg_fixture/scripts/release/prepared_release.py"
 cp "$ROOT/scripts/release/verify_notarization_receipt.py" \
   "$signed_dmg_fixture/scripts/release/verify_notarization_receipt.py"
 cp "$ROOT/scripts/release/lib/strict_semver.sh" \
   "$signed_dmg_fixture/scripts/release/lib/strict_semver.sh"
 cp "$public_key_path" \
   "$signed_dmg_fixture/EasySplatApp/Resources/public_key_ed25519.txt"
-cp "$public_key_path" "$signed_dmg_fixture/Toolchains/public_key_ed25519.txt"
-cp "$bootstrap_manifest" "$signed_dmg_fixture/Toolchains/manifest.json"
+cp "$public_key_path" \
+  "$signed_dmg_fixture/prepared/toolchain/public_key_ed25519.txt"
+cp "$bootstrap_manifest" \
+  "$signed_dmg_fixture/prepared/toolchain/manifest.json"
 cp "$bootstrap_core_archive" \
-  "$signed_dmg_fixture/Toolchains/out/toolchain-macos-arm64-2.0.0-core.zip"
+  "$signed_dmg_fixture/prepared/toolchain/out/toolchain-macos-arm64-2.0.0-core.zip"
 cp "$bootstrap_base_archive" \
-  "$signed_dmg_fixture/Toolchains/out/toolchain-geometry-da3-base-2.0.0.zip"
+  "$signed_dmg_fixture/prepared/toolchain/out/toolchain-geometry-da3-base-2.0.0.zip"
 cp "$bootstrap_small_archive" \
-  "$signed_dmg_fixture/Toolchains/out/toolchain-geometry-da3-small-2.0.0.zip"
+  "$signed_dmg_fixture/prepared/toolchain/out/toolchain-geometry-da3-small-2.0.0.zip"
+for prepared_authority_file in \
+  toolchain-release-request.json \
+  toolchain-authority-envelope.json \
+  toolchain-authority-receipt.json \
+  toolchain-benchmark-evidence.json; do
+  printf '%s\n' '{}' \
+    >"$signed_dmg_fixture/prepared/toolchain/out/$prepared_authority_file"
+done
 printf '%s\n' 'fixture license' >"$signed_dmg_fixture/LICENSE"
 printf '%s\n' 'fixture notice' >"$signed_dmg_fixture/NOTICE.md"
 printf '%s\n' 'fixture viewer license' \
   >"$signed_dmg_fixture/ThirdParty/MetalSplatter/LICENSE"
+printf '%s' 'prepared app' \
+  >"$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/MacOS/EasySplatApp"
+chmod 0755 \
+  "$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/MacOS/EasySplatApp"
+printf '%s' 'prepared symbols' \
+  >"$signed_dmg_fixture/prepared/product/EasySplat.app.dSYM/Contents/Resources/DWARF/EasySplatApp"
+cat >"$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>EasySplatReleaseChannel</key><string>prepare-release</string>
+</dict></plist>
+EOF
+printf '%s' 'prepared release candidate' \
+  >"$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/Resources/release_channel.txt"
+/usr/bin/python3 -I "$signed_dmg_fixture/scripts/release/prepared_release.py" create \
+  --root "$signed_dmg_fixture/prepared" \
+  --source-repository dud8/EasySplat \
+  --source-commit 0123456789abcdef0123456789abcdef01234567 \
+  --app-version 0.2.0 \
+  --toolchain-version 2.0.0 \
+  --run-id 1 \
+  --run-attempt 1 \
+  --builder-environment github-hosted \
+  --xcode-version 16.4 \
+  --xcode-build 16F6 \
+  --macos-sdk-version 15.5
 
 cat >"$signed_dmg_fixture/scripts/release/build_app.sh" <<'PY'
 #!/usr/bin/env python3
@@ -4503,8 +4545,36 @@ import hashlib
 import json
 import os
 import re
+import stat
+import struct
 import sys
 from pathlib import Path
+
+
+def artifact_digest(root: Path) -> str:
+    if root.is_file():
+        return hashlib.sha256(root.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    paths = [
+        root,
+        *sorted(
+            root.rglob("*"),
+            key=lambda path: path.relative_to(root).as_posix(),
+        ),
+    ]
+    for path in paths:
+        metadata = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        relative_bytes = relative.encode("utf-8", errors="surrogateescape")
+        digest.update(b"D" if stat.S_ISDIR(metadata.st_mode) else b"F")
+        digest.update(struct.pack(">Q", len(relative_bytes)))
+        digest.update(relative_bytes)
+        digest.update(struct.pack(">I", stat.S_IMODE(metadata.st_mode)))
+        if stat.S_ISREG(metadata.st_mode):
+            data = path.read_bytes()
+            digest.update(struct.pack(">Q", len(data)))
+            digest.update(hashlib.sha256(data).digest())
+    return digest.hexdigest()
 
 arguments = sys.argv[1:]
 values = {}
@@ -4583,12 +4653,44 @@ if verify_only:
     validate_receipt()
     if bind_receipt_to_current_artifact:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        current_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        current_digest = artifact_digest(artifact)
         if receipt.get("artifactDigest", {}).get("postSignSHA256") != current_digest:
             raise SystemExit("fake signing receipt does not bind current bytes")
     raise SystemExit(0)
+if kind == "app" and artifact.is_dir():
+    signature = artifact / "Contents/_CodeSignature/CodeResources"
+    signature.parent.mkdir(parents=True, exist_ok=True)
+    signature.write_bytes(b"signed")
+    post_sign_sha256 = artifact_digest(artifact)
+    payload = {
+        "schemaVersion": 1,
+        "rootKind": kind,
+        "identityFingerprintSHA1": fingerprint,
+        "teamID": team_id,
+        "artifactDigest": {
+            "format": "sha256-tree-v1",
+            "postSignSHA256": post_sign_sha256,
+        },
+        "tree": {"postSignManifestSHA256": "a" * 64},
+        "entries": [{
+            "kind": "appBundle",
+            "relativePath": ".",
+            "postSignSHA256": "a" * 64,
+            "identityFingerprintSHA1": fingerprint,
+            "teamID": team_id,
+            "codesign": {
+                "hardenedRuntime": True,
+                "leafCertificateSHA1": fingerprint,
+                "teamIdentifier": team_id,
+                "timestamp": "Jul 18, 2026 at 11:45:00 PM",
+            },
+        }],
+    }
+    receipt_path.write_text(json.dumps(payload), encoding="utf-8")
+    validate_receipt()
+    raise SystemExit(0)
 if kind != "dmg" or not artifact.is_file():
-    raise SystemExit("the fake signer only signs disk images")
+    raise SystemExit("the fake signer requires an app or disk image")
 artifact.write_bytes(artifact.read_bytes() + b"\nsigned")
 post_sign_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
 payload = {
@@ -4712,6 +4814,11 @@ if command == "generate":
     Path(values["--spdx-out"]).write_text("{}\n", encoding="utf-8")
     Path(values["--licenses-out"]).write_bytes(b"license fixture")
 PY
+cat >"$signed_dmg_fixture/mock-bin/ManifestTool" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$1" = verify-release
+EOF
 cat >"$signed_dmg_fixture/mock-bin/swift" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -4736,6 +4843,8 @@ chmod +x \
   "$signed_dmg_fixture/scripts/release/sign_macos_distribution.py" \
   "$signed_dmg_fixture/scripts/release/notarize_artifact.sh" \
   "$signed_dmg_fixture/scripts/release/generate_release_metadata.py" \
+  "$signed_dmg_fixture/scripts/release/prepared_release.py" \
+  "$signed_dmg_fixture/mock-bin/ManifestTool" \
   "$signed_dmg_fixture/mock-bin/swift" \
   "$signed_dmg_fixture/mock-bin/xcodebuild" \
   "$signed_dmg_fixture/mock-bin/git" \
@@ -4781,6 +4890,26 @@ PY
 
 signed_dmg_log="$TMP_DIR/signed-dmg-release.jsonl"
 signed_dmg_build_root="$signed_dmg_fixture/build-output"
+signed_dmg_prepared_root="$signed_dmg_fixture/prepared"
+signed_dmg_prepared_manifest_sha256="$(
+  shasum -a 256 "$signed_dmg_prepared_root/prepared-release.json" | awk '{print $1}'
+)"
+signed_dmg_source_commit=0123456789abcdef0123456789abcdef01234567
+signed_dmg_tampered_root="$TMP_DIR/signed-dmg-tampered-prepared"
+/usr/bin/ditto --noqtn "$signed_dmg_prepared_root" "$signed_dmg_tampered_root"
+printf '%s' 'tamper' \
+  >>"$signed_dmg_tampered_root/product/EasySplat.app/Contents/MacOS/EasySplatApp"
+if /usr/bin/python3 -I \
+  "$signed_dmg_fixture/scripts/release/prepared_release.py" verify \
+  --root "$signed_dmg_tampered_root" \
+  --authority-from-manifest \
+  --expected-manifest-sha256 "$signed_dmg_prepared_manifest_sha256" \
+  --source-commit "$signed_dmg_source_commit" \
+  --app-version 0.2.0 \
+  --toolchain-version 2.0.0 >/dev/null 2>&1; then
+  echo "Prepared release verifier accepted a changed app." >&2
+  exit 1
+fi
 PATH="$signed_dmg_fixture/mock-bin:$PATH" \
 FAKE_RELEASE_LOG="$signed_dmg_log" \
   "$signed_dmg_fixture/scripts/release/build_dmg.sh" \
@@ -4793,6 +4922,10 @@ FAKE_RELEASE_LOG="$signed_dmg_log" \
   --project-url https://example.com/EasySplat \
   --build-root "$signed_dmg_build_root" \
   --use-existing-toolchain \
+  --prepared-release-root "$signed_dmg_prepared_root" \
+  --prepared-manifest-sha256 "$signed_dmg_prepared_manifest_sha256" \
+  --source-commit "$signed_dmg_source_commit" \
+  --manifest-tool-bin "$signed_dmg_fixture/mock-bin/ManifestTool" \
   --production \
   --identity-fingerprint "$signed_fingerprint" \
   --team-id "$signed_team_id" \
@@ -4854,7 +4987,8 @@ rows = [json.loads(line) for line in Path(sys.argv[1]).read_text(encoding="utf-8
 events = [row[0:2] for row in rows]
 assert events == [
     ["metadata", "verify-toolchain"],
-    ["build-app", "--manifest-url"],
+    ["sign", "--root"],
+    ["verify-signature", "--verify-only"],
     ["notarize", "--type"],
     ["verify-signature", "--verify-only"],
     ["create-dmg", "--app-path"],
@@ -4864,28 +4998,26 @@ assert events == [
     ["verify-signature", "--verify-only"],
     ["metadata", "generate"],
 ]
-build_arguments = rows[1][1:]
-sign_arguments = rows[5][1:]
+app_sign_arguments = rows[1][1:]
+dmg_sign_arguments = rows[6][1:]
 verification_arguments = [row[1:] for row in rows if row[0] == "verify-signature"]
-package_build_root = Path(build_arguments[build_arguments.index("--build-root") + 1])
-assert "--production" in build_arguments
-assert build_arguments[build_arguments.index("--identity-fingerprint") + 1] == sys.argv[2]
-assert build_arguments[build_arguments.index("--team-id") + 1] == sys.argv[3]
-assert package_build_root.parent == Path(sys.argv[4])
-assert package_build_root.name.startswith(".EasySplat-0.2.0.package.")
-assert not package_build_root.exists()
-assert sign_arguments[sign_arguments.index("--identity-fingerprint") + 1] == sys.argv[2]
-assert sign_arguments[sign_arguments.index("--team-id") + 1] == sys.argv[3]
-assert len(verification_arguments) == 3
+assert all(row[0] != "build-app" for row in rows)
+for sign_arguments in (app_sign_arguments, dmg_sign_arguments):
+    assert sign_arguments[sign_arguments.index("--identity-fingerprint") + 1] == sys.argv[2]
+    assert sign_arguments[sign_arguments.index("--team-id") + 1] == sys.argv[3]
+build_root = Path(sys.argv[4])
+assert build_root.is_dir()
+assert not any(build_root.iterdir())
+assert len(verification_arguments) == 4
 assert all("--receipt" in arguments for arguments in verification_arguments)
 assert sum(
     "--bind-receipt-to-current-artifact" in arguments
     for arguments in verification_arguments
-) == 1
-assert "--deep" not in build_arguments + sign_arguments
-assert rows[2][rows[2].index("--type") + 1] == "app"
-assert rows[7][rows[7].index("--type") + 1] == "dmg"
-assert rows[9][rows[9].index("--release-mode") + 1] == "production"
+) == 2
+assert "--deep" not in app_sign_arguments + dmg_sign_arguments
+assert rows[3][rows[3].index("--type") + 1] == "app"
+assert rows[8][rows[8].index("--type") + 1] == "dmg"
+assert rows[10][rows[10].index("--release-mode") + 1] == "production"
 PY
 
 rm -rf "$signed_dmg_output"
@@ -4902,6 +5034,10 @@ if PATH="$signed_dmg_fixture/mock-bin:$PATH" \
   --da3-small-artifact-url https://example.com/small.zip \
   --build-root "$signed_dmg_build_root" \
   --use-existing-toolchain \
+  --prepared-release-root "$signed_dmg_prepared_root" \
+  --prepared-manifest-sha256 "$signed_dmg_prepared_manifest_sha256" \
+  --source-commit "$signed_dmg_source_commit" \
+  --manifest-tool-bin "$signed_dmg_fixture/mock-bin/ManifestTool" \
   --production \
   --identity-fingerprint "$signed_fingerprint" \
   --team-id "$signed_team_id" \
@@ -6971,11 +7107,25 @@ grep -Fq -- '--cached-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER"' "$app_workfl
 grep -Fq -- '--evidence-dir "$EVIDENCE/full-verification"' "$app_workflow"
 grep -Fq 'name: easysplat-live-release-authority-${{ github.run_id }}-${{ github.run_attempt }}' "$app_workflow"
 grep -Fq 'name: easysplat-quarantined-install-${{ github.sha }}' "$app_workflow"
+grep -Fq 'EXACT_HEAD_CHECKS = REQUIRED_CHECKS - {"Pull request dependency review"}' "$app_workflow"
+grep -Fq '"check_runs",' "$app_workflow"
+grep -Fq '?filter=latest&app_id={GITHUB_ACTIONS_APP_ID}&per_page=100' "$app_workflow"
+test "$(grep -Fc -- '--source-commit "$GITHUB_SHA"' "$app_workflow")" -ge 2
 python3 - "$app_workflow" <<'PY'
 import sys
 from pathlib import Path
 
 workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+for required in (
+    'len(candidates) == 1',
+    'latest.get("head_sha") == source_commit',
+    'app.get("id") == GITHUB_ACTIONS_APP_ID',
+    'latest.get("status") == "completed"',
+    'datetime.strptime(',
+    'latest.get("conclusion") == "success"',
+):
+    if required not in workflow:
+        raise SystemExit(f"Exact-head release evidence is missing: {required}")
 job_markers = [
     "  live-policy-preflight:\n",
     "  minimum-macos-compatibility:\n",

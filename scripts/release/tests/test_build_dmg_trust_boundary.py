@@ -14,6 +14,60 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class BuildDMGTrustBoundaryTests(unittest.TestCase):
+    def test_production_requires_a_prepared_release_before_build_work(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as raw:
+            fixture = Path(raw).resolve()
+            repository = fixture / "repository"
+            build_root = fixture / "build"
+            output = fixture / "output"
+            (repository / "scripts/release/lib").mkdir(parents=True)
+            shutil.copy2(
+                ROOT / "scripts/release/build_dmg.sh",
+                repository / "scripts/release/build_dmg.sh",
+            )
+            shutil.copy2(
+                ROOT / "scripts/release/lib/strict_semver.sh",
+                repository / "scripts/release/lib/strict_semver.sh",
+            )
+
+            result = subprocess.run(
+                [
+                    os.fspath(repository / "scripts/release/build_dmg.sh"),
+                    "--app-version",
+                    "0.2.0",
+                    "--toolchain-version",
+                    "2.0.0",
+                    "--manifest-url",
+                    "https://example.com/manifest.json",
+                    "--core-artifact-url",
+                    "https://example.com/core.zip",
+                    "--da3-base-artifact-url",
+                    "https://example.com/base.zip",
+                    "--da3-small-artifact-url",
+                    "https://example.com/small.zip",
+                    "--build-root",
+                    os.fspath(build_root),
+                    "--output-dir",
+                    os.fspath(output),
+                    "--use-existing-toolchain",
+                    "--production",
+                    "--identity-fingerprint",
+                    "A" * 40,
+                    "--team-id",
+                    "ABCDE12345",
+                    "--notary-keychain-profile",
+                    "easysplat-notary",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("requires a prepared release", result.stderr)
+            self.assertFalse(build_root.exists())
+            self.assertFalse(output.exists())
+
     def test_prepared_artifact_manifest_tool_is_never_executed(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as raw:
             fixture = Path(raw).resolve()

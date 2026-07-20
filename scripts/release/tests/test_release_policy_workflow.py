@@ -20,6 +20,7 @@ WORKFLOW_PARSER_START = "          # BEGIN TRUSTED WORKFLOW YAML POLICY PARSER\n
 WORKFLOW_PARSER_END = "          # END TRUSTED WORKFLOW YAML POLICY PARSER\n"
 TAG = "v0.2.0"
 AUTHORITY = "dud8"
+SOURCE_COMMIT = "a" * 40
 GITHUB_ACTIONS_APP_ID = 15368
 REQUIRED_CHECKS = {
     "Swift · macOS 15 arm64 · Xcode 16.4",
@@ -36,6 +37,19 @@ REQUIRED_CHECKS = {
     "Analyze c-cpp",
     "Analyze actions",
 }
+EXACT_HEAD_CHECKS = REQUIRED_CHECKS - {"Pull request dependency review"}
+
+
+def successful_check_run(identifier, name):
+    return {
+        "id": identifier,
+        "name": name,
+        "head_sha": SOURCE_COMMIT,
+        "app": {"id": GITHUB_ACTIONS_APP_ID},
+        "status": "completed",
+        "conclusion": "success",
+        "completed_at": f"2026-07-20T00:00:{identifier:02d}Z",
+    }
 
 
 def valid_snapshot():
@@ -141,6 +155,10 @@ def valid_snapshot():
             ".github/workflows/ci.yml": "permissions:\n  contents: read\n",
             ".github/workflows/release-app.yml": "permissions:\n  contents: read\n",
         },
+        "check_runs": [
+            successful_check_run(identifier, name)
+            for identifier, name in enumerate(sorted(EXACT_HEAD_CHECKS), start=1)
+        ],
         "rulesets": [
             {
                 "id": 42,
@@ -186,7 +204,13 @@ class ReleasePolicyWorkflowTests(unittest.TestCase):
         body = workflow.split(START, 1)[1].split(END, 1)[0]
         cls.checker = textwrap.dedent(body)
 
-    def run_snapshot(self, snapshot, expect_success, parser_hash=None):
+    def run_snapshot(
+        self,
+        snapshot,
+        expect_success,
+        parser_hash=None,
+        source_commit=SOURCE_COMMIT,
+    ):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             checker = root / "checker.py"
@@ -214,6 +238,8 @@ class ReleasePolicyWorkflowTests(unittest.TestCase):
                     "dud8/EasySplat",
                     "--tag",
                     TAG,
+                    "--source-commit",
+                    source_commit,
                 ],
                 check=False,
                 capture_output=True,
@@ -278,6 +304,55 @@ class ReleasePolicyWorkflowTests(unittest.TestCase):
         snapshot = valid_snapshot()
         snapshot["branch"]["required_status_checks"]["checks"][0]["app_id"] = None
         self.run_snapshot(snapshot, False)
+
+    def test_missing_exact_head_check_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["check_runs"] = snapshot["check_runs"][1:]
+        self.run_snapshot(snapshot, False)
+
+    def test_exact_head_check_from_wrong_commit_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["check_runs"][0]["head_sha"] = "b" * 40
+        self.run_snapshot(snapshot, False)
+
+    def test_exact_head_check_from_wrong_app_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["check_runs"][0]["app"]["id"] = 1
+        self.run_snapshot(snapshot, False)
+
+    def test_unsuccessful_exact_head_check_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["check_runs"][0]["conclusion"] = "skipped"
+        self.run_snapshot(snapshot, False)
+
+    def test_duplicate_required_name_fails_closed(self):
+        snapshot = valid_snapshot()
+        current = snapshot["check_runs"][0]
+        current["id"] = 1
+        current["completed_at"] = "2026-07-20T00:01:00Z"
+        stale = copy.deepcopy(current)
+        stale["id"] = 10_000
+        stale["conclusion"] = "skipped"
+        stale["completed_at"] = "2026-07-20T00:00:00Z"
+        snapshot["check_runs"].append(stale)
+        self.run_snapshot(snapshot, False)
+
+    def test_incomplete_exact_head_check_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["check_runs"][0]["status"] = "in_progress"
+        snapshot["check_runs"][0]["conclusion"] = None
+        snapshot["check_runs"][0]["completed_at"] = None
+        self.run_snapshot(snapshot, False)
+
+    def test_duplicate_check_run_identifier_fails(self):
+        snapshot = valid_snapshot()
+        duplicate = copy.deepcopy(snapshot["check_runs"][0])
+        duplicate["name"] = snapshot["check_runs"][1]["name"]
+        snapshot["check_runs"].append(duplicate)
+        self.run_snapshot(snapshot, False)
+
+    def test_noncanonical_source_commit_fails(self):
+        self.run_snapshot(valid_snapshot(), False, source_commit="A" * 40)
 
     def test_writer_collaborator_fails(self):
         snapshot = valid_snapshot()

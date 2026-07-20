@@ -2438,13 +2438,14 @@ class ArtifactContentTests(unittest.TestCase):
                     with self.assertRaisesRegex(MODULE.PublicationError, expected_error):
                         validate(spdx)
 
-    def test_release_timestamps_are_strict_utc_and_cross_bound(self) -> None:
+    def test_release_timestamps_are_strict_utc_and_ordered(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             fixture = supply_chain_fixture(Path(temporary))
             for invalid in (
                 "2026-07-15Z",
                 "2026-13-15T12:00:00Z",
                 "2026-07-15T12:00:00+00:00",
+                "2026-07-15T12:00:00.123Z",
                 "2026-07-15T12:00:00Zjunk",
             ):
                 with self.subTest(timestamp=invalid), mock.patch.object(
@@ -2461,11 +2462,38 @@ class ArtifactContentTests(unittest.TestCase):
                             source_repository=REPOSITORY,
                             source_commit=COMMIT,
                         )
-            with self.assertRaisesRegex(MODULE.PublicationError, "timestamp.*differ"):
+            MODULE.validate_release_timestamps(
+                {"createdAt": "2026-07-15T12:00:01Z"},
+                {"publishedAt": "2026-07-15T12:00:00Z"},
+            )
+            with self.assertRaisesRegex(MODULE.PublicationError, "predates"):
                 MODULE.validate_release_timestamps(
                     {"createdAt": "2026-07-15T12:00:00Z"},
                     {"publishedAt": "2026-07-15T12:00:01Z"},
                 )
+
+    def test_release_metadata_creation_time_is_current_and_not_predated(self) -> None:
+        created_at = GENERATOR.release_created_at(
+            "2026-07-15T12:00:00Z",
+            now=GENERATOR.datetime(
+                2026,
+                7,
+                15,
+                12,
+                0,
+                1,
+                987_654,
+                tzinfo=GENERATOR.timezone.utc,
+            ),
+        )
+        self.assertEqual(created_at, "2026-07-15T12:00:01Z")
+        with self.assertRaisesRegex(GENERATOR.MetadataError, "predates"):
+            GENERATOR.release_created_at(
+                "2026-07-15T12:00:01Z",
+                now=GENERATOR.datetime(
+                    2026, 7, 15, 12, 0, 0, tzinfo=GENERATOR.timezone.utc
+                ),
+            )
 
     def test_semver_comparison_honors_prerelease_precedence(self) -> None:
         ordered = (

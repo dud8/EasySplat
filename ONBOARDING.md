@@ -223,7 +223,7 @@ The full benchmark requires external media matching `scripts/benchmark/corpus.js
 
 ## Releases
 
-Production packaging consumes an existing signed toolchain closure. Call `build_dmg.sh` with explicit HTTPS URLs for the manifest and every component, `--use-existing-toolchain`, and `--production`. It never builds a toolchain, creates a release key, or falls back to an unsigned artifact. Use `./scripts/run.sh` for local toolchain builds and development.
+Production packaging runs only through the protected Release App workflow. Its identity-free job builds and seals the app, dSYM, and signed toolchain closure; the isolated signing job accepts only that authenticated prepared product. `build_dmg.sh --production` is intentionally incomplete without the workflow-supplied prepared-root digest, merged source commit, and independently built `ManifestTool`. It never builds a toolchain, creates a release key, or falls back to an unsigned artifact. Use `./scripts/run.sh` for local toolchain builds and development.
 
 The app release workflow is manual and requires a stable version tag pointing at current protected `main`. Build, signing, notarization, and packaged verification run on isolated Apple Silicon release hosts. The workflow verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, and a quarantined clean installation before assembling the final release closure.
 

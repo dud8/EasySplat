@@ -96,6 +96,7 @@ for language in swift python c-cpp actions; do
   require_line "^[[:space:]]+languages: $language$" "$CODEQL"
   require_line "^[[:space:]]+category: /language:$language$" "$CODEQL"
 done
+require_line '^  workflow_dispatch:$' "$CODEQL"
 if grep -Fq '${{ matrix.' "$CODEQL"; then
   fail "CodeQL required-check identities must not depend on matrix expansion"
 fi

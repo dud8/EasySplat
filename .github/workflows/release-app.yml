@@ -1615,6 +1615,7 @@ jobs:
 
           import argparse
           import base64
+          from datetime import datetime
           import hashlib
           import json
           import os
@@ -1643,6 +1644,7 @@ jobs:
               "Analyze c-cpp",
               "Analyze actions",
           }
+          EXACT_HEAD_CHECKS = REQUIRED_CHECKS - {"Pull request dependency review"}
           SNAPSHOT_NAMES = {
               "repository",
               "branch",
@@ -1656,6 +1658,7 @@ jobs:
               "rulesets",
               "versions",
               "workflows",
+              "check_runs",
           }
 
 
@@ -1855,6 +1858,37 @@ jobs:
               return rows
 
 
+          def flatten_check_run_pages(value, endpoint):
+              require(isinstance(value, list) and value, f"GitHub pagination failed for {endpoint}")
+              rows = []
+              expected_total = None
+              for page in value:
+                  require(isinstance(page, dict), f"GitHub pagination shape differs for {endpoint}")
+                  total = page.get("total_count")
+                  page_rows = page.get("check_runs")
+                  require(
+                      isinstance(total, int)
+                      and total >= 0
+                      and isinstance(page_rows, list),
+                      f"GitHub check-run pagination shape differs for {endpoint}",
+                  )
+                  if expected_total is None:
+                      expected_total = total
+                  require(total == expected_total, f"GitHub check-run total changed for {endpoint}")
+                  rows.extend(page_rows)
+              require(len(rows) == expected_total, f"GitHub check-run pagination is incomplete for {endpoint}")
+              return rows
+
+
+          def validate_source_commit(source_commit):
+              require(
+                  isinstance(source_commit, str)
+                  and len(source_commit) == 40
+                  and all(character in "0123456789abcdef" for character in source_commit),
+                  "release source commit is not a canonical SHA-1",
+              )
+
+
           def environment_is_protected(environment, expected_name, authority):
               require(environment.get("name") == expected_name, f"release environment identity differs: {expected_name}")
               require(environment.get("can_admins_bypass") is False, f"{expected_name} must prevent administrator bypass")
@@ -1886,7 +1920,8 @@ jobs:
                   require(isinstance(login, str) and login and login != authority, f"{expected_name} reviewer is not independent")
 
 
-          def validate(snapshot, repository, tag):
+          def validate(snapshot, repository, tag, source_commit):
+              validate_source_commit(source_commit)
               require(set(snapshot) == SNAPSHOT_NAMES, "release policy snapshot closure is incomplete")
               versions = snapshot["versions"]
               require(
@@ -1938,6 +1973,57 @@ jobs:
               }
               expected_checks = {(context, GITHUB_ACTIONS_APP_ID) for context in REQUIRED_CHECKS}
               require(actual_checks == expected_checks and len(check_rows) == len(expected_checks), "main required checks are not bound to GitHub Actions")
+
+              check_runs = snapshot["check_runs"]
+              require(isinstance(check_runs, list), "exact-head check-run evidence is absent")
+              identifiers = []
+              grouped = {name: [] for name in EXACT_HEAD_CHECKS}
+              for row in check_runs:
+                  require(isinstance(row, dict), "exact-head check-run evidence is malformed")
+                  identifier = row.get("id")
+                  name = row.get("name")
+                  require(
+                      isinstance(identifier, int)
+                      and identifier > 0
+                      and isinstance(name, str)
+                      and name,
+                      "exact-head check-run identity is malformed",
+                  )
+                  identifiers.append(identifier)
+                  if name in grouped:
+                      grouped[name].append(row)
+              require(
+                  len(identifiers) == len(set(identifiers)),
+                  "exact-head check-run identifiers are ambiguous",
+              )
+              for name in sorted(EXACT_HEAD_CHECKS):
+                  candidates = grouped[name]
+                  require(
+                      len(candidates) == 1,
+                      f"latest exact-head required check is absent or ambiguous: {name}",
+                  )
+                  latest = candidates[0]
+                  app = latest.get("app")
+                  require(latest.get("head_sha") == source_commit, f"required check targets another commit: {name}")
+                  require(
+                      isinstance(app, dict) and app.get("id") == GITHUB_ACTIONS_APP_ID,
+                      f"required check is not owned by GitHub Actions: {name}",
+                  )
+                  require(
+                      latest.get("status") == "completed",
+                      f"exact-head required check is not complete: {name}",
+                  )
+                  try:
+                      datetime.strptime(
+                          latest.get("completed_at"),
+                          "%Y-%m-%dT%H:%M:%SZ",
+                      )
+                  except (TypeError, ValueError):
+                      fail(f"required check completion time is invalid: {name}")
+                  require(
+                      latest.get("conclusion") == "success",
+                      f"latest exact-head required check did not succeed: {name}",
+                  )
               require(branch.get("required_linear_history", {}).get("enabled") is True, "main must require linear history")
               require(branch.get("required_conversation_resolution", {}).get("enabled") is True, "main must require conversation resolution")
               require(branch.get("allow_force_pushes", {}).get("enabled") is False, "main must disable force pushes")
@@ -2015,7 +2101,8 @@ jobs:
               return {name: read_json(root / f"{name}.json") for name in SNAPSHOT_NAMES}
 
 
-          def live_snapshot(repository):
+          def live_snapshot(repository, source_commit):
+              validate_source_commit(source_commit)
               versions = api("/versions")
               repository_data = api(f"repos/{repository}")
               branch = api(f"repos/{repository}/branches/main/protection")
@@ -2029,6 +2116,14 @@ jobs:
               key_endpoint = f"repos/{repository}/keys?per_page=100"
               keys = flatten_pages(api(key_endpoint, paginate=True), key_endpoint)
               actions = api(f"repos/{repository}/actions/permissions/workflow")
+              check_run_endpoint = (
+                  f"repos/{repository}/commits/{source_commit}/check-runs"
+                  f"?filter=latest&app_id={GITHUB_ACTIONS_APP_ID}&per_page=100"
+              )
+              check_runs = flatten_check_run_pages(
+                  api(check_run_endpoint, paginate=True),
+                  check_run_endpoint,
+              )
               ruleset_endpoint = f"repos/{repository}/rulesets?targets=tag&per_page=100"
               ruleset_rows = flatten_pages(api(ruleset_endpoint, paginate=True), ruleset_endpoint)
               rulesets = []
@@ -2062,6 +2157,7 @@ jobs:
                   "collaborators": collaborators,
                   "keys": keys,
                   "actions": actions,
+                  "check_runs": check_runs,
                   "rulesets": rulesets,
                   "versions": versions,
                   "workflows": workflows,
@@ -2075,19 +2171,21 @@ jobs:
               live.add_argument("--evidence-dir", required=True, type=Path)
               live.add_argument("--repository", required=True)
               live.add_argument("--tag", required=True)
+              live.add_argument("--source-commit", required=True)
               verify = subparsers.add_parser("verify-snapshot")
               verify.add_argument("--snapshot-dir", required=True, type=Path)
               verify.add_argument("--repository", required=True)
               verify.add_argument("--tag", required=True)
+              verify.add_argument("--source-commit", required=True)
               arguments = parser.parse_args()
               if arguments.command == "live":
                   root = arguments.evidence_dir
                   require(root.is_dir() and not root.is_symlink(), "release policy evidence directory is invalid")
                   require(not any(root.iterdir()), "release policy evidence directory must be empty")
-                  snapshot = live_snapshot(arguments.repository)
+                  snapshot = live_snapshot(arguments.repository, arguments.source_commit)
                   for name in sorted(SNAPSHOT_NAMES):
                       write_json(root, name, snapshot[name])
-                  validate(snapshot, arguments.repository, arguments.tag)
+                  validate(snapshot, arguments.repository, arguments.tag, arguments.source_commit)
                   root_descriptor = os.open(root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
                   try:
                       os.fsync(root_descriptor)
@@ -2095,7 +2193,7 @@ jobs:
                       os.close(root_descriptor)
               else:
                   snapshot = load_snapshot(arguments.snapshot_dir)
-                  validate(snapshot, arguments.repository, arguments.tag)
+                  validate(snapshot, arguments.repository, arguments.tag, arguments.source_commit)
               print(
                   f"Draft policy verified for {arguments.repository} {arguments.tag}. "
                   "GitHub App write authority is not authoritatively inventoryable by the release PAT; "
@@ -2254,7 +2352,8 @@ jobs:
           "$RELEASE_POLICY_CHECKER" live \
             --evidence-dir "$LIVE_POLICY_ROOT" \
             --repository "$GITHUB_REPOSITORY" \
-            --tag "$TAG"
+            --tag "$TAG" \
+            --source-commit "$GITHUB_SHA"
           test "$GITHUB_REF" = "refs/heads/main"
           test "$DEFAULT_BRANCH" = "main"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = "true"
@@ -2915,7 +3014,8 @@ jobs:
           "$RELEASE_POLICY_CHECKER" live \
             --evidence-dir "$FINAL_POLICY_ROOT" \
             --repository "$GITHUB_REPOSITORY" \
-            --tag "$TAG"
+            --tag "$TAG" \
+            --source-commit "$GITHUB_SHA"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = "true"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" = "$GITHUB_SHA"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)" = "$GITHUB_SHA"

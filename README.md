@@ -174,24 +174,9 @@ Fixture reproducibility proves input integrity only. The integrated geometry-con
 
 ## Release builds
 
-Stable release packaging consumes an already signed toolchain closure. The production build uses explicit release inputs:
+Stable release packaging is performed only by the protected **Release App** workflow. It checks out the exact `v0.2.0` commit on protected `main`, builds an identity-free prepared product, and hands those authenticated bytes to the isolated signing environment. `build_dmg.sh --production` intentionally rejects a live source checkout.
 
-```bash
-./scripts/release/build_dmg.sh \
-  --app-version 0.2.0 \
-  --toolchain-version 2.0.0 \
-  --manifest-url https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json \
-  --core-artifact-url https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-macos-arm64-2.0.0-core.zip \
-  --da3-base-artifact-url https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-geometry-da3-base-2.0.0.zip \
-  --da3-small-artifact-url https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-geometry-da3-small-2.0.0.zip \
-  --use-existing-toolchain \
-  --production \
-  --identity-fingerprint "$EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1" \
-  --team-id "$EASYSPLAT_DEVELOPER_TEAM_ID" \
-  --notary-keychain-profile "$EASYSPLAT_NOTARY_KEYCHAIN_PROFILE"
-```
-
-The signed manifest, public key, and component archives must already be present under `Toolchains/`. Toolchain Producer builds the native components on an identity-free host, signs and notarizes them in isolation, then emits a request over those final bytes. The external authority signs that exact request. Release benchmarks bind the resulting closure; Toolchain Publication verifies its authority and benchmark evidence before staging the release. `./scripts/run.sh` remains the development entry point.
+The signed manifest, public key, and component archives must already come from Toolchain Publication. Toolchain Producer builds the native components on an identity-free host, signs and notarizes them in isolation, then emits a request over those final bytes. The external authority signs that exact request. Release benchmarks bind the resulting closure; Toolchain Publication verifies its authority and benchmark evidence before staging the release. `./scripts/run.sh` remains the development entry point.
 
 The release workflow builds from a version tag on protected `main`, verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, a quarantined install, the DMG, checksums, SBOM, licenses, and provenance. Publication remains a human action.
 
