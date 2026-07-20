@@ -134,6 +134,12 @@ class FakeReleaseAPI:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.publication = root / "publication"
+        self.runner_temp = root / "runner"
+        self.evidence_root = self.runner_temp / "manual-publication-evidence"
+        self.release_id_file = self.runner_temp / "draft-release-id"
+        self.publication.mkdir(mode=0o700)
+        self.runner_temp.mkdir(mode=0o700)
         self.tag = f"toolchain-v{self.version}"
         self.owner = (
             f"<!-- easysplat-toolchain-release-owner:v1:{self.repository}:"
@@ -160,6 +166,10 @@ class FakeReleaseAPI:
         self.uploaded: list[str] = []
         self.immutable_policy_calls = 0
         self.immutable_policy_states = [True]
+        self.main_ref_calls = 0
+        self.main_ref_states = [self.commit]
+        self.tag_ref_calls = 0
+        self.tag_ref_states = [self.commit]
 
     @property
     def names(self) -> list[str]:
@@ -175,7 +185,7 @@ class FakeReleaseAPI:
         ]
 
     def asset(self, name: str, data: bytes | None = None) -> dict[str, object]:
-        payload = (self.root / name).read_bytes() if data is None else data
+        payload = (self.publication / name).read_bytes() if data is None else data
         return {
             "id": self.names.index(name) + 1001,
             "name": name,
@@ -184,6 +194,10 @@ class FakeReleaseAPI:
             "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
         }
 
+    def write_assets(self) -> None:
+        for name in self.names:
+            (self.publication / name).write_bytes(name.encode("utf-8"))
+
     def urlopen(self, call: object, *, timeout: int) -> FakeJSONResponse:
         if timeout != 120:
             raise AssertionError("unexpected API timeout")
@@ -191,6 +205,20 @@ class FakeReleaseAPI:
         method = call.get_method()
         parsed = urllib.parse.urlsplit(url)
         releases_path = f"/repos/{self.repository}/releases"
+        if method == "GET" and parsed.path == f"/repos/{self.repository}/branches/main":
+            commit = self.main_ref_states[
+                min(self.main_ref_calls, len(self.main_ref_states) - 1)
+            ]
+            self.main_ref_calls += 1
+            return FakeJSONResponse({"protected": True, "commit": {"sha": commit}})
+        if method == "GET" and parsed.path == (
+            f"/repos/{self.repository}/commits/refs%2Ftags%2F{self.tag}"
+        ):
+            commit = self.tag_ref_states[
+                min(self.tag_ref_calls, len(self.tag_ref_states) - 1)
+            ]
+            self.tag_ref_calls += 1
+            return FakeJSONResponse({"sha": commit})
         if method == "GET" and parsed.path == f"/repos/{self.repository}/immutable-releases":
             state = self.immutable_policy_states[
                 min(self.immutable_policy_calls, len(self.immutable_policy_states) - 1)
@@ -246,8 +274,15 @@ class FakeReleaseAPI:
             "GITHUB_SHA": self.commit,
             "GH_TOKEN": "fixture-token",
             "VERSION": self.version,
-            "PUBLICATION": str(self.root),
+            "PUBLICATION": str(self.publication),
+            "EVIDENCE_ROOT": str(self.evidence_root),
+            "RELEASE_ID_FILE": str(self.release_id_file),
+            "VERIFIED_PUBLICATION_ARTIFACT_ID": "777",
+            "VERIFIED_PUBLICATION_ARTIFACT_DIGEST": "sha256:" + "b" * 64,
+            "GITHUB_RUN_ID": "888",
+            "GITHUB_RUN_ATTEMPT": "2",
         }
+        self.evidence_root.mkdir(mode=0o700)
         with (
             mock.patch.dict(os.environ, environment, clear=False),
             mock.patch("urllib.request.urlopen", side_effect=self.urlopen),
@@ -599,13 +634,25 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             'release.get("target_commitish") != commit',
             'release.get("name") != tag',
             'release.get("body") != owner',
-            'release.get("immutable") is True',
+            'release.get("immutable") is not False',
             'f"{api}/immutable-releases"',
             "require_immutable_release_policy()",
+            "require_protected_source_refs()",
+            "protected main moved during toolchain publication",
+            "toolchain tag moved during publication",
             'state == "starter"',
             'state != "uploaded"',
             'f"{api}/releases/assets/{asset[\'id\']}"',
             "duplicate asset",
+            "manual-publication-request.json",
+            '"resolved_tag_commit": resolved_tag_commit',
+            '"retention_days": 45',
+            "VERIFIED_PUBLICATION_ARTIFACT_ID",
+            "publication_boundary",
+            "independent_human_exact_id_refetch",
+            "Preserve manual publication evidence",
+            "toolchain-manual-publication-${{ github.sha }}",
+            "Report the preserved owned draft",
         ):
             self.assertIn(required, draft)
         for forbidden in (
@@ -620,15 +667,30 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             "/releases/tags/",
         ):
             self.assertNotIn(forbidden, draft)
-        self.assertNotIn("GITHUB_RUN_ID", draft)
         self.assertEqual(draft.count("          require_immutable_release_policy()"), 2)
+        self.assertEqual(
+            draft.count(
+                "          resolved_tag_commit = require_protected_source_refs()"
+            ),
+            2,
+        )
+
+        first_ref_check = draft.index(
+            "          resolved_tag_commit = require_protected_source_refs()"
+        )
+        first_mutation = draft.index("              created = request(")
+        final_ref_check = draft.rindex(
+            "          resolved_tag_commit = require_protected_source_refs()"
+        )
+        evidence = draft.index("          evidence = {")
+        self.assertLess(first_ref_check, first_mutation)
+        self.assertLess(final_ref_check, evidence)
 
     def test_draft_publisher_requires_immutable_releases_before_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             api = FakeReleaseAPI(root)
-            for name in api.names:
-                (root / name).write_bytes(name.encode("utf-8"))
+            api.write_assets()
             api.pages = [[]]
             api.immutable_policy_states = [False]
 
@@ -643,8 +705,7 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             api = FakeReleaseAPI(root)
-            for name in api.names:
-                (root / name).write_bytes(name.encode("utf-8"))
+            api.write_assets()
             api.pages = [[]]
             api.immutable_policy_states = [True, False]
 
@@ -659,8 +720,7 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             api = FakeReleaseAPI(root)
-            for name in api.names:
-                (root / name).write_bytes(name.encode("utf-8"))
+            api.write_assets()
             api.pages = [[]]
 
             api.run()
@@ -671,6 +731,107 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             self.assertEqual(
                 {asset["name"] for asset in api.release["assets"]}, set(api.names)
             )
+            evidence = json.loads(
+                (api.evidence_root / "manual-publication-request.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                set(evidence),
+                {
+                    "assets",
+                    "body",
+                    "current_release_state",
+                    "owner",
+                    "publication_boundary",
+                    "publication_request",
+                    "release_id",
+                    "repository",
+                    "resolved_tag_commit",
+                    "schema_version",
+                    "source_commit",
+                    "tag",
+                    "verified_publication_artifact",
+                    "workflow_run_attempt",
+                    "workflow_run_id",
+                },
+            )
+            self.assertEqual(evidence["release_id"], api.release_id)
+            self.assertEqual(evidence["repository"], api.repository)
+            self.assertEqual(evidence["source_commit"], api.commit)
+            self.assertEqual(evidence["tag"], api.tag)
+            self.assertEqual(evidence["resolved_tag_commit"], api.commit)
+            self.assertEqual(evidence["owner"], api.owner)
+            self.assertEqual(
+                evidence["current_release_state"],
+                {"draft": True, "immutable": False, "prerelease": False},
+            )
+            self.assertEqual(
+                evidence["publication_request"],
+                {"draft": False, "make_latest": "false", "prerelease": False},
+            )
+            self.assertEqual(
+                evidence["verified_publication_artifact"],
+                {
+                    "digest": "sha256:" + "b" * 64,
+                    "id": 777,
+                    "retention_days": 45,
+                },
+            )
+            self.assertEqual(
+                evidence["assets"],
+                sorted(
+                    [
+                        {
+                            "digest": asset["digest"],
+                            "id": asset["id"],
+                            "name": asset["name"],
+                            "size_bytes": asset["size"],
+                        }
+                        for asset in api.release["assets"]
+                    ],
+                    key=lambda asset: asset["name"],
+                ),
+            )
+            self.assertEqual(api.release_id_file.read_text(encoding="utf-8"), "321\n")
+
+    def test_draft_publisher_rejects_moved_source_refs_before_mutation(self) -> None:
+        for ref in ("main", "tag"):
+            with self.subTest(ref=ref), tempfile.TemporaryDirectory() as raw:
+                api = FakeReleaseAPI(Path(raw))
+                api.write_assets()
+                api.pages = [[]]
+                if ref == "main":
+                    api.main_ref_states = ["c" * 40]
+                else:
+                    api.tag_ref_states = ["c" * 40]
+
+                with self.assertRaises(SystemExit):
+                    api.run()
+
+                self.assertEqual(api.created, 0)
+                self.assertEqual(api.deleted, [])
+                self.assertEqual(api.uploaded, [])
+
+    def test_draft_publisher_rejects_moved_source_refs_before_handoff(self) -> None:
+        for ref in ("main", "tag"):
+            with self.subTest(ref=ref), tempfile.TemporaryDirectory() as raw:
+                api = FakeReleaseAPI(Path(raw))
+                api.write_assets()
+                api.pages = [[]]
+                if ref == "main":
+                    api.main_ref_states = [api.commit, "c" * 40]
+                else:
+                    api.tag_ref_states = [api.commit, "c" * 40]
+
+                with self.assertRaises(SystemExit):
+                    api.run()
+
+                self.assertEqual(api.created, 1)
+                self.assertEqual(set(api.uploaded), set(api.names))
+                self.assertFalse(
+                    (api.evidence_root / "manual-publication-request.json").exists()
+                )
 
     def test_draft_publisher_resumes_a_later_page_and_only_uploads_missing_assets(
         self,
@@ -678,8 +839,7 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             api = FakeReleaseAPI(root)
-            for name in api.names:
-                (root / name).write_bytes(name.encode("utf-8"))
+            api.write_assets()
             present = api.names[:4]
             starter = {
                 **api.asset(api.names[4]),
@@ -720,8 +880,7 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as raw:
                 root = Path(raw)
                 api = FakeReleaseAPI(root)
-                for name in api.names:
-                    (root / name).write_bytes(name.encode("utf-8"))
+                api.write_assets()
                 assets = [api.asset(name) for name in api.names]
                 api.release["assets"] = assets
                 if case == "duplicate-tag":

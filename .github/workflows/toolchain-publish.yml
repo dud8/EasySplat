@@ -451,7 +451,7 @@ jobs:
           path: ${{ runner.temp }}/verified-toolchain-publication
           if-no-files-found: error
           compression-level: 0
-          retention-days: 14
+          retention-days: 45
 
   minimum-macos-compatibility:
     if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
@@ -503,9 +503,16 @@ jobs:
           GH_TOKEN: ${{ secrets.EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN }}
           VERSION: ${{ inputs.version }}
           PUBLICATION: ${{ runner.temp }}/verified-toolchain-publication
+          EVIDENCE_ROOT: ${{ runner.temp }}/toolchain-manual-publication-evidence
+          RELEASE_ID_FILE: ${{ runner.temp }}/toolchain-draft-release-id
+          VERIFIED_PUBLICATION_ARTIFACT_ID: ${{ needs.verify-publication.outputs.artifact_id }}
+          VERIFIED_PUBLICATION_ARTIFACT_DIGEST: ${{ needs.verify-publication.outputs.artifact_digest }}
         run: |
           set -euo pipefail
           test -n "$GH_TOKEN"
+          test ! -e "$EVIDENCE_ROOT"
+          test ! -e "$RELEASE_ID_FILE"
+          mkdir -m 0700 "$EVIDENCE_ROOT"
           echo "draft=true prerelease=false"
           python3 -I - <<'PY'
           import hashlib
@@ -513,6 +520,7 @@ jobs:
           import json
           import mimetypes
           import os
+          import re
           import urllib.parse
           import urllib.request
           from pathlib import Path
@@ -522,6 +530,21 @@ jobs:
           token = os.environ["GH_TOKEN"]
           version = os.environ["VERSION"]
           root = Path(os.environ["PUBLICATION"])
+          evidence_root = Path(os.environ["EVIDENCE_ROOT"])
+          release_id_file = Path(os.environ["RELEASE_ID_FILE"])
+          verified_artifact_id = os.environ["VERIFIED_PUBLICATION_ARTIFACT_ID"]
+          verified_artifact_digest = os.environ["VERIFIED_PUBLICATION_ARTIFACT_DIGEST"]
+          workflow_run_id = os.environ["GITHUB_RUN_ID"]
+          workflow_run_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          for value in (
+              verified_artifact_id,
+              workflow_run_id,
+              workflow_run_attempt,
+          ):
+              if re.fullmatch(r"[1-9][0-9]*", value) is None:
+                  raise SystemExit("toolchain publication evidence identity is invalid")
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", verified_artifact_digest) is None:
+              raise SystemExit("verified publication artifact digest is invalid")
           tag = f"toolchain-v{version}"
           owner = (
               f"<!-- easysplat-toolchain-release-owner:v1:"
@@ -597,6 +620,25 @@ jobs:
               if not isinstance(policy, dict) or policy.get("enabled") is not True:
                   raise SystemExit("immutable releases must be enabled before toolchain publication")
 
+          def require_protected_source_refs():
+              branch = request("GET", f"{api}/branches/main")
+              branch_commit = branch.get("commit") if isinstance(branch, dict) else None
+              if (
+                  not isinstance(branch_commit, dict)
+                  or branch.get("protected") is not True
+                  or branch_commit.get("sha") != commit
+              ):
+                  raise SystemExit("protected main moved during toolchain publication")
+              resolved_tag = request(
+                  "GET", f"{api}/commits/refs%2Ftags%2F{tag}"
+              )
+              tag_commit = (
+                  resolved_tag.get("sha") if isinstance(resolved_tag, dict) else None
+              )
+              if tag_commit != commit:
+                  raise SystemExit("toolchain tag moved during publication")
+              return tag_commit
+
           def next_page_url(link):
               if link is None:
                   return None
@@ -637,6 +679,31 @@ jobs:
                   for block in iter(lambda: source.read(1024 * 1024), b""):
                       digest.update(block)
               return digest.hexdigest()
+
+          def write_private(path, payload):
+              descriptor = os.open(
+                  path,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                  0o600,
+              )
+              try:
+                  written = 0
+                  while written < len(payload):
+                      count = os.write(descriptor, payload[written:])
+                      if count <= 0:
+                          raise SystemExit("private release evidence write stalled")
+                      written += count
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+              directory = os.open(
+                  path.parent,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+              )
+              try:
+                  os.fsync(directory)
+              finally:
+                  os.close(directory)
 
           def upload_file(url, path, content_type, release_id):
               parsed = urllib.parse.urlsplit(url)
@@ -695,7 +762,7 @@ jobs:
               if (
                   release.get("draft") is not True
                   or release.get("prerelease") is not False
-                  or release.get("immutable") is True
+                  or release.get("immutable") is not False
               ):
                   raise SystemExit("toolchain release is not the expected mutable stable draft")
 
@@ -740,6 +807,7 @@ jobs:
                   raise SystemExit("toolchain draft asset closure is not exact")
               return by_name, starters
 
+          resolved_tag_commit = require_protected_source_refs()
           require_immutable_release_policy()
           matches = [
               release
@@ -779,6 +847,8 @@ jobs:
                   or release_id <= 0
               ):
                   raise SystemExit("created toolchain draft has an invalid identifier")
+
+          write_private(release_id_file, f"{release_id}\n".encode("utf-8"))
 
           release = request("GET", f"{api}/releases/{release_id}")
           validate_release(release, release_id)
@@ -826,4 +896,119 @@ jobs:
               ):
                   raise SystemExit(f"uploaded draft asset failed byte verification: {name}")
           require_immutable_release_policy()
+          resolved_tag_commit = require_protected_source_refs()
+          evidence = {
+              "assets": [
+                  {
+                      "digest": assets[name]["digest"],
+                      "id": assets[name]["id"],
+                      "name": name,
+                      "size_bytes": assets[name]["size"],
+                  }
+                  for name in sorted(names)
+              ],
+              "body": owner,
+              "current_release_state": {
+                  "draft": True,
+                  "immutable": False,
+                  "prerelease": False,
+              },
+              "owner": owner,
+              "publication_boundary": "independent_human_exact_id_refetch",
+              "publication_request": {
+                  "draft": False,
+                  "make_latest": "false",
+                  "prerelease": False,
+              },
+              "release_id": release_id,
+              "repository": repository,
+              "schema_version": 1,
+              "source_commit": commit,
+              "tag": tag,
+              "resolved_tag_commit": resolved_tag_commit,
+              "verified_publication_artifact": {
+                  "digest": verified_artifact_digest,
+                  "id": int(verified_artifact_id),
+                  "retention_days": 45,
+              },
+              "workflow_run_attempt": int(workflow_run_attempt),
+              "workflow_run_id": int(workflow_run_id),
+          }
+          encoded_evidence = (
+              json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+          ).encode("utf-8")
+          write_private(
+              evidence_root / "manual-publication-request.json",
+              encoded_evidence,
+          )
           PY
+          RELEASE_ID="$(cat "$RELEASE_ID_FILE")"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Stable toolchain release draft ready
+
+          Draft release ID: \`$RELEASE_ID\`
+
+          GitHub's release API does not expose compare-and-swap or an exclusive publication lease. Before publishing, independently re-fetch this exact release ID and match its repository, tag, source commit, owner body, draft/stable state, verified-publication artifact, and every remote asset ID, size, and SHA-256 digest. This workflow intentionally leaves the verified stable toolchain release as a draft.
+          EOF
+
+      - name: Preserve manual publication evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-manual-publication-${{ github.sha }}
+          path: ${{ runner.temp }}/toolchain-manual-publication-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Report the preserved owned draft
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_ID_FILE="$RUNNER_TEMP/toolchain-draft-release-id"
+          test -f "$RELEASE_ID_FILE" || exit 0
+          RELEASE_ID="$(cat "$RELEASE_ID_FILE")"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+          RELEASE_JSON="$RUNNER_TEMP/toolchain-incomplete-release.json"
+          if ! gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$RELEASE_JSON" 2>/dev/null
+          then
+            echo "Stored toolchain release ID $RELEASE_ID could not be reverified; no cleanup was attempted." >&2
+            exit 0
+          fi
+          if python3 -I - "$RELEASE_JSON" "$RELEASE_ID" "$GITHUB_REPOSITORY" \
+            "$GITHUB_SHA" "toolchain-v$VERSION" <<'PY'
+          import json
+          import sys
+
+          path, release_id, repository, commit, tag = sys.argv[1:]
+          owner = (
+              f"<!-- easysplat-toolchain-release-owner:v1:"
+              f"{repository}:{tag}:{commit} -->"
+          )
+          with open(path, encoding="utf-8") as source:
+              release = json.load(source)
+          valid = (
+              isinstance(release, dict)
+              and release.get("id") == int(release_id)
+              and release.get("tag_name") == tag
+              and release.get("target_commitish") == commit
+              and release.get("name") == tag
+              and release.get("body") == owner
+              and release.get("draft") is True
+              and release.get("prerelease") is False
+              and release.get("immutable") is False
+          )
+          raise SystemExit(0 if valid else 1)
+          PY
+          then
+            cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Unpublished toolchain draft preserved
+
+          Owned draft release ID \`$RELEASE_ID\` remains unpublished. Re-run Toolchain Publication with the same exact evidence after correcting the failure; the workflow will revalidate and resume this draft.
+          EOF
+          else
+            echo "Stored toolchain release ID $RELEASE_ID no longer matches the owned draft; no cleanup was attempted." >&2
+          fi

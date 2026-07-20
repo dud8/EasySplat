@@ -552,6 +552,7 @@ for contract in \
   'actions/artifacts/$BENCHMARK_ARTIFACT_ID/zip' \
   'actions/artifacts/$AUTHORITY_PAYLOAD_ARTIFACT_ID/zip' \
   'actions/artifacts/$AUTHORITY_RECEIPT_ARTIFACT_ID/zip' \
+  '.github/workflows/sign-toolchain-authority.yml' \
   'benchmark-transport.json' \
   'verifiedSuiteSHA256' \
   'toolchain-authority-handoff-${{ github.run_id }}-${{ github.run_attempt }}'; do
@@ -604,6 +605,9 @@ for contract in \
   'easysplat-toolchain-release-owner:v1:' \
   'release.get("target_commitish") != commit' \
   'release.get("body") != owner' \
+  'require_protected_source_refs()' \
+  'protected main moved during toolchain publication' \
+  'toolchain tag moved during publication' \
   'require_immutable_release_policy()' \
   'f"{api}/immutable-releases"' \
   'state == "starter"' \
@@ -614,12 +618,23 @@ for contract in \
   'toolchain-authority-envelope.json' \
   'toolchain-authority-receipt.json' \
   'toolchain-benchmark-evidence.json' \
+  'manual-publication-request.json' \
+  '"resolved_tag_commit": resolved_tag_commit' \
+  '"retention_days": 45' \
+  'independent_human_exact_id_refetch' \
+  'toolchain-manual-publication-${{ github.sha }}' \
+  'Report the preserved owned draft' \
+  'every remote asset ID, size, and SHA-256 digest' \
   'http.client.HTTPSConnection'; do
   grep -Fq -- "$contract" <<<"$stage_draft_block" \
     || fail "toolchain draft publication is missing: $contract"
 done
 [ "$(grep -Fc '          require_immutable_release_policy()' <<<"$stage_draft_block")" -eq 2 ] \
   || fail "toolchain publication must recheck immutable-release policy before and after mutation"
+[ "$(grep -Fc '          resolved_tag_commit = require_protected_source_refs()' <<<"$stage_draft_block")" -eq 2 ] \
+  || fail "toolchain publication must resolve protected source refs before mutation and before handoff"
+grep -Fq '          retention-days: 45' "$TOOLCHAIN_PUBLISH" \
+  || fail "verified toolchain publication must outlive the 30-day manual handoff"
 if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]|notarize_artifact|finalize_signed_toolchain|read_bytes\(' <<<"$stage_draft_block"; then
   fail "toolchain publication must only stream the exact verified artifact closure"
 fi
@@ -659,6 +674,7 @@ for contract in \
   'refs/tags/toolchain-v$VERSION' \
   'repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2Ftoolchain-v$VERSION' \
   'toolchain-benchmark-handoff-${{ github.run_id }}-${{ github.run_attempt }}' \
+  '.github/workflows/sign-toolchain-authority.yml' \
   'authority-transport.json'; do
   grep -Fq -- "$contract" <<<"$benchmark_bind_block" \
     || fail "signed toolchain benchmark binding is missing: $contract"

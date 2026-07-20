@@ -12,6 +12,9 @@ ROOT = Path(__file__).resolve().parents[3]
 PRODUCER = (ROOT / ".github/workflows/toolchain-build.yml").read_text(encoding="utf-8")
 PUBLISH_PATH = ROOT / ".github/workflows/toolchain-publish.yml"
 PUBLISH = PUBLISH_PATH.read_text(encoding="utf-8") if PUBLISH_PATH.exists() else ""
+BENCHMARK = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
+    encoding="utf-8"
+)
 
 
 def job_block(source: str, name: str) -> str:
@@ -60,6 +63,14 @@ class ToolchainAuthorityHandoffTests(unittest.TestCase):
             "benchmark_artifact_digest:",
         ):
             self.assertIn(required, inputs)
+
+    def test_authority_consumers_require_the_sign_only_workflow(self) -> None:
+        sign_only = ".github/workflows/sign-toolchain-authority.yml"
+        publishing = ".github/workflows/release-toolchain.yml"
+        self.assertIn(sign_only, PUBLISH)
+        self.assertIn(sign_only, BENCHMARK)
+        self.assertNotIn(publishing, PUBLISH)
+        self.assertNotIn(publishing, BENCHMARK)
 
     def test_preflight_downloads_private_bytes_but_executes_no_repo_code(self) -> None:
         block = job_block(PUBLISH, "metadata-preflight")

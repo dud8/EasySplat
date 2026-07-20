@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 import importlib.util
-import re
 import unittest
 
 
@@ -113,6 +112,10 @@ class StableReleaseContractTests(unittest.TestCase):
         self.assertIn('default: "0.2.0"', source)
         self.assertIn("environment: toolchain-release", source)
         self.assertIn("environment: toolchain-publication", source)
+        self.assertIn("toolchain-manual-publication-${{ github.sha }}", source)
+        self.assertIn("retention-days: 45", source)
+        self.assertIn("independent_human_exact_id_refetch", source)
+        self.assertIn("This workflow intentionally leaves the verified stable toolchain release as a draft.", source)
         self.assertNotIn("environment: release-signing", source)
         self.assertNotIn("public-beta", source)
 
