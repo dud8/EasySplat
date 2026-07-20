@@ -106,9 +106,9 @@ final class UnorderedPhotoProductBoundaryTests: XCTestCase {
             requiredAtomicWorkspaceReserveBytes: 0,
             limits: .init(
                 maximumPhotoCount: 8,
-                maximumTotalBytes: 8 * 1_024 * 1_024,
-                maximumSinglePhotoBytes: 1_024 * 1_024,
-                maximumPixelCount: 1_024 * 1_024,
+                maximumTotalBytes: Int64(8) * 1_024 * 1_024,
+                maximumSinglePhotoBytes: Int64(1_024) * 1_024,
+                maximumPixelCount: Int64(1_024) * 1_024,
                 maximumDecodedDimension: 128,
                 maximumTraversalEntryCount: 16,
                 maximumRecursionDepth: 2,

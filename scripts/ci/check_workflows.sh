@@ -71,6 +71,22 @@ require_line '^[[:space:]]+test "\$\(uname -m\)" = "arm64"$' "$TESTS"
 require_line '^[[:space:]]+memory_bytes="\$\(sysctl -n hw\.memsize\)"$' "$TESTS"
 require_line '^[[:space:]]+swift test --filter RunPlanResolverTests$' "$TESTS"
 require_line '^[[:space:]]+--require-hashes --requirement scripts/benchmark/requirements\.txt$' "$TESTS"
+native_msplat_block="$(awk '
+  /^  native-msplat:$/ { in_job = 1 }
+  in_job { print }
+  in_job && /^  repo-health:$/ { exit }
+' "$TESTS")"
+for contract in \
+  '      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6' \
+  '          python-version: "3.12"' \
+  '          python -m pip install --disable-pip-version-check --no-input \' \
+  '            --require-hashes --requirement scripts/benchmark/requirements.txt'; do
+  grep -Fq "$contract" <<<"$native_msplat_block" \
+    || fail "native Metal validation must install its hash-locked Python fixture dependencies: $contract"
+done
+if grep -Fq '          cache: pip' <<<"$native_msplat_block"; then
+  fail "native Metal validation must not depend on a mutable pip cache"
+fi
 repo_health_block="$(awk '
   /^  repo-health:$/ { in_job = 1 }
   in_job { print }
