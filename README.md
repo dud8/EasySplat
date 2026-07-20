@@ -178,7 +178,9 @@ Stable release packaging is performed only by the protected **Release App** work
 
 The signed manifest, public key, and component archives must already come from Toolchain Publication. Toolchain Producer builds the native components on an identity-free host, signs and notarizes them in isolation, then emits a request over those final bytes. The external authority signs that exact request. Release benchmarks bind the resulting closure; Toolchain Publication verifies its authority and benchmark evidence before staging the release. `./scripts/run.sh` remains the development entry point.
 
-The release workflow builds from a version tag on protected `main`, verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, a quarantined install, the DMG, checksums, SBOM, licenses, and provenance. Publication remains a human action.
+The release order is fixed: merge the reviewed release commit into protected `main`; make the repository public only after the owner approves publication and rotates any exposed credentials; manually dispatch CodeQL on that exact `main` commit and confirm all four CodeQL checks pass; create the immutable version tag at the same commit; then run Release App. Creating a tag while the old private-repository workflows are still on `main` is unsupported.
+
+Release App verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, a quarantined install, the DMG, checksums, SBOM, licenses, and provenance. It can resume only its exact repository/tag/commit-owned draft and rejects different or foreign assets. Final publication remains a separate human action.
 
 ## License
 

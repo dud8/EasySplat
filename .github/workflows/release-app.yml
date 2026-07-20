@@ -82,7 +82,7 @@ jobs:
           EXISTING_RELEASE="$RUNNER_TEMP/easysplat-existing-release.json"
           if gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
               "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >"$EXISTING_RELEASE" 2>/dev/null; then
-            OWNER="easysplat-release-owner:v2:${GITHUB_RUN_ID}:${GITHUB_SHA}"
+            OWNER="easysplat-release-owner:v3:${GITHUB_REPOSITORY}:${TAG}:${GITHUB_SHA}"
             jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" --arg owner "<!-- $OWNER -->" '
               (.id | type == "number" and . > 0) and
               .tag_name == $tag and .target_commitish == $commit and
@@ -679,7 +679,7 @@ jobs:
           EXISTING_RELEASE="$RUNNER_TEMP/easysplat-existing-release-before-signing.json"
           if gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
               "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >"$EXISTING_RELEASE" 2>/dev/null; then
-            OWNER="easysplat-release-owner:v2:${GITHUB_RUN_ID}:${GITHUB_SHA}"
+            OWNER="easysplat-release-owner:v3:${GITHUB_REPOSITORY}:${TAG}:${GITHUB_SHA}"
             test "$(/usr/bin/plutil -extract tag_name raw -o - "$EXISTING_RELEASE")" = "$TAG"
             test "$(/usr/bin/plutil -extract target_commitish raw -o - "$EXISTING_RELEASE")" = "$AUTHORIZED_SOURCE"
             test "$(/usr/bin/plutil -extract draft raw -o - "$EXISTING_RELEASE")" = "true"
@@ -2376,7 +2376,7 @@ jobs:
           test ! -e "$DRAFT_JSON"
           test ! -e "$DRAFT_MODE_FILE"
           test ! -e "$PENDING_ASSETS_FILE"
-          DRAFT_OWNER="easysplat-release-owner:v2:${GITHUB_RUN_ID}:${GITHUB_SHA}"
+          DRAFT_OWNER="easysplat-release-owner:v3:${GITHUB_REPOSITORY}:${TAG}:${GITHUB_SHA}"
           umask 077
           printf '%s\n' "$DRAFT_OWNER" >"$DRAFT_OWNER_FILE"
           cp "$PUBLICATION_ROOT/EasySplat-$VERSION-release-notes.txt" "$DRAFT_NOTES_FILE"
@@ -2577,10 +2577,11 @@ jobs:
               raise SystemExit("draft release API response is oversized")
           release = json.loads(release_path.read_text(encoding="utf-8"))
           owner = owner_path.read_text(encoding="utf-8").strip()
-          if not re.fullmatch(
-              r"easysplat-release-owner:v2:[1-9][0-9]*:[0-9a-f]{40}",
-              owner,
-          ):
+          expected_owner = (
+              f"easysplat-release-owner:v3:{os.environ['GITHUB_REPOSITORY']}:"
+              f"{os.environ['TAG']}:{os.environ['GITHUB_SHA']}"
+          )
+          if owner != expected_owner:
               raise SystemExit("draft owner marker is invalid")
           expected_id = int((Path(os.environ["RUNNER_TEMP"]) / "easysplat-draft-release-id").read_text(encoding="ascii"))
           if release.get("id") != expected_id:
@@ -2838,10 +2839,11 @@ jobs:
               os.close(root_descriptor)
 
           owner = read_stable_file(Path(owner_value), 512).decode("utf-8").strip()
-          if not re.fullmatch(
-              r"easysplat-release-owner:v2:[1-9][0-9]*:[0-9a-f]{40}",
-              owner,
-          ):
+          expected_owner = (
+              f"easysplat-release-owner:v3:{os.environ['GITHUB_REPOSITORY']}:"
+              f"{expected_tag}:{expected_commit}"
+          )
+          if owner != expected_owner:
               raise SystemExit("draft owner marker is invalid")
           release_id_text = read_stable_file(Path(release_id_value), 64).decode("ascii").strip()
           if not re.fullmatch(r"[1-9][0-9]*", release_id_text):
@@ -2967,10 +2969,11 @@ jobs:
               if not isinstance(asset["digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", asset["digest"]):
                   raise SystemExit(f"final local release asset digest is invalid: {name}")
           owner = evidence["owner"]
-          if not re.fullmatch(
-              r"easysplat-release-owner:v2:[1-9][0-9]*:[0-9a-f]{40}",
-              owner,
-          ):
+          expected_owner = (
+              f"easysplat-release-owner:v3:{os.environ['GITHUB_REPOSITORY']}:"
+              f"{evidence['tag']}:{evidence['source_commit']}"
+          )
+          if owner != expected_owner:
               raise SystemExit("draft owner marker is invalid")
           if not isinstance(evidence["body"], str) or f"<!-- {owner} -->" not in evidence["body"]:
               raise SystemExit("final local release owner body is invalid")
@@ -3132,10 +3135,11 @@ jobs:
 
           path, expected_tag, owner_path, notes_path, expected_id, repository, expected_commit = sys.argv[1:]
           owner = Path(owner_path).read_text(encoding="utf-8").strip()
-          if not re.fullmatch(
-              r"easysplat-release-owner:v2:[1-9][0-9]*:[0-9a-f]{40}",
-              owner,
-          ):
+          expected_owner = (
+              f"easysplat-release-owner:v3:{repository}:"
+              f"{expected_tag}:{expected_commit}"
+          )
+          if owner != expected_owner:
               raise SystemExit("draft owner marker is invalid")
           with open(path, encoding="utf-8") as stream:
               release = json.load(stream)

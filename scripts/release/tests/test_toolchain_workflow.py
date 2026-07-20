@@ -158,6 +158,8 @@ class FakeReleaseAPI:
         self.created = 0
         self.deleted: list[int] = []
         self.uploaded: list[str] = []
+        self.immutable_policy_calls = 0
+        self.immutable_policy_states = [True]
 
     @property
     def names(self) -> list[str]:
@@ -189,6 +191,12 @@ class FakeReleaseAPI:
         method = call.get_method()
         parsed = urllib.parse.urlsplit(url)
         releases_path = f"/repos/{self.repository}/releases"
+        if method == "GET" and parsed.path == f"/repos/{self.repository}/immutable-releases":
+            state = self.immutable_policy_states[
+                min(self.immutable_policy_calls, len(self.immutable_policy_states) - 1)
+            ]
+            self.immutable_policy_calls += 1
+            return FakeJSONResponse({"enabled": state})
         if method == "GET" and parsed.path == releases_path:
             query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
             page = int(query["page"][0])
@@ -592,6 +600,8 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             'release.get("name") != tag',
             'release.get("body") != owner',
             'release.get("immutable") is True',
+            'f"{api}/immutable-releases"',
+            "require_immutable_release_policy()",
             'state == "starter"',
             'state != "uploaded"',
             'f"{api}/releases/assets/{asset[\'id\']}"',
@@ -600,7 +610,6 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             self.assertIn(required, draft)
         for forbidden in (
             "immutable == true",
-            "immutable-releases",
             "--latest",
             "prerelease=true",
             "gh release edit",
@@ -612,6 +621,39 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, draft)
         self.assertNotIn("GITHUB_RUN_ID", draft)
+        self.assertEqual(draft.count("          require_immutable_release_policy()"), 2)
+
+    def test_draft_publisher_requires_immutable_releases_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            api = FakeReleaseAPI(root)
+            for name in api.names:
+                (root / name).write_bytes(name.encode("utf-8"))
+            api.pages = [[]]
+            api.immutable_policy_states = [False]
+
+            with self.assertRaises(SystemExit):
+                api.run()
+
+            self.assertEqual(api.created, 0)
+            self.assertEqual(api.deleted, [])
+            self.assertEqual(api.uploaded, [])
+
+    def test_draft_publisher_rechecks_immutable_releases_after_upload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            api = FakeReleaseAPI(root)
+            for name in api.names:
+                (root / name).write_bytes(name.encode("utf-8"))
+            api.pages = [[]]
+            api.immutable_policy_states = [True, False]
+
+            with self.assertRaises(SystemExit):
+                api.run()
+
+            self.assertEqual(api.created, 1)
+            self.assertEqual(set(api.uploaded), set(api.names))
+            self.assertEqual(api.immutable_policy_calls, 2)
 
     def test_draft_publisher_creates_an_owned_exact_release(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -350,12 +350,17 @@ if grep -Fq 'name: Verify live release policy' <<<"$publish_release_block"; then
   fail "publication must not spend a separate early admin-token phase"
 fi
 for contract in \
-  'easysplat-release-owner:v2:' \
+  'easysplat-release-owner:v3:${GITHUB_REPOSITORY}:${TAG}:${GITHUB_SHA}' \
   'name: Reverify policy, create or resume draft, and upload exact assets' \
   'existing asset differs from the publication manifest'; do
   grep -Fq -- "$contract" <<<"$publish_release_block" \
     || fail "idempotent draft publication is missing: $contract"
 done
+if grep -Fq 'easysplat-release-owner:v2:' "$RELEASE_GATE"; then
+  fail "app release drafts must not be owned by one workflow run"
+fi
+[ "$(grep -Fc 'f"easysplat-release-owner:v3:' <<<"$publish_release_block")" -eq 4 ] \
+  || fail "every app draft verifier must recompute repository/tag/commit ownership"
 if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]|hdiutil|open[[:space:]].*EasySplat' <<<"$publish_release_block"; then
   fail "the publish job must not checkout or execute repository, app, or toolchain code"
 fi
@@ -578,6 +583,8 @@ for contract in \
   'easysplat-toolchain-release-owner:v1:' \
   'release.get("target_commitish") != commit' \
   'release.get("body") != owner' \
+  'require_immutable_release_policy()' \
+  'f"{api}/immutable-releases"' \
   'state == "starter"' \
   'state != "uploaded"' \
   'releases/assets/{asset['\''id'\'']}' \
@@ -590,6 +597,8 @@ for contract in \
   grep -Fq -- "$contract" <<<"$stage_draft_block" \
     || fail "toolchain draft publication is missing: $contract"
 done
+[ "$(grep -Fc '          require_immutable_release_policy()' <<<"$stage_draft_block")" -eq 2 ] \
+  || fail "toolchain publication must recheck immutable-release policy before and after mutation"
 if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]|notarize_artifact|finalize_signed_toolchain|read_bytes\(' <<<"$stage_draft_block"; then
   fail "toolchain publication must only stream the exact verified artifact closure"
 fi

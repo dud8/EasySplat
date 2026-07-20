@@ -7199,7 +7199,7 @@ for required in (
 for required in (
     'DRAFT_OWNER_FILE="$RUNNER_TEMP/easysplat-draft-owner"',
     'DRAFT_RELEASE_ID_FILE="$RUNNER_TEMP/easysplat-draft-release-id"',
-    'easysplat-release-owner:v2:${GITHUB_RUN_ID}:${GITHUB_SHA}',
+    'easysplat-release-owner:v3:${GITHUB_REPOSITORY}:${TAG}:${GITHUB_SHA}',
     "printf '\\n\\n<!-- %s -->\\n' \"$DRAFT_OWNER\"",
     '--paginate --slurp',
     'DRAFT_MODE="$(cat "$DRAFT_MODE_FILE")"',
@@ -7211,6 +7211,8 @@ for required in (
 ):
     if required not in create_block:
         raise SystemExit(f"Draft publication lacks run-owned release identity: {required}")
+if 'easysplat-release-owner:v2:' in create_block:
+    raise SystemExit("Draft publication is still owned by one workflow run.")
 resolve_existing = create_block.index('mode = "resume"', 0, create_call)
 validate_response = create_block.index('owned draft source identity differs', create_call)
 plan_assets = create_block.index('existing asset differs from the publication manifest', validate_response)
@@ -7396,7 +7398,8 @@ assert workflow.count("secrets.BENCHMARK_EVIDENCE_PRIVATE_KEY_BASE64") == 0
 assert "signed_artifact_id:" in workflow and "signed_artifact_digest:" in workflow
 assert "publication_artifact_id:" in workflow and "publication_artifact_digest:" in workflow
 assert "DRAFT_OWNER_FILE=\"$RUNNER_TEMP/easysplat-draft-owner\"" in publish_block
-assert "easysplat-release-owner:v2:${GITHUB_RUN_ID}:${GITHUB_SHA}" in publish_block
+assert "easysplat-release-owner:v3:${GITHUB_REPOSITORY}:${TAG}:${GITHUB_SHA}" in publish_block
+assert "easysplat-release-owner:v2:" not in publish_block
 assert "<!-- %s -->" in publish_block
 assert "Report the preserved owned draft" in publish_block
 assert "Owned draft preserved for manual review or cleanup." in publish_block
@@ -7520,7 +7523,14 @@ with tempfile.TemporaryDirectory(prefix="easysplat-draft-resume.") as raw:
         encoding="utf-8",
     )
     notes = root / "notes"
-    notes.write_text("notes\n\n<!-- easysplat-release-owner:v2:9:" + "a" * 40 + " -->\n", encoding="utf-8")
+    notes.write_text(
+        "notes\n\n<!-- easysplat-release-owner:v3:dud8/EasySplat:"
+        + tag
+        + ":"
+        + "a" * 40
+        + " -->\n",
+        encoding="utf-8",
+    )
     response = root / "draft.json"
     pending = root / "pending"
     release = {
@@ -7590,6 +7600,27 @@ if rg -n '^  push:|uses: [^ ]+@(v[0-9]+|main|master)$' "$app_workflow" >/dev/nul
   echo "App release workflow must be manual and pin actions to commit SHAs" >&2
   exit 1
 fi
+
+python3 -I - "$ROOT/README.md" "$ROOT/ONBOARDING.md" <<'PY'
+import sys
+from pathlib import Path
+
+markers = (
+    "merge the reviewed release commit",
+    "make the repository public",
+    "manually dispatch codeql",
+    "create the immutable version tag",
+    "run release app",
+)
+for raw_path in sys.argv[1:]:
+    path = Path(raw_path)
+    text = path.read_text(encoding="utf-8").lower()
+    positions = [text.find(marker) for marker in markers]
+    if any(position < 0 for position in positions):
+        raise SystemExit(f"{path.name} omits the stable release order")
+    if positions != sorted(positions) or len(set(positions)) != len(positions):
+        raise SystemExit(f"{path.name} states the stable release order ambiguously")
+PY
 
 benchmark_workflow="$ROOT/.github/workflows/benchmark-release.yml"
 grep -Fq 'workflow_dispatch:' "$benchmark_workflow"
