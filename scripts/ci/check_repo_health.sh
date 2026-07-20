@@ -88,6 +88,25 @@ if rg -n 'activate\s*\(\s*ignoringOtherApps\s*:' "$ROOT/EasySplatApp" >/dev/null
 fi
 
 toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
+retired_suitesparse_builder="$ROOT/scripts/toolchain/build_suitesparse.sh"
+if [ -e "$retired_suitesparse_builder" ] || [ -L "$retired_suitesparse_builder" ]; then
+  echo "Retired native SuiteSparse builder is present: $retired_suitesparse_builder" >&2
+  exit 1
+fi
+
+if rg -n -F 'build_suitesparse.sh' \
+  -g '!build_suitesparse.sh' \
+  "$ROOT/.github/workflows" \
+  "$ROOT/scripts/run.sh" \
+  "$ROOT/scripts/toolchain" \
+  "$ROOT/scripts/release" \
+  "$ROOT/README.md" \
+  "$ROOT/ONBOARDING.md" \
+  "$ROOT/CONTRIBUTING.md" >/dev/null; then
+  echo "A live build, launch, release, or public documentation surface references the retired SuiteSparse builder." >&2
+  exit 1
+fi
+
 for builder in \
   build_colmap_support.sh \
   build_ceres.sh \
