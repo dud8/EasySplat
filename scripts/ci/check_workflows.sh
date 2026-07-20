@@ -70,7 +70,6 @@ require_line '^[[:space:]]+test -d /Applications/Xcode_16\.4\.app$' "$TESTS"
 require_line '^[[:space:]]+test "\$\(uname -m\)" = "arm64"$' "$TESTS"
 require_line '^[[:space:]]+memory_bytes="\$\(sysctl -n hw\.memsize\)"$' "$TESTS"
 require_line '^[[:space:]]+swift test --filter RunPlanResolverTests$' "$TESTS"
-require_text 'cache-dependency-path: scripts/benchmark/requirements.txt' "$TESTS"
 require_line '^[[:space:]]+--require-hashes --requirement scripts/benchmark/requirements\.txt$' "$TESTS"
 repo_health_block="$(awk '
   /^  repo-health:$/ { in_job = 1 }
@@ -85,6 +84,12 @@ grep -Fq '          sudo xcode-select -s /Applications/Xcode_16.4.app' <<<"$repo
   || fail "repository contracts must use the pinned Xcode toolchain"
 grep -Fq '          command -v rg >/dev/null' <<<"$repo_health_block" \
   || fail "repository contracts must verify the ripgrep dependency"
+if grep -Fq '          cache: pip' <<<"$repo_health_block"; then
+  fail "repository contracts must not enable setup-python's empty pip cache on a fresh macOS host"
+fi
+if grep -Fq '          cache-dependency-path:' <<<"$repo_health_block"; then
+  fail "repository contracts must not configure a pip cache before the fresh macOS host has created it"
+fi
 if grep -Fq 'apt-get' <<<"$repo_health_block"; then
   fail "repository contracts must not install Linux dependencies on the macOS host"
 fi

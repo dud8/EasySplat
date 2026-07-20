@@ -1325,9 +1325,9 @@ final class RunPlanResolverTests: XCTestCase {
             requiredAtomicWorkspaceReserveBytes: 0,
             limits: .init(
                 maximumPhotoCount: 16,
-                maximumTotalBytes: 16 * 1_024 * 1_024,
-                maximumSinglePhotoBytes: 4 * 1_024 * 1_024,
-                maximumPixelCount: 1_024 * 1_024,
+                maximumTotalBytes: Int64(16) * 1_024 * 1_024,
+                maximumSinglePhotoBytes: Int64(4) * 1_024 * 1_024,
+                maximumPixelCount: Int64(1_024) * 1_024,
                 maximumDecodedDimension: 128,
                 maximumTraversalEntryCount: 32,
                 maximumRecursionDepth: 4,

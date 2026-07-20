@@ -471,17 +471,23 @@ final class FrameExtractorLogicTests: XCTestCase {
     }
 
     func testTimelineSelectionIsIndependentOfCandidateInputOrder() {
-        let ordered: [TimedFrameCandidate] = (0..<12).map { index -> TimedFrameCandidate in
-            TimedFrameCandidate(
+        var ordered: [TimedFrameCandidate] = []
+        ordered.reserveCapacity(12)
+        for index in 0..<12 {
+            let timestampSeconds = Double(index) / 3
+            let sharpness = Double(50 + index % 3)
+            let perceptualHash = UInt64(index * 17)
+            let frame = TimedFrameCandidate(
                 frameIndex: index,
-                timestampSeconds: Double(index) / 3,
+                timestampSeconds: timestampSeconds,
                 candidate: SmartFrameCandidate(
                     index: index,
-                    sharpness: Double(50 + index % 3),
+                    sharpness: sharpness,
                     brightness: 0.5,
-                    dHash: UInt64(index * 17)
+                    dHash: perceptualHash
                 )
             )
+            ordered.append(frame)
         }
 
         let forward = SmartFrameSelection.selectTimeline(
