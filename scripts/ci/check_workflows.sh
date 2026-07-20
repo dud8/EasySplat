@@ -72,6 +72,22 @@ require_line '^[[:space:]]+memory_bytes="\$\(sysctl -n hw\.memsize\)"$' "$TESTS"
 require_line '^[[:space:]]+swift test --filter RunPlanResolverTests$' "$TESTS"
 require_text 'cache-dependency-path: scripts/benchmark/requirements.txt' "$TESTS"
 require_line '^[[:space:]]+--require-hashes --requirement scripts/benchmark/requirements\.txt$' "$TESTS"
+repo_health_block="$(awk '
+  /^  repo-health:$/ { in_job = 1 }
+  in_job { print }
+  in_job && /^  python-tools:$/ { exit }
+' "$TESTS")"
+grep -Fq '    runs-on: macos-15' <<<"$repo_health_block" \
+  || fail "repository contracts must run on the supported macOS host"
+grep -Fq '          test "$(uname -m)" = "arm64"' <<<"$repo_health_block" \
+  || fail "repository contracts must require an Apple Silicon host"
+grep -Fq '          sudo xcode-select -s /Applications/Xcode_16.4.app' <<<"$repo_health_block" \
+  || fail "repository contracts must use the pinned Xcode toolchain"
+grep -Fq '          command -v rg >/dev/null' <<<"$repo_health_block" \
+  || fail "repository contracts must verify the ripgrep dependency"
+if grep -Fq 'apt-get' <<<"$repo_health_block"; then
+  fail "repository contracts must not install Linux dependencies on the macOS host"
+fi
 if grep -Fq 'scripts/benchmark/render-requirements.txt' "$TESTS"; then
   fail "ordinary repository tests must not install the protected render-scoring closure"
 fi

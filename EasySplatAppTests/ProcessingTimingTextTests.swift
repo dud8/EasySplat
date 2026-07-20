@@ -206,9 +206,9 @@ final class ProcessingTimingTextTests: XCTestCase {
             requiredAtomicWorkspaceReserveBytes: 0,
             limits: .init(
                 maximumPhotoCount: 4,
-                maximumTotalBytes: 4 * 1_024 * 1_024,
-                maximumSinglePhotoBytes: 1_024 * 1_024,
-                maximumPixelCount: 1_024 * 1_024,
+                maximumTotalBytes: Int64(4) * 1_024 * 1_024,
+                maximumSinglePhotoBytes: Int64(1_024) * 1_024,
+                maximumPixelCount: Int64(1_024) * 1_024,
                 maximumDecodedDimension: 128,
                 maximumTraversalEntryCount: 8,
                 maximumRecursionDepth: 2,

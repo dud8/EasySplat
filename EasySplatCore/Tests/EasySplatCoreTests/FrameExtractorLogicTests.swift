@@ -471,7 +471,7 @@ final class FrameExtractorLogicTests: XCTestCase {
     }
 
     func testTimelineSelectionIsIndependentOfCandidateInputOrder() {
-        let ordered = (0..<12).map { index in
+        let ordered: [TimedFrameCandidate] = (0..<12).map { index -> TimedFrameCandidate in
             TimedFrameCandidate(
                 frameIndex: index,
                 timestampSeconds: Double(index) / 3,
@@ -496,7 +496,10 @@ final class FrameExtractorLogicTests: XCTestCase {
             minimumTimeDistance: 0.2
         )
 
-        XCTAssertEqual(forward.map(\.frameIndex), shuffled.map(\.frameIndex))
+        XCTAssertEqual(
+            forward.map { candidate in candidate.frameIndex },
+            shuffled.map { candidate in candidate.frameIndex }
+        )
     }
 
     func testTimelineSelectionUsesTimeRatherThanVFRCandidateDensity() {

@@ -87,7 +87,7 @@ jobs:
 
   repo-health:
     name: Repository contracts
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -98,10 +98,14 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: scripts/benchmark/requirements.txt
+      - name: Select Xcode 16.4
+        run: |
+          test "$(uname -m)" = "arm64"
+          test -d /Applications/Xcode_16.4.app
+          sudo xcode-select -s /Applications/Xcode_16.4.app
       - name: Install repository check dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ripgrep
+          command -v rg >/dev/null
           python -m pip install --disable-pip-version-check --no-input \
             --require-hashes --requirement scripts/benchmark/requirements.txt
       - name: Verify public repository collateral

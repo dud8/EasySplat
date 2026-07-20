@@ -907,7 +907,7 @@ final class ColmapPairPlanningPolicyTests: XCTestCase {
             imageNames: names,
             scheduledPairs: []
         )
-        let invalidContracts = [
+        let invalidContracts: [[String]] = [
             [header, validQueries[0]] + [pairs[0]],
             [header] + validQueries + [validQueries[1]] + pairs,
             [header, validQueries[1], validQueries[0]] + pairs,

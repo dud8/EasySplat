@@ -706,7 +706,7 @@ final class PhotoInputAdmissionTests: XCTestCase {
             keyframeBudget: 1,
             requiredAtomicWorkspaceReserveBytes: 0,
             limits: .init(
-                maximumTotalBytes: 32 * 1_024 * 1_024,
+                maximumTotalBytes: Int64(32) * 1_024 * 1_024,
                 maximumDecodedDimension: 32,
                 minimumFreeSpaceReserveBytes: 0
             ),

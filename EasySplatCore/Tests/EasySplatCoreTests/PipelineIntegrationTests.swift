@@ -7451,9 +7451,9 @@ final class PipelineIntegrationTests: XCTestCase {
             requiredAtomicWorkspaceReserveBytes: 0,
             limits: .init(
                 maximumPhotoCount: 64,
-                maximumTotalBytes: 128 * 1_024 * 1_024,
-                maximumSinglePhotoBytes: 8 * 1_024 * 1_024,
-                maximumPixelCount: 4_096 * 4_096,
+                maximumTotalBytes: Int64(128) * 1_024 * 1_024,
+                maximumSinglePhotoBytes: Int64(8) * 1_024 * 1_024,
+                maximumPixelCount: Int64(4_096) * 4_096,
                 maximumDecodedDimension: 256,
                 maximumTraversalEntryCount: 128,
                 maximumRecursionDepth: 8,
