@@ -82,8 +82,18 @@ grep -Fq '          test "$(uname -m)" = "arm64"' <<<"$repo_health_block" \
   || fail "repository contracts must require an Apple Silicon host"
 grep -Fq '          sudo xcode-select -s /Applications/Xcode_16.4.app' <<<"$repo_health_block" \
   || fail "repository contracts must use the pinned Xcode toolchain"
-grep -Fq '          command -v rg >/dev/null' <<<"$repo_health_block" \
-  || fail "repository contracts must verify the ripgrep dependency"
+for contract in \
+  'RIPGREP_VERSION: "15.2.0"' \
+  'RIPGREP_SHA256: "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4"' \
+  'https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-aarch64-apple-darwin.tar.gz' \
+  'echo "$RIPGREP_SHA256  $archive" | /usr/bin/shasum -a 256 -c -' \
+  'printf '\''%s\n'\'' "$ripgrep_root" >> "$GITHUB_PATH"'; do
+  grep -Fq "$contract" <<<"$repo_health_block" \
+    || fail "repository contracts must install verified arm64 ripgrep: $contract"
+done
+if grep -Fq 'command -v rg >/dev/null' <<<"$repo_health_block"; then
+  fail "repository contracts must not assume ripgrep is preinstalled on a fresh macOS host"
+fi
 if grep -Fq '          cache: pip' <<<"$repo_health_block"; then
   fail "repository contracts must not enable setup-python's empty pip cache on a fresh macOS host"
 fi

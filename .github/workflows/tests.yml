@@ -102,8 +102,22 @@ jobs:
           test -d /Applications/Xcode_16.4.app
           sudo xcode-select -s /Applications/Xcode_16.4.app
       - name: Install repository check dependencies
+        env:
+          RIPGREP_VERSION: "15.2.0"
+          RIPGREP_SHA256: "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4"
         run: |
-          command -v rg >/dev/null
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ripgrep.tar.gz"
+          ripgrep_root="$RUNNER_TEMP/ripgrep-$RIPGREP_VERSION-aarch64-apple-darwin"
+          /usr/bin/curl --fail --location --retry 3 --proto '=https' --tlsv1.2 \
+            --output "$archive" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-aarch64-apple-darwin.tar.gz"
+          echo "$RIPGREP_SHA256  $archive" | /usr/bin/shasum -a 256 -c -
+          /usr/bin/tar -xzf "$archive" -C "$RUNNER_TEMP" \
+            "ripgrep-${RIPGREP_VERSION}-aarch64-apple-darwin/rg"
+          test -x "$ripgrep_root/rg"
+          "$ripgrep_root/rg" --version
+          printf '%s\n' "$ripgrep_root" >> "$GITHUB_PATH"
           python -m pip install --disable-pip-version-check --no-input \
             --require-hashes --requirement scripts/benchmark/requirements.txt
       - name: Verify public repository collateral
