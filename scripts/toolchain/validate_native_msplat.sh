@@ -40,6 +40,7 @@ reject_raster_test_symbols() {
     msplat_stage_timing_sample_valid_for_testing \
     msplat_stage_timing_aggregate_coherent_for_testing \
     msplat_enable_stage_profiling_for_testing \
+    msplat_stage_profiling_status_for_testing \
     msplat_gpu_timestamp_calibration_for_testing \
     msplat_copy_last_raster_debug \
     msplat_copy_last_raster_reference_debug; do
@@ -147,14 +148,14 @@ exact_values = {
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
     "overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23",
-    "raster_test_sha256": "b2529dedfc7e2027b6f3e0f86db522cfc95be5fb90208a8d6b75a892584a52b7",
+    "raster_test_sha256": "8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2",
     "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
     "source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
     "numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3",
     "metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac",
     "exact_raster_patch_sha256": "c34a8860ed8ae9bc92c976aaa1c3f89eec8aa9be9cab4778f074491e98860855",
-    "stage_timing_patch_sha256": "e803a9e6027fb81835d3c30bccd6cec1fa7ad63315ffb6bbae0f135cc476941d",
+    "stage_timing_patch_sha256": "fcc00c8b9eb3c79ccc7be3f27b997421b28e2c0ea98477c4382d7acefd334435",
     "memory_efficiency_patch_sha256": "bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c",
     "densification_memory_patch_sha256": "b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7",
     "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",

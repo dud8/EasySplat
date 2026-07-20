@@ -1,5 +1,5 @@
 diff --git a/core/metal/bindings.h b/core/metal/bindings.h
-index 89be4ee..1242a37 100644
+index 8842e61..9c2d454 100644
 --- a/core/metal/bindings.h
 +++ b/core/metal/bindings.h
 @@ -2,6 +2,7 @@
@@ -10,9 +10,15 @@ index 89be4ee..1242a37 100644
  #include <cstdint>
  #include "metal_tensor.hpp"
  
-@@ -64,6 +65,13 @@ void msplat_grow_exact_raster_capacity(uint64_t intersection_count);
+@@ -63,7 +64,19 @@ void msplat_set_raster_iteration_context(uint64_t iteration, uint64_t camera_ind
+ void msplat_grow_exact_raster_capacity(uint64_t intersection_count);
  void msplat_restore_exact_raster_capacity(uint64_t intersection_count);
  void msplat_clear_raster_capacity_failure();
++enum MsplatStageProfilingStatus : uint32_t {
++    MSPLAT_STAGE_PROFILING_UNAVAILABLE = 0,
++    MSPLAT_STAGE_PROFILING_AVAILABLE = 1,
++    MSPLAT_STAGE_PROFILING_INITIALIZATION_FAILED = 2,
++};
  #ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
 +struct MsplatGpuTimestampCalibration {
 +    double frequency_hz;
@@ -24,8 +30,7 @@ index 89be4ee..1242a37 100644
  void msplat_set_force_exact_for_testing(bool force_exact);
  void msplat_set_exact_fallback_enabled_for_testing(bool enabled);
  void msplat_set_exact_execution_capacity_for_testing(uint64_t capacity);
-@@ -71,7 +79,23 @@ void msplat_set_exact_capacity_limit_for_testing(uint64_t capacity);
- void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
+@@ -72,6 +85,23 @@ void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
  void msplat_fail_next_sync_for_testing();
  uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
  uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count);
@@ -44,12 +49,13 @@ index 89be4ee..1242a37 100644
 +    double command_buffer_seconds
 +);
 +void msplat_enable_stage_profiling_for_testing();
++MsplatStageProfilingStatus msplat_stage_profiling_status_for_testing();
 +MsplatGpuTimestampCalibration msplat_gpu_timestamp_calibration_for_testing();
  void msplat_copy_last_raster_debug(
      float* rgb,
      float* alpha,
 diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
-index 9fff022..d258886 100644
+index 7d2344a..acd0203 100644
 --- a/core/metal/msplat_metal.mm
 +++ b/core/metal/msplat_metal.mm
 @@ -8,6 +8,8 @@
@@ -218,7 +224,7 @@ index 9fff022..d258886 100644
  struct MetalContext {
      id<MTLDevice>       device;
      id<MTLCommandQueue> queue;
-@@ -94,13 +246,12 @@ struct MetalContext {
+@@ -94,13 +246,13 @@ struct MetalContext {
  
      // Per-stage GPU timestamp profiling (Metal counter sample buffer)
      id<MTLCounterSampleBuffer> counterSampleBuffer;
@@ -226,6 +232,7 @@ index 9fff022..d258886 100644
 +    std::atomic_bool stageTimingValid {true};
      bool counterSamplingAvailable = false;
 -    double ticksToMs = 0.0;  // conversion factor from GPU ticks to milliseconds
++    MsplatStageProfilingStatus stageProfilingStatus = MSPLAT_STAGE_PROFILING_UNAVAILABLE;
 +    GPUTimestampCalibration timestampCalibration;
  
      void initCounterSampling() {
@@ -235,10 +242,11 @@ index 9fff022..d258886 100644
          // Find timestamp counter set
          id<MTLCounterSet> timestampSet = nil;
          for (id<MTLCounterSet> cs in device.counterSets) {
-@@ -120,28 +271,38 @@ struct MetalContext {
+@@ -120,28 +272,40 @@ struct MetalContext {
              return;
          }
  
++        stageProfilingStatus = MSPLAT_STAGE_PROFILING_INITIALIZATION_FAILED;
 +        timestampCalibration = calibrateGPUTimestamps(device);
 +        if (!plausibleGPUTimestampFrequency(timestampCalibration.counterFrequencyHz) ||
 +            !plausibleGPUTimestampFrequency(timestampCalibration.referenceFrequencyHz)) {
@@ -271,6 +279,7 @@ index 9fff022..d258886 100644
          counterSamplingAvailable = true;
 -        fprintf(stderr, "PROFILE_STAGES: GPU timestamp profiling enabled (%lu sample slots)\n",
 -                (unsigned long)sampleCount);
++        stageProfilingStatus = MSPLAT_STAGE_PROFILING_AVAILABLE;
 +        fprintf(
 +            stderr,
 +            "PROFILE_STAGES: GPU timestamp profiling enabled "
@@ -283,7 +292,7 @@ index 9fff022..d258886 100644
      }
  
      // Forward pipeline kernels
-@@ -337,8 +498,10 @@ MetalContext* init_msplat_metal_context() {
+@@ -337,8 +501,11 @@ MetalContext* init_msplat_metal_context() {
  
      // Initialize counter sampling if PROFILE_STAGES is set
      ctx->counterSampleBuffer = nil;
@@ -291,11 +300,12 @@ index 9fff022..d258886 100644
 +    ctx->stageTimingValid.store(true, std::memory_order_relaxed);
      ctx->counterSamplingAvailable = false;
 -    ctx->ticksToMs = 0.0;
++    ctx->stageProfilingStatus = MSPLAT_STAGE_PROFILING_UNAVAILABLE;
 +    ctx->timestampCalibration = {};
      if (std::getenv("PROFILE_STAGES")) {
          g_profile_stages = true;
          g_profile_stages_checked = true;
-@@ -467,6 +630,61 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
+@@ -467,6 +634,65 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
      }
  }
  
@@ -343,6 +353,10 @@ index 9fff022..d258886 100644
 +    if (!context->counterSamplingAvailable) context->initCounterSampling();
 +}
 +
++MsplatStageProfilingStatus msplat_stage_profiling_status_for_testing() {
++    return get_global_context()->stageProfilingStatus;
++}
++
 +MsplatGpuTimestampCalibration msplat_gpu_timestamp_calibration_for_testing() {
 +    const GPUTimestampCalibration calibration = get_global_context()->timestampCalibration;
 +    return {
@@ -357,7 +371,7 @@ index 9fff022..d258886 100644
  #define RAST_BLOCK_X 8
  #define RAST_BLOCK_Y 8
  static constexpr int64_t kMaxTileElements = 2048;
-@@ -2430,15 +2648,20 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -2451,15 +2677,20 @@ std::tuple<MTensor, float> msplat_train_step(
          g_profile_stages_checked = true;
      }
  
@@ -380,7 +394,7 @@ index 9fff022..d258886 100644
  
          // Encode each stage in its own encoder with timestamp bookends
          typedef void (^encode_fn_t)(id<MTLComputeCommandEncoder>);
-@@ -2519,38 +2742,77 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -2540,36 +2771,75 @@ std::tuple<MTensor, float> msplat_train_step(
          [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
              @autoreleasepool {
                  NSData *data = [csb resolveCounterRange:NSMakeRange(0, (N_TRAIN_STAGES - 1) * 2)];
@@ -485,6 +499,3 @@ index 9fff022..d258886 100644
 +                dispatch_semaphore_signal(ctx->stageCounterSemaphore);
              }
          }];
--
-+
-     } else {

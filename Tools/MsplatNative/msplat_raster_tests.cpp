@@ -2376,6 +2376,17 @@ void verifyStageTiming(const std::string &dataset) {
     msplat_enable_gpu_timing(true);
     msplat_enable_stage_profiling_for_testing();
 
+    const MsplatStageProfilingStatus profilingStatus =
+        msplat_stage_profiling_status_for_testing();
+    if (profilingStatus == MSPLAT_STAGE_PROFILING_UNAVAILABLE) {
+        cleanup_msplat_metal();
+        std::cout << "msplat stage timing skipped: Metal timestamp counters unavailable\n";
+        return;
+    }
+    if (profilingStatus != MSPLAT_STAGE_PROFILING_AVAILABLE) {
+        throw std::runtime_error("runtime GPU stage profiler initialization failed");
+    }
+
     const MsplatGpuTimestampCalibration calibration =
         msplat_gpu_timestamp_calibration_for_testing();
     if (!std::isfinite(calibration.frequency_hz) || calibration.frequency_hz <= 0 ||

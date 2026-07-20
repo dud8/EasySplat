@@ -19,7 +19,7 @@ INSTALL_STAGE_INODE=""
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 OVERLAY_SHA256="ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="b2529dedfc7e2027b6f3e0f86db522cfc95be5fb90208a8d6b75a892584a52b7"
+RASTER_TEST_SHA256="8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"
@@ -33,7 +33,7 @@ METAL_SAFETY_PATCH_SHA256="5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5d
 EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
 EXACT_RASTER_PATCH_SHA256="c34a8860ed8ae9bc92c976aaa1c3f89eec8aa9be9cab4778f074491e98860855"
 STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
-STAGE_TIMING_PATCH_SHA256="e803a9e6027fb81835d3c30bccd6cec1fa7ad63315ffb6bbae0f135cc476941d"
+STAGE_TIMING_PATCH_SHA256="fcc00c8b9eb3c79ccc7be3f27b997421b28e2c0ea98477c4382d7acefd334435"
 MEMORY_EFFICIENCY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-memory-efficiency.patch"
 MEMORY_EFFICIENCY_PATCH_SHA256="bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c"
 DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-memory.patch"
@@ -160,6 +160,7 @@ reject_raster_test_symbols() {
     msplat_stage_timing_sample_valid_for_testing \
     msplat_stage_timing_aggregate_coherent_for_testing \
     msplat_enable_stage_profiling_for_testing \
+    msplat_stage_profiling_status_for_testing \
     msplat_gpu_timestamp_calibration_for_testing \
     msplat_copy_last_raster_debug \
     msplat_copy_last_raster_reference_debug; do

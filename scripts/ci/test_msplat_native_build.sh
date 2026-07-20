@@ -114,7 +114,7 @@ require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT
 require_contains '"overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$VALIDATOR"
 require_contains '"patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$VALIDATOR"
 require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$VALIDATOR"
-require_contains 'RASTER_TEST_SHA256="b2529dedfc7e2027b6f3e0f86db522cfc95be5fb90208a8d6b75a892584a52b7"' "$BUILD_SCRIPT"
+require_contains 'RASTER_TEST_SHA256="8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$BUILD_SCRIPT"
 require_contains 'NANOFLANN_SHA256="57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc"' "$BUILD_SCRIPT"
@@ -157,12 +157,12 @@ require_contains 'git -C "$SOURCE_DIR" apply "$EXACT_RASTER_PATCH"' "$BUILD_SCRI
 require_contains 'exact_raster_patch_sha256' "$BUILD_SCRIPT"
 require_contains 'exact_raster_patch_sha256' "$VALIDATOR"
 require_contains 'msplat-1.1.3-stage-timing.patch' "$BUILD_SCRIPT"
-require_contains 'STAGE_TIMING_PATCH_SHA256="e803a9e6027fb81835d3c30bccd6cec1fa7ad63315ffb6bbae0f135cc476941d"' "$BUILD_SCRIPT"
+require_contains 'STAGE_TIMING_PATCH_SHA256="fcc00c8b9eb3c79ccc7be3f27b997421b28e2c0ea98477c4382d7acefd334435"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$STAGE_TIMING_PATCH")" = "$STAGE_TIMING_PATCH_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply --check "$STAGE_TIMING_PATCH"' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply "$STAGE_TIMING_PATCH"' "$BUILD_SCRIPT"
 require_contains 'stage_timing_patch_sha256' "$BUILD_SCRIPT"
-require_contains '"stage_timing_patch_sha256": "e803a9e6027fb81835d3c30bccd6cec1fa7ad63315ffb6bbae0f135cc476941d"' "$VALIDATOR"
+require_contains '"stage_timing_patch_sha256": "fcc00c8b9eb3c79ccc7be3f27b997421b28e2c0ea98477c4382d7acefd334435"' "$VALIDATOR"
 require_contains 'msplat-1.1.3-memory-efficiency.patch' "$BUILD_SCRIPT"
 require_contains 'MEMORY_EFFICIENCY_PATCH_SHA256="bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$MEMORY_EFFICIENCY_PATCH")" = "$MEMORY_EFFICIENCY_PATCH_SHA256" ]' "$BUILD_SCRIPT"
@@ -320,10 +320,16 @@ require_contains 'kResolvedCounterTimestampFrequencyHz = 1.0e9' "$STAGE_TIMING_P
 require_contains 'dispatch_semaphore_wait' "$STAGE_TIMING_PATCH"
 require_contains 'end <= start' "$STAGE_TIMING_PATCH"
 require_contains 'stageTimingValid' "$STAGE_TIMING_PATCH"
+require_contains 'MSPLAT_STAGE_PROFILING_UNAVAILABLE = 0' "$STAGE_TIMING_PATCH"
+require_contains 'MSPLAT_STAGE_PROFILING_INITIALIZATION_FAILED = 2' "$STAGE_TIMING_PATCH"
+require_contains 'msplat_stage_profiling_status_for_testing' "$STAGE_TIMING_PATCH"
 require_contains 'return ratio <= 1.05' "$STAGE_TIMING_PATCH"
 require_contains 'stageSeconds / commandBufferSeconds >= 0.25' "$STAGE_TIMING_PATCH"
 require_contains 'stageTimingIterations = 512' "$RASTER_TEST_SOURCE"
 require_contains '--stage-timing' "$RASTER_TEST_SOURCE"
+require_contains 'profilingStatus == MSPLAT_STAGE_PROFILING_UNAVAILABLE' "$RASTER_TEST_SOURCE"
+require_contains 'profilingStatus != MSPLAT_STAGE_PROFILING_AVAILABLE' "$RASTER_TEST_SOURCE"
+require_contains 'msplat stage timing skipped: Metal timestamp counters unavailable' "$RASTER_TEST_SOURCE"
 require_contains '--stage-timing "$RASTER_TEST_FIXTURES/01-sphere-500"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$BUILD_SCRIPT"
 require_contains 'msplat_raster_tests' "$BUILD_SCRIPT"
@@ -348,7 +354,7 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
   require_contains '"overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$contract_file"
   require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$contract_file"
-  require_contains '"raster_test_sha256": "b2529dedfc7e2027b6f3e0f86db522cfc95be5fb90208a8d6b75a892584a52b7"' "$contract_file"
+  require_contains '"raster_test_sha256": "8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
   require_contains '"allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$contract_file"
   require_contains '"exact_prefix_hardening_patch_sha256": "e7437861085e86e8671898b8c5833568e0420bdf1c0559175ddcdb34ed159ace"' "$contract_file"
@@ -630,6 +636,7 @@ for symbol in \
   msplat_stage_timing_sample_valid_for_testing \
   msplat_stage_timing_aggregate_coherent_for_testing \
   msplat_enable_stage_profiling_for_testing \
+  msplat_stage_profiling_status_for_testing \
   msplat_gpu_timestamp_calibration_for_testing \
   msplat_copy_last_raster_debug \
   msplat_copy_last_raster_reference_debug; do
