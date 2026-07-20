@@ -3465,7 +3465,9 @@ class RemoteToolchainReleaseTests(unittest.TestCase):
             )
         return {
             "tag_name": f"toolchain-v{TOOLCHAIN_VERSION}",
+            "target_commitish": COMMIT,
             "draft": False,
+            "prerelease": False,
             "immutable": True,
             "assets": assets,
         }
@@ -3498,11 +3500,12 @@ class RemoteToolchainReleaseTests(unittest.TestCase):
                     manifest,
                     source_repository=REPOSITORY,
                     toolchain_version=TOOLCHAIN_VERSION,
+                    authority_source_commit=COMMIT,
                     github_token="read-only-token",
                 )
             self.assertEqual(api.call_count, 1)
 
-    def test_mutable_release_is_rejected(self) -> None:
+    def test_release_identity_mutations_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             closure = authority_fixture(root)
@@ -3511,31 +3514,44 @@ class RemoteToolchainReleaseTests(unittest.TestCase):
             benchmark_evidence_path = root / "toolchain-benchmark-evidence.json"
             benchmark_evidence_path.write_text("{}\n", encoding="utf-8")
             manifest = self._manifest()
-            release = self._release(
-                manifest_path,
-                closure["request_path"],
-                closure["envelope_path"],
-                closure["receipt_path"],
-                benchmark_evidence_path,
-                manifest,
+            mutations = (
+                ("immutable", False),
+                ("target_commitish", "f" * 40),
+                ("target_commitish", None),
+                ("prerelease", True),
+                ("prerelease", None),
             )
-            release["immutable"] = False
-
-            with mock.patch.object(MODULE, "api_json", return_value=release):
-                with self.assertRaisesRegex(
-                    MODULE.PublicationError, "release identity"
-                ):
-                    MODULE.validate_remote_toolchain_assets(
+            for field, value in mutations:
+                with self.subTest(field=field, value=value):
+                    release = self._release(
                         manifest_path,
                         closure["request_path"],
                         closure["envelope_path"],
                         closure["receipt_path"],
                         benchmark_evidence_path,
                         manifest,
-                        source_repository=REPOSITORY,
-                        toolchain_version=TOOLCHAIN_VERSION,
-                        github_token="read-only-token",
                     )
+                    if value is None:
+                        release.pop(field)
+                    else:
+                        release[field] = value
+
+                    with mock.patch.object(MODULE, "api_json", return_value=release):
+                        with self.assertRaisesRegex(
+                            MODULE.PublicationError, "release identity"
+                        ):
+                            MODULE.validate_remote_toolchain_assets(
+                                manifest_path,
+                                closure["request_path"],
+                                closure["envelope_path"],
+                                closure["receipt_path"],
+                                benchmark_evidence_path,
+                                manifest,
+                                source_repository=REPOSITORY,
+                                toolchain_version=TOOLCHAIN_VERSION,
+                                authority_source_commit=COMMIT,
+                                github_token="read-only-token",
+                            )
 
 if __name__ == "__main__":
     unittest.main()

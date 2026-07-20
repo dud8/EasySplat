@@ -3591,6 +3591,7 @@ def validate_remote_toolchain_assets(
     *,
     source_repository: str,
     toolchain_version: str,
+    authority_source_commit: str,
     github_token: str,
 ) -> None:
     quoted_repo = "/".join(
@@ -3603,7 +3604,9 @@ def validate_remote_toolchain_assets(
     )
     if (
         release.get("tag_name") != f"toolchain-v{toolchain_version}"
+        or release.get("target_commitish") != authority_source_commit
         or release.get("draft") is not False
+        or release.get("prerelease") is not False
         or release.get("immutable") is not True
     ):
         fail("published toolchain release identity is invalid")
@@ -4539,7 +4542,7 @@ def _verify_staged_publication(
         license_closure=license_closure,
         licenses_name=licenses.name,
     )
-    validate_toolchain_authority_closure(
+    authority_closure = validate_toolchain_authority_closure(
         release_request_path,
         authority_envelope_path,
         authority_receipt_path,
@@ -4558,6 +4561,7 @@ def _verify_staged_publication(
         manifest,
         source_repository=source_repository,
         toolchain_version=toolchain_version,
+        authority_source_commit=authority_closure["receipt"]["sourceCommit"],
         github_token=github_token,
     )
     if benchmark_suite is not None:
