@@ -165,7 +165,8 @@ jobs:
           test "$AUTHORITY_REPOSITORY" = "dud8/easysplat-release-authority"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/git/ref/tags/toolchain-v$VERSION" --jq .object.sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/git/ref/tags/toolchain-v$VERSION" --jq .ref)" = "refs/tags/toolchain-v$VERSION"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2Ftoolchain-v$VERSION" --jq .sha)" = "$GITHUB_SHA"
 
           verify_run() {
             repository="$1"

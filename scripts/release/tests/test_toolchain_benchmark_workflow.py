@@ -58,6 +58,18 @@ class ToolchainBenchmarkWorkflowTests(unittest.TestCase):
         self.assertIn("authority-transport.json", block)
         self.assertNotRegex(block, r"actions/checkout@|scripts/|swift\s|python3 scripts/")
 
+    def test_binding_peels_annotated_or_lightweight_tag_to_commit(self) -> None:
+        block = job_block("bind-toolchain")
+        self.assertIn(
+            '"repos/$GITHUB_REPOSITORY/git/ref/tags/toolchain-v$VERSION" --jq .ref',
+            block,
+        )
+        self.assertIn(
+            '"repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2Ftoolchain-v$VERSION" --jq .sha',
+            block,
+        )
+        self.assertNotIn("--jq .object.sha", block)
+
     def test_prepare_verifies_and_installs_final_signed_closure_without_token(self) -> None:
         block = job_block("prepare")
         for required in (

@@ -397,7 +397,9 @@ toolchain_post_sign_block="$(sed -n '/^  derive-post-sign-request:/,$p' "$TOOLCH
 for contract in \
   'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' \
   'repos/$GITHUB_REPOSITORY/branches/main' \
-  'repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG'; do
+  'repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG' \
+  'refs/tags/$TAG' \
+  'repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$TAG'; do
   grep -Fq -- "$contract" <<<"$toolchain_preflight_block" \
     || fail "toolchain metadata preflight is missing: $contract"
 done
@@ -515,6 +517,9 @@ stage_draft_block="$(sed -n '/^  stage-draft-release:/,$p' "$TOOLCHAIN_PUBLISH")
 
 for contract in \
   'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' \
+  'repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG' \
+  'refs/tags/$TAG' \
+  'repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$TAG' \
   'actions/artifacts/$PRODUCER_ARTIFACT_ID/zip' \
   'actions/artifacts/$REQUEST_ARTIFACT_ID/zip' \
   'actions/artifacts/$BENCHMARK_ARTIFACT_ID/zip' \
@@ -566,6 +571,16 @@ for contract in \
   'Create or resume the exact draft release' \
   'draft=true' \
   'prerelease=false' \
+  'releases?per_page=100&page=1' \
+  'response.headers.get("Link")' \
+  'multiple releases claim the toolchain tag' \
+  'easysplat-toolchain-release-owner:v1:' \
+  'release.get("target_commitish") != commit' \
+  'release.get("body") != owner' \
+  'state == "starter"' \
+  'state != "uploaded"' \
+  'releases/assets/{asset['\''id'\'']}' \
+  'toolchain draft contains a duplicate asset' \
   'toolchain-release-request.json' \
   'toolchain-authority-envelope.json' \
   'toolchain-authority-receipt.json' \
@@ -579,6 +594,9 @@ if grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]|notarize_artifact|final
 fi
 if grep -Eq 'contents: write|git tag|git push|gh release edit|prerelease=true' <<<"$stage_draft_block"; then
   fail "toolchain publication must stage, but never publish, the stable draft"
+fi
+if grep -Fq '/releases/tags/' <<<"$stage_draft_block"; then
+  fail "toolchain publication must discover authenticated drafts through the paginated release listing"
 fi
 
 publisher_policy_token_count="$(grep -Fc 'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' "$TOOLCHAIN_PUBLISH")"
@@ -606,6 +624,9 @@ benchmark_bind_block="$(sed -n '/^  bind-toolchain:/,/^  prepare:/p' "$BENCHMARK
 benchmark_prepare_block="$(sed -n '/^  prepare:/,/^  reference:/p' "$BENCHMARK_GATE")"
 for contract in \
   'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN' \
+  'repos/$GITHUB_REPOSITORY/git/ref/tags/toolchain-v$VERSION' \
+  'refs/tags/toolchain-v$VERSION' \
+  'repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2Ftoolchain-v$VERSION' \
   'toolchain-benchmark-handoff-${{ github.run_id }}-${{ github.run_attempt }}' \
   'authority-transport.json'; do
   grep -Fq -- "$contract" <<<"$benchmark_bind_block" \
@@ -707,6 +728,12 @@ benchmark_policy_token_count="$(grep -Fc 'secrets.EASYSPLAT_RELEASE_POLICY_TOKEN
 if grep -Eq '^[[:space:]]*(pull_request|pull_request_target):' "$BENCHMARK_GATE"; then
   fail "release benchmark must never run pull-request code"
 fi
+
+for workflow in "$TOOLCHAIN_GATE" "$TOOLCHAIN_PUBLISH" "$BENCHMARK_GATE"; do
+  if grep -Fq -- '--jq .object.sha' "$workflow"; then
+    fail "toolchain release workflows must compare the peeled tag commit, not a raw tag object"
+  fi
+done
 
 for untrusted in "$TESTS" "$SECURITY" "$CODEQL"; do
   if grep -Fq '${{ secrets.' "$untrusted"; then

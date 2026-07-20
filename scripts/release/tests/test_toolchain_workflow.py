@@ -3,13 +3,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -35,6 +40,212 @@ def job_block(source: str, name: str) -> str:
 def workflow_jobs(source: str) -> list[str]:
     jobs = source.split("\njobs:\n", 1)[1]
     return re.findall(r"^  ([A-Za-z0-9_-]+):$", jobs, flags=re.M)
+
+
+def embedded_draft_publisher() -> str:
+    draft = job_block(PUBLISH, "stage-draft-release")
+    match = re.search(
+        r"python3 -I - <<'PY'\n(?P<script>.*?)^          PY$",
+        draft,
+        flags=re.M | re.S,
+    )
+    if match is None:
+        raise AssertionError("missing embedded toolchain draft publisher")
+    return textwrap.dedent(match.group("script"))
+
+
+class FakeJSONResponse:
+    def __init__(self, payload: object, *, link: str | None = None) -> None:
+        self.payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.headers = {} if link is None else {"Link": link}
+
+    def __enter__(self) -> FakeJSONResponse:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self, _: int = -1) -> bytes:
+        return self.payload
+
+
+class FakeUploadResponse:
+    status = 201
+
+    def __init__(self, payload: object) -> None:
+        self.payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    def read(self, _: int = -1) -> bytes:
+        return self.payload
+
+
+class FakeEmptyResponse:
+    status = 204
+    headers: dict[str, str] = {}
+
+    def __enter__(self) -> FakeEmptyResponse:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self, _: int = -1) -> bytes:
+        return b""
+
+
+class FakeUploadConnection:
+    def __init__(self, api: FakeReleaseAPI) -> None:
+        self.api = api
+        self.response: FakeUploadResponse | None = None
+
+    def request(
+        self,
+        method: str,
+        target: str,
+        *,
+        body: object,
+        headers: dict[str, str],
+    ) -> None:
+        parsed = urllib.parse.urlsplit(target)
+        query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        name = query["name"][0]
+        data = body.read()
+        if method != "POST" or int(headers["Content-Length"]) != len(data):
+            raise AssertionError("invalid fake upload request")
+        asset = self.api.asset(name, data)
+        self.api.release["assets"].append(asset)
+        self.api.uploaded.append(name)
+        self.response = FakeUploadResponse(asset)
+
+    def getresponse(self) -> FakeUploadResponse:
+        if self.response is None:
+            raise AssertionError("upload response requested before upload")
+        return self.response
+
+    def close(self) -> None:
+        return None
+
+
+class FakeReleaseAPI:
+    repository = "dud8/EasySplat"
+    version = "2.0.0"
+    commit = "a" * 40
+    release_id = 321
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.tag = f"toolchain-v{self.version}"
+        self.owner = (
+            f"<!-- easysplat-toolchain-release-owner:v1:{self.repository}:"
+            f"{self.tag}:{self.commit} -->"
+        )
+        self.release: dict[str, object] = {
+            "id": self.release_id,
+            "tag_name": self.tag,
+            "target_commitish": self.commit,
+            "name": self.tag,
+            "body": self.owner,
+            "draft": True,
+            "prerelease": False,
+            "immutable": False,
+            "upload_url": (
+                f"https://uploads.github.com/repos/{self.repository}/releases/"
+                f"{self.release_id}/assets{{?name,label}}"
+            ),
+            "assets": [],
+        }
+        self.pages: list[list[object]] = [[self.release]]
+        self.created = 0
+        self.deleted: list[int] = []
+        self.uploaded: list[str] = []
+
+    @property
+    def names(self) -> list[str]:
+        return [
+            f"toolchain-macos-arm64-{self.version}-core.zip",
+            f"toolchain-geometry-da3-base-{self.version}.zip",
+            f"toolchain-geometry-da3-small-{self.version}.zip",
+            "manifest.json",
+            "toolchain-release-request.json",
+            "toolchain-authority-envelope.json",
+            "toolchain-authority-receipt.json",
+            "toolchain-benchmark-evidence.json",
+        ]
+
+    def asset(self, name: str, data: bytes | None = None) -> dict[str, object]:
+        payload = (self.root / name).read_bytes() if data is None else data
+        return {
+            "id": self.names.index(name) + 1001,
+            "name": name,
+            "state": "uploaded",
+            "size": len(payload),
+            "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+        }
+
+    def urlopen(self, call: object, *, timeout: int) -> FakeJSONResponse:
+        if timeout != 120:
+            raise AssertionError("unexpected API timeout")
+        url = call.full_url
+        method = call.get_method()
+        parsed = urllib.parse.urlsplit(url)
+        releases_path = f"/repos/{self.repository}/releases"
+        if method == "GET" and parsed.path == releases_path:
+            query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+            page = int(query["page"][0])
+            payload = self.pages[page - 1]
+            link = None
+            if page < len(self.pages):
+                link = (
+                    f'<https://api.github.com{releases_path}?per_page=100&page={page + 1}>; '
+                    'rel="next"'
+                )
+            return FakeJSONResponse(payload, link=link)
+        if method == "POST" and parsed.path == releases_path:
+            fields = json.loads(call.data.decode("utf-8"))
+            self.created += 1
+            self.release.update(fields)
+            self.release["id"] = self.release_id
+            self.release["immutable"] = False
+            self.release["upload_url"] = (
+                f"https://uploads.github.com/repos/{self.repository}/releases/"
+                f"{self.release_id}/assets{{?name,label}}"
+            )
+            self.release["assets"] = []
+            return FakeJSONResponse(self.release)
+        if method == "DELETE" and parsed.path.startswith(f"{releases_path}/assets/"):
+            asset_id = int(parsed.path.rsplit("/", 1)[1])
+            assets = self.release["assets"]
+            matches = [asset for asset in assets if asset["id"] == asset_id]
+            if len(matches) != 1:
+                raise AssertionError("fake asset deletion is not exact")
+            self.release["assets"] = [
+                asset for asset in assets if asset["id"] != asset_id
+            ]
+            self.deleted.append(asset_id)
+            return FakeEmptyResponse()
+        if method == "GET" and parsed.path == f"{releases_path}/{self.release_id}":
+            return FakeJSONResponse(self.release)
+        raise AssertionError(f"unexpected fake GitHub request: {method} {url}")
+
+    def connection(self, host: str, port: int | None, *, timeout: int) -> FakeUploadConnection:
+        if host != "uploads.github.com" or port is not None or timeout != 300:
+            raise AssertionError("invalid fake upload connection")
+        return FakeUploadConnection(self)
+
+    def run(self) -> None:
+        environment = {
+            "GITHUB_REPOSITORY": self.repository,
+            "GITHUB_SHA": self.commit,
+            "GH_TOKEN": "fixture-token",
+            "VERSION": self.version,
+            "PUBLICATION": str(self.root),
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch("urllib.request.urlopen", side_effect=self.urlopen),
+            mock.patch("http.client.HTTPSConnection", side_effect=self.connection),
+        ):
+            exec(compile(embedded_draft_publisher(), "<draft-publisher>", "exec"), {})
 
 
 def assert_embedded_semver_validator(
@@ -134,6 +345,15 @@ class ToolchainProducerWorkflowTests(unittest.TestCase):
         self.assertIn("repos/$GITHUB_REPOSITORY/branches/main", block)
         self.assertIn("repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG", block)
         assert_embedded_semver_validator(self, PRODUCER, "metadata-preflight")
+
+    def test_preflight_peels_annotated_or_lightweight_tag_to_commit(self) -> None:
+        block = job_block(PRODUCER, "metadata-preflight")
+        self.assertIn('"repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .ref', block)
+        self.assertIn(
+            '"repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$TAG" --jq .sha',
+            block,
+        )
+        self.assertNotIn("--jq .object.sha", block)
 
     def test_builder_is_identity_free_and_uploads_only_unsigned_handoff(self) -> None:
         build = job_block(PRODUCER, "build-unsigned")
@@ -302,6 +522,15 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             stable_only=True,
         )
 
+    def test_preflight_peels_annotated_or_lightweight_tag_to_commit(self) -> None:
+        preflight = job_block(PUBLISH, "metadata-preflight")
+        self.assertIn('"repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .ref', preflight)
+        self.assertIn(
+            '"repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$TAG" --jq .sha',
+            preflight,
+        )
+        self.assertNotIn("--jq .object.sha", preflight)
+
     def test_secretless_verifier_consumes_local_producer_and_same_run_handoff(self) -> None:
         verifier = job_block(PUBLISH, "verify-publication")
         for required in (
@@ -353,6 +582,20 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             "toolchain-benchmark-evidence.json",
             "draft=true",
             "prerelease=false",
+            'f"{api}/releases?per_page=100&page=1"',
+            'response.headers.get("Link")',
+            "next_page_url(link)",
+            'f"{api}/releases/{release_id}"',
+            "multiple releases claim the toolchain tag",
+            "easysplat-toolchain-release-owner:v1:",
+            'release.get("target_commitish") != commit',
+            'release.get("name") != tag',
+            'release.get("body") != owner',
+            'release.get("immutable") is True',
+            'state == "starter"',
+            'state != "uploaded"',
+            'f"{api}/releases/assets/{asset[\'id\']}"',
+            "duplicate asset",
         ):
             self.assertIn(required, draft)
         for forbidden in (
@@ -365,8 +608,113 @@ class ToolchainPublicationWorkflowTests(unittest.TestCase):
             "git push",
             "scripts/",
             "actions/checkout@",
+            "/releases/tags/",
         ):
             self.assertNotIn(forbidden, draft)
+        self.assertNotIn("GITHUB_RUN_ID", draft)
+
+    def test_draft_publisher_creates_an_owned_exact_release(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            api = FakeReleaseAPI(root)
+            for name in api.names:
+                (root / name).write_bytes(name.encode("utf-8"))
+            api.pages = [[]]
+
+            api.run()
+
+            self.assertEqual(api.created, 1)
+            self.assertEqual(set(api.uploaded), set(api.names))
+            self.assertEqual(api.release["body"], api.owner)
+            self.assertEqual(
+                {asset["name"] for asset in api.release["assets"]}, set(api.names)
+            )
+
+    def test_draft_publisher_resumes_a_later_page_and_only_uploads_missing_assets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            api = FakeReleaseAPI(root)
+            for name in api.names:
+                (root / name).write_bytes(name.encode("utf-8"))
+            present = api.names[:4]
+            starter = {
+                **api.asset(api.names[4]),
+                "state": "starter",
+                "size": 0,
+                "digest": None,
+            }
+            api.release["assets"] = [api.asset(name) for name in present] + [starter]
+            api.pages = [[{"id": 999, "tag_name": "unrelated"}], [api.release]]
+
+            api.run()
+
+            self.assertEqual(api.created, 0)
+            self.assertEqual(api.deleted, [starter["id"]])
+            self.assertEqual(set(api.uploaded), set(api.names[4:]))
+            self.assertEqual(
+                {asset["name"] for asset in api.release["assets"]}, set(api.names)
+            )
+
+    def test_draft_publisher_rejects_foreign_or_corrupt_release_state(self) -> None:
+        cases = (
+            "duplicate-tag",
+            "invalid-id",
+            "foreign-owner",
+            "wrong-commit",
+            "published",
+            "prerelease",
+            "immutable",
+            "malformed-asset",
+            "duplicate-asset",
+            "duplicate-asset-id",
+            "unexpected-asset",
+            "non-uploaded-asset",
+            "nonempty-starter-asset",
+            "wrong-digest",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                api = FakeReleaseAPI(root)
+                for name in api.names:
+                    (root / name).write_bytes(name.encode("utf-8"))
+                assets = [api.asset(name) for name in api.names]
+                api.release["assets"] = assets
+                if case == "duplicate-tag":
+                    api.pages = [[api.release, {**api.release, "id": 322}]]
+                elif case == "invalid-id":
+                    api.pages = [[{"id": False, "tag_name": api.tag}]]
+                elif case == "foreign-owner":
+                    api.release["body"] = "<!-- foreign -->"
+                elif case == "wrong-commit":
+                    api.release["target_commitish"] = "b" * 40
+                elif case == "published":
+                    api.release["draft"] = False
+                elif case == "prerelease":
+                    api.release["prerelease"] = True
+                elif case == "immutable":
+                    api.release["immutable"] = True
+                elif case == "malformed-asset":
+                    api.release["assets"] = ["not-an-asset"]
+                elif case == "duplicate-asset":
+                    api.release["assets"] = [assets[0], assets[0]]
+                elif case == "duplicate-asset-id":
+                    api.release["assets"] = [assets[0], {**assets[1], "id": assets[0]["id"]}]
+                elif case == "unexpected-asset":
+                    api.release["assets"] = [{**assets[0], "name": "unexpected.zip"}]
+                elif case == "non-uploaded-asset":
+                    api.release["assets"] = [{**assets[0], "state": "new"}]
+                elif case == "nonempty-starter-asset":
+                    api.release["assets"] = [
+                        {**assets[0], "state": "starter", "digest": None}
+                    ]
+                elif case == "wrong-digest":
+                    api.release["assets"] = [{**assets[0], "digest": "sha256:" + "0" * 64}]
+
+                with self.assertRaises(SystemExit):
+                    api.run()
 
 
 if __name__ == "__main__":

@@ -193,7 +193,8 @@ jobs:
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
           test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
-          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .object.sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .ref)" = "refs/tags/$TAG"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$TAG" --jq .sha)" = "$GITHUB_SHA"
 
           verify_run() {
             repository="$1"
@@ -512,7 +513,6 @@ jobs:
           import json
           import mimetypes
           import os
-          import urllib.error
           import urllib.parse
           import urllib.request
           from pathlib import Path
@@ -523,6 +523,10 @@ jobs:
           version = os.environ["VERSION"]
           root = Path(os.environ["PUBLICATION"])
           tag = f"toolchain-v{version}"
+          owner = (
+              f"<!-- easysplat-toolchain-release-owner:v1:"
+              f"{repository}:{tag}:{commit} -->"
+          )
           names = [
               f"toolchain-macos-arm64-{version}-core.zip",
               f"toolchain-geometry-da3-base-{version}.zip",
@@ -544,14 +548,83 @@ jobs:
               "User-Agent": "EasySplat-toolchain-publisher",
           }
 
-          def request(method, url, *, body=None, content_type=None):
+          def api_call(method, url, *, body=None, content_type=None):
+              parsed = urllib.parse.urlsplit(url)
+              if (
+                  parsed.scheme != "https"
+                  or parsed.hostname != "api.github.com"
+                  or parsed.port is not None
+                  or parsed.username is not None
+                  or parsed.password is not None
+                  or parsed.fragment
+              ):
+                  raise SystemExit("GitHub API URL is invalid")
               current = dict(headers)
               if content_type:
                   current["Content-Type"] = content_type
-              payload = None if body is None else body
-              call = urllib.request.Request(url, data=payload, headers=current, method=method)
+              return urllib.request.Request(
+                  url, data=body, headers=current, method=method
+              )
+
+          def request_with_link(method, url, *, body=None, content_type=None):
+              call = api_call(
+                  method, url, body=body, content_type=content_type
+              )
               with urllib.request.urlopen(call, timeout=120) as response:
-                  return json.loads(response.read().decode("utf-8"))
+                  encoded = response.read(32 * 1024 * 1024 + 1)
+                  if len(encoded) > 32 * 1024 * 1024:
+                      raise SystemExit("GitHub API response is oversized")
+                  try:
+                      payload = json.loads(encoded.decode("utf-8"))
+                  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                      raise SystemExit("GitHub API response is not valid JSON") from error
+                  return payload, response.headers.get("Link")
+
+          def request(method, url, *, body=None, content_type=None):
+              payload, _ = request_with_link(
+                  method, url, body=body, content_type=content_type
+              )
+              return payload
+
+          def request_empty(method, url):
+              call = api_call(method, url)
+              with urllib.request.urlopen(call, timeout=120) as response:
+                  if response.status != 204 or response.read(1) != b"":
+                      raise SystemExit("GitHub API empty response is invalid")
+
+          def next_page_url(link):
+              if link is None:
+                  return None
+              matches = []
+              for item in link.split(","):
+                  sections = [section.strip() for section in item.split(";")]
+                  if len(sections) < 2 or not sections[0].startswith("<") or not sections[0].endswith(">"):
+                      raise SystemExit("GitHub pagination Link header is invalid")
+                  relations = []
+                  for parameter in sections[1:]:
+                      name, separator, value = parameter.partition("=")
+                      if separator and name.strip().lower() == "rel":
+                          relations.extend(value.strip().strip('"').split())
+                  if "next" in relations:
+                      matches.append(sections[0][1:-1])
+              if len(matches) > 1:
+                  raise SystemExit("GitHub pagination has multiple next links")
+              return matches[0] if matches else None
+
+          def list_releases():
+              pages = []
+              url = f"{api}/releases?per_page=100&page=1"
+              visited = set()
+              while url is not None:
+                  if url in visited or len(visited) >= 10_000:
+                      raise SystemExit("GitHub release pagination did not terminate")
+                  visited.add(url)
+                  payload, link = request_with_link("GET", url)
+                  if not isinstance(payload, list) or len(payload) > 100:
+                      raise SystemExit("GitHub release listing has an invalid schema")
+                  pages.extend(payload)
+                  url = next_page_url(link)
+              return pages
 
           def hash_file(path):
               digest = hashlib.sha256()
@@ -560,10 +633,21 @@ jobs:
                       digest.update(block)
               return digest.hexdigest()
 
-          def upload_file(url, path, content_type):
+          def upload_file(url, path, content_type, release_id):
               parsed = urllib.parse.urlsplit(url)
-              if parsed.scheme != "https" or not parsed.hostname:
-                  raise SystemExit("release upload URL is not HTTPS")
+              expected_path = f"/repos/{repository}/releases/{release_id}/assets"
+              query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+              if (
+                  parsed.scheme != "https"
+                  or parsed.hostname != "uploads.github.com"
+                  or parsed.port is not None
+                  or parsed.username is not None
+                  or parsed.password is not None
+                  or parsed.fragment
+                  or parsed.path != expected_path
+                  or query != {"name": [path.name]}
+              ):
+                  raise SystemExit("release upload URL is invalid")
               target = urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, ""))
               connection = http.client.HTTPSConnection(
                   parsed.hostname, parsed.port, timeout=300
@@ -581,7 +665,9 @@ jobs:
                           },
                       )
                       response = connection.getresponse()
-                      response_body = response.read(1024 * 1024)
+                      response_body = response.read(1024 * 1024 + 1)
+                  if len(response_body) > 1024 * 1024:
+                      raise SystemExit("release upload response is oversized")
                   if response.status < 200 or response.status >= 300:
                       raise SystemExit(
                           f"release upload failed with HTTP {response.status}: "
@@ -591,50 +677,146 @@ jobs:
               finally:
                   connection.close()
 
-          try:
-              release = request("GET", f"{api}/releases/tags/{urllib.parse.quote(tag, safe='')}")
-          except urllib.error.HTTPError as error:
-              if error.code != 404:
-                  raise
-              release = request(
+          def validate_release(release, release_id):
+              if not isinstance(release, dict) or release.get("id") != release_id:
+                  raise SystemExit("toolchain draft release identifier differs")
+              if (
+                  release.get("tag_name") != tag
+                  or release.get("target_commitish") != commit
+                  or release.get("name") != tag
+                  or release.get("body") != owner
+              ):
+                  raise SystemExit("toolchain draft release identity differs")
+              if (
+                  release.get("draft") is not True
+                  or release.get("prerelease") is not False
+                  or release.get("immutable") is True
+              ):
+                  raise SystemExit("toolchain release is not the expected mutable stable draft")
+
+          def validate_assets(release, *, complete, allow_empty_starter=False):
+              assets = release.get("assets")
+              if not isinstance(assets, list):
+                  raise SystemExit("toolchain draft assets have an invalid schema")
+              by_name = {}
+              asset_ids = set()
+              starters = []
+              for asset in assets:
+                  if not isinstance(asset, dict):
+                      raise SystemExit("toolchain draft contains an invalid asset")
+                  name = asset.get("name")
+                  asset_id = asset.get("id")
+                  if name not in names:
+                      raise SystemExit("toolchain draft contains an unexpected asset")
+                  if name in by_name:
+                      raise SystemExit("toolchain draft contains a duplicate asset")
+                  if (
+                      not isinstance(asset_id, int)
+                      or isinstance(asset_id, bool)
+                      or asset_id <= 0
+                  ):
+                      raise SystemExit(f"toolchain draft asset state is invalid: {name}")
+                  state = asset.get("state")
+                  if state == "starter":
+                      if (
+                          not allow_empty_starter
+                          or asset.get("size") != 0
+                          or asset.get("digest") not in {None, ""}
+                      ):
+                          raise SystemExit(f"toolchain draft asset state is invalid: {name}")
+                      starters.append(asset)
+                  elif state != "uploaded":
+                      raise SystemExit(f"toolchain draft asset state is invalid: {name}")
+                  if asset_id in asset_ids:
+                      raise SystemExit("toolchain draft contains a duplicate asset identifier")
+                  by_name[name] = asset
+                  asset_ids.add(asset_id)
+              if complete and set(by_name) != set(names):
+                  raise SystemExit("toolchain draft asset closure is not exact")
+              return by_name, starters
+
+          matches = [
+              release
+              for release in list_releases()
+              if isinstance(release, dict) and release.get("tag_name") == tag
+          ]
+          if len(matches) > 1:
+              raise SystemExit("multiple releases claim the toolchain tag")
+          if matches:
+              release_id = matches[0].get("id")
+              if (
+                  not isinstance(release_id, int)
+                  or isinstance(release_id, bool)
+                  or release_id <= 0
+              ):
+                  raise SystemExit("existing toolchain draft has an invalid identifier")
+          else:
+              created = request(
                   "POST",
                   f"{api}/releases",
                   body=json.dumps({
                       "tag_name": tag,
                       "target_commitish": commit,
                       "name": tag,
+                      "body": owner,
                       "draft": True,
                       "prerelease": False,
+                      "make_latest": "false",
                       "generate_release_notes": False,
                   }, separators=(",", ":")).encode("utf-8"),
                   content_type="application/json",
               )
-          if release.get("draft") is not True or release.get("prerelease") is not False or release.get("tag_name") != tag:
-              raise SystemExit("existing toolchain release is not the expected stable draft release")
-          existing = {asset["name"]: asset for asset in release.get("assets", [])}
-          if not set(existing).issubset(names):
-              raise SystemExit("draft release contains an unexpected asset")
-          upload_base = release["upload_url"].split("{", 1)[0]
+              release_id = created.get("id") if isinstance(created, dict) else None
+              if (
+                  not isinstance(release_id, int)
+                  or isinstance(release_id, bool)
+                  or release_id <= 0
+              ):
+                  raise SystemExit("created toolchain draft has an invalid identifier")
+
+          release = request("GET", f"{api}/releases/{release_id}")
+          validate_release(release, release_id)
+          existing, starters = validate_assets(
+              release, complete=False, allow_empty_starter=True
+          )
+          for asset in starters:
+              request_empty(
+                  "DELETE", f"{api}/releases/assets/{asset['id']}"
+              )
+          if starters:
+              release = request("GET", f"{api}/releases/{release_id}")
+              validate_release(release, release_id)
+              existing, _ = validate_assets(release, complete=False)
+          upload_url = release.get("upload_url")
+          if not isinstance(upload_url, str) or "{" not in upload_url:
+              raise SystemExit("toolchain draft upload URL is invalid")
+          upload_base = upload_url.split("{", 1)[0]
           for name in names:
               path = root / name
               size = path.stat().st_size
               digest = "sha256:" + hash_file(path)
               prior = existing.get(name)
               if prior is not None:
-                  if prior.get("size") != size or prior.get("digest") != digest:
+                  if (
+                      prior.get("size") != size
+                      or prior.get("digest") != digest
+                  ):
                       raise SystemExit(f"existing draft asset differs: {name}")
                   continue
               upload_file(
                   upload_base + "?" + urllib.parse.urlencode({"name": name}),
                   path,
                   mimetypes.guess_type(name)[0] or "application/octet-stream",
+                  release_id,
               )
-          final = request("GET", f"{api}/releases/{release['id']}")
-          assets = {asset["name"]: asset for asset in final.get("assets", [])}
-          if set(assets) != set(names):
-              raise SystemExit("draft release asset closure is not exact")
+          final = request("GET", f"{api}/releases/{release_id}")
+          validate_release(final, release_id)
+          assets, _ = validate_assets(final, complete=True)
           for name in names:
               path = root / name
-              if assets[name].get("size") != path.stat().st_size or assets[name].get("digest") != "sha256:" + hash_file(path):
+              if (
+                  assets[name].get("size") != path.stat().st_size
+                  or assets[name].get("digest") != "sha256:" + hash_file(path)
+              ):
                   raise SystemExit(f"uploaded draft asset failed byte verification: {name}")
           PY
