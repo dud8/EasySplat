@@ -1190,7 +1190,7 @@ class Da3BuilderLicenseTests(unittest.TestCase):
 
     def test_builder_pins_whitespace_clean_runtime_patch(self) -> None:
         self.assertIn(
-            'DA3_RUNTIME_PATCH_SHA256="885ade24b466ab3dff04169ff47dd3813d64c40ffd0bdb7dd9b779de97a370eb"',
+            'DA3_RUNTIME_PATCH_SHA256="d2c2eb882195abe28dd32ee8c42631dbe1a14d8c37a26ecba95b2b6da443fc88"',
             self.script,
         )
 

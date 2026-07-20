@@ -7,7 +7,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT/scripts/toolchain/build_msplat.sh"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
+APACHE_LICENSE="$ROOT/ThirdParty/LICENSES/Apache-2.0.txt"
+MSPLAT_NOTICE="$ROOT/Tools/MsplatNative/NOTICE.md"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
+SOURCE_NOTICE_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-source-notices.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
 METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
@@ -56,7 +59,10 @@ require_file() {
 require_file "$BUILD_SCRIPT"
 require_file "$OVERLAY"
 require_file "$RASTER_TEST_SOURCE"
+require_file "$APACHE_LICENSE"
+require_file "$MSPLAT_NOTICE"
 require_file "$UPSTREAM_PATCH"
+require_file "$SOURCE_NOTICE_PATCH"
 require_file "$CHECKPOINT_PATCH"
 require_file "$NUMERIC_STABILITY_PATCH"
 require_file "$METAL_SAFETY_PATCH"
@@ -86,13 +92,29 @@ require_file "$SWIFT_FIXTURE"
 require_contains 'MSPLAT_REPO="https://github.com/rayanht/msplat.git"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_VERSION="1.1.3"' "$BUILD_SCRIPT"
+require_contains 'Apache License' "$APACHE_LICENSE"
+require_contains 'Version 2.0, January 2004' "$APACHE_LICENSE"
+[ "$(shasum -a 256 "$APACHE_LICENSE" | awk '{print $1}')" = \
+  "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30" ] \
+  || fail "Apache-2.0 license text is not the canonical upstream text"
+require_contains 'Copyright 2025 Rayan Hatout' "$MSPLAT_NOTICE"
+require_contains '106499b0a53f82b0c92d013b0861fbebd341b17e' "$MSPLAT_NOTICE"
+require_contains 'Modified by the EasySplat project in 2026 from msplat 1.1.3.' "$OVERLAY"
+require_contains 'Modified by the EasySplat project in 2026 from msplat 1.1.3.' "$RASTER_TEST_SOURCE"
+[ "$(grep -Fc 'Modified by the EasySplat project in 2026 from msplat 1.1.3.' "$SOURCE_NOTICE_PATCH")" -eq 10 ] \
+  || fail "msplat patch does not mark every modified upstream source"
 require_contains 'UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$UPSTREAM_PATCH")" = "$UPSTREAM_PATCH_SHA256" ]' "$BUILD_SCRIPT"
-require_contains 'OVERLAY_SHA256="fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc"' "$BUILD_SCRIPT"
+require_contains 'SOURCE_NOTICE_PATCH_SHA256="6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$SOURCE_NOTICE_PATCH")" = "$SOURCE_NOTICE_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero --check "$SOURCE_NOTICE_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero "$SOURCE_NOTICE_PATCH"' "$BUILD_SCRIPT"
+require_contains 'OVERLAY_SHA256="ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT"
-require_contains '"overlay_sha256": "fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc"' "$VALIDATOR"
+require_contains '"overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$VALIDATOR"
 require_contains '"patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$VALIDATOR"
-require_contains 'RASTER_TEST_SHA256="3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934"' "$BUILD_SCRIPT"
+require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$VALIDATOR"
+require_contains 'RASTER_TEST_SHA256="b2529dedfc7e2027b6f3e0f86db522cfc95be5fb90208a8d6b75a892584a52b7"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$BUILD_SCRIPT"
 require_contains 'NANOFLANN_SHA256="57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc"' "$BUILD_SCRIPT"
@@ -307,6 +329,7 @@ require_contains 'reject_raster_test_symbols' "$VALIDATOR"
 require_contains 'raster_test_sha256' "$BUILD_SCRIPT"
 require_contains 'raster_test_sha256' "$VALIDATOR"
 for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
+  require_contains 'source_notice_patch_sha256' "$contract_file"
   require_contains 'exact_raster_patch_sha256' "$contract_file"
   require_contains 'stage_timing_patch_sha256' "$contract_file"
   require_contains 'memory_efficiency_patch_sha256' "$contract_file"
@@ -318,14 +341,15 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'exact_prefix_hardening_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
-  require_contains '"overlay_sha256": "fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc"' "$contract_file"
-  require_contains '"raster_test_sha256": "3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934"' "$contract_file"
+  require_contains '"overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$contract_file"
+  require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$contract_file"
+  require_contains '"raster_test_sha256": "b2529dedfc7e2027b6f3e0f86db522cfc95be5fb90208a8d6b75a892584a52b7"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
   require_contains '"allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$contract_file"
   require_contains '"exact_prefix_hardening_patch_sha256": "99022e824c91ca57b34f60f21b29753db788290541c3c6bc52a5b496794d9683"' "$contract_file"
 done
 require_contains 'scene_bounds_status' "$SWIFT_VALIDATOR"
-require_contains 'python3 - "$build_info"' "$BUILD_SCRIPT"
+require_contains '"$PYTHON_BIN" - "$build_info"' "$BUILD_SCRIPT"
 require_contains 'json.dump(payload, output, indent=2, sort_keys=True)' "$BUILD_SCRIPT"
 require_contains 'json.load(source, parse_constant=reject_constant)' "$BUILD_SCRIPT"
 require_contains '/usr/bin/otool -L' "$BUILD_SCRIPT"
@@ -1069,10 +1093,11 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
+source_notice_patch_hash="$(shasum -a 256 "$SOURCE_NOTICE_PATCH" | awk '{print $1}')"
 numeric_stability_patch_hash="$(shasum -a 256 "$NUMERIC_STABILITY_PATCH" | awk '{print $1}')"
 metal_safety_patch_hash="$(shasum -a 256 "$METAL_SAFETY_PATCH" | awk '{print $1}')"
 exact_raster_patch_hash="$(shasum -a 256 "$EXACT_RASTER_PATCH" | awk '{print $1}')"
@@ -1087,7 +1112,7 @@ exact_prefix_hardening_patch_hash="$(shasum -a 256 "$EXACT_PREFIX_HARDENING_PATC
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" "$allocation_pressure_patch_hash" "$exact_prefix_hardening_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$source_notice_patch_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" "$allocation_pressure_patch_hash" "$exact_prefix_hardening_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -1102,20 +1127,21 @@ expected = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "overlay_sha256": sys.argv[2],
-    "numeric_stability_patch_sha256": sys.argv[3],
-    "metal_safety_patch_sha256": sys.argv[4],
-    "exact_raster_patch_sha256": sys.argv[5],
-    "stage_timing_patch_sha256": sys.argv[6],
-    "memory_efficiency_patch_sha256": sys.argv[7],
-    "densification_memory_patch_sha256": sys.argv[8],
-    "row_span_culling_patch_sha256": sys.argv[9],
-    "geometry_adam_fusion_patch_sha256": sys.argv[10],
-    "parallel_radix_scan_patch_sha256": sys.argv[11],
-    "allocation_pressure_patch_sha256": sys.argv[12],
-    "exact_prefix_hardening_patch_sha256": sys.argv[13],
-    "raster_test_sha256": sys.argv[14],
-    "executable_sha256": sys.argv[15],
-    "metallib_sha256": sys.argv[16],
+    "source_notice_patch_sha256": sys.argv[3],
+    "numeric_stability_patch_sha256": sys.argv[4],
+    "metal_safety_patch_sha256": sys.argv[5],
+    "exact_raster_patch_sha256": sys.argv[6],
+    "stage_timing_patch_sha256": sys.argv[7],
+    "memory_efficiency_patch_sha256": sys.argv[8],
+    "densification_memory_patch_sha256": sys.argv[9],
+    "row_span_culling_patch_sha256": sys.argv[10],
+    "geometry_adam_fusion_patch_sha256": sys.argv[11],
+    "parallel_radix_scan_patch_sha256": sys.argv[12],
+    "allocation_pressure_patch_sha256": sys.argv[13],
+    "exact_prefix_hardening_patch_sha256": sys.argv[14],
+    "raster_test_sha256": sys.argv[15],
+    "executable_sha256": sys.argv[16],
+    "metallib_sha256": sys.argv[17],
 }
 for key, value in expected.items():
     if payload.get(key) != value:

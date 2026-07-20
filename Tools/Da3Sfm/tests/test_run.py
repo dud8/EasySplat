@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -173,6 +174,28 @@ class Da3RunTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         patch = (root / "patches/da3-api-lazy-export.patch").read_text(
             encoding="utf-8"
+        )
+
+        license_text = (
+            root.parents[1] / "ThirdParty/LICENSES/Apache-2.0.txt"
+        ).read_text(encoding="utf-8")
+        license_bytes = (
+            root.parents[1] / "ThirdParty/LICENSES/Apache-2.0.txt"
+        ).read_bytes()
+        notice = (root / "NOTICE.md").read_text(encoding="utf-8")
+        self.assertIn("Apache License", license_text)
+        self.assertIn("Version 2.0, January 2004", license_text)
+        self.assertEqual(
+            hashlib.sha256(license_bytes).hexdigest(),
+            "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        )
+        self.assertIn("Copyright 2025 The Depth Anything 3 Team", notice)
+        self.assertIn("41736238f5bced4debf3f2a12375d2466874866d", notice)
+        self.assertEqual(
+            patch.count(
+                "Modified by the EasySplat project in 2026 from Depth Anything 3."
+            ),
+            3,
         )
 
         self.assertIn("utils/io/input_processor.py", patch)

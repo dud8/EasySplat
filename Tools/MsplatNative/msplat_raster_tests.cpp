@@ -1,3 +1,6 @@
+// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+// Licensed under Apache-2.0; see Tools/MsplatNative/NOTICE.md.
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>

@@ -17,12 +17,14 @@ INSTALL_STAGE_DEVICE=""
 INSTALL_STAGE_INODE=""
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
-OVERLAY_SHA256="fde0d92e1235ebdddc45fd55ee6ee0f87809c2978d452c80fee54f0d1d135ffc"
+OVERLAY_SHA256="ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="3e73cb270bcd6bb72fc33bacc334f8884cb84d3ab211448ea5b451283ca41934"
+RASTER_TEST_SHA256="b2529dedfc7e2027b6f3e0f86db522cfc95be5fb90208a8d6b75a892584a52b7"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"
+SOURCE_NOTICE_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-source-notices.patch"
+SOURCE_NOTICE_PATCH_SHA256="6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
 NUMERIC_STABILITY_PATCH_SHA256="231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3"
@@ -190,6 +192,9 @@ preflight() {
   [ -f "$UPSTREAM_PATCH" ] || die "missing upstream patch: $UPSTREAM_PATCH"
   [ "$(sha256 "$UPSTREAM_PATCH")" = "$UPSTREAM_PATCH_SHA256" ] \
     || die "upstream patch SHA-256 mismatch"
+  [ -f "$SOURCE_NOTICE_PATCH" ] || die "missing source-notice patch: $SOURCE_NOTICE_PATCH"
+  [ "$(sha256 "$SOURCE_NOTICE_PATCH")" = "$SOURCE_NOTICE_PATCH_SHA256" ] \
+    || die "source-notice patch SHA-256 mismatch"
   [ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ] \
     || die "raster parity test SHA-256 mismatch"
   [ -f "$CHECKPOINT_PATCH" ] || die "missing checkpoint patch: $CHECKPOINT_PATCH"
@@ -337,6 +342,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply "$ALLOCATION_PRESSURE_PATCH"
   git -C "$SOURCE_DIR" apply --check "$EXACT_PREFIX_HARDENING_PATCH"
   git -C "$SOURCE_DIR" apply "$EXACT_PREFIX_HARDENING_PATCH"
+  git -C "$SOURCE_DIR" apply --unidiff-zero --check "$SOURCE_NOTICE_PATCH"
+  git -C "$SOURCE_DIR" apply --unidiff-zero "$SOURCE_NOTICE_PATCH"
 }
 
 configure_and_build() {
@@ -389,7 +396,7 @@ configure_and_build() {
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -398,6 +405,7 @@ write_build_info() {
   overlay_sha256="$(sha256 "$OVERLAY")"
   raster_test_sha256="$(sha256 "$RASTER_TEST_SOURCE")"
   patch_sha256="$(sha256 "$UPSTREAM_PATCH")"
+  source_notice_patch_sha256="$(sha256 "$SOURCE_NOTICE_PATCH")"
   checkpoint_patch_sha256="$(sha256 "$CHECKPOINT_PATCH")"
   numeric_stability_patch_sha256="$(sha256 "$NUMERIC_STABILITY_PATCH")"
   metal_safety_patch_sha256="$(sha256 "$METAL_SAFETY_PATCH")"
@@ -413,7 +421,7 @@ write_build_info() {
 
   "$PYTHON_BIN" - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" "$parallel_radix_scan_patch_sha256" "$allocation_pressure_patch_sha256" "$exact_prefix_hardening_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$source_notice_patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" "$parallel_radix_scan_patch_sha256" "$allocation_pressure_patch_sha256" "$exact_prefix_hardening_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -429,6 +437,7 @@ import sys
     overlay_sha256,
     raster_test_sha256,
     patch_sha256,
+    source_notice_patch_sha256,
     checkpoint_patch_sha256,
     numeric_stability_patch_sha256,
     metal_safety_patch_sha256,
@@ -461,6 +470,7 @@ payload = {
     "overlay_sha256": overlay_sha256,
     "raster_test_sha256": raster_test_sha256,
     "patch_sha256": patch_sha256,
+    "source_notice_patch_sha256": source_notice_patch_sha256,
     "checkpoint_patch_sha256": checkpoint_patch_sha256,
     "numeric_stability_patch_sha256": numeric_stability_patch_sha256,
     "metal_safety_patch_sha256": metal_safety_patch_sha256,
