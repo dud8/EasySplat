@@ -715,7 +715,13 @@ class SourceContractTests(unittest.TestCase):
             shutil.copy2(CONTROL_FREEZER, toolchain_directory / CONTROL_FREEZER.name)
             shutil.copy2(PROMOTER, toolchain_directory / PROMOTER.name)
 
+            external_tools = Path(temporary) / "external-tools"
+            external_tools.mkdir()
+            for name in ("cmake", "ninja", "rg"):
+                (external_tools / name).symlink_to("/usr/bin/true")
+
             environment = os.environ.copy()
+            environment["PATH"] = f"{external_tools}:{environment['PATH']}"
             environment["BASH_FUNC_uname%%"] = "() { printf 'x86_64\\n'; }"
             environment["EASYSPLAT_HERMETIC_BUILD"] = "1"
             environment["EASYSPLAT_BOOTSTRAP_CMAKE"] = "/private/tmp/forged-cmake"
