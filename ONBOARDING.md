@@ -235,6 +235,8 @@ Before starting:
 
 Run the release in this order:
 
+First merge the reviewed release commit, make the repository public, manually dispatch CodeQL, create the immutable version tag, and then run Release App through the protected workflow sequence below.
+
 1. Merge the reviewed source into protected EasySplat `main`.
 2. After explicit owner approval and credential rotation, make EasySplat public. Dispatch **CodeQL** on that exact commit and require all four language jobs to pass.
 3. Create `toolchain-v2.0.0` at that commit. Do not let a workflow create or move the tag.

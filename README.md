@@ -176,6 +176,8 @@ Fixture reproducibility proves input integrity only. The integrated geometry-con
 
 Stable release packaging is performed only by the protected workflows. `build_dmg.sh --production` intentionally rejects a live source checkout.
 
+The release order is fixed: merge the reviewed release commit, make the repository public, manually dispatch CodeQL, create the immutable version tag, then run Release App.
+
 The toolchain is released first. From protected `main`, create `toolchain-v2.0.0`, run **Toolchain Producer**, obtain the schema-v2 payload and receipt from the external sign-only authority, run **Release Benchmark Evidence**, then run **Toolchain Publication**. Independently reverify the exact draft release ID, source ref, artifact IDs, sizes, and digests before publishing that draft.
 
 After the signed toolchain is live, create `v0.2.0` at the same protected `main` commit and run **Release App**. It builds an identity-free prepared product, hands only authenticated bytes to the isolated signing environment, verifies the final closure, and leaves an owned stable draft. Independently reverify that draft before publishing it. The required sign-only authority workflow and EasySplat's release workflows must not publish automatically.
