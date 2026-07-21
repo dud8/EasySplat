@@ -907,7 +907,7 @@ class WrapperHostileEnvironmentTests(unittest.TestCase):
                     "EASYSPLAT_BOOTSTRAP_NINJA": "/tmp/forged-ninja",
                     "EASYSPLAT_BOOTSTRAP_RG": "/tmp/forged-rg",
                     "BASH_FUNC_cmake%%": "() { echo forged; }",
-                    "DYLD_INSERT_LIBRARIES": "/tmp/forged.dylib",
+                    "DYLD_LIBRARY_PATH": "/tmp/forged-libraries",
                     "CMAKE_PROJECT_INCLUDE": "/tmp/forged.cmake",
                 }
             )

@@ -508,7 +508,7 @@ class SourceContractTests(unittest.TestCase):
                     "BASH_FUNC_cmake%%": "() { exit 86; }",
                     "EASYSPLAT_BOOTSTRAP_CMAKE": "/private/tmp/forged-cmake",
                     "CMAKE_TOOLCHAIN_FILE": "/private/tmp/hostile.cmake",
-                    "DYLD_INSERT_LIBRARIES": "/private/tmp/hostile.dylib",
+                    "DYLD_LIBRARY_PATH": "/private/tmp/hostile-libraries",
                 }
             )
             result = subprocess.run(
@@ -524,7 +524,7 @@ class SourceContractTests(unittest.TestCase):
                 received["EASYSPLAT_BOOTSTRAP_CMAKE"], str(tools / "cmake")
             )
             self.assertNotIn("CMAKE_TOOLCHAIN_FILE", received)
-            self.assertNotIn("DYLD_INSERT_LIBRARIES", received)
+            self.assertNotIn("DYLD_LIBRARY_PATH", received)
             self.assertFalse(any(key.startswith("BASH_FUNC_") for key in received))
 
     def test_impl_is_non_executable_and_uses_pinned_xcode_tools(self) -> None:
