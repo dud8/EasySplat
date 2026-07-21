@@ -1612,20 +1612,6 @@ while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do
   training_dir="$negative_dir/training-$fixture_name"
   memory_budget_bytes=536870912
   validation_environment=(env)
-  if [ "$metal_pipeline_stress" = "true" ]; then
-    # Metal shader validation inflates device.currentAllocatedSize far beyond
-    # the process RSS. Keep the real 512 MiB RSS gate below, but give the debug
-    # layer enough room for its shadow allocations.
-    memory_budget_bytes=8589934592
-    validation_environment=(
-      env
-      MTL_DEBUG_LAYER=1
-      MTL_SHADER_VALIDATION=1
-      MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1
-      MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1
-      MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1
-    )
-  fi
   mkdir -p "$training_dir"
   if ! "${validation_environment[@]}" "$BIN" \
     --dataset "$training_fixture" \
@@ -1679,6 +1665,58 @@ for fixture in manifest["fixtures"]:
 PY
 )
 [ "$fixture_count" = "12" ] || fail "sparse fixture generator did not produce twelve cases"
+
+# Shader validation changes floating-point scheduling enough to make a long,
+# adversarial convergence run nondeterministic on some hosted GPUs. Keep the
+# full 3,000-iteration production run above, then exercise the instrumented
+# Metal pipeline separately through warmup, densification, and publication.
+metal_validation_dir="$negative_dir/metal-validation-11-room-1279"
+mkdir -p "$metal_validation_dir"
+env \
+  MTL_DEBUG_LAYER=1 \
+  MTL_SHADER_VALIDATION=1 \
+  MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1 \
+  MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
+  MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1 \
+  "$BIN" \
+    --dataset "$fixture_root/11-room-1279" \
+    --output "$metal_validation_dir/splat.ply" \
+    --profile fast \
+    --iteration-limit 800 \
+    --checkpoint "$metal_validation_dir/checkpoint" \
+    --seed 42 \
+    --memory-budget-bytes 8589934592 \
+    --events-fd 1 \
+    >"$metal_validation_dir/events.jsonl" \
+    2>"$metal_validation_dir/stderr.log"
+if grep -Eqi 'shader validation|invalid (device|threadgroup|texture)|validation (error|fault)|gpu fault' \
+  "$metal_validation_dir/stderr.log"; then
+  sed -n '1,200p' "$metal_validation_dir/stderr.log" >&2
+  fail "instrumented Metal training emitted validation diagnostics"
+fi
+validate_jsonl "$metal_validation_dir/events.jsonl"
+python3 - "$metal_validation_dir/events.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+started, completed = records[0], records[-1]
+if started.get("event") != "started" or completed.get("event") != "completed":
+    raise SystemExit("instrumented Metal run has invalid event boundaries")
+if started.get("iteration_limit") != 800 or completed.get("iteration_limit") != 800:
+    raise SystemExit("instrumented Metal run lost its bounded iteration limit")
+if started.get("initial_gaussian_count") != 1279:
+    raise SystemExit("instrumented Metal run used the wrong stress fixture")
+if completed.get("dropped_intersection_count") != 0:
+    raise SystemExit("instrumented Metal run dropped raster intersections")
+PY
+[ -s "$metal_validation_dir/splat.ply" ] \
+  || fail "instrumented Metal training did not publish a PLY"
+"$BIN" --validate-ply "$metal_validation_dir/splat.ply" --events-fd 1 \
+  >"$metal_validation_dir/validation.jsonl" \
+  2>"$metal_validation_dir/validation.stderr"
+require_contains '"status":"ok"' "$metal_validation_dir/validation.jsonl"
 
 overflow_dir="$negative_dir/raster-overflow"
 mkdir -p "$overflow_dir"
