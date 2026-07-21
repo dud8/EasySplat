@@ -131,6 +131,68 @@ def set_birthtime(path: Path, seconds: int) -> None:
 
 
 class MixedInputStagingTests(unittest.TestCase):
+    def test_rename_no_replace_uses_macos_15_compatible_flags(self) -> None:
+        class FakeRename:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, bytes, int, bytes, int]] = []
+                self.argtypes: object = None
+                self.restype: object = None
+
+            def __call__(
+                self,
+                source_directory_descriptor: int,
+                source_name: bytes,
+                destination_directory_descriptor: int,
+                destination_name: bytes,
+                flags: int,
+            ) -> int:
+                self.calls.append(
+                    (
+                        source_directory_descriptor,
+                        source_name,
+                        destination_directory_descriptor,
+                        destination_name,
+                        flags,
+                    )
+                )
+                return 0
+
+        rename = FakeRename()
+        library = type("FakeLibrary", (), {"renameatx_np": rename})()
+        with mock.patch.object(staging.ctypes, "CDLL", return_value=library):
+            staging._rename_no_replace(3, "source", 4, "destination")
+
+        self.assertEqual(
+            rename.calls,
+            [(3, b"source", 4, b"destination", 0x00000004 | 0x00000010)],
+        )
+
+    def test_rename_no_replace_rejects_non_leaf_names_before_libc(self) -> None:
+        invalid_names = ("", ".", "..", "/absolute", "nested/name", "nul\0name")
+        for invalid_name in invalid_names:
+            for source_name, destination_name in (
+                (invalid_name, "destination"),
+                ("source", invalid_name),
+            ):
+                with (
+                    self.subTest(
+                        source_name=source_name,
+                        destination_name=destination_name,
+                    ),
+                    mock.patch.object(
+                        staging.ctypes,
+                        "CDLL",
+                        side_effect=AssertionError("libc must not be called"),
+                    ),
+                    self.assertRaisesRegex(staging.StagingError, "leaf name"),
+                ):
+                    staging._rename_no_replace(
+                        3,
+                        source_name,
+                        4,
+                        destination_name,
+                    )
+
     def test_stages_a_deterministic_private_mixed_input_closure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)

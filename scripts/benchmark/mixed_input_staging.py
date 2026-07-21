@@ -747,6 +747,14 @@ def _rename_no_replace(
     destination_directory_descriptor: int,
     destination_name: str,
 ) -> None:
+    for name in (source_name, destination_name):
+        if (
+            not name
+            or name in {".", ".."}
+            or "\0" in name
+            or Path(name).name != name
+        ):
+            raise StagingError("exclusive rename requires a plain leaf name")
     try:
         renameatx_np = ctypes.CDLL(None, use_errno=True).renameatx_np
     except (AttributeError, OSError) as error:
@@ -766,7 +774,7 @@ def _rename_no_replace(
             os.fsencode(source_name),
             destination_directory_descriptor,
             os.fsencode(destination_name),
-            0x00000004 | 0x00000010 | 0x00000020,
+            0x00000004 | 0x00000010,
         )
         == 0
     ):
