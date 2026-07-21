@@ -244,10 +244,11 @@ require_contains 'MSPLAT_ENABLE_RASTER_TEST_HOOKS' "$ALLOCATION_PRESSURE_PATCH"
 require_absent 'add_option("--simulate' "$ALLOCATION_PRESSURE_PATCH"
 require_absent 'add_flag("--simulate' "$ALLOCATION_PRESSURE_PATCH"
 require_contains 'return 71;' "$ALLOCATION_PRESSURE_PATCH"
-require_contains 'EXACT_PREFIX_HARDENING_PATCH_SHA256="0f6ee3db885249b9e1e429e30c3ac277b6ed1f1e730d823e38ed97c9afa6f333"' "$BUILD_SCRIPT"
+require_contains 'EXACT_PREFIX_HARDENING_PATCH_SHA256="81e72d3a9f32a6b138e9546892e26323b24da7b8c81dc5ca8e4ba49167e5f59b"' "$BUILD_SCRIPT"
 actual_exact_prefix_hardening_patch_sha256="$(shasum -a 256 "$EXACT_PREFIX_HARDENING_PATCH" | awk '{print $1}')"
-[ "$actual_exact_prefix_hardening_patch_sha256" = "0f6ee3db885249b9e1e429e30c3ac277b6ed1f1e730d823e38ed97c9afa6f333" ] \
+[ "$actual_exact_prefix_hardening_patch_sha256" = "81e72d3a9f32a6b138e9546892e26323b24da7b8c81dc5ca8e4ba49167e5f59b" ] \
   || fail "exact-prefix hardening patch SHA-256 mismatch"
+require_contains 'std::max(0.0, value)' "$EXACT_PREFIX_HARDENING_PATCH"
 require_contains '[ "$(sha256 "$EXACT_PREFIX_HARDENING_PATCH")" = "$EXACT_PREFIX_HARDENING_PATCH_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply --check "$EXACT_PREFIX_HARDENING_PATCH"' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply "$EXACT_PREFIX_HARDENING_PATCH"' "$BUILD_SCRIPT"
@@ -359,7 +360,7 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains '"raster_test_sha256": "8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
   require_contains '"allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$contract_file"
-  require_contains '"exact_prefix_hardening_patch_sha256": "0f6ee3db885249b9e1e429e30c3ac277b6ed1f1e730d823e38ed97c9afa6f333"' "$contract_file"
+  require_contains '"exact_prefix_hardening_patch_sha256": "81e72d3a9f32a6b138e9546892e26323b24da7b8c81dc5ca8e4ba49167e5f59b"' "$contract_file"
 done
 require_contains 'scene_bounds_status' "$SWIFT_VALIDATOR"
 require_contains '"$PYTHON_BIN" - "$build_info"' "$BUILD_SCRIPT"

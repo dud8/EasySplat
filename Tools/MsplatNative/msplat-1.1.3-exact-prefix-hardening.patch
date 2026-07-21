@@ -343,3 +343,16 @@ index a9fdd8ff54162221920dc27daf5b2a54a8e1683d..037f3d2e89ab2f5505be309c2a6984d3
      [enc setComputePipelineState:ctx->exact_block_scan_propagate_u64_kernel_cpso];
      ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, g_tcache.num_tiles_hit, 1);
      ENC_BUF(enc, g_tcache.cum_tiles_hit, 2); ENC_BUF(enc, g_tcache.block_totals, 3);
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -1532,6 +1532,8 @@ void msplat_sync_loss_window(int count, float* output) {
+         if (!std::isfinite(value)) {
+             throw std::runtime_error("msplat: loss window contains a non-finite value");
+         }
+-        output[index] = static_cast<float>(value);
++        // L1 + (1 - SSIM) is nonnegative. Discard only the floating-point
++        // undershoot in its checkpoint and early-stop evidence.
++        output[index] = static_cast<float>(std::max(0.0, value));
+     }
+ }
