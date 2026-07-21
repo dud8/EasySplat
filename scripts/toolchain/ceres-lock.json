@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "dependencies": {
+    "ceres": {
+      "version": "2.2.0",
+      "commit": "85331393dc0dff09f6fb9903ab0c4bfa3e134b01",
+      "license": "BSD-3-Clause",
+      "source": {
+        "url": "https://github.com/ceres-solver/ceres-solver/archive/85331393dc0dff09f6fb9903ab0c4bfa3e134b01.tar.gz",
+        "sha256": "4cdd9f11f5afb34f8c9a043396a574b4a0a888f866710e7d65acb5b88ce64bcb"
+      }
+    },
+    "eigen": {
+      "version": "3.4.0",
+      "commit": "3147391d946bb4b6c68edd901f2add6ac1f31f8c",
+      "license": "MPL-2.0",
+      "source": {
+        "url": "https://gitlab.com/libeigen/eigen/-/archive/3147391d946bb4b6c68edd901f2add6ac1f31f8c/eigen-3147391d946bb4b6c68edd901f2add6ac1f31f8c.tar.gz",
+        "sha256": "0c8c490764f9c2a793133491adca0cd073b73e0bde965c68cbe58d91b5ed4261"
+      }
+    }
+  }
+}

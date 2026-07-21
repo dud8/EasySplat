@@ -1,0 +1,8 @@
+self-hosted-runner:
+  labels:
+    - easysplat-release
+    - easysplat-signing
+    - easysplat-benchmark-reference
+    - easysplat-benchmark-constrained
+    - easysplat-benchmark-8gb
+    - easysplat-ephemeral

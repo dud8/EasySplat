@@ -1,0 +1,234 @@
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -107,6 +107,11 @@
+     uint64_t* sorted_keys,
+     uint32_t* sorted_values
+ );
++void msplat_quaternion_vjp_for_testing(
++    const float* quaternion,
++    const float* rotation_gradient,
++    float* quaternion_gradient
++);
+ double msplat_gpu_ticks_to_seconds_for_testing(uint64_t ticks, double frequency_hz);
+ double msplat_gpu_frequency_from_timestamp_pairs_for_testing(
+     const uint64_t* cpu_timestamps,
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -245,16 +245,48 @@
+     return out;
+ }
+ 
+-// Normalized quaternion → 3x3 rotation matrix (column-major for Metal).
+-inline float3x3 quat_to_rotmat(const float4 quat) {
+-    float s = rsqrt(
+-        quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z
++inline bool normalize_quaternion(
++    const float4 quaternion,
++    thread float4 &normalized,
++    thread float &inverse_norm
++) {
++    const float largest = max(
++        max(abs(quaternion.x), abs(quaternion.y)),
++        max(abs(quaternion.z), abs(quaternion.w))
+     );
+-    float w = quat.x * s;
+-    float x = quat.y * s;
+-    float y = quat.z * s;
+-    float z = quat.w * s;
++    if (!isfinite(largest) || largest <= 0.0f) {
++        normalized = float4(1.0f, 0.0f, 0.0f, 0.0f);
++        inverse_norm = 0.0f;
++        return false;
++    }
++    const float4 scaled = quaternion / largest;
++    const float scaled_norm_squared = dot(scaled, scaled);
++    if (!isfinite(scaled_norm_squared) || scaled_norm_squared <= 0.0f) {
++        normalized = float4(1.0f, 0.0f, 0.0f, 0.0f);
++        inverse_norm = 0.0f;
++        return false;
++    }
++    const float inverse_scaled_norm = rsqrt(scaled_norm_squared);
++    normalized = scaled * inverse_scaled_norm;
++    inverse_norm = inverse_scaled_norm / largest;
++    if (!all(isfinite(normalized)) || !isfinite(inverse_norm)) {
++        normalized = float4(1.0f, 0.0f, 0.0f, 0.0f);
++        inverse_norm = 0.0f;
++        return false;
++    }
++    return true;
++}
+ 
++// Quaternion → 3x3 rotation matrix (column-major for Metal).
++inline float3x3 quat_to_rotmat(const float4 quat) {
++    float4 normalized;
++    float inverse_norm;
++    normalize_quaternion(quat, normalized, inverse_norm);
++    float w = normalized.x;
++    float x = normalized.y;
++    float y = normalized.z;
++    float z = normalized.w;
++
+     return float3x3(
+         1.f - 2.f * (y * y + z * z),
+         2.f * (x * y + w * z),
+@@ -1797,13 +1829,15 @@
+ }
+ 
+ inline float4 quat_to_rotmat_vjp(const float4 quat, const float3x3 v_R) {
+-    float s = rsqrt(
+-        quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z
+-    );
+-    float w = quat.x * s;
+-    float x = quat.y * s;
+-    float y = quat.z * s;
+-    float z = quat.w * s;
++    float4 normalized;
++    float inverse_norm;
++    if (!normalize_quaternion(quat, normalized, inverse_norm)) {
++        return float4(0.0f);
++    }
++    float w = normalized.x;
++    float x = normalized.y;
++    float y = normalized.z;
++    float z = normalized.w;
+ 
+     float4 v_quat;
+     // v_R is COLUMN MAJOR
+@@ -1838,9 +1872,33 @@
+             x * (v_R[0][2] + v_R[2][0]) + y * (v_R[1][2] + v_R[2][1]) -
+             2.f * z * (v_R[0][0] + v_R[1][1]) + w * (v_R[0][1] - v_R[1][0])
+         );
+-    return v_quat;
++    // The matrix is a function of q / ||q||. Project the normalized-coordinate
++    // cotangent onto the quaternion tangent plane, then apply d(q/||q||)/dq.
++    return inverse_norm * (v_quat - normalized * dot(normalized, v_quat));
+ }
+ 
++kernel void quaternion_vjp_for_testing_kernel(
++    constant float* quaternion [[buffer(0)]],
++    constant float* rotation_gradient [[buffer(1)]],
++    device float* quaternion_gradient [[buffer(2)]],
++    uint index [[thread_position_in_grid]]
++) {
++    if (index != 0) return;
++    const float4 value = float4(
++        quaternion[0], quaternion[1], quaternion[2], quaternion[3]
++    );
++    const float3x3 gradient = float3x3(
++        float3(rotation_gradient[0], rotation_gradient[1], rotation_gradient[2]),
++        float3(rotation_gradient[3], rotation_gradient[4], rotation_gradient[5]),
++        float3(rotation_gradient[6], rotation_gradient[7], rotation_gradient[8])
++    );
++    const float4 result = quat_to_rotmat_vjp(value, gradient);
++    quaternion_gradient[0] = result.x;
++    quaternion_gradient[1] = result.y;
++    quaternion_gradient[2] = result.z;
++    quaternion_gradient[3] = result.w;
++}
++
+ // given cotangent v in output space (e.g. d_L/d_cov3d) in R(6)
+ // compute vJp for scale and rotation
+ void scale_rot_to_cov3d_vjp(
+@@ -4357,11 +4415,23 @@
+     int c0 = N + 2 * ord;             // child 0 position
+     int c1 = c0 + 1;                  // child 1 position
+ 
+-    // Read parent quaternion and normalize
+-    float qw = quats_buf[idx*4], qx = quats_buf[idx*4+1];
+-    float qy = quats_buf[idx*4+2], qz = quats_buf[idx*4+3];
+-    float qlen = sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+-    qw /= qlen; qx /= qlen; qy /= qlen; qz /= qlen;
++    // Read the parent quaternion through the same overflow-safe normalization
++    // used by rendering and its VJP.
++    const float4 parent_quaternion = float4(
++        quats_buf[idx*4], quats_buf[idx*4+1],
++        quats_buf[idx*4+2], quats_buf[idx*4+3]
++    );
++    float4 normalized_quaternion;
++    float inverse_quaternion_norm;
++    normalize_quaternion(
++        parent_quaternion,
++        normalized_quaternion,
++        inverse_quaternion_norm
++    );
++    const float qw = normalized_quaternion.x;
++    const float qx = normalized_quaternion.y;
++    const float qy = normalized_quaternion.z;
++    const float qz = normalized_quaternion.w;
+ 
+     // Parent scale (exp)
+     float sx = exp(scales_buf[idx*3]), sy = exp(scales_buf[idx*3+1]), sz = exp(scales_buf[idx*3+2]);
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -327,6 +327,9 @@
+     id<MTLComputePipelineState> exact_block_reduce_u64_kernel_cpso;
+     id<MTLComputePipelineState> exact_block_offsets_u64_kernel_cpso;
+     id<MTLComputePipelineState> exact_block_scan_propagate_u64_kernel_cpso;
++#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++    id<MTLComputePipelineState> quaternion_vjp_for_testing_kernel_cpso;
++#endif
+     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
+     id<MTLComputePipelineState> radix_sort_histogram_kernel_cpso;
+     id<MTLComputePipelineState> radix_sort_scan_blocks_kernel_cpso;
+@@ -469,6 +472,10 @@
+     ctx->exact_block_offsets_u64_kernel_cpso      = load(@"exact_block_offsets_u64_kernel");
+     ctx->exact_block_scan_propagate_u64_kernel_cpso =
+         load(@"exact_block_scan_propagate_u64_kernel");
++#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++    ctx->quaternion_vjp_for_testing_kernel_cpso =
++        load(@"quaternion_vjp_for_testing_kernel");
++#endif
+     ctx->map_gaussian_to_intersects_kernel_cpso   = load(@"map_gaussian_to_intersects_kernel");
+     ctx->radix_sort_histogram_kernel_cpso         = load(@"radix_sort_histogram_kernel");
+     ctx->radix_sort_scan_blocks_kernel_cpso       = load(@"radix_sort_scan_blocks_kernel");
+@@ -1360,6 +1367,50 @@
+     );
+ }
+ 
++void msplat_quaternion_vjp_for_testing(
++    const float* quaternion,
++    const float* rotation_gradient,
++    float* quaternion_gradient
++) {
++    if (!quaternion || !rotation_gradient || !quaternion_gradient) {
++        throw std::invalid_argument("msplat: quaternion VJP oracle received a null buffer");
++    }
++    MetalContext* context = get_global_context();
++    MTensor device_quaternion = mtensor_empty(context->device, {4}, DType::Float32);
++    MTensor device_rotation_gradient = mtensor_empty(
++        context->device,
++        {9},
++        DType::Float32
++    );
++    MTensor device_quaternion_gradient = mtensor_empty(
++        context->device,
++        {4},
++        DType::Float32
++    );
++    std::memcpy(device_quaternion.data<float>(), quaternion, 4 * sizeof(float));
++    std::memcpy(
++        device_rotation_gradient.data<float>(),
++        rotation_gradient,
++        9 * sizeof(float)
++    );
++
++    id<MTLCommandBuffer> command_buffer = context->getCommandBuffer();
++    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
++    [encoder setComputePipelineState:context->quaternion_vjp_for_testing_kernel_cpso];
++    ENC_BUF(encoder, device_quaternion, 0);
++    ENC_BUF(encoder, device_rotation_gradient, 1);
++    ENC_BUF(encoder, device_quaternion_gradient, 2);
++    [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
++       threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
++    [encoder endEncoding];
++    context->syncCB();
++    std::memcpy(
++        quaternion_gradient,
++        device_quaternion_gradient.data<float>(),
++        4 * sizeof(float)
++    );
++}
++
+ void msplat_exact_radix_sort_for_testing(
+     const uint64_t* keys,
+     const uint32_t* values,

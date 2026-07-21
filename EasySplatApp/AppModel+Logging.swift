@@ -6,18 +6,17 @@ extension AppModel {
         let now = Date()
         switch event {
         case .stageStarted(let stage):
+            updatePhaseStart(for: stage, at: now)
             self.stage = stage
             progress = nil
             statusTitle = stage.displayName
             statusDetail = nil
             stageStartedAt = now
             lastPipelineEventAt = now
-            if stage != .trainBrush {
-                activeTrainingBackend = nil
-            }
             appendLogLine("[\(stage.displayName)] started")
         case .stageProgress(let stage, let fraction, let message):
             let previousStage = self.stage
+            updatePhaseStart(for: stage, at: now)
             self.stage = stage
             if previousStage != stage || stageStartedAt == nil {
                 stageStartedAt = now
@@ -29,6 +28,7 @@ extension AppModel {
             maybeAppendProgressLog(stage: stage, message: message)
         case .stageLog(let stage, let line, let isError):
             if self.stage != stage || stageStartedAt == nil {
+                updatePhaseStart(for: stage, at: now)
                 self.stage = stage
                 stageStartedAt = now
             }
@@ -57,13 +57,7 @@ extension AppModel {
             self.stage = stage
             progress = 1.0
             lastPipelineEventAt = now
-            if stage == .trainBrush {
-                activeTrainingBackend = nil
-            }
             appendLogLine("[\(stage.displayName)] finished")
-        case .trainingBackendSelected(let backend):
-            activeTrainingBackend = backend
-            lastPipelineEventAt = now
         case .pipelineFailed(_, let userMessage, let debugMessage):
             if stopAction != nil {
                 return
@@ -79,17 +73,30 @@ extension AppModel {
     }
 
     func handleToolchainProgress(fraction: Double, message: String) {
+        if phaseStartedAt == nil {
+            phaseStartedAt = Date()
+        }
         progress = fraction < 0 ? nil : fraction
-        statusTitle = "Downloading tools"
+        statusTitle = "Preparing tools"
         statusDetail = message
         maybeAppendToolchainProgressLog(fraction: fraction, message: message)
+    }
+
+    private func updatePhaseStart(for newStage: PipelineStage, at date: Date) {
+        let previousPhase = stage.map(ProcessingPhase.forStage)
+        let nextPhase = ProcessingPhase.forStage(newStage)
+        if phaseStartedAt == nil
+            || (previousPhase == nil && nextPhase != .prepare)
+            || (previousPhase != nil && previousPhase != nextPhase) {
+            phaseStartedAt = date
+        }
     }
 
     func maybeAppendProgressLog(stage: PipelineStage, message: String) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        if stage == .trainBrush {
+        if stage == .trainSplat {
             if trimmed.hasPrefix("Preparing training dataset (images)") {
                 if let ratio = parseProgressRatio(trimmed) {
                     let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
@@ -120,7 +127,7 @@ extension AppModel {
         }
 
         let now = Date()
-        let minInterval: TimeInterval = stage == .trainBrush && trimmed.hasPrefix("Training model")
+        let minInterval: TimeInterval = stage == .trainSplat && trimmed.hasPrefix("Training model")
             ? trainingProgressLogMinInterval
             : 1.5
         if stage == lastProgressLogStage && trimmed == lastProgressLogMessage && now.timeIntervalSince(lastProgressLogAt) < minInterval {
@@ -289,20 +296,21 @@ extension AppModel {
     }
 
     func loadPipelineLogTail(projectURL: URL, maxLines: Int = 200, maxBytes: Int = 64 * 1024) -> [String] {
-        let logURL = ProjectPaths(root: projectURL).pipelineLogURL
-        guard let handle = try? FileHandle(forReadingFrom: logURL) else { return [] }
-        defer { try? handle.close() }
-
-        let fileSize = (try? handle.seekToEnd()) ?? 0
-        let readSize = min(UInt64(maxBytes), fileSize)
-        guard readSize > 0 else { return [] }
+        let paths = ProjectPaths(root: projectURL)
+        guard let logURL = try? paths.resolveProjectRelativePath("Logs/pipeline.log") else {
+            return []
+        }
         do {
-            try handle.seek(toOffset: fileSize - readSize)
-            var data = try handle.readToEnd() ?? Data()
+            let tail = try BoundedFileReader.readRegularFileTail(
+                at: logURL,
+                maximumBytes: maxBytes
+            )
+            guard !tail.data.isEmpty else { return [] }
+            var data = tail.data
             // If we didn't read from the start of the file, the seek may have landed mid-line
             // (and possibly mid-multibyte-UTF-8). Drop everything up to and including the first
             // newline so the first surviving line is always whole and decodes cleanly.
-            if readSize < fileSize, let firstNewline = data.firstIndex(of: 0x0A) {
+            if !tail.startsAtFileBeginning, let firstNewline = data.firstIndex(of: 0x0A) {
                 data = data.subdata(in: data.index(after: firstNewline)..<data.endIndex)
             }
             let text = String(decoding: data, as: UTF8.self)
@@ -313,7 +321,6 @@ extension AppModel {
             for raw in rawLines {
                 let sanitized = sanitizeLogLine(raw).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !sanitized.isEmpty else { continue }
-                guard shouldKeepLoadedLogLine(sanitized) else { continue }
                 if sanitized == last { continue }
                 cleaned.append(sanitized)
                 last = sanitized
@@ -325,21 +332,5 @@ extension AppModel {
         } catch {
             return []
         }
-    }
-
-    func shouldKeepLoadedLogLine(_ line: String) -> Bool {
-        let lower = line.lowercased()
-        if lower.contains("[training model]") {
-            if lower.contains("completed loading") || lower.contains("evaluating every") {
-                return false
-            }
-            if lower.contains("🖌") || lower.contains("░") || lower.contains("▓") || lower.contains("█") || lower.contains("•") || lower.contains("·") {
-                return false
-            }
-            if lower.contains("[2k") || lower.contains("[1b") {
-                return false
-            }
-        }
-        return true
     }
 }

@@ -1,108 +1,119 @@
+import EasySplatCore
 import SwiftUI
 import UniformTypeIdentifiers
-import EasySplatCore
 
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var showVideoImporter = false
-    @State private var showFolderImporter = false
+    @State private var showInputImporter = false
+    @State private var replaceInputOnImport = false
     @State private var showLowDiskWarning = false
+    @State private var optionsExpanded = false
+
+    private var hasInput: Bool {
+        !model.pendingVideoURLs.isEmpty || model.pendingPhotosFolderURL != nil
+    }
+
+    private var hasPhotos: Bool {
+        model.pendingPhotosFolderURL != nil
+    }
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 24) {
-                VStack(spacing: 8) {
-                    Text("EasySplat")
-                        .font(.largeTitle.weight(.bold))
-                    Text("Drop a video or photos folder to build a 3D memory.")
+            VStack(alignment: .leading, spacing: Theme.Spacing.large) {
+                VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+                    Text("Create a 3D splat")
+                        .font(.largeTitle.weight(.semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    Text("Choose a video or a folder of photos.")
+                        .font(.title3)
                         .foregroundStyle(.secondary)
                 }
 
                 DropZoneView(
-                    title: "Drop a video or photos folder",
-                    subtitle: "MP4/MOV or a folder of images",
+                    title: "Choose Input…",
+                    subtitle: "or drop a video or photos folder here",
+                    onChoose: { presentInputImporter(replacing: false) },
                     onDropURLs: { model.addInputs(urls: $0) }
                 )
-                .frame(height: 220)
+                .frame(height: 180)
+                .accessibilityIdentifier("home.chooseInput")
 
-                HStack(spacing: 12) {
-                    Button("Choose Video…") { showVideoImporter = true }
-                        .buttonStyle(PrimaryButtonStyle())
-                        .keyboardShortcut("o", modifiers: .command)
-                        .help("Pick one or more video files (⌘O).")
-                        .accessibilityIdentifier("home.chooseVideo")
-                        .fileImporter(
-                            isPresented: $showVideoImporter,
-                            allowedContentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
-                            allowsMultipleSelection: true
-                        ) { result in
-                            if case let .success(urls) = result {
-                                model.addInputs(urls: urls)
-                            }
-                        }
-                    Button("Choose Photos Folder…") { showFolderImporter = true }
-                        .buttonStyle(SecondaryButtonStyle())
-                        .keyboardShortcut("o", modifiers: [.command, .shift])
-                        .help("Pick a folder of images (⇧⌘O).")
-                        .accessibilityIdentifier("home.choosePhotosFolder")
-                        .fileImporter(
-                            isPresented: $showFolderImporter,
-                            allowedContentTypes: [UTType.folder],
-                            allowsMultipleSelection: false
-                        ) { result in
-                            if case let .success(urls) = result, let url = urls.first {
-                                model.addInputs(urls: [url])
-                            }
-                        }
+                if hasInput {
+                    selectedInputs
                 }
 
-                selectedInputsPanel
-
-                settingsPanel
-
-                ProjectFleetStatsView(
-                    stats: ProjectFleetStats.aggregate(model.projectSummaries),
-                    freeDiskBytes: model.cachedFreeDiskBytes
-                )
-
-                ProjectListView(projects: model.projectSummaries)
-            }
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .padding(40)
-        }
-        .onAppear {
-            model.refreshProjectSummaries()
-        }
-        .alert(
-            "Resume interrupted project?",
-            isPresented: Binding(
-                get: { model.recoveryPromptProject != nil },
-                set: { isPresented in
-                    if !isPresented, let project = model.recoveryPromptProject {
-                        model.keepInterruptedProjectForLater(project)
+                DisclosureGroup(isExpanded: $optionsExpanded) {
+                    optionControls
+                        .padding(.top, Theme.Spacing.medium)
+                } label: {
+                    HStack(spacing: Theme.Spacing.medium) {
+                        Text("Options")
+                        Spacer()
+                        if !optionsExpanded {
+                            Text(optionsSummary)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }
                 }
-            ),
-            presenting: model.recoveryPromptProject
-        ) { project in
-            Button("Resume") {
-                model.resumeInterruptedProject(project)
+                .font(.headline)
+                .accessibilityIdentifier("home.options")
+
+                if let warning = model.selectionWarning {
+                    Text(warning)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let input = model.buildInputSpec(),
+                   let prediction = RunDurationPredictor.predict(
+                       options: model.requestedRunOptions,
+                       input: input,
+                       from: model.projectSummaries
+                   ) {
+                    Label(prediction.displayText, systemImage: "clock")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Create Splat") {
+                        start()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(!hasInput)
+                    .accessibilityIdentifier("home.start")
+                }
             }
-            Button("Keep for later", role: .cancel) {
-                model.keepInterruptedProjectForLater(project)
+            .frame(maxWidth: 720, alignment: .leading)
+            .focusSection()
+            .padding(Theme.Spacing.extraLarge)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .fileImporter(
+            isPresented: $showInputImporter,
+            allowedContentTypes: [
+                .folder,
+                .movie,
+                .video,
+                .mpeg4Movie,
+                .quickTimeMovie
+            ],
+            allowsMultipleSelection: true
+        ) { result in
+            defer { replaceInputOnImport = false }
+            guard case let .success(urls) = result else { return }
+            if replaceInputOnImport {
+                model.clearPendingInputs()
             }
-            Button("Delete", role: .destructive) {
-                model.deleteInterruptedProject(project)
-            }
-        } message: { project in
-            if let updatedAt = project.checkpointUpdatedAt {
-                Text("Found unfinished progress for \"\(project.title)\" (last checkpoint: \(updatedAt.formatted(date: .abbreviated, time: .shortened))).")
-            } else {
-                Text("Found unfinished progress for \"\(project.title)\".")
-            }
+            model.addInputs(urls: urls)
         }
         .alert("Low disk space", isPresented: $showLowDiskWarning) {
-            Button("Start Anyway") {
+            Button("Create Anyway") {
                 model.startFromPendingSelection()
             }
             Button("Cancel", role: .cancel) { }
@@ -111,162 +122,284 @@ struct HomeView: View {
         }
     }
 
+    private var selectedInputs: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
+            HStack {
+                Text("Input")
+                    .font(.headline)
+                Spacer()
+                Button("Replace Input…") {
+                    presentInputImporter(replacing: true)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            if let folder = model.pendingPhotosFolderURL {
+                inputRow(name: folder.lastPathComponent, systemImage: "folder") {
+                    model.removePhotoFolder()
+                }
+            }
+
+            ForEach(Array(model.pendingVideoURLs.enumerated()), id: \.element) { index, url in
+                inputRow(name: url.lastPathComponent, systemImage: "film") {
+                    model.pendingVideoURLs.remove(at: index)
+                }
+            }
+        }
+    }
+
+    private func inputRow(name: String, systemImage: String, remove: @escaping () -> Void) -> some View {
+        HStack(spacing: Theme.Spacing.medium) {
+            Image(systemName: systemImage)
+                .foregroundStyle(.secondary)
+                .frame(width: 18)
+            Text(name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(name)
+            Spacer(minLength: Theme.Spacing.medium)
+            Button(action: remove) {
+                Label("Remove \(name)", systemImage: "xmark")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Remove \(name)")
+        }
+    }
+
+    private var optionControls: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
+            optionRow("Capture Path") {
+                Picker("Capture Path", selection: $model.requestedRunOptions.capturePath) {
+                    Text("Automatic").tag(CapturePath.automatic)
+                    Text("Around a subject").tag(CapturePath.orbit)
+                    Text("Through a space").tag(CapturePath.walkthrough)
+                    Text("Across a large area").tag(CapturePath.largeArea)
+                }
+                .accessibilityIdentifier("home.capturePath")
+            }
+
+            optionRow("Detail") {
+                Picker("Detail", selection: $model.requestedRunOptions.detailProfile) {
+                    Text("Fast").tag(DetailProfile.fast)
+                    Text("Balanced")
+                        .tag(DetailProfile.balanced)
+                        .disabled(!RunPlanResolver.supports(detail: .balanced, memoryGB: memoryGB))
+                    Text("High Detail")
+                        .tag(DetailProfile.highDetail)
+                        .disabled(!RunPlanResolver.supports(detail: .highDetail, memoryGB: memoryGB))
+                }
+                .accessibilityIdentifier("home.detail")
+            }
+            if let explanation = Self.detailAvailabilityHelp(memoryGB: memoryGB) {
+                Text(explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+
+            optionRow("Camera Source") {
+                Picker("Camera Source", selection: $model.requestedRunOptions.cameraGrouping) {
+                    Text("Automatic").tag(CameraGrouping.automatic)
+                    Text("Same camera and lens").tag(CameraGrouping.sameCameraAndLens)
+                    Text("Mixed cameras or lenses").tag(CameraGrouping.mixedCamerasOrLenses)
+                }
+                .accessibilityIdentifier("home.cameraSource")
+            }
+
+            optionRow("Lens") {
+                Picker("Lens", selection: $model.requestedRunOptions.lensProjection) {
+                    Text("Automatic").tag(LensProjection.automatic)
+                    Text("Perspective").tag(LensProjection.perspective)
+                    Text("Fisheye").tag(LensProjection.fisheye)
+                }
+                .accessibilityIdentifier("home.lens")
+            }
+
+            optionRow("Input Order") {
+                Picker("Input Order", selection: $model.requestedRunOptions.inputOrdering) {
+                    Text("Automatic").tag(InputOrdering.automatic)
+                    Text("Continuous sequence")
+                        .tag(InputOrdering.continuous)
+                        .disabled(!continuousOrderingIsAvailable)
+                        .help(continuousOrderingHelp)
+                    Text("Unordered").tag(InputOrdering.unordered)
+                }
+                .accessibilityIdentifier("home.inputOrder")
+            }
+
+            optionRow("Resource Use") {
+                Picker("Resource Use", selection: $model.requestedRunOptions.resourcePolicy) {
+                    Text("Automatic").tag(ResourcePolicy.automatic)
+                    Text("Conserve Memory").tag(ResourcePolicy.conserveMemory)
+                    Text("Maximum Performance")
+                        .tag(ResourcePolicy.maximumPerformance)
+                        .disabled(!Self.maximumPerformanceIsAvailable(memoryGB: memoryGB))
+                        .help(
+                            Self.resourceUseHelp(memoryGB: memoryGB)
+                                ?? "Use more of this Mac for the fastest run."
+                        )
+                }
+                .accessibilityIdentifier("home.resourceUse")
+            }
+
+            if hasPhotos {
+                optionRow("Photo Use") {
+                    Picker("Photo Use", selection: $model.requestedRunOptions.photoSelection) {
+                        Text("Automatic selection").tag(PhotoSelection.automatic)
+                        Text("Use all valid photos").tag(PhotoSelection.useAllValidPhotos)
+                    }
+                    .accessibilityIdentifier("home.photoUse")
+                }
+            }
+        }
+        .font(.body)
+    }
+
+    private var memoryGB: Double {
+        model.hardwareProfile.memoryGB
+    }
+
+    private var continuousOrderingIsAvailable: Bool {
+        guard let input = model.buildInputSpec() else { return true }
+        return RunPlanResolver.supports(inputOrdering: .continuous, input: input)
+    }
+
+    private var continuousOrderingHelp: String {
+        continuousOrderingIsAvailable
+            ? "Treat the input as one ordered capture."
+            : "Continuous sequence can't combine videos and photos."
+    }
+
+    nonisolated static func maximumPerformanceIsAvailable(memoryGB: Double) -> Bool {
+        RunPlanResolver.supports(resourcePolicy: .maximumPerformance, memoryGB: memoryGB)
+    }
+
+    nonisolated static func resourceUseHelp(memoryGB: Double) -> String? {
+        guard !maximumPerformanceIsAvailable(memoryGB: memoryGB) else { return nil }
+        return "Maximum Performance is unavailable on Macs with 16 GB of unified memory or less."
+    }
+
+    nonisolated static func detailAvailabilityHelp(memoryGB: Double) -> String? {
+        if !RunPlanResolver.supports(detail: .balanced, memoryGB: memoryGB) {
+            return "Balanced and High Detail need more than 8 GB of unified memory."
+        }
+        if !RunPlanResolver.supports(detail: .highDetail, memoryGB: memoryGB) {
+            return "High Detail needs at least 24 GB of unified memory."
+        }
+        return nil
+    }
+
+    private func optionRow<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        LabeledContent(title) {
+            content()
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 260, alignment: .trailing)
+        }
+    }
+
+    private var optionsSummary: String {
+        let options = model.requestedRunOptions
+        var parts = [Self.detailLabel(options.detailProfile)]
+        if options.capturePath != .automatic {
+            parts.append(Self.captureLabel(options.capturePath))
+        }
+        if options.cameraGrouping != .automatic {
+            parts.append(Self.cameraLabel(options.cameraGrouping))
+        }
+        if options.lensProjection != .automatic {
+            parts.append(Self.lensLabel(options.lensProjection))
+        }
+        if options.inputOrdering != .automatic {
+            parts.append(Self.orderLabel(options.inputOrdering))
+        }
+        if options.resourcePolicy != .automatic {
+            parts.append(Self.resourceLabel(options.resourcePolicy))
+        }
+        if hasPhotos, options.photoSelection == .useAllValidPhotos {
+            parts.append("All valid photos")
+        }
+        if parts.count == 1 {
+            parts.append("Automatic")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    nonisolated static func detailLabel(_ value: DetailProfile) -> String {
+        switch value {
+        case .fast: "Fast"
+        case .balanced: "Balanced"
+        case .highDetail: "High Detail"
+        }
+    }
+
+    nonisolated static func captureLabel(_ value: CapturePath) -> String {
+        switch value {
+        case .automatic: "Automatic"
+        case .orbit: "Around a subject"
+        case .walkthrough: "Through a space"
+        case .largeArea: "Across a large area"
+        }
+    }
+
+    nonisolated static func cameraLabel(_ value: CameraGrouping) -> String {
+        switch value {
+        case .automatic: "Automatic"
+        case .sameCameraAndLens: "Same camera"
+        case .mixedCamerasOrLenses: "Mixed cameras"
+        }
+    }
+
+    nonisolated static func lensLabel(_ value: LensProjection) -> String {
+        switch value {
+        case .automatic: "Automatic"
+        case .perspective: "Perspective"
+        case .fisheye: "Fisheye"
+        }
+    }
+
+    nonisolated static func orderLabel(_ value: InputOrdering) -> String {
+        switch value {
+        case .automatic: "Automatic"
+        case .continuous: "Continuous"
+        case .unordered: "Unordered"
+        }
+    }
+
+    nonisolated static func resourceLabel(_ value: ResourcePolicy) -> String {
+        switch value {
+        case .automatic: "Automatic"
+        case .conserveMemory: "Conserve Memory"
+        case .maximumPerformance: "Maximum Performance"
+        }
+    }
+
+    private func presentInputImporter(replacing: Bool) {
+        replaceInputOnImport = replacing
+        showInputImporter = true
+    }
+
+    private func start() {
+        let timingBoundary = RunTimingBoundary.capture()
+        let freeBytes = model.freeDiskSpaceBytes()
+        model.cachedFreeDiskBytes = freeBytes
+        if let freeBytes, freeBytes < AppModel.recommendedFreeSpaceBytes {
+            showLowDiskWarning = true
+        } else {
+            model.startFromPendingSelection(timingBoundary: timingBoundary)
+        }
+    }
+
     private var lowDiskWarningMessage: String {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useGB, .useMB]
         formatter.countStyle = .file
         let recommended = formatter.string(fromByteCount: AppModel.recommendedFreeSpaceBytes)
-        let freeText = model.cachedFreeDiskBytes.map { formatter.string(fromByteCount: $0) } ?? "unknown"
-        return "Only \(freeText) free on the EasySplat Projects volume. A run typically needs \(recommended) of working space for frames, COLMAP intermediates, and the trained splat. You can continue, but the run may fail partway."
-    }
-
-    private var selectedInputsPanel: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Selected Inputs")
-                    .font(.headline)
-                Spacer()
-                if !model.pendingVideoURLs.isEmpty || model.pendingPhotosFolderURL != nil {
-                    Button("Clear All") {
-                        model.clearPendingInputs()
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .controlSize(.small)
-                }
-            }
-
-            if let warning = model.selectionWarning {
-                Text(warning)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if model.pendingVideoURLs.isEmpty && model.pendingPhotosFolderURL == nil {
-                Text("No inputs selected yet.")
-                    .foregroundStyle(.secondary)
-            }
-
-            if let folder = model.pendingPhotosFolderURL {
-                HStack {
-                    Image(systemName: "folder")
-                        .foregroundStyle(.secondary)
-                    Text(folder.lastPathComponent)
-                    Spacer()
-                    Button("Remove") {
-                        model.pendingPhotosFolderURL = nil
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .controlSize(.small)
-                }
-            }
-
-            if !model.pendingVideoURLs.isEmpty {
-                ForEach(Array(model.pendingVideoURLs.enumerated()), id: \.element) { index, url in
-                    HStack {
-                        Image(systemName: "film")
-                            .foregroundStyle(.secondary)
-                        Text(url.lastPathComponent)
-                        Spacer()
-                        Button("Remove") {
-                            model.pendingVideoURLs.remove(at: index)
-                        }
-                        .buttonStyle(SecondaryButtonStyle())
-                        .controlSize(.small)
-                    }
-                }
-            }
-
-            HStack {
-                if let prediction = RunDurationPredictor.predict(
-                    mode: model.captureMode,
-                    quality: model.qualityPreset,
-                    from: model.projectSummaries
-                ) {
-                    Label(prediction.displayText, systemImage: "clock.arrow.circlepath")
-                        .labelStyle(.titleAndIcon)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Start") {
-                    // Re-probe right before Start so the warning reflects the
-                    // current free-space state instead of a stale cached value.
-                    let freshFree = model.freeDiskSpaceBytes()
-                    model.cachedFreeDiskBytes = freshFree
-                    if let free = freshFree, free < AppModel.recommendedFreeSpaceBytes {
-                        showLowDiskWarning = true
-                    } else {
-                        model.startFromPendingSelection()
-                    }
-                }
-                .buttonStyle(PrimaryButtonStyle())
-                .keyboardShortcut(.return, modifiers: .command)
-                .help("Start the pipeline with the selected input and preset (⌘↩).")
-                .accessibilityIdentifier("home.start")
-                .disabled(model.pendingVideoURLs.isEmpty && model.pendingPhotosFolderURL == nil)
-            }
-        }
-        .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                .fill(Theme.surface)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                .stroke(Theme.border)
-        )
-    }
-
-    private var settingsPanel: some View {
-        ViewThatFits(in: .horizontal) {
-            settingsPanelHorizontal
-            settingsPanelVertical
-        }
-    }
-
-    private var settingsPanelHorizontal: some View {
-        HStack(spacing: 20) {
-            modePicker
-                .frame(minWidth: 180, maxWidth: 240, alignment: .leading)
-                .layoutPriority(1)
-            qualityPicker
-                .frame(minWidth: 240, maxWidth: 360, alignment: .leading)
-                .layoutPriority(1)
-        }
-    }
-
-    private var settingsPanelVertical: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            modePicker
-            qualityPicker
-        }
-        .frame(maxWidth: 420, alignment: .leading)
-    }
-
-    private var modePicker: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Mode")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Picker("Mode", selection: $model.captureMode) {
-                Text("Object").tag(CaptureMode.object)
-                Text("Room").tag(CaptureMode.room)
-            }
-            .pickerStyle(.segmented)
-        }
-    }
-
-    private var qualityPicker: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Profile")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Picker("Profile", selection: $model.qualityPreset) {
-                Text("Fast").tag(QualityPreset.draft)
-                Text("Balanced").tag(QualityPreset.standard)
-                Text("Ultra").tag(QualityPreset.ultra)
-            }
-            .pickerStyle(.segmented)
-        }
+        let free = model.cachedFreeDiskBytes.map(formatter.string(fromByteCount:)) ?? "an unknown amount of space"
+        return "This Mac has \(free) free. EasySplat recommends \(recommended) for working files and the finished splat."
     }
 }

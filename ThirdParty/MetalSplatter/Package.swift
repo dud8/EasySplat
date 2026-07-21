@@ -38,6 +38,7 @@ let package = Package(
             name: "PLYIOTests",
             dependencies: [ "PLYIO" ],
             path: "PLYIO",
+            exclude: [ "Sources" ],
             sources: [ "Tests" ],
             resources: [ .copy("TestData") ]
         ),
@@ -52,6 +53,7 @@ let package = Package(
             name: "SplatIOTests",
             dependencies: [ "SplatIO" ],
             path: "SplatIO",
+            exclude: [ "Sources" ],
             sources: [ "Tests" ],
             resources: [ .copy("TestData") ]
         ),
@@ -59,8 +61,14 @@ let package = Package(
             name: "MetalSplatter",
             dependencies: [ "PLYIO", "SplatIO" ],
             path: "MetalSplatter",
+            exclude: [ "Tests" ],
             sources: [ "Sources" ],
             resources: [ .process("Resources") ]
+        ),
+        .testTarget(
+            name: "MetalSplatterTests",
+            dependencies: [ "MetalSplatter", "SplatIO" ],
+            path: "MetalSplatter/Tests"
         ),
         .target(
             name: "SampleBoxRenderer",

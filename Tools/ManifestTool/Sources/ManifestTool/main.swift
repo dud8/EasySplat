@@ -21,18 +21,148 @@ struct ManifestTool {
                 exit(ExitCode.ok.rawValue)
             }
 
+            if command == "verify-bootstrap" {
+                var parser = ArgParser(Array(args.dropFirst()))
+                try parser.requireOnly([
+                    "--manifest",
+                    "--public-key-file",
+                    "--app-version",
+                    "--core-zip",
+                    "--url-policy",
+                ])
+                let manifestURL = URL(fileURLWithPath: try parser.require("--manifest"))
+                let publicKeyURL = URL(fileURLWithPath: try parser.require("--public-key-file"))
+                let appVersion = try parser.require("--app-version")
+                let coreArchive = URL(fileURLWithPath: try parser.require("--core-zip"))
+                let rawURLPolicy = try parser.require("--url-policy")
+                guard let urlPolicy = BootstrapURLPolicy(rawValue: rawURLPolicy) else {
+                    throw NSError(
+                        domain: "ManifestTool",
+                        code: 4,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "--url-policy must be release, loopback-development, "
+                                    + "or release-or-loopback-development."
+                        ]
+                    )
+                }
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let manifest = try decoder.decode(
+                    ManifestDocument.self,
+                    from: Data(contentsOf: manifestURL)
+                )
+                let publicKeyBase64 = try String(contentsOf: publicKeyURL, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try ManifestBuilder.verifyBootstrap(
+                    manifest: manifest,
+                    publicKeyBase64: publicKeyBase64,
+                    expectedAppVersion: appVersion,
+                    coreArchive: coreArchive,
+                    urlPolicy: urlPolicy
+                )
+                print("Verified signed core bootstrap \(manifest.version)")
+                exit(ExitCode.ok.rawValue)
+            }
+
+            if command == "verify-release" {
+                var parser = ArgParser(Array(args.dropFirst()))
+                let manifestURL = URL(fileURLWithPath: try parser.require("--manifest"))
+                let publicKeyURL = URL(fileURLWithPath: try parser.require("--public-key-file"))
+                let version = try parser.require("--toolchain-version")
+                let appVersion = try parser.require("--app-version")
+                let coreURL = try parser.require("--core-url")
+                let baseURL = try parser.require("--da3-base-url")
+                let smallURL = try parser.require("--da3-small-url")
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let manifest = try decoder.decode(
+                    ManifestDocument.self,
+                    from: Data(contentsOf: manifestURL)
+                )
+                let publicKey = try String(contentsOf: publicKeyURL, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try ManifestBuilder.verifyRelease(
+                    manifest: manifest,
+                    publicKeyBase64: publicKey,
+                    expectedToolchainVersion: version,
+                    expectedAppVersion: appVersion,
+                    expectedComponentURLs: [
+                        "macos-arm64-core": coreURL,
+                        "geometry-da3-base": baseURL,
+                        "geometry-da3-small": smallURL,
+                    ],
+                    componentArchives: [
+                        "macos-arm64-core": URL(fileURLWithPath: try parser.require("--core-zip")),
+                        "geometry-da3-base": URL(fileURLWithPath: try parser.require("--da3-base-zip")),
+                        "geometry-da3-small": URL(fileURLWithPath: try parser.require("--da3-small-zip")),
+                    ]
+                )
+                print("Verified signed toolchain closure \(version)")
+                exit(ExitCode.ok.rawValue)
+            }
+
+            if command == "prepare-release" {
+                var parser = ArgParser(Array(args.dropFirst()))
+                try parser.requireOnly([
+                    "--repository",
+                    "--source-commit",
+                    "--version",
+                    "--published-at",
+                    "--app-version-minimum",
+                    "--app-version-maximum-exclusive",
+                    "--public-key-file",
+                    "--core-zip",
+                    "--core-url",
+                    "--da3-base-zip",
+                    "--da3-base-url",
+                    "--da3-small-zip",
+                    "--da3-small-url",
+                    "--request-out",
+                ])
+                let repository = try parser.require("--repository")
+                let sourceCommit = try parser.require("--source-commit")
+                let version = try parser.require("--version")
+                let publishedAt = try parsePublishedAt(parser.require("--published-at"))
+                let appRange = ManifestDocument.AppVersionRange(
+                    minimum: try parser.require("--app-version-minimum"),
+                    maximumExclusive: try parser.require("--app-version-maximum-exclusive")
+                )
+                let publicKey = try readPublicKey(
+                    at: URL(fileURLWithPath: parser.require("--public-key-file"))
+                )
+                let request = try ManifestBuilder.prepareRelease(
+                    repository: repository,
+                    sourceCommit: sourceCommit,
+                    version: version,
+                    publishedAt: publishedAt,
+                    appVersionRange: appRange,
+                    publicKeyBase64: publicKey,
+                    components: buildComponentInputs(parser: &parser)
+                )
+                try ManifestBuilder.writeReleaseSigningRequest(
+                    request,
+                    to: URL(fileURLWithPath: parser.require("--request-out"))
+                )
+                exit(ExitCode.ok.rawValue)
+            }
+
             var parser = ArgParser(Array(args))
             let version = try parser.require("--version")
             let publishedAtValue = try parser.require("--published-at")
             let manifestOut = try parser.require("--manifest-out")
-            let privateKey = try ManifestKeyInput.resolvePrivateKeyBase64(parser: &parser)
             let publishedAt = try parsePublishedAt(publishedAtValue)
+            let minimumAppVersion = try parser.require("--app-version-minimum")
+            let maximumAppVersion = try parser.require("--app-version-maximum-exclusive")
 
-            let artifactInputs = try buildArtifactInputs(parser: &parser)
+            let componentInputs = try buildComponentInputs(parser: &parser)
+            try ManifestBuilder.requireDirectSigningAllowed(components: componentInputs)
+            let privateKey = try ManifestKeyInput.resolvePrivateKeyBase64(parser: &parser)
             let manifest = try ManifestBuilder.build(
                 version: version,
                 publishedAt: publishedAt,
-                artifacts: artifactInputs,
+                appVersionRange: .init(minimum: minimumAppVersion, maximumExclusive: maximumAppVersion),
+                components: componentInputs,
                 privateKeyBase64: privateKey
             )
             try ManifestBuilder.writeManifest(manifest, to: URL(fileURLWithPath: manifestOut))
@@ -50,18 +180,38 @@ struct ManifestTool {
         Generate keypair:
           ManifestTool generate-keypair --public-key-out <path> --private-key-out <path>
 
-        Generate manifest (single artifact):
-          ManifestTool --zip <path> --version <semver> --published-at <iso8601> \\
-            --artifact-url <url> --private-key-file <path> --manifest-out <path>
-
-        Generate manifest (core + models):
+        Generate a local-development schema-2 component manifest:
           ManifestTool --core-zip <path> --core-url <url> \\
-            --models-zip <path> --models-url <url> \\
+            --da3-base-zip <path> --da3-base-url <url> \\
+            --da3-small-zip <path> --da3-small-url <url> \\
             --version <semver> --published-at <iso8601> \\
+            --app-version-minimum <semver> --app-version-maximum-exclusive <semver> \\
             --private-key-file <path> --manifest-out <path>
 
+        Verify a signed release closure:
+          ManifestTool verify-release --manifest <path> --public-key-file <path> \
+            --toolchain-version <semver> --app-version <semver> \
+            --core-zip <path> --core-url <url> \
+            --da3-base-zip <path> --da3-base-url <url> \
+            --da3-small-zip <path> --da3-small-url <url>
+
+        Verify a signed bundled core bootstrap:
+          ManifestTool verify-bootstrap --manifest <path> --public-key-file <path> \
+            --app-version <semver> --core-zip <path> \
+            --url-policy release|loopback-development|release-or-loopback-development
+
+        Prepare a canonical release signing request without a private key:
+          ManifestTool prepare-release --repository <owner/repo> --source-commit <sha> \
+            --version <semver> --published-at <iso8601> \
+            --app-version-minimum <semver> --app-version-maximum-exclusive <semver> \
+            --public-key-file <path> \
+            --core-zip <path> --core-url <url> \
+            --da3-base-zip <path> --da3-base-url <url> \
+            --da3-small-zip <path> --da3-small-url <url> \
+            --request-out <path>
+
         Private key source:
-          Use exactly one of --private-key-file <path>, --private-key-env <name>, or legacy --private-key <base64>.
+          Use exactly one of --private-key-file <path> or --private-key-env <name>.
         """
         print(text)
     }
@@ -78,36 +228,48 @@ struct ManifestTool {
         return date
     }
 
-    private static func buildArtifactInputs(parser: inout ArgParser) throws -> [ManifestArtifactInput] {
-        if let coreZipPath = parser.value(for: "--core-zip") {
-            let coreURL = try parser.require("--core-url")
-            let modelsZipPath = try parser.require("--models-zip")
-            let modelsURL = try parser.require("--models-url")
-            return [
-                ManifestArtifactInput(
-                    name: "macos-arm64-core",
-                    artifactURL: coreURL,
-                    zipURL: URL(fileURLWithPath: coreZipPath),
-                    contents: ManifestToolDefaults.splitCoreContents
-                ),
-                ManifestArtifactInput(
-                    name: "macos-arm64-models",
-                    artifactURL: modelsURL,
-                    zipURL: URL(fileURLWithPath: modelsZipPath),
-                    contents: ManifestToolDefaults.splitModelsContents
-                ),
-            ]
-        }
+    private static func readPublicKey(at url: URL) throws -> String {
+        try String(contentsOf: url, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
-        let zipPath = try parser.require("--zip")
-        let artifactURL = try parser.require("--artifact-url")
+    private static func buildComponentInputs(
+        parser: inout ArgParser
+    ) throws -> [ManifestArtifactInput] {
+        let coreZipPath = try parser.require("--core-zip")
+        let coreURL = try parser.require("--core-url")
+        let baseZipPath = try parser.require("--da3-base-zip")
+        let baseURL = try parser.require("--da3-base-url")
+        let smallZipPath = try parser.require("--da3-small-zip")
+        let smallURL = try parser.require("--da3-small-url")
         return [
             ManifestArtifactInput(
-                name: "macos-arm64",
-                artifactURL: artifactURL,
-                zipURL: URL(fileURLWithPath: zipPath),
-                contents: ManifestToolDefaults.monolithicContents
-            )
+                name: "macos-arm64-core",
+                artifactURL: coreURL,
+                zipURL: URL(fileURLWithPath: coreZipPath),
+                capabilities: ManifestToolDefaults.coreCapabilities,
+                dependencies: [],
+                requirement: .required,
+                criticalFilePaths: ManifestToolDefaults.criticalCoreFiles
+            ),
+            ManifestArtifactInput(
+                name: "geometry-da3-base",
+                artifactURL: baseURL,
+                zipURL: URL(fileURLWithPath: baseZipPath),
+                capabilities: ["geometry.da3.runtime", "geometry.da3.base"],
+                dependencies: ["macos-arm64-core"],
+                requirement: .optional,
+                criticalFilePaths: ManifestToolDefaults.da3BaseContents
+            ),
+            ManifestArtifactInput(
+                name: "geometry-da3-small",
+                artifactURL: smallURL,
+                zipURL: URL(fileURLWithPath: smallZipPath),
+                capabilities: ["geometry.da3.small"],
+                dependencies: ["geometry-da3-base"],
+                requirement: .optional,
+                criticalFilePaths: ManifestToolDefaults.da3SmallContents
+            ),
         ]
     }
 }

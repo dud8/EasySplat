@@ -1,0 +1,135 @@
+{
+  "schema_version": 2,
+  "references": {
+    "paired_baseline": {
+      "git_commit": "4f3c11735ad15e1318ee2043ce351e185c225d30",
+      "toolchain_identity": "sha256:bd32d5868c5cb6a06a2ae5822d87753f08daf050ea7299c9e373c174be49116b",
+      "run_configuration": {
+        "detail_profile": "balanced",
+        "selected_frame_count": "request_scale",
+        "geometry_route": "colmap",
+        "feature_type": "sift",
+        "feature_max_image_size": 1024,
+        "feature_max_count": 10000,
+        "descriptor_matcher": "exact_cpu_brute_force",
+        "maximum_match_count": 10000,
+        "matcher_threads": 8,
+        "sequential_overlap": {
+          "automatic": 8,
+          "orbit": 8,
+          "walkthrough": 8,
+          "large_area": 16
+        },
+        "exhaustive_block_size": 25,
+        "mapper": "incremental",
+        "bundle_adjustment_max_iterations": {
+          "automatic": 75,
+          "orbit": 75,
+          "walkthrough": 75,
+          "large_area": 94
+        },
+        "ba_global_frames_ratio": 1.1,
+        "ba_global_points_ratio": 1.1,
+        "ba_global_max_refinements": 5,
+        "ba_local_max_refinements": 2,
+        "trainer": "native_msplat",
+        "trainer_iterations": 7000,
+        "trainer_plateau_window": 800,
+        "run_seed": 42
+      }
+    },
+    "accurate_colmap": {
+      "mapper": "mapper",
+      "bundle_adjustment": "full"
+    },
+    "rendering": {
+      "iterations": 30000,
+      "pose_source": "accurate_colmap"
+    }
+  },
+  "thresholds": {
+    "coverage": {
+      "absolute_min": 0.9,
+      "colmap_relative_min": 0.95
+    },
+    "residual_pixels": {
+      "median_max": 1.5,
+      "p90_max": 3.0
+    },
+    "pose": {
+      "ate_colmap_ratio_max": 1.1,
+      "rotation_rpe_delta_degrees_max": 0.2,
+      "translation_rpe_delta_percentage_points_max": 2.0
+    },
+    "orientation": {
+      "physical_up_error_degrees_max": 5.0
+    },
+    "balanced_rendering": {
+      "median_psnr_loss_db_max": 0.5,
+      "median_ssim_loss_max": 0.01,
+      "median_lpips_increase_max": 0.02,
+      "scene_psnr_loss_db_max": 1.0,
+      "scene_ssim_loss_max": 0.02,
+      "scene_lpips_increase_max": 0.03
+    },
+    "fast_rendering": {
+      "scene_psnr_loss_db_max": 1.0,
+      "scene_ssim_loss_max": 0.02,
+      "scene_lpips_increase_max": 0.03,
+      "end_to_end_speedup_min": 2.0
+    },
+    "paired_baseline_rendering": {
+      "median_psnr_loss_db_max": 0.2,
+      "median_ssim_loss_max": 0.005,
+      "median_lpips_increase_max": 0.01,
+      "scene_psnr_loss_db_max": 0.5,
+      "scene_ssim_loss_max": 0.01,
+      "scene_lpips_increase_max": 0.02
+    },
+    "speed": {
+      "m4_max_balanced_p50_seconds_max_by_scale": {
+        "30": 120.0,
+        "120": 300.0,
+        "250": 600.0,
+        "500": 1200.0
+      },
+      "constrained_fast_p50_seconds_max_by_scale": {
+        "30": 300.0,
+        "120": 600.0
+      },
+      "eight_gb_fast_p50_seconds_max_by_scale": {
+        "30": 300.0
+      },
+      "geometry_geometric_mean_speedup_min": 2.0,
+      "category_median_geometry_speedup_min": 1.5,
+      "matching_geometric_mean_speedup_min": 10.0,
+      "matching_speedup_scales": [
+        120,
+        250,
+        500
+      ],
+      "ordered_mapping_speedup_min": 1.5,
+      "unordered_mapping_regression_max_fraction": 0.1
+    },
+    "long_sequence": {
+      "analysis_fps_min": 5.0,
+      "sustained_frames_min": 3000,
+      "rss_growth_fraction_max": 0.05
+    },
+    "memory": {
+      "eight_gb_fast_bytes_max": 6500000000,
+      "constrained_bytes_max": 12000000000,
+      "larger_fraction_max": 0.75
+    },
+    "stability": {
+      "repeat_runs_min": 50,
+      "crashes_max": 0,
+      "corrupt_outputs_max": 0,
+      "durable_state_recovery_required": true
+    },
+    "toolchain": {
+      "normal_photo_bytes_max": 2500000000,
+      "large_area_bytes_max": 2500000000
+    }
+  }
+}

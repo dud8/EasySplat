@@ -189,88 +189,6 @@ extension PipelineRunner {
         return false
     }
 
-    static func looksLikeBrushSpinnerLine(_ line: String) -> Bool {
-        let lower = line.lowercased()
-        guard lower.contains("training") else { return false }
-        if line.contains("🖌") || line.contains("·") || line.contains("•") {
-            return true
-        }
-        if line.contains("░") || line.contains("▓") || line.contains("█") || line.contains("▉") || line.contains("▊") {
-            return true
-        }
-        return false
-    }
-
-    private static let brushStepRateRegex = try? NSRegularExpression(
-        pattern: #"([0-9]+(?:\.[0-9]+)?)\s*(?:it)?/s"#,
-        options: [.caseInsensitive]
-    )
-
-    func brushTrainStepProgress(from line: String) -> BrushTrainProgress? {
-        let s = line
-        var index = s.startIndex
-
-        func isDigit(_ c: Character) -> Bool {
-            c >= "0" && c <= "9"
-        }
-
-        while index < s.endIndex {
-            while index < s.endIndex, !isDigit(s[index]) {
-                index = s.index(after: index)
-            }
-            if index >= s.endIndex { break }
-
-            let aStart = index
-            var aEnd = index
-            while aEnd < s.endIndex, isDigit(s[aEnd]) {
-                aEnd = s.index(after: aEnd)
-            }
-            let aStr = String(s[aStart..<aEnd])
-            let a = Int(aStr) ?? -1
-
-            var slash = aEnd
-            while slash < s.endIndex, s[slash] == " " {
-                slash = s.index(after: slash)
-            }
-            guard slash < s.endIndex, s[slash] == "/" else {
-                index = aEnd
-                continue
-            }
-
-            var bStart = s.index(after: slash)
-            while bStart < s.endIndex, s[bStart] == " " {
-                bStart = s.index(after: bStart)
-            }
-            var bEnd = bStart
-            while bEnd < s.endIndex, isDigit(s[bEnd]) {
-                bEnd = s.index(after: bEnd)
-            }
-            guard bEnd > bStart else {
-                index = aEnd
-                continue
-            }
-
-            let bStr = String(s[bStart..<bEnd])
-            let b = Int(bStr) ?? -1
-            guard a >= 0, b > 0 else {
-                index = aEnd
-                continue
-            }
-            return BrushTrainProgress(step: a, total: b)
-        }
-
-        return nil
-    }
-
-    func brushTrainStepRate(from line: String) -> Double? {
-        guard let regex = Self.brushStepRateRegex else { return nil }
-        let range = NSRange(line.startIndex..<line.endIndex, in: line)
-        guard let match = regex.firstMatch(in: line, range: range) else { return nil }
-        guard match.numberOfRanges > 1, let rateRange = Range(match.range(at: 1), in: line) else { return nil }
-        let value = Double(line[rateRange])
-        guard let value, value > 0 else { return nil }
-        return value
-    }
 }
 
 final class StageTimingTracker: @unchecked Sendable {
@@ -278,10 +196,55 @@ final class StageTimingTracker: @unchecked Sendable {
     private let clock = ContinuousClock()
     private var starts: [PipelineStage: (instant: ContinuousClock.Instant, wallClock: Date)] = [:]
     private var pendingRecords: [PipelineStage: (startedAt: Date, durationSeconds: TimeInterval)] = [:]
+    private var firstStarts: [PipelineStage: Date] = [:]
+    private var accumulatedSeconds: [PipelineStage: TimeInterval] = [:]
+
+    init(
+        initialImportDurationSeconds: TimeInterval = 0,
+        importStartedAt: Date? = nil
+    ) {
+        let now = Date()
+        var initial: TimeInterval
+        var hasInitialBoundary = false
+        if initialImportDurationSeconds.isFinite,
+           initialImportDurationSeconds > 0 {
+            initial = initialImportDurationSeconds
+            hasInitialBoundary = true
+        } else if initialImportDurationSeconds == 0,
+                  importStartedAt != nil {
+            // A supplied start label distinguishes an explicit zero-duration
+            // boundary from the default "no preparation boundary" value.
+            initial = 0
+            hasInitialBoundary = true
+        } else if let importStartedAt {
+            let wallDuration = now.timeIntervalSince(importStartedAt)
+            initial = wallDuration.isFinite && wallDuration >= 0 ? wallDuration : 0
+            hasInitialBoundary = initial > 0
+        } else {
+            initial = 0
+        }
+        if hasInitialBoundary {
+            accumulatedSeconds[.importInput] = initial
+            firstStarts[.importInput] = importStartedAt ?? now.addingTimeInterval(-initial)
+            // Keep Import active until its real stage starts so validation and
+            // runner setup between configuration and the first event stay in Total.
+            starts[.importInput] = (instant: clock.now, wallClock: now)
+        }
+    }
 
     func start(_ stage: PipelineStage) {
         lock.lock()
-        starts[stage] = (instant: clock.now, wallClock: Date())
+        let now = clock.now
+        let wallClock = Date()
+        if let active = starts[stage] {
+            accumulatedSeconds[stage, default: 0] += Self.durationInSeconds(
+                now - active.instant
+            )
+        }
+        if firstStarts[stage] == nil {
+            firstStarts[stage] = wallClock
+        }
+        starts[stage] = (instant: now, wallClock: wallClock)
         lock.unlock()
     }
 
@@ -293,10 +256,23 @@ final class StageTimingTracker: @unchecked Sendable {
         }
         starts[stage] = nil
         let duration = clock.now - entry.instant
-        let seconds = Self.durationInSeconds(duration)
-        pendingRecords[stage] = (startedAt: entry.wallClock, durationSeconds: seconds)
+        accumulatedSeconds[stage, default: 0] += Self.durationInSeconds(duration)
+        let totalSeconds = accumulatedSeconds[stage, default: 0]
+        pendingRecords[stage] = (
+            startedAt: firstStarts[stage] ?? entry.wallClock,
+            durationSeconds: totalSeconds
+        )
         lock.unlock()
-        return Self.format(seconds: seconds)
+        return Self.format(seconds: totalSeconds)
+    }
+
+    /// Samples cumulative elapsed time without ending the active stage.
+    func elapsedSeconds(_ stage: PipelineStage) -> TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let active = starts[stage] else { return nil }
+        return accumulatedSeconds[stage, default: 0]
+            + Self.durationInSeconds(clock.now - active.instant)
     }
 
     /// Pop the most recent completed timing for a stage. Used by the runner to
@@ -349,10 +325,8 @@ final class PipelineLogger: @unchecked Sendable {
         let fm = FileManager.default
         try? fm.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? fm.createDirectory(at: eventsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        fm.createFile(atPath: logURL.path, contents: nil)
-        fm.createFile(atPath: eventsURL.path, contents: nil)
-        self.logHandle = try? FileHandle(forWritingTo: logURL)
-        self.eventsHandle = try? FileHandle(forWritingTo: eventsURL)
+        self.logHandle = try? SecureLogFileHandle.openForReplacing(at: logURL)
+        self.eventsHandle = try? SecureLogFileHandle.openForReplacing(at: eventsURL)
         if self.logHandle == nil {
             FileHandle.standardError.write(Data("PipelineLogger: failed to open pipeline log at \(logURL.path)\n".utf8))
         }
@@ -377,8 +351,6 @@ final class PipelineLogger: @unchecked Sendable {
             appendProgressLine(stage: stage, fraction: fraction, message: message)
         case let .stageLog(stage, line, isError):
             appendLogLine(stage: stage, line: line, isError: isError)
-        case let .trainingBackendSelected(backend):
-            appendLogLine(stage: .trainBrush, line: "Training backend: \(backend.rawValue)", isError: false)
         case let .stageFinished(stage):
             appendLogLine(stage: stage, line: "Stage finished", isError: false)
         case let .pipelineFailed(stage, userMessage, _):

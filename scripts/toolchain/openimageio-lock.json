@@ -1,0 +1,53 @@
+{
+  "dependencies": {
+    "fmt": {
+      "license": "MIT",
+      "source": {
+        "sha256": "2da863d7d454814286c48ef90c9b461a5d27834f026ed9472eed53bd6abbc426",
+        "url": "https://github.com/fmtlib/fmt/archive/a0b8a92e3d1532361c2f7feb63babc5c18d00ef2.tar.gz"
+      },
+      "version": "10.0.0"
+    },
+    "imath": {
+      "license": "BSD-3-Clause",
+      "source": {
+        "sha256": "b4275d83fb95521510e389b8d13af10298ed5bed1c8e13efd961d91b1105e462",
+        "url": "https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v3.2.2.tar.gz"
+      },
+      "version": "3.2.2"
+    },
+    "libjpeg-turbo": {
+      "license": "IJG AND BSD-3-Clause AND Zlib",
+      "source": {
+        "sha256": "980dd81f425082aa6d7c9e47fef27554ce7a9ffc8e2f6e863b97d263c5c50858",
+        "url": "https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/3.2.0.tar.gz"
+      },
+      "version": "3.2.0"
+    },
+    "libpng": {
+      "license": "libpng-2.0",
+      "source": {
+        "sha256": "a9d4df463d36a6e5f9c29bd6f4967312d17e996c1854f3511f833924eb1993cf",
+        "url": "https://github.com/pnggroup/libpng/archive/refs/tags/v1.6.58.tar.gz"
+      },
+      "version": "1.6.58"
+    },
+    "openimageio": {
+      "license": "Apache-2.0 AND BSD-3-Clause AND BSD-2-Clause AND MIT AND BSL-1.0",
+      "source": {
+        "sha256": "5de71b0e92a27b8353c901a45aaa4d99004b652f3d9a7cdba5161d99f1420ac4",
+        "url": "https://github.com/AcademySoftwareFoundation/OpenImageIO/archive/f32bf6e6f8de38ab6d197a72fd72366b66fd30a3.tar.gz"
+      },
+      "version": "2.5.19.1+f32bf6e6f8de38ab6d197a72fd72366b66fd30a3"
+    },
+    "robin-map": {
+      "license": "MIT",
+      "source": {
+        "sha256": "374dcfa5933eb2ae1b86123691198991bade6c4d1263e62ccc6a76f56304e1a1",
+        "url": "https://github.com/Tessil/robin-map/archive/908ccf9f039a0e50813544c0444ca664ca292d7c.tar.gz"
+      },
+      "version": "0.6.2"
+    }
+  },
+  "schemaVersion": 1
+}

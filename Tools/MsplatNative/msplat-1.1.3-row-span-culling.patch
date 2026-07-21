@@ -1,0 +1,478 @@
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -74,6 +74,7 @@
+ 
+ void msplat_set_force_exact_for_testing(bool force_exact);
+ void msplat_set_exact_fallback_enabled_for_testing(bool enabled);
++void msplat_set_tile_culling_min_area_for_testing(uint32_t minimum_tile_area);
+ void msplat_set_exact_execution_capacity_for_testing(uint64_t capacity);
+ void msplat_set_exact_capacity_limit_for_testing(uint64_t capacity);
+ void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -86,6 +86,143 @@
+     get_bbox(tile_center, tile_radius, tile_bounds, tile_min, tile_max);
+ }
+ 
++inline bool opacity_power_limit(const float raw_opacity, thread float &power_limit) {
++    if (!isfinite(raw_opacity)) {
++        return false;
++    }
++    const float opacity = 1.0f / (1.0f + exp(-raw_opacity));
++    const float scaled_opacity = opacity * 255.0f;
++    if (!(scaled_opacity >= 1.0f)) {
++        return false;
++    }
++    // Match the rasterizer's alpha >= 1/255 support exactly. A 4.5 (three
++    // sigma) cap is not conservative after the projected pixel AABB is rounded
++    // outward and can discard pixels the current raster path still evaluates.
++    power_limit = log(scaled_opacity);
++    return true;
++}
++
++inline bool ellipse_tile_row_span(
++    const float3 conic,
++    const float2 mean,
++    const uint tile_y,
++    const uint2 image_size,
++    const float power_limit,
++    const uint broad_begin,
++    const uint broad_end,
++    thread uint &span_begin,
++    thread uint &span_end
++) {
++    if (image_size.x == 0 || image_size.y == 0 || broad_begin >= broad_end ||
++        power_limit < 0.0f) {
++        return false;
++    }
++    const float determinant = fma(conic.x, conic.z, -conic.y * conic.y);
++    const float determinant_scale = max(
++        max(abs(conic.x * conic.z), conic.y * conic.y),
++        FLT_MIN
++    );
++    const float determinant_error =
++        8.0f * FLT_EPSILON * determinant_scale;
++    const float determinant_lower = nextafter(
++        determinant - determinant_error,
++        -INFINITY
++    );
++    if (!isfinite(conic.x) || !isfinite(conic.y) || !isfinite(conic.z) ||
++        !isfinite(mean.x) || !isfinite(mean.y) || !isfinite(power_limit) ||
++        !isfinite(determinant_scale) || !(conic.x > 0.0f) ||
++        !(conic.z > 0.0f) || !(determinant_lower > 0.0f)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
++
++    const uint pixel_min_y = tile_y * BLOCK_Y;
++    if (pixel_min_y >= image_size.y) {
++        return false;
++    }
++    const uint pixel_max_y = min(pixel_min_y + BLOCK_Y - 1, image_size.y - 1);
++    const float support_guard = 128.0f * FLT_EPSILON *
++        (1.0f + 2.0f * abs(power_limit));
++    const float q = 2.0f * (power_limit + support_guard);
++    const float y_radius = sqrt(max(0.0f, q * conic.x / determinant_lower));
++    if (!isfinite(y_radius)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
++    const float feasible_min_y = max(float(pixel_min_y) - mean.y, -y_radius);
++    const float feasible_max_y = min(float(pixel_max_y) - mean.y, y_radius);
++    if (feasible_min_y > feasible_max_y) {
++        return false;
++    }
++
++    const float lower_radicand = max(
++        0.0f, fma(-determinant_lower, feasible_min_y * feasible_min_y, conic.x * q));
++    const float upper_radicand = max(
++        0.0f, fma(-determinant_lower, feasible_max_y * feasible_max_y, conic.x * q));
++    const float lower_center = -conic.y * feasible_min_y / conic.x;
++    const float upper_center = -conic.y * feasible_max_y / conic.x;
++    const float lower_half_width = sqrt(lower_radicand) / conic.x;
++    const float upper_half_width = sqrt(upper_radicand) / conic.x;
++    float minimum_x = min(
++        lower_center - lower_half_width,
++        upper_center - upper_half_width
++    );
++    float maximum_x = max(
++        lower_center + lower_half_width,
++        upper_center + upper_half_width
++    );
++
++    const float x_radius = sqrt(max(0.0f, q * conic.z / determinant_lower));
++    if (!isfinite(lower_center) || !isfinite(upper_center) ||
++        !isfinite(lower_half_width) || !isfinite(upper_half_width) ||
++        !isfinite(x_radius)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
++    const float minimum_critical_y = conic.y * x_radius / conic.z;
++    if (minimum_critical_y >= feasible_min_y &&
++        minimum_critical_y <= feasible_max_y) {
++        minimum_x = -x_radius;
++    }
++    const float maximum_critical_y = -conic.y * x_radius / conic.z;
++    if (maximum_critical_y >= feasible_min_y &&
++        maximum_critical_y <= feasible_max_y) {
++        maximum_x = x_radius;
++    }
++
++    minimum_x += mean.x;
++    maximum_x += mean.x;
++    const float pixel_guard = 64.0f * FLT_EPSILON *
++        (1.0f + abs(mean.x) + abs(minimum_x) + abs(maximum_x));
++    if (!isfinite(minimum_x) || !isfinite(maximum_x) ||
++        !isfinite(pixel_guard)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
++    const float lower_tile = floor(
++        (minimum_x - pixel_guard) / float(BLOCK_X)
++    );
++    const float upper_tile = floor(
++        (maximum_x + pixel_guard) / float(BLOCK_X)
++    ) + 1.0f;
++    if (!isfinite(lower_tile) || !isfinite(upper_tile)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
++    span_begin = uint(clamp(
++        lower_tile, float(broad_begin), float(broad_end)
++    ));
++    span_end = uint(clamp(
++        upper_tile, float(broad_begin), float(broad_end)
++    ));
++    return span_begin < span_end;
++}
++
+ // Affine transform: mat (row-major 4x3) applied to point p.
+ inline float3 transform_4x3(constant float *mat, const float3 p) {
+     float3 out = {
+@@ -950,7 +1087,61 @@
+     if (!exact_raster_enabled(overflow_flag, raster_stats) || idx >= num_tiles) return;
+     write_packed_int2(tile_bins, idx, int2(0));
+ }
++
++kernel void count_exact_tile_intersections_kernel(
++    constant uint& num_points [[buffer(0)]],
++    constant float* xys [[buffer(1)]],
++    constant int* radii [[buffer(2)]],
++    constant float* aabb [[buffer(3)]],
++    constant float* conics [[buffer(4)]],
++    constant float* opacities [[buffer(5)]],
++    constant uint3& tile_bounds [[buffer(6)]],
++    constant uint2& image_size [[buffer(7)]],
++    constant uint& tile_culling_min_area [[buffer(8)]],
++    device int32_t* num_tiles_hit [[buffer(9)]],
++    device atomic_uint* overflow_flag [[buffer(10)]],
++    device atomic_uint* raster_stats [[buffer(11)]],
++    uint idx [[thread_position_in_grid]]
++) {
++    if (!exact_raster_enabled(overflow_flag, raster_stats) || idx >= num_points ||
++        tile_culling_min_area == 0) {
++        return;
++    }
++    if (radii[idx] <= 0) {
++        num_tiles_hit[idx] = 0;
++        return;
++    }
+ 
++    const float2 center = read_packed_float2(xys, idx);
++    uint2 tile_min, tile_max;
++    get_tile_bbox(
++        center, read_packed_float2(aabb, idx), (int3)tile_bounds,
++        tile_min, tile_max
++    );
++    const uint tile_area =
++        (tile_max.x - tile_min.x) * (tile_max.y - tile_min.y);
++    if (tile_area < tile_culling_min_area) {
++        return;
++    }
++    float power_limit = 0.0f;
++    if (!opacity_power_limit(opacities[idx], power_limit)) {
++        num_tiles_hit[idx] = 0;
++        return;
++    }
++    const float3 conic = read_packed_float3(conics, idx);
++    int32_t count = 0;
++    for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
++        uint span_begin = 0;
++        uint span_end = 0;
++        if (ellipse_tile_row_span(
++                conic, center, tile_y, image_size, power_limit,
++                tile_min.x, tile_max.x, span_begin, span_end)) {
++            count += int32_t(span_end - span_begin);
++        }
++    }
++    num_tiles_hit[idx] = count;
++}
++
+ // Build full (tile_id, IEEE-754 depth) pairs for each gaussian-tile intersection.
+ kernel void map_gaussian_to_intersects_kernel(
+     constant int& num_points,
+@@ -965,6 +1156,10 @@
+     constant float* aabb, // float2: per-axis pixel extents
+     device atomic_uint* overflow_flag,
+     device atomic_uint* raster_stats,
++    constant float* conics,
++    constant float* opacities,
++    constant uint2& image_size,
++    constant uint& tile_culling_min_area,
+     uint3 gp [[thread_position_in_grid]]
+ ) {
+     if (!exact_raster_enabled(overflow_flag, raster_stats)) return;
+@@ -978,10 +1173,29 @@
+     float2 center = read_packed_float2(xys, idx);
+     get_tile_bbox(center, read_packed_float2(aabb, idx), (int3)tile_bounds, tile_min, tile_max);
+ 
++    const uint tile_area =
++        (tile_max.x - tile_min.x) * (tile_max.y - tile_min.y);
++    const bool apply_tile_culling =
++        tile_culling_min_area != 0 && tile_area >= tile_culling_min_area;
++    float power_limit = 0.0f;
++    const bool has_support = !apply_tile_culling ||
++        opacity_power_limit(opacities[idx], power_limit);
++    const float3 conic = read_packed_float3(conics, idx);
++
+     // update the intersection info for all tiles this gaussian hits
+     uint64_t cur_idx = (idx == 0) ? 0 : num_tiles_hit[idx - 1];
+-    for (int i = tile_min.y; i < tile_max.y; ++i) {
+-        for (int j = tile_min.x; j < tile_max.x; ++j) {
++    if (!has_support) {
++        return;
++    }
++    for (uint i = tile_min.y; i < tile_max.y; ++i) {
++        uint span_begin = tile_min.x;
++        uint span_end = tile_max.x;
++        if (apply_tile_culling && !ellipse_tile_row_span(
++                conic, center, i, image_size, power_limit,
++                tile_min.x, tile_max.x, span_begin, span_end)) {
++            continue;
++        }
++        for (uint j = span_begin; j < span_end; ++j) {
+             if (cur_idx >= (uint64_t)capacity) {
+                 atomic_store_explicit(&raster_stats[3], 1u, memory_order_relaxed);
+                 return;
+@@ -2202,6 +2416,10 @@
+     device atomic_uint* scatter_counters    [[buffer(6)]],
+     device uint64_t* prealloc_bins          [[buffer(7)]],
+     device atomic_uint* overflow_flag       [[buffer(8)]],
++    constant float* conics                  [[buffer(9)]],
++    constant float* opacities               [[buffer(10)]],
++    constant uint2& image_size              [[buffer(11)]],
++    constant uint& tile_culling_min_area    [[buffer(12)]],
+     uint idx [[thread_position_in_grid]]
+ ) {
+     if (idx >= num_points) return;
+@@ -2211,10 +2429,29 @@
+     uint2 tile_min, tile_max;
+     get_tile_bbox(center, read_packed_float2(aabb, idx), (int3)tile_bounds, tile_min, tile_max);
+ 
++    const uint tile_area =
++        (tile_max.x - tile_min.x) * (tile_max.y - tile_min.y);
++    const bool apply_tile_culling =
++        tile_culling_min_area != 0 && tile_area >= tile_culling_min_area;
++    float power_limit = 0.0f;
++    const bool has_support = !apply_tile_culling ||
++        opacity_power_limit(opacities[idx], power_limit);
++    const float3 conic = read_packed_float3(conics, idx);
++
+     uint depth_bits = as_type<uint>(depths[idx]);
+ 
++    if (!has_support) {
++        return;
++    }
+     for (uint i = tile_min.y; i < tile_max.y; i++) {
+-        for (uint j = tile_min.x; j < tile_max.x; j++) {
++        uint span_begin = tile_min.x;
++        uint span_end = tile_max.x;
++        if (apply_tile_culling && !ellipse_tile_row_span(
++                conic, center, i, image_size, power_limit,
++                tile_min.x, tile_max.x, span_begin, span_end)) {
++            continue;
++        }
++        for (uint j = span_begin; j < span_end; j++) {
+             uint tile_id = i * tile_bounds.x + j;
+             uint pos = atomic_fetch_add_explicit(&scatter_counters[tile_id], 1u, memory_order_relaxed);
+             if (pos >= MAX_TILE_ELEMS) {
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -314,6 +314,7 @@
+     id<MTLComputePipelineState> prepare_exact_dispatch_kernel_cpso;
+     id<MTLComputePipelineState> prepare_exact_raster_kernel_cpso;
+     id<MTLComputePipelineState> clear_exact_tile_bins_kernel_cpso;
++    id<MTLComputePipelineState> count_exact_tile_intersections_kernel_cpso;
+     id<MTLComputePipelineState> exact_block_reduce_u64_kernel_cpso;
+     id<MTLComputePipelineState> exact_block_scan_propagate_u64_kernel_cpso;
+     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
+@@ -447,6 +448,8 @@
+     ctx->prepare_exact_dispatch_kernel_cpso       = load(@"prepare_exact_dispatch_kernel");
+     ctx->prepare_exact_raster_kernel_cpso         = load(@"prepare_exact_raster_kernel");
+     ctx->clear_exact_tile_bins_kernel_cpso        = load(@"clear_exact_tile_bins_kernel");
++    ctx->count_exact_tile_intersections_kernel_cpso =
++        load(@"count_exact_tile_intersections_kernel");
+     ctx->exact_block_reduce_u64_kernel_cpso       = load(@"exact_block_reduce_u64_kernel");
+     ctx->exact_block_scan_propagate_u64_kernel_cpso =
+         load(@"exact_block_scan_propagate_u64_kernel");
+@@ -706,11 +709,13 @@
+ static uint64_t g_exact_capacity_limit_for_testing = 0;
+ static bool g_force_exact_for_testing = false;
+ static bool g_exact_fallback_enabled_for_testing = true;
++static uint32_t g_tile_culling_min_area_for_testing = 0;
+ #else
+ static constexpr uint64_t g_exact_execution_capacity_for_testing = 0;
+ static constexpr uint64_t g_exact_capacity_limit_for_testing = 0;
+ static constexpr bool g_force_exact_for_testing = false;
+ static constexpr bool g_exact_fallback_enabled_for_testing = true;
++static constexpr uint32_t g_tile_culling_min_area_for_testing = 4;
+ #endif
+ static bool g_last_raster_memory_budget_exceeded = false;
+ static bool g_last_raster_resource_limit_exceeded = false;
+@@ -1486,6 +1491,13 @@
+         throw std::runtime_error("msplat: exact-raster dispatch mode cannot change after training starts");
+     }
+     g_exact_fallback_enabled_for_testing = enabled;
++}
++
++void msplat_set_tile_culling_min_area_for_testing(uint32_t minimum_tile_area) {
++    if (g_tcache.fwd_num_points != 0) {
++        throw std::runtime_error("msplat: tile-culling test mode cannot change after training starts");
++    }
++    g_tile_culling_min_area_for_testing = minimum_tile_area;
+ }
+ 
+ void msplat_set_exact_execution_capacity_for_testing(uint64_t capacity) {
+@@ -1753,6 +1765,7 @@
+     g_exact_capacity_limit_for_testing = 0;
+     g_force_exact_for_testing = false;
+     g_exact_fallback_enabled_for_testing = true;
++    g_tile_culling_min_area_for_testing = 0;
+     g_fail_next_sync_for_testing = false;
+ #endif
+     g_last_raster_memory_budget_exceeded = false;
+@@ -1767,6 +1780,8 @@
+     uint32_t num_tiles,
+     uint32_t capacity,
+     const std::array<uint32_t, 4> &tile_bounds,
++    const std::array<uint32_t, 4> &image_size,
++    uint32_t tile_culling_enabled,
+     MTensor &xys,
+     MTensor &depths,
+     MTensor &radii,
+@@ -1794,6 +1809,18 @@
+     [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+ 
++    [enc setComputePipelineState:ctx->count_exact_tile_intersections_kernel_cpso];
++    ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, xys, 1); ENC_BUF(enc, radii, 2);
++    ENC_BUF(enc, aabb, 3); ENC_BUF(enc, conics, 4); ENC_BUF(enc, opacities, 5);
++    [enc setBytes:tile_bounds.data() length:sizeof(tile_bounds) atIndex:6];
++    [enc setBytes:image_size.data() length:sizeof(image_size) atIndex:7];
++    ENC_SCALAR(enc, tile_culling_enabled, 8); ENC_BUF(enc, g_tcache.num_tiles_hit, 9);
++    ENC_BUF(enc, g_tcache.overflow_flag, 10); ENC_BUF(enc, g_tcache.raster_stats, 11);
++    [enc dispatchThreadgroupsWithIndirectBuffer:dispatch_args
++                           indirectBufferOffset:prefix_dispatch_offset
++                          threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
++    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
++
+     [enc setComputePipelineState:ctx->exact_block_reduce_u64_kernel_cpso];
+     ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, g_tcache.num_tiles_hit, 1);
+     ENC_BUF(enc, g_tcache.block_totals, 2);
+@@ -1842,6 +1869,9 @@
+     ENC_SCALAR(enc, capacity, 6); ENC_BUF(enc, g_tcache.exact_isect_ids, 7);
+     ENC_BUF(enc, gaussian_ids, 8); ENC_BUF(enc, aabb, 9);
+     ENC_BUF(enc, g_tcache.overflow_flag, 10); ENC_BUF(enc, g_tcache.raster_stats, 11);
++    ENC_BUF(enc, conics, 12); ENC_BUF(enc, opacities, 13);
++    [enc setBytes:image_size.data() length:sizeof(image_size) atIndex:14];
++    ENC_SCALAR(enc, tile_culling_enabled, 15);
+     [enc dispatchThreadgroupsWithIndirectBuffer:dispatch_args
+                            indirectBufferOffset:map_dispatch_offset
+                           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+@@ -1969,6 +1999,7 @@
+     });
+     auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
+     uint32_t num_points_u32 = (uint32_t)num_points;
++    uint32_t tile_culling_enabled = g_tile_culling_min_area_for_testing;
+     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
+     auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
+ 
+@@ -2009,7 +2040,6 @@
+         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:18];
+         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
+         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
+-        // buffer 23 removed (was opacity-aware AABB, reverted)
+ 
+         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+     };
+@@ -2026,6 +2056,9 @@
+             ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
+             ENC_BUF(enc, g_tcache.prealloc_bins, 7);
+             ENC_BUF(enc, g_tcache.overflow_flag, 8);
++            ENC_BUF(enc, conics, 9); ENC_BUF(enc, opacities, 10);
++            [enc setBytes:proj_img_size->data() length:sizeof(*proj_img_size) atIndex:11];
++            ENC_SCALAR(enc, tile_culling_enabled, 12);
+             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+         }
+         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+@@ -2095,7 +2128,8 @@
+             if (g_exact_fallback_enabled_for_testing) {
+                 encode_exact_raster_fallback(
+                     ctx, encoder, num_points_u32, static_cast<uint32_t>(num_tiles),
+-                    exact_capacity_u32, *tile_bounds_arr, xys, depths, radii_out, aabb,
++                    exact_capacity_u32, *tile_bounds_arr, *img_size_dim3,
++                    tile_culling_enabled, xys, depths, radii_out, aabb,
+                     conics, colors, opacities, gaussian_ids, tile_bins,
+                     packed_xy_opac, packed_conic, packed_rgb
+                 );
+@@ -2212,6 +2246,7 @@
+     });
+     auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
+     uint32_t num_points_u32 = (uint32_t)num_points;
++    uint32_t tile_culling_enabled = g_tile_culling_min_area_for_testing;
+     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
+     auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
+     // tile_bounds for rasterize kernels must be 16x16 tile counts (tile_bins granularity)
+@@ -2242,7 +2277,6 @@
+         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:18];
+         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
+         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
+-        // buffer 23 removed (was opacity-aware AABB, reverted)
+ 
+         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+     };
+@@ -2259,6 +2293,9 @@
+             ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
+             ENC_BUF(enc, g_tcache.prealloc_bins, 7);
+             ENC_BUF(enc, g_tcache.overflow_flag, 8);
++            ENC_BUF(enc, conics, 9); ENC_BUF(enc, opacities, 10);
++            [enc setBytes:proj_img_size->data() length:sizeof(*proj_img_size) atIndex:11];
++            ENC_SCALAR(enc, tile_culling_enabled, 12);
+             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+         }
+         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+@@ -2509,7 +2546,8 @@
+             if (g_exact_fallback_enabled_for_testing) {
+                 encode_exact_raster_fallback(
+                     ctx, enc, num_points_u32, static_cast<uint32_t>(num_tiles),
+-                    exact_capacity_u32, *tile_bounds_arr, xys, depths, radii_out, aabb,
++                    exact_capacity_u32, *tile_bounds_arr, *img_size_dim3,
++                    tile_culling_enabled, xys, depths, radii_out, aabb,
+                     conics, colors, opacities, gaussian_ids, tile_bins,
+                     packed_xy_opac, packed_conic, packed_rgb
+                 );
+@@ -2638,7 +2676,8 @@
+             if (g_exact_fallback_enabled_for_testing) {
+                 encode_exact_raster_fallback(
+                     ctx, enc, num_points_u32, static_cast<uint32_t>(num_tiles),
+-                    exact_capacity_u32, *tile_bounds_arr, xys, depths, radii_out, aabb,
++                    exact_capacity_u32, *tile_bounds_arr, *img_size_dim3,
++                    tile_culling_enabled, xys, depths, radii_out, aabb,
+                     conics, colors, opacities, gaussian_ids, tile_bins,
+                     packed_xy_opac, packed_conic, packed_rgb
+                 );

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "manifest_profile": "smoke",
+  "scenes": [
+    {
+      "id": "harness-smoke",
+      "category": "object_orbit",
+      "scenario": "harness_fixture",
+      "capture_traits": [
+        "unordered"
+      ],
+      "gate_scopes": [
+        "scene_performance",
+        "scene_quality",
+        "suite_performance"
+      ],
+      "license": {
+        "name": "MIT License",
+        "url": "https://github.com/dud8/EasySplat/blob/main/LICENSE",
+        "redistributable": true
+      },
+      "provenance": {
+        "source": "EasySplat deterministic harness fixture",
+        "authorization_status": "redistributable",
+        "authorization_sha256": null
+      },
+      "input": {
+        "kind": "photos",
+        "media_path": "smoke-input.txt",
+        "supplied": true
+      },
+      "scale_lanes": [
+        30
+      ],
+      "aggregate_scale": 30,
+      "split": {
+        "status": "fixture"
+      },
+      "reference": {
+        "status": "fixture"
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "fixture",
+        "result_path": "smoke-result.json"
+      }
+    }
+  ]
+}

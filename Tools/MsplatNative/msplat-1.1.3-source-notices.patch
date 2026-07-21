@@ -1,0 +1,50 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,0 +1 @@
++# Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/include/model.hpp b/core/include/model.hpp
+--- a/core/include/model.hpp
++++ b/core/include/model.hpp
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/include/metal_tensor.hpp b/core/include/metal_tensor.hpp
+--- a/core/include/metal_tensor.hpp
++++ b/core/include/metal_tensor.hpp
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/include/random_iter.hpp b/core/include/random_iter.hpp
+--- a/core/include/random_iter.hpp
++++ b/core/include/random_iter.hpp
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/metal/bindings.h b/core/metal/bindings.h
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/src/loaders/image_io.cpp b/core/src/loaders/image_io.cpp
+--- a/core/src/loaders/image_io.cpp
++++ b/core/src/loaders/image_io.cpp
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/src/loaders/save_gaussians.cpp b/core/src/loaders/save_gaussians.cpp
+--- a/core/src/loaders/save_gaussians.cpp
++++ b/core/src/loaders/save_gaussians.cpp
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.
+diff --git a/core/src/model.cpp b/core/src/model.cpp
+--- a/core/src/model.cpp
++++ b/core/src/model.cpp
+@@ -1,0 +1 @@
++// Modified by the EasySplat project in 2026 from msplat 1.1.3.

@@ -1,0 +1,1154 @@
+name: Release Benchmark Evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Final signed toolchain version"
+        required: true
+        type: string
+      app_version:
+        description: "EasySplat version under test"
+        required: true
+        default: "0.2.0"
+        type: string
+      producer_run_id:
+        description: "Toolchain producer run ID"
+        required: true
+        type: string
+      producer_run_attempt:
+        description: "Toolchain producer run attempt"
+        required: true
+        type: string
+      producer_artifact_id:
+        description: "Final signed producer artifact ID"
+        required: true
+        type: string
+      producer_artifact_name:
+        description: "Final signed producer artifact name"
+        required: true
+        type: string
+      producer_artifact_digest:
+        description: "Final signed producer artifact digest"
+        required: true
+        type: string
+      request_artifact_id:
+        description: "Post-sign request artifact ID"
+        required: true
+        type: string
+      request_artifact_name:
+        description: "Post-sign request artifact name"
+        required: true
+        type: string
+      request_artifact_digest:
+        description: "Post-sign request artifact digest"
+        required: true
+        type: string
+      request_sha256:
+        description: "Post-sign request file SHA-256"
+        required: true
+        type: string
+      authority_repository:
+        description: "Private release-authority repository"
+        required: true
+        default: "dud8/easysplat-release-authority"
+        type: string
+      authority_commit:
+        description: "Release-authority source commit"
+        required: true
+        type: string
+      authority_run_id:
+        description: "Release-authority workflow run ID"
+        required: true
+        type: string
+      authority_run_attempt:
+        description: "Release-authority workflow run attempt"
+        required: true
+        type: string
+      authority_payload_artifact_id:
+        description: "Signed authority payload artifact ID"
+        required: true
+        type: string
+      authority_payload_artifact_name:
+        description: "Signed authority payload artifact name"
+        required: true
+        type: string
+      authority_payload_artifact_digest:
+        description: "Signed authority payload artifact digest"
+        required: true
+        type: string
+      authority_receipt_artifact_id:
+        description: "Signed authority receipt artifact ID"
+        required: true
+        type: string
+      authority_receipt_artifact_name:
+        description: "Signed authority receipt artifact name"
+        required: true
+        type: string
+      authority_receipt_artifact_digest:
+        description: "Signed authority receipt artifact digest"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: release-benchmark-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  bind-toolchain:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: benchmark-release
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
+    steps:
+      - name: Bind and collect exact signed toolchain evidence
+        env:
+          GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_POLICY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          APP_VERSION: ${{ inputs.app_version }}
+          PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ inputs.producer_run_attempt }}
+          PRODUCER_ARTIFACT_ID: ${{ inputs.producer_artifact_id }}
+          PRODUCER_ARTIFACT_NAME: ${{ inputs.producer_artifact_name }}
+          PRODUCER_ARTIFACT_DIGEST: ${{ inputs.producer_artifact_digest }}
+          REQUEST_ARTIFACT_ID: ${{ inputs.request_artifact_id }}
+          REQUEST_ARTIFACT_NAME: ${{ inputs.request_artifact_name }}
+          REQUEST_ARTIFACT_DIGEST: ${{ inputs.request_artifact_digest }}
+          REQUEST_SHA256: ${{ inputs.request_sha256 }}
+          AUTHORITY_REPOSITORY: ${{ inputs.authority_repository }}
+          AUTHORITY_COMMIT: ${{ inputs.authority_commit }}
+          AUTHORITY_RUN_ID: ${{ inputs.authority_run_id }}
+          AUTHORITY_RUN_ATTEMPT: ${{ inputs.authority_run_attempt }}
+          AUTHORITY_PAYLOAD_ARTIFACT_ID: ${{ inputs.authority_payload_artifact_id }}
+          AUTHORITY_PAYLOAD_ARTIFACT_NAME: ${{ inputs.authority_payload_artifact_name }}
+          AUTHORITY_PAYLOAD_ARTIFACT_DIGEST: ${{ inputs.authority_payload_artifact_digest }}
+          AUTHORITY_RECEIPT_ARTIFACT_ID: ${{ inputs.authority_receipt_artifact_id }}
+          AUTHORITY_RECEIPT_ARTIFACT_NAME: ${{ inputs.authority_receipt_artifact_name }}
+          AUTHORITY_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.authority_receipt_artifact_digest }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          python3 - "$VERSION" "$APP_VERSION" <<'PY'
+          import re
+          import sys
+
+          pattern = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+          for value in sys.argv[1:]:
+              if re.fullmatch(pattern, value) is None:
+                  raise SystemExit(f"invalid semantic version: {value}")
+              if "-" in value and any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in value.split("-", 1)[1].split(".")):
+                  raise SystemExit(f"invalid numeric prerelease identifier: {value}")
+          PY
+          for value in \
+            "$PRODUCER_RUN_ID" "$PRODUCER_RUN_ATTEMPT" "$PRODUCER_ARTIFACT_ID" \
+            "$REQUEST_ARTIFACT_ID" "$AUTHORITY_RUN_ID" "$AUTHORITY_RUN_ATTEMPT" \
+            "$AUTHORITY_PAYLOAD_ARTIFACT_ID" "$AUTHORITY_RECEIPT_ARTIFACT_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          for value in \
+            "$PRODUCER_ARTIFACT_DIGEST" "$REQUEST_ARTIFACT_DIGEST" \
+            "$AUTHORITY_PAYLOAD_ARTIFACT_DIGEST" "$AUTHORITY_RECEIPT_ARTIFACT_DIGEST"; do
+            [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
+          [[ "$REQUEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$AUTHORITY_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$AUTHORITY_REPOSITORY" = "dud8/easysplat-release-authority"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/git/ref/tags/toolchain-v$VERSION" --jq .ref)" = "refs/tags/toolchain-v$VERSION"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2Ftoolchain-v$VERSION" --jq .sha)" = "$GITHUB_SHA"
+
+          verify_run() {
+            repository="$1"
+            run_id="$2"
+            run_attempt="$3"
+            commit="$4"
+            workflow="$5"
+            row="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$repository/actions/runs/$run_id" --jq '[.status, .conclusion, .head_sha, .head_branch, .event, .run_attempt, .path] | @tsv')"
+            test "$(printf '%s\n' "$row" | cut -f1)" = "completed"
+            test "$(printf '%s\n' "$row" | cut -f2)" = "success"
+            test "$(printf '%s\n' "$row" | cut -f3)" = "$commit"
+            test "$(printf '%s\n' "$row" | cut -f4)" = "main"
+            test "$(printf '%s\n' "$row" | cut -f5)" = "workflow_dispatch"
+            test "$(printf '%s\n' "$row" | cut -f6)" = "$run_attempt"
+            case "$(printf '%s\n' "$row" | cut -f7)" in
+              "$workflow"|"$workflow@main") ;;
+              *) exit 1 ;;
+            esac
+          }
+          verify_artifact() {
+            repository="$1"
+            run_id="$2"
+            artifact_id="$3"
+            name="$4"
+            digest="$5"
+            row="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$repository/actions/artifacts/$artifact_id" --jq '[.workflow_run.id, .name, .digest, .expired] | @tsv')"
+            test "$(printf '%s\n' "$row" | cut -f1)" = "$run_id"
+            test "$(printf '%s\n' "$row" | cut -f2)" = "$name"
+            test "$(printf '%s\n' "$row" | cut -f3)" = "$digest"
+            test "$(printf '%s\n' "$row" | cut -f4)" = "false"
+          }
+          verify_run "$GITHUB_REPOSITORY" "$PRODUCER_RUN_ID" "$PRODUCER_RUN_ATTEMPT" "$GITHUB_SHA" ".github/workflows/toolchain-build.yml"
+          verify_artifact "$GITHUB_REPOSITORY" "$PRODUCER_RUN_ID" "$PRODUCER_ARTIFACT_ID" "$PRODUCER_ARTIFACT_NAME" "$PRODUCER_ARTIFACT_DIGEST"
+          verify_artifact "$GITHUB_REPOSITORY" "$PRODUCER_RUN_ID" "$REQUEST_ARTIFACT_ID" "$REQUEST_ARTIFACT_NAME" "$REQUEST_ARTIFACT_DIGEST"
+          verify_run "$AUTHORITY_REPOSITORY" "$AUTHORITY_RUN_ID" "$AUTHORITY_RUN_ATTEMPT" "$AUTHORITY_COMMIT" ".github/workflows/sign-toolchain-authority.yml"
+          verify_artifact "$AUTHORITY_REPOSITORY" "$AUTHORITY_RUN_ID" "$AUTHORITY_PAYLOAD_ARTIFACT_ID" "$AUTHORITY_PAYLOAD_ARTIFACT_NAME" "$AUTHORITY_PAYLOAD_ARTIFACT_DIGEST"
+          verify_artifact "$AUTHORITY_REPOSITORY" "$AUTHORITY_RUN_ID" "$AUTHORITY_RECEIPT_ARTIFACT_ID" "$AUTHORITY_RECEIPT_ARTIFACT_NAME" "$AUTHORITY_RECEIPT_ARTIFACT_DIGEST"
+
+          HANDOFF="$RUNNER_TEMP/toolchain-benchmark-handoff"
+          RAW="$RUNNER_TEMP/toolchain-benchmark-downloads"
+          rm -rf "$HANDOFF" "$RAW"
+          mkdir -m 0700 "$HANDOFF" "$RAW"
+          mkdir -m 0700 "$HANDOFF/producer" "$HANDOFF/request" "$HANDOFF/authority-handoff"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$PRODUCER_ARTIFACT_ID/zip" >"$RAW/producer.zip"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$REQUEST_ARTIFACT_ID/zip" >"$RAW/request.zip"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$AUTHORITY_REPOSITORY/actions/artifacts/$AUTHORITY_PAYLOAD_ARTIFACT_ID/zip" >"$HANDOFF/authority-handoff/toolchain-authority-payload.zip"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$AUTHORITY_REPOSITORY/actions/artifacts/$AUTHORITY_RECEIPT_ARTIFACT_ID/zip" >"$HANDOFF/authority-handoff/toolchain-authority-receipt.zip"
+          python3 -I - "$RAW" "$HANDOFF" "$VERSION" <<'PY'
+          import shutil
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          raw, handoff, version = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+
+          def extract_exact(source, destination, expected):
+              with zipfile.ZipFile(source) as archive:
+                  infos = archive.infolist()
+                  if {info.filename for info in infos} != expected or len(infos) != len(expected):
+                      raise SystemExit("artifact file set is invalid")
+                  for info in infos:
+                      path = PurePosixPath(info.filename)
+                      mode = (info.external_attr >> 16) & 0o170000
+                      if path.is_absolute() or ".." in path.parts or info.is_dir() or info.flag_bits & 1 or mode == stat.S_IFLNK:
+                          raise SystemExit("artifact member is unsafe")
+                      target = destination.joinpath(*path.parts)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with archive.open(info) as input_file, target.open("xb") as output_file:
+                          shutil.copyfileobj(input_file, output_file, 1024 * 1024)
+
+          extract_exact(raw / "producer.zip", handoff / "producer", {
+              f"toolchain-macos-arm64-{version}-core.zip",
+              f"toolchain-geometry-da3-base-{version}.zip",
+              f"toolchain-geometry-da3-small-{version}.zip",
+              "distribution-signing-finalization.json",
+              "core-notarization.json",
+              "da3-base-notarization.json",
+              "toolchain-build-host.json",
+          })
+          extract_exact(raw / "request.zip", handoff / "request", {"toolchain-release-request.json"})
+          PY
+          PAYLOAD_DOWNLOAD_SHA256="$(/usr/bin/shasum -a 256 "$HANDOFF/authority-handoff/toolchain-authority-payload.zip" | cut -d' ' -f1)"
+          RECEIPT_DOWNLOAD_SHA256="$(/usr/bin/shasum -a 256 "$HANDOFF/authority-handoff/toolchain-authority-receipt.zip" | cut -d' ' -f1)"
+          export PAYLOAD_DOWNLOAD_SHA256 RECEIPT_DOWNLOAD_SHA256
+          python3 -I - "$HANDOFF/authority-handoff/authority-transport.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          payload = {
+              "schemaVersion": 1,
+              "sourceRepository": os.environ["GITHUB_REPOSITORY"],
+              "sourceCommit": os.environ["GITHUB_SHA"],
+              "handoffRunID": int(os.environ["GITHUB_RUN_ID"]),
+              "handoffRunAttempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "authorityRepository": os.environ["AUTHORITY_REPOSITORY"],
+              "authorityCommit": os.environ["AUTHORITY_COMMIT"],
+              "authorityRunID": int(os.environ["AUTHORITY_RUN_ID"]),
+              "authorityRunAttempt": int(os.environ["AUTHORITY_RUN_ATTEMPT"]),
+              "payloadArtifact": {
+                  "id": int(os.environ["AUTHORITY_PAYLOAD_ARTIFACT_ID"]),
+                  "name": os.environ["AUTHORITY_PAYLOAD_ARTIFACT_NAME"],
+                  "digest": os.environ["AUTHORITY_PAYLOAD_ARTIFACT_DIGEST"],
+                  "downloadSHA256": os.environ["PAYLOAD_DOWNLOAD_SHA256"],
+              },
+              "receiptArtifact": {
+                  "id": int(os.environ["AUTHORITY_RECEIPT_ARTIFACT_ID"]),
+                  "name": os.environ["AUTHORITY_RECEIPT_ARTIFACT_NAME"],
+                  "digest": os.environ["AUTHORITY_RECEIPT_ARTIFACT_DIGEST"],
+                  "downloadSHA256": os.environ["RECEIPT_DOWNLOAD_SHA256"],
+              },
+          }
+          Path(sys.argv[1]).write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+
+      - name: Upload inert signed-toolchain handoff
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-benchmark-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/toolchain-benchmark-handoff
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  prepare:
+    needs: bind-toolchain
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-reference, easysplat-ephemeral]
+    environment: benchmark-release
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    timeout-minutes: 60
+    outputs:
+      signed_toolchain_artifact_id: ${{ steps.upload-signed-toolchain.outputs.artifact-id }}
+      signed_toolchain_artifact_digest: ${{ format('sha256:{0}', steps.upload-signed-toolchain.outputs.artifact-digest) }}
+      full_toolchain_identity: ${{ steps.verify-signed-toolchain.outputs.full_toolchain_identity }}
+      requests_artifact_id: ${{ steps.upload-requests.outputs.artifact-id }}
+      requests_artifact_digest: ${{ format('sha256:{0}', steps.upload-requests.outputs.artifact-digest) }}
+      renderer_artifact_id: ${{ steps.upload-renderer.outputs.artifact-id }}
+      renderer_artifact_digest: ${{ format('sha256:{0}', steps.upload-renderer.outputs.artifact-digest) }}
+      measurement_runner_artifact_id: ${{ steps.upload-measurement-runner.outputs.artifact-id }}
+      measurement_runner_artifact_digest: ${{ format('sha256:{0}', steps.upload-measurement-runner.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Download inert signed-toolchain handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.bind-toolchain.outputs.artifact_id }}
+          path: ${{ runner.temp }}/toolchain-benchmark-handoff
+          merge-multiple: true
+      - name: Verify and install the final signed toolchain closure
+        id: verify-signed-toolchain
+        run: |
+          set -euo pipefail
+          HANDOFF="$RUNNER_TEMP/toolchain-benchmark-handoff"
+          MANIFEST="$RUNNER_TEMP/signed-toolchain-manifest.json"
+          TOOLCHAIN_ROOT="$RUNNER_TEMP/signed-toolchain-root"
+          RESULT="$(python3 scripts/release/toolchain_publication.py verify-authority \
+            --producer "$HANDOFF/producer" \
+            --request "$HANDOFF/request/toolchain-release-request.json" \
+            --authority-handoff "$HANDOFF/authority-handoff" \
+            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --manifest-out "$MANIFEST" \
+            --install-root "$TOOLCHAIN_ROOT" \
+            --version "${{ inputs.version }}" \
+            --app-version "${{ inputs.app_version }}" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --producer-run-id "${{ inputs.producer_run_id }}" \
+            --producer-run-attempt "${{ inputs.producer_run_attempt }}" \
+            --producer-artifact-id "${{ inputs.producer_artifact_id }}" \
+            --producer-artifact-name "${{ inputs.producer_artifact_name }}" \
+            --producer-artifact-digest "${{ inputs.producer_artifact_digest }}" \
+            --request-artifact-id "${{ inputs.request_artifact_id }}" \
+            --request-artifact-name "${{ inputs.request_artifact_name }}" \
+            --request-artifact-digest "${{ inputs.request_artifact_digest }}" \
+            --request-sha256 "${{ inputs.request_sha256 }}" \
+            --authority-repository "${{ inputs.authority_repository }}" \
+            --authority-commit "${{ inputs.authority_commit }}" \
+            --authority-run-id "${{ inputs.authority_run_id }}" \
+            --authority-run-attempt "${{ inputs.authority_run_attempt }}" \
+            --authority-payload-artifact-id "${{ inputs.authority_payload_artifact_id }}" \
+            --authority-payload-artifact-name "${{ inputs.authority_payload_artifact_name }}" \
+            --authority-payload-artifact-digest "${{ inputs.authority_payload_artifact_digest }}" \
+            --authority-receipt-artifact-id "${{ inputs.authority_receipt_artifact_id }}" \
+            --authority-receipt-artifact-name "${{ inputs.authority_receipt_artifact_name }}" \
+            --authority-receipt-artifact-digest "${{ inputs.authority_receipt_artifact_digest }}" \
+            --handoff-run-id "$GITHUB_RUN_ID" \
+            --handoff-run-attempt "$GITHUB_RUN_ATTEMPT")"
+          FULL_IDENTITY="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["full_toolchain_identity"])' <<<"$RESULT")"
+          [[ "$FULL_IDENTITY" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "full_toolchain_identity=$FULL_IDENTITY" >>"$GITHUB_OUTPUT"
+          VERSION="${{ inputs.version }}"
+          swift run --package-path Tools/ManifestTool ManifestTool verify-release \
+            --manifest "$MANIFEST" \
+            --public-key-file "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --toolchain-version "$VERSION" \
+            --app-version "${{ inputs.app_version }}" \
+            --core-zip "$HANDOFF/producer/toolchain-macos-arm64-$VERSION-core.zip" \
+            --core-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-macos-arm64-$VERSION-core.zip" \
+            --da3-base-zip "$HANDOFF/producer/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-small-zip "$HANDOFF/producer/toolchain-geometry-da3-small-$VERSION.zip" \
+            --da3-small-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-small-$VERSION.zip"
+          CLOSURE="$RUNNER_TEMP/signed-toolchain-closure"
+          mkdir -m 0700 "$CLOSURE"
+          mkdir -m 0700 "$CLOSURE/producer"
+          cp "$MANIFEST" "$CLOSURE/manifest.json"
+          cp "$HANDOFF/producer/toolchain-macos-arm64-$VERSION-core.zip" "$CLOSURE/producer/"
+          cp "$HANDOFF/producer/toolchain-geometry-da3-base-$VERSION.zip" "$CLOSURE/producer/"
+          cp "$HANDOFF/producer/toolchain-geometry-da3-small-$VERSION.zip" "$CLOSURE/producer/"
+      - name: Verify shipping host
+        run: ./scripts/benchmark/verify_shipping_host.sh
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/benchmark/requirements.txt
+      - name: Install protected benchmark dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/requirements.txt
+      - name: Verify protected source and prepare bound requests
+        env:
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_CORPUS }}
+          LPIPS_BACKBONE: ${{ vars.EASYSPLAT_BENCHMARK_LPIPS_BACKBONE }}
+        run: |
+          test -n "$RELEASE_CORPUS" && test -f "$RELEASE_CORPUS"
+          TOOLCHAIN_ROOT="$RUNNER_TEMP/signed-toolchain-root"
+          test -d "$TOOLCHAIN_ROOT"
+          test -n "$LPIPS_BACKBONE" && test -f "$LPIPS_BACKBONE" && test ! -L "$LPIPS_BACKBONE"
+          test "$(shasum -a 256 "$LPIPS_BACKBONE" | awk '{print $1}')" = "b8a52dc049b60e4b6ab68ad0df457362afab8b6304b2febdc1650a5dab4d7e7b"
+          test -z "$(git status --porcelain)"
+          RENDERER_BUILD="$RUNNER_TEMP/renderer-build"
+          RENDERER_PACKAGE="$RUNNER_TEMP/renderer-package"
+          rm -rf "$RENDERER_BUILD" "$RENDERER_PACKAGE"
+          swift build \
+            --configuration release \
+            --scratch-path "$RENDERER_BUILD" \
+            --product EasySplatBenchmarkDriver
+          RENDERER_BIN="$(swift build \
+            --configuration release \
+            --scratch-path "$RENDERER_BUILD" \
+            --show-bin-path)"
+          python3 scripts/benchmark/renderer_closure.py build \
+            --executable "$RENDERER_BIN/EasySplatBenchmarkDriver" \
+            --resource-bundle "$RENDERER_BIN/MetalSplatter_MetalSplatter.bundle" \
+            --output "$RENDERER_PACKAGE/closure" \
+            --identity-output "$RENDERER_PACKAGE/identity.json"
+          MEASUREMENT_BUILD="$RUNNER_TEMP/measurement-runner-build"
+          MEASUREMENT_PACKAGE="$RUNNER_TEMP/measurement-runner-package"
+          rm -rf "$MEASUREMENT_BUILD" "$MEASUREMENT_PACKAGE"
+          swift build \
+            --configuration release \
+            --scratch-path "$MEASUREMENT_BUILD" \
+            --product EasySplatMeasurementRunner
+          MEASUREMENT_BIN="$(swift build \
+            --configuration release \
+            --scratch-path "$MEASUREMENT_BUILD" \
+            --show-bin-path)"
+          PREPARE_BASELINE_CHECKOUT="$RUNNER_TEMP/prepare-baseline-checkout"
+          BASELINE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["references"]["paired_baseline"]["git_commit"])' scripts/benchmark/reference-config.json)"
+          git worktree add --detach "$PREPARE_BASELINE_CHECKOUT" "$BASELINE_COMMIT"
+          cleanup_prepare_baseline() {
+            git worktree remove --force "$PREPARE_BASELINE_CHECKOUT" >/dev/null 2>&1 || true
+          }
+          trap cleanup_prepare_baseline EXIT
+          python3 scripts/benchmark/build_measurement_adapters.py \
+            --current-checkout "$GITHUB_WORKSPACE" \
+            --current-commit "$GITHUB_SHA" \
+            --baseline-checkout "$PREPARE_BASELINE_CHECKOUT" \
+            --baseline-commit "$BASELINE_COMMIT" \
+            --adapter-source "Tools/MeasurementRunner/Adapters/PipelineMeasurementAdapter.swift" \
+            --support-source "Tools/MeasurementRunner/Sources/MeasurementAdapterSupport/MeasurementAdapterSupport.swift" \
+            --scratch-root "$RUNNER_TEMP/measurement-adapter-build" \
+            --output-root "$RUNNER_TEMP/measurement-adapters"
+          ./scripts/benchmark/verify_shipping_host.sh \
+            --binary "$RENDERER_BIN/EasySplatBenchmarkDriver" \
+            --binary "$MEASUREMENT_BIN/EasySplatMeasurementRunner" \
+            --binary "$RUNNER_TEMP/measurement-adapters/PipelineMeasurementAdapter-current" \
+            --binary "$RUNNER_TEMP/measurement-adapters/PipelineMeasurementAdapter-baseline" \
+            --binary "$RUNNER_TEMP/measurement-adapters/AccurateReferenceMeasurementAdapter"
+          python3 scripts/benchmark/measurement_runner_closure.py build \
+            --executable "$MEASUREMENT_BIN/EasySplatMeasurementRunner" \
+            --adapter-source "Tools/MeasurementRunner/Adapters/PipelineMeasurementAdapter.swift" \
+            --support-source "Tools/MeasurementRunner/Sources/MeasurementAdapterSupport/MeasurementAdapterSupport.swift" \
+            --candidate-adapter "$RUNNER_TEMP/measurement-adapters/PipelineMeasurementAdapter-current" \
+            --baseline-adapter "$RUNNER_TEMP/measurement-adapters/PipelineMeasurementAdapter-baseline" \
+            --reference-adapter "$RUNNER_TEMP/measurement-adapters/AccurateReferenceMeasurementAdapter" \
+            --source-commit "$GITHUB_SHA" \
+            --xcode-version "$(xcodebuild -version | sed -n '1p')" \
+            --swift-version "$(swift --version | sed -n '1p')" \
+            --output "$MEASUREMENT_PACKAGE/closure" \
+            --identity-output "$MEASUREMENT_PACKAGE/identity.json"
+          MEASUREMENT_RUNNER_SHA256="sha256:$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["files"]["EasySplatMeasurementRunner"]["sha256"])' "$MEASUREMENT_PACKAGE/identity.json")"
+          mkdir -p "$RENDERER_PACKAGE/scoring"
+          cp "$LPIPS_BACKBONE" "$RENDERER_PACKAGE/scoring/squeezenet1_1-b8a52dc0.pth"
+          test -z "$(git status --porcelain)"
+          REQUESTS="$RUNNER_TEMP/easysplat-benchmark-requests"
+          rm -rf "$REQUESTS"
+          scripts/benchmark/run_suite.sh \
+            --profile release \
+            --corpus "$RELEASE_CORPUS" \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --output "$RUNNER_TEMP/unused-benchmark-output" \
+            --runner-identity "reference_m4_max=$MEASUREMENT_RUNNER_SHA256" \
+            --runner-identity "constrained_14_16gb=$MEASUREMENT_RUNNER_SHA256" \
+            --runner-identity "eight_gb_fast=$MEASUREMENT_RUNNER_SHA256" \
+            --rendering-driver-identity "$RENDERER_PACKAGE/identity.json" \
+            --emit-requests "$REQUESTS"
+      - name: Upload verified signed toolchain archives
+        id: upload-signed-toolchain
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-signed-toolchain-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/signed-toolchain-closure
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Upload bound requests
+        id: upload-requests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-requests-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-benchmark-requests
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload bound renderer closure
+        id: upload-renderer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-renderer-${{ github.sha }}
+          path: ${{ runner.temp }}/renderer-package
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload bound measurement runner closure
+        id: upload-measurement-runner
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-measurement-runner-${{ github.sha }}
+          path: ${{ runner.temp }}/measurement-runner-package
+          if-no-files-found: error
+          retention-days: 7
+
+  reference:
+    needs: [prepare]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-reference, easysplat-ephemeral]
+    environment: benchmark-release
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    timeout-minutes: 1440
+    outputs:
+      raw_artifact_id: ${{ steps.upload-raw.outputs.artifact-id }}
+      raw_artifact_digest: ${{ format('sha256:{0}', steps.upload-raw.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Download verified signed toolchain archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.signed_toolchain_artifact_id }}
+          path: ${{ runner.temp }}/signed-toolchain-closure
+          merge-multiple: true
+      - name: Install verified signed toolchain
+        run: |
+          python3 scripts/release/toolchain_publication.py install \
+            --producer "$RUNNER_TEMP/signed-toolchain-closure/producer" \
+            --manifest "$RUNNER_TEMP/signed-toolchain-closure/manifest.json" \
+            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --version "${{ inputs.version }}" \
+            --app-version "${{ inputs.app_version }}" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --install-root "$RUNNER_TEMP/signed-toolchain-root"
+      - name: Verify shipping host
+        run: ./scripts/benchmark/verify_shipping_host.sh
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/benchmark/requirements.txt
+      - name: Install protected benchmark dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/requirements.txt
+      - name: Download bound requests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.requests_artifact_id }}
+          path: ${{ runner.temp }}/requests
+      - name: Download bound renderer closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.renderer_artifact_id }}
+          path: ${{ runner.temp }}/renderer-package
+      - name: Download bound measurement runner closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.measurement_runner_artifact_id }}
+          path: ${{ runner.temp }}/measurement-runner
+          digest-mismatch: error
+      - name: Validate prepared measurement runner digest binding
+        env:
+          MEASUREMENT_RUNNER_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.measurement_runner_artifact_digest }}
+        run: |
+          grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$MEASUREMENT_RUNNER_ARTIFACT_DIGEST"
+          test "$MEASUREMENT_RUNNER_ARTIFACT_DIGEST" != "sha256:$(printf '0%.0s' {1..64})"
+      - name: Collect reference measurements
+        env:
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_CORPUS }}
+          BASELINE_TOOLCHAIN_ROOT: ${{ vars.EASYSPLAT_BENCHMARK_BASELINE_TOOLCHAIN_ROOT }}
+        run: |
+          test -n "$RELEASE_CORPUS" && test -f "$RELEASE_CORPUS"
+          TOOLCHAIN_ROOT="$RUNNER_TEMP/signed-toolchain-root"
+          test -d "$TOOLCHAIN_ROOT"
+          test -n "$BASELINE_TOOLCHAIN_ROOT" && test -d "$BASELINE_TOOLCHAIN_ROOT"
+          BASELINE_CHECKOUT="$RUNNER_TEMP/baseline-checkout"
+          rm -rf "$BASELINE_CHECKOUT"
+          BASELINE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseline_git_commit"])' "$RUNNER_TEMP/requests/index.json")"
+          git worktree add --detach "$BASELINE_CHECKOUT" "$BASELINE_COMMIT"
+          cleanup() {
+            git worktree remove --force "$BASELINE_CHECKOUT" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          chmod 0755 "$RUNNER_TEMP/renderer-package/closure/EasySplatBenchmarkDriver"
+          python3 scripts/benchmark/renderer_closure.py verify \
+            --closure "$RUNNER_TEMP/renderer-package/closure" \
+            --identity "$RUNNER_TEMP/renderer-package/identity.json"
+          chmod 0755 "$RUNNER_TEMP/measurement-runner/closure/EasySplatMeasurementRunner"
+          python3 scripts/benchmark/measurement_runner_closure.py verify \
+            --closure "$RUNNER_TEMP/measurement-runner/closure" \
+            --identity "$RUNNER_TEMP/measurement-runner/identity.json"
+          python3 scripts/benchmark/run_lane.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --corpus "$RELEASE_CORPUS" \
+            --reference-config scripts/benchmark/reference-config.json \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --baseline-checkout-root "$BASELINE_CHECKOUT" \
+            --baseline-toolchain-root "$BASELINE_TOOLCHAIN_ROOT" \
+            --output "$RUNNER_TEMP/reference-evidence" \
+            --lane reference_m4_max \
+            --runner "$RUNNER_TEMP/measurement-runner/closure/EasySplatMeasurementRunner" \
+            --rendering-driver-closure "$RUNNER_TEMP/renderer-package/closure"
+      - name: Upload raw reference measurements
+        id: upload-raw
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-reference-raw-${{ github.sha }}
+          path: ${{ runner.temp }}/reference-evidence
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  constrained:
+    needs: [prepare]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-constrained, easysplat-ephemeral]
+    environment: benchmark-release
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    timeout-minutes: 1440
+    outputs:
+      raw_artifact_id: ${{ steps.upload-raw.outputs.artifact-id }}
+      raw_artifact_digest: ${{ format('sha256:{0}', steps.upload-raw.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Download verified signed toolchain archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.signed_toolchain_artifact_id }}
+          path: ${{ runner.temp }}/signed-toolchain-closure
+          merge-multiple: true
+      - name: Install verified signed toolchain
+        run: |
+          python3 scripts/release/toolchain_publication.py install \
+            --producer "$RUNNER_TEMP/signed-toolchain-closure/producer" \
+            --manifest "$RUNNER_TEMP/signed-toolchain-closure/manifest.json" \
+            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --version "${{ inputs.version }}" \
+            --app-version "${{ inputs.app_version }}" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --install-root "$RUNNER_TEMP/signed-toolchain-root"
+      - name: Verify shipping host
+        run: ./scripts/benchmark/verify_shipping_host.sh
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/benchmark/requirements.txt
+      - name: Install protected benchmark dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/requirements.txt
+      - name: Download bound requests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.requests_artifact_id }}
+          path: ${{ runner.temp }}/requests
+      - name: Download bound renderer closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.renderer_artifact_id }}
+          path: ${{ runner.temp }}/renderer-package
+      - name: Download bound measurement runner closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.measurement_runner_artifact_id }}
+          path: ${{ runner.temp }}/measurement-runner
+          digest-mismatch: error
+      - name: Validate prepared measurement runner digest binding
+        env:
+          MEASUREMENT_RUNNER_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.measurement_runner_artifact_digest }}
+        run: |
+          grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$MEASUREMENT_RUNNER_ARTIFACT_DIGEST"
+          test "$MEASUREMENT_RUNNER_ARTIFACT_DIGEST" != "sha256:$(printf '0%.0s' {1..64})"
+      - name: Collect constrained measurements
+        env:
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_CONSTRAINED_CORPUS }}
+          BASELINE_TOOLCHAIN_ROOT: ${{ vars.EASYSPLAT_BENCHMARK_BASELINE_TOOLCHAIN_ROOT }}
+        run: |
+          test -n "$RELEASE_CORPUS" && test -f "$RELEASE_CORPUS"
+          TOOLCHAIN_ROOT="$RUNNER_TEMP/signed-toolchain-root"
+          test -d "$TOOLCHAIN_ROOT"
+          test -n "$BASELINE_TOOLCHAIN_ROOT" && test -d "$BASELINE_TOOLCHAIN_ROOT"
+          BASELINE_CHECKOUT="$RUNNER_TEMP/baseline-checkout"
+          rm -rf "$BASELINE_CHECKOUT"
+          BASELINE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseline_git_commit"])' "$RUNNER_TEMP/requests/index.json")"
+          git worktree add --detach "$BASELINE_CHECKOUT" "$BASELINE_COMMIT"
+          cleanup() {
+            git worktree remove --force "$BASELINE_CHECKOUT" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          chmod 0755 "$RUNNER_TEMP/renderer-package/closure/EasySplatBenchmarkDriver"
+          python3 scripts/benchmark/renderer_closure.py verify \
+            --closure "$RUNNER_TEMP/renderer-package/closure" \
+            --identity "$RUNNER_TEMP/renderer-package/identity.json"
+          chmod 0755 "$RUNNER_TEMP/measurement-runner/closure/EasySplatMeasurementRunner"
+          python3 scripts/benchmark/measurement_runner_closure.py verify \
+            --closure "$RUNNER_TEMP/measurement-runner/closure" \
+            --identity "$RUNNER_TEMP/measurement-runner/identity.json"
+          python3 scripts/benchmark/run_lane.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --corpus "$RELEASE_CORPUS" \
+            --reference-config scripts/benchmark/reference-config.json \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --baseline-checkout-root "$BASELINE_CHECKOUT" \
+            --baseline-toolchain-root "$BASELINE_TOOLCHAIN_ROOT" \
+            --output "$RUNNER_TEMP/constrained-evidence" \
+            --lane constrained_14_16gb \
+            --runner "$RUNNER_TEMP/measurement-runner/closure/EasySplatMeasurementRunner" \
+            --rendering-driver-closure "$RUNNER_TEMP/renderer-package/closure"
+      - name: Upload raw constrained measurements
+        id: upload-raw
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-constrained-raw-${{ github.sha }}
+          path: ${{ runner.temp }}/constrained-evidence
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  eight-gb:
+    needs: [prepare]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-8gb, easysplat-ephemeral]
+    environment: benchmark-release
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    timeout-minutes: 1440
+    outputs:
+      raw_artifact_id: ${{ steps.upload-raw.outputs.artifact-id }}
+      raw_artifact_digest: ${{ format('sha256:{0}', steps.upload-raw.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Download verified signed toolchain archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.signed_toolchain_artifact_id }}
+          path: ${{ runner.temp }}/signed-toolchain-closure
+          merge-multiple: true
+      - name: Install verified signed toolchain
+        run: |
+          python3 scripts/release/toolchain_publication.py install \
+            --producer "$RUNNER_TEMP/signed-toolchain-closure/producer" \
+            --manifest "$RUNNER_TEMP/signed-toolchain-closure/manifest.json" \
+            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --version "${{ inputs.version }}" \
+            --app-version "${{ inputs.app_version }}" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --install-root "$RUNNER_TEMP/signed-toolchain-root"
+      - name: Verify shipping host
+        run: ./scripts/benchmark/verify_shipping_host.sh
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/benchmark/requirements.txt
+      - name: Install protected benchmark dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/requirements.txt
+      - name: Download bound requests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.requests_artifact_id }}
+          path: ${{ runner.temp }}/requests
+      - name: Download bound renderer closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.renderer_artifact_id }}
+          path: ${{ runner.temp }}/renderer-package
+      - name: Download bound measurement runner closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.measurement_runner_artifact_id }}
+          path: ${{ runner.temp }}/measurement-runner
+          digest-mismatch: error
+      - name: Validate prepared measurement runner digest binding
+        env:
+          MEASUREMENT_RUNNER_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.measurement_runner_artifact_digest }}
+        run: |
+          grep -Eq '^sha256:[0-9a-f]{64}$' <<<"$MEASUREMENT_RUNNER_ARTIFACT_DIGEST"
+          test "$MEASUREMENT_RUNNER_ARTIFACT_DIGEST" != "sha256:$(printf '0%.0s' {1..64})"
+      - name: Collect physical 8 GB measurements
+        env:
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_8GB_CORPUS }}
+          BASELINE_TOOLCHAIN_ROOT: ${{ vars.EASYSPLAT_BENCHMARK_BASELINE_TOOLCHAIN_ROOT }}
+        run: |
+          test -n "$RELEASE_CORPUS" && test -f "$RELEASE_CORPUS"
+          TOOLCHAIN_ROOT="$RUNNER_TEMP/signed-toolchain-root"
+          test -d "$TOOLCHAIN_ROOT"
+          test -n "$BASELINE_TOOLCHAIN_ROOT" && test -d "$BASELINE_TOOLCHAIN_ROOT"
+          BASELINE_CHECKOUT="$RUNNER_TEMP/baseline-checkout"
+          rm -rf "$BASELINE_CHECKOUT"
+          BASELINE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["baseline_git_commit"])' "$RUNNER_TEMP/requests/index.json")"
+          git worktree add --detach "$BASELINE_CHECKOUT" "$BASELINE_COMMIT"
+          cleanup() {
+            git worktree remove --force "$BASELINE_CHECKOUT" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          chmod 0755 "$RUNNER_TEMP/renderer-package/closure/EasySplatBenchmarkDriver"
+          python3 scripts/benchmark/renderer_closure.py verify \
+            --closure "$RUNNER_TEMP/renderer-package/closure" \
+            --identity "$RUNNER_TEMP/renderer-package/identity.json"
+          chmod 0755 "$RUNNER_TEMP/measurement-runner/closure/EasySplatMeasurementRunner"
+          python3 scripts/benchmark/measurement_runner_closure.py verify \
+            --closure "$RUNNER_TEMP/measurement-runner/closure" \
+            --identity "$RUNNER_TEMP/measurement-runner/identity.json"
+          python3 scripts/benchmark/run_lane.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --corpus "$RELEASE_CORPUS" \
+            --reference-config scripts/benchmark/reference-config.json \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --baseline-checkout-root "$BASELINE_CHECKOUT" \
+            --baseline-toolchain-root "$BASELINE_TOOLCHAIN_ROOT" \
+            --output "$RUNNER_TEMP/eight-gb-evidence" \
+            --lane eight_gb_fast \
+            --runner "$RUNNER_TEMP/measurement-runner/closure/EasySplatMeasurementRunner" \
+            --rendering-driver-closure "$RUNNER_TEMP/renderer-package/closure"
+      - name: Upload raw physical 8 GB measurements
+        id: upload-raw
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-8gb-raw-${{ github.sha }}
+          path: ${{ runner.temp }}/eight-gb-evidence
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  derive-reference:
+    needs: [prepare, reference]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: macos-15
+    timeout-minutes: 240
+    outputs:
+      prepared_artifact_id: ${{ steps.upload-prepared.outputs.artifact-id }}
+      prepared_artifact_digest: ${{ format('sha256:{0}', steps.upload-prepared.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            scripts/benchmark/requirements.txt
+            scripts/benchmark/render-requirements.txt
+      - name: Install protected benchmark dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/requirements.txt
+      - name: Install protected render-scoring dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/render-requirements.txt
+      - name: Verify bound request, renderer, and raw artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTS_ID: ${{ needs.prepare.outputs.requests_artifact_id }}
+          REQUESTS_DIGEST: ${{ needs.prepare.outputs.requests_artifact_digest }}
+          RENDERER_ID: ${{ needs.prepare.outputs.renderer_artifact_id }}
+          RENDERER_DIGEST: ${{ needs.prepare.outputs.renderer_artifact_digest }}
+          RAW_ID: ${{ needs.reference.outputs.raw_artifact_id }}
+          RAW_DIGEST: ${{ needs.reference.outputs.raw_artifact_digest }}
+        run: |
+          for pair in \
+            "$REQUESTS_ID:$REQUESTS_DIGEST" \
+            "$RENDERER_ID:$RENDERER_DIGEST" \
+            "$RAW_ID:$RAW_DIGEST"; do
+            artifact_id="${pair%%:*}"
+            expected_digest="${pair#*:}"
+            actual_digest="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" --jq .digest)"
+            test -n "$artifact_id" && test "$actual_digest" = "$expected_digest"
+          done
+      - name: Download bound requests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.requests_artifact_id }}
+          path: ${{ runner.temp }}/requests
+      - name: Download bound renderer package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.renderer_artifact_id }}
+          path: ${{ runner.temp }}/renderer-package
+      - name: Download raw reference measurements
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.reference.outputs.raw_artifact_id }}
+          path: ${{ runner.temp }}/raw-reference
+      - name: Derive compact reference evidence
+        env:
+          EASYSPLAT_BENCHMARK_LPIPS_BACKBONE: ${{ runner.temp }}/renderer-package/scoring/squeezenet1_1-b8a52dc0.pth
+        run: |
+          test -f "$EASYSPLAT_BENCHMARK_LPIPS_BACKBONE" && test ! -L "$EASYSPLAT_BENCHMARK_LPIPS_BACKBONE"
+          test "$(shasum -a 256 "$EASYSPLAT_BENCHMARK_LPIPS_BACKBONE" | awk '{print $1}')" = "b8a52dc049b60e4b6ab68ad0df457362afab8b6304b2febdc1650a5dab4d7e7b"
+          python3 scripts/benchmark/prepare_evidence.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --raw-evidence-root "$RUNNER_TEMP/raw-reference" \
+            --output-root "$RUNNER_TEMP/prepared-reference" \
+            --lane reference_m4_max
+      - name: Upload compact reference evidence
+        id: upload-prepared
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-reference-prepared-${{ github.sha }}
+          path: ${{ runner.temp }}/prepared-reference
+          if-no-files-found: error
+          retention-days: 7
+
+  derive-constrained:
+    needs: [prepare, constrained]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: macos-15
+    timeout-minutes: 60
+    outputs:
+      prepared_artifact_id: ${{ steps.upload-prepared.outputs.artifact-id }}
+      prepared_artifact_digest: ${{ format('sha256:{0}', steps.upload-prepared.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/benchmark/requirements.txt
+      - name: Install protected benchmark dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/requirements.txt
+      - name: Verify bound request and raw artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTS_ID: ${{ needs.prepare.outputs.requests_artifact_id }}
+          REQUESTS_DIGEST: ${{ needs.prepare.outputs.requests_artifact_digest }}
+          RAW_ID: ${{ needs.constrained.outputs.raw_artifact_id }}
+          RAW_DIGEST: ${{ needs.constrained.outputs.raw_artifact_digest }}
+        run: |
+          for pair in "$REQUESTS_ID:$REQUESTS_DIGEST" "$RAW_ID:$RAW_DIGEST"; do
+            artifact_id="${pair%%:*}"
+            expected_digest="${pair#*:}"
+            actual_digest="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" --jq .digest)"
+            test -n "$artifact_id" && test "$actual_digest" = "$expected_digest"
+          done
+      - name: Download bound requests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.requests_artifact_id }}
+          path: ${{ runner.temp }}/requests
+      - name: Download raw constrained measurements
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.constrained.outputs.raw_artifact_id }}
+          path: ${{ runner.temp }}/raw-constrained
+      - name: Derive compact constrained evidence
+        run: |
+          python3 scripts/benchmark/prepare_evidence.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --raw-evidence-root "$RUNNER_TEMP/raw-constrained" \
+            --output-root "$RUNNER_TEMP/prepared-constrained" \
+            --lane constrained_14_16gb
+      - name: Upload compact constrained evidence
+        id: upload-prepared
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-constrained-prepared-${{ github.sha }}
+          path: ${{ runner.temp }}/prepared-constrained
+          if-no-files-found: error
+          retention-days: 7
+
+  derive-eight-gb:
+    needs: [prepare, eight-gb]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: macos-15
+    timeout-minutes: 60
+    outputs:
+      prepared_artifact_id: ${{ steps.upload-prepared.outputs.artifact-id }}
+      prepared_artifact_digest: ${{ format('sha256:{0}', steps.upload-prepared.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/benchmark/requirements.txt
+      - name: Install protected benchmark dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/requirements.txt
+      - name: Verify bound request and raw artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTS_ID: ${{ needs.prepare.outputs.requests_artifact_id }}
+          REQUESTS_DIGEST: ${{ needs.prepare.outputs.requests_artifact_digest }}
+          RAW_ID: ${{ needs.eight-gb.outputs.raw_artifact_id }}
+          RAW_DIGEST: ${{ needs.eight-gb.outputs.raw_artifact_digest }}
+        run: |
+          for pair in "$REQUESTS_ID:$REQUESTS_DIGEST" "$RAW_ID:$RAW_DIGEST"; do
+            artifact_id="${pair%%:*}"
+            expected_digest="${pair#*:}"
+            actual_digest="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" --jq .digest)"
+            test -n "$artifact_id" && test "$actual_digest" = "$expected_digest"
+          done
+      - name: Download bound requests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.requests_artifact_id }}
+          path: ${{ runner.temp }}/requests
+      - name: Download raw physical 8 GB measurements
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.eight-gb.outputs.raw_artifact_id }}
+          path: ${{ runner.temp }}/raw-eight-gb
+      - name: Derive compact physical 8 GB evidence
+        run: |
+          python3 scripts/benchmark/prepare_evidence.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --raw-evidence-root "$RUNNER_TEMP/raw-eight-gb" \
+            --output-root "$RUNNER_TEMP/prepared-eight-gb" \
+            --lane eight_gb_fast
+      - name: Upload compact physical 8 GB evidence
+        id: upload-prepared
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-8gb-prepared-${{ github.sha }}
+          path: ${{ runner.temp }}/prepared-eight-gb
+          if-no-files-found: error
+          retention-days: 7
+
+  aggregate:
+    needs: [derive-reference, derive-constrained, derive-eight-gb]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/benchmark/requirements.txt
+      - name: Install protected benchmark dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes \
+            --requirement scripts/benchmark/requirements.txt
+      - name: Verify prepared artifact identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REFERENCE_ID: ${{ needs.derive-reference.outputs.prepared_artifact_id }}
+          REFERENCE_DIGEST: ${{ needs.derive-reference.outputs.prepared_artifact_digest }}
+          CONSTRAINED_ID: ${{ needs.derive-constrained.outputs.prepared_artifact_id }}
+          CONSTRAINED_DIGEST: ${{ needs.derive-constrained.outputs.prepared_artifact_digest }}
+          EIGHT_GB_ID: ${{ needs.derive-eight-gb.outputs.prepared_artifact_id }}
+          EIGHT_GB_DIGEST: ${{ needs.derive-eight-gb.outputs.prepared_artifact_digest }}
+        run: |
+          for pair in \
+            "$REFERENCE_ID:$REFERENCE_DIGEST" \
+            "$CONSTRAINED_ID:$CONSTRAINED_DIGEST" \
+            "$EIGHT_GB_ID:$EIGHT_GB_DIGEST"; do
+            artifact_id="${pair%%:*}"
+            expected_digest="${pair#*:}"
+            test -n "$artifact_id" && test -n "$expected_digest"
+            actual_digest="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" --jq .digest)"
+            test "$actual_digest" = "$expected_digest"
+          done
+      - name: Download compact reference evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.derive-reference.outputs.prepared_artifact_id }}
+          path: ${{ runner.temp }}/prepared-reference
+      - name: Download compact constrained evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.derive-constrained.outputs.prepared_artifact_id }}
+          path: ${{ runner.temp }}/prepared-constrained
+      - name: Download compact physical 8 GB evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.derive-eight-gb.outputs.prepared_artifact_id }}
+          path: ${{ runner.temp }}/prepared-eight-gb
+      - name: Validate and aggregate prepared benchmark evidence
+        run: |
+          python3 scripts/benchmark/aggregate_evidence.py \
+            --prepared-root "$RUNNER_TEMP/prepared-reference" \
+            --prepared-root "$RUNNER_TEMP/prepared-constrained" \
+            --prepared-root "$RUNNER_TEMP/prepared-eight-gb" \
+            --output "$RUNNER_TEMP/verified-benchmark"
+          test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$RUNNER_TEMP/verified-benchmark/suite.json")" = "passed"
+          FINAL="$RUNNER_TEMP/final-benchmark"
+          rm -rf "$FINAL"
+          mkdir -p "$FINAL"
+          cp "$RUNNER_TEMP/verified-benchmark/suite.json" "$FINAL/verified-suite.json"
+          mkdir -p "$FINAL/evidence"
+          cp -R "$RUNNER_TEMP/prepared-reference" "$FINAL/evidence/reference_m4_max"
+          cp -R "$RUNNER_TEMP/prepared-constrained" "$FINAL/evidence/constrained_14_16gb"
+          cp -R "$RUNNER_TEMP/prepared-eight-gb" "$FINAL/evidence/eight_gb_fast"
+      - name: Upload verified benchmark closure
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-${{ github.sha }}
+          path: ${{ runner.temp }}/final-benchmark
+          if-no-files-found: error
+          retention-days: 90

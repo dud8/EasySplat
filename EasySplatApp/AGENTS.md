@@ -3,7 +3,7 @@
 SwiftUI front-end for EasySplat. `AppModel` is the single source of truth for UI state, pipeline progress, and toolchain installation status; views observe it.
 
 ## Key layout
-- `AppModel.swift`: state machine for the app (home/processing/viewer), kicks off `PipelineRunner`, manages toolchain download, builds project metadata.
+- `AppModel.swift`: state for the project library and workspace, pipeline lifecycle, toolchain preparation, and project metadata.
 - `EasySplatApp.swift`: app entry point and dependency wiring.
 - `Model/`: lightweight UI models (for example `ProjectSummary`).
 - `UI/`: SwiftUI screens and components (`Home`, `Project`, `Theme`, `Components`).
@@ -20,3 +20,4 @@ SwiftUI front-end for EasySplat. `AppModel` is the single source of truth for UI
 
 ## Tests
 - App-level tests live in `EasySplatAppTests/` at repo root.
+- Presentation and navigation contracts use deterministic app tests. Release automation never synthesizes global input or captures the user session.

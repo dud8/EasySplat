@@ -1,0 +1,5 @@
+cryptography==48.0.1
+jsonschema==4.26.0
+numpy==2.5.1
+Pillow==12.3.0
+referencing==0.37.0

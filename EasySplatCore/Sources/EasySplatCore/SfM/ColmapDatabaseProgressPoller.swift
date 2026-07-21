@@ -12,11 +12,11 @@ struct ColmapDatabaseProgressPoller: Sendable {
         self.databasePath = databasePath
     }
 
-    /// Returns the number of processed image pairs currently present in the database.
+    /// Returns the number of image pairs attempted by raw matching or verification.
     ///
-    /// COLMAP schema varies by command/path; we try multiple tables and return the first count
-    /// we can read. If the DB exists but tables aren't created yet, returns 0.
-    func readProcessedPairCount() throws -> Int {
+    /// When both tables exist, their pair-ID union prevents verification lag from making
+    /// progress move backward. If matching tables are not created yet, this returns zero.
+    func readAttemptedPairCount() throws -> Int {
         var db: OpaquePointer?
         defer { sqlite3_close(db) }
 
@@ -28,19 +28,25 @@ struct ColmapDatabaseProgressPoller: Sendable {
         }
         sqlite3_busy_timeout(db, 250)
 
-        if let count = queryCount(db: db, sql: "SELECT COUNT(*) FROM two_view_geometries;") {
+        if let count = queryCount(
+            db: db,
+            sql: "SELECT COUNT(*) FROM (SELECT pair_id FROM matches UNION SELECT pair_id FROM two_view_geometries);"
+        ) {
             return count
         }
         if let count = queryCount(db: db, sql: "SELECT COUNT(*) FROM matches;") {
+            return count
+        }
+        if let count = queryCount(db: db, sql: "SELECT COUNT(*) FROM two_view_geometries;") {
             return count
         }
         return 0
     }
 
     /// Actual per-image keypoint counts read back from the database after feature extraction.
-    /// This build's COLMAP silently ignores `--SiftExtraction.max_num_features`, so the count
-    /// is content-driven, not the requested cap — reading it back gives the true figure for the
-    /// log and lets us flag frames that extracted almost nothing (flat/low-texture/degenerate).
+    /// COLMAP applies `max_num_features` before assigning multiple feature orientations, so the
+    /// stored count may exceed the requested cap. Reading it back gives the true figure for the
+    /// log and flags frames that extracted almost nothing (flat/low-texture/degenerate).
     struct KeypointStats: Sendable, Equatable {
         var imageCount: Int
         var totalKeypoints: Int

@@ -1,11 +1,298 @@
 import XCTest
 @testable import EasySplatApp
+import EasySplatCore
 
-/// Covers the pure timing-caption logic extracted from ProcessingView. These assert real
-/// formatting behavior (clamping, rounding, sub-second silence, absent prediction) rather
-/// than pinning presentation copy.
 @MainActor
 final class ProcessingTimingTextTests: XCTestCase {
+    func testEveryPipelineStageMapsToOneOfFourUserPhases() {
+        let expected: [(PipelineStage, ProcessingPhase)] = [
+            (.importInput, .prepare),
+            (.extractFrames, .prepare),
+            (.selectFrames, .prepare),
+            (.sfmFeatures, .reconstruct),
+            (.sfmMatching, .reconstruct),
+            (.sfmMapping, .reconstruct),
+            (.trainSplat, .train),
+            (.exportSplat, .finish),
+            (.done, .finish)
+        ]
+
+        XCTAssertEqual(expected.count, PipelineStage.allCases.count)
+        for (stage, phase) in expected {
+            XCTAssertEqual(ProcessingPhase.forStage(stage), phase, "Unexpected phase for \(stage)")
+        }
+    }
+
+    func testPhaseHeadingsAreShortAndUserFacing() {
+        XCTAssertEqual(ProcessingPhase.prepare.heading, "Step 1 of 4 · Preparing input")
+        XCTAssertEqual(ProcessingPhase.reconstruct.heading, "Step 2 of 4 · Reconstructing scene")
+        XCTAssertEqual(ProcessingPhase.train.heading, "Step 3 of 4 · Training splat")
+        XCTAssertEqual(ProcessingPhase.finish.heading, "Step 4 of 4 · Finishing")
+    }
+
+    func testVisibleProgressNeverPresentsInternalStageFractionsAsPhaseProgress() {
+        XCTAssertNil(ProcessingView.phaseProgress(stage: .importInput, progress: 0.8))
+        XCTAssertNil(ProcessingView.phaseProgress(stage: .extractFrames, progress: 0.2))
+        XCTAssertNil(ProcessingView.phaseProgress(stage: .sfmFeatures, progress: 0.9))
+        XCTAssertNil(ProcessingView.phaseProgress(stage: .sfmMapping, progress: 0.1))
+        XCTAssertEqual(ProcessingView.phaseProgress(stage: .trainSplat, progress: 0.4), 0.4)
+        XCTAssertEqual(ProcessingView.phaseProgress(stage: .exportSplat, progress: 0.7), 0.7)
+        XCTAssertEqual(ProcessingView.phaseProgress(stage: .done, progress: 1), 1)
+    }
+
+    func testTryAgainSupportsDurableProjectsAndPreProjectSetupFailures() {
+        XCTAssertTrue(ProcessingView.canTryAgain(projectExists: true, pendingInputExists: false))
+        XCTAssertTrue(ProcessingView.canTryAgain(projectExists: false, pendingInputExists: true))
+        XCTAssertFalse(ProcessingView.canTryAgain(projectExists: false, pendingInputExists: false))
+    }
+
+    func testValidationFailuresPresentSpecificRecoveryActions() {
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useUnordered), "Use Unordered")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useFast), "Use Fast")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useFastForMemory), "Use Fast")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useBalanced), "Use Balanced")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useMoreTrainingMemory(123)), "Use More Memory")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: nil), "Try Again")
+    }
+
+    func testRasterMemoryRecoveryUsesMoreMemoryBeforeReducingDetail() {
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let automaticBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .automatic
+        )
+        let maximumBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .maximumPerformance
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: .automatic
+                ),
+                currentBudgetBytes: automaticBudget,
+                hardware: hardware
+            ),
+            .useMoreTrainingMemory(maximumBudget)
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: .maximumPerformance
+                ),
+                currentBudgetBytes: maximumBudget,
+                hardware: hardware
+            ),
+            .useFastForMemory
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .highDetail,
+                    resourcePolicy: .maximumPerformance
+                ),
+                currentBudgetBytes: maximumBudget,
+                hardware: hardware
+            ),
+            .useBalanced
+        )
+        XCTAssertNil(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    resourcePolicy: .maximumPerformance
+                ),
+                currentBudgetBytes: maximumBudget,
+                hardware: hardware
+            )
+        )
+    }
+
+    func testRasterResourceRecoveryReducesDetailWithoutOfferingMoreMemory() {
+        XCTAssertEqual(
+            AppModel.rasterResourceRecovery(
+                requestedOptions: RequestedRunOptions(detailProfile: .highDetail)
+            ),
+            .useBalanced
+        )
+        XCTAssertEqual(
+            AppModel.rasterResourceRecovery(
+                requestedOptions: RequestedRunOptions(detailProfile: .balanced)
+            ),
+            .useFastForMemory
+        )
+        XCTAssertNil(
+            AppModel.rasterResourceRecovery(
+                requestedOptions: RequestedRunOptions(detailProfile: .fast)
+            )
+        )
+    }
+
+    func testConstrainedRasterMemoryRecoveryRaisesOnlyTheTrainerBudgetFirst() {
+        let hardware = HardwareProfile(memoryGB: 16, cpuCount: 10, gpuWorkingSetGB: 12)
+        let conserveBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .conserveMemory
+        )
+        let automaticBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .automatic
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: .conserveMemory
+                ),
+                currentBudgetBytes: conserveBudget,
+                hardware: hardware
+            ),
+            .useMoreTrainingMemory(automaticBudget)
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: .automatic
+                ),
+                currentBudgetBytes: automaticBudget,
+                hardware: hardware
+            ),
+            .useFastForMemory
+        )
+    }
+
+    func testMoreMemoryRecoveryChangesOnlyTheTrainingContract() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let sourcePhotos = root.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let sourcePhoto = sourcePhotos.appendingPathComponent("source.png")
+        let photoBytes = try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+        try photoBytes.write(to: sourcePhoto, options: [.atomic])
+
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let requestedInput = InputSpec.photos(folder: sourcePhotos.path)
+        let options = RequestedRunOptions(
+            detailProfile: .balanced,
+            resourcePolicy: .automatic
+        )
+        let originalPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: requestedInput,
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let prepared = try await PhotoInputPreflight.prepare(
+            folder: sourcePhotos,
+            stagingParent: root,
+            photoSelection: originalPlan.photoSelection,
+            inputOrdering: originalPlan.inputOrdering,
+            keyframeBudget: originalPlan.keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: 0,
+            limits: .init(
+                maximumPhotoCount: 4,
+                maximumTotalBytes: Int64(4) * 1_024 * 1_024,
+                maximumSinglePhotoBytes: Int64(1_024) * 1_024,
+                maximumPixelCount: Int64(1_024) * 1_024,
+                maximumDecodedDimension: 128,
+                maximumTraversalEntryCount: 8,
+                maximumRecursionDepth: 2,
+                minimumFreeSpaceReserveBytes: 0
+            ),
+            progress: { _, _ in }
+        )
+        defer { prepared.discard() }
+        XCTAssertEqual(prepared.photos.count, 1)
+
+        let projectURL = root.appendingPathComponent("Retry.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        var adoption = ProjectInputAdoption(requestedInput: requestedInput)
+        try adoption.adoptPhotos(prepared, into: paths)
+        let input = adoption.input
+        let metadata = ProjectMetadata(
+            title: "Retry",
+            input: input,
+            photoInputReceipts: try XCTUnwrap(adoption.photoInputReceipts),
+            photoSelectionReceipt: try XCTUnwrap(adoption.photoSelectionReceipt),
+            requestedRunOptions: options,
+            resolvedRunPlan: originalPlan
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try PhotoInputReceiptValidator.validateFiles(metadata: metadata, paths: paths)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: root,
+            hardwareProfile: hardware
+        ) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+        let largerBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .maximumPerformance
+        )
+
+        XCTAssertTrue(model.applyValidationRecovery(
+            .useMoreTrainingMemory(largerBudget),
+            projectURL: projectURL
+        ))
+        let updated = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(updated.requestedRunOptions, options)
+        XCTAssertEqual(updated.resolvedRunPlan, originalPlan)
+        XCTAssertEqual(updated.trainingMemoryRetryBudgetBytes, largerBudget)
+
+        let retryPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: input,
+            hardware: hardware,
+            developmentOverrides: .none,
+            trainingMemoryRetryBudgetBytes: updated.trainingMemoryRetryBudgetBytes
+        )
+        var expectedPlan = originalPlan
+        expectedPlan.trainerMemoryBudgetBytes = largerBudget
+        XCTAssertEqual(retryPlan, expectedPlan)
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: input,
+                previousPlan: originalPlan,
+                currentPlan: retryPlan
+            ),
+            .sfmMapping,
+            "A training-only memory retry must reuse accepted geometry."
+        )
+    }
+
+    func testFailureMessageShowsOnlyTheTrimmedUserFacingError() {
+        XCTAssertEqual(
+            ProcessingView.failureMessage("  The capture could not be connected. Try again with more overlap.\n"),
+            "The capture could not be connected. Try again with more overlap."
+        )
+        XCTAssertEqual(
+            ProcessingView.failureMessage("   "),
+            "No error details were reported."
+        )
+        XCTAssertEqual(
+            ProcessingView.failureMessage(nil),
+            "No error details were reported."
+        )
+    }
+
     func testFormatElapsedClampsRoundsAndFormats() {
         XCTAssertEqual(ProcessingView.formatElapsed(0), "0m 00s")
         XCTAssertEqual(ProcessingView.formatElapsed(-5), "0m 00s", "Negative elapsed clamps to zero.")
@@ -15,34 +302,27 @@ final class ProcessingTimingTextTests: XCTestCase {
     }
 
     func testTimingTextIsNilWithoutElapsed() {
-        XCTAssertNil(ProcessingView.timingText(elapsed: nil, silenceSeconds: 5, stagePrediction: 10))
+        XCTAssertNil(ProcessingView.timingText(elapsed: nil, silenceSeconds: 5))
     }
 
     func testTimingTextElapsedOnly() {
         XCTAssertEqual(
-            ProcessingView.timingText(elapsed: 65, silenceSeconds: nil, stagePrediction: nil),
+            ProcessingView.timingText(elapsed: 65, silenceSeconds: nil),
             "Elapsed 1m 05s"
         )
     }
 
     func testTimingTextSubSecondSilenceReadsNow() {
         XCTAssertEqual(
-            ProcessingView.timingText(elapsed: 65, silenceSeconds: 0.4, stagePrediction: nil),
-            "Elapsed 1m 05s • Last update now"
+            ProcessingView.timingText(elapsed: 65, silenceSeconds: 0.4),
+            "Elapsed 1m 05s · Last update now"
         )
     }
 
     func testTimingTextSilenceAtLeastOneSecondReadsAgo() {
         XCTAssertEqual(
-            ProcessingView.timingText(elapsed: 65, silenceSeconds: 5, stagePrediction: nil),
-            "Elapsed 1m 05s • Last update 0m 05s ago"
-        )
-    }
-
-    func testTimingTextIncludesPredictionWhenPresent() {
-        XCTAssertEqual(
-            ProcessingView.timingText(elapsed: 65, silenceSeconds: nil, stagePrediction: 130),
-            "Elapsed 1m 05s • Typical 2m 10s"
+            ProcessingView.timingText(elapsed: 65, silenceSeconds: 5),
+            "Elapsed 1m 05s · Last update 0m 05s ago"
         )
     }
 }

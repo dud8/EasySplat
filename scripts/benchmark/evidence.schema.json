@@ -1,0 +1,1234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dud8/EasySplat/blob/main/scripts/benchmark/evidence.schema.json",
+  "title": "EasySplat protected benchmark attestation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "binding",
+    "baseline_run_configuration",
+    "candidate_run_configuration",
+    "category",
+    "capture_traits",
+    "holdout_indices",
+    "reference_artifacts",
+    "timing_basis",
+    "expected_outcome",
+    "input_kind",
+    "video_source_count",
+    "gate_scopes",
+    "rendering_driver_identity",
+    "scoring_runtime",
+    "lane",
+    "machine",
+    "producer",
+    "measurement_runner",
+    "commands",
+    "resolved_compute",
+    "actual",
+    "metrics",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": 13},
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "scene_id",
+        "scale",
+        "lane",
+        "input_digest",
+        "corpus_digest",
+        "thresholds_digest",
+        "git_commit",
+        "app_version",
+        "toolchain_identity",
+        "baseline_git_commit",
+        "baseline_toolchain_identity",
+        "baseline_configuration_digest",
+        "benchmark_contract_sha256"
+      ],
+      "properties": {
+        "profile": {"const": "release"},
+        "scene_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "scale": {"enum": [30, 120, 250, 500, 3000]},
+        "lane": {"enum": ["reference_m4_max", "constrained_14_16gb", "eight_gb_fast"]},
+        "input_digest": {"$ref": "#/$defs/sha256"},
+        "corpus_digest": {"$ref": "#/$defs/sha256"},
+        "thresholds_digest": {"$ref": "#/$defs/sha256"},
+        "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "app_version": {"const": "0.2.0"},
+        "toolchain_identity": {"$ref": "#/$defs/sha256"},
+        "baseline_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "baseline_toolchain_identity": {"$ref": "#/$defs/sha256"},
+        "baseline_configuration_digest": {"$ref": "#/$defs/sha256"},
+        "benchmark_contract_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "baseline_run_configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "detail_profile",
+        "selected_frame_count",
+        "geometry_route",
+        "feature_type",
+        "feature_max_image_size",
+        "feature_max_count",
+        "descriptor_matcher",
+        "maximum_match_count",
+        "matcher_threads",
+        "sequential_overlap",
+        "exhaustive_block_size",
+        "mapper",
+        "bundle_adjustment_max_iterations",
+        "ba_global_frames_ratio",
+        "ba_global_points_ratio",
+        "ba_global_max_refinements",
+        "ba_local_max_refinements",
+        "trainer",
+        "trainer_iterations",
+        "trainer_plateau_window",
+        "run_seed"
+      ],
+      "properties": {
+        "detail_profile": {"const": "balanced"},
+        "selected_frame_count": {"const": "request_scale"},
+        "geometry_route": {"const": "colmap"},
+        "feature_type": {"const": "sift"},
+        "feature_max_image_size": {"const": 1024},
+        "feature_max_count": {"const": 10000},
+        "descriptor_matcher": {"const": "exact_cpu_brute_force"},
+        "maximum_match_count": {"const": 10000},
+        "matcher_threads": {"const": 8},
+        "sequential_overlap": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["automatic", "orbit", "walkthrough", "large_area"],
+          "properties": {
+            "automatic": {"const": 8},
+            "orbit": {"const": 8},
+            "walkthrough": {"const": 8},
+            "large_area": {"const": 16}
+          }
+        },
+        "exhaustive_block_size": {"const": 25},
+        "mapper": {"const": "incremental"},
+        "bundle_adjustment_max_iterations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["automatic", "orbit", "walkthrough", "large_area"],
+          "properties": {
+            "automatic": {"const": 75},
+            "orbit": {"const": 75},
+            "walkthrough": {"const": 75},
+            "large_area": {"const": 94}
+          }
+        },
+        "ba_global_frames_ratio": {"const": 1.1},
+        "ba_global_points_ratio": {"const": 1.1},
+        "ba_global_max_refinements": {"const": 5},
+        "ba_local_max_refinements": {"const": 2},
+        "trainer": {"const": "native_msplat"},
+        "trainer_iterations": {"const": 7000},
+        "trainer_plateau_window": {"const": 800},
+        "run_seed": {"const": 42}
+      }
+    },
+    "candidate_run_configuration": {"$ref": "#/$defs/candidateRunConfiguration"},
+    "category": {
+      "enum": [
+        "object_orbit",
+        "interior_walkthrough",
+        "professional_photos",
+        "large_area_exterior",
+        "low_light",
+        "invalid"
+      ]
+    },
+    "capture_traits": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"}
+    },
+    "holdout_indices": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "reference_artifacts": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "selection_manifest_sha256",
+            "geometry_input_digest",
+            "selected_frames_digests",
+            "ground_truth_poses_sha256",
+            "accurate_colmap_model_sha256",
+            "accurate_rendering_reference_sha256",
+            "ground_truth_preparation_sha256",
+            "paired_baseline_rendering_reference_sha256",
+            "orientation_label_sha256",
+            "orientation_expected_status"
+          ],
+          "properties": {
+            "selection_manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "geometry_input_digest": {"$ref": "#/$defs/sha256"},
+            "selected_frames_digests": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["candidate", "fast_candidate"],
+              "properties": {
+                "candidate": {"$ref": "#/$defs/sha256"},
+                "fast_candidate": {"$ref": "#/$defs/sha256"}
+              }
+            },
+            "ground_truth_poses_sha256": {"$ref": "#/$defs/sha256"},
+            "accurate_colmap_model_sha256": {"$ref": "#/$defs/sha256"},
+            "accurate_rendering_reference_sha256": {"$ref": "#/$defs/sha256"},
+            "ground_truth_preparation_sha256": {"$ref": "#/$defs/sha256"},
+            "paired_baseline_rendering_reference_sha256": {"$ref": "#/$defs/sha256"},
+            "orientation_label_sha256": {"$ref": "#/$defs/sha256"},
+            "orientation_expected_status": {
+              "enum": ["verified", "axis_aligned_sign_unverified", "unresolved"]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {"status": {"const": "not_applicable"}}
+        }
+      ]
+    },
+    "timing_basis": {"const": "selected_view_count"},
+    "expected_outcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {"kind": {"const": "valid"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "failure_type"],
+          "properties": {
+            "kind": {"const": "invalid"},
+            "failure_type": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"}
+          }
+        }
+      ]
+    },
+    "input_kind": {"enum": ["video", "multi_video", "photos", "mixed"]},
+    "video_source_count": {"type": "integer", "minimum": 0},
+    "gate_scopes": {"$ref": "result.schema.json#/$defs/gateScopes"},
+    "rendering_driver_identity": {"$ref": "result.schema.json#/$defs/renderingDriver"},
+    "scoring_runtime": {"$ref": "result.schema.json#/$defs/renderScoringRuntime"},
+    "lane": {"enum": ["reference_m4_max", "constrained_14_16gb", "eight_gb_fast"]},
+    "machine": {"$ref": "result.schema.json#/$defs/machine"},
+    "producer": {"$ref": "result.schema.json#/$defs/producer"},
+    "measurement_runner": {"$ref": "result.schema.json#/$defs/measurementRunner"},
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run_id",
+          "phase",
+          "variant",
+          "argv",
+          "mapper_invocations",
+          "planned_mapper_cadence",
+          "accepted_mapper_cadence",
+          "cadence_fallback_trigger",
+          "runtime_worker_evidence",
+          "started_monotonic_seconds",
+          "ended_monotonic_seconds",
+          "process_cpu_microseconds",
+          "exit_code",
+          "checkout_commit",
+          "toolchain_identity",
+          "run_configuration_digest",
+          "executable_sha256",
+          "output_sha256",
+          "scene_id",
+          "input_digest",
+          "scale",
+          "lane",
+          "published_output"
+        ],
+        "properties": {
+          "run_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+          "phase": {"enum": ["candidate", "ordinary", "phase", "fast_profile", "invalid_input"]},
+          "variant": {"enum": ["candidate", "baseline", "fast_candidate", "accurate_reference"]},
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "mapper_invocations": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {"$ref": "#/$defs/referenceMapperInvocation"},
+                {"$ref": "#/$defs/candidateMapperInvocation"}
+              ]
+            }
+          },
+          "planned_mapper_cadence": {
+            "oneOf": [{"type": "null"}, {"$ref": "#/$defs/mapperCadence"}]
+          },
+          "accepted_mapper_cadence": {
+            "oneOf": [{"type": "null"}, {"$ref": "#/$defs/mapperCadence"}]
+          },
+          "cadence_fallback_trigger": {
+            "oneOf": [
+              {"type": "null"},
+              {"$ref": "#/$defs/mappingCadenceFallbackTrigger"}
+            ]
+          },
+          "runtime_worker_evidence": {
+            "oneOf": [
+              {"type": "null"},
+              {"$ref": "#/$defs/runtimeWorkerEvidence"}
+            ]
+          },
+          "started_monotonic_seconds": {"type": "number", "minimum": 0},
+          "ended_monotonic_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "process_cpu_microseconds": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["user", "system"],
+            "properties": {
+              "user": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+              "system": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+            }
+          },
+          "exit_code": {"type": "integer"},
+          "checkout_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+          "toolchain_identity": {"$ref": "#/$defs/sha256"},
+          "run_configuration_digest": {"$ref": "#/$defs/sha256"},
+          "executable_sha256": {"$ref": "#/$defs/sha256"},
+          "output_sha256": {"$ref": "#/$defs/sha256"},
+          "scene_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+          "input_digest": {"$ref": "#/$defs/sha256"},
+          "scale": {"enum": [30, 120, 250, 500, 3000]},
+          "lane": {"enum": ["reference_m4_max", "constrained_14_16gb", "eight_gb_fast"]},
+          "published_output": {"type": "boolean"}
+        }
+      }
+    },
+    "resolved_compute": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stages", "cpu_only_reasons"],
+          "properties": {
+            "stages": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["feature_extraction", "matching", "mapping", "training", "rendering"],
+              "properties": {
+                "feature_extraction": {"enum": ["cpu", "metal"]},
+                "matching": {"enum": ["cpu", "metal"]},
+                "mapping": {"enum": ["cpu", "metal"]},
+                "training": {"const": "metal"},
+                "rendering": {"const": "metal"}
+              }
+            },
+            "cpu_only_reasons": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "feature_extraction": {"const": "colmap_sift_has_no_supported_metal_backend"},
+                "matching": {"const": "faiss_metal_disabled_selected_indices_unsupported"},
+                "mapping": {"const": "ceres_has_no_supported_metal_backend"}
+              }
+            }
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"stages": {"properties": {"feature_extraction": {"const": "cpu"}}}}},
+              "then": {"properties": {"cpu_only_reasons": {"required": ["feature_extraction"]}}},
+              "else": {"properties": {"cpu_only_reasons": {"not": {"required": ["feature_extraction"]}}}}
+            },
+            {
+              "if": {"properties": {"stages": {"properties": {"matching": {"const": "cpu"}}}}},
+              "then": {"properties": {"cpu_only_reasons": {"required": ["matching"]}}},
+              "else": {"properties": {"cpu_only_reasons": {"not": {"required": ["matching"]}}}}
+            },
+            {
+              "if": {"properties": {"stages": {"properties": {"mapping": {"const": "cpu"}}}}},
+              "then": {"properties": {"cpu_only_reasons": {"required": ["mapping"]}}},
+              "else": {"properties": {"cpu_only_reasons": {"not": {"required": ["mapping"]}}}}
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {"status": {"const": "not_applicable"}}
+        }
+      ]
+    },
+    "actual": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exit_code", "termination_reason", "cancelled", "failure_type", "corrupt_ply"],
+      "properties": {
+        "exit_code": {"type": ["integer", "null"]},
+        "termination_reason": {"enum": ["exit", "signal", "cancelled", "not_available"]},
+        "cancelled": {"type": "boolean"},
+        "failure_type": {"type": ["string", "null"]},
+        "corrupt_ply": {"type": ["boolean", "null"]}
+      }
+    },
+    "photo_permutation": {"$ref": "#/$defs/photoPermutationEvidence"},
+    "photo_permutation_execution_receipt": {
+      "$ref": "#/$defs/photoPermutationExecutionReceipt"
+    },
+    "photo_permutation_source_authorization": {
+      "$ref": "#/$defs/photoPermutationSourceAuthorization"
+    },
+    "photo_permutation_supervisor_provenance": {
+      "$ref": "#/$defs/photoPermutationSupervisorProvenance"
+    },
+    "metrics": {"$ref": "result.schema.json#/$defs/metrics"},
+    "artifacts": {
+      "type": "object",
+      "minProperties": 4,
+      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "bytes"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"$ref": "#/$defs/sha256"},
+          "bytes": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  },
+  "dependentRequired": {
+    "photo_permutation": [
+      "photo_permutation_execution_receipt",
+      "photo_permutation_source_authorization",
+      "photo_permutation_supervisor_provenance"
+    ],
+    "photo_permutation_execution_receipt": [
+      "photo_permutation",
+      "photo_permutation_source_authorization",
+      "photo_permutation_supervisor_provenance"
+    ],
+    "photo_permutation_source_authorization": [
+      "photo_permutation",
+      "photo_permutation_execution_receipt",
+      "photo_permutation_supervisor_provenance"
+    ],
+    "photo_permutation_supervisor_provenance": [
+      "photo_permutation",
+      "photo_permutation_execution_receipt",
+      "photo_permutation_source_authorization"
+    ]
+  },
+  "allOf": [
+    {
+      "if": {"required": ["photo_permutation"]},
+      "then": {
+        "properties": {
+          "artifacts": {
+            "required": [
+              "photo_permutation_execution_receipt",
+              "photo_permutation_attestation_bundle",
+              "photo_permutation_source_authorization",
+              "photo_permutation_source_authorization_attestation_bundle"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "expected_outcome": {
+            "properties": {"kind": {"const": "valid"}},
+            "required": ["kind"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "category": {"not": {"const": "invalid"}},
+          "gate_scopes": {"not": {"contains": {"const": "invalid_input"}}},
+          "holdout_indices": {"minItems": 1},
+          "reference_artifacts": {"required": ["selection_manifest_sha256"]},
+          "resolved_compute": {"required": ["stages"]},
+          "actual": {
+            "properties": {
+              "exit_code": {"const": 0},
+              "termination_reason": {"const": "exit"},
+              "cancelled": {"const": false},
+              "failure_type": {"type": "null"},
+              "corrupt_ply": {"const": false}
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "category": {"const": "invalid"},
+          "gate_scopes": {"const": ["invalid_input"]},
+          "holdout_indices": {"maxItems": 0},
+          "reference_artifacts": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {"status": {"const": "not_applicable"}}
+          },
+          "resolved_compute": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {"status": {"const": "not_applicable"}}
+          },
+          "actual": {
+            "properties": {
+              "exit_code": {"type": "integer", "not": {"const": 0}},
+              "termination_reason": {"const": "exit"},
+              "cancelled": {"const": false},
+              "failure_type": {"type": "string"},
+              "corrupt_ply": {"const": false}
+            }
+          },
+          "artifacts": {"not": {"required": ["output_ply"]}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"lane": {"const": "reference_m4_max"}},
+        "required": ["lane"]
+      },
+      "then": {
+        "properties": {
+          "candidate_run_configuration": {
+            "properties": {
+              "feature_extraction_workers": {"const": 12},
+              "coupled_matching_workers": {"const": 8},
+              "vocabulary_retrieval_workers": {"const": 8}
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "candidate_run_configuration": {
+            "properties": {
+              "feature_extraction_workers": {"const": 4},
+              "coupled_matching_workers": {"const": 4},
+              "vocabulary_retrieval_workers": {"const": 4}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"input_kind": {"const": "photos"}},
+        "required": ["input_kind"]
+      },
+      "then": {
+        "properties": {
+          "video_source_count": {"const": 0},
+          "candidate_run_configuration": {
+            "properties": {"maximum_concurrent_video_source_analysis_tasks": {"const": 1}}
+          }
+        }
+      },
+      "else": {
+        "if": {
+          "properties": {"lane": {"const": "reference_m4_max"}},
+          "required": ["lane"]
+        },
+        "then": {
+          "properties": {
+            "candidate_run_configuration": {
+              "properties": {"maximum_concurrent_video_source_analysis_tasks": {"const": 4}}
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "candidate_run_configuration": {
+              "properties": {"maximum_concurrent_video_source_analysis_tasks": {"const": 2}}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"input_kind": {"const": "video"}},
+        "required": ["input_kind"]
+      },
+      "then": {"properties": {"video_source_count": {"const": 1}}}
+    },
+    {
+      "if": {
+        "properties": {"input_kind": {"const": "multi_video"}},
+        "required": ["input_kind"]
+      },
+      "then": {"properties": {"video_source_count": {"minimum": 2}}}
+    },
+    {
+      "if": {
+        "properties": {"input_kind": {"const": "mixed"}},
+        "required": ["input_kind"]
+      },
+      "then": {"properties": {"video_source_count": {"minimum": 1}}}
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "opaqueSha256": {
+      "type": "string",
+      "pattern": "^opaque-sha256:[0-9a-f]{64}$"
+    },
+    "photoPermutationEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "mode",
+        "expected_variant_count",
+        "closure_claims",
+        "variants",
+        "execution_provenance"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "mode": {"enum": ["release", "development"]},
+        "expected_variant_count": {"type": "integer", "minimum": 2, "maximum": 100},
+        "closure_claims": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "contains": {"const": "order_mechanics"},
+          "items": {
+            "enum": ["order_mechanics", "professional_photo", "raw_camera_metadata"]
+          }
+        },
+        "variants": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 100,
+          "items": {"$ref": "#/$defs/photoPermutationVariant"}
+        },
+        "execution_provenance": {
+          "$ref": "#/$defs/photoPermutationExecutionProvenance"
+        }
+      }
+    },
+    "photoPermutationExecutionProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "group_contract_sha256",
+        "request_binding_sha256",
+        "source_authorization_sha256",
+        "source_kind",
+        "source_provenance_commitment",
+        "trust_boundary",
+        "producer_implementation_sha256",
+        "adapter_sha256",
+        "toolchain_closure_sha256",
+        "variant_schedule_sha256",
+        "variant_receipts_sha256",
+        "execution_receipt_sha256"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "group_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "request_binding_sha256": {"$ref": "#/$defs/sha256"},
+        "source_authorization_sha256": {"$ref": "#/$defs/sha256"},
+        "source_kind": {
+          "enum": [
+            "native_photos",
+            "single_video_derived_stills",
+            "multi_video_derived_stills",
+            "mixed_derived_stills",
+            "calibration_dataset_derived_stills"
+          ]
+        },
+        "source_provenance_commitment": {"$ref": "#/$defs/opaqueSha256"},
+        "trust_boundary": {
+          "const": "requires_github_artifact_attestation"
+        },
+        "producer_implementation_sha256": {"$ref": "#/$defs/sha256"},
+        "adapter_sha256": {"$ref": "#/$defs/sha256"},
+        "toolchain_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "variant_schedule_sha256": {"$ref": "#/$defs/sha256"},
+        "variant_receipts_sha256": {"$ref": "#/$defs/sha256"},
+        "execution_receipt_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "photoPermutationExecutionReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "group_contract_sha256",
+        "request_binding_sha256",
+        "source_authorization_sha256",
+        "source_kind",
+        "source_provenance_commitment",
+        "trust_boundary",
+        "producer_implementation_sha256",
+        "adapter_sha256",
+        "toolchain_closure_sha256",
+        "variant_schedule_sha256",
+        "variant_receipts",
+        "variant_receipts_sha256",
+        "group_payload_sha256"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "kind": {
+          "const": "easysplat-photo-permutation-execution-receipt"
+        },
+        "group_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "request_binding_sha256": {"$ref": "#/$defs/sha256"},
+        "source_authorization_sha256": {"$ref": "#/$defs/sha256"},
+        "source_kind": {
+          "enum": [
+            "native_photos",
+            "single_video_derived_stills",
+            "multi_video_derived_stills",
+            "mixed_derived_stills",
+            "calibration_dataset_derived_stills"
+          ]
+        },
+        "source_provenance_commitment": {"$ref": "#/$defs/opaqueSha256"},
+        "trust_boundary": {
+          "const": "requires_github_artifact_attestation"
+        },
+        "producer_implementation_sha256": {"$ref": "#/$defs/sha256"},
+        "adapter_sha256": {"$ref": "#/$defs/sha256"},
+        "toolchain_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "variant_schedule_sha256": {"$ref": "#/$defs/sha256"},
+        "variant_receipts": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["variant_id", "public_variant_sha256", "receipt_sha256"],
+            "properties": {
+              "variant_id": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"
+              },
+              "public_variant_sha256": {"$ref": "#/$defs/sha256"},
+              "receipt_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        },
+        "variant_receipts_sha256": {"$ref": "#/$defs/sha256"},
+        "group_payload_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "photoPermutationSupervisorProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "repository",
+        "signer_workflow",
+        "source_commit",
+        "source_ref",
+        "subject_sha256",
+        "bundle_sha256",
+        "verified_attestation_count",
+        "source_authorization_subject_sha256",
+        "source_authorization_bundle_sha256",
+        "verified_source_authorization_attestation_count"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "status": {"const": "verified"},
+        "repository": {"const": "dud8/EasySplat"},
+        "signer_workflow": {
+          "const": "dud8/EasySplat/.github/workflows/benchmark-release.yml"
+        },
+        "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source_ref": {"const": "refs/heads/main"},
+        "subject_sha256": {"$ref": "#/$defs/sha256"},
+        "bundle_sha256": {"$ref": "#/$defs/sha256"},
+        "verified_attestation_count": {"type": "integer", "minimum": 1},
+        "source_authorization_subject_sha256": {"$ref": "#/$defs/sha256"},
+        "source_authorization_bundle_sha256": {"$ref": "#/$defs/sha256"},
+        "verified_source_authorization_attestation_count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "photoPermutationSourceAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "request_binding_sha256",
+        "source_kind",
+        "source_manifest_sha256",
+        "source_content_set_sha256",
+        "origin_evidence_sha256",
+        "adapter_sha256",
+        "toolchain_closure_sha256",
+        "containment_supervisor_sha256",
+        "containment_policy_sha256",
+        "dedicated_uid",
+        "gh_verifier_sha256",
+        "source_commit",
+        "source_ref"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "kind": {
+          "const": "easysplat-photo-permutation-source-authorization"
+        },
+        "request_binding_sha256": {"$ref": "#/$defs/sha256"},
+        "source_kind": {
+          "enum": [
+            "native_photos",
+            "single_video_derived_stills",
+            "multi_video_derived_stills",
+            "mixed_derived_stills",
+            "calibration_dataset_derived_stills"
+          ]
+        },
+        "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "source_content_set_sha256": {"$ref": "#/$defs/sha256"},
+        "origin_evidence_sha256": {"$ref": "#/$defs/sha256"},
+        "adapter_sha256": {"$ref": "#/$defs/sha256"},
+        "toolchain_closure_sha256": {"$ref": "#/$defs/sha256"},
+        "containment_supervisor_sha256": {"$ref": "#/$defs/sha256"},
+        "containment_policy_sha256": {"$ref": "#/$defs/sha256"},
+        "dedicated_uid": {"type": "integer", "minimum": 1},
+        "gh_verifier_sha256": {"$ref": "#/$defs/sha256"},
+        "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "source_ref": {"const": "refs/heads/main"}
+      }
+    },
+    "photoPermutationVariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "group_id",
+        "variant_id",
+        "permutation",
+        "order_commitment",
+        "content_set_attestation",
+        "canonical_observation_attestation",
+        "source_kind",
+        "selected_content_ids",
+        "registered_content_ids",
+        "selected_content_set_sha256",
+        "registered_content_set_sha256",
+        "normalized_pair_graph_sha256",
+        "normalized_pair_edges",
+        "requested_plan_sha256",
+        "scale",
+        "run_seed",
+        "pairing_policy",
+        "accepted_attempt",
+        "scheduled_pair_count",
+        "scheduled_pair_graph_sha256",
+        "attempted_pair_count",
+        "attempted_pair_graph_sha256",
+        "raw_matched_pair_count",
+        "raw_matched_pair_graph_sha256",
+        "spatially_verified_pair_count",
+        "retrieval_worker_executed",
+        "pair_counts",
+        "registered_views",
+        "point_count",
+        "observation_count",
+        "residual_median_pixels",
+        "residual_p90_pixels",
+        "camera_center_p95_scene_radius_fraction",
+        "rotation_p95_degrees"
+      ],
+      "properties": {
+        "group_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "variant_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "permutation": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind"],
+              "properties": {"kind": {"const": "canonical"}}
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "index", "seed"],
+              "properties": {
+                "kind": {"const": "shuffled"},
+                "index": {"type": "integer", "minimum": 1},
+                "seed": {"type": "integer", "minimum": 0}
+              }
+            }
+          ]
+        },
+        "order_commitment": {"$ref": "#/$defs/opaqueSha256"},
+        "content_set_attestation": {"$ref": "#/$defs/opaqueSha256"},
+        "canonical_observation_attestation": {
+          "$ref": "#/$defs/opaqueSha256"
+        },
+        "source_kind": {
+          "enum": [
+            "native_photos",
+            "single_video_derived_stills",
+            "multi_video_derived_stills",
+            "mixed_derived_stills",
+            "calibration_dataset_derived_stills"
+          ]
+        },
+        "selected_content_ids": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 3000,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/opaqueSha256"}
+        },
+        "registered_content_ids": {
+          "type": "array",
+          "maxItems": 3000,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/opaqueSha256"}
+        },
+        "selected_content_set_sha256": {"$ref": "#/$defs/opaqueSha256"},
+        "registered_content_set_sha256": {"$ref": "#/$defs/opaqueSha256"},
+        "normalized_pair_graph_sha256": {"$ref": "#/$defs/opaqueSha256"},
+        "normalized_pair_edges": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/photoPermutationPairEdge"}
+        },
+        "requested_plan_sha256": {"$ref": "#/$defs/sha256"},
+        "scale": {"type": "integer", "minimum": 2},
+        "run_seed": {"type": "integer", "minimum": 0},
+        "pairing_policy": {"enum": ["unordered_exhaustive", "unordered_retrieval"]},
+        "accepted_attempt": {
+          "enum": ["exhaustive_primary", "vocabulary_retrieval", "exhaustive_recovery"]
+        },
+        "scheduled_pair_count": {"type": "integer", "minimum": 1},
+        "scheduled_pair_graph_sha256": {"$ref": "#/$defs/opaqueSha256"},
+        "attempted_pair_count": {"type": "integer", "minimum": 1},
+        "attempted_pair_graph_sha256": {"$ref": "#/$defs/opaqueSha256"},
+        "raw_matched_pair_count": {"type": "integer", "minimum": 1},
+        "raw_matched_pair_graph_sha256": {"$ref": "#/$defs/opaqueSha256"},
+        "spatially_verified_pair_count": {"type": "integer", "minimum": 1},
+        "retrieval_worker_executed": {"type": "boolean"},
+        "pair_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "temporal",
+            "vocabulary_retrieval",
+            "loop_revisit",
+            "exhaustive_primary",
+            "exhaustive_recovery"
+          ],
+          "properties": {
+            "temporal": {"type": "integer", "minimum": 0},
+            "vocabulary_retrieval": {"type": "integer", "minimum": 0},
+            "loop_revisit": {"type": "integer", "minimum": 0},
+            "exhaustive_primary": {"type": "integer", "minimum": 0},
+            "exhaustive_recovery": {"type": "integer", "minimum": 0}
+          }
+        },
+        "registered_views": {"type": "integer", "minimum": 0},
+        "point_count": {"type": "integer", "minimum": 1},
+        "observation_count": {"type": "integer", "minimum": 1},
+        "residual_median_pixels": {"type": "number", "minimum": 0},
+        "residual_p90_pixels": {"type": "number", "minimum": 0},
+        "camera_center_p95_scene_radius_fraction": {"type": "number", "minimum": 0},
+        "rotation_p95_degrees": {"type": "number", "minimum": 0}
+      }
+    },
+    "photoPermutationPairEdge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_a", "content_b", "edge_id"],
+      "properties": {
+        "content_a": {"$ref": "#/$defs/opaqueSha256"},
+        "content_b": {"$ref": "#/$defs/opaqueSha256"},
+        "edge_id": {"$ref": "#/$defs/opaqueSha256"}
+      }
+    },
+    "mappingCadenceFallbackTrigger": {
+      "enum": [
+        "insufficientViewSupport",
+        "collapsedCameraTrajectory",
+        "insufficientParallax",
+        "degeneratePointDistribution",
+        "lowReconstructionQuality",
+        "fragmentedReconstruction",
+        "lowRegisteredViewCoverage",
+        "sparseResidualCoverage",
+        "excessiveResiduals"
+      ]
+    },
+    "mapperCadence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "localMaxRefinements",
+        "globalFramesRatio",
+        "globalPointsRatio",
+        "globalMaxRefinements",
+        "localMaxNumIterations",
+        "localFunctionTolerance",
+        "globalFunctionTolerance",
+        "localImageCount"
+      ],
+      "properties": {
+        "localMaxRefinements": {"type": "integer", "minimum": 1},
+        "globalFramesRatio": {"type": "number", "exclusiveMinimum": 1},
+        "globalPointsRatio": {"type": "number", "exclusiveMinimum": 1},
+        "globalMaxRefinements": {"type": "integer", "minimum": 1},
+        "localMaxNumIterations": {"type": "integer", "minimum": 1},
+        "localFunctionTolerance": {"type": "number", "exclusiveMinimum": 0},
+        "globalFunctionTolerance": {"type": "number", "exclusiveMinimum": 0},
+        "localImageCount": {"type": "integer", "minimum": 1}
+      }
+    },
+    "mapperArgv": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "referenceMapperInvocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "outcome",
+        "mapping_attempt_ordinal",
+        "matching_attempt",
+        "pair_list_digest",
+        "descriptor_matcher"
+      ],
+      "properties": {
+        "argv": {"$ref": "#/$defs/mapperArgv"},
+        "outcome": {"const": "accepted"},
+        "mapping_attempt_ordinal": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "matching_attempt": {"type": "integer", "minimum": 1},
+        "pair_list_digest": {"$ref": "#/$defs/sha256"},
+        "descriptor_matcher": {"const": "exact"}
+      }
+    },
+    "candidateMapperInvocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "mapping_attempt_ordinal",
+        "incremental_cadence",
+        "global_max_num_iterations",
+        "random_seed",
+        "refine_focal_length",
+        "minimum_pair_inlier_count",
+        "pair_graph_attempt_ordinal",
+        "pair_list_digest",
+        "descriptor_matcher",
+        "matching_database_digest",
+        "evaluation"
+      ],
+      "properties": {
+        "argv": {"$ref": "#/$defs/mapperArgv"},
+        "mapping_attempt_ordinal": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "incremental_cadence": {"$ref": "#/$defs/mapperCadence"},
+        "global_max_num_iterations": {"type": "integer", "minimum": 1},
+        "random_seed": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+        "refine_focal_length": {"const": true},
+        "minimum_pair_inlier_count": {"type": "integer", "minimum": 1},
+        "pair_graph_attempt_ordinal": {"type": "integer", "minimum": 1},
+        "pair_list_digest": {"$ref": "#/$defs/sha256"},
+        "descriptor_matcher": {"enum": ["faiss", "exact"]},
+        "matching_database_digest": {"$ref": "#/$defs/sha256"},
+        "evaluation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "fallback_trigger"],
+          "properties": {
+            "status": {"enum": ["accepted", "rejected", "interrupted", "failed"]},
+            "fallback_trigger": {
+              "oneOf": [
+                {"type": "null"},
+                {"$ref": "#/$defs/mappingCadenceFallbackTrigger"}
+              ]
+            }
+          }
+        }
+      }
+    },
+    "runtimeWorkerEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_name",
+        "artifact_sha256",
+        "geometry_manifest_name",
+        "geometry_manifest_sha256",
+        "canonical_cameras_name",
+        "canonical_cameras_sha256",
+        "geometry_input_digest",
+        "selected_frames_digest"
+      ],
+      "properties": {
+        "artifact_name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "geometry_manifest_name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "geometry_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "canonical_cameras_name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "canonical_cameras_sha256": {"$ref": "#/$defs/sha256"},
+        "geometry_input_digest": {"$ref": "#/$defs/sha256"},
+        "selected_frames_digest": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "candidateRunConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "detail_profile",
+        "selected_frame_count",
+        "capture_path",
+        "input_topology",
+        "camera_grouping",
+        "lens_projection",
+        "resource_policy",
+        "compute_policy",
+        "pairing_policy",
+        "temporal_pairing",
+        "temporal_offsets",
+        "vocabulary_candidate_count",
+        "vocabulary_returned_neighbor_count",
+        "vocabulary_query_stride",
+        "descriptor_matcher",
+        "ba_global_frames_ratio",
+        "ba_global_points_ratio",
+        "ba_global_max_refinements",
+        "ba_local_max_refinements",
+        "ba_local_max_num_iterations",
+        "ba_local_function_tolerance",
+        "ba_global_function_tolerance",
+        "ba_local_num_images",
+        "trainer_iterations",
+        "trainer_plateau_window",
+        "feature_extraction_workers",
+        "coupled_matching_workers",
+        "vocabulary_retrieval_workers",
+        "maximum_concurrent_video_source_analysis_tasks",
+        "run_seed"
+      ],
+      "properties": {
+        "detail_profile": {"enum": ["fast", "balanced"]},
+        "selected_frame_count": {"enum": [30, 120, 250, 500, 3000]},
+        "capture_path": {"enum": ["automatic", "around_subject", "through_space", "large_area"]},
+        "input_topology": {"enum": ["continuous", "segmented_mixed", "unordered"]},
+        "camera_grouping": {"enum": ["automatic", "same_camera_and_lens"]},
+        "lens_projection": {"enum": ["automatic", "fisheye"]},
+        "resource_policy": {"enum": ["automatic", "conserve_memory"]},
+        "compute_policy": {"const": "metal_for_supported_stages"},
+        "pairing_policy": {
+          "enum": [
+            "generic_continuous",
+            "object_orbit",
+            "walkthrough",
+            "large_area",
+            "segmented_mixed",
+            "unordered_exhaustive",
+            "unordered_retrieval"
+          ]
+        },
+        "temporal_pairing": {"enum": ["none", "linear", "multiscale"]},
+        "temporal_offsets": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1, "maximum": 128}
+        },
+        "vocabulary_candidate_count": {"type": "integer", "minimum": 0},
+        "vocabulary_returned_neighbor_count": {"type": "integer", "minimum": 0},
+        "vocabulary_query_stride": {"type": "integer", "minimum": 1},
+        "descriptor_matcher": {"const": "faiss"},
+        "ba_global_frames_ratio": {"enum": [1.4, 4.0]},
+        "ba_global_points_ratio": {"enum": [1.4, 4.0]},
+        "ba_global_max_refinements": {"const": 5},
+        "ba_local_max_refinements": {"type": "integer", "minimum": 1},
+        "ba_local_max_num_iterations": {"const": 10},
+        "ba_local_function_tolerance": {"const": 0.001},
+        "ba_global_function_tolerance": {"const": 0.000001},
+        "ba_local_num_images": {"const": 6},
+        "trainer_iterations": {"enum": [3000, 7000]},
+        "trainer_plateau_window": {"enum": [400, 800]},
+        "feature_extraction_workers": {"type": "integer", "minimum": 1, "maximum": 64},
+        "coupled_matching_workers": {"type": "integer", "minimum": 1, "maximum": 64},
+        "vocabulary_retrieval_workers": {"type": "integer", "minimum": 1, "maximum": 64},
+        "maximum_concurrent_video_source_analysis_tasks": {"type": "integer", "minimum": 1, "maximum": 64},
+        "run_seed": {"const": 42}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"input_topology": {"const": "continuous"}},
+            "required": ["input_topology"]
+          },
+          "then": {
+            "properties": {
+              "ba_global_frames_ratio": {"const": 4.0},
+              "ba_global_points_ratio": {"const": 4.0},
+              "ba_local_max_refinements": {"const": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "input_topology": {"enum": ["segmented_mixed", "unordered"]}
+            },
+            "required": ["input_topology"]
+          },
+          "then": {
+            "properties": {
+              "ba_global_frames_ratio": {"const": 1.4},
+              "ba_global_points_ratio": {"const": 1.4},
+              "ba_local_max_refinements": {"const": 2}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

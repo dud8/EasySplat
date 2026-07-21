@@ -1,209 +1,270 @@
-import SwiftUI
 import AppKit
-import Foundation
-import Combine
 import EasySplatCore
+import Foundation
+import SwiftUI
+
+enum ProcessingPhase: Int, Equatable {
+    case prepare = 1
+    case reconstruct
+    case train
+    case finish
+
+    var phrase: String {
+        switch self {
+        case .prepare: return "Preparing input"
+        case .reconstruct: return "Reconstructing scene"
+        case .train: return "Training splat"
+        case .finish: return "Finishing"
+        }
+    }
+
+    var heading: String {
+        "Step \(rawValue) of 4 · \(phrase)"
+    }
+
+    static func forStage(_ stage: PipelineStage) -> ProcessingPhase {
+        switch stage {
+        case .importInput, .extractFrames, .selectFrames:
+            return .prepare
+        case .sfmFeatures, .sfmMatching, .sfmMapping:
+            return .reconstruct
+        case .trainSplat:
+            return .train
+        case .exportSplat, .done:
+            return .finish
+        }
+    }
+}
 
 struct ProcessingView: View {
+    let onBackToProjects: () -> Void
+
     @EnvironmentObject private var model: AppModel
-    @State private var showReturnConfirm = false
+    @State private var isTechnicalDetailsExpanded = false
+    @State private var showStopConfirmation = false
+
+    private var phase: ProcessingPhase {
+        model.stage.map(ProcessingPhase.forStage) ?? .prepare
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Text("Building your 3D memory")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                Text(phase.heading)
                     .font(.title2.weight(.semibold))
-                    .layoutPriority(2)
                     .accessibilityAddTraits(.isHeader)
-                if let preset = model.currentPreset, let input = model.currentInput {
-                    RunConfigSummaryView(preset: preset, input: input)
-                        .controlSize(.small)
-                        .frame(maxWidth: 380, alignment: .leading)
+                    .accessibilityIdentifier("processing.phase")
+
+                if model.lastError != nil {
+                    failureContent
+                } else {
+                    progressContent
                 }
-                Spacer(minLength: 0)
+
+                technicalDetails
             }
-
-            GeometryReader { geometry in
-                let availableHeight = geometry.size.height
-                let previewHeight = min(420, max(260, availableHeight * 0.38))
-                let detailsHeight = min(320, max(180, availableHeight * 0.26))
-
-                HStack(alignment: .top, spacing: 24) {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text(model.statusTitle)
-                                .font(.headline)
-                            if let detail = model.statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                Text(summaryDetail(detail))
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                            }
-                            TimelineView(.periodic(from: .now, by: 1.0)) { context in
-                                if let timingText = timingText(now: context.date) {
-                                    Text(timingText)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            if model.isTrainingStageActive {
-                                Text(model.isBrushSnapshotTrainingActive
-                                     ? "Training in progress. Closing now exports a snapshot only; resuming restarts from scratch."
-                                     : "Training in progress. Resuming later starts training over.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            ShimmeringProgressView(progress: model.progress)
-                            if model.isBrushSnapshotTrainingActive {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Toggle("Show live preview", isOn: $model.isLivePreviewEnabled)
-                                        .toggleStyle(.checkbox)
-                                        .disabled(model.isStopping)
-                                    Text("May slow training. Updates every few minutes.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    if model.isLivePreviewEnabled, let snapshotURL = model.trainingSnapshotURL {
-                                        TrainingLivePreviewView(
-                                            snapshotURL: snapshotURL,
-                                            preferredHeight: previewHeight,
-                                            trainingProgressFraction: model.progress
-                                        )
-                                    }
-                                }
-                            }
-                            if model.isStopping {
-                                HStack(spacing: 10) {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                    Text(stoppingStatusText)
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            if let error = model.lastError {
-                                let category = ProjectFailureCategory.classify(message: error)
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Label(error, systemImage: category.systemImageName)
-                                        .labelStyle(.titleAndIcon)
-                                        .foregroundStyle(.red)
-                                        .font(.subheadline)
-                                    if let hint = category.hint {
-                                        Text(hint)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                            LogDrawerView(
-                                lines: model.logLines,
-                                detailsText: model.processingDetailsText,
-                                copyText: model.errorDetailsText,
-                                maxExpandedHeight: detailsHeight
-                            )
-                        }
+            .frame(maxWidth: 720, alignment: .leading)
+            .padding(32)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                if model.isRunActive {
+                    Button(Self.stopToolbarTitle(projectExists: model.currentProjectURL != nil)) {
+                        showStopConfirmation = true
                     }
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-
-                    StepperProgressView(currentStage: model.stage)
-                        .frame(width: 220)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            }
-            .frame(maxHeight: .infinity)
-
-            HStack(spacing: 12) {
-                if let projectURL = model.currentProjectURL {
-                    Button("Show in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([projectURL])
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
                     .disabled(model.isStopping)
+                    .accessibilityIdentifier("processing.stop")
                 }
-
-                if let projectURL = model.currentProjectURL, model.lastError != nil {
-                    Button("Copy Diagnostics") {
-                        model.copyDiagnosticBundle(forProjectURL: projectURL)
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .disabled(model.isStopping)
-                    .help("Copy a paste-ready diagnostic summary (metadata + log tails) for bug reports.")
-                }
-
-                Button("Return") {
-                    showReturnConfirm = true
-                }
-                .buttonStyle(SecondaryButtonStyle(variant: .subtleAccent))
-                .disabled(model.isStopping)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(32)
-        .sheet(isPresented: $model.isShowingTrainingConsent) {
-            TrainingConsentSheet()
-                .environmentObject(model)
-        }
-        .overlay {
-            if model.isStopping {
-                ZStack {
-                    Color.black.opacity(0.18)
-                        .ignoresSafeArea()
-                    VStack(spacing: 12) {
-                        ProgressView()
-                            .controlSize(.regular)
-                        Text(stoppingHeadlineText)
-                            .font(.headline)
-                        Text(stoppingDetailText)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(20)
-                    .background(
-                        RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                            .fill(Theme.surface)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                            .stroke(Theme.border)
-                    )
-                }
-                .transition(.opacity)
-            }
-        }
-        .confirmationDialog("Stop this project?", isPresented: $showReturnConfirm, titleVisibility: .visible) {
-            Button(returnPrimaryActionLabel) {
+        .confirmationDialog(
+            Self.stopDialogTitle(
+                projectExists: model.currentProjectURL != nil,
+                isTraining: model.isTrainingStageActive
+            ),
+            isPresented: $showStopConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(Self.stopActionTitle(projectExists: model.currentProjectURL != nil)) {
                 model.cancelCurrentProject(deleteProject: false)
             }
             .keyboardShortcut(.defaultAction)
-            Button("Delete Project", role: .destructive) {
-                model.cancelCurrentProject(deleteProject: true)
-            }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(returnDialogMessage)
+            Text(stopDialogMessage)
         }
     }
 
-    private func timingText(now: Date) -> String? {
-        let stagePrediction: TimeInterval? = {
-            guard let stage = model.stage else { return nil }
-            let preset = model.currentPreset ?? PresetSpec(mode: model.captureMode, quality: model.qualityPreset)
-            return RunDurationPredictor.predictStage(
-                stage,
-                mode: preset.mode,
-                quality: preset.quality,
-                from: model.projectSummaries
-            )?.seconds
-        }()
-        return Self.timingText(
-            elapsed: model.elapsedSinceStageStart(now: now),
-            silenceSeconds: model.lastPipelineEventAt.map { now.timeIntervalSince($0) },
-            stagePrediction: stagePrediction
+    private var progressContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let progress = Self.phaseProgress(stage: model.stage, progress: model.progress) {
+                let clampedProgress = min(max(progress, 0), 1)
+                ProgressView(value: clampedProgress)
+                    .accessibilityLabel("Phase progress")
+                    .accessibilityValue("\(Int((clampedProgress * 100).rounded())) percent")
+                    .accessibilityIdentifier("processing.progress")
+            } else {
+                ProgressView()
+                    .accessibilityLabel("In progress")
+                    .accessibilityIdentifier("processing.progress")
+            }
+
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                if let timingText = timingText(now: context.date) {
+                    Text(timingText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("processing.timing")
+                }
+            }
+
+            if model.isStopping {
+                Label(stoppingStatusText, systemImage: "stop.circle")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var failureContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Couldn’t finish this splat", systemImage: "exclamationmark.triangle")
+                    .font(.headline)
+                    .foregroundStyle(.red)
+                Text(Self.failureMessage(model.lastError))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .combine)
+
+            HStack(spacing: 12) {
+                if model.failureRetryAllowed {
+                    Button(Self.failureActionTitle(recovery: model.validationRecovery)) {
+                        model.retryAfterFailure()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canTryAgain || model.isStopping || model.isRunActive)
+                    .accessibilityIdentifier("processing.tryAgain")
+                }
+
+                Button("Back to Projects") {
+                    onBackToProjects()
+                }
+                .disabled(model.isStopping || model.isRunActive)
+                .accessibilityIdentifier("processing.backToProjects")
+
+                if let projectURL = model.currentProjectURL {
+                    Menu {
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([projectURL])
+                        }
+                        Button("Copy Diagnostics") {
+                            model.copyDiagnosticBundle(forProjectURL: projectURL)
+                        }
+                        Button("Save Diagnostics…") {
+                            model.saveDiagnosticBundle(forProjectURL: projectURL)
+                        }
+                    } label: {
+                        Label("More", systemImage: "ellipsis.circle")
+                    }
+                    .disabled(model.isStopping || model.isRunActive)
+                    .accessibilityIdentifier("processing.failureMore")
+                }
+            }
+        }
+    }
+
+    private var technicalDetails: some View {
+        DisclosureGroup(isExpanded: $isTechnicalDetailsExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                LabeledContent("Stage", value: model.stage?.displayName ?? "Preparing")
+                    .font(.caption)
+
+                if !model.statusTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(model.statusTitle)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+
+                ScrollView {
+                    Text(technicalText)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 260)
+
+                HStack {
+                    Spacer()
+                    Button("Copy Details") {
+                        model.copyTechnicalDetails(technicalText)
+                    }
+                    .controlSize(.small)
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            Text("Technical Details")
+                .font(.headline)
+        }
+        .accessibilityIdentifier("processing.technicalDetails")
+    }
+
+    private var canTryAgain: Bool {
+        Self.canTryAgain(
+            projectExists: model.currentProjectURL != nil,
+            pendingInputExists: !model.pendingVideoURLs.isEmpty || model.pendingPhotosFolderURL != nil
         )
     }
 
-    /// Pure composition of the processing "Elapsed … • Last update … • Typical …" caption.
-    /// Split out from the view so its formatting edge cases (nil elapsed, sub-second silence,
-    /// absent prediction) are unit-testable without a live AppModel.
-    static func timingText(elapsed: TimeInterval?, silenceSeconds: TimeInterval?, stagePrediction: TimeInterval?) -> String? {
+    nonisolated static func canTryAgain(projectExists: Bool, pendingInputExists: Bool) -> Bool {
+        projectExists || pendingInputExists
+    }
+
+    nonisolated static func failureActionTitle(recovery: RunValidationRecovery?) -> String {
+        switch recovery {
+        case .useUnordered: return "Use Unordered"
+        case .useFast, .useFastForMemory: return "Use Fast"
+        case .useBalanced: return "Use Balanced"
+        case .useAutomaticPhotoSelection: return "Use Automatic Selection"
+        case .useMoreTrainingMemory: return "Use More Memory"
+        case nil: return "Try Again"
+        }
+    }
+
+    nonisolated static func failureMessage(_ message: String?) -> String {
+        let trimmed = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "No error details were reported." : trimmed
+    }
+
+    nonisolated static func phaseProgress(stage: PipelineStage?, progress: Double?) -> Double? {
+        guard let progress, let stage else { return nil }
+        switch stage {
+        case .trainSplat, .exportSplat, .done:
+            return progress
+        case .importInput, .extractFrames, .selectFrames, .sfmFeatures, .sfmMatching, .sfmMapping:
+            return nil
+        }
+    }
+
+    private var technicalText: String {
+        let text = model.errorDetailsText ?? model.processingDetailsText
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "No technical details yet." : trimmed
+    }
+
+    private func timingText(now: Date) -> String? {
+        Self.timingText(
+            elapsed: model.elapsedSincePhaseStart(now: now),
+            silenceSeconds: model.lastPipelineEventAt.map { now.timeIntervalSince($0) }
+        )
+    }
+
+    static func timingText(elapsed: TimeInterval?, silenceSeconds: TimeInterval?) -> String? {
         guard let elapsed else { return nil }
         var parts = ["Elapsed \(formatElapsed(elapsed))"]
         if let silenceSeconds {
@@ -213,10 +274,7 @@ struct ProcessingView: View {
                 parts.append("Last update now")
             }
         }
-        if let stagePrediction {
-            parts.append("Typical \(StageTimingDisplay.formatDuration(seconds: stagePrediction))")
-        }
-        return parts.joined(separator: " • ")
+        return parts.joined(separator: " · ")
     }
 
     static func formatElapsed(_ elapsed: TimeInterval) -> String {
@@ -230,100 +288,46 @@ struct ProcessingView: View {
         return String(format: "%dm %02ds", minutes, seconds)
     }
 
-    private func summaryDetail(_ detail: String) -> String {
-        guard model.isBrushSnapshotTrainingActive else { return detail }
-        guard let range = detail.range(of: " (running ") else { return detail }
-        return String(detail[..<range.lowerBound])
-    }
-
-    private var returnPrimaryActionLabel: String {
-        model.isBrushSnapshotTrainingActive ? "Export Snapshot" : "Save Project"
-    }
-
     private var stoppingStatusText: String {
+        if model.currentProjectURL == nil {
+            return "Stopping setup…"
+        }
         if model.stopAction == .deleteProject {
-            return "Stopping and deleting… (up to 15 seconds)"
-        }
-        if model.isBrushSnapshotTrainingActive {
-            return "Exporting snapshot… (up to 15 seconds)"
+            return "Stopping and moving project to Trash…"
         }
         if model.isTrainingStageActive {
-            return "Saving project… (up to 15 seconds)"
+            return "Saving and validating the training checkpoint…"
         }
-        return "Saving progress… (up to 15 seconds)"
+        return "Stopping at a safe point…"
     }
 
-    private var stoppingHeadlineText: String {
-        if model.stopAction == .deleteProject {
-            return "Stopping and deleting…"
-        }
-        if model.isBrushSnapshotTrainingActive {
-            return "Exporting snapshot…"
-        }
-        if model.isTrainingStageActive {
-            return "Saving project…"
-        }
-        return "Saving progress…"
+    private var stopDialogMessage: String {
+        Self.stopDialogMessage(
+            projectExists: model.currentProjectURL != nil,
+            isTraining: model.isTrainingStageActive
+        )
     }
 
-    private var stoppingDetailText: String {
-        if model.stopAction == .deleteProject {
-            return "Stopping at the next safe point (up to 15 seconds)."
-        }
-        if model.isBrushSnapshotTrainingActive {
-            return "Exporting the latest snapshot (training restarts from scratch on resume)."
-        }
-        if model.isTrainingStageActive {
-            return "Stopping training at the next safe point. Resume starts training over."
-        }
-        return "Stopping at the next safe point (up to 15 seconds)."
+    nonisolated static func stopToolbarTitle(projectExists: Bool) -> String {
+        projectExists ? "Stop…" : "Stop Setup…"
     }
 
-    private var returnDialogMessage: String {
-        if model.isBrushSnapshotTrainingActive {
-            return "Exporting keeps only a snapshot. If you resume, training starts over from scratch. Delete removes all project data."
-        }
-        if model.isTrainingStageActive {
-            return "You can save progress, but training starts over if you resume later. Delete removes all project data."
-        }
-        return "You can save and resume later, or delete the project."
+    nonisolated static func stopDialogTitle(projectExists: Bool, isTraining: Bool) -> String {
+        guard projectExists else { return "Stop setup?" }
+        return isTraining ? "Stop training?" : "Stop this project?"
     }
-}
 
-private struct TrainingConsentSheet: View {
-    @EnvironmentObject private var model: AppModel
-    @State private var rememberChoice = false
+    nonisolated static func stopActionTitle(projectExists: Bool) -> String {
+        projectExists ? "Stop and Keep Project" : "Stop Setup"
+    }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Training will start")
-                .font(.headline)
-            Text("If you quit during training, resuming starts training over.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Toggle("Remember my choice", isOn: $rememberChoice)
-                .toggleStyle(.checkbox)
-            HStack {
-                Spacer()
-                Button("Cancel") {
-                    model.resolveTrainingConsent(accepted: false, remember: false)
-                }
-                .buttonStyle(SecondaryButtonStyle())
-                .keyboardShortcut(.cancelAction)
-
-                Button("Continue Training") {
-                    let remember = rememberChoice
-                    model.resolveTrainingConsent(accepted: true, remember: remember)
-                }
-                .buttonStyle(PrimaryButtonStyle())
-                .keyboardShortcut(.defaultAction)
-            }
+    nonisolated static func stopDialogMessage(projectExists: Bool, isTraining: Bool) -> String {
+        guard projectExists else {
+            return "EasySplat will stop preparing tools. No project has been created."
         }
-        .padding(24)
-        .frame(width: 420)
-        .interactiveDismissDisabled(true)
-        .onAppear {
-            rememberChoice = false
+        if isTraining {
+            return "EasySplat will stop at a safe point. It will resume from a validated optimizer checkpoint when one is available; otherwise training restarts from the reconstructed scene."
         }
+        return "EasySplat will stop at a safe point and keep the last completed stage. You can resume this project later."
     }
 }

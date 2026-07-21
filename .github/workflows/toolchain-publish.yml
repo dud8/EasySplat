@@ -1,0 +1,1014 @@
+name: Toolchain Publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Toolchain version (semver)"
+        required: true
+        default: "2.0.0"
+        type: string
+      app_version:
+        description: "EasySplat version used by the release benchmark"
+        required: true
+        default: "0.2.0"
+        type: string
+      app_version_minimum:
+        description: "Minimum compatible EasySplat app version"
+        required: true
+        default: "0.2.0"
+        type: string
+      app_version_maximum_exclusive:
+        description: "Exclusive maximum compatible EasySplat app version"
+        required: true
+        default: "0.3.0"
+        type: string
+      producer_run_id:
+        description: "Producer workflow run ID"
+        required: true
+        type: string
+      producer_run_attempt:
+        description: "Producer workflow run attempt"
+        required: true
+        type: string
+      producer_artifact_id:
+        description: "Final signed producer artifact ID"
+        required: true
+        type: string
+      producer_artifact_digest:
+        description: "Final signed producer artifact digest"
+        required: true
+        type: string
+      request_artifact_id:
+        description: "Post-sign request artifact ID"
+        required: true
+        type: string
+      request_artifact_digest:
+        description: "Post-sign request artifact digest"
+        required: true
+        type: string
+      request_sha256:
+        description: "Post-sign request file SHA-256"
+        required: true
+        type: string
+      authority_commit:
+        description: "Release-authority source commit"
+        required: true
+        type: string
+      authority_run_id:
+        description: "Release-authority workflow run ID"
+        required: true
+        type: string
+      authority_run_attempt:
+        description: "Release-authority workflow run attempt"
+        required: true
+        type: string
+      authority_payload_artifact_id:
+        description: "Signed authority payload artifact ID"
+        required: true
+        type: string
+      authority_payload_artifact_name:
+        description: "Signed authority payload artifact name"
+        required: true
+        type: string
+      authority_payload_artifact_digest:
+        description: "Signed authority payload artifact digest"
+        required: true
+        type: string
+      authority_receipt_artifact_id:
+        description: "Signed authority receipt artifact ID"
+        required: true
+        type: string
+      authority_receipt_artifact_name:
+        description: "Signed authority receipt artifact name"
+        required: true
+        type: string
+      authority_receipt_artifact_digest:
+        description: "Signed authority receipt artifact digest"
+        required: true
+        type: string
+      benchmark_run_id:
+        description: "Protected benchmark workflow run ID"
+        required: true
+        type: string
+      benchmark_run_attempt:
+        description: "Protected benchmark workflow run attempt"
+        required: true
+        type: string
+      benchmark_artifact_id:
+        description: "Verified benchmark artifact ID"
+        required: true
+        type: string
+      benchmark_artifact_name:
+        description: "Verified benchmark artifact name"
+        required: true
+        type: string
+      benchmark_artifact_digest:
+        description: "Verified benchmark artifact digest"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: toolchain-publication-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  metadata-preflight:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: toolchain-release
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      handoff_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      handoff_artifact_digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
+    steps:
+      - name: Bind and collect exact producer, authority, and benchmark evidence
+        env:
+          GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_POLICY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          APP_VERSION: ${{ inputs.app_version }}
+          APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
+          APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
+          PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ inputs.producer_run_attempt }}
+          PRODUCER_ARTIFACT_ID: ${{ inputs.producer_artifact_id }}
+          PRODUCER_ARTIFACT_NAME: toolchain-final-producer-${{ inputs.version }}
+          PRODUCER_ARTIFACT_DIGEST: ${{ inputs.producer_artifact_digest }}
+          REQUEST_ARTIFACT_ID: ${{ inputs.request_artifact_id }}
+          REQUEST_ARTIFACT_NAME: toolchain-post-sign-request-${{ inputs.version }}
+          REQUEST_ARTIFACT_DIGEST: ${{ inputs.request_artifact_digest }}
+          REQUEST_SHA256: ${{ inputs.request_sha256 }}
+          AUTHORITY_REPOSITORY: dud8/easysplat-release-authority
+          AUTHORITY_COMMIT: ${{ inputs.authority_commit }}
+          AUTHORITY_RUN_ID: ${{ inputs.authority_run_id }}
+          AUTHORITY_RUN_ATTEMPT: ${{ inputs.authority_run_attempt }}
+          AUTHORITY_PAYLOAD_ARTIFACT_ID: ${{ inputs.authority_payload_artifact_id }}
+          AUTHORITY_PAYLOAD_ARTIFACT_NAME: ${{ inputs.authority_payload_artifact_name }}
+          AUTHORITY_PAYLOAD_ARTIFACT_DIGEST: ${{ inputs.authority_payload_artifact_digest }}
+          AUTHORITY_RECEIPT_ARTIFACT_ID: ${{ inputs.authority_receipt_artifact_id }}
+          AUTHORITY_RECEIPT_ARTIFACT_NAME: ${{ inputs.authority_receipt_artifact_name }}
+          AUTHORITY_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.authority_receipt_artifact_digest }}
+          BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
+          BENCHMARK_RUN_ATTEMPT: ${{ inputs.benchmark_run_attempt }}
+          BENCHMARK_ARTIFACT_ID: ${{ inputs.benchmark_artifact_id }}
+          BENCHMARK_ARTIFACT_NAME: ${{ inputs.benchmark_artifact_name }}
+          BENCHMARK_ARTIFACT_DIGEST: ${{ inputs.benchmark_artifact_digest }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          python3 - "$VERSION" "$APP_VERSION" "$APP_VERSION_MINIMUM" "$APP_VERSION_MAXIMUM_EXCLUSIVE" <<'PY'
+          import re
+          import sys
+
+          core = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+          identifier = r"[0-9A-Za-z-]+"
+          for value in sys.argv[1:]:
+              if re.fullmatch(core, value) is None:
+                  raise SystemExit(f"stable semantic version required: {value}")
+          PY
+          for value in \
+            "$PRODUCER_RUN_ID" "$PRODUCER_RUN_ATTEMPT" "$PRODUCER_ARTIFACT_ID" \
+            "$REQUEST_ARTIFACT_ID" "$AUTHORITY_RUN_ID" "$AUTHORITY_RUN_ATTEMPT" \
+            "$AUTHORITY_PAYLOAD_ARTIFACT_ID" "$AUTHORITY_RECEIPT_ARTIFACT_ID" \
+            "$BENCHMARK_RUN_ID" "$BENCHMARK_RUN_ATTEMPT" "$BENCHMARK_ARTIFACT_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          for value in \
+            "$PRODUCER_ARTIFACT_DIGEST" "$REQUEST_ARTIFACT_DIGEST" \
+            "$AUTHORITY_PAYLOAD_ARTIFACT_DIGEST" "$AUTHORITY_RECEIPT_ARTIFACT_DIGEST" \
+            "$BENCHMARK_ARTIFACT_DIGEST"; do
+            [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
+          [[ "$REQUEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$AUTHORITY_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$AUTHORITY_REPOSITORY" = "dud8/easysplat-release-authority"
+          TAG="toolchain-v$VERSION"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .ref)" = "refs/tags/$TAG"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$TAG" --jq .sha)" = "$GITHUB_SHA"
+
+          verify_run() {
+            repository="$1"
+            run_id="$2"
+            run_attempt="$3"
+            commit="$4"
+            workflow="$5"
+            payload="$(mktemp)"
+            gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$repository/actions/runs/$run_id" >"$payload"
+            python3 - "$payload" "$run_attempt" "$commit" "$workflow" <<'PY'
+          import json
+          import sys
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          expected_attempt, expected_commit, expected_workflow = sys.argv[2:]
+          if payload.get("status") != "completed" or payload.get("conclusion") != "success":
+              raise SystemExit("workflow run did not complete successfully")
+          if str(payload.get("run_attempt")) != expected_attempt or payload.get("head_sha") != expected_commit:
+              raise SystemExit("workflow run identity is invalid")
+          if payload.get("head_branch") != "main" or payload.get("event") != "workflow_dispatch":
+              raise SystemExit("workflow run did not execute on protected main")
+          if payload.get("path") not in {expected_workflow, expected_workflow + "@main"}:
+              raise SystemExit("workflow path is invalid")
+          PY
+          }
+          verify_artifact() {
+            repository="$1"
+            run_id="$2"
+            artifact_id="$3"
+            name="$4"
+            digest="$5"
+            row="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$repository/actions/artifacts/$artifact_id" \
+              --jq '[.workflow_run.id, .name, .digest, .expired] | @tsv')"
+            test "$(printf '%s\n' "$row" | cut -f1)" = "$run_id"
+            test "$(printf '%s\n' "$row" | cut -f2)" = "$name"
+            test "$(printf '%s\n' "$row" | cut -f3)" = "$digest"
+            test "$(printf '%s\n' "$row" | cut -f4)" = "false"
+          }
+
+          verify_run "$GITHUB_REPOSITORY" "$PRODUCER_RUN_ID" "$PRODUCER_RUN_ATTEMPT" "$GITHUB_SHA" ".github/workflows/toolchain-build.yml"
+          verify_artifact "$GITHUB_REPOSITORY" "$PRODUCER_RUN_ID" "$PRODUCER_ARTIFACT_ID" "$PRODUCER_ARTIFACT_NAME" "$PRODUCER_ARTIFACT_DIGEST"
+          verify_artifact "$GITHUB_REPOSITORY" "$PRODUCER_RUN_ID" "$REQUEST_ARTIFACT_ID" "$REQUEST_ARTIFACT_NAME" "$REQUEST_ARTIFACT_DIGEST"
+          verify_run "$AUTHORITY_REPOSITORY" "$AUTHORITY_RUN_ID" "$AUTHORITY_RUN_ATTEMPT" "$AUTHORITY_COMMIT" ".github/workflows/sign-toolchain-authority.yml"
+          verify_artifact "$AUTHORITY_REPOSITORY" "$AUTHORITY_RUN_ID" "$AUTHORITY_PAYLOAD_ARTIFACT_ID" "$AUTHORITY_PAYLOAD_ARTIFACT_NAME" "$AUTHORITY_PAYLOAD_ARTIFACT_DIGEST"
+          verify_artifact "$AUTHORITY_REPOSITORY" "$AUTHORITY_RUN_ID" "$AUTHORITY_RECEIPT_ARTIFACT_ID" "$AUTHORITY_RECEIPT_ARTIFACT_NAME" "$AUTHORITY_RECEIPT_ARTIFACT_DIGEST"
+          verify_run "$GITHUB_REPOSITORY" "$BENCHMARK_RUN_ID" "$BENCHMARK_RUN_ATTEMPT" "$GITHUB_SHA" ".github/workflows/benchmark-release.yml"
+          verify_artifact "$GITHUB_REPOSITORY" "$BENCHMARK_RUN_ID" "$BENCHMARK_ARTIFACT_ID" "$BENCHMARK_ARTIFACT_NAME" "$BENCHMARK_ARTIFACT_DIGEST"
+
+          HANDOFF="$RUNNER_TEMP/toolchain-publication-handoff"
+          RAW="$RUNNER_TEMP/toolchain-publication-downloads"
+          rm -rf "$HANDOFF" "$RAW"
+          mkdir -m 0700 "$HANDOFF" "$RAW"
+          mkdir -m 0700 "$HANDOFF/producer" "$HANDOFF/request" "$HANDOFF/benchmark" "$HANDOFF/authority-handoff"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$PRODUCER_ARTIFACT_ID/zip" >"$RAW/producer.zip"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$REQUEST_ARTIFACT_ID/zip" >"$RAW/request.zip"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$BENCHMARK_ARTIFACT_ID/zip" >"$RAW/benchmark.zip"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$AUTHORITY_REPOSITORY/actions/artifacts/$AUTHORITY_PAYLOAD_ARTIFACT_ID/zip" >"$HANDOFF/authority-handoff/toolchain-authority-payload.zip"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$AUTHORITY_REPOSITORY/actions/artifacts/$AUTHORITY_RECEIPT_ARTIFACT_ID/zip" >"$HANDOFF/authority-handoff/toolchain-authority-receipt.zip"
+          python3 -I - "$RAW" "$HANDOFF" "$VERSION" <<'PY'
+          import shutil
+          import stat
+          import sys
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          raw, handoff, version = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+
+          def extract_exact(archive_path, destination, expected):
+              with zipfile.ZipFile(archive_path) as archive:
+                  infos = archive.infolist()
+                  if len(infos) != len(expected) or {info.filename for info in infos} != expected:
+                      raise SystemExit(f"artifact file set is invalid: {archive_path.name}")
+                  for info in infos:
+                      path = PurePosixPath(info.filename)
+                      mode = (info.external_attr >> 16) & 0o170000
+                      if path.is_absolute() or ".." in path.parts or info.is_dir() or info.flag_bits & 1 or mode == stat.S_IFLNK:
+                          raise SystemExit("artifact contains an unsafe member")
+                      target = destination.joinpath(*path.parts)
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      with archive.open(info) as source, target.open("xb") as output:
+                          shutil.copyfileobj(source, output, 1024 * 1024)
+
+          producer = {
+              f"toolchain-macos-arm64-{version}-core.zip",
+              f"toolchain-geometry-da3-base-{version}.zip",
+              f"toolchain-geometry-da3-small-{version}.zip",
+              "distribution-signing-finalization.json",
+              "core-notarization.json",
+              "da3-base-notarization.json",
+              "toolchain-build-host.json",
+          }
+          extract_exact(raw / "producer.zip", handoff / "producer", producer)
+          extract_exact(raw / "request.zip", handoff / "request", {"toolchain-release-request.json"})
+          with zipfile.ZipFile(raw / "benchmark.zip") as archive:
+              matches = [info for info in archive.infolist() if info.filename == "verified-suite.json"]
+              if len(matches) != 1 or matches[0].is_dir() or matches[0].flag_bits & 1:
+                  raise SystemExit("benchmark artifact lacks one safe verified-suite.json")
+              with archive.open(matches[0]) as source, (handoff / "benchmark/verified-suite.json").open("xb") as output:
+                  shutil.copyfileobj(source, output, 1024 * 1024)
+          PY
+          PAYLOAD_DOWNLOAD_SHA256="$(/usr/bin/shasum -a 256 "$HANDOFF/authority-handoff/toolchain-authority-payload.zip" | cut -d' ' -f1)"
+          RECEIPT_DOWNLOAD_SHA256="$(/usr/bin/shasum -a 256 "$HANDOFF/authority-handoff/toolchain-authority-receipt.zip" | cut -d' ' -f1)"
+          export PAYLOAD_DOWNLOAD_SHA256 RECEIPT_DOWNLOAD_SHA256
+          python3 -I - "$HANDOFF/authority-handoff/authority-transport.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          payload = {
+              "schemaVersion": 1,
+              "sourceRepository": os.environ["GITHUB_REPOSITORY"],
+              "sourceCommit": os.environ["GITHUB_SHA"],
+              "handoffRunID": int(os.environ["GITHUB_RUN_ID"]),
+              "handoffRunAttempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "authorityRepository": os.environ["AUTHORITY_REPOSITORY"],
+              "authorityCommit": os.environ["AUTHORITY_COMMIT"],
+              "authorityRunID": int(os.environ["AUTHORITY_RUN_ID"]),
+              "authorityRunAttempt": int(os.environ["AUTHORITY_RUN_ATTEMPT"]),
+              "payloadArtifact": {
+                  "id": int(os.environ["AUTHORITY_PAYLOAD_ARTIFACT_ID"]),
+                  "name": os.environ["AUTHORITY_PAYLOAD_ARTIFACT_NAME"],
+                  "digest": os.environ["AUTHORITY_PAYLOAD_ARTIFACT_DIGEST"],
+                  "downloadSHA256": os.environ["PAYLOAD_DOWNLOAD_SHA256"],
+              },
+              "receiptArtifact": {
+                  "id": int(os.environ["AUTHORITY_RECEIPT_ARTIFACT_ID"]),
+                  "name": os.environ["AUTHORITY_RECEIPT_ARTIFACT_NAME"],
+                  "digest": os.environ["AUTHORITY_RECEIPT_ARTIFACT_DIGEST"],
+                  "downloadSHA256": os.environ["RECEIPT_DOWNLOAD_SHA256"],
+              },
+          }
+          Path(sys.argv[1]).write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+          PY
+          python3 -I - "$HANDOFF/benchmark/benchmark-transport.json" "$HANDOFF/benchmark/verified-suite.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          evidence_path, suite_path = map(Path, sys.argv[1:])
+          suite_digest = hashlib.sha256(suite_path.read_bytes()).hexdigest()
+          payload = {
+              "schemaVersion": 1,
+              "sourceRepository": os.environ["GITHUB_REPOSITORY"],
+              "sourceCommit": os.environ["GITHUB_SHA"],
+              "benchmarkRunID": int(os.environ["BENCHMARK_RUN_ID"]),
+              "benchmarkRunAttempt": int(os.environ["BENCHMARK_RUN_ATTEMPT"]),
+              "benchmarkArtifact": {
+                  "id": int(os.environ["BENCHMARK_ARTIFACT_ID"]),
+                  "name": os.environ["BENCHMARK_ARTIFACT_NAME"],
+                  "digest": os.environ["BENCHMARK_ARTIFACT_DIGEST"],
+                  "verifiedSuiteSHA256": suite_digest,
+              },
+          }
+          evidence_path.write_text(
+              json.dumps(payload, sort_keys=True, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload same-run inert publication handoff
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-authority-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/toolchain-publication-handoff
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  verify-publication:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: metadata-preflight
+    runs-on: ${{ fromJSON('["self-hosted","macOS","ARM64","easysplat-toolchain-verifier","easysplat-ephemeral"]') }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
+      full_toolchain_identity: ${{ steps.verify.outputs.full_toolchain_identity }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download same-run inert handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.metadata-preflight.outputs.handoff_artifact_id }}
+          path: ${{ runner.temp }}/toolchain-publication-handoff
+          merge-multiple: true
+
+      - name: Verify exact post-sign publication closure
+        id: verify
+        env:
+          OUTPUT: ${{ runner.temp }}/verified-toolchain-publication
+        run: |
+          set -euo pipefail
+          HANDOFF="$RUNNER_TEMP/toolchain-publication-handoff"
+          RESULT="$(python3 scripts/release/toolchain_publication.py verify \
+            --producer "$HANDOFF/producer" \
+            --request "$HANDOFF/request/toolchain-release-request.json" \
+            --authority-handoff "$HANDOFF/authority-handoff" \
+            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --benchmark-suite "$HANDOFF/benchmark/verified-suite.json" \
+            --benchmark-evidence "$HANDOFF/benchmark/benchmark-transport.json" \
+            --output "$OUTPUT" \
+            --version "${{ inputs.version }}" \
+            --app-version "${{ inputs.app_version }}" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --producer-run-id "${{ inputs.producer_run_id }}" \
+            --producer-run-attempt "${{ inputs.producer_run_attempt }}" \
+            --producer-artifact-id "${{ inputs.producer_artifact_id }}" \
+            --producer-artifact-name "toolchain-final-producer-${{ inputs.version }}" \
+            --producer-artifact-digest "${{ inputs.producer_artifact_digest }}" \
+            --request-artifact-id "${{ inputs.request_artifact_id }}" \
+            --request-artifact-name "toolchain-post-sign-request-${{ inputs.version }}" \
+            --request-artifact-digest "${{ inputs.request_artifact_digest }}" \
+            --request-sha256 "${{ inputs.request_sha256 }}" \
+            --authority-repository "dud8/easysplat-release-authority" \
+            --authority-commit "${{ inputs.authority_commit }}" \
+            --authority-run-id "${{ inputs.authority_run_id }}" \
+            --authority-run-attempt "${{ inputs.authority_run_attempt }}" \
+            --authority-payload-artifact-id "${{ inputs.authority_payload_artifact_id }}" \
+            --authority-payload-artifact-name "${{ inputs.authority_payload_artifact_name }}" \
+            --authority-payload-artifact-digest "${{ inputs.authority_payload_artifact_digest }}" \
+            --authority-receipt-artifact-id "${{ inputs.authority_receipt_artifact_id }}" \
+            --authority-receipt-artifact-name "${{ inputs.authority_receipt_artifact_name }}" \
+            --authority-receipt-artifact-digest "${{ inputs.authority_receipt_artifact_digest }}" \
+            --handoff-run-id "$GITHUB_RUN_ID" \
+            --handoff-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --benchmark-run-id "${{ inputs.benchmark_run_id }}" \
+            --benchmark-run-attempt "${{ inputs.benchmark_run_attempt }}" \
+            --benchmark-artifact-id "${{ inputs.benchmark_artifact_id }}" \
+            --benchmark-artifact-name "${{ inputs.benchmark_artifact_name }}" \
+            --benchmark-artifact-digest "${{ inputs.benchmark_artifact_digest }}")"
+          FULL_IDENTITY="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["full_toolchain_identity"])' <<<"$RESULT")"
+          [[ "$FULL_IDENTITY" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "full_toolchain_identity=$FULL_IDENTITY" >>"$GITHUB_OUTPUT"
+
+      - name: Upload exact verified publication closure
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-toolchain-publication-${{ inputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-toolchain-publication
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 45
+
+  minimum-macos-compatibility:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: verify-publication
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download only the verified publication closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-publication.outputs.artifact_id }}
+          path: ${{ runner.temp }}/verified-toolchain-publication
+          merge-multiple: true
+
+      - name: Smoke the minimum supported macOS toolchain
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          PUBLICATION="$RUNNER_TEMP/verified-toolchain-publication"
+          CORE="$RUNNER_TEMP/core"
+          mkdir -m 0700 "$CORE"
+          unzip -q "$PUBLICATION/toolchain-macos-arm64-$VERSION-core.zip" -d "$CORE"
+          "$RUNNER_TEMP/core/bin/colmap" help
+          "$RUNNER_TEMP/core/bin/easysplat-train" --self-check
+
+  stage-draft-release:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: [verify-publication, minimum-macos-compatibility]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: toolchain-publication
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download exact verified publication closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-publication.outputs.artifact_id }}
+          path: ${{ runner.temp }}/verified-toolchain-publication
+          merge-multiple: true
+
+      - name: Create or resume the exact draft release
+        env:
+          GH_TOKEN: ${{ secrets.EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          PUBLICATION: ${{ runner.temp }}/verified-toolchain-publication
+          EVIDENCE_ROOT: ${{ runner.temp }}/toolchain-manual-publication-evidence
+          RELEASE_ID_FILE: ${{ runner.temp }}/toolchain-draft-release-id
+          VERIFIED_PUBLICATION_ARTIFACT_ID: ${{ needs.verify-publication.outputs.artifact_id }}
+          VERIFIED_PUBLICATION_ARTIFACT_DIGEST: ${{ needs.verify-publication.outputs.artifact_digest }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          test ! -e "$EVIDENCE_ROOT"
+          test ! -e "$RELEASE_ID_FILE"
+          mkdir -m 0700 "$EVIDENCE_ROOT"
+          echo "draft=true prerelease=false"
+          python3 -I - <<'PY'
+          import hashlib
+          import http.client
+          import json
+          import mimetypes
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          commit = os.environ["GITHUB_SHA"]
+          token = os.environ["GH_TOKEN"]
+          version = os.environ["VERSION"]
+          root = Path(os.environ["PUBLICATION"])
+          evidence_root = Path(os.environ["EVIDENCE_ROOT"])
+          release_id_file = Path(os.environ["RELEASE_ID_FILE"])
+          verified_artifact_id = os.environ["VERIFIED_PUBLICATION_ARTIFACT_ID"]
+          verified_artifact_digest = os.environ["VERIFIED_PUBLICATION_ARTIFACT_DIGEST"]
+          workflow_run_id = os.environ["GITHUB_RUN_ID"]
+          workflow_run_attempt = os.environ["GITHUB_RUN_ATTEMPT"]
+          for value in (
+              verified_artifact_id,
+              workflow_run_id,
+              workflow_run_attempt,
+          ):
+              if re.fullmatch(r"[1-9][0-9]*", value) is None:
+                  raise SystemExit("toolchain publication evidence identity is invalid")
+          if re.fullmatch(r"sha256:[0-9a-f]{64}", verified_artifact_digest) is None:
+              raise SystemExit("verified publication artifact digest is invalid")
+          tag = f"toolchain-v{version}"
+          owner = (
+              f"<!-- easysplat-toolchain-release-owner:v1:"
+              f"{repository}:{tag}:{commit} -->"
+          )
+          names = [
+              f"toolchain-macos-arm64-{version}-core.zip",
+              f"toolchain-geometry-da3-base-{version}.zip",
+              f"toolchain-geometry-da3-small-{version}.zip",
+              "manifest.json",
+              "toolchain-release-request.json",
+              "toolchain-authority-envelope.json",
+              "toolchain-authority-receipt.json",
+              "toolchain-benchmark-evidence.json",
+          ]
+          if sorted(path.name for path in root.iterdir()) != sorted(names):
+              raise SystemExit("verified publication directory is not the exact eight-asset closure")
+
+          api = f"https://api.github.com/repos/{repository}"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2026-03-10",
+              "User-Agent": "EasySplat-toolchain-publisher",
+          }
+
+          def api_call(method, url, *, body=None, content_type=None):
+              parsed = urllib.parse.urlsplit(url)
+              if (
+                  parsed.scheme != "https"
+                  or parsed.hostname != "api.github.com"
+                  or parsed.port is not None
+                  or parsed.username is not None
+                  or parsed.password is not None
+                  or parsed.fragment
+              ):
+                  raise SystemExit("GitHub API URL is invalid")
+              current = dict(headers)
+              if content_type:
+                  current["Content-Type"] = content_type
+              return urllib.request.Request(
+                  url, data=body, headers=current, method=method
+              )
+
+          def request_with_link(method, url, *, body=None, content_type=None):
+              call = api_call(
+                  method, url, body=body, content_type=content_type
+              )
+              with urllib.request.urlopen(call, timeout=120) as response:
+                  encoded = response.read(32 * 1024 * 1024 + 1)
+                  if len(encoded) > 32 * 1024 * 1024:
+                      raise SystemExit("GitHub API response is oversized")
+                  try:
+                      payload = json.loads(encoded.decode("utf-8"))
+                  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                      raise SystemExit("GitHub API response is not valid JSON") from error
+                  return payload, response.headers.get("Link")
+
+          def request(method, url, *, body=None, content_type=None):
+              payload, _ = request_with_link(
+                  method, url, body=body, content_type=content_type
+              )
+              return payload
+
+          def request_empty(method, url):
+              call = api_call(method, url)
+              with urllib.request.urlopen(call, timeout=120) as response:
+                  if response.status != 204 or response.read(1) != b"":
+                      raise SystemExit("GitHub API empty response is invalid")
+
+          def require_immutable_release_policy():
+              policy = request("GET", f"{api}/immutable-releases")
+              if not isinstance(policy, dict) or policy.get("enabled") is not True:
+                  raise SystemExit("immutable releases must be enabled before toolchain publication")
+
+          def require_protected_source_refs():
+              branch = request("GET", f"{api}/branches/main")
+              branch_commit = branch.get("commit") if isinstance(branch, dict) else None
+              if (
+                  not isinstance(branch_commit, dict)
+                  or branch.get("protected") is not True
+                  or branch_commit.get("sha") != commit
+              ):
+                  raise SystemExit("protected main moved during toolchain publication")
+              resolved_tag = request(
+                  "GET", f"{api}/commits/refs%2Ftags%2F{tag}"
+              )
+              tag_commit = (
+                  resolved_tag.get("sha") if isinstance(resolved_tag, dict) else None
+              )
+              if tag_commit != commit:
+                  raise SystemExit("toolchain tag moved during publication")
+              return tag_commit
+
+          def next_page_url(link):
+              if link is None:
+                  return None
+              matches = []
+              for item in link.split(","):
+                  sections = [section.strip() for section in item.split(";")]
+                  if len(sections) < 2 or not sections[0].startswith("<") or not sections[0].endswith(">"):
+                      raise SystemExit("GitHub pagination Link header is invalid")
+                  relations = []
+                  for parameter in sections[1:]:
+                      name, separator, value = parameter.partition("=")
+                      if separator and name.strip().lower() == "rel":
+                          relations.extend(value.strip().strip('"').split())
+                  if "next" in relations:
+                      matches.append(sections[0][1:-1])
+              if len(matches) > 1:
+                  raise SystemExit("GitHub pagination has multiple next links")
+              return matches[0] if matches else None
+
+          def list_releases():
+              pages = []
+              url = f"{api}/releases?per_page=100&page=1"
+              visited = set()
+              while url is not None:
+                  if url in visited or len(visited) >= 10_000:
+                      raise SystemExit("GitHub release pagination did not terminate")
+                  visited.add(url)
+                  payload, link = request_with_link("GET", url)
+                  if not isinstance(payload, list) or len(payload) > 100:
+                      raise SystemExit("GitHub release listing has an invalid schema")
+                  pages.extend(payload)
+                  url = next_page_url(link)
+              return pages
+
+          def hash_file(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as source:
+                  for block in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def write_private(path, payload):
+              descriptor = os.open(
+                  path,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                  0o600,
+              )
+              try:
+                  written = 0
+                  while written < len(payload):
+                      count = os.write(descriptor, payload[written:])
+                      if count <= 0:
+                          raise SystemExit("private release evidence write stalled")
+                      written += count
+                  os.fsync(descriptor)
+              finally:
+                  os.close(descriptor)
+              directory = os.open(
+                  path.parent,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+              )
+              try:
+                  os.fsync(directory)
+              finally:
+                  os.close(directory)
+
+          def upload_file(url, path, content_type, release_id):
+              parsed = urllib.parse.urlsplit(url)
+              expected_path = f"/repos/{repository}/releases/{release_id}/assets"
+              query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+              if (
+                  parsed.scheme != "https"
+                  or parsed.hostname != "uploads.github.com"
+                  or parsed.port is not None
+                  or parsed.username is not None
+                  or parsed.password is not None
+                  or parsed.fragment
+                  or parsed.path != expected_path
+                  or query != {"name": [path.name]}
+              ):
+                  raise SystemExit("release upload URL is invalid")
+              target = urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, ""))
+              connection = http.client.HTTPSConnection(
+                  parsed.hostname, parsed.port, timeout=300
+              )
+              try:
+                  with path.open("rb") as source:
+                      connection.request(
+                          "POST",
+                          target,
+                          body=source,
+                          headers={
+                              **headers,
+                              "Content-Type": content_type,
+                              "Content-Length": str(path.stat().st_size),
+                          },
+                      )
+                      response = connection.getresponse()
+                      response_body = response.read(1024 * 1024 + 1)
+                  if len(response_body) > 1024 * 1024:
+                      raise SystemExit("release upload response is oversized")
+                  if response.status < 200 or response.status >= 300:
+                      raise SystemExit(
+                          f"release upload failed with HTTP {response.status}: "
+                          + response_body.decode("utf-8", errors="replace")
+                      )
+                  return json.loads(response_body.decode("utf-8"))
+              finally:
+                  connection.close()
+
+          def validate_release(release, release_id):
+              if not isinstance(release, dict) or release.get("id") != release_id:
+                  raise SystemExit("toolchain draft release identifier differs")
+              if (
+                  release.get("tag_name") != tag
+                  or release.get("target_commitish") != commit
+                  or release.get("name") != tag
+                  or release.get("body") != owner
+              ):
+                  raise SystemExit("toolchain draft release identity differs")
+              if (
+                  release.get("draft") is not True
+                  or release.get("prerelease") is not False
+                  or release.get("immutable") is not False
+              ):
+                  raise SystemExit("toolchain release is not the expected mutable stable draft")
+
+          def validate_assets(release, *, complete, allow_empty_starter=False):
+              assets = release.get("assets")
+              if not isinstance(assets, list):
+                  raise SystemExit("toolchain draft assets have an invalid schema")
+              by_name = {}
+              asset_ids = set()
+              starters = []
+              for asset in assets:
+                  if not isinstance(asset, dict):
+                      raise SystemExit("toolchain draft contains an invalid asset")
+                  name = asset.get("name")
+                  asset_id = asset.get("id")
+                  if name not in names:
+                      raise SystemExit("toolchain draft contains an unexpected asset")
+                  if name in by_name:
+                      raise SystemExit("toolchain draft contains a duplicate asset")
+                  if (
+                      not isinstance(asset_id, int)
+                      or isinstance(asset_id, bool)
+                      or asset_id <= 0
+                  ):
+                      raise SystemExit(f"toolchain draft asset state is invalid: {name}")
+                  state = asset.get("state")
+                  if state == "starter":
+                      if (
+                          not allow_empty_starter
+                          or asset.get("size") != 0
+                          or asset.get("digest") not in {None, ""}
+                      ):
+                          raise SystemExit(f"toolchain draft asset state is invalid: {name}")
+                      starters.append(asset)
+                  elif state != "uploaded":
+                      raise SystemExit(f"toolchain draft asset state is invalid: {name}")
+                  if asset_id in asset_ids:
+                      raise SystemExit("toolchain draft contains a duplicate asset identifier")
+                  by_name[name] = asset
+                  asset_ids.add(asset_id)
+              if complete and set(by_name) != set(names):
+                  raise SystemExit("toolchain draft asset closure is not exact")
+              return by_name, starters
+
+          resolved_tag_commit = require_protected_source_refs()
+          require_immutable_release_policy()
+          matches = [
+              release
+              for release in list_releases()
+              if isinstance(release, dict) and release.get("tag_name") == tag
+          ]
+          if len(matches) > 1:
+              raise SystemExit("multiple releases claim the toolchain tag")
+          if matches:
+              release_id = matches[0].get("id")
+              if (
+                  not isinstance(release_id, int)
+                  or isinstance(release_id, bool)
+                  or release_id <= 0
+              ):
+                  raise SystemExit("existing toolchain draft has an invalid identifier")
+          else:
+              created = request(
+                  "POST",
+                  f"{api}/releases",
+                  body=json.dumps({
+                      "tag_name": tag,
+                      "target_commitish": commit,
+                      "name": tag,
+                      "body": owner,
+                      "draft": True,
+                      "prerelease": False,
+                      "make_latest": "false",
+                      "generate_release_notes": False,
+                  }, separators=(",", ":")).encode("utf-8"),
+                  content_type="application/json",
+              )
+              release_id = created.get("id") if isinstance(created, dict) else None
+              if (
+                  not isinstance(release_id, int)
+                  or isinstance(release_id, bool)
+                  or release_id <= 0
+              ):
+                  raise SystemExit("created toolchain draft has an invalid identifier")
+
+          write_private(release_id_file, f"{release_id}\n".encode("utf-8"))
+
+          release = request("GET", f"{api}/releases/{release_id}")
+          validate_release(release, release_id)
+          existing, starters = validate_assets(
+              release, complete=False, allow_empty_starter=True
+          )
+          for asset in starters:
+              request_empty(
+                  "DELETE", f"{api}/releases/assets/{asset['id']}"
+              )
+          if starters:
+              release = request("GET", f"{api}/releases/{release_id}")
+              validate_release(release, release_id)
+              existing, _ = validate_assets(release, complete=False)
+          upload_url = release.get("upload_url")
+          if not isinstance(upload_url, str) or "{" not in upload_url:
+              raise SystemExit("toolchain draft upload URL is invalid")
+          upload_base = upload_url.split("{", 1)[0]
+          for name in names:
+              path = root / name
+              size = path.stat().st_size
+              digest = "sha256:" + hash_file(path)
+              prior = existing.get(name)
+              if prior is not None:
+                  if (
+                      prior.get("size") != size
+                      or prior.get("digest") != digest
+                  ):
+                      raise SystemExit(f"existing draft asset differs: {name}")
+                  continue
+              upload_file(
+                  upload_base + "?" + urllib.parse.urlencode({"name": name}),
+                  path,
+                  mimetypes.guess_type(name)[0] or "application/octet-stream",
+                  release_id,
+              )
+          final = request("GET", f"{api}/releases/{release_id}")
+          validate_release(final, release_id)
+          assets, _ = validate_assets(final, complete=True)
+          for name in names:
+              path = root / name
+              if (
+                  assets[name].get("size") != path.stat().st_size
+                  or assets[name].get("digest") != "sha256:" + hash_file(path)
+              ):
+                  raise SystemExit(f"uploaded draft asset failed byte verification: {name}")
+          require_immutable_release_policy()
+          resolved_tag_commit = require_protected_source_refs()
+          evidence = {
+              "assets": [
+                  {
+                      "digest": assets[name]["digest"],
+                      "id": assets[name]["id"],
+                      "name": name,
+                      "size_bytes": assets[name]["size"],
+                  }
+                  for name in sorted(names)
+              ],
+              "body": owner,
+              "current_release_state": {
+                  "draft": True,
+                  "immutable": False,
+                  "prerelease": False,
+              },
+              "owner": owner,
+              "publication_boundary": "independent_human_exact_id_refetch",
+              "publication_request": {
+                  "draft": False,
+                  "make_latest": "false",
+                  "prerelease": False,
+              },
+              "release_id": release_id,
+              "repository": repository,
+              "schema_version": 1,
+              "source_commit": commit,
+              "tag": tag,
+              "resolved_tag_commit": resolved_tag_commit,
+              "verified_publication_artifact": {
+                  "digest": verified_artifact_digest,
+                  "id": int(verified_artifact_id),
+                  "retention_days": 45,
+              },
+              "workflow_run_attempt": int(workflow_run_attempt),
+              "workflow_run_id": int(workflow_run_id),
+          }
+          encoded_evidence = (
+              json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+          ).encode("utf-8")
+          write_private(
+              evidence_root / "manual-publication-request.json",
+              encoded_evidence,
+          )
+          PY
+          RELEASE_ID="$(cat "$RELEASE_ID_FILE")"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Stable toolchain release draft ready
+
+          Draft release ID: \`$RELEASE_ID\`
+
+          GitHub's release API does not expose compare-and-swap or an exclusive publication lease. Before publishing, independently re-fetch this exact release ID and match its repository, tag, source commit, owner body, draft/stable state, verified-publication artifact, and every remote asset ID, size, and SHA-256 digest. This workflow intentionally leaves the verified stable toolchain release as a draft.
+          EOF
+
+      - name: Preserve manual publication evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-manual-publication-${{ github.sha }}
+          path: ${{ runner.temp }}/toolchain-manual-publication-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Report the preserved owned draft
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          RELEASE_ID_FILE="$RUNNER_TEMP/toolchain-draft-release-id"
+          test -f "$RELEASE_ID_FILE" || exit 0
+          RELEASE_ID="$(cat "$RELEASE_ID_FILE")"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+          RELEASE_JSON="$RUNNER_TEMP/toolchain-incomplete-release.json"
+          if ! gh api -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >"$RELEASE_JSON" 2>/dev/null
+          then
+            echo "Stored toolchain release ID $RELEASE_ID could not be reverified; no cleanup was attempted." >&2
+            exit 0
+          fi
+          if python3 -I - "$RELEASE_JSON" "$RELEASE_ID" "$GITHUB_REPOSITORY" \
+            "$GITHUB_SHA" "toolchain-v$VERSION" <<'PY'
+          import json
+          import sys
+
+          path, release_id, repository, commit, tag = sys.argv[1:]
+          owner = (
+              f"<!-- easysplat-toolchain-release-owner:v1:"
+              f"{repository}:{tag}:{commit} -->"
+          )
+          with open(path, encoding="utf-8") as source:
+              release = json.load(source)
+          valid = (
+              isinstance(release, dict)
+              and release.get("id") == int(release_id)
+              and release.get("tag_name") == tag
+              and release.get("target_commitish") == commit
+              and release.get("name") == tag
+              and release.get("body") == owner
+              and release.get("draft") is True
+              and release.get("prerelease") is False
+              and release.get("immutable") is False
+          )
+          raise SystemExit(0 if valid else 1)
+          PY
+          then
+            cat >>"$GITHUB_STEP_SUMMARY" <<EOF
+          ## Unpublished toolchain draft preserved
+
+          Owned draft release ID \`$RELEASE_ID\` remains unpublished. Re-run Toolchain Publication with the same exact evidence after correcting the failure; the workflow will revalidate and resume this draft.
+          EOF
+          else
+            echo "Stored toolchain release ID $RELEASE_ID no longer matches the owned draft; no cleanup was attempted." >&2
+          fi

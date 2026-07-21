@@ -5,14 +5,229 @@ import MetalKit
 import SplatIO
 
 public class SplatRenderer {
+    private final class SceneReadAbortState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var aborted = false
+
+        var shouldAbort: Bool {
+            lock.withLock { aborted }
+        }
+
+        func abort() {
+            lock.withLock {
+                aborted = true
+            }
+        }
+    }
+
+    enum InitializationError: LocalizedError, Sendable, Equatable {
+        case shaderLibraryUnavailable(String)
+        case missingShaderFunction(String)
+        case renderPipelineUnavailable(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .shaderLibraryUnavailable(let reason):
+                "The viewer shader library could not be loaded: \(reason)"
+            case .missingShaderFunction(let name):
+                "The viewer shader library is missing \(name)."
+            case .renderPipelineUnavailable(let reason):
+                "The viewer render pipeline could not be created: \(reason)"
+            }
+        }
+    }
+
+    public enum ViewerMemoryAdmissionError: LocalizedError, Sendable, Equatable {
+        case invalidBudget(Int)
+        case invalidSplatCapacity(Int)
+        case arithmeticOverflow(pointCount: Int)
+        case budgetExceeded(pointCount: Int, requiredBytes: Int, budgetBytes: Int)
+        case permanentCapacityExceeded(
+            pointCount: Int,
+            requiredBytes: Int,
+            maximumRecoverableBytes: Int
+        )
+
+        public var errorDescription: String? {
+            switch self {
+            case .invalidBudget(let bytes):
+                return "The viewer memory budget is invalid (\(bytes) bytes)."
+            case .invalidSplatCapacity(let pointCount):
+                return "The viewer splat capacity is invalid (\(pointCount) splats)."
+            case .arithmeticOverflow(let pointCount):
+                return "The splat count is too large to calculate a safe viewer working set (\(pointCount))."
+            case .budgetExceeded(let pointCount, let requiredBytes, let budgetBytes):
+                let required = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: requiredBytes),
+                    countStyle: .memory
+                )
+                let available = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: budgetBytes),
+                    countStyle: .memory
+                )
+                return "This splat needs about \(required) to open, but \(available) is available to the viewer (\(pointCount) splats)."
+            case .permanentCapacityExceeded(
+                let pointCount,
+                let requiredBytes,
+                let maximumRecoverableBytes
+            ):
+                let required = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: requiredBytes),
+                    countStyle: .memory
+                )
+                let maximum = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: maximumRecoverableBytes),
+                    countStyle: .memory
+                )
+                return "This splat needs about \(required) to open, beyond this Mac’s viewer capacity of \(maximum) (\(pointCount) splats)."
+            }
+        }
+    }
+
+    public enum ViewerMemoryModel {
+        /// PLY decoding, command buffers, the drawable, and framework bookkeeping are not
+        /// proportional to point count, so retain a fixed margin in every admission decision.
+        public static let fixedReserveBytes = 64 * 1_024 * 1_024
+
+        /// During a full-SH camera sort, all of these allocations coexist: encoded geometry,
+        /// 16 packed SH RGB triplets, the published and replacement index buffers, and two CPU
+        /// index/depth arrays. The async scalar sort captures the reusable array, then mutates a
+        /// local copy, so Swift copy-on-write keeps both backing stores live while sorting. The
+        /// production reader admits against this worst-case representation before it knows whether
+        /// a PLY uses SH0 or SH3.
+        public static let bytesPerFullSphericalHarmonicSplat =
+            MemoryLayout<Splat>.stride
+            + SHDegree.payloadCount * MemoryLayout<PackedHalf3>.stride
+            + 2 * MemoryLayout<IndexType>.stride
+            + 2 * MemoryLayout<SplatIndexAndDepth>.stride
+
+        public static func requiredBytes(forPointCount pointCount: Int) throws -> Int {
+            guard pointCount >= 0 else {
+                throw ViewerMemoryAdmissionError.arithmeticOverflow(pointCount: pointCount)
+            }
+            let variable = pointCount.multipliedReportingOverflow(
+                by: bytesPerFullSphericalHarmonicSplat
+            )
+            guard !variable.overflow else {
+                throw ViewerMemoryAdmissionError.arithmeticOverflow(pointCount: pointCount)
+            }
+            let total = fixedReserveBytes.addingReportingOverflow(variable.partialValue)
+            guard !total.overflow else {
+                throw ViewerMemoryAdmissionError.arithmeticOverflow(pointCount: pointCount)
+            }
+            return total.partialValue
+        }
+
+        public static func admit(pointCount: Int, budgetBytes: Int) throws {
+            guard budgetBytes >= 0 else {
+                throw ViewerMemoryAdmissionError.invalidBudget(budgetBytes)
+            }
+            let requiredBytes = try requiredBytes(forPointCount: pointCount)
+            guard requiredBytes <= budgetBytes else {
+                throw ViewerMemoryAdmissionError.budgetExceeded(
+                    pointCount: pointCount,
+                    requiredBytes: requiredBytes,
+                    budgetBytes: budgetBytes
+                )
+            }
+        }
+    }
+
+    public static func isRetryableLoadError(_ error: Swift.Error) -> Bool {
+        if error is CancellationError {
+            return false
+        }
+        if let memoryError = error as? ViewerMemoryAdmissionError {
+            switch memoryError {
+            case .budgetExceeded:
+                return true
+            case .invalidBudget,
+                 .invalidSplatCapacity,
+                 .arithmeticOverflow,
+                 .permanentCapacityExceeded:
+                return false
+            }
+        }
+        if error is ReadError
+            || error is SplatEncodingError
+            || error is SplatRenderEncodingValidationError
+            || error is InitializationError {
+            return false
+        }
+        return SplatPLYSceneReader.isRetryableReadError(error)
+    }
+
+    private enum ReadError: LocalizedError {
+        case incomplete
+        case callbackWithoutActiveRead
+        case failureWithoutError
+
+        var errorDescription: String? {
+            switch self {
+            case .incomplete:
+                "Splat reader returned before completing"
+            case .callbackWithoutActiveRead:
+                "Splat reader callback arrived without an active read"
+            case .failureWithoutError:
+                "Splat reader failed without an error"
+            }
+        }
+    }
+
+    private enum SplatEncodingError: LocalizedError {
+        case invalidAdditionalCapacity(Int)
+        case mixedColorEncodings
+        case sphericalHarmonicCapacityOverflow
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidAdditionalCapacity(let count):
+                "Additional splat capacity cannot be negative (\(count))."
+            case .mixedColorEncodings:
+                "A splat scene cannot mix full spherical-harmonic and fixed-color points."
+            case .sphericalHarmonicCapacityOverflow:
+                "The spherical-harmonic coefficient buffer is too large."
+            }
+        }
+    }
+
+    public enum SortFailure: LocalizedError, Sendable, Equatable {
+        case orderBufferAllocationFailed(String)
+        case sceneResetAllocationFailed(String)
+        case temporaryBufferAllocationFailed(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .orderBufferAllocationFailed(let detail):
+                "Could not allocate a sorted splat-order buffer: \(detail)"
+            case .sceneResetAllocationFailed(let detail):
+                "Could not allocate empty splat scene storage: \(detail)"
+            case .temporaryBufferAllocationFailed(let detail):
+                "Could not allocate temporary splat-sort storage: \(detail)"
+            }
+        }
+    }
+
+    private struct SortCamera: Equatable {
+        let position: SIMD3<Float>
+        let forward: SIMD3<Float>
+    }
+
+    private struct SortContext {
+        let generation: UInt64
+        let camera: SortCamera
+        let splatBuffer: MTLBuffer
+        let splatCount: Int
+        let startedAt: Date
+        let orderBufferCapacityLimit: Int?
+    }
+
     enum Constants {
         // Keep in sync with Shaders.metal : maxViewCount
         static let maxViewCount = 2
-        // Sort by euclidian distance squared from camera position (true), or along the "forward" vector (false)
-        // TODO: compare the behaviour and performance of sortByDistance
-        // notes: sortByDistance introduces unstable artifacts when you get close to an object; whereas !sortByDistance introduces artifacts are you turn -- but they're a little subtler maybe?
+        // Euclidean distance avoids the camera-turn artifacts produced by forward-depth sorting.
         static let sortByDistance = true
-        // TODO: compare the performance of useAccelerateForSort, both for small and large scenes
+        // Keep the scalar CPU sorter as the single production path.
         static let useAccelerateForSort = false
         static let renderFrontToBack = true
     }
@@ -35,15 +250,26 @@ public class SplatRenderer {
 
     // Keep in sync with Shaders.metal : BufferIndex
     enum BufferIndex: NSInteger {
-        case uniforms = 0
-        case splat    = 1
-        case order    = 2
+        case uniforms          = 0
+        case splat             = 1
+        case order             = 2
+        case sphericalHarmonic = 3
+    }
+
+    enum SHDegree: UInt32 {
+        case sh0 = 0
+        case sh3 = 3
+
+        // Full-SH payload: one raw DC RGB triplet followed by 15 higher-order triplets.
+        static let payloadCount = 16
     }
 
     // Keep in sync with Shaders.metal : Uniforms
     struct Uniforms {
         var projectionMatrix: matrix_float4x4
         var viewMatrix: matrix_float4x4
+        var cameraWorldPosition: MTLPackedFloat3
+        var sphericalHarmonicDegree: UInt32
         var screenSize: SIMD2<UInt32> // Size of screen in pixels
     }
 
@@ -91,6 +317,14 @@ public class SplatRenderer {
         var depth: Float
     }
 
+    struct RenderSceneSnapshot {
+        let splatBuffer: MTLBuffer
+        let splatCount: Int
+        let orderBuffer: MTLBuffer
+        let sphericalHarmonicCoefficientBuffer: MTLBuffer
+        let sphericalHarmonicDegree: SHDegree
+    }
+
     var pipelineState: MTLRenderPipelineState
     var depthState: MTLDepthStencilState
     public let maxViewCount: Int
@@ -98,6 +332,10 @@ public class SplatRenderer {
 
     public var onSortStart: (() -> Void)?
     public var onSortComplete: ((TimeInterval) -> Void)?
+    public var onSortFailure: ((SortFailure) -> Void)?
+    public var onSortSuccess: (() -> Void)?
+    var onSortSnapshotCapturedForTesting: ((MTLBuffer) -> Void)?
+    var onSortWorkerBufferBoundForTesting: ((MTLBuffer) -> Void)?
 
     // dynamicUniformBuffers contains maxSimultaneousRenders uniforms buffers,
     // which we round-robin through, one per render; this is managed by switchToNextDynamicBuffer.
@@ -114,18 +352,20 @@ public class SplatRenderer {
     typealias IndexType = UInt32
     // splatBuffer contains one entry for each gaussian splat
     var splatBuffer: MetalBuffer<Splat>
+    // Full-SH scenes store raw DC plus 15 basis-major RGB triplets per splat. SH0 scenes keep this nil.
+    var sphericalHarmonicCoefficientBuffer: MetalBuffer<PackedHalf3>?
+    var sphericalHarmonicDegree: SHDegree = .sh0
+    private let emptySphericalHarmonicCoefficientBuffer: MetalBuffer<PackedHalf3>
     // orderBuffer indexes into splatBuffer, and is sorted by distance
     var orderBuffer: MetalBuffer<IndexType>
 
-    public var splatCount: Int { splatBuffer.count }
+    public var splatCount: Int { withSortStateLock { splatBuffer.count } }
 
     var sorting = false
-    // orderBufferPrime is a copy of orderBuffer, which is not currenly in use for rendering.
-    // We use this for sorting, and when we're done, swap it with orderBuffer.
-    // There's a good chance that we'll sometimes end up sorting an orderBuffer still in use for
-    // rendering;.
-    // TODO: Replace this with a more robust multiple-buffer scheme to guarantee we're never actively sorting a buffer still in use for rendering
-    var orderBufferPrime: MetalBuffer<IndexType>
+    private let sortStateLock = NSLock()
+    private var sceneGeneration: UInt64 = 0
+    private var lastScheduledSortCamera: SortCamera?
+    var sortedOrderBufferCapacityLimit: Int?
 
     // Sorting via Accelerate
     // While not sorting, we guarantee that orderBufferTempSort remains valid: the count may not match splatCount, but for every i in 0..<orderBufferTempSort.count, orderBufferTempSort should contain exactly one element equal to i
@@ -138,17 +378,79 @@ public class SplatRenderer {
     // So for every i in 0..<orderAndDepthTempSort.count, orderAndDepthTempSort should contain exactly one element with .index = i
     var orderAndDepthTempSort: [SplatIndexAndDepth] = []
 
+    private let maximumSplatCount: Int?
+    private let maximumWorkingSetBytes: Int?
+    private let maximumRecoverableWorkingSetBytes: Int
     private var readFailure: Error?
+    private var readAbortState: SceneReadAbortState?
+    private var pendingSplatBuffer: MetalBuffer<Splat>?
+    private var pendingSphericalHarmonicCoefficientBuffer: MetalBuffer<PackedHalf3>?
+    private var pendingSphericalHarmonicDegree: SHDegree = .sh0
+    private var readFinished = false
 
-    public init(device: MTLDevice,
-                colorFormat: MTLPixelFormat,
-                depthFormat: MTLPixelFormat,
-                stencilFormat: MTLPixelFormat,
-                sampleCount: Int,
-                maxViewCount: Int,
-                maxSimultaneousRenders: Int) throws {
+    public convenience init(device: MTLDevice,
+                            colorFormat: MTLPixelFormat,
+                            depthFormat: MTLPixelFormat,
+                            stencilFormat: MTLPixelFormat,
+                            sampleCount: Int,
+                            maxViewCount: Int,
+                            maxSimultaneousRenders: Int,
+                            maximumWorkingSetBytes: Int? = nil,
+                            maximumRecoverableWorkingSetBytes: Int? = nil) throws {
+        try self.init(
+            device: device,
+            colorFormat: colorFormat,
+            depthFormat: depthFormat,
+            stencilFormat: stencilFormat,
+            sampleCount: sampleCount,
+            maxViewCount: maxViewCount,
+            maxSimultaneousRenders: maxSimultaneousRenders,
+            maximumSplatCount: nil,
+            maximumWorkingSetBytes: maximumWorkingSetBytes,
+            maximumRecoverableWorkingSetBytes: maximumRecoverableWorkingSetBytes
+        )
+    }
+
+    init(device: MTLDevice,
+         colorFormat: MTLPixelFormat,
+         depthFormat: MTLPixelFormat,
+         stencilFormat: MTLPixelFormat,
+         sampleCount: Int,
+         maxViewCount: Int,
+         maxSimultaneousRenders: Int,
+         maximumSplatCount: Int?,
+         maximumWorkingSetBytes: Int? = nil,
+         maximumRecoverableWorkingSetBytes: Int? = nil) throws {
         self.maxViewCount = min(maxViewCount, Constants.maxViewCount)
         self.maxSimultaneousRenders = maxSimultaneousRenders
+        if let maximumSplatCount, maximumSplatCount <= 0 {
+            throw ViewerMemoryAdmissionError.invalidSplatCapacity(maximumSplatCount)
+        }
+        if let maximumWorkingSetBytes, maximumWorkingSetBytes < 0 {
+            throw ViewerMemoryAdmissionError.invalidBudget(maximumWorkingSetBytes)
+        }
+        if let maximumRecoverableWorkingSetBytes, maximumRecoverableWorkingSetBytes < 0 {
+            throw ViewerMemoryAdmissionError.invalidBudget(maximumRecoverableWorkingSetBytes)
+        }
+        self.maximumWorkingSetBytes = maximumWorkingSetBytes
+        let devicePointCapacity = min(
+            MetalBuffer<Splat>.maxCapacity(for: device),
+            MetalBuffer<PackedHalf3>.maxCapacity(for: device) / SHDegree.payloadCount,
+            MetalBuffer<IndexType>.maxCapacity(for: device)
+        )
+        let pointCapacity = min(maximumSplatCount ?? devicePointCapacity, devicePointCapacity)
+        self.maximumSplatCount = pointCapacity
+        let bufferBoundWorkingSetBytes = try ViewerMemoryModel.requiredBytes(
+            forPointCount: pointCapacity
+        )
+        self.maximumRecoverableWorkingSetBytes = min(
+            maximumRecoverableWorkingSetBytes ?? bufferBoundWorkingSetBytes,
+            bufferBoundWorkingSetBytes
+        )
+        if let maximumWorkingSetBytes,
+           maximumWorkingSetBytes > self.maximumRecoverableWorkingSetBytes {
+            throw ViewerMemoryAdmissionError.invalidBudget(maximumWorkingSetBytes)
+        }
 
         let dynamicUniformBuffersSize = UniformsArray.alignedSize * maxSimultaneousRenders
         self.dynamicUniformBuffers = device.makeBuffer(length: dynamicUniformBuffersSize,
@@ -156,11 +458,13 @@ public class SplatRenderer {
         self.dynamicUniformBuffers.label = "Uniform Buffers"
         self.uniforms = UnsafeMutableRawPointer(dynamicUniformBuffers.contents()).bindMemory(to: UniformsArray.self, capacity: 1)
 
-        self.splatBuffer = try MetalBuffer(device: device)
+        self.splatBuffer = try MetalBuffer(device: device, maximumCapacity: pointCapacity)
+        self.sphericalHarmonicCoefficientBuffer = nil
+        self.emptySphericalHarmonicCoefficientBuffer = try MetalBuffer(device: device)
         self.orderBuffer = try MetalBuffer(device: device)
-        self.orderBufferPrime = try MetalBuffer(device: device)
         self.orderBufferTempSort = try MetalBuffer(device: device)
         self.depthBufferTempSort = try MetalBuffer(device: device)
+        self.sortedOrderBufferCapacityLimit = nil
 
         pipelineState = try Self.buildRenderPipelineWithDevice(device: device,
                                                                colorFormat: colorFormat,
@@ -176,21 +480,99 @@ public class SplatRenderer {
     }
 
     public func reset() {
-        splatBuffer.count = 0
-        orderBuffer.count = 0
-        orderBufferPrime.count = 0
-        orderBufferTempSort.count = 0
-        depthBufferTempSort.count = 0
-        orderAndDepthTempSort = []
+        do {
+            let emptySplats = try MetalBuffer<Splat>(
+                device: splatBuffer.device,
+                maximumCapacity: maximumSplatCount
+            )
+            let emptyOrder = try makeOrderBuffer(
+                device: splatBuffer.device,
+                count: 0,
+                maximumCapacity: nil,
+                indexAt: { _ in 0 }
+            )
+            withSortStateLock {
+                splatBuffer = emptySplats
+                sphericalHarmonicCoefficientBuffer = nil
+                sphericalHarmonicDegree = .sh0
+                orderBuffer = emptyOrder
+                sceneGeneration &+= 1
+                lastScheduledSortCamera = nil
+            }
+        } catch {
+            recordSortFailure(.sceneResetAllocationFailed(error.localizedDescription))
+        }
     }
 
     public func readPLY(from url: URL) throws {
+        try readPLY(from: url, shouldCancel: { false })
+    }
+
+    public func readPLY(
+        from url: URL,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws {
+        try readScene(shouldCancel: shouldCancel) { delegate, shouldStop in
+            SplatPLYSceneReader(
+                url,
+                validatesRenderEncoding: false
+            ).read(to: delegate, shouldCancel: shouldStop)
+        }
+    }
+
+    func readScene(
+        shouldCancel: @escaping @Sendable () -> Bool,
+        using read: (
+            _ delegate: SplatSceneReaderDelegate,
+            _ shouldStop: @escaping @Sendable () -> Bool
+        ) -> Void
+    ) throws {
         readFailure = nil
-        SplatPLYSceneReader(url).read(to: self)
-        if let readFailure {
+        readFinished = false
+        let readAbortState = SceneReadAbortState()
+        self.readAbortState = readAbortState
+        let pendingSplatBuffer = try MetalBuffer<Splat>(
+            device: splatBuffer.device,
+            maximumCapacity: maximumSplatCount
+        )
+        self.pendingSplatBuffer = pendingSplatBuffer
+        self.pendingSphericalHarmonicCoefficientBuffer = nil
+        self.pendingSphericalHarmonicDegree = .sh0
+        defer {
+            self.pendingSplatBuffer = nil
+            self.pendingSphericalHarmonicCoefficientBuffer = nil
+            self.pendingSphericalHarmonicDegree = .sh0
             self.readFailure = nil
+            self.readFinished = false
+            self.readAbortState = nil
+        }
+
+        let shouldStop: @Sendable () -> Bool = {
+            shouldCancel() || readAbortState.shouldAbort
+        }
+        read(self, shouldStop)
+        if let readFailure {
             throw readFailure
         }
+        if shouldCancel() {
+            throw CancellationError()
+        }
+        guard readFinished else {
+            throw ReadError.incomplete
+        }
+
+        let identityOrder = try makeOrderBuffer(
+            device: pendingSplatBuffer.device,
+            count: pendingSplatBuffer.count,
+            maximumCapacity: nil,
+            indexAt: { UInt32($0) }
+        )
+        publishScene(
+            splats: pendingSplatBuffer,
+            sphericalHarmonics: pendingSphericalHarmonicCoefficientBuffer,
+            degree: pendingSphericalHarmonicDegree,
+            order: identityOrder
+        )
     }
 
     private class func buildRenderPipelineWithDevice(device: MTLDevice,
@@ -202,19 +584,29 @@ public class SplatRenderer {
         let library: MTLLibrary
         do {
             library = try device.makeDefaultLibrary(bundle: Bundle.module)
-        } catch {
+        } catch let bundledLibraryError {
             // SwiftPM does not always build a default .metallib for `.metal` files included as
             // resources, which causes `makeDefaultLibrary(bundle:)` to fail at runtime.
             // Fall back to compiling from the packaged shader source.
             guard let shaderURL = Bundle.module.url(forResource: "Shaders", withExtension: "metal") else {
-                throw error
+                throw InitializationError.shaderLibraryUnavailable(
+                    bundledLibraryError.localizedDescription
+                )
             }
-            let source = try String(contentsOf: shaderURL, encoding: .utf8)
-            library = try device.makeLibrary(source: source, options: nil)
+            do {
+                let source = try String(contentsOf: shaderURL, encoding: .utf8)
+                library = try device.makeLibrary(source: source, options: nil)
+            } catch {
+                throw InitializationError.shaderLibraryUnavailable(error.localizedDescription)
+            }
         }
 
-        let vertexFunction = library.makeFunction(name: "splatVertexShader")
-        let fragmentFunction = library.makeFunction(name: "splatFragmentShader")
+        guard let vertexFunction = library.makeFunction(name: "splatVertexShader") else {
+            throw InitializationError.missingShaderFunction("splatVertexShader")
+        }
+        guard let fragmentFunction = library.makeFunction(name: "splatFragmentShader") else {
+            throw InitializationError.missingShaderFunction("splatFragmentShader")
+        }
 
         let pipelineDescriptor = MTLRenderPipelineDescriptor()
         pipelineDescriptor.label = "RenderPipeline"
@@ -246,25 +638,78 @@ public class SplatRenderer {
 
         pipelineDescriptor.maxVertexAmplificationCount = maxViewCount
 
-        return try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        do {
+            return try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        } catch {
+            throw InitializationError.renderPipelineUnavailable(error.localizedDescription)
+        }
     }
 
     public func ensureAdditionalCapacity(_ pointCount: Int) throws {
-        try splatBuffer.ensureCapacity(splatBuffer.count + pointCount)
+        try withSortStateLock {
+            guard pointCount >= 0 else {
+                throw SplatEncodingError.invalidAdditionalCapacity(pointCount)
+            }
+            let targetCount = splatBuffer.count.addingReportingOverflow(pointCount)
+            guard !targetCount.overflow else {
+                throw SplatEncodingError.sphericalHarmonicCapacityOverflow
+            }
+            try splatBuffer.ensureCapacity(targetCount.partialValue)
+            if let sphericalHarmonicCoefficientBuffer {
+                try sphericalHarmonicCoefficientBuffer.ensureCapacity(
+                    Self.sphericalHarmonicCoefficientCount(for: targetCount.partialValue)
+                )
+            }
+        }
     }
 
     public func add(_ point: SplatScenePoint) throws {
-        do {
-            try ensureAdditionalCapacity(1)
-        } catch {
-            Self.log.error("Failed to grow buffers: \(error)")
-            return
+        let validated = try SplatRenderEncodingValidator.encode(point)
+        let encoded = Splat(validated)
+        try withSortStateLock {
+            try Self.validateColorEncoding(
+                usesFullSphericalHarmonics: validated.sphericalHarmonics != nil,
+                existingPointCount: splatBuffer.count,
+                degree: sphericalHarmonicDegree
+            )
+            let newCount = splatBuffer.count + 1
+            try splatBuffer.ensureCapacity(newCount)
+            let identityOrder = try makeOrderBuffer(
+                device: splatBuffer.device,
+                count: newCount,
+                maximumCapacity: nil,
+                indexAt: { UInt32($0) }
+            )
+            var coefficients = sphericalHarmonicCoefficientBuffer
+            var degree = sphericalHarmonicDegree
+            try Self.appendSphericalHarmonics(
+                payload: validated.sphericalHarmonics,
+                existingPointCount: splatBuffer.count,
+                targetPointCapacity: splatBuffer.capacity,
+                device: splatBuffer.device,
+                maximumCoefficientCount: try maximumSphericalHarmonicCoefficientCount(),
+                buffer: &coefficients,
+                degree: &degree
+            )
+            sphericalHarmonicCoefficientBuffer = coefficients
+            sphericalHarmonicDegree = degree
+            splatBuffer.append(encoded)
+            orderBuffer = identityOrder
+            sceneGeneration &+= 1
+            lastScheduledSortCamera = nil
         }
-
-        splatBuffer.append([ Splat(point) ])
     }
 
-    public func willRender(viewportCameras: [CameraDescriptor]) {}
+    public func willRender(viewportCameras: [CameraDescriptor]) {
+        let camera = SortCamera(
+            position: viewportCameras.map { Self.cameraWorldPosition(forViewMatrix: $0.viewMatrix) }.mean ?? .zero,
+            forward: viewportCameras.map { Self.cameraWorldForward(forViewMatrix: $0.viewMatrix) }.mean?.normalized
+                ?? .init(x: 0, y: 0, z: -1)
+        )
+        cameraWorldPosition = camera.position
+        cameraWorldForward = camera.forward
+        resortIndicesIfCameraChanged(camera)
+    }
 
     private func switchToNextDynamicBuffer() {
         uniformBufferIndex = (uniformBufferIndex + 1) % maxSimultaneousRenders
@@ -272,19 +717,22 @@ public class SplatRenderer {
         uniforms = UnsafeMutableRawPointer(dynamicUniformBuffers.contents() + uniformBufferOffset).bindMemory(to: UniformsArray.self, capacity: 1)
     }
 
-    private func updateUniforms(forViewportCameras viewportCameras: [CameraDescriptor]) {
-        for (i, viewportCamera) in viewportCameras.enumerated() where i <= maxViewCount {
+    private func updateUniforms(
+        forViewportCameras viewportCameras: [CameraDescriptor],
+        sphericalHarmonicDegree: SHDegree
+    ) {
+        for (i, viewportCamera) in viewportCameras.prefix(maxViewCount).enumerated() {
+            let cameraPosition = Self.cameraWorldPosition(forViewMatrix: viewportCamera.viewMatrix)
             let uniforms = Uniforms(projectionMatrix: viewportCamera.projectionMatrix,
                                     viewMatrix: viewportCamera.viewMatrix,
+                                    cameraWorldPosition: MTLPackedFloat3Make(
+                                        cameraPosition.x,
+                                        cameraPosition.y,
+                                        cameraPosition.z
+                                    ),
+                                    sphericalHarmonicDegree: sphericalHarmonicDegree.rawValue,
                                     screenSize: SIMD2(x: UInt32(viewportCamera.screenSize.x), y: UInt32(viewportCamera.screenSize.y)))
             self.uniforms.pointee.setUniforms(index: i, uniforms)
-        }
-
-        cameraWorldPosition = viewportCameras.map { Self.cameraWorldPosition(forViewMatrix: $0.viewMatrix) }.mean ?? .zero
-        cameraWorldForward = viewportCameras.map { Self.cameraWorldForward(forViewMatrix: $0.viewMatrix) }.mean?.normalized ?? .init(x: 0, y: 0, z: -1)
-
-        if !sorting {
-            resortIndices()
         }
     }
 
@@ -297,10 +745,40 @@ public class SplatRenderer {
     }
 
     public func render(viewportCameras: [CameraDescriptor], to renderEncoder: MTLRenderCommandEncoder) {
-        guard splatBuffer.count != 0 else { return }
+        guard let capturedScene = captureRenderScene() else { return }
+        render(
+            viewportCameras: viewportCameras,
+            capturedScene: capturedScene,
+            to: renderEncoder
+        )
+    }
+
+    func captureRenderScene() -> RenderSceneSnapshot? {
+        withSortStateLock {
+            guard splatBuffer.count != 0 else { return nil }
+            return RenderSceneSnapshot(
+                splatBuffer: splatBuffer.buffer,
+                splatCount: splatBuffer.count,
+                orderBuffer: orderBuffer.buffer,
+                sphericalHarmonicCoefficientBuffer:
+                    sphericalHarmonicCoefficientBuffer?.buffer
+                    ?? emptySphericalHarmonicCoefficientBuffer.buffer,
+                sphericalHarmonicDegree: sphericalHarmonicDegree
+            )
+        }
+    }
+
+    func render(
+        viewportCameras: [CameraDescriptor],
+        capturedScene: RenderSceneSnapshot,
+        to renderEncoder: MTLRenderCommandEncoder
+    ) {
 
         switchToNextDynamicBuffer()
-        updateUniforms(forViewportCameras: viewportCameras)
+        updateUniforms(
+            forViewportCameras: viewportCameras,
+            sphericalHarmonicDegree: capturedScene.sphericalHarmonicDegree
+        )
 
         renderEncoder.pushDebugGroup("Draw Splat Model")
 
@@ -309,18 +787,30 @@ public class SplatRenderer {
         renderEncoder.setDepthStencilState(depthState)
 
         renderEncoder.setVertexBuffer(dynamicUniformBuffers, offset: uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
-        renderEncoder.setVertexBuffer(splatBuffer.buffer, offset: 0, index: BufferIndex.splat.rawValue)
-        renderEncoder.setVertexBuffer(orderBuffer.buffer, offset: 0, index: BufferIndex.order.rawValue)
+        renderEncoder.setVertexBuffer(
+            capturedScene.splatBuffer,
+            offset: 0,
+            index: BufferIndex.splat.rawValue
+        )
+        renderEncoder.setVertexBuffer(
+            capturedScene.orderBuffer,
+            offset: 0,
+            index: BufferIndex.order.rawValue
+        )
+        renderEncoder.setVertexBuffer(
+            capturedScene.sphericalHarmonicCoefficientBuffer,
+            offset: 0,
+            index: BufferIndex.sphericalHarmonic.rawValue
+        )
 
         renderEncoder.drawPrimitives(type: .triangleStrip,
                                      vertexStart: 0,
                                      vertexCount: 4,
-                                     instanceCount: splatBuffer.count)
+                                     instanceCount: capturedScene.splatCount)
 
         renderEncoder.popDebugGroup()
     }
 
-    // Set indicesPrime to a depth-sorted version of indices, then swap indices and indicesPrime
     public func resortIndices() {
         if Constants.useAccelerateForSort {
             resortIndicesViaAccelerate()
@@ -330,190 +820,416 @@ public class SplatRenderer {
     }
 
     public func resortIndicesOnCPU() {
-        guard !sorting else { return }
-        sorting = true
+        resortIndicesOnCPU(camera: currentSortCamera, force: true)
+    }
+
+    public func resortIndicesViaAccelerate() {
+        resortIndicesViaAccelerate(camera: currentSortCamera, force: true)
+    }
+
+    private var currentSortCamera: SortCamera {
+        SortCamera(position: cameraWorldPosition, forward: cameraWorldForward)
+    }
+
+    private func resortIndicesIfCameraChanged(_ camera: SortCamera) {
+        if Constants.useAccelerateForSort {
+            resortIndicesViaAccelerate(camera: camera, force: false)
+        } else {
+            resortIndicesOnCPU(camera: camera, force: false)
+        }
+    }
+
+    private func resortIndicesOnCPU(camera: SortCamera, force: Bool) {
+        guard let context = beginSort(camera: camera, force: force) else { return }
+        onSortSnapshotCapturedForTesting?(context.splatBuffer)
         onSortStart?()
-        let sortStartTime = Date()
 
-        let splatCount = splatBuffer.count
-
-        if orderAndDepthTempSort.count != splatCount {
-            orderAndDepthTempSort = Array(repeating: SplatIndexAndDepth(index: .max, depth: 0), count: splatCount)
-            for i in 0..<splatCount {
-                orderAndDepthTempSort[i].index = UInt32(i)
+        var workingOrder = orderAndDepthTempSort
+        orderAndDepthTempSort = []
+        if workingOrder.count != context.splatCount {
+            workingOrder = Array(
+                repeating: SplatIndexAndDepth(index: .max, depth: 0),
+                count: context.splatCount
+            )
+            for index in workingOrder.indices {
+                workingOrder[index].index = UInt32(index)
             }
         }
 
-        let cameraWorldForward = cameraWorldForward
-        let cameraWorldPosition = cameraWorldPosition
-
-        Task(priority: .high) {
-            defer {
-                sorting = false
-                onSortComplete?(-sortStartTime.timeIntervalSinceNow)
-            }
-
-            // We maintain the old order in indicesAndDepthTempSort in order to provide the opportunity to optimize the sort performance
-            for i in 0..<splatCount {
-                let index = orderAndDepthTempSort[i].index
-                let splatPosition = splatBuffer.values[Int(index)].position
+        Task(priority: .high) { [self, context, workingOrder] in
+            var workingOrder = workingOrder
+            let splatValues = sortSplatValues(for: context)
+            for index in workingOrder.indices {
+                let splatIndex = workingOrder[index].index
+                let splatPosition = splatValues[Int(splatIndex)].position
                 let splatPositionUnpacked = SIMD3<Float>(splatPosition.x, splatPosition.y, splatPosition.z)
                 if Constants.sortByDistance {
-                    orderAndDepthTempSort[i].depth = (splatPositionUnpacked - cameraWorldPosition).lengthSquared
+                    workingOrder[index].depth = (splatPositionUnpacked - context.camera.position).lengthSquared
                 } else {
-                    orderAndDepthTempSort[i].depth = dot(splatPositionUnpacked, cameraWorldForward)
+                    workingOrder[index].depth = dot(splatPositionUnpacked, context.camera.forward)
                 }
             }
 
             if Constants.renderFrontToBack {
-                orderAndDepthTempSort.sort { $0.depth < $1.depth }
+                workingOrder.sort { $0.depth < $1.depth }
             } else {
-                orderAndDepthTempSort.sort { $0.depth > $1.depth }
+                workingOrder.sort { $0.depth > $1.depth }
             }
 
+            orderAndDepthTempSort = workingOrder
             do {
-                orderBufferPrime.count = 0
-                try orderBufferPrime.ensureCapacity(splatCount)
-                for i in 0..<splatCount {
-                    orderBufferPrime.append(orderAndDepthTempSort[i].index)
-                }
-
-                swap(&orderBuffer, &orderBufferPrime)
+                let sortedOrder = try makeOrderBuffer(
+                    device: context.splatBuffer.device,
+                    count: context.splatCount,
+                    maximumCapacity: context.orderBufferCapacityLimit,
+                    indexAt: { workingOrder[$0].index }
+                )
+                finishSort(context, publishedOrder: sortedOrder, failure: nil)
             } catch {
-                // TODO: report error
+                finishSort(
+                    context,
+                    publishedOrder: nil,
+                    failure: .orderBufferAllocationFailed(error.localizedDescription)
+                )
             }
         }
     }
-    
-    public func resortIndicesViaAccelerate() {
-        guard !sorting else { return }
-        sorting = true
+
+    private func resortIndicesViaAccelerate(camera: SortCamera, force: Bool) {
+        guard let context = beginSort(camera: camera, force: force) else { return }
+        onSortSnapshotCapturedForTesting?(context.splatBuffer)
         onSortStart?()
-        let sortStartTime = Date()
+        let orderScratch = orderBufferTempSort
+        let depthScratch = depthBufferTempSort
 
-        let splatCount = splatBuffer.count
-
-        if orderBufferTempSort.count != splatCount {
+        if orderScratch.count != context.splatCount || depthScratch.count != context.splatCount {
             do {
-                try orderBufferTempSort.ensureCapacity(splatCount)
-                orderBufferTempSort.count = splatCount
-                try depthBufferTempSort.ensureCapacity(splatCount)
-                depthBufferTempSort.count = splatCount
+                try orderScratch.ensureCapacity(context.splatCount)
+                try depthScratch.ensureCapacity(context.splatCount)
+                orderScratch.count = context.splatCount
+                depthScratch.count = context.splatCount
 
-                for i in 0..<splatCount {
-                    orderBufferTempSort.values[i] = UInt(i)
+                for index in 0..<context.splatCount {
+                    orderScratch.values[index] = UInt(index)
                 }
             } catch {
-                // TODO: report error
-                sorting = false
+                finishSort(
+                    context,
+                    publishedOrder: nil,
+                    failure: .temporaryBufferAllocationFailed(error.localizedDescription)
+                )
                 return
             }
         }
 
-        let cameraWorldForward = cameraWorldForward
-        let cameraWorldPosition = cameraWorldPosition
-
-        Task(priority: .high) {
-            defer {
-                sorting = false
-                onSortComplete?(-sortStartTime.timeIntervalSinceNow)
-            }
-
-            // TODO: use Accelerate to calculate the depth
-            // We maintain the old order in indicesTempSort in order to provide the opportunity to optimize the sort performance
-            for index in 0..<splatCount {
-                let splatPosition = splatBuffer.values[Int(index)].position
+        Task(priority: .high) { [self, context, orderScratch, depthScratch] in
+            let splatValues = sortSplatValues(for: context)
+            // Depth remains scalar in this opt-in path; vDSP performs the indexed sort below.
+            for index in 0..<context.splatCount {
+                let splatPosition = splatValues[index].position
                 let splatPositionUnpacked = SIMD3<Float>(splatPosition.x, splatPosition.y, splatPosition.z)
                 if Constants.sortByDistance {
-                    depthBufferTempSort.values[index] = (splatPositionUnpacked - cameraWorldPosition).lengthSquared
+                    depthScratch.values[index] = (splatPositionUnpacked - context.camera.position).lengthSquared
                 } else {
-                    depthBufferTempSort.values[index] = dot(splatPositionUnpacked, cameraWorldForward)
+                    depthScratch.values[index] = dot(splatPositionUnpacked, context.camera.forward)
                 }
             }
 
-            vDSP_vsorti(depthBufferTempSort.values,
-                        orderBufferTempSort.values,
+            vDSP_vsorti(depthScratch.values,
+                        orderScratch.values,
                         nil,
-                        vDSP_Length(splatCount),
+                        vDSP_Length(context.splatCount),
                         Constants.renderFrontToBack ? 1 : -1)
 
             do {
-                orderBufferPrime.count = 0
-                try orderBufferPrime.ensureCapacity(splatCount)
-                for i in 0..<splatCount {
-                    orderBufferPrime.append(UInt32(orderBufferTempSort.values[i]))
-                }
-
-                swap(&orderBuffer, &orderBufferPrime)
+                let sortedOrder = try makeOrderBuffer(
+                    device: context.splatBuffer.device,
+                    count: context.splatCount,
+                    maximumCapacity: context.orderBufferCapacityLimit,
+                    indexAt: { UInt32(orderScratch.values[$0]) }
+                )
+                finishSort(context, publishedOrder: sortedOrder, failure: nil)
             } catch {
-                // TODO: report error
+                finishSort(
+                    context,
+                    publishedOrder: nil,
+                    failure: .orderBufferAllocationFailed(error.localizedDescription)
+                )
             }
         }
+    }
+
+    private func beginSort(camera: SortCamera, force: Bool) -> SortContext? {
+        withSortStateLock {
+            guard !sorting else { return nil }
+            guard splatBuffer.count > 0 else { return nil }
+            if !force, lastScheduledSortCamera == camera {
+                return nil
+            }
+            sorting = true
+            lastScheduledSortCamera = camera
+            return SortContext(
+                generation: sceneGeneration,
+                camera: camera,
+                splatBuffer: splatBuffer.buffer,
+                splatCount: splatBuffer.count,
+                startedAt: Date(),
+                orderBufferCapacityLimit: sortedOrderBufferCapacityLimit
+            )
+        }
+    }
+
+    private func finishSort(
+        _ context: SortContext,
+        publishedOrder: MetalBuffer<IndexType>?,
+        failure: SortFailure?
+    ) {
+        let isCurrentGeneration = withSortStateLock {
+            let isCurrent = context.generation == sceneGeneration
+            if isCurrent, let publishedOrder {
+                orderBuffer = publishedOrder
+            }
+            sorting = false
+            return isCurrent
+        }
+
+        if isCurrentGeneration, let failure {
+            recordSortFailure(failure)
+        } else if isCurrentGeneration, publishedOrder != nil {
+            onSortSuccess?()
+        }
+        onSortComplete?(-context.startedAt.timeIntervalSinceNow)
+    }
+
+    private func sortSplatValues(for context: SortContext) -> UnsafeMutablePointer<Splat> {
+        onSortWorkerBufferBoundForTesting?(context.splatBuffer)
+        return UnsafeMutableRawPointer(context.splatBuffer.contents())
+            .bindMemory(to: Splat.self, capacity: context.splatCount)
+    }
+
+    private func makeOrderBuffer(
+        device: MTLDevice,
+        count: Int,
+        maximumCapacity: Int?,
+        indexAt: (Int) -> IndexType
+    ) throws -> MetalBuffer<IndexType> {
+        guard count <= Int(UInt32.max) else {
+            throw SortFailure.orderBufferAllocationFailed("The scene contains too many splats to index.")
+        }
+        let buffer = try MetalBuffer<IndexType>(
+            device: device,
+            capacity: max(1, count),
+            maximumCapacity: maximumCapacity
+        )
+        for index in 0..<count {
+            buffer.append(indexAt(index))
+        }
+        return buffer
+    }
+
+    private func recordSortFailure(_ failure: SortFailure) {
+        Self.log.error("Failed to update splat ordering: \(failure.localizedDescription)")
+        onSortFailure?(failure)
+    }
+
+    private func withSortStateLock<T>(_ body: () throws -> T) rethrows -> T {
+        sortStateLock.lock()
+        defer { sortStateLock.unlock() }
+        return try body()
+    }
+
+    private func publishScene(
+        splats: MetalBuffer<Splat>,
+        sphericalHarmonics: MetalBuffer<PackedHalf3>?,
+        degree: SHDegree,
+        order: MetalBuffer<IndexType>
+    ) {
+        withSortStateLock {
+            splatBuffer = splats
+            sphericalHarmonicCoefficientBuffer = sphericalHarmonics
+            sphericalHarmonicDegree = degree
+            orderBuffer = order
+            sceneGeneration &+= 1
+            lastScheduledSortCamera = nil
+        }
+    }
+
+    private static func appendSphericalHarmonics(
+        payload: SplatRenderSphericalHarmonics?,
+        existingPointCount: Int,
+        targetPointCapacity: Int,
+        device: MTLDevice,
+        maximumCoefficientCount: Int?,
+        buffer: inout MetalBuffer<PackedHalf3>?,
+        degree: inout SHDegree
+    ) throws {
+        if payload != nil, buffer == nil {
+            guard existingPointCount == 0 else {
+                throw SplatEncodingError.mixedColorEncodings
+            }
+            let capacity = try sphericalHarmonicCoefficientCount(for: targetPointCapacity)
+            let newBuffer = try MetalBuffer<PackedHalf3>(
+                device: device,
+                capacity: max(1, capacity),
+                maximumCapacity: maximumCoefficientCount
+            )
+            buffer = newBuffer
+            degree = .sh3
+        }
+
+        guard let buffer else { return }
+        let requiredCount = try sphericalHarmonicCoefficientCount(for: existingPointCount + 1)
+        try buffer.ensureCapacity(requiredCount)
+        if let payload {
+            for index in 0..<SplatRenderSphericalHarmonics.coefficientCount {
+                let coefficient = payload[index]
+                buffer.append(PackedHalf3(
+                    x: Float16(coefficient.x),
+                    y: Float16(coefficient.y),
+                    z: Float16(coefficient.z)
+                ))
+            }
+        } else {
+            throw SplatEncodingError.mixedColorEncodings
+        }
+    }
+
+    private static func validateColorEncoding(
+        usesFullSphericalHarmonics: Bool,
+        existingPointCount: Int,
+        degree: SHDegree
+    ) throws {
+        guard existingPointCount > 0 else { return }
+        guard usesFullSphericalHarmonics == (degree == .sh3) else {
+            throw SplatEncodingError.mixedColorEncodings
+        }
+    }
+
+    private func maximumSphericalHarmonicCoefficientCount() throws -> Int? {
+        guard let maximumSplatCount else { return nil }
+        return try Self.sphericalHarmonicCoefficientCount(for: maximumSplatCount)
+    }
+
+    private static func sphericalHarmonicCoefficientCount(for splatCount: Int) throws -> Int {
+        let result = splatCount.multipliedReportingOverflow(by: SHDegree.payloadCount)
+        guard !result.overflow else {
+            throw SplatEncodingError.sphericalHarmonicCapacityOverflow
+        }
+        return result.partialValue
     }
 }
 
 extension SplatRenderer: SplatSceneReaderDelegate {
     public func didStartReading(withPointCount pointCount: UInt32) {
         Self.log.info("Will read \(pointCount) points")
-        try? ensureAdditionalCapacity(Int(pointCount))
+        guard let pendingSplatBuffer else {
+            recordReadFailure(ReadError.callbackWithoutActiveRead)
+            return
+        }
+        do {
+            let requiredBytes = try ViewerMemoryModel.requiredBytes(
+                forPointCount: Int(pointCount)
+            )
+            guard requiredBytes <= maximumRecoverableWorkingSetBytes else {
+                throw ViewerMemoryAdmissionError.permanentCapacityExceeded(
+                    pointCount: Int(pointCount),
+                    requiredBytes: requiredBytes,
+                    maximumRecoverableBytes: maximumRecoverableWorkingSetBytes
+                )
+            }
+            if let maximumWorkingSetBytes {
+                try ViewerMemoryModel.admit(
+                    pointCount: Int(pointCount),
+                    budgetBytes: maximumWorkingSetBytes
+                )
+            }
+            try pendingSplatBuffer.ensureCapacity(Int(pointCount))
+        } catch {
+            recordReadFailure(error)
+        }
     }
 
     public func didRead(points: [SplatIO.SplatScenePoint]) {
-        for point in points {
-            try? add(point)
+        guard readFailure == nil else { return }
+        guard let pendingSplatBuffer else {
+            recordReadFailure(ReadError.callbackWithoutActiveRead)
+            return
+        }
+        do {
+            try pendingSplatBuffer.ensureCapacity(pendingSplatBuffer.count + points.count)
+            for point in points {
+                let validated = try SplatRenderEncodingValidator.encode(point)
+                let encoded = Splat(validated)
+                try Self.validateColorEncoding(
+                    usesFullSphericalHarmonics: validated.sphericalHarmonics != nil,
+                    existingPointCount: pendingSplatBuffer.count,
+                    degree: pendingSphericalHarmonicDegree
+                )
+                var coefficients = pendingSphericalHarmonicCoefficientBuffer
+                var degree = pendingSphericalHarmonicDegree
+                try Self.appendSphericalHarmonics(
+                    payload: validated.sphericalHarmonics,
+                    existingPointCount: pendingSplatBuffer.count,
+                    targetPointCapacity: pendingSplatBuffer.capacity,
+                    device: pendingSplatBuffer.device,
+                    maximumCoefficientCount: try maximumSphericalHarmonicCoefficientCount(),
+                    buffer: &coefficients,
+                    degree: &degree
+                )
+                pendingSphericalHarmonicCoefficientBuffer = coefficients
+                pendingSphericalHarmonicDegree = degree
+                pendingSplatBuffer.append(encoded)
+            }
+        } catch {
+            recordReadFailure(error)
         }
     }
 
     public func didFinishReading() {
+        readFinished = true
         Self.log.info("Finished reading points")
     }
 
     public func didFailReading(withError error: Error?) {
+        recordReadFailure(error ?? ReadError.failureWithoutError)
+    }
+
+    private func recordReadFailure(_ error: Error) {
+        guard readFailure == nil else { return }
         readFailure = error
-        Self.log.error("Failed to read points: \(error)")
+        readAbortState?.abort()
+        Self.log.error("Failed to read points: \(error.localizedDescription)")
     }
 }
 
 extension SplatRenderer.Splat {
-    init(_ splat: SplatScenePoint) {
-        let scale = SIMD3<Float>(exp(splat.scale.x),
-                                 exp(splat.scale.y),
-                                 exp(splat.scale.z))
-        let rotation = splat.rotation.normalized
-
-        var color: SIMD3<Float>
-        switch splat.color {
-        case let .sphericalHarmonic(r, g, b, _), let .firstOrderSphericalHarmonic(r, g, b):
-            let SH_C0: Float = 0.28209479177387814
-            color = SIMD3(x: max(0, min(1, 0.5 + SH_C0 * r)),
-                          y: max(0, min(1, 0.5 + SH_C0 * g)),
-                          z: max(0, min(1, 0.5 + SH_C0 * b)))
-        case .linearFloat(let r, let g, let b):
-            color = SIMD3(x: r / 255.0, y: g / 255.0, z: b / 255.0)
-        case .linearUInt8(let r, let g, let b):
-            color = SIMD3(x: Float(r) / 255.0, y: Float(g) / 255.0, z: Float(b) / 255.0)
-        case .none:
-            color = .zero
-        }
-
-        let opacity = 1 / (1 + exp(-splat.opacity))
-
-        self.init(position: splat.position,
-                  color: .init(color.sRGBToLinear, opacity),
-                  scale: scale,
-                  rotation: rotation)
-    }
-
-    init(position: SIMD3<Float>,
-         color: SIMD4<Float>,
-         scale: SIMD3<Float>,
-         rotation: simd_quatf) {
-        let transform = simd_float3x3(rotation) * simd_float3x3(diagonal: scale)
-        let cov3D = transform * transform.transpose
-        self.init(position: MTLPackedFloat3Make(position.x, position.y, position.z),
-                  color: SplatRenderer.PackedRGBHalf4(r: Float16(color.x), g: Float16(color.y), b: Float16(color.z), a: Float16(color.w)),
-                  covA: SplatRenderer.PackedHalf3(x: Float16(cov3D[0, 0]), y: Float16(cov3D[0, 1]), z: Float16(cov3D[0, 2])),
-                  covB: SplatRenderer.PackedHalf3(x: Float16(cov3D[1, 1]), y: Float16(cov3D[1, 2]), z: Float16(cov3D[2, 2])))
+    init(_ encoding: SplatRenderEncoding) {
+        let color = encoding.linearColorOpacity
+        let covA = encoding.covarianceA
+        let covB = encoding.covarianceB
+        self.init(
+            position: MTLPackedFloat3Make(
+                encoding.position.x,
+                encoding.position.y,
+                encoding.position.z
+            ),
+            color: SplatRenderer.PackedRGBHalf4(
+                r: Float16(color.x),
+                g: Float16(color.y),
+                b: Float16(color.z),
+                a: Float16(color.w)
+            ),
+            covA: SplatRenderer.PackedHalf3(
+                x: Float16(covA.x),
+                y: Float16(covA.y),
+                z: Float16(covA.z)
+            ),
+            covB: SplatRenderer.PackedHalf3(
+                x: Float16(covB.x),
+                y: Float16(covB.y),
+                z: Float16(covB.z)
+            )
+        )
     }
 }
 
@@ -550,12 +1266,6 @@ private extension SIMD3 where Scalar: BinaryFloatingPoint, Scalar.RawSignificand
 
     static func random(in range: Range<Scalar>) -> SIMD3<Scalar> {
         Self(x: Scalar.random(in: range), y: .random(in: range), z: .random(in: range))
-    }
-}
-
-private extension SIMD3<Float> {
-    var sRGBToLinear: SIMD3<Float> {
-        SIMD3(x: pow(x, 2.2), y: pow(y, 2.2), z: pow(z, 2.2))
     }
 }
 

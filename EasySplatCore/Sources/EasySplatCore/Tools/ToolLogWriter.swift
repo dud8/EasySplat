@@ -1,4 +1,44 @@
+import Darwin
 import Foundation
+
+enum SecureLogFileHandle {
+    private enum OpenError: Error {
+        case cannotOpen(Int32)
+        case notRegularFile
+    }
+
+    static func openForAppending(at url: URL) throws -> FileHandle {
+        try open(at: url, append: true, truncate: false)
+    }
+
+    static func openForReplacing(at url: URL) throws -> FileHandle {
+        try open(at: url, append: false, truncate: true)
+    }
+
+    private static func open(at url: URL, append: Bool, truncate: Bool) throws -> FileHandle {
+        let accessFlags = append ? O_APPEND : 0
+        let descriptor = Darwin.open(
+            url.path,
+            O_WRONLY | accessFlags | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+            mode_t(S_IRUSR | S_IWUSR)
+        )
+        guard descriptor >= 0 else { throw OpenError.cannotOpen(errno) }
+
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_nlink == 1 else {
+            Darwin.close(descriptor)
+            throw OpenError.notRegularFile
+        }
+        if truncate, ftruncate(descriptor, 0) != 0 {
+            let code = errno
+            Darwin.close(descriptor)
+            throw OpenError.cannotOpen(code)
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+}
 
 /// Minimal, append-only tool log file writer used to persist external tool stdout/stderr to disk.
 /// We keep this separate from `pipeline.log` so users can inspect raw-ish tool output when needed.
@@ -27,16 +67,9 @@ final class ToolLogWriter: @unchecked Sendable {
         self.toolName = toolName
         let fm = FileManager.default
         try? fm.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        // Only create when missing — multiple ToolLogWriter instances for the same file
-        // (e.g. consecutive COLMAP stages within one pipeline run) must append, not clobber
-        // each other. `beginSection` writes a timestamped banner so sections are still
-        // visually separable.
-        if !fm.fileExists(atPath: fileURL.path) {
-            fm.createFile(atPath: fileURL.path, contents: nil)
-        }
-        let opened = try? FileHandle(forWritingTo: fileURL)
-        // Position at end so the first write doesn't overwrite earlier content.
-        _ = try? opened?.seekToEnd()
+        // O_APPEND preserves earlier stages while O_NOFOLLOW rejects a malicious leaf
+        // symlink instead of sending tool output outside the project bundle.
+        let opened = try? SecureLogFileHandle.openForAppending(at: fileURL)
         self.handle = opened
         if self.handle == nil {
             FileHandle.standardError.write(Data("ToolLogWriter[\(toolName)]: failed to open log at \(fileURL.path)\n".utf8))

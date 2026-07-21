@@ -1,111 +1,439 @@
 import EasySplatCore
 import Foundation
+import OSLog
+
+private let projectLibraryLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "com.easysplat.app",
+    category: "ProjectLibrary"
+)
+
+struct RunTimingBoundary: Sendable {
+    struct Sample: Sendable, Equatable {
+        let wallClock: Date
+        let monotonicSeconds: TimeInterval
+    }
+
+    let startedAt: Date
+    private let elapsed: @Sendable () -> TimeInterval
+
+    static func capture() -> RunTimingBoundary {
+        let clock = ContinuousClock()
+        let monotonicStartedAt = clock.now
+        return RunTimingBoundary(startedAt: Date()) {
+            durationSeconds(clock.now - monotonicStartedAt)
+        }
+    }
+
+    static func capture(
+        sample: @escaping @Sendable () -> Sample
+    ) -> RunTimingBoundary {
+        let started = sample()
+        return RunTimingBoundary(startedAt: started.wallClock) {
+            sample().monotonicSeconds - started.monotonicSeconds
+        }
+    }
+
+    func elapsedSeconds() -> TimeInterval {
+        let seconds = elapsed()
+        guard seconds.isFinite, seconds >= 0 else { return 0 }
+        return seconds
+    }
+
+    private static func durationSeconds(_ duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return TimeInterval(components.seconds)
+            + TimeInterval(components.attoseconds) / 1e18
+    }
+}
+
+struct PendingResultViewerTiming: Sendable {
+    let projectID: UUID
+    let projectURL: URL
+    let outputURL: URL
+    let boundary: RunTimingBoundary
+    var firstReadyElapsedSeconds: TimeInterval?
+}
 
 extension AppModel {
-    func startFromPendingSelection() {
-        guard let inputSpec = buildInputSpec() else { return }
-        let title = projectTitle(for: inputSpec)
-        clearPendingInputs()
-        currentTask?.cancel()
-        let token = UUID()
-        currentTaskToken = token
-        currentTask = Task { await startProject(input: inputSpec, title: title, taskToken: token) }
+    func prepareResultViewerTiming(
+        projectID: UUID,
+        projectURL: URL,
+        outputURL: URL,
+        boundary: RunTimingBoundary
+    ) {
+        pendingResultViewerTiming = PendingResultViewerTiming(
+            projectID: projectID,
+            projectURL: projectURL,
+            outputURL: outputURL,
+            boundary: boundary,
+            firstReadyElapsedSeconds: nil
+        )
     }
 
-    func resumeProject(at url: URL) {
-        clearRecoveryPromptSuppression(for: url)
-        currentTask?.cancel()
-        let token = UUID()
-        currentTaskToken = token
-        currentTask = Task { await resumeProjectTask(at: url, taskToken: token) }
-    }
-
-    func resumeInterruptedProject(_ project: ProjectSummary) {
-        recoveryPromptProject = nil
-        clearRecoveryPromptSuppression(for: project.url)
-        currentTask?.cancel()
-        let token = UUID()
-        currentTaskToken = token
-        currentTask = Task { await resumeProjectTask(at: project.url, taskToken: token) }
-    }
-
-    func keepInterruptedProjectForLater(_ project: ProjectSummary) {
-        suppressRecoveryPrompt(for: project.url)
-        if recoveryPromptProject?.id == project.id {
-            recoveryPromptProject = nil
-        }
-    }
-
-    func deleteInterruptedProject(_ project: ProjectSummary) {
-        if currentProjectURL == project.url {
-            markInterruptedProjectDeleted(project)
-            cancelCurrentProject(deleteProject: true)
+    func resultViewerDidBecomeReady(projectURL: URL, outputURL: URL) {
+        guard viewState == .viewer,
+              ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
+              ProjectSummary.hasSameLocation(outputPlyURL, outputURL),
+              var pending = pendingResultViewerTiming,
+              ProjectSummary.hasSameLocation(pending.projectURL, projectURL),
+              ProjectSummary.hasSameLocation(pending.outputURL, outputURL) else {
             return
         }
+
+        if pending.firstReadyElapsedSeconds == nil {
+            pending.firstReadyElapsedSeconds = pending.boundary.elapsedSeconds()
+            pendingResultViewerTiming = pending
+        }
+        let elapsedSeconds = pending.firstReadyElapsedSeconds ?? 0
+        let metadataURL = ProjectPaths(root: projectURL).metadataURL
         do {
-            try FileManager.default.removeItem(at: project.url)
-            markInterruptedProjectDeleted(project)
-        } catch {
-            if isMissingFileError(error) {
-                markInterruptedProjectDeleted(project)
-            } else {
-                recoveryPromptProject = project
+            let snapshot = try ProjectMetadataStore.load(from: metadataURL)
+            guard snapshot.id == pending.projectID else {
+                pendingResultViewerTiming = nil
+                return
             }
+            guard snapshot.createToViewerReadySeconds == nil else {
+                pendingResultViewerTiming = nil
+                return
+            }
+            var didRecord = false
+            let metadata = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+                guard metadata.id == pending.projectID,
+                      metadata.createToViewerReadySeconds == nil else {
+                    return
+                }
+                metadata.createToViewerReadySeconds = elapsedSeconds
+                didRecord = true
+            }
+            guard didRecord
+                    || (metadata.id == pending.projectID
+                        && metadata.createToViewerReadySeconds != nil) else {
+                return
+            }
+            currentCreateToViewerReadySeconds = metadata.createToViewerReadySeconds
+            pendingResultViewerTiming = nil
+            refreshProjectSummaries()
+        } catch {
+            // Keep the pending boundary so a later ready notification can retry
+            // after a transient metadata write failure.
         }
-        refreshProjectSummaries()
     }
 
-    private func markInterruptedProjectDeleted(_ project: ProjectSummary) {
-        ignoredRecoveryProjectIDs.insert(project.id)
-        if recoveryPromptProject?.id == project.id {
-            recoveryPromptProject = nil
+    func startFromPendingSelection(timingBoundary: RunTimingBoundary? = nil) {
+        let timingBoundary = timingBoundary ?? .capture()
+        guard !isRunActive else { return }
+        guard let inputSpec = buildInputSpec() else { return }
+        photoFolderCountTask?.cancel()
+        photoFolderCountTask = nil
+        let title = projectTitle(for: inputSpec)
+        let token = UUID()
+        currentTaskToken = token
+        isRunActive = true
+        currentTask = Task {
+            await startProject(
+                input: inputSpec,
+                title: title,
+                taskToken: token,
+                timingBoundary: timingBoundary
+            )
         }
     }
 
-    private func isMissingFileError(_ error: Error) -> Bool {
-        let nsError = error as NSError
-        return nsError.domain == NSCocoaErrorDomain
-            && nsError.code == CocoaError.Code.fileNoSuchFile.rawValue
+    @discardableResult
+    func resumeProject(at url: URL) -> Bool {
+        guard !isRunActive else { return false }
+        guard flushPendingNotesSave() else { return false }
+        let token = UUID()
+        currentTaskToken = token
+        isRunActive = true
+        currentTask = Task { await resumeProjectTask(at: url, taskToken: token) }
+        return true
+    }
+
+    static func validationRecovery(for error: RunPlanResolver.ValidationError) -> RunValidationRecovery? {
+        switch error {
+        case .continuousMixedInputUnsupported:
+            return .useUnordered
+        case .fastDetailRequired:
+            return .useFast
+        case .highDetailRequiresMoreMemory:
+            return .useBalanced
+        case .noValidPhotos, .insufficientValidPhotos:
+            return nil
+        case .photoSelectionExceedsSafeLimit:
+            return .useAutomaticPhotoSelection
+        }
+    }
+
+    static func rasterMemoryRecovery(
+        requestedOptions: RequestedRunOptions,
+        currentBudgetBytes: Int64,
+        hardware: HardwareProfile
+    ) -> RunValidationRecovery? {
+        let largerBudgets = [
+            TrainingMemoryBudget.resolve(hardware: hardware, resourcePolicy: .automatic),
+            TrainingMemoryBudget.resolve(hardware: hardware, resourcePolicy: .maximumPerformance),
+        ]
+            .filter { $0 > currentBudgetBytes }
+            .sorted()
+        if let nextBudget = largerBudgets.first {
+            return .useMoreTrainingMemory(nextBudget)
+        }
+        if requestedOptions.detailProfile == .highDetail {
+            return .useBalanced
+        }
+        if requestedOptions.detailProfile != .fast {
+            return .useFastForMemory
+        }
+        return nil
+    }
+
+    static func rasterResourceRecovery(
+        requestedOptions: RequestedRunOptions
+    ) -> RunValidationRecovery? {
+        switch requestedOptions.detailProfile {
+        case .highDetail:
+            return .useBalanced
+        case .balanced:
+            return .useFastForMemory
+        case .fast:
+            return nil
+        }
+    }
+
+    func configureRuntimeRecovery(for error: Error) {
+        let options = currentRunOptions ?? requestedRunOptions
+        if let admissionError = error as? TrainingResourceAdmissionError {
+            let message: String = switch admissionError {
+            case .invalidObservation:
+                "Current memory availability could not be verified. Try again."
+            case .staleObservation:
+                "Memory availability changed before training could start. Try again."
+            case .insufficientAvailableMemory:
+                "Training needs more free unified memory. Close other demanding apps, then try again."
+            }
+            validationRecovery = nil
+            failureRetryAllowed = true
+            lastError = message
+            statusTitle = message
+            statusDetail = nil
+            return
+        }
+        if error is MsplatMetalAllocationUnavailable {
+            let message = "Training could not reserve unified memory. Close other demanding apps, then try again."
+            validationRecovery = nil
+            failureRetryAllowed = true
+            lastError = message
+            statusTitle = message
+            statusDetail = nil
+            return
+        }
+        if error is MsplatRasterResourceLimitExceeded {
+            let recovery = Self.rasterResourceRecovery(requestedOptions: options)
+            validationRecovery = recovery
+            failureRetryAllowed = recovery != nil
+            let message: String = switch recovery {
+            case .useBalanced:
+                "This scene exceeded Metal's buffer limit. Use Balanced detail."
+            case .useFastForMemory:
+                "This scene exceeded Metal's buffer limit. Use Fast detail."
+            case nil:
+                "This scene exceeded Metal's buffer limit even at Fast detail."
+            case .useMoreTrainingMemory, .useUnordered, .useFast, .useAutomaticPhotoSelection:
+                preconditionFailure("Unexpected recovery for a raster resource limit")
+            }
+            lastError = message
+            statusTitle = message
+            statusDetail = nil
+            return
+        }
+        guard error is MsplatRasterMemoryBudgetExceeded else { return }
+        let currentBudget = currentProjectURL
+            .flatMap { try? ProjectMetadataStore.load(from: ProjectPaths(root: $0).metadataURL) }
+            .flatMap(\.resolvedRunPlan)
+            .map(\.trainerMemoryBudgetBytes)
+            ?? TrainingMemoryBudget.resolve(
+                hardware: hardwareProfile,
+                resourcePolicy: options.resourcePolicy
+            )
+        let recovery = Self.rasterMemoryRecovery(
+            requestedOptions: options,
+            currentBudgetBytes: currentBudget,
+            hardware: hardwareProfile
+        )
+        validationRecovery = recovery
+        failureRetryAllowed = recovery != nil
+        let message: String = switch recovery {
+        case .useMoreTrainingMemory:
+            "Training needs more memory than this run allows. Use more unified memory."
+        case .useFastForMemory:
+            "Training needs more memory than this run allows. Use Fast detail."
+        case nil:
+            "Training needs more memory than this Mac can safely use for this scene."
+        case .useBalanced:
+            "Training needs more memory than this run allows. Use Balanced detail."
+        case .useUnordered, .useFast, .useAutomaticPhotoSelection:
+            preconditionFailure("Unexpected recovery for a raster memory failure")
+        }
+        lastError = message
+        statusTitle = message
+        statusDetail = nil
+    }
+
+    @discardableResult
+    func applyValidationRecovery(
+        _ recovery: RunValidationRecovery,
+        projectURL: URL?
+    ) -> Bool {
+        if case .useMoreTrainingMemory(let budgetBytes) = recovery {
+            guard let projectURL,
+                  budgetBytes > 0,
+                  mutateProjectMetadata(at: projectURL, mutation: { metadata in
+                      metadata.trainingMemoryRetryBudgetBytes = budgetBytes
+                  }) != nil else {
+                statusTitle = "Couldn’t update the training plan"
+                statusDetail = "The project was not changed. Check folder permissions and try again."
+                lastError = statusTitle
+                return false
+            }
+            return true
+        }
+        if let projectURL {
+            let updated = mutateProjectMetadata(at: projectURL) { metadata in
+                var options = metadata.requestedRunOptions
+                recovery.apply(to: &options)
+                if !RunPlanResolver.supports(
+                    resourcePolicy: options.resourcePolicy,
+                    memoryGB: hardwareProfile.memoryGB
+                ) {
+                    options.resourcePolicy = .automatic
+                }
+                metadata.requestedRunOptions = options
+            }
+            guard updated != nil else {
+                statusTitle = "Couldn’t update project options"
+                statusDetail = "The project was not changed. Check folder permissions and try again."
+                lastError = statusTitle
+                return false
+            }
+            return true
+        }
+
+        recovery.apply(to: &requestedRunOptions)
+        if !RunPlanResolver.supports(
+            resourcePolicy: requestedRunOptions.resourcePolicy,
+            memoryGB: hardwareProfile.memoryGB
+        ) {
+            requestedRunOptions.resourcePolicy = .automatic
+        }
+        return true
+    }
+
+    func retryAfterFailure() {
+        guard failureRetryAllowed else { return }
+        let projectURL = currentProjectURL
+        if let recovery = validationRecovery {
+            guard applyValidationRecovery(recovery, projectURL: projectURL) else { return }
+            validationRecovery = nil
+        }
+        if let projectURL {
+            resumeProject(at: projectURL)
+        } else {
+            startFromPendingSelection()
+        }
     }
 
     func refreshProjectSummaries() {
+        projectSummaryRefreshTask?.cancel()
+        projectSummaryRefreshTask = nil
+        projectSummaries = Self.loadProjectSummaries(
+            from: projectBaseDirectory(),
+            currentProjectURL: currentProjectURL,
+            isRunActive: isRunActive
+        )
+    }
+
+    func refreshProjectSummariesInBackground() {
+        projectSummaryRefreshTask?.cancel()
         let base = projectBaseDirectory()
+        let activeProjectURL = currentProjectURL
+        let runIsActive = isRunActive
+        projectSummaryRefreshTask = Task { [weak self] in
+            let summaries = await Task.detached(priority: .utility) {
+                Self.loadProjectSummaries(
+                    from: base,
+                    currentProjectURL: activeProjectURL,
+                    isRunActive: runIsActive
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            self?.projectSummaries = summaries
+            self?.projectSummaryRefreshTask = nil
+        }
+    }
+
+    nonisolated private static func loadProjectSummaries(
+        from base: URL,
+        currentProjectURL: URL?,
+        isRunActive: Bool
+    ) -> [ProjectSummary] {
+        _ = ProjectPublicationTransaction.reconcile(in: base)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: base,
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         ) else {
-            projectSummaries = []
-            return
+            return []
         }
 
         var summaries: [ProjectSummary] = []
         for url in contents where url.pathExtension == "easysplatproj" {
-            let metadataURL = url.appendingPathComponent("project.json")
-            let metadata: ProjectMetadata
-            do {
-                metadata = try ProjectMetadataStore.load(from: metadataURL)
-            } catch ProjectMetadataStore.LoadError.unsupportedFormatVersion {
-                // Surface future-version projects in the listing with a clear hint instead
-                // of silently dropping them — otherwise the user sees their project disappear.
-                summaries.append(makeNeedsAppUpdateSummary(at: url, metadataURL: metadataURL))
-                continue
-            } catch {
+            guard let values = try? url.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+            ), values.isDirectory == true, values.isSymbolicLink != true else {
                 continue
             }
-            // Project list refresh runs on the main actor; avoid scanning large ASCII PLY bodies here.
-            let outputURL = readyOutputURL(projectURL: url, metadata: metadata, validationDepth: .quick)
+            let snapshot: ProjectArtifactSnapshot?
+            let metadata: ProjectMetadata
+            do {
+                let loaded = try ProjectArtifactSnapshotStore.load(
+                    projectURL: url,
+                    validationDepth: .quick
+                )
+                snapshot = loaded
+                metadata = loaded.metadata
+            } catch {
+                guard let currentMetadata = try? ProjectMetadataStore.load(
+                    from: ProjectPaths(root: url).metadataURL
+                ) else {
+                    projectLibraryLogger.notice(
+                        "Skipping unreadable project at \(url.path, privacy: .private): \(String(describing: error), privacy: .public)"
+                    )
+                    continue
+                }
+                snapshot = nil
+                metadata = currentMetadata
+                projectLibraryLogger.notice(
+                    "Project artifacts are unavailable at \(url.path, privacy: .private): \(String(describing: error), privacy: .public)"
+                )
+            }
+            let outputURL = snapshot.flatMap {
+                readyOutputURLOnDisk(
+                    projectURL: url,
+                    snapshot: $0,
+                    validationDepth: .quick
+                )
+            }
             let outputExists = outputURL != nil
-            let isActive = currentProjectURL == url && viewState == .processing
-            let isRetrying = isActive && metadata.state.lastError != nil
+            let isActive = ProjectSummary.hasSameLocation(currentProjectURL, url)
+                && isRunActive
             let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
             let isInterrupted = !isActive
                 && !outputExists
                 && metadata.state.lastError == nil
                 && metadata.state.stage != .done
                 && hasInterruptionEvidence
-                && metadata.recoveryPromptSuppressed != true
             let status: ProjectStatus
             if isActive {
                 status = .inProgress
@@ -113,16 +441,11 @@ extension AppModel {
                 status = .ready
             } else if metadata.state.lastError != nil {
                 status = .failed
+            } else if metadata.state.stage == .done {
+                status = .failed
             } else {
                 status = .inProgress
             }
-            let outputSize: Int64? = outputURL.flatMap { url in
-                (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value
-            }
-            let errorCount = cachedRecentPipelineErrorCount(at: ProjectPaths(root: url).pipelineLogURL)
-            // Prefer the sidecar value (cannot be clobbered by pipeline writes)
-            // and fall back to the legacy metadata.lastOpenedAt field for projects
-            // that were stamped before the sidecar split.
             let sidecarOpened = LastOpenedSidecar.load(from: ProjectPaths(root: url).lastOpenedSidecarURL)
             summaries.append(ProjectSummary(
                 id: metadata.id,
@@ -131,36 +454,19 @@ extension AppModel {
                 createdAt: metadata.createdAt,
                 status: status,
                 isActive: isActive,
-                isRetrying: isRetrying,
                 isInterrupted: isInterrupted,
                 checkpointUpdatedAt: metadata.checkpoint?.updatedAt,
-                lastError: metadata.state.lastError,
-                outputPlyURL: outputURL,
-                outputPlySizeBytes: outputSize,
-                reconstruction: metadata.reconstruction,
                 stageTimings: metadata.stageTimings ?? [],
-                preset: metadata.preset,
-                lastOpenedAt: sidecarOpened ?? metadata.lastOpenedAt,
-                lastFailureAt: metadata.lastFailureAt,
-                recentErrorCount: errorCount
+                createToViewerReadySeconds: metadata.createToViewerReadySeconds,
+                input: metadata.input,
+                requestedRunOptions: metadata.requestedRunOptions,
+                lastOpenedAt: sidecarOpened,
+                lastRunStartedAt: metadata.lastRunStartedAt,
+                lastFailureAt: metadata.lastFailureAt
             ))
         }
 
-        projectSummaries = summaries.sorted { $0.createdAt > $1.createdAt }
-        maybePresentInterruptedProjectPrompt()
-    }
-
-    func createProjectDirectory(title: String) throws -> URL {
-        let fm = FileManager.default
-        let base = projectBaseDirectory()
-        try fm.createDirectory(at: base, withIntermediateDirectories: true)
-        let safeTitle = title.isEmpty ? "Project" : title
-        var projectURL = base.appendingPathComponent("\(safeTitle).easysplatproj", isDirectory: true)
-        if fm.fileExists(atPath: projectURL.path) {
-            projectURL = base.appendingPathComponent("\(safeTitle)-\(UUID().uuidString.prefix(6)).easysplatproj", isDirectory: true)
-        }
-        try fm.createDirectory(at: projectURL, withIntermediateDirectories: true)
-        return projectURL
+        return summaries.sorted { $0.createdAt > $1.createdAt }
     }
 
     func projectBaseDirectory() -> URL {
@@ -191,43 +497,95 @@ extension AppModel {
         return (exists, isDirectory.boolValue)
     }
 
-    func regularOutputFileExists(at url: URL) -> Bool {
-        ProjectArtifactValidator.validatePlyFile(at: url) == .valid
-    }
-
-    func metadataOutputURL(projectURL: URL, metadata: ProjectMetadata? = nil) -> URL? {
-        let loadedMetadata: ProjectMetadata
-        if let metadata {
-            loadedMetadata = metadata
-        } else {
-            guard let metadata = try? ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL) else {
-                return nil
-            }
-            loadedMetadata = metadata
+    func canonicalOutputURL(projectURL: URL, metadata: ProjectMetadata? = nil) -> URL? {
+        guard let snapshot = try? ProjectArtifactSnapshotStore.load(projectURL: projectURL) else {
+            return nil
         }
-        guard let relativePath = loadedMetadata.outputs?.splatPlyPath else { return nil }
         let paths = ProjectPaths(root: projectURL)
-        guard let outputURL = try? paths.resolveProjectRelativePath(relativePath) else { return nil }
-        return outputURL
+        guard snapshot.trainingArtifact?.completionStatus == .completed,
+              snapshot.trainingArtifact?.outputPath == "Output/splat.ply" else {
+            return nil
+        }
+        return paths.outputSplatURL
     }
 
     func readyOutputURL(
         projectURL: URL,
         metadata: ProjectMetadata? = nil,
-        validationDepth: ProjectArtifactValidationDepth = .full
+        validationDepth: ProjectArtifactValidationDepth
     ) -> URL? {
-        guard let outputURL = metadataOutputURL(projectURL: projectURL, metadata: metadata) else {
-            return nil
-        }
-        return ProjectArtifactValidator.validatePlyFile(at: outputURL, depth: validationDepth) == .valid ? outputURL : nil
+        Self.readyOutputURLOnDisk(
+            projectURL: projectURL,
+            metadata: metadata,
+            validationDepth: validationDepth
+        )
     }
 
-    /// Reload the persisted reconstruction summary for a project from disk. The pipeline
-    /// writes the summary as part of `metadata.reconstruction`, so we just decode the
-    /// current project.json.
-    func loadReconstructionSummary(projectURL: URL) -> ReconstructionSummary? {
-        let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        return (try? ProjectMetadataStore.load(from: metadataURL))?.reconstruction
+    nonisolated static func readyOutputURLOnDisk(
+        projectURL: URL,
+        metadata: ProjectMetadata? = nil,
+        validationDepth: ProjectArtifactValidationDepth
+    ) -> URL? {
+        let snapshotDepth: ProjectArtifactSnapshotStore.ValidationDepth = switch validationDepth {
+        case .quick: .quick
+        case .full: .full
+        }
+        guard let snapshot = try? ProjectArtifactSnapshotStore.load(
+            projectURL: projectURL,
+            validationDepth: snapshotDepth
+        ) else {
+            return nil
+        }
+        return readyOutputURLOnDisk(
+            projectURL: projectURL,
+            snapshot: snapshot,
+            validationDepth: validationDepth
+        )
+    }
+
+    nonisolated private static func readyOutputURLOnDisk(
+        projectURL: URL,
+        snapshot: ProjectArtifactSnapshot,
+        validationDepth: ProjectArtifactValidationDepth
+    ) -> URL? {
+        guard snapshot.metadata.state.stage == .done,
+              snapshot.metadata.state.lastError == nil,
+              let trainingArtifact = snapshot.trainingArtifact,
+              trainingArtifact.completionStatus == .completed,
+              trainingArtifact.outputPath == "Output/splat.ply" else {
+            return nil
+        }
+        let outputURL = ProjectPaths(root: projectURL).outputSplatURL
+        switch validationDepth {
+        case .quick:
+            guard ProjectArtifactValidator.validatePlyFile(at: outputURL, depth: .quick) == .valid else {
+                return nil
+            }
+        case .full:
+            do {
+                try TrainingArtifactStore.validateCompletedOutput(
+                    trainingArtifact,
+                    at: outputURL
+                )
+            } catch {
+                return nil
+            }
+        }
+        return outputURL
+    }
+
+    func validatedFinishedOutputURL(projectURL: URL) async throws -> URL? {
+        let validator = finishedOutputValidator
+        let validationTask = Task.detached(priority: .userInitiated) {
+            validator(projectURL)
+        }
+        return try await withTaskCancellationHandler {
+            let outputURL = await validationTask.value
+            try Task.checkCancellation()
+            return outputURL
+        } onCancel: {
+            validationTask.cancel()
+        }
     }
 
     /// Reload the persisted per-stage timings. Returns an empty array when no timings
@@ -237,19 +595,16 @@ extension AppModel {
         return (try? ProjectMetadataStore.load(from: metadataURL))?.stageTimings ?? []
     }
 
-    /// Reload the persisted AutoTune snapshot. Returns nil for runs that
-    /// pre-date the snapshot feature or that disabled AutoTune.
-    func loadAutoTuneSnapshot(projectURL: URL) -> AutoTuneSnapshot? {
+    func loadCreateToViewerReadySeconds(projectURL: URL) -> TimeInterval? {
         let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        return (try? ProjectMetadataStore.load(from: metadataURL))?.autoTune
+        return (try? ProjectMetadataStore.load(from: metadataURL))?
+            .createToViewerReadySeconds
     }
 
-    /// Reload the persisted preset + input pair for a project. Used by the
-    /// viewer to render a "Run configuration" badge alongside the result.
-    func loadProjectConfig(projectURL: URL) -> (preset: PresetSpec, input: InputSpec)? {
+    func loadProjectConfig(projectURL: URL) -> (options: RequestedRunOptions, input: InputSpec)? {
         let metadataURL = ProjectPaths(root: projectURL).metadataURL
         guard let metadata = try? ProjectMetadataStore.load(from: metadataURL) else { return nil }
-        return (metadata.preset, metadata.input)
+        return (metadata.requestedRunOptions, metadata.input)
     }
 
     /// Free disk space on the volume that hosts the project base directory.
@@ -288,15 +643,9 @@ extension AppModel {
         }
     }
 
-    /// Recommended minimum free space for a single run. The pipeline produces
-    /// frame extracts, COLMAP intermediate database, sparse model, and the
-    /// trained PLY; on a 30-frame Fast run this stays under 1 GB but Ultra
-    /// runs with longer videos can blow past 5 GB. 8 GB is a conservative
-    /// cushion that catches "almost full" situations without false alarms.
+    /// Leaves room for selected frames, accepted geometry, checkpoints, and output.
     static let recommendedFreeSpaceBytes: Int64 = 8 * 1024 * 1024 * 1024
 
-    /// Debounce window for notes auto-save. Tuned so a typing pause of half
-    /// a second commits without thrashing disk on every keystroke.
     static let notesAutoSaveDelay: TimeInterval = 0.5
 
     /// Schedule a debounced save of the project's notes. Cancels any prior
@@ -306,6 +655,7 @@ extension AppModel {
     func scheduleNotesSave(at url: URL, to text: String) {
         notesSaveTask?.cancel()
         pendingNotesSave = (url: url, text: text)
+        notesSaveState = .saving
         let token = url
         let value = text
         notesSaveTask = Task { [weak self] in
@@ -317,10 +667,20 @@ extension AppModel {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self else { return }
-                self.pendingNotesSave = nil
+                guard ProjectSummary.hasSameLocation(self.currentProjectURL, token) else { return }
+                guard let pending = self.pendingNotesSave,
+                      ProjectSummary.hasSameLocation(pending.url, token),
+                      pending.text == value else {
+                    return
+                }
                 self.notesSaveTask = nil
-                guard self.currentProjectURL == token else { return }
-                self.updateProjectNotes(at: token, to: value)
+                do {
+                    _ = try self.persistProjectNotes(at: token, text: value)
+                    self.pendingNotesSave = nil
+                    self.notesSaveState = .saved
+                } catch {
+                    self.presentNotesSaveFailure(projectURL: token)
+                }
             }
         }
     }
@@ -329,77 +689,19 @@ extension AppModel {
     /// debounce timer. Safe to call when no save is pending. Use before
     /// reset(), project switch, or app termination so a half-typed note
     /// doesn't silently disappear.
-    func flushPendingNotesSave() {
+    @discardableResult
+    func flushPendingNotesSave() -> Bool {
         notesSaveTask?.cancel()
         notesSaveTask = nil
-        guard let pending = pendingNotesSave else { return }
-        pendingNotesSave = nil
-        updateProjectNotes(at: pending.url, to: pending.text)
-    }
-
-    /// mtime+size-keyed cache wrapper around `countRecentPipelineErrors`.
-    /// With 50+ projects the unconditional disk read on every refresh adds
-    /// up; log files rarely change between refreshes, so a stat + compare
-    /// hits the fast path most of the time. Size is included alongside
-    /// mtime because some filesystems only report second-level mtime
-    /// resolution; two writes inside the same second would otherwise be
-    /// mistaken for a cache hit.
-    func cachedRecentPipelineErrorCount(at url: URL) -> Int? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let mtime = attributes[.modificationDate] as? Date,
-              let size = (attributes[.size] as? NSNumber)?.int64Value else {
-            // Log absent — drop any stale cache entry and return nil.
-            pipelineErrorCountCache[url] = nil
-            return nil
-        }
-        if let cached = pipelineErrorCountCache[url], cached.mtime == mtime, cached.size == size {
-            return cached.count
-        }
-        guard let fresh = AppModel.countRecentPipelineErrors(at: url) else {
-            pipelineErrorCountCache[url] = nil
-            return nil
-        }
-        pipelineErrorCountCache[url] = (mtime: mtime, size: size, count: fresh)
-        return fresh
-    }
-
-    /// Count `[err]` prefixed lines in the tail of a pipeline.log. Uses a
-    /// bounded read (default 16 KB) so a multi-megabyte log doesn't stall
-    /// the main-actor refresh loop. Returns nil when the log doesn't exist.
-    static func countRecentPipelineErrors(at url: URL, byteLimit: Int = 16 * 1024) -> Int? {
-        let fm = FileManager.default
-        guard let attributes = try? fm.attributesOfItem(atPath: url.path),
-              let size = (attributes[.size] as? NSNumber)?.int64Value, size > 0 else {
-            return nil
-        }
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let readLength = Int(min(Int64(byteLimit), size))
-        let offset = UInt64(size) - UInt64(readLength)
+        guard let pending = pendingNotesSave else { return true }
         do {
-            try handle.seek(toOffset: offset)
+            _ = try persistProjectNotes(at: pending.url, text: pending.text)
+            pendingNotesSave = nil
+            notesSaveState = .saved
+            return true
         } catch {
-            return nil
-        }
-        guard let data = try? handle.read(upToCount: readLength), !data.isEmpty else { return nil }
-        // If the seek landed mid-UTF-8 codepoint, drop bytes until we're at a
-        // valid leading byte; otherwise decoding fails and we drop the count.
-        var trimmed = data
-        if offset > 0 {
-            while let first = trimmed.first, first & 0b1100_0000 == 0b1000_0000 {
-                trimmed.removeFirst()
-            }
-        }
-        guard let text = String(data: trimmed, encoding: .utf8) else { return nil }
-        // Also drop the first partial line, since we likely sliced into the
-        // middle of one when seeking; otherwise an unrelated "[err]"-containing
-        // payload upstream of the cut could double-count.
-        var lines = text.split(whereSeparator: { $0 == "\n" || $0 == "\r" })
-        if offset > 0, !lines.isEmpty {
-            lines.removeFirst()
-        }
-        return lines.reduce(into: 0) { partial, line in
-            if line.hasPrefix("[err]") { partial += 1 }
+            presentNotesSaveFailure(projectURL: pending.url)
+            return false
         }
     }
 
@@ -418,29 +720,46 @@ extension AppModel {
     /// can't be loaded or when the new note matches the existing one.
     @discardableResult
     func updateProjectNotes(at url: URL, to text: String) -> Bool {
+        do {
+            let didChange = try persistProjectNotes(at: url, text: text)
+            if ProjectSummary.hasSameLocation(currentProjectURL, url) {
+                notesSaveState = .saved
+            }
+            return didChange
+        } catch {
+            presentNotesSaveFailure(projectURL: url)
+            return false
+        }
+    }
+
+    private func persistProjectNotes(at url: URL, text: String) throws -> Bool {
         let metadataURL = ProjectPaths(root: url).metadataURL
-        guard var metadata = try? ProjectMetadataStore.load(from: metadataURL) else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let newNotes: String? = trimmed.isEmpty ? nil : trimmed
-        guard metadata.notes != newNotes else { return false }
-        metadata.notes = newNotes
         // Deliberately do not assign `currentProjectNotes` here. The binding
         // owner (notes editor) drives that property; reassigning the trimmed
         // value back into the binding mid-typing would yank cursor position
         // and drop in-progress whitespace from the user.
-        do {
-            try ProjectMetadataStore.save(metadata, to: metadataURL)
-            return true
-        } catch {
-            // Surface the failure as a non-fatal status so the user knows
-            // their typed note didn't make it to disk (typical cause: the
-            // project volume filled up mid-run).
-            if currentProjectURL == url {
-                shareStatusMessage = "Could not save notes: \(error.localizedDescription)"
-                shareStatusIsError = true
-            }
-            return false
+        var didChange = false
+        _ = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+            guard metadata.notes != newNotes else { return }
+            metadata.notes = newNotes
+            didChange = true
         }
+        return didChange
+    }
+
+    private func presentNotesSaveFailure(projectURL: URL) {
+        guard ProjectSummary.hasSameLocation(currentProjectURL, projectURL)
+                || pendingNotesSave.map({ ProjectSummary.hasSameLocation($0.url, projectURL) }) == true else {
+            return
+        }
+        let message = "The last edit is still waiting to be saved. Check free space and folder permissions, then try again."
+        notesSaveState = .failed(message)
+        actionFailure = ActionFailurePresentation(
+            title: "Couldn’t save notes",
+            message: message
+        )
     }
 
     func loadProjectNotes(projectURL: URL) -> String {
@@ -457,51 +776,25 @@ extension AppModel {
     func renameProject(at url: URL, to newTitle: String) -> Bool {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        actionFailure = nil
         let metadataURL = ProjectPaths(root: url).metadataURL
-        guard var metadata = try? ProjectMetadataStore.load(from: metadataURL) else { return false }
-        guard metadata.title != trimmed else { return false }
-        metadata.title = trimmed
         do {
-            try ProjectMetadataStore.save(metadata, to: metadataURL)
+            var didChange = false
+            _ = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+                guard metadata.title != trimmed else { return }
+                metadata.title = trimmed
+                didChange = true
+            }
+            guard didChange else { return false }
             refreshProjectSummaries()
             return true
         } catch {
+            actionFailure = ActionFailurePresentation(
+                title: "Couldn’t rename project",
+                message: "The project name wasn’t changed. Check folder permissions and try again."
+            )
             return false
         }
     }
 
-    /// Build a minimal summary for a project whose metadata is unreadable due to a
-    /// formatVersion mismatch. We pull `title` from a raw JSON peek if possible so the
-    /// listing still shows the user's chosen name; otherwise fall back to the directory.
-    private func makeNeedsAppUpdateSummary(at url: URL, metadataURL: URL) -> ProjectSummary {
-        let fallbackTitle = url.deletingPathExtension().lastPathComponent
-        var title = fallbackTitle
-        if let data = try? Data(contentsOf: metadataURL),
-           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let raw = object["title"] as? String,
-           !raw.isEmpty {
-            title = raw
-        }
-        let createdAt = (try? FileManager.default.attributesOfItem(atPath: url.path)[.creationDate] as? Date) ?? Date()
-        return ProjectSummary(
-            id: UUID(),
-            title: title,
-            url: url,
-            createdAt: createdAt,
-            status: .needsAppUpdate,
-            isActive: false,
-            isRetrying: false,
-            isInterrupted: false,
-            checkpointUpdatedAt: nil,
-            lastError: nil,
-            outputPlyURL: nil,
-            outputPlySizeBytes: nil,
-            reconstruction: nil,
-            stageTimings: [],
-            preset: nil,
-            lastOpenedAt: nil,
-            lastFailureAt: nil,
-            recentErrorCount: nil
-        )
-    }
 }

@@ -1,0 +1,206 @@
+diff --git a/core/include/random_iter.hpp b/core/include/random_iter.hpp
+index c704fd0..b6d637a 100644
+--- a/core/include/random_iter.hpp
++++ b/core/include/random_iter.hpp
+@@ -5,0 +6 @@
++#include <cstdint>
+@@ -12 +13 @@ public:
+-    InfiniteRandomIterator(const std::vector<T> &items, unsigned seed = 42)
++    InfiniteRandomIterator(const std::vector<T> &items, std::uint64_t seed = 42)
+@@ -29 +30 @@ private:
+-    std::mt19937 rng_;
++    std::mt19937_64 rng_;
+diff --git a/core/metal/bindings.h b/core/metal/bindings.h
+index 3df8e32..159e98b 100644
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -25,0 +26,2 @@ void msplat_gpu_sync();
++void msplat_record_last_loss(int slot, int capacity, float normalization);
++void msplat_sync_loss_window(int count, float* output);
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+index 40965ae..a02a869 100644
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -1002,2 +1002,2 @@ kernel void rasterize_backward_kernel(
+-            float3 b_conic, b_xy_opac, b_rgb;
+-            int32_t b_id;
++            float3 b_conic = float3(0.0f), b_xy_opac = float3(0.0f), b_rgb = float3(0.0f);
++            int32_t b_id = 0;
+@@ -2908,5 +2908,5 @@ kernel void rasterize_backward_chunked_kernel(
+-    if (chunk_start >= chunk_end || bin_final < chunk_start) {
+-        return; // empty chunk or no contributors
+-    }
+-
+-    const int num_batches = (chunk_end - chunk_start + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
++    const bool pixel_has_contributors =
++        inside && chunk_start < chunk_end && bin_final >= chunk_start;
++    const int num_batches = chunk_start < chunk_end
++        ? (chunk_end - chunk_start + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE
++        : 0;
+@@ -2920 +2920,4 @@ kernel void rasterize_backward_chunked_kernel(
+-    const int warp_bin_final = warp_reduce_all_max(bin_final, warp_size);
++    const int warp_bin_final = warp_reduce_all_max(
++        pixel_has_contributors ? bin_final : -1,
++        warp_size
++    );
+@@ -2950,2 +2953,2 @@ kernel void rasterize_backward_chunked_kernel(
+-            float3 b_conic, b_xy_opac, b_rgb;
+-            int32_t b_id;
++            float3 b_conic = float3(0.0f), b_xy_opac = float3(0.0f), b_rgb = float3(0.0f);
++            int32_t b_id = 0;
+@@ -2963 +2966 @@ kernel void rasterize_backward_chunked_kernel(
+-            int valid = inside;
++            int valid = pixel_has_contributors;
+@@ -3047 +3050 @@ constant float GAUSS_1D[11] = {
+-#define SSIM_TG 16   // threadgroup dimension (16×16 = 256 threads)
++#define SSIM_TG 8
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+index 791e124..cab90a9 100644
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -14,0 +15,2 @@
++#include <cmath>
++#include <stdexcept>
+@@ -174 +176 @@ MetalContext* init_msplat_metal_context() {
+-    MetalContext* ctx = (MetalContext*)malloc(sizeof(MetalContext));
++    MetalContext* ctx = new MetalContext{};
+@@ -175,0 +178,5 @@ MetalContext* init_msplat_metal_context() {
++    if (!device) {
++        fprintf(stderr, "msplat: no Metal device is available\n");
++        delete ctx;
++        return NULL;
++    }
+@@ -178,0 +186,5 @@ MetalContext* init_msplat_metal_context() {
++    if (!ctx->queue) {
++        fprintf(stderr, "msplat: failed to create the Metal command queue\n");
++        delete ctx;
++        return NULL;
++    }
+@@ -215 +227 @@ MetalContext* init_msplat_metal_context() {
+-        free(ctx);
++        delete ctx;
+@@ -217,0 +230 @@ MetalContext* init_msplat_metal_context() {
++    bool pipelineLoadFailed = false;
+@@ -221,0 +235 @@ MetalContext* init_msplat_metal_context() {
++            pipelineLoadFailed = true;
+@@ -225 +239,3 @@ MetalContext* init_msplat_metal_context() {
+-        id<MTLComputePipelineState> pso = [ctx->device newComputePipelineStateWithFunction:fn error:&error];
++        NSError *pipelineError = nil;
++        id<MTLComputePipelineState> pso =
++            [ctx->device newComputePipelineStateWithFunction:fn error:&pipelineError];
+@@ -227 +243 @@ MetalContext* init_msplat_metal_context() {
+-        if (error) {
++        if (!pso) {
+@@ -229 +245,12 @@ MetalContext* init_msplat_metal_context() {
+-                    [name UTF8String], [[error description] UTF8String]);
++                    [name UTF8String],
++                    pipelineError ? [[pipelineError description] UTF8String] : "unknown Metal error");
++            pipelineLoadFailed = true;
++        } else if (pso.staticThreadgroupMemoryLength > ctx->device.maxThreadgroupMemoryLength) {
++            fprintf(stderr,
++                    "msplat: kernel %s requires %lu bytes of threadgroup memory; device limit is %lu\n",
++                    [name UTF8String],
++                    (unsigned long)pso.staticThreadgroupMemoryLength,
++                    (unsigned long)ctx->device.maxThreadgroupMemoryLength);
++            [pso release];
++            pso = nil;
++            pipelineLoadFailed = true;
+@@ -266,0 +294,5 @@ MetalContext* init_msplat_metal_context() {
++    if (pipelineLoadFailed) {
++        fprintf(stderr, "msplat: metallib is missing required Metal pipelines\n");
++        delete ctx;
++        return NULL;
++    }
+@@ -285,0 +318,3 @@ MetalContext* get_global_context() {
++        if (ctx == NULL) {
++            throw std::runtime_error("msplat: Metal context initialization failed");
++        }
+@@ -380,0 +416,3 @@ struct FusedTensorCache {
++    MTensor loss_history;
++    std::vector<float> loss_normalizers;
++    int loss_history_capacity = 0;
+@@ -455,0 +494,50 @@ static FusedTensorCache g_tcache;
++void msplat_record_last_loss(int slot, int capacity, float normalization) {
++    if (capacity <= 0 || slot < 0 || slot >= capacity ||
++        !std::isfinite(normalization) || normalization <= 0) {
++        throw std::runtime_error("msplat: invalid loss-history request");
++    }
++    if (!g_tcache.loss_sum.defined()) {
++        throw std::runtime_error("msplat: no training loss is available to record");
++    }
++    MetalContext* ctx = get_global_context();
++    if (g_tcache.loss_history_capacity != capacity) {
++        if (slot != 0) {
++            throw std::runtime_error("msplat: loss-history capacity changed mid-window");
++        }
++        g_tcache.loss_history = mtensor_empty(
++            ctx->device, {capacity}, DType::Float32
++        );
++        g_tcache.loss_normalizers.assign(capacity, 0);
++        g_tcache.loss_history_capacity = capacity;
++    }
++    g_tcache.loss_normalizers[slot] = normalization;
++
++    id<MTLBlitCommandEncoder> blit = [ctx->getCommandBuffer() blitCommandEncoder];
++    if (!blit) {
++        throw std::runtime_error("msplat: failed to create loss-history blit encoder");
++    }
++    [blit copyFromBuffer:g_tcache.loss_sum.buffer()
++            sourceOffset:0
++                toBuffer:g_tcache.loss_history.buffer()
++       destinationOffset:static_cast<NSUInteger>(slot) * sizeof(float)
++                    size:sizeof(float)];
++    [blit endEncoding];
++}
++
++void msplat_sync_loss_window(int count, float* output) {
++    if (count <= 0 || count > g_tcache.loss_history_capacity ||
++        !g_tcache.loss_history.defined() || output == nullptr) {
++        throw std::runtime_error("msplat: invalid completed loss window");
++    }
++    get_global_context()->syncCB();
++    const float* losses = g_tcache.loss_history.data<float>();
++    for (int index = 0; index < count; ++index) {
++        const double value = static_cast<double>(losses[index]) *
++            static_cast<double>(g_tcache.loss_normalizers[index]);
++        if (!std::isfinite(value)) {
++            throw std::runtime_error("msplat: loss window contains a non-finite value");
++        }
++        output[index] = static_cast<float>(value);
++    }
++}
++
+@@ -527 +615 @@ static void forward_pipeline(
+-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
++    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
+@@ -673 +761 @@ static void forward_pipeline(
+-        MTLSize tg = MTLSizeMake(16, 16, 1);
++        MTLSize tg = MTLSizeMake(8, 8, 1);
+@@ -859 +947 @@ std::tuple<MTensor, float> msplat_train_step(
+-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
++    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
+@@ -1001 +1089 @@ std::tuple<MTensor, float> msplat_train_step(
+-        MTLSize tg = MTLSizeMake(16, 16, 1);
++        MTLSize tg = MTLSizeMake(8, 8, 1);
+diff --git a/core/src/loaders/save_gaussians.cpp b/core/src/loaders/save_gaussians.cpp
+index 1111349..1ab144d 100644
+--- a/core/src/loaders/save_gaussians.cpp
++++ b/core/src/loaders/save_gaussians.cpp
+@@ -13 +13,3 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
+-    std::ofstream o(path, std::ios::binary);
++    std::ofstream o;
++    o.exceptions(std::ios::failbit | std::ios::badbit);
++    o.open(path, std::ios::binary);
+@@ -53,0 +56,2 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
++    o.flush();
++    o.close();
+diff --git a/core/src/loaders/image_io.cpp b/core/src/loaders/image_io.cpp
+index f916922..56d9b37 100644
+--- a/core/src/loaders/image_io.cpp
++++ b/core/src/loaders/image_io.cpp
+@@ -34 +34 @@ Image imreadRGB(const std::string &path) {
+-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+@@ -69 +69 @@ void imwriteRGB(const std::string &path, const Image &img) {
+-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);

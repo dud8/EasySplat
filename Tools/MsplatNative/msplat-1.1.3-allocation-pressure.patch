@@ -1,0 +1,287 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -134,6 +134,16 @@ if(MSPLAT_BUILD_RASTER_TESTS)
+         USE_MPS
+         MSPLAT_ENABLE_RASTER_TEST_HOOKS
+     )
++    add_executable(msplat_allocation_pressure_cli cli/msplat.cpp)
++    target_link_libraries(msplat_allocation_pressure_cli PRIVATE
++        msplat_core_raster_tests CLI11::CLI11 pthread
++    )
++    target_compile_definitions(msplat_allocation_pressure_cli PRIVATE
++        USE_MPS
++        MSPLAT_ENABLE_RASTER_TEST_HOOKS
++        msplat_set_raster_memory_budget_bytes=msplat_set_raster_memory_budget_and_fail_for_testing
++    )
++    add_dependencies(msplat_allocation_pressure_cli metallib)
+ endif()
+ 
+ # --- Python bindings (optional, enabled when building via scikit-build-core) ---
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -15,14 +15,17 @@
+     uint64_t peak_exact_intersection_capacity;
+     uint64_t latest_intersection_count;
+     uint64_t allocation_bytes;
++    uint64_t requested_bytes;
+     uint64_t required_bytes;
+     uint64_t budget_bytes;
++    uint64_t recommended_working_set_bytes;
+     uint64_t first_overflow_iteration;
+     uint64_t first_overflow_camera;
+     uint64_t max_buffer_bytes;
+     bool capacity_exceeded;
+     bool memory_budget_exceeded;
+     bool resource_limit_exceeded;
++    bool allocation_unavailable;
+ };
+ 
+ // Release all cached GPU tensors (call before exit to prevent GPU memory leak)
+@@ -79,6 +82,8 @@
+ void msplat_set_exact_execution_capacity_for_testing(uint64_t capacity);
+ void msplat_set_exact_capacity_limit_for_testing(uint64_t capacity);
+ void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
++void msplat_simulate_gpu_allocation_failure_for_testing(uint64_t requested_bytes);
++void msplat_set_raster_memory_budget_and_fail_for_testing(uint64_t budget_bytes);
+ void msplat_fail_next_sync_for_testing();
+ uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
+ uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count);
+@@ -120,6 +124,7 @@
+ MsplatRasterStats msplat_get_raster_stats();
+ bool msplat_raster_memory_budget_was_exceeded();
+ bool msplat_raster_resource_limit_was_exceeded();
++bool msplat_metal_allocation_was_unavailable();
+ uint64_t msplat_get_raster_fallback_count();
+ uint64_t msplat_get_dropped_intersection_count();
+ void msplat_record_last_loss(int slot, int capacity, float normalization);
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -706,8 +706,10 @@
+ static uint64_t g_initial_raster_fallback_count = 0;
+ static uint64_t g_last_raster_required_bytes = 0;
+ static uint64_t g_last_raster_allocation_bytes = 0;
++static uint64_t g_last_metal_requested_bytes = 0;
+ static uint64_t g_last_raster_intersection_count = 0;
+ static uint64_t g_last_raster_max_buffer_bytes = 0;
++static uint64_t g_last_metal_recommended_working_set_bytes = 0;
+ static uint64_t g_raster_iteration = 0;
+ static uint64_t g_raster_camera_index = 0;
+ static std::mutex g_exact_raster_metric_mutex;
+@@ -733,6 +735,7 @@
+ #endif
+ static bool g_last_raster_memory_budget_exceeded = false;
+ static bool g_last_raster_resource_limit_exceeded = false;
++static bool g_last_metal_allocation_unavailable = false;
+ 
+ static uint64_t checked_add_u64(uint64_t lhs, uint64_t rhs, const char *context) {
+     if (rhs > std::numeric_limits<uint64_t>::max() - lhs) {
+@@ -817,10 +820,23 @@
+     id<MTLDevice> device,
+     size_t bytes
+ ) {
+-    (void)device;
++    const uint64_t requested = static_cast<uint64_t>(bytes);
++    const uint64_t allocated = static_cast<uint64_t>(device.currentAllocatedSize);
++    const uint64_t required = checked_add_u64(
++        allocated,
++        requested,
++        "reporting a failed Metal allocation"
++    );
++    g_last_raster_allocation_bytes = allocated;
++    g_last_metal_requested_bytes = requested;
++    g_last_raster_required_bytes = required;
++    g_last_raster_max_buffer_bytes = static_cast<uint64_t>(device.maxBufferLength);
++    g_last_metal_recommended_working_set_bytes =
++        static_cast<uint64_t>(device.recommendedMaxWorkingSetSize);
++    g_last_metal_allocation_unavailable = true;
+     throw std::runtime_error(
+-        "Metal buffer allocation failed after capacity validation: requested_bytes=" +
+-        std::to_string(static_cast<uint64_t>(bytes))
++        "metal_allocation_unavailable requested_bytes=" + std::to_string(requested) +
++        " current_allocated_bytes=" + std::to_string(allocated)
+     );
+ }
+ 
+@@ -1374,10 +1390,13 @@
+     g_raster_memory_budget_bytes = budget_bytes;
+     g_last_raster_required_bytes = 0;
+     g_last_raster_allocation_bytes = 0;
++    g_last_metal_requested_bytes = 0;
+     g_last_raster_intersection_count = 0;
+     g_last_raster_max_buffer_bytes = 0;
++    g_last_metal_recommended_working_set_bytes = 0;
+     g_last_raster_memory_budget_exceeded = false;
+     g_last_raster_resource_limit_exceeded = false;
++    g_last_metal_allocation_unavailable = false;
+ }
+ 
+ void msplat_set_raster_fallback_count(uint64_t fallback_count) {
+@@ -1634,9 +1653,12 @@
+     stats[kRasterStatFirstOverflowCamera] = 0;
+     g_last_raster_required_bytes = 0;
+     g_last_raster_allocation_bytes = 0;
++    g_last_metal_requested_bytes = 0;
+     g_last_raster_max_buffer_bytes = 0;
++    g_last_metal_recommended_working_set_bytes = 0;
+     g_last_raster_memory_budget_exceeded = false;
+     g_last_raster_resource_limit_exceeded = false;
++    g_last_metal_allocation_unavailable = false;
+ }
+ 
+ #ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
+@@ -1693,6 +1715,22 @@
+     g_last_raster_memory_budget_exceeded = false;
+ }
+ 
++void msplat_simulate_gpu_allocation_failure_for_testing(uint64_t requested_bytes) {
++    if (requested_bytes == 0 || requested_bytes > std::numeric_limits<size_t>::max()) {
++        throw std::invalid_argument("msplat: simulated Metal allocation size is invalid");
++    }
++    msplat_report_gpu_allocation_failure(
++        get_global_context()->device,
++        static_cast<size_t>(requested_bytes)
++    );
++}
++
++void msplat_set_raster_memory_budget_and_fail_for_testing(uint64_t budget_bytes) {
++    msplat_set_raster_memory_budget_bytes(budget_bytes);
++    msplat_simulate_gpu_allocation_failure_for_testing(64ULL * 1024ULL * 1024ULL);
++    throw std::logic_error("msplat: simulated Metal allocation failure unexpectedly returned");
++}
++
+ void msplat_fail_next_sync_for_testing() {
+     if (g_fail_next_sync_for_testing) {
+         throw std::runtime_error("msplat: a sync failure is already pending");
+@@ -1731,14 +1763,17 @@
+             peakExactIntersectionCapacity,
+             g_last_raster_intersection_count,
+             g_last_raster_allocation_bytes,
++            g_last_metal_requested_bytes,
+             g_last_raster_required_bytes,
+             budget,
++            g_last_metal_recommended_working_set_bytes,
+             0,
+             0,
+             g_last_raster_max_buffer_bytes,
+             false,
+             g_last_raster_memory_budget_exceeded,
+             g_last_raster_resource_limit_exceeded,
++            g_last_metal_allocation_unavailable,
+         };
+     }
+     const auto *stats = g_tcache.raster_stats.data<uint32_t>();
+@@ -1746,7 +1781,8 @@
+         (static_cast<uint64_t>(stats[kRasterStatLatestIntersectionCountHigh]) << 32) |
+         static_cast<uint64_t>(stats[kRasterStatLatestIntersectionCount]);
+     const uint64_t reportedIntersectionCount =
+-        g_last_raster_memory_budget_exceeded || g_last_raster_resource_limit_exceeded
++        g_last_raster_memory_budget_exceeded || g_last_raster_resource_limit_exceeded ||
++            g_last_metal_allocation_unavailable
+         ? g_last_raster_intersection_count
+         : actual;
+     const uint64_t allocation = g_tcache.raster_allocation_bytes();
+@@ -1758,15 +1794,18 @@
+         exactBufferBytesAdded,
+         peakExactIntersectionCapacity,
+         reportedIntersectionCount,
+-        allocation,
++        g_last_metal_allocation_unavailable ? g_last_raster_allocation_bytes : allocation,
++        g_last_metal_requested_bytes,
+         g_last_raster_required_bytes,
+         budget,
++        g_last_metal_recommended_working_set_bytes,
+         stats[kRasterStatFirstOverflowIteration],
+         stats[kRasterStatFirstOverflowCamera],
+         g_last_raster_max_buffer_bytes,
+         stats[kRasterStatFatalFlag] != 0,
+         g_last_raster_memory_budget_exceeded,
+         g_last_raster_resource_limit_exceeded,
++        g_last_metal_allocation_unavailable,
+     };
+ }
+ 
+@@ -1776,6 +1815,10 @@
+ 
+ bool msplat_raster_resource_limit_was_exceeded() {
+     return g_last_raster_resource_limit_exceeded;
++}
++
++bool msplat_metal_allocation_was_unavailable() {
++    return g_last_metal_allocation_unavailable;
+ }
+ 
+ uint64_t msplat_get_raster_fallback_count() {
+--- a/cli/msplat.cpp
++++ b/cli/msplat.cpp
+@@ -2848,6 +2848,32 @@
+         if (!events->enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
+         return 0;
+     } catch (const std::exception &error) {
++        if (msplat_metal_allocation_was_unavailable()) {
++            const MsplatRasterStats stats = msplat_get_raster_stats();
++            if (events) {
++                try {
++                    json fields = {
++                        {"budget_bytes", stats.budget_bytes},
++                        {"current_allocated_bytes", stats.allocation_bytes},
++                        {"iteration", terminalIteration},
++                        {"max_buffer_bytes", stats.max_buffer_bytes},
++                        {"recommended_working_set_bytes",
++                         stats.recommended_working_set_bytes},
++                        {"requested_bytes", stats.requested_bytes},
++                        {"required_bytes", stats.required_bytes},
++                    };
++                    if (stats.latest_intersection_count > 0) {
++                        fields["intersection_count"] = stats.latest_intersection_count;
++                    }
++                    events->emit("metal_allocation_unavailable", std::move(fields));
++                } catch (const std::exception &eventError) {
++                    std::cerr << "easysplat-train: cannot report Metal allocation failure: "
++                              << eventError.what() << '\n';
++                }
++            }
++            std::cerr << "easysplat-train: " << error.what() << '\n';
++            return 71;
++        }
+         if (msplat_raster_resource_limit_was_exceeded()) {
+             const MsplatRasterStats stats = msplat_get_raster_stats();
+             if (events) {
+--- a/tests/msplat_raster_tests.cpp
++++ b/tests/msplat_raster_tests.cpp
+@@ -1915,6 +1915,36 @@
+             stats.dropped_intersection_count != 0) {
+             throw std::runtime_error("exact growth did not report a typed memory limit");
+         }
++    }
++
++    // Metal can still refuse a valid allocation after policy and maximum-buffer
++    // preflight when unified memory becomes unavailable between those operations.
++    // Exercise the same reporting function as the nil-buffer branch without
++    // deliberately exhausting the host.
++    cleanup_msplat_metal();
++    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
++    constexpr std::uint64_t unavailableRequest = 64ULL * 1024ULL * 1024ULL;
++    bool allocationRejected = false;
++    try {
++        msplat_simulate_gpu_allocation_failure_for_testing(unavailableRequest);
++    } catch (const std::exception &) {
++        allocationRejected = true;
++    }
++    const MsplatRasterStats allocationFailure = msplat_get_raster_stats();
++    if (!allocationRejected || !allocationFailure.allocation_unavailable ||
++        !msplat_metal_allocation_was_unavailable() ||
++        allocationFailure.memory_budget_exceeded || allocationFailure.resource_limit_exceeded ||
++        allocationFailure.requested_bytes != unavailableRequest ||
++        allocationFailure.required_bytes !=
++            allocationFailure.allocation_bytes + unavailableRequest ||
++        allocationFailure.budget_bytes != memoryBudgetBytes ||
++        allocationFailure.recommended_working_set_bytes == 0 ||
++        allocationFailure.max_buffer_bytes == 0 ||
++        allocationFailure.latest_intersection_count != 0 ||
++        allocationFailure.dropped_intersection_count != 0) {
++        throw std::runtime_error(
++            "post-preflight Metal allocation failure did not report typed evidence"
++        );
+     }
+ 
+     cleanup_msplat_metal();

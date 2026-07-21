@@ -2,23 +2,57 @@ import Foundation
 import SwiftUI
 import EasySplatCore
 
+enum RunValidationRecovery: Equatable {
+    case useUnordered
+    case useFast
+    case useFastForMemory
+    case useBalanced
+    case useAutomaticPhotoSelection
+    case useMoreTrainingMemory(Int64)
+
+    func apply(to options: inout RequestedRunOptions) {
+        switch self {
+        case .useUnordered:
+            options.inputOrdering = .unordered
+        case .useFast:
+            options.detailProfile = .fast
+            options.resourcePolicy = .conserveMemory
+        case .useFastForMemory:
+            options.detailProfile = .fast
+        case .useBalanced:
+            options.detailProfile = .balanced
+        case .useAutomaticPhotoSelection:
+            options.photoSelection = .automatic
+        case .useMoreTrainingMemory:
+            break
+        }
+    }
+}
+
+struct ProjectPublicationCheckpointHook: Sendable {
+    static let none = ProjectPublicationCheckpointHook()
+
+    private let handler: ProjectPublicationTransaction.CheckpointHandler
+
+    init(
+        _ handler: @escaping ProjectPublicationTransaction.CheckpointHandler = { _ in }
+    ) {
+        self.handler = handler
+    }
+
+    func handle(_ checkpoint: ProjectPublicationTransaction.Checkpoint) throws {
+        try handler(checkpoint)
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
-    enum ViewState {
+    typealias FinishedOutputValidator = @Sendable (URL) -> URL?
+
+    enum ViewState: Equatable {
         case home
         case processing
         case viewer
-    }
-
-    enum AppModelError: LocalizedError {
-        case noDocumentsDirectory
-
-        var errorDescription: String? {
-            switch self {
-            case .noDocumentsDirectory:
-                return "Unable to locate the Documents folder."
-            }
-        }
     }
 
     @Published var viewState: ViewState = .home
@@ -27,49 +61,51 @@ final class AppModel: ObservableObject {
     @Published var statusTitle: String = "Ready to start"
     @Published var statusDetail: String? = nil
     @Published var stageStartedAt: Date? = nil
+    @Published var phaseStartedAt: Date? = nil
     @Published var lastPipelineEventAt: Date? = nil
     @Published var logLines: [String] = []
     @Published var errorLogLines: [String] = []
     @Published var lastError: String? = nil
     @Published var errorDetails: String? = nil
+    @Published var validationRecovery: RunValidationRecovery? = nil
+    @Published var failureRetryAllowed = true
     @Published var outputPlyURL: URL? = nil
-    @Published var currentReconstruction: ReconstructionSummary? = nil
     @Published var currentStageTimings: [StageTimingRecord] = []
+    @Published var currentCreateToViewerReadySeconds: TimeInterval? = nil
     @Published var currentOutputPlyInfo: OutputPlyInfo? = nil
-    @Published var currentAutoTune: AutoTuneSnapshot? = nil
-    @Published var currentPreset: PresetSpec? = nil
+    @Published var currentRunOptions: RequestedRunOptions? = nil
     @Published var currentInput: InputSpec? = nil
     @Published var currentProjectNotes: String = ""
+    @Published var notesSaveState: NotesSaveState = .idle
     @Published var currentProjectURL: URL? = nil
-    @Published var toolchainPaths: ToolchainPaths? = nil
     @Published var stopAction: StopAction? = nil
-    @Published var isShowingTrainingConsent: Bool = false
-    @Published var isLivePreviewEnabled: Bool = false
-    @Published var activeTrainingBackend: TrainingBackend? = nil
+    @Published var isRunActive = false
+    @Published var actionFailure: ActionFailurePresentation?
 
     @Published var cachedFreeDiskBytes: Int64? = nil
-    @Published var captureMode: CaptureMode = AppModel.persistedCaptureMode() {
-        didSet { UserDefaults.standard.set(captureMode.rawValue, forKey: AppModel.captureModeUserDefaultsKey) }
-    }
-    @Published var qualityPreset: QualityPreset = AppModel.persistedQualityPreset() {
-        didSet { UserDefaults.standard.set(qualityPreset.rawValue, forKey: AppModel.qualityPresetUserDefaultsKey) }
-    }
+    @Published var requestedRunOptions = RequestedRunOptions()
     @Published var pendingVideoURLs: [URL] = []
     @Published var pendingPhotosFolderURL: URL? = nil
     @Published var projectSummaries: [ProjectSummary] = []
     @Published var selectionWarning: String? = nil
-    @Published var recoveryPromptProject: ProjectSummary? = nil
     @Published var shareStatusMessage: String? = nil
     @Published var shareStatusIsError: Bool = false
-    @Published var shareMetrics: ShareMetrics = .init()
     @Published var isShareSheetActive: Bool = false
+    @Published var isShareReady: Bool = false
+    @Published var isPreparingShare: Bool = false
 
     let toolchainManager: ToolchainManaging
+    let hardwareProfile: HardwareProfile
     let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
     let powerAssertion: PowerAssertionManaging
+    let finishedOutputValidator: FinishedOutputValidator
+    let videoInputPreflight: VideoInputPreflight
+    let projectPublicationCheckpointHook: ProjectPublicationCheckpointHook
     let projectBaseURL: URL?
+    let projectTrashHandler: (URL) throws -> Void
     var currentTask: Task<Void, Never>?
     var currentTaskToken: UUID?
+    var pendingResultViewerTiming: PendingResultViewerTiming?
     var lastProgressLogAt: Date = .distantPast
     var lastProgressLogMessage: String = ""
     var lastProgressLogStage: PipelineStage? = nil
@@ -84,42 +120,51 @@ final class AppModel: ObservableObject {
     let trainingStepLogInterval = 120
     let trainingProgressLogMinInterval: TimeInterval = 3.0
     var notesSaveTask: Task<Void, Never>?
+    var projectSummaryRefreshTask: Task<Void, Never>?
     var pendingNotesSave: (url: URL, text: String)?
-    /// In-memory cache for recent pipeline error counts. Keyed by log URL,
-    /// invalidated when the log's mtime OR size changes between refreshes
-    /// (mtime alone has only second-level precision on some filesystems,
-    /// so two writes inside the same second would falsely cache-hit).
-    var pipelineErrorCountCache: [URL: (mtime: Date, size: Int64, count: Int)] = [:]
-    var trainingConsentContinuation: CheckedContinuation<Bool, Never>?
-    var trainingConsentPauseStartedAt: Date?
-    var trainingConsentPausedDuration: TimeInterval = 0
+    var photoFolderCountTask: Task<Void, Never>?
     var exitIntent: ExitIntent = .none
     weak var pendingCloseWindow: NSWindow?
     var allowNextWindowClose = false
-    var pendingSnapshotRevealURL: URL?
-    var pendingSnapshotRevealRequiresExit: Bool = false
+    var replyToTerminationRequest: (Bool) -> Void = { shouldTerminate in
+        NSApp.reply(toApplicationShouldTerminate: shouldTerminate)
+    }
     var forcedExitTask: Task<Void, Never>?
     var activeShareSession: ShareSession?
-    var ignoredRecoveryProjectIDs: Set<UUID> = []
+    var inFlightShareSessions: [UUID: ShareSession] = [:]
+    var latestShareOperationID: UUID?
+    var preparedShareItem: PreparedShareItem?
+    var sharePreparationToken: UUID?
+    var sharePreparationTask: Task<Void, Never>?
     static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
-
-    nonisolated static let trainingConsentRememberedKey = "EasySplatTrainingConsentRemembered"
-    nonisolated static let captureModeUserDefaultsKey = "EasySplatCaptureMode"
-    nonisolated static let qualityPresetUserDefaultsKey = "EasySplatQualityPreset"
-
-    static func persistedCaptureMode() -> CaptureMode {
-        let raw = UserDefaults.standard.string(forKey: captureModeUserDefaultsKey) ?? ""
-        return CaptureMode(rawValue: raw) ?? .object
-    }
-
-    static func persistedQualityPreset() -> QualityPreset {
-        let raw = UserDefaults.standard.string(forKey: qualityPresetUserDefaultsKey) ?? ""
-        return QualityPreset(rawValue: raw) ?? .draft
-    }
 
     enum StopAction {
         case keepProject
         case deleteProject
+    }
+
+    struct StopFailurePresentation: Equatable {
+        let title: String
+        let detail: String
+    }
+
+    struct ActionFailurePresentation: Equatable {
+        let title: String
+        let message: String
+    }
+
+    enum NotesSaveState: Equatable {
+        case idle
+        case saving
+        case saved
+        case failed(String)
+    }
+
+    struct ExitConfirmationPresentation: Equatable {
+        let title: String
+        let message: String
+        let primaryActionTitle: String
+        let destructiveActionTitle: String?
     }
 
     enum ExitIntent {
@@ -139,28 +184,32 @@ final class AppModel: ObservableObject {
     }
 
     var isTrainingStageActive: Bool {
-        stage == .trainBrush
+        stage == .trainSplat
     }
 
-    var isBrushSnapshotTrainingActive: Bool {
-        isTrainingStageActive && activeTrainingBackend == .brush
-    }
-
-    var trainingSnapshotURL: URL? {
-        guard let currentProjectURL else { return nil }
-        return ProjectPaths(root: currentProjectURL)
-            .trainingURL
-            .appendingPathComponent("latest_snapshot.ply")
-    }
-
-    var shareSummaryText: String? {
-        let completed = shareMetrics.shareCompletedCount
-        guard completed > 0 else { return nil }
-        let prefix = completed == 1 ? "Shared once." : "Shared \(completed) times."
-        if let service = shareMetrics.lastShareService, !service.isEmpty {
-            return "\(prefix) Last via \(service)."
+    func stopFailurePresentation(for action: StopAction) -> StopFailurePresentation {
+        if currentProjectURL == nil {
+            return StopFailurePresentation(
+                title: "Couldn’t stop setup",
+                detail: "EasySplat could not stop safely. Review the details and try again."
+            )
         }
-        return prefix
+        if action == .deleteProject {
+            return StopFailurePresentation(
+                title: "Couldn’t move project to Trash",
+                detail: "The project stayed in place because EasySplat could not stop safely. Review the details and try again."
+            )
+        }
+        if isTrainingStageActive {
+            return StopFailurePresentation(
+                title: "Couldn’t save the project",
+                detail: "The training checkpoint was not saved. Review the details and try again."
+            )
+        }
+        return StopFailurePresentation(
+            title: "Couldn’t save the project",
+            detail: "The project was not saved. Review the details and try again."
+        )
     }
 
     var processingDetailsText: String? {
@@ -208,17 +257,68 @@ final class AppModel: ObservableObject {
     }
 
     init(
-        toolchainManager: ToolchainManaging = ToolchainManager(),
+        toolchainManager: ToolchainManaging = AppModel.makeDefaultToolchainManager(),
         projectBaseURL: URL? = nil,
+        hardwareProfile: HardwareProfile? = nil,
+        videoInputPreflight: VideoInputPreflight = VideoInputPreflight(),
         pipelineRunnerFactory: @escaping (URL, PipelineRunner.PipelineConfig) -> PipelineRunning = { projectURL, config in
             PipelineRunner(projectURL: projectURL, config: config)
         },
-        powerAssertion: PowerAssertionManaging = SystemPowerAssertion()
+        projectPublicationCheckpointHook: ProjectPublicationCheckpointHook = .none,
+        powerAssertion: PowerAssertionManaging = SystemPowerAssertion(),
+        projectTrashHandler: @escaping (URL) throws -> Void = { url in
+            var resultingURL: NSURL?
+            try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+        },
+        finishedOutputValidator: @escaping FinishedOutputValidator = { projectURL in
+            AppModel.readyOutputURLOnDisk(
+                projectURL: projectURL,
+                validationDepth: .full
+            )
+        }
     ) {
         self.toolchainManager = toolchainManager
         self.projectBaseURL = projectBaseURL
+        self.hardwareProfile = hardwareProfile ?? .detect()
+        self.finishedOutputValidator = finishedOutputValidator
+        self.videoInputPreflight = videoInputPreflight
+        self.projectPublicationCheckpointHook = projectPublicationCheckpointHook
+        self.projectTrashHandler = projectTrashHandler
         self.pipelineRunnerFactory = pipelineRunnerFactory
         self.powerAssertion = powerAssertion
-        refreshProjectSummaries()
+        if self.hardwareProfile.memoryGB <= 8.5 {
+            requestedRunOptions.detailProfile = .fast
+            requestedRunOptions.resourcePolicy = .conserveMemory
+        }
+        if projectBaseURL != nil {
+            refreshProjectSummaries()
+        }
+    }
+
+    static func makeDefaultToolchainManager(
+        bundledBootstrap: ToolchainBootstrap? = AppConfig.bundledToolchainBootstrap,
+        sourcePolicy: ToolchainSourcePolicy = AppModel.defaultToolchainSourcePolicy(),
+        developmentOverrides: DevelopmentOverrides = AppConfig.currentDevelopmentOverrides,
+        factory: (ToolchainBootstrap?, ToolchainSourcePolicy, URL?) -> ToolchainManaging = {
+            bundledBootstrap,
+            sourcePolicy,
+            localToolchainRoot in
+            ToolchainManager(
+                appVersion: EasySplatReleaseIdentity.version(),
+                localToolchainRoot: localToolchainRoot,
+                allowInsecureLoopbackHTTP: AppConfig.allowInsecureLoopbackToolchainHTTP,
+                bundledBootstrap: bundledBootstrap,
+                sourcePolicy: sourcePolicy
+            )
+        }
+    ) -> ToolchainManaging {
+        factory(bundledBootstrap, sourcePolicy, developmentOverrides.localToolchainRoot)
+    }
+
+    static func defaultToolchainSourcePolicy(
+        releaseVerificationConfiguration: AppConfig.ReleaseVerificationConfiguration?
+            = AppConfig.releaseVerificationConfiguration
+    ) -> ToolchainSourcePolicy {
+        releaseVerificationConfiguration == nil ? .automatic : .bundledBootstrapOnly
     }
 }

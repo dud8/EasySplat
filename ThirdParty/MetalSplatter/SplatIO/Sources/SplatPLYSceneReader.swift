@@ -24,21 +24,73 @@ public class SplatPLYSceneReader: SplatSceneReader {
     }
 
     private let ply: PLYReader
+    private let validatesRenderEncoding: Bool
 
-    public convenience init(_ url: URL) {
-        self.init(PLYReader(url))
+    /// Set `validatesRenderEncoding` to `false` only when the delegate encodes every
+    /// point with ``SplatRenderEncodingValidator`` before retaining or publishing it.
+    public convenience init(_ url: URL, validatesRenderEncoding: Bool = true) {
+        self.init(
+            PLYReader(url),
+            validatesRenderEncoding: validatesRenderEncoding
+        )
     }
 
-    public init(_ ply: PLYReader) {
+    /// Set `validatesRenderEncoding` to `false` only when the delegate encodes every
+    /// point with ``SplatRenderEncodingValidator`` before retaining or publishing it.
+    public init(_ ply: PLYReader, validatesRenderEncoding: Bool = true) {
         self.ply = ply
+        self.validatesRenderEncoding = validatesRenderEncoding
+    }
+
+    public static func isRetryableReadError(_ error: Swift.Error) -> Bool {
+        if error is SplatRenderEncodingValidationError || error is Error {
+            return false
+        }
+        guard let plyError = error as? PLYReader.Error else {
+            return true
+        }
+        switch plyError {
+        case .cannotOpenSource, .readError:
+            return true
+        case .headerStartMissing,
+             .headerEndMissing,
+             .headerFormatMissing,
+             .headerInvalidCharacters,
+             .headerUnknownKeyword,
+             .headerUnexpectedKeyword,
+             .headerInvalidLine,
+             .headerInvalidFileFormatType,
+             .headerUnknownPropertyType,
+             .headerInvalidListCountType,
+             .bodyInvalidStringForPropertyType,
+             .bodyMissingPropertyValuesInElement,
+             .bodyUnexpectedValuesInElement,
+             .unexpectedEndOfFile,
+             .internalConsistency:
+            return false
+        }
     }
 
     public func read(to delegate: SplatSceneReaderDelegate) {
-        SplatPLYSceneReaderStream().read(ply, to: delegate)
+        read(to: delegate, shouldCancel: { false })
+    }
+
+    public func read(
+        to delegate: SplatSceneReaderDelegate,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) {
+        SplatPLYSceneReaderStream(
+            validatesRenderEncoding: validatesRenderEncoding
+        ).read(
+            ply,
+            to: delegate,
+            shouldCancel: shouldCancel
+        )
     }
 }
 
 private class SplatPLYSceneReaderStream {
+    private let validatesRenderEncoding: Bool
     private weak var delegate: SplatSceneReaderDelegate? = nil
     private var active = false
     private var pointElementMapping: PointElementMapping?
@@ -46,14 +98,22 @@ private class SplatPLYSceneReaderStream {
     private var pointCount: UInt32 = 0
     private var reusablePoint = SplatScenePoint(position: .zero, normal: .zero, color: .none, opacity: .zero, scale: .zero, rotation: .init(vector: .zero))
 
-    func read(_ ply: PLYReader, to delegate: SplatSceneReaderDelegate) {
+    init(validatesRenderEncoding: Bool) {
+        self.validatesRenderEncoding = validatesRenderEncoding
+    }
+
+    func read(
+        _ ply: PLYReader,
+        to delegate: SplatSceneReaderDelegate,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) {
         self.delegate = delegate
         active = true
         pointElementMapping = nil
         expectedPointCount = 0
         pointCount = 0
 
-        ply.read(to: self)
+        ply.read(to: self, shouldCancel: shouldCancel)
 
         assert(!active)
     }
@@ -91,6 +151,9 @@ extension SplatPLYSceneReaderStream: PLYReaderDelegate {
         guard typeIndex == pointElementMapping.elementTypeIndex else { return }
         do {
             try pointElementMapping.apply(from: element, to: &reusablePoint)
+            if validatesRenderEncoding {
+                try SplatRenderEncodingValidator.validate(reusablePoint)
+            }
             pointCount += 1
             delegate?.didRead(points: [ reusablePoint ])
         } catch {
@@ -197,11 +260,11 @@ private struct PointElementMapping {
         if let sh0_rPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.sh0_r),
            let sh0_gPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.sh0_g),
             let sh0_bPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.sh0_b) {
-            let sphericalHarmonicsPropertyIndices: [Int]
-            if headerElement.hasProperty(forName: "\(PropertyName.sphericalHarmonicsPrefix)0") {
-                sphericalHarmonicsPropertyIndices = try (0..<sphericalHarmonicsCount).map {
-                    try headerElement.index(forFloat32PropertyNamed: [ "\(PropertyName.sphericalHarmonicsPrefix)\($0)" ])
-                }
+            let sphericalHarmonicsPropertyIndices = try headerElement.sphericalHarmonicPropertyIndices(
+                prefix: PropertyName.sphericalHarmonicsPrefix,
+                expectedCount: sphericalHarmonicsCount
+            )
+            if !sphericalHarmonicsPropertyIndices.isEmpty {
                 color = .sphericalHarmonic(sh0_rPropertyIndex, sh0_gPropertyIndex, sh0_bPropertyIndex, sphericalHarmonicsPropertyIndices)
             } else {
                 color = .firstOrderSphericalHarmonic(sh0_rPropertyIndex, sh0_gPropertyIndex, sh0_bPropertyIndex)
@@ -306,6 +369,19 @@ private struct PointElementMapping {
 }
 
 private extension PLYHeader.Element {
+    func sphericalHarmonicPropertyIndices(prefix: String, expectedCount: Int) throws -> [Int] {
+        let names = properties.lazy.map(\.name).filter { $0.hasPrefix(prefix) }
+        guard !names.isEmpty else { return [] }
+
+        let expectedNames = (0..<expectedCount).map { "\(prefix)\($0)" }
+        guard names.count == expectedCount, Set(names) == Set(expectedNames) else {
+            throw SplatPLYSceneReader.Error.unsupportedFileContents(
+                "Expected higher-order properties \(prefix)0 through \(prefix)\(expectedCount - 1) with no gaps"
+            )
+        }
+        return try expectedNames.map { try index(forFloat32PropertyNamed: [$0]) }
+    }
+
     func hasProperty(forName name: String, type: PLYHeader.PrimitivePropertyType? = nil) -> Bool {
         guard let index = index(forPropertyNamed: name) else {
             return false

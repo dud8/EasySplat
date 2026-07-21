@@ -26,6 +26,9 @@ public struct ReconstructionScore: Sendable {
 }
 
 public enum ReconstructionScorer {
+    static let minimumRegisteredViewFraction = 0.90
+    static let maximumMeanReprojectionError = 2.5
+
     static func parseSparseTextModel(at sparseModelURL: URL, expectedTotalImages: Int? = nil) -> ReconstructionScore? {
         let imagesTxt = sparseModelURL.appendingPathComponent("images.txt")
         let pointsTxt = sparseModelURL.appendingPathComponent("points3D.txt")
@@ -165,12 +168,21 @@ public enum ReconstructionScorer {
         )
     }
 
-    public static func isAcceptable(_ score: ReconstructionScore, mode: CaptureMode) -> Bool {
-        guard score.totalImages > 0 else { return false }
+    public static func isAcceptable(
+        _ score: ReconstructionScore,
+        capturePath _: CapturePath
+    ) -> Bool {
+        guard score.totalImages > 0,
+              score.registeredImages > 0,
+              score.registeredImages <= score.totalImages else {
+            return false
+        }
         let ratio = Double(score.registeredImages) / Double(score.totalImages)
-        let threshold: Double = (mode == .room) ? 0.55 : 0.65
-        if ratio < threshold { return false }
-        if let reproj = score.meanReprojectionError, reproj > 2.5 { return false }
+        if ratio < minimumRegisteredViewFraction { return false }
+        if let reproj = score.meanReprojectionError,
+           !reproj.isFinite || reproj < 0 || reproj > maximumMeanReprojectionError {
+            return false
+        }
         if let points = score.pointCount, points <= 0 { return false }
         if let observations = score.observationCount, observations <= 0 { return false }
         if let meanTrackLength = score.meanTrackLength, meanTrackLength <= 0 { return false }
@@ -190,19 +202,6 @@ public enum ReconstructionScorer {
             observationCount: score.observationCount,
             meanTrackLength: score.meanTrackLength
         )
-    }
-
-    /// Same as `summary(_:)`, but reports "n/a" for the reprojection error when the mapper's
-    /// model_analyzer value is a placeholder rather than a real pixel residual (see
-    /// `ReconstructionSummary.reprojectionErrorIsUnreliable`), so diagnostic logs and
-    /// checkpoints match the honest, persisted summary instead of the raw tool output.
-    public static func summary(_ score: ReconstructionScore, mapper: String) -> String {
-        guard ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: mapper) else {
-            return summary(score)
-        }
-        var masked = score
-        masked.meanReprojectionError = nil
-        return summary(masked)
     }
 
     public static func summary(_ score: ReconstructionScore) -> String {

@@ -1,1 +1,1 @@
-"""EasySplat Depth Anything 3 SfM bridge."""
+"""EasySplat Depth Anything 3 runtime."""

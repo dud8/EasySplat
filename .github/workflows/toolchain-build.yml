@@ -1,4 +1,4 @@
-name: Toolchain Build
+name: Toolchain Producer
 
 on:
   workflow_dispatch:
@@ -7,119 +7,559 @@ on:
         description: "Toolchain version (semver)"
         required: true
         type: string
-  push:
-    tags:
-      - "toolchain-v*"
+      app_version_minimum:
+        description: "Minimum compatible EasySplat app version"
+        required: true
+        default: "0.2.0"
+        type: string
+      app_version_maximum_exclusive:
+        description: "Exclusive maximum compatible EasySplat app version"
+        required: true
+        default: "0.3.0"
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: toolchain-producer-${{ inputs.version }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    runs-on: macos-14
+  metadata-preflight:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: toolchain-release
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      source_commit: ${{ steps.metadata.outputs.source_commit }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve version
+      - name: Bind protected main and release tag
+        id: metadata
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_VERSION: ${{ inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_POLICY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
+          APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
         run: |
-          semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            VERSION="$INPUT_VERSION"
-            TAG="toolchain-v${VERSION}"
-          else
-            case "$REF_NAME" in
-              toolchain-v*) ;;
-              *)
-                echo "Expected toolchain tag to start with toolchain-v, got: $REF_NAME" >&2
-                exit 1
-                ;;
-            esac
-            TAG="$REF_NAME"
-            VERSION="${TAG#toolchain-v}"
-          fi
-          if ! [[ "$VERSION" =~ $semver_re ]]; then
-            echo "Invalid semantic version: $VERSION" >&2
-            exit 1
-          fi
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          python3 - "$VERSION" "$APP_VERSION_MINIMUM" "$APP_VERSION_MAXIMUM_EXCLUSIVE" <<'PY'
+          import re
+          import sys
 
-      - name: Install dependencies
+          core = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+          identifier = r"[0-9A-Za-z-]+"
+          prerelease = rf"{identifier}(?:\.{identifier})*"
+          for value in sys.argv[1:]:
+              if re.fullmatch(rf"{core}(?:-{prerelease})?", value) is None:
+                  raise SystemExit(f"invalid semantic version: {value}")
+              if "-" not in value:
+                  continue
+              for part in value.split("-", 1)[1].split("."):
+                  if part.isdigit() and len(part) > 1 and part.startswith("0"):
+                      raise SystemExit(f"numeric prerelease identifier contains leading zeroes: {value}")
+          PY
+          TAG="toolchain-v$VERSION"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" --jq .ref)" = "refs/tags/$TAG"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/refs%2Ftags%2F$TAG" --jq .sha)" = "$GITHUB_SHA"
+          {
+            echo "version=$VERSION"
+            echo "release_tag=$TAG"
+            echo "source_commit=$GITHUB_SHA"
+          } >>"$GITHUB_OUTPUT"
+
+  build-unsigned:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: metadata-preflight
+    runs-on: ${{ fromJSON('["self-hosted","macOS","ARM64","easysplat-toolchain-builder","easysplat-ephemeral"]') }}
+    timeout-minutes: 300
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.upload-components.outputs.artifact-id }}
+      artifact_digest: ${{ format('sha256:{0}', steps.upload-components.outputs.artifact-digest) }}
+      request_artifact_id: ${{ steps.upload-request.outputs.artifact-id }}
+      request_artifact_digest: ${{ format('sha256:{0}', steps.upload-request.outputs.artifact-digest) }}
+      request_sha256: ${{ steps.package.outputs.request_sha256 }}
+    env:
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Attest exact shipping build host and absence of signing identities
         run: |
-          brew install cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp openimageio
+          set -euo pipefail
+          test "$DEVELOPER_DIR" = "/Applications/Xcode.app/Contents/Developer"
+          scripts/benchmark/verify_shipping_host.sh
+          identity_count="$(
+            security find-identity -v -p codesigning | awk '
+              /^[[:space:]]*[0-9]+ valid identities found[.]?[[:space:]]*$/ {
+                identity_count = $1
+                found = 1
+              }
+              END {
+                if (!found) exit 1
+                print identity_count
+              }
+            '
+          )"
+          test "$identity_count" = "0"
+          python3 - <<'PY' >"$RUNNER_TEMP/toolchain-build-host.json"
+          import json
+          import subprocess
 
-      - name: Build COLMAP
-        run: scripts/toolchain/build_colmap.sh
+          def run(command):
+              return subprocess.check_output(command, text=True).strip()
 
-      - name: Build OpenSSL
-        run: scripts/toolchain/build_openssl.sh
+          payload = {
+              "schemaVersion": 1,
+              "hostRole": "identity-free-production-builder",
+              "macOS": "macOS 26.5.2",
+              "macOSBuild": "25F84",
+              "developerDir": "/Applications/Xcode.app/Contents/Developer",
+              "xcode": "Xcode 26.6",
+              "xcodeBuild": "17F113",
+              "sdk": "SDK 26.5",
+              "sdkBuild": "25F70",
+              "architecture": run(["/usr/bin/uname", "-m"]),
+              "swift": run(["/usr/bin/xcrun", "swift", "--version"]).splitlines()[0],
+              "clang": run(["/usr/bin/xcrun", "clang", "--version"]).splitlines()[0],
+              "metal": run(["/usr/bin/xcrun", "metal", "--version"]).splitlines()[0],
+          }
+          print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+          PY
 
-      - name: Build Brush
-        run: scripts/toolchain/build_brush.sh
-
-      - name: Build msplat
-        run: scripts/toolchain/build_msplat.sh
-
-      - name: Build DA3-MPS bundle
+      - name: Build native toolchain closure
         run: |
+          set -euo pipefail
+          scripts/toolchain/build_colmap_support.sh
+          scripts/toolchain/build_ceres.sh
+          scripts/toolchain/build_openimageio.sh
+          scripts/toolchain/build_colmap.sh
+          scripts/toolchain/build_msplat.sh
           case "${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}" in
             ""|0|false|FALSE|no|NO|off|OFF) ;;
             *)
-              echo "Toolchain release workflow refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE; DA3 source must have pinned git provenance." >&2
+              echo "Unpinned DA3 source overrides are forbidden in release toolchain builds." >&2
               exit 1
               ;;
           esac
           scripts/toolchain/build_da3_mps.sh
 
-      - name: Build MapAnything-MPS bundle
-        run: scripts/toolchain/build_mapanything_mps.sh
-
-      - name: Build VGGT-MPS bundle
-        run: scripts/toolchain/build_vggt_mps.sh
-
-      - name: Build FastVGGT-MPS bundle
-        run: scripts/toolchain/build_fastvggt_mps.sh
-
-      - name: Package toolchain
-        run: scripts/toolchain/package_toolchain.sh --version "$VERSION"
-
-      - name: Generate manifest
+      - name: Package data-only unsigned producer
+        id: package
         env:
-          REPOSITORY: ${{ github.repository }}
-          TOOLCHAIN_SIGNING_KEY_BASE64: ${{ secrets.TOOLCHAIN_SIGNING_KEY_BASE64 }}
+          VERSION: ${{ needs.metadata-preflight.outputs.version }}
+          APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
+          APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
         run: |
-          if [ -z "$TOOLCHAIN_SIGNING_KEY_BASE64" ]; then
-            echo "Missing TOOLCHAIN_SIGNING_KEY_BASE64 secret"
-            exit 1
-          fi
-          CORE_ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION-core.zip"
-          MODELS_ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION-models.zip"
-          CORE_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-macos-arm64-$VERSION-core.zip"
-          MODELS_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-macos-arm64-$VERSION-models.zip"
-          PRIVATE_KEY_FILE="$(mktemp)"
-          trap 'rm -f "$PRIVATE_KEY_FILE"' EXIT
-          printf '%s' "$TOOLCHAIN_SIGNING_KEY_BASE64" > "$PRIVATE_KEY_FILE"
-          chmod 600 "$PRIVATE_KEY_FILE"
-          swift run --package-path Tools/ManifestTool ManifestTool \
-            --core-zip "$CORE_ZIP" \
-            --core-url "$CORE_URL" \
-            --models-zip "$MODELS_ZIP" \
-            --models-url "$MODELS_URL" \
+          set -euo pipefail
+          scripts/toolchain/package_toolchain.sh --version "$VERSION"
+          COMPONENTS="$RUNNER_TEMP/toolchain-components"
+          REQUEST="$RUNNER_TEMP/toolchain-signing-request"
+          rm -rf "$COMPONENTS" "$REQUEST"
+          mkdir -m 0700 "$COMPONENTS" "$REQUEST"
+          cp "Toolchains/out/toolchain-macos-arm64-$VERSION-core.zip" "$COMPONENTS/"
+          cp "Toolchains/out/toolchain-geometry-da3-base-$VERSION.zip" "$COMPONENTS/"
+          cp "Toolchains/out/toolchain-geometry-da3-small-$VERSION.zip" "$COMPONENTS/"
+          cp "$RUNNER_TEMP/toolchain-build-host.json" "$COMPONENTS/"
+          unzip -q "$COMPONENTS/toolchain-macos-arm64-$VERSION-core.zip" -d "$RUNNER_TEMP/core-probe"
+          scripts/benchmark/verify_shipping_host.sh \
+            --binary "$RUNNER_TEMP/core-probe/bin/colmap" \
+            --binary "$RUNNER_TEMP/core-probe/bin/easysplat-train"
+          swift run --package-path Tools/ManifestTool ManifestTool prepare-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
             --version "$VERSION" \
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --private-key-file "$PRIVATE_KEY_FILE" \
-            --manifest-out "Toolchains/out/manifest.json"
+            --app-version-minimum "$APP_VERSION_MINIMUM" \
+            --app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE" \
+            --public-key-file "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --core-zip "$COMPONENTS/toolchain-macos-arm64-$VERSION-core.zip" \
+            --core-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-macos-arm64-$VERSION-core.zip" \
+            --da3-base-zip "$COMPONENTS/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-small-zip "$COMPONENTS/toolchain-geometry-da3-small-$VERSION.zip" \
+            --da3-small-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-small-$VERSION.zip" \
+            --request-out "$REQUEST/toolchain-release-request.json"
+          python3 - "$COMPONENTS" "$REQUEST" "$VERSION" <<'PY'
+          import stat
+          import sys
+          from pathlib import Path
 
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+          root = Path(sys.argv[1])
+          request = Path(sys.argv[2])
+          version = sys.argv[3]
+          expected = {
+              f"toolchain-macos-arm64-{version}-core.zip",
+              f"toolchain-geometry-da3-base-{version}.zip",
+              f"toolchain-geometry-da3-small-{version}.zip",
+              "toolchain-build-host.json",
+          }
+          if {path.name for path in root.iterdir()} != expected:
+              raise SystemExit("unsigned component file set is invalid")
+          if {path.name for path in request.iterdir()} != {"toolchain-release-request.json"}:
+              raise SystemExit("signing request file set is invalid")
+          for path in [*root.iterdir(), *request.iterdir()]:
+              metadata = path.lstat()
+              if path.suffix in {".sh", ".py"}:
+                  raise SystemExit("unsigned handoff contains an executable control surface")
+              if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_nlink != 1 or metadata.st_size <= 0:
+                  raise SystemExit(f"unsigned handoff file is unsafe: {path.name}")
+              if path.suffix == ".zip" and metadata.st_size >= 2_147_483_648:
+                  raise SystemExit("component exceeds GitHub release asset limit")
+          PY
+          REQUEST_SHA256="$(shasum -a 256 "$REQUEST/toolchain-release-request.json" | awk '{print $1}')"
+          [[ "$REQUEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          echo "request_sha256=$REQUEST_SHA256" >>"$GITHUB_OUTPUT"
+
+      - name: Upload identity-free unsigned producer
+        id: upload-components
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tag_name: ${{ env.TAG }}
-          target_commitish: ${{ github.sha }}
-          files: |
-            Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}-core.zip
-            Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}-models.zip
-            Toolchains/out/manifest.json
+          name: toolchain-unsigned-components-${{ inputs.version }}
+          path: ${{ runner.temp }}/toolchain-components
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload exact unsigned request
+        id: upload-request
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-unsigned-request-${{ inputs.version }}
+          path: ${{ runner.temp }}/toolchain-signing-request/toolchain-release-request.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  sign-and-notarize:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: [metadata-preflight, build-unsigned]
+    runs-on: ${{ fromJSON('["self-hosted","macOS","ARM64","easysplat-toolchain-signing","easysplat-ephemeral"]') }}
+    timeout-minutes: 180
+    environment: toolchain-signing
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -p -e -u -o pipefail {0}
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ format('sha256:{0}', steps.upload.outputs.artifact-digest) }}
+    steps:
+      - name: Download exact unsigned producer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-unsigned.outputs.artifact_id }}
+          path: ${{ runner.temp }}/toolchain-components
+          merge-multiple: true
+
+      - name: Download exact unsigned request
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-unsigned.outputs.request_artifact_id }}
+          path: ${{ runner.temp }}/toolchain-signing-request
+          merge-multiple: true
+
+      - name: Authenticate builder artifacts before repository checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UNSIGNED_ARTIFACT_ID: ${{ needs.build-unsigned.outputs.artifact_id }}
+          REQUEST_ARTIFACT_ID: ${{ needs.build-unsigned.outputs.request_artifact_id }}
+        run: |
+          set -euo pipefail
+          unset BASH_ENV ENV PYTHONHOME PYTHONPATH PYTHONSTARTUP
+          [[ "$UNSIGNED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$REQUEST_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          AUTHORITY="$RUNNER_TEMP/toolchain-builder-authority"
+          rm -rf "$AUTHORITY"
+          mkdir -m 0700 "$AUTHORITY"
+          /usr/bin/python3 -I - "$AUTHORITY/github-authority.json" <<'PY'
+          import json
+          import os
+          import ssl
+          import sys
+          import urllib.request
+          from pathlib import Path
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *_args, **_kwargs):
+                  return None
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          endpoints = {
+              f"repos/{repository}/actions/artifacts/{os.environ['UNSIGNED_ARTIFACT_ID']}",
+              f"repos/{repository}/actions/artifacts/{os.environ['REQUEST_ARTIFACT_ID']}",
+              f"repos/{repository}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              f"repos/{repository}/branches/main",
+          }
+          context = ssl.create_default_context(cafile="/private/etc/ssl/cert.pem")
+          opener = urllib.request.build_opener(
+              urllib.request.ProxyHandler({}),
+              urllib.request.HTTPSHandler(context=context),
+              NoRedirect(),
+          )
+          responses = {}
+          for endpoint in sorted(endpoints):
+              request = urllib.request.Request(
+                  f"https://api.github.com/{endpoint}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2026-03-10",
+                      "User-Agent": "EasySplat-toolchain-authority-capture/1",
+                  },
+              )
+              with opener.open(request, timeout=30) as response:
+                  data = response.read(1_048_577)
+                  if response.status != 200 or not data or len(data) > 1_048_576:
+                      raise SystemExit("GitHub authority response is invalid")
+              responses[endpoint] = json.loads(data)
+          payload = {"schemaVersion": 1, "responses": responses}
+          Path(sys.argv[1]).write_text(
+              json.dumps(payload, sort_keys=True, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+          chmod 0400 "$AUTHORITY/github-authority.json"
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Validate isolated signing host and inert builder handoff
+        env:
+          VERSION: ${{ needs.metadata-preflight.outputs.version }}
+          EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1: ${{ vars.EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1 }}
+          EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID: ${{ vars.EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID }}
+          EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE: ${{ vars.EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE }}
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR SDKROOT TOOLCHAINS
+          [[ "$EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1" =~ ^[0-9A-Fa-f]{40}$ ]]
+          [[ "$EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]
+          [[ "$EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+          test "$(/usr/bin/uname -m)" = "arm64"
+          python3 - "$RUNNER_TEMP/toolchain-components" "$RUNNER_TEMP/toolchain-signing-request" "$VERSION" <<'PY'
+          import stat
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          request = Path(sys.argv[2])
+          version = sys.argv[3]
+          expected = {
+              f"toolchain-macos-arm64-{version}-core.zip",
+              f"toolchain-geometry-da3-base-{version}.zip",
+              f"toolchain-geometry-da3-small-{version}.zip",
+              "toolchain-build-host.json",
+          }
+          if {path.name for path in root.iterdir()} != expected:
+              raise SystemExit("unsigned component file set is invalid for signing")
+          if {path.name for path in request.iterdir()} != {"toolchain-release-request.json"}:
+              raise SystemExit("unsigned request file set is invalid for signing")
+          for path in [*root.iterdir(), *request.iterdir()]:
+              metadata = path.lstat()
+              if path.suffix in {".py", ".sh"} or metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                  raise SystemExit("unsigned handoff contains an executable control surface")
+              if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_nlink != 1 or metadata.st_size <= 0:
+                  raise SystemExit(f"unsigned handoff file is unsafe: {path.name}")
+          PY
+
+      - name: Developer ID sign and notarize exact producer bytes
+        env:
+          VERSION: ${{ needs.metadata-preflight.outputs.version }}
+          UNSIGNED_ARTIFACT_ID: ${{ needs.build-unsigned.outputs.artifact_id }}
+          UNSIGNED_ARTIFACT_DIGEST: ${{ needs.build-unsigned.outputs.artifact_digest }}
+          REQUEST_ARTIFACT_ID: ${{ needs.build-unsigned.outputs.request_artifact_id }}
+          REQUEST_ARTIFACT_DIGEST: ${{ needs.build-unsigned.outputs.request_artifact_digest }}
+          REQUEST_SHA256: ${{ needs.build-unsigned.outputs.request_sha256 }}
+          IDENTITY_FINGERPRINT: ${{ vars.EASYSPLAT_TOOLCHAIN_DEVELOPER_ID_APPLICATION_SHA1 }}
+          TEAM_ID: ${{ vars.EASYSPLAT_TOOLCHAIN_DEVELOPER_TEAM_ID }}
+          PROFILE: ${{ vars.EASYSPLAT_TOOLCHAIN_NOTARY_KEYCHAIN_PROFILE }}
+        run: |
+          set -euo pipefail
+          unset DEVELOPER_DIR SDKROOT TOOLCHAINS
+          UNSIGNED="$RUNNER_TEMP/toolchain-components"
+          REQUEST="$RUNNER_TEMP/toolchain-signing-request/toolchain-release-request.json"
+          FINALIZED="$RUNNER_TEMP/toolchain-signed-producer"
+          rm -rf "$FINALIZED"
+          test "$(shasum -a 256 "$REQUEST" | awk '{print $1}')" = "$REQUEST_SHA256"
+          python3 scripts/release/finalize_signed_toolchain.py \
+            --version "$VERSION" \
+            --core-zip "$UNSIGNED/toolchain-macos-arm64-$VERSION-core.zip" \
+            --base-zip "$UNSIGNED/toolchain-geometry-da3-base-$VERSION.zip" \
+            --small-zip "$UNSIGNED/toolchain-geometry-da3-small-$VERSION.zip" \
+            --unsigned-release-request "$REQUEST" \
+            --builder-attested-unsigned-request-sha256 "$REQUEST_SHA256" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --source-commit "$GITHUB_SHA" \
+            --unsigned-artifact-id "$UNSIGNED_ARTIFACT_ID" \
+            --unsigned-artifact-digest "$UNSIGNED_ARTIFACT_DIGEST" \
+            --request-artifact-id "$REQUEST_ARTIFACT_ID" \
+            --request-artifact-digest "$REQUEST_ARTIFACT_DIGEST" \
+            --github-authority-receipt "$RUNNER_TEMP/toolchain-builder-authority/github-authority.json" \
+            --output-directory "$FINALIZED" \
+            --identity-fingerprint "$IDENTITY_FINGERPRINT" \
+            --team-id "$TEAM_ID" \
+            --receipt "$FINALIZED/distribution-signing-finalization.json"
+          bash scripts/release/notarize_artifact.sh \
+            --type zip \
+            --artifact "$FINALIZED/toolchain-macos-arm64-$VERSION-core.zip" \
+            --keychain-profile "$PROFILE" \
+            --receipt "$FINALIZED/core-notarization.json" \
+            --diagnostics-dir "$RUNNER_TEMP/notary-core"
+          bash scripts/release/notarize_artifact.sh \
+            --type zip \
+            --artifact "$FINALIZED/toolchain-geometry-da3-base-$VERSION.zip" \
+            --keychain-profile "$PROFILE" \
+            --receipt "$FINALIZED/da3-base-notarization.json" \
+            --diagnostics-dir "$RUNNER_TEMP/notary-da3-base"
+          cp "$UNSIGNED/toolchain-build-host.json" "$FINALIZED/toolchain-build-host.json"
+          echo "FINALIZED=$FINALIZED" >>"$GITHUB_ENV"
+
+      - name: Upload exact signed intermediate
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-signed-intermediate-${{ inputs.version }}
+          path: ${{ env.FINALIZED }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  derive-post-sign-request:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    needs: [metadata-preflight, sign-and-notarize]
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      source_run_id: ${{ steps.derive.outputs.source_run_id }}
+      source_run_attempt: ${{ steps.derive.outputs.source_run_attempt }}
+      producer_artifact_id: ${{ steps.upload-producer.outputs.artifact-id }}
+      producer_artifact_digest: ${{ format('sha256:{0}', steps.upload-producer.outputs.artifact-digest) }}
+      request_artifact_id: ${{ steps.upload-request.outputs.artifact-id }}
+      request_artifact_digest: ${{ format('sha256:{0}', steps.upload-request.outputs.artifact-digest) }}
+      request_sha256: ${{ steps.derive.outputs.request_sha256 }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Download exact signed intermediate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.sign-and-notarize.outputs.artifact_id }}
+          path: ${{ runner.temp }}/toolchain-final-producer
+          merge-multiple: true
+
+      - name: Derive authority request from final signed archives
+        id: derive
+        env:
+          VERSION: ${{ needs.metadata-preflight.outputs.version }}
+          APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
+          APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
+        run: |
+          set -euo pipefail
+          FINAL="$RUNNER_TEMP/toolchain-final-producer"
+          REQUEST="$RUNNER_TEMP/toolchain-post-sign-request"
+          mkdir -m 0700 "$REQUEST"
+          swift run --package-path Tools/ManifestTool ManifestTool prepare-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --version "$VERSION" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --app-version-minimum "$APP_VERSION_MINIMUM" \
+            --app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE" \
+            --public-key-file "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --core-zip "$FINAL/toolchain-macos-arm64-$VERSION-core.zip" \
+            --core-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-macos-arm64-$VERSION-core.zip" \
+            --da3-base-zip "$FINAL/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-small-zip "$FINAL/toolchain-geometry-da3-small-$VERSION.zip" \
+            --da3-small-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-geometry-da3-small-$VERSION.zip" \
+            --request-out "$REQUEST/toolchain-release-request.json"
+          python3 scripts/release/toolchain_publication.py validate-producer \
+            --producer "$FINAL" \
+            --request "$REQUEST/toolchain-release-request.json" \
+            --version "$VERSION" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA"
+          REQUEST_SHA256="$(shasum -a 256 "$REQUEST/toolchain-release-request.json" | awk '{print $1}')"
+          [[ "$REQUEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo "request_sha256=$REQUEST_SHA256"
+            echo "source_run_id=${{ github.run_id }}"
+            echo "source_run_attempt=${{ github.run_attempt }}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload final signed producer
+        id: upload-producer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-final-producer-${{ inputs.version }}
+          path: ${{ runner.temp }}/toolchain-final-producer
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload post-sign authority request
+        id: upload-request
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: toolchain-post-sign-request-${{ inputs.version }}
+          path: ${{ runner.temp }}/toolchain-post-sign-request/toolchain-release-request.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Record exact external-authority inputs
+        env:
+          REQUEST_SHA256: ${{ steps.derive.outputs.request_sha256 }}
+          PRODUCER_ARTIFACT_ID: ${{ steps.upload-producer.outputs.artifact-id }}
+          PRODUCER_ARTIFACT_DIGEST: ${{ format('sha256:{0}', steps.upload-producer.outputs.artifact-digest) }}
+          REQUEST_ARTIFACT_ID: ${{ steps.upload-request.outputs.artifact-id }}
+          REQUEST_ARTIFACT_DIGEST: ${{ format('sha256:{0}', steps.upload-request.outputs.artifact-digest) }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Toolchain authority handoff"
+            echo "- Source run: $GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "- Producer artifact: $PRODUCER_ARTIFACT_ID ($PRODUCER_ARTIFACT_DIGEST)"
+            echo "- Request artifact: $REQUEST_ARTIFACT_ID ($REQUEST_ARTIFACT_DIGEST)"
+            echo "- Request SHA-256: $REQUEST_SHA256"
+          } >>"$GITHUB_STEP_SUMMARY"

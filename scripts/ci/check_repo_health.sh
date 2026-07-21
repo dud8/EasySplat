@@ -17,6 +17,23 @@ required_files=(
   "$ROOT/.github/pull_request_template.md"
   "$ROOT/.github/ISSUE_TEMPLATE/bug_report.yml"
   "$ROOT/.github/ISSUE_TEMPLATE/feature_request.yml"
+  "$ROOT/scripts/benchmark/run_suite.sh"
+  "$ROOT/scripts/benchmark/easysplat_benchmark.py"
+  "$ROOT/scripts/benchmark/evidence_protocol.py"
+  "$ROOT/scripts/benchmark/run_lane.py"
+  "$ROOT/scripts/benchmark/prepare_evidence.py"
+  "$ROOT/scripts/benchmark/aggregate_evidence.py"
+  "$ROOT/scripts/benchmark/result.schema.json"
+  "$ROOT/scripts/benchmark/evidence.schema.json"
+  "$ROOT/scripts/benchmark/corpus.json"
+  "$ROOT/scripts/benchmark/reference-config.json"
+  "$ROOT/scripts/benchmark/tests/test_benchmark.py"
+  "$ROOT/scripts/benchmark/tests/test_aggregate_evidence.py"
+  "$ROOT/scripts/release/verify_publication_bundle.py"
+  "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
+  "$ROOT/scripts/toolchain/validate_da3_payload.py"
+  "$ROOT/scripts/toolchain/tests/test_da3_payload.py"
+  "$ROOT/.github/workflows/benchmark-release.yml"
 )
 
 for path in "${required_files[@]}"; do
@@ -38,6 +55,8 @@ public_text_files=(
   "$ROOT/.github/ISSUE_TEMPLATE/feature_request.yml"
 )
 
+# The final alternative intentionally matches a Windows path prefix.
+# shellcheck disable=SC1003
 if rg -n '/Users/|/home/|C:\\\\' "${public_text_files[@]}" >/dev/null; then
   echo "Public repo docs/templates contain machine-specific absolute paths." >&2
   exit 1
@@ -55,30 +74,123 @@ if rg -n 'sparkle-project/Sparkle|Sparkle.framework' \
   exit 1
 fi
 
-if rg -n 'github.com/dud8/EasySplat|http://localhost:8000' \
+if rg -n 'github.com/EasySplat/EasySplat|http://localhost:8000' \
   "$ROOT/EasySplatApp/AppConfig.swift" \
   "$ROOT/EasySplatApp/AppModel.swift" \
   "$ROOT/EasySplatApp/Resources" >/dev/null; then
-  echo "Shipped app sources/resources still contain personal or localhost defaults." >&2
+  echo "Shipped app sources/resources contain a stale or localhost release default." >&2
   exit 1
 fi
 
-if ! rg -n 'build_da3_mps\.sh' "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
-  echo "Toolchain release workflow no longer builds DA3 before packaging." >&2
+if rg -n 'activate\s*\(\s*ignoringOtherApps\s*:' "$ROOT/EasySplatApp" >/dev/null; then
+  echo "Shipped app sources use the deprecated focus-stealing activation API." >&2
   exit 1
 fi
 
-for path in "$ROOT/scripts/release/build_dmg.sh" "$ROOT/.github/workflows/toolchain-build.yml"; do
-  if ! rg -n 'refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE' "$path" >/dev/null; then
-    echo "Release path no longer rejects unpinned DA3 source overrides: $path" >&2
+toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
+retired_suitesparse_builder="$ROOT/scripts/toolchain/build_suitesparse.sh"
+if [ -e "$retired_suitesparse_builder" ] || [ -L "$retired_suitesparse_builder" ]; then
+  echo "Retired native SuiteSparse builder is present: $retired_suitesparse_builder" >&2
+  exit 1
+fi
+
+if rg -n -F 'build_suitesparse.sh' \
+  -g '!build_suitesparse.sh' \
+  "$ROOT/.github/workflows" \
+  "$ROOT/scripts/run.sh" \
+  "$ROOT/scripts/toolchain" \
+  "$ROOT/scripts/release" \
+  "$ROOT/README.md" \
+  "$ROOT/ONBOARDING.md" \
+  "$ROOT/CONTRIBUTING.md" >/dev/null; then
+  echo "A live build, launch, release, or public documentation surface references the retired SuiteSparse builder." >&2
+  exit 1
+fi
+
+for builder in \
+  build_colmap_support.sh \
+  build_ceres.sh \
+  build_openimageio.sh \
+  build_colmap.sh \
+  build_msplat.sh \
+  build_da3_mps.sh; do
+  if ! rg -n "scripts/toolchain/$builder" "$toolchain_workflow" >/dev/null; then
+    echo "Toolchain workflow no longer runs required builder $builder: $toolchain_workflow" >&2
     exit 1
   fi
 done
 
-if ! rg -n 'build_mapanything_mps\.sh' "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
-  echo "Toolchain release workflow no longer builds MapAnything fallback before packaging." >&2
+if rg -n 'scripts/toolchain/build_suitesparse\.sh' "$toolchain_workflow" >/dev/null; then
+  echo "Toolchain workflow restored retired native SuiteSparse builder: $toolchain_workflow" >&2
   exit 1
 fi
+
+python3 - "$toolchain_workflow" <<'PY'
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+builders = [
+    "build_colmap_support.sh",
+    "build_ceres.sh",
+    "build_openimageio.sh",
+    "build_colmap.sh",
+    "build_msplat.sh",
+    "build_da3_mps.sh",
+    "package_toolchain.sh",
+]
+positions = [workflow.index(f"scripts/toolchain/{builder}") for builder in builders]
+if positions != sorted(positions):
+    raise SystemExit("Toolchain workflow build order is not the reviewed native release order.")
+PY
+
+for retired_source in \
+  "$ROOT/Tools/Da3Sfm/colmap_launcher.c" \
+  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py" \
+  "$ROOT/Tools/Da3Sfm/tests/test_colmap_cli.py"; do
+  if [ -e "$retired_source" ]; then
+    echo "Retired DA3 Python COLMAP bridge source still exists: $retired_source" >&2
+    exit 1
+  fi
+done
+if rg -n 'pycolmap|PYCOLMAP|easysplat_colmap|colmap_launcher|colmap_cli\.py|--self-check' \
+  "$ROOT/Tools/Da3Sfm/requirements.in" \
+  "$ROOT/Tools/Da3Sfm/requirements.txt" \
+  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm" \
+  "$ROOT/scripts/toolchain/build_da3_mps.sh" \
+  "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" >/dev/null; then
+  echo "Release runtime retains a retired DA3 Python COLMAP bridge surface." >&2
+  exit 1
+fi
+
+if rg -n 'brew install .*\b(suitesparse|ceres-solver|cgal|freeimage|qt)\b' \
+  "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
+  echo "Toolchain workflow installs a forbidden prebuilt or disabled COLMAP dependency." >&2
+  exit 1
+fi
+
+legacy_runtime_pattern='brush|mapanything|fastvggt|vggt|glomap'
+for path in \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" \
+  "$ROOT/scripts/run.sh" \
+  "$ROOT/scripts/release/build_dmg.sh" \
+  "$ROOT/.github/workflows/toolchain-build.yml"; do
+  if rg -n -i "$legacy_runtime_pattern" "$path" >/dev/null; then
+    echo "Release path still references a removed runtime: $path" >&2
+    exit 1
+  fi
+done
+
+for contract in \
+  "case \"\${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}\" in" \
+  '""|0|false|FALSE|no|NO|off|OFF) ;;' \
+  'scripts/toolchain/build_da3_mps.sh'; do
+  if ! rg -n -F "$contract" "$toolchain_workflow" >/dev/null; then
+    echo "Toolchain workflow no longer rejects unpinned DA3 source overrides: $toolchain_workflow" >&2
+    exit 1
+  fi
+done
 
 if rg -n '(^|[^A-Za-z0-9_])(xformers|flash[-_]attn|triton|torch[-_]scatter)([^A-Za-z0-9_]|$)' \
   "$ROOT/Tools/Da3Sfm" \
@@ -95,3 +207,32 @@ if rg -n 'DA3-(LARGE|GIANT)|DA3-NESTED|DA3NESTED|DA3-GIANT|DA3-LARGE|CC-BY-NC' \
   echo "DA3 default path references non-commercial weights." >&2
   exit 1
 fi
+
+if rg -n -i 'global_mapper|globalmapper|global mapper' \
+  "$ROOT/EasySplatCore/Sources" \
+  "$ROOT/EasySplatApp" \
+  "$ROOT/scripts/toolchain/build_colmap.sh" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" >/dev/null; then
+  echo "The rejected COLMAP global-mapper candidate remains in a runtime surface." >&2
+  exit 1
+fi
+
+for colmap_contract_path in \
+  "$ROOT/EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManager+Validation.swift" \
+  "$ROOT/scripts/benchmark_da3.sh" \
+  "$ROOT/scripts/toolchain/build_colmap_impl.sh" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh"; do
+  if ! rg -n -F 'TwoViewGeometry.random_seed' "$colmap_contract_path" >/dev/null; then
+    echo "Native COLMAP contract does not require deterministic two-view geometry: $colmap_contract_path" >&2
+    exit 1
+  fi
+done
+
+if git -C "$ROOT" ls-files scripts/benchmark | rg '(^|/)suite\.json$|(^|/)raw/|\.(mov|mp4|m4v|heic|jpe?g|png|tiff?)$' >/dev/null; then
+  echo "Generated benchmark results or corpus media are tracked in Git." >&2
+  exit 1
+fi
+
+python3 -m unittest discover -s "$ROOT/scripts/benchmark/tests" -p 'test_*.py' >/dev/null
+python3 "$ROOT/scripts/toolchain/tests/test_da3_payload.py" >/dev/null
+"$ROOT/scripts/benchmark/run_suite.sh" --profile release --dry-run >/dev/null

@@ -95,7 +95,14 @@ public class PLYReader {
     }
 
     public func read(to delegate: PLYReaderDelegate) {
-        PLYReaderStream().read(url, to: delegate)
+        read(to: delegate, shouldCancel: { false })
+    }
+
+    public func read(
+        to delegate: PLYReaderDelegate,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) {
+        PLYReaderStream().read(url, to: delegate, shouldCancel: shouldCancel)
     }
 }
 
@@ -113,7 +120,11 @@ fileprivate class PLYReaderStream {
     private var currentElementCountInGroup: Int = 0
     private var reusableElement = PLYElement(properties: [])
 
-    public func read(_ url: URL, to delegate: PLYReaderDelegate) {
+    public func read(
+        _ url: URL,
+        to delegate: PLYReaderDelegate,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) {
         header = nil
         body = Data()
         bodyOffset = 0
@@ -136,6 +147,10 @@ fileprivate class PLYReaderStream {
         var phase: Phase = .unstarted
 
         while true {
+            if shouldCancel() {
+                delegate.didFailReading(withError: CancellationError())
+                return
+            }
             let readResult = inputStream.read(buffer, maxLength: bufferSize)
             let bytesRead: Int
             switch readResult {
@@ -149,7 +164,11 @@ fileprivate class PLYReaderStream {
                 case .body:
                     // Reprocess the remaining data, now with isEOF = true, since that might mean a successful completion (e.g. ASCII data missing a final EOL)
                     do {
-                        try processBody(delegate: delegate, isEOF: true)
+                        try processBody(
+                            delegate: delegate,
+                            isEOF: true,
+                            shouldCancel: shouldCancel
+                        )
                     } catch {
                         delegate.didFailReading(withError: error)
                         return
@@ -167,6 +186,10 @@ fileprivate class PLYReaderStream {
 
             var bufferIndex = 0
             while bufferIndex < bytesRead {
+                if shouldCancel() {
+                    delegate.didFailReading(withError: CancellationError())
+                    return
+                }
                 switch phase {
                 case .unstarted:
                     headerData.append(buffer[bufferIndex])
@@ -203,7 +226,11 @@ fileprivate class PLYReaderStream {
                     }
                     bufferIndex = bytesRead
                     do {
-                        try processBody(delegate: delegate, isEOF: false)
+                        try processBody(
+                            delegate: delegate,
+                            isEOF: false,
+                            shouldCancel: shouldCancel
+                        )
                     } catch {
                         delegate.didFailReading(withError: error)
                         return
@@ -321,8 +348,11 @@ fileprivate class PLYReaderStream {
         return header
     }
 
-    private func processBody(delegate: PLYReaderDelegate,
-                             isEOF: Bool) throws {
+    private func processBody(
+        delegate: PLYReaderDelegate,
+        isEOF: Bool,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws {
         guard let header else {
             throw PLYReader.Error.internalConsistency
         }
@@ -334,6 +364,7 @@ fileprivate class PLYReaderStream {
                 var bodyUnsafeBytePointerOffset = 0
                 let bodyUnsafeBytePointerCount = bodyUnsafeRawBufferPointer.count
                 while !isComplete {
+                    if shouldCancel() { throw CancellationError() }
                     let elementHeader = header.elements[self.currentElementGroup]
 
                     let lineStart = bodyUnsafeBytePointerOffset
@@ -383,6 +414,7 @@ fileprivate class PLYReaderStream {
                 let bodyUnsafeRawPointer = bodyUnsafeRawBufferPointer.baseAddress!
                 var bodyUnsafeRawPointerOffset = 0
                 while !isComplete {
+                    if shouldCancel() { throw CancellationError() }
                     let elementHeader = header.elements[self.currentElementGroup]
 
                     let (success, bytesConsumed) = try Self.processBinaryBodyElement(bodyUnsafeRawPointer,

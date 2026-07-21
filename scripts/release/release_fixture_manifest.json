@@ -1,0 +1,507 @@
+{
+  "camera": {
+    "cxPixels": 319.5,
+    "cyPixels": 239.5,
+    "fxPixels": 612.0,
+    "fyPixels": 610.0,
+    "model": "PINHOLE",
+    "views": [
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            0.03489418134011367,
+            -0.01745240643728351,
+            0.9992386149554826
+          ],
+          "right": [
+            0.9993908270190958,
+            0.0,
+            -0.03489949670250097
+          ],
+          "up": [
+            0.0006090802009086826,
+            0.9998476951563913,
+            0.017441774902830158
+          ]
+        },
+        "image": "images/view-01.png",
+        "pitchDegrees": -1.0,
+        "positionMeters": [
+          -0.66,
+          -0.08,
+          0.0
+        ],
+        "view": 1,
+        "yawDegrees": 2.0
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            0.02443124785017348,
+            -0.008726535498373935,
+            0.9996634242117088
+          ],
+          "right": [
+            0.9997014897811831,
+            0.0,
+            -0.024432178152653153
+          ],
+          "up": [
+            0.00021320826995172384,
+            0.9999619230641713,
+            0.008723930538352801
+          ]
+        },
+        "image": "images/view-02.png",
+        "pitchDegrees": -0.5,
+        "positionMeters": [
+          -0.54,
+          0.06,
+          0.03
+        ],
+        "view": 2,
+        "yawDegrees": 1.4
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            0.013962095276764654,
+            0.003490651415223732,
+            0.9998964322609517
+          ],
+          "right": [
+            0.9999025240093042,
+            0.0,
+            -0.013962180339145272
+          ],
+          "up": [
+            -4.873710456044641e-05,
+            0.9999939076577904,
+            -0.0034903111605188598
+          ]
+        },
+        "image": "images/view-03.png",
+        "pitchDegrees": 0.2,
+        "positionMeters": [
+          -0.42,
+          -0.12,
+          0.01
+        ],
+        "view": 3,
+        "yawDegrees": 0.8
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            0.0034903111605188598,
+            -0.013962180339145272,
+            0.9998964322609517
+          ],
+          "right": [
+            0.9999939076577904,
+            0.0,
+            -0.003490651415223732
+          ],
+          "up": [
+            4.873710456044641e-05,
+            0.9999025240093042,
+            0.013962095276764654
+          ]
+        },
+        "image": "images/view-04.png",
+        "pitchDegrees": -0.8,
+        "positionMeters": [
+          -0.3,
+          0.1,
+          0.04
+        ],
+        "view": 4,
+        "yawDegrees": 0.2
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            -0.006981090169572635,
+            0.0069812602979615525,
+            0.999951262004652
+          ],
+          "right": [
+            0.9999756307053947,
+            0.0,
+            0.0069812602979615525
+          ],
+          "up": [
+            4.8737995347894225e-05,
+            0.9999756307053947,
+            -0.006981090169572635
+          ]
+        },
+        "image": "images/view-05.png",
+        "pitchDegrees": 0.4,
+        "positionMeters": [
+          -0.18,
+          -0.05,
+          0.02
+        ],
+        "view": 5,
+        "yawDegrees": -0.4
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            -0.0139619889490318,
+            -0.00523596383141958,
+            0.9998888175929077
+          ],
+          "right": [
+            0.9999025240093042,
+            0.0,
+            0.013962180339145272
+          ],
+          "up": [
+            -7.310547126352221e-05,
+            0.9999862922474267,
+            0.0052354534506578645
+          ]
+        },
+        "image": "images/view-06.png",
+        "pitchDegrees": -0.3,
+        "positionMeters": [
+          -0.06,
+          0.12,
+          0.05
+        ],
+        "view": 6,
+        "yawDegrees": -0.8
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            -0.0139619889490318,
+            0.00523596383141958,
+            0.9998888175929077
+          ],
+          "right": [
+            0.9999025240093042,
+            0.0,
+            0.013962180339145272
+          ],
+          "up": [
+            7.310547126352221e-05,
+            0.9999862922474267,
+            -0.0052354534506578645
+          ]
+        },
+        "image": "images/view-07.png",
+        "pitchDegrees": 0.3,
+        "positionMeters": [
+          0.06,
+          -0.1,
+          0.03
+        ],
+        "view": 7,
+        "yawDegrees": -0.8
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            -0.006981090169572635,
+            -0.0069812602979615525,
+            0.999951262004652
+          ],
+          "right": [
+            0.9999756307053947,
+            0.0,
+            0.0069812602979615525
+          ],
+          "up": [
+            -4.8737995347894225e-05,
+            0.9999756307053947,
+            0.006981090169572635
+          ]
+        },
+        "image": "images/view-08.png",
+        "pitchDegrees": -0.4,
+        "positionMeters": [
+          0.18,
+          0.05,
+          0.01
+        ],
+        "view": 8,
+        "yawDegrees": -0.4
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            0.0034903111605188598,
+            0.013962180339145272,
+            0.9998964322609517
+          ],
+          "right": [
+            0.9999939076577904,
+            0.0,
+            -0.003490651415223732
+          ],
+          "up": [
+            -4.873710456044641e-05,
+            0.9999025240093042,
+            -0.013962095276764654
+          ]
+        },
+        "image": "images/view-09.png",
+        "pitchDegrees": 0.8,
+        "positionMeters": [
+          0.3,
+          -0.12,
+          0.04
+        ],
+        "view": 9,
+        "yawDegrees": 0.2
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            0.013962095276764654,
+            -0.003490651415223732,
+            0.9998964322609517
+          ],
+          "right": [
+            0.9999025240093042,
+            0.0,
+            -0.013962180339145272
+          ],
+          "up": [
+            4.873710456044641e-05,
+            0.9999939076577904,
+            0.0034903111605188598
+          ]
+        },
+        "image": "images/view-10.png",
+        "pitchDegrees": -0.2,
+        "positionMeters": [
+          0.42,
+          0.1,
+          0.02
+        ],
+        "view": 10,
+        "yawDegrees": 0.8
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            0.02443124785017348,
+            0.008726535498373935,
+            0.9996634242117088
+          ],
+          "right": [
+            0.9997014897811831,
+            0.0,
+            -0.024432178152653153
+          ],
+          "up": [
+            -0.00021320826995172384,
+            0.9999619230641713,
+            -0.008723930538352801
+          ]
+        },
+        "image": "images/view-11.png",
+        "pitchDegrees": 0.5,
+        "positionMeters": [
+          0.54,
+          -0.06,
+          0.03
+        ],
+        "view": 11,
+        "yawDegrees": 1.4
+      },
+      {
+        "basisWorldFromCamera": {
+          "forward": [
+            0.03489418134011367,
+            -0.01745240643728351,
+            0.9992386149554826
+          ],
+          "right": [
+            0.9993908270190958,
+            0.0,
+            -0.03489949670250097
+          ],
+          "up": [
+            0.0006090802009086826,
+            0.9998476951563913,
+            0.017441774902830158
+          ]
+        },
+        "image": "images/view-12.png",
+        "pitchDegrees": -1.0,
+        "positionMeters": [
+          0.66,
+          -0.08,
+          0.0
+        ],
+        "view": 12,
+        "yawDegrees": 2.0
+      }
+    ]
+  },
+  "closureSHA256": "3bd1dbffea0bffcc5f97bdbbfd3e5339748e0b8e64aeb586e7197016de9f4ae2",
+  "files": [
+    {
+      "bytes": 922218,
+      "path": "images/view-01.png",
+      "sha256": "fbdacef3eba43c1fc319860b1b457bb7ae0f0b6fd833f05d365ea32cf56d3a5b",
+      "view": 1
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-02.png",
+      "sha256": "f97b118510a4fad398dd7b52d843c7e07e02a4d3b6af2ad94a088ad3c7dad602",
+      "view": 2
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-03.png",
+      "sha256": "4867a4467dbd05ceb45c174abba80b4c620df64988670875f10c671d08850a3c",
+      "view": 3
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-04.png",
+      "sha256": "56434303b990269d9d9b740c284b105ca059aae4458e4415faf9add57f979d04",
+      "view": 4
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-05.png",
+      "sha256": "eb6c8bc40b09ab7035609de71adac9e9e28be3bfe2e0d855547a3f73d22e1628",
+      "view": 5
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-06.png",
+      "sha256": "8ce118343b99e40f36c8ce93160693e666eeab207d3ca0bc39b96f721a755f5e",
+      "view": 6
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-07.png",
+      "sha256": "4876f264a9fe05770355bff03b3a1a56dd3d3bc20433a7ad099eea45c5bb2745",
+      "view": 7
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-08.png",
+      "sha256": "2a9489f7a269c8f0b2488dcc3b21e950d09824434a98c2545dcb81a57258fe92",
+      "view": 8
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-09.png",
+      "sha256": "94057839806f4eb6c9439326cfb1a5eb1275364d5d35e6a9018269318fa1a8d2",
+      "view": 9
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-10.png",
+      "sha256": "30b414eb3ad1287b7af6582f571258a1be33b884c7496aab7f1f400516d14e9f",
+      "view": 10
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-11.png",
+      "sha256": "8484fdba04e908a8f180a3c9542acc8e56c137a72ca08c8e4244c6a29435be33",
+      "view": 11
+    },
+    {
+      "bytes": 922218,
+      "path": "images/view-12.png",
+      "sha256": "e517df896fba54ed3f0539fa28fd9090e064c9a7ec1ffa3475c0e38083f70e8e",
+      "view": 12
+    }
+  ],
+  "fixtureID": "org.easysplat.release-smoke.v1",
+  "image": {
+    "bitDepth": 8,
+    "colorType": "RGB",
+    "count": 12,
+    "heightPixels": 480,
+    "pngEncoding": "filter-none-deflate-stored-v1",
+    "widthPixels": 640
+  },
+  "license": {
+    "copyright": "Copyright (c) 2026 EasySplat contributors",
+    "spdxID": "MIT",
+    "terms": "Repository LICENSE"
+  },
+  "provenance": {
+    "generatorPath": "scripts/release/generate_release_fixture.py",
+    "generatorSHA256": "aab1c9f125847830efd3ce49a89c6c65e53b7f513483f2faec74820ca649b489",
+    "method": "deterministic stdlib-only analytic scene rendering",
+    "sourceAssets": [],
+    "synthetic": true
+  },
+  "scene": {
+    "construction": "three coherent world-textured planes with finite near and middle occluders",
+    "coordinateSystem": "right-handed; x right, y up, z forward; meters",
+    "depthPlanesMeters": [
+      3.8,
+      5.8,
+      8.8
+    ],
+    "parallaxWitnesses": [
+      {
+        "viewPixels": [
+          [
+            538.643217836,
+            176.477620752
+          ],
+          [
+            328.727779084,
+            175.842440675
+          ]
+        ],
+        "worldMeters": [
+          0.85,
+          0.25,
+          3.8
+        ]
+      },
+      {
+        "viewPixels": [
+          [
+            456.372188281,
+            194.392821065
+          ],
+          [
+            318.176762141,
+            194.118995113
+          ]
+        ],
+        "worldMeters": [
+          0.85,
+          0.25,
+          5.8
+        ]
+      },
+      {
+        "viewPixels": [
+          [
+            402.710760441,
+            206.078042874
+          ],
+          [
+            311.341690493,
+            205.958759918
+          ]
+        ],
+        "worldMeters": [
+          0.85,
+          0.25,
+          8.8
+        ]
+      }
+    ]
+  },
+  "schemaVersion": 1,
+  "totalBytes": 11066616
+}

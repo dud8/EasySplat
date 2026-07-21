@@ -37,10 +37,10 @@ struct WindowAccessor: NSViewRepresentable {
             self.window?.delegate = nil
             self.window = window
             window.delegate = self
+            window.minSize = NSSize(width: 920, height: 640)
             // Persist window size + position across launches. SwiftUI's
-            // automatic restoration sometimes drops state when WindowGroup
-            // tears down; setting an explicit autosave name forces AppKit to
-            // remember the frame in user defaults under a stable key.
+            // automatic restoration can drop state across launches; an explicit
+            // autosave name keeps the frame under a stable user-defaults key.
             if window.frameAutosaveName.isEmpty {
                 window.setFrameAutosaveName("EasySplatMainWindow")
             }
@@ -60,9 +60,9 @@ struct WindowAccessor: NSViewRepresentable {
 
             // Flush any pending notes save so closing the window with a
             // half-typed annotation doesn't drop it on the floor.
-            model.flushPendingNotesSave()
+            guard model.flushPendingNotesSave() else { return false }
 
-            guard model.viewState == .processing else { return true }
+            guard model.currentTask != nil else { return true }
 
             let decision = model.presentExitConfirmation()
             switch decision {

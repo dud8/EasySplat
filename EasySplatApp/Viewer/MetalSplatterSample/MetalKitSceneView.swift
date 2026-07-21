@@ -1,11 +1,62 @@
 import SwiftUI
 import MetalKit
 import AppKit
-import SplatIO
+import MetalSplatter
 
-struct PreviewLoadRequest: Equatable {
+struct PreviewLoadRequest: Hashable {
     let url: URL?
     let reloadToken: Int
+    let loadAttemptRevision: Int
+
+    init(url: URL?, reloadToken: Int, loadAttemptRevision: Int = 0) {
+        self.url = url
+        self.reloadToken = reloadToken
+        self.loadAttemptRevision = loadAttemptRevision
+    }
+}
+
+enum SplatViewerConfigurationError: Error, Equatable, LocalizedError {
+    case missingAuthenticatedSceneBounds
+    case sceneBoundsOutsideSupportedRange
+
+    var errorDescription: String? {
+        switch self {
+        case .missingAuthenticatedSceneBounds:
+            "This splat is missing authenticated scene bounds."
+        case .sceneBoundsOutsideSupportedRange:
+            "This splat’s scene bounds are outside the viewer’s supported range."
+        }
+    }
+}
+
+struct SplatViewerSceneConfiguration: Equatable {
+    let bounds: ViewerSceneBounds?
+    let openingDirection: SIMD3<Float>?
+    let isViewOnlyFlipActive: Bool
+    let validationError: SplatViewerConfigurationError?
+
+    init(
+        bounds: ViewerSceneBounds? = nil,
+        openingDirection: SIMD3<Float>? = nil,
+        isViewOnlyFlipActive: Bool = false
+    ) {
+        let boundsError = bounds.flatMap { bounds in
+            ViewerCameraState.canRepresentSceneBounds(
+                center: bounds.center,
+                radius: bounds.radius
+            ) ? nil : SplatViewerConfigurationError.sceneBoundsOutsideSupportedRange
+        }
+        self.validationError = boundsError
+        self.bounds = self.validationError == nil ? bounds : nil
+        self.openingDirection = openingDirection
+        self.isViewOnlyFlipActive = isViewOnlyFlipActive
+    }
+
+    func validate() throws {
+        if let validationError {
+            throw validationError
+        }
+    }
 }
 
 enum PreviewLoadDecision: Equatable {
@@ -82,26 +133,161 @@ final class SplatViewerController: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var isUpdating: Bool = false
     @Published var hasRenderedPreview: Bool = false
-    private(set) var currentBounds: (center: SIMD3<Float>, radius: Float)?
-    fileprivate var renderer: MetalKitSceneRenderer?
+    @Published private(set) var loadAttemptRevision = 0
+    @Published private(set) var sortFailureMessage: String?
+    @Published private(set) var isLoadFailureRetryable = false
+    private(set) var currentBounds: ViewerSceneBounds?
+    var renderer: MetalKitSceneRenderer?
+    private var boundsInteractionRevision: UInt64 = 0
+    private var sceneConfiguration = SplatViewerSceneConfiguration()
+    private var isSceneConfigurationActive = false
 
     func resetCamera() {
         renderer?.resetCamera()
     }
 
     func fitToView() {
-        if let bounds = currentBounds {
-            renderer?.applyBounds(center: bounds.center, radius: bounds.radius)
+        renderer?.fitToView()
+    }
+
+    var canRetryLoad: Bool {
+        errorMessage != nil && isLoadFailureRetryable && !isLoading && !isUpdating
+    }
+
+    var loadErrorTitle: String {
+        hasRenderedPreview ? "Couldn’t update splat" : "Couldn’t load splat"
+    }
+
+    func beginLoadAttempt() {
+        recordLoadSuccess()
+        if hasRenderedPreview {
+            isLoading = false
+            isUpdating = true
         } else {
-            renderer?.fitToView()
+            isLoading = true
+            isUpdating = false
         }
     }
 
-    func computeBounds(for url: URL) async throws {
-        let bounds = try await Task.detached {
-            try BoundsCalculator.computeBounds(for: url)
-        }.value
-        currentBounds = bounds
+    func recordLoadFailure(_ message: String, retryable: Bool = true) {
+        errorMessage = message
+        isLoadFailureRetryable = retryable
+    }
+
+    func recordLoadSuccess() {
+        errorMessage = nil
+        isLoadFailureRetryable = false
+    }
+
+    @discardableResult
+    func retryFailedLoad() -> Bool {
+        guard canRetryLoad else { return false }
+        errorMessage = nil
+        loadAttemptRevision &+= 1
+        return true
+    }
+
+    func recordSortFailure(_ message: String) {
+        sortFailureMessage = message
+    }
+
+    func recordSortSuccess() {
+        sortFailureMessage = nil
+    }
+
+    func retrySortOrdering() {
+        renderer?.retrySortOrdering()
+    }
+
+    func prepareSceneConfiguration(
+        _ configuration: SplatViewerSceneConfiguration,
+        activate: Bool = true
+    ) {
+        sceneConfiguration = configuration
+        currentBounds = configuration.bounds
+        boundsInteractionRevision = renderer?.interactionRevision ?? 0
+        isSceneConfigurationActive = false
+        if activate {
+            _ = activatePreparedSceneConfiguration()
+        }
+    }
+
+    func updateSceneConfiguration(_ configuration: SplatViewerSceneConfiguration) {
+        let previous = sceneConfiguration
+        guard previous != configuration else { return }
+        if let validationError = configuration.validationError {
+            sceneConfiguration = configuration
+            currentBounds = nil
+            recordLoadFailure(validationError.localizedDescription, retryable: false)
+            return
+        }
+        sceneConfiguration = configuration
+        if let bounds = configuration.bounds {
+            currentBounds = bounds
+        } else if previous.bounds != nil {
+            currentBounds = nil
+        }
+        guard isSceneConfigurationActive else { return }
+        if previous.isViewOnlyFlipActive != configuration.isViewOnlyFlipActive {
+            renderer?.setViewOnlyFlipActive(configuration.isViewOnlyFlipActive)
+            boundsInteractionRevision = renderer?.interactionRevision ?? boundsInteractionRevision
+        }
+        if currentBounds != nil,
+           previous.bounds != configuration.bounds
+            || previous.openingDirection != configuration.openingDirection {
+            applyCurrentBoundsIfPossible()
+        }
+    }
+
+    func validatePreparedSceneConfiguration(for request: PreviewLoadRequest) throws {
+        try sceneConfiguration.validate()
+        if request.url != nil, currentBounds == nil {
+            throw SplatViewerConfigurationError.missingAuthenticatedSceneBounds
+        }
+    }
+
+    @discardableResult
+    func activatePreparedSceneConfiguration(requestDraw: Bool = true) -> Bool {
+        guard !isSceneConfigurationActive else { return true }
+        do {
+            try sceneConfiguration.validate()
+        } catch {
+            recordLoadFailure(error.localizedDescription, retryable: false)
+            return false
+        }
+        guard let renderer else {
+            isSceneConfigurationActive = true
+            return true
+        }
+        let accepted = renderer.activateSceneConfiguration(
+            bounds: currentBounds,
+            openingDirection: sceneConfiguration.openingDirection,
+            isViewOnlyFlipActive: sceneConfiguration.isViewOnlyFlipActive,
+            ifInteractionRevisionMatches: boundsInteractionRevision,
+            requestDraw: requestDraw
+        )
+        guard accepted else {
+            let error = SplatViewerConfigurationError.sceneBoundsOutsideSupportedRange
+            recordLoadFailure(error.localizedDescription, retryable: false)
+            return false
+        }
+        isSceneConfigurationActive = true
+        return true
+    }
+
+    func resetSceneConfiguration() {
+        currentBounds = nil
+        isSceneConfigurationActive = false
+    }
+
+    private func applyCurrentBoundsIfPossible() {
+        guard isSceneConfigurationActive, let bounds = currentBounds else { return }
+        _ = renderer?.applyBounds(
+            center: bounds.center,
+            radius: bounds.radius,
+            openingDirection: sceneConfiguration.openingDirection,
+            ifInteractionRevisionMatches: boundsInteractionRevision
+        )
     }
 }
 
@@ -109,31 +295,123 @@ final class SplatViewerController: ObservableObject {
 struct MetalKitSceneView: NSViewRepresentable {
     var splatURL: URL?
     var reloadToken: Int = 0
+    var loadAttemptRevision: Int = 0
     var controller: SplatViewerController
+    var sceneConfiguration = SplatViewerSceneConfiguration()
     var onLoadStateChanged: ((SplatViewerLoadState) -> Void)?
 
     @MainActor
     final class Coordinator {
         var renderer: MetalKitSceneRenderer?
         weak var controller: SplatViewerController?
+        weak var interactiveView: InteractiveMTKView?
         var onLoadStateChanged: ((SplatViewerLoadState) -> Void)?
         var loadTask: Task<Void, Never>?
         var deferredLoadTask: Task<Void, Never>?
+        var scheduledEvaluationTask: Task<Void, Never>?
+        var initializationFailureTask: Task<Void, Never>?
+        private var initializationFailureMessage: String?
+        private var initializationFailurePublicationControllerID: ObjectIdentifier?
+        var modelLoadPreparer: (@MainActor (
+            MetalKitSceneRenderer,
+            ModelIdentifier?,
+            Bool
+        ) async throws -> PreparedViewerModelLoad)?
         var planner = PreviewReloadPlanner()
+        private var sceneConfigurations: [PreviewLoadRequest: SplatViewerSceneConfiguration] = [:]
+        private(set) var displayedRequest: PreviewLoadRequest?
 
         deinit {
             loadTask?.cancel()
             deferredLoadTask?.cancel()
+            scheduledEvaluationTask?.cancel()
+            initializationFailureTask?.cancel()
         }
 
-        func requestLoad(url: URL?, reloadToken: Int) {
-            planner.request(PreviewLoadRequest(url: url, reloadToken: reloadToken))
-            evaluateAndStartLoad()
+        func requestLoad(
+            url: URL?,
+            reloadToken: Int,
+            loadAttemptRevision: Int = 0,
+            configuration: SplatViewerSceneConfiguration
+        ) {
+            if let initializationFailureMessage {
+                interactiveView?.setViewerLoadState(.failed)
+                scheduleInitializationFailurePublication(initializationFailureMessage)
+                return
+            }
+            let request = PreviewLoadRequest(
+                url: url,
+                reloadToken: reloadToken,
+                loadAttemptRevision: loadAttemptRevision
+            )
+            sceneConfigurations[request] = configuration
+            if displayedRequest != request,
+               planner.lastHandledRequest != request,
+               planner.inFlightRequest != request {
+                interactiveView?.setViewerLoadState(
+                    controller?.hasRenderedPreview == true ? .ready : .loading
+                )
+            }
+            if displayedRequest == request, planner.inFlightRequest == nil {
+                controller?.updateSceneConfiguration(configuration)
+            }
+            planner.request(request)
+            scheduleLoadEvaluation()
         }
 
         func recordInteraction() {
             planner.recordInteraction(now: Date())
-            evaluateAndStartLoad()
+            scheduleLoadEvaluation()
+        }
+
+        func scheduleInitializationFailure(_ message: String) {
+            if initializationFailureMessage != message {
+                initializationFailurePublicationControllerID = nil
+                initializationFailureTask?.cancel()
+                initializationFailureTask = nil
+            }
+            initializationFailureMessage = message
+            interactiveView?.setViewerLoadState(.failed)
+            scheduleInitializationFailurePublication(message)
+        }
+
+        private func scheduleInitializationFailurePublication(_ message: String) {
+            guard initializationFailureTask == nil, let controller else { return }
+            let controllerID = ObjectIdentifier(controller)
+            if initializationFailurePublicationControllerID == controllerID,
+               controller.errorMessage == message {
+                return
+            }
+            initializationFailureTask = Task { [weak self] in
+                await Task.yield()
+                guard let self else { return }
+                self.initializationFailureTask = nil
+                guard !Task.isCancelled,
+                      self.initializationFailureMessage == message,
+                      let controller = self.controller else {
+                    return
+                }
+                let controllerID = ObjectIdentifier(controller)
+                if self.initializationFailurePublicationControllerID == controllerID,
+                   controller.errorMessage == message {
+                    return
+                }
+                controller.recordLoadFailure(message, retryable: false)
+                controller.isLoading = false
+                controller.isUpdating = false
+                self.initializationFailurePublicationControllerID = controllerID
+                self.onLoadStateChanged?(.failed(message))
+            }
+        }
+
+        private func scheduleLoadEvaluation() {
+            guard scheduledEvaluationTask == nil else { return }
+            scheduledEvaluationTask = Task { [weak self] in
+                await Task.yield()
+                guard !Task.isCancelled, let self else { return }
+                self.scheduledEvaluationTask = nil
+                self.evaluateAndStartLoad()
+            }
         }
 
         private func evaluateAndStartLoad() {
@@ -173,13 +451,14 @@ struct MetalKitSceneView: NSViewRepresentable {
             renderer: MetalKitSceneRenderer,
             controller: SplatViewerController
         ) {
-            if controller.hasRenderedPreview {
-                controller.isLoading = false
-                controller.isUpdating = true
-            } else {
-                controller.isLoading = true
-                controller.isUpdating = false
-            }
+            let configuration = sceneConfigurations[request] ?? SplatViewerSceneConfiguration()
+            controller.prepareSceneConfiguration(
+                configuration,
+                activate: false
+            )
+            let keepsRenderedPreview = controller.hasRenderedPreview
+            controller.beginLoadAttempt()
+            interactiveView?.setViewerLoadState(keepsRenderedPreview ? .ready : .loading)
             onLoadStateChanged?(.loading)
 
             loadTask = Task { [weak self] in
@@ -187,33 +466,74 @@ struct MetalKitSceneView: NSViewRepresentable {
                 defer {
                     self.loadTask = nil
                     self.planner.completeInFlight()
+                    let retainedRequests = Set([
+                        self.displayedRequest,
+                        self.planner.latestRequested,
+                        self.planner.pendingRequest,
+                        self.planner.inFlightRequest,
+                    ].compactMap { $0 })
+                    self.sceneConfigurations = self.sceneConfigurations.filter {
+                        retainedRequests.contains($0.key)
+                    }
                     self.evaluateAndStartLoad()
                 }
                 do {
-                    try await renderer.load(
-                        request.url.map { ModelIdentifier.gaussianSplat($0) },
-                        forceReload: forceReload
-                    )
-                guard !Task.isCancelled else { return }
-                    controller.errorMessage = nil
+                    try controller.validatePreparedSceneConfiguration(for: request)
+                    guard !Task.isCancelled else { return }
+                    if let latestConfiguration = self.sceneConfigurations[request] {
+                        controller.updateSceneConfiguration(latestConfiguration)
+                    }
+                    try controller.validatePreparedSceneConfiguration(for: request)
+                    let requestedModel = request.url.map { ModelIdentifier.gaussianSplat($0) }
+                    let preparedModel: PreparedViewerModelLoad
+                    if let modelLoadPreparer = self.modelLoadPreparer {
+                        preparedModel = try await modelLoadPreparer(
+                            renderer,
+                            requestedModel,
+                            forceReload
+                        )
+                    } else {
+                        preparedModel = try await renderer.prepareModelLoad(
+                            requestedModel,
+                            forceReload: forceReload
+                        )
+                    }
+                    guard !Task.isCancelled,
+                          self.planner.latestRequested == request else {
+                        return
+                    }
+                    if let latestConfiguration = self.sceneConfigurations[request] {
+                        controller.updateSceneConfiguration(latestConfiguration)
+                    }
+                    try controller.validatePreparedSceneConfiguration(for: request)
+                    guard controller.activatePreparedSceneConfiguration(requestDraw: false) else {
+                        throw SplatViewerConfigurationError.sceneBoundsOutsideSupportedRange
+                    }
+                    renderer.commitPreparedModelLoad(preparedModel)
+                    self.displayedRequest = request
+                    controller.recordLoadSuccess()
                     controller.isLoading = false
                     controller.isUpdating = false
                     controller.hasRenderedPreview = request.url != nil
-                self.onLoadStateChanged?(.ready)
-                    if let url = request.url {
-                        Task {
-                            do {
-                                try await controller.computeBounds(for: url)
-                            } catch {
-                                // Bounds are optional for rendering; keep the preview interactive.
-                            }
-                        }
+                    self.interactiveView?.setViewerLoadState(.ready)
+                    self.onLoadStateChanged?(.ready)
+                } catch {
+                    guard !Task.isCancelled,
+                          self.planner.latestRequested == request else {
+                        return
                     }
-            } catch {
-                guard !Task.isCancelled else { return }
-                controller.isLoading = false
-                controller.isUpdating = false
-                controller.errorMessage = error.localizedDescription
+                    controller.isLoading = false
+                    controller.isUpdating = false
+                    controller.recordLoadFailure(
+                        error.localizedDescription,
+                        retryable: !(error is SplatViewerConfigurationError)
+                            && SplatRenderer.isRetryableLoadError(error)
+                    )
+                    if controller.hasRenderedPreview {
+                        self.interactiveView?.setViewerLoadState(.ready)
+                    } else {
+                        self.interactiveView?.setViewerLoadState(.failed)
+                    }
                     self.onLoadStateChanged?(.failed(error.localizedDescription))
                     print("Error loading model: \(error.localizedDescription)")
                 }
@@ -225,36 +545,96 @@ struct MetalKitSceneView: NSViewRepresentable {
         Coordinator()
     }
 
+    static func dismantleNSView(_ nsView: MTKView, coordinator: Coordinator) {
+        coordinator.controller?.resetSceneConfiguration()
+        coordinator.loadTask?.cancel()
+        coordinator.deferredLoadTask?.cancel()
+        coordinator.scheduledEvaluationTask?.cancel()
+        coordinator.initializationFailureTask?.cancel()
+        coordinator.modelLoadPreparer = nil
+        if let interactiveView = nsView as? InteractiveMTKView {
+            interactiveView.onOrbit = nil
+            interactiveView.onScrollZoom = nil
+            interactiveView.onMagnify = nil
+            interactiveView.onPan = nil
+            interactiveView.onKeyboardCommand = nil
+            interactiveView.onInteractionActivity = nil
+        }
+        if coordinator.controller?.renderer === coordinator.renderer {
+            coordinator.controller?.renderer = nil
+        }
+        coordinator.renderer?.onSortFailure = nil
+        coordinator.renderer?.onSortSuccess = nil
+        nsView.delegate = nil
+        coordinator.renderer = nil
+        coordinator.interactiveView = nil
+        coordinator.controller = nil
+    }
+
     func makeNSView(context: NSViewRepresentableContext<MetalKitSceneView>) -> MTKView {
-        let metalKitView = InteractiveMTKView()
+        let metalKitView = InteractiveMTKView(frame: .zero, device: nil)
+        context.coordinator.interactiveView = metalKitView
+        context.coordinator.controller = controller
+        context.coordinator.onLoadStateChanged = onLoadStateChanged
         guard let metalDevice = MTLCreateSystemDefaultDevice() else {
-            controller.errorMessage = "Metal is not available on this Mac."
-            controller.isLoading = false
-            controller.isUpdating = false
+            context.coordinator.scheduleInitializationFailure(
+                "Metal is not available on this Mac."
+            )
             return metalKitView
         }
         metalKitView.device = metalDevice
 
         guard let renderer = MetalKitSceneRenderer(metalKitView) else {
-            controller.errorMessage = "Failed to initialize Metal renderer."
-            controller.isLoading = false
-            controller.isUpdating = false
+            context.coordinator.scheduleInitializationFailure(
+                "Failed to initialize Metal renderer."
+            )
             return metalKitView
         }
         context.coordinator.renderer = renderer
-        context.coordinator.controller = controller
-        context.coordinator.onLoadStateChanged = onLoadStateChanged
         controller.renderer = renderer
+        renderer.onSortFailure = { [weak controller] message in
+            controller?.recordSortFailure(message)
+        }
+        renderer.onSortSuccess = { [weak controller] in
+            controller?.recordSortSuccess()
+        }
         metalKitView.delegate = renderer
 
-        metalKitView.onOrbit = { deltaX, deltaY in
-            renderer.orbit(deltaX: Float(deltaX), deltaY: Float(deltaY))
+        metalKitView.onOrbit = { [weak renderer] deltaX, deltaY in
+            renderer?.orbit(deltaX: Float(deltaX), deltaY: Float(deltaY))
         }
-        metalKitView.onZoom = { delta in
-            renderer.zoom(delta: Float(delta))
+        metalKitView.onScrollZoom = { [weak renderer] delta, point in
+            renderer?.zoomByScroll(delta: Float(delta), anchoredAt: point)
         }
-        metalKitView.onPan = { deltaX, deltaY in
-            renderer.pan(deltaX: Float(deltaX), deltaY: Float(deltaY))
+        metalKitView.onMagnify = { [weak renderer] magnification, point in
+            renderer?.zoomByPinch(magnification: Float(magnification), anchoredAt: point)
+        }
+        metalKitView.onPan = { [weak renderer] deltaX, deltaY in
+            renderer?.pan(deltaX: Float(deltaX), deltaY: Float(deltaY))
+        }
+        metalKitView.onKeyboardCommand = { [weak renderer, weak controller] command in
+            let orbitStep: Float = 16
+            let panStep: Float = 12
+            switch command {
+            case .orbit(let horizontal, let vertical):
+                renderer?.orbit(
+                    deltaX: Float(horizontal) * orbitStep,
+                    deltaY: Float(vertical) * orbitStep
+                )
+            case .pan(let horizontal, let vertical):
+                renderer?.pan(
+                    deltaX: Float(horizontal) * panStep,
+                    deltaY: Float(vertical) * panStep
+                )
+            case .zoomIn:
+                renderer?.keyboardZoomIn()
+            case .zoomOut:
+                renderer?.keyboardZoomOut()
+            case .fit:
+                controller?.fitToView()
+            case .reset:
+                controller?.resetCamera()
+            }
         }
         metalKitView.onInteractionActivity = { [weak coordinator = context.coordinator] in
             coordinator?.recordInteraction()
@@ -271,64 +651,80 @@ struct MetalKitSceneView: NSViewRepresentable {
     }
 
     private func loadIfNeeded(context: NSViewRepresentableContext<MetalKitSceneView>) {
-        context.coordinator.requestLoad(url: splatURL, reloadToken: reloadToken)
+        context.coordinator.requestLoad(
+            url: splatURL,
+            reloadToken: reloadToken,
+            loadAttemptRevision: loadAttemptRevision,
+            configuration: sceneConfiguration
+        )
     }
 }
 
-private enum BoundsCalculator {
-    static func computeBounds(for url: URL) throws -> (center: SIMD3<Float>, radius: Float)? {
-        let collector = BoundsCollector()
-        let reader = SplatPLYSceneReader(url)
-        reader.read(to: collector)
-
-        if let error = collector.error {
-            throw error
-        }
-        guard collector.hasPoints else { return nil }
-        let minPoint = collector.minPoint
-        let maxPoint = collector.maxPoint
-        let center = (minPoint + maxPoint) * 0.5
-        let radius = simd_length(maxPoint - minPoint) * 0.5
-        return radius.isFinite ? (center: center, radius: radius) : nil
-    }
-
-    private final class BoundsCollector: NSObject, SplatSceneReaderDelegate {
-        fileprivate var minPoint = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-        fileprivate var maxPoint = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-        fileprivate var hasPoints = false
-        fileprivate var error: Error?
-
-        func didStartReading(withPointCount pointCount: UInt32) {}
-
-        func didRead(points: [SplatScenePoint]) {
-            for point in points {
-                let pos = point.position
-                minPoint = simd.min(minPoint, pos)
-                maxPoint = simd.max(maxPoint, pos)
-            }
-            if !points.isEmpty {
-                hasPoints = true
-            }
-        }
-
-        func didFinishReading() {}
-
-        func didFailReading(withError error: Error?) {
-            self.error = error
-        }
-    }
+enum SplatViewerAccessibilityLoadState: String {
+    case loading = "Loading"
+    case ready = "Ready"
+    case failed = "Failed"
 }
 
 final class InteractiveMTKView: MTKView {
     var onOrbit: ((CGFloat, CGFloat) -> Void)?
-    var onZoom: ((CGFloat) -> Void)?
+    var onScrollZoom: ((CGFloat, CGPoint) -> Void)?
+    var onMagnify: ((CGFloat, CGPoint) -> Void)?
     var onPan: ((CGFloat, CGFloat) -> Void)?
+    var onKeyboardCommand: ((ViewerKeyboardCommand) -> Void)?
     var onInteractionActivity: (() -> Void)?
 
     private var lastLocation: NSPoint?
     private var isPanning = false
 
+    override init(frame frameRect: CGRect, device: MTLDevice?) {
+        super.init(frame: frameRect, device: device)
+        configureInteractionSurface()
+    }
+
+    required init(coder: NSCoder) {
+        super.init(coder: coder)
+        configureInteractionSurface()
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { true }
+
+    override var focusRingMaskBounds: NSRect {
+        bounds.insetBy(dx: 2, dy: 2)
+    }
+
+    func setViewerLoadState(_ state: SplatViewerAccessibilityLoadState) {
+        setAccessibilityValue(state.rawValue)
+    }
+
+    override func drawFocusRingMask() {
+        NSColor.black.setFill()
+        NSBezierPath(
+            roundedRect: focusRingMaskBounds,
+            xRadius: Theme.Radius.standard - 2,
+            yRadius: Theme.Radius.standard - 2
+        ).fill()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted {
+            noteFocusRingMaskChanged()
+        }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned {
+            noteFocusRingMaskChanged()
+        }
+        return resigned
+    }
+
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         onInteractionActivity?()
         lastLocation = event.locationInWindow
         isPanning = event.modifierFlags.contains(.option)
@@ -351,11 +747,57 @@ final class InteractiveMTKView: MTKView {
 
     override func scrollWheel(with event: NSEvent) {
         onInteractionActivity?()
-        onZoom?(event.deltaY)
+        onScrollZoom?(event.scrollingDeltaY, viewerPoint(for: event))
+    }
+
+    override func magnify(with event: NSEvent) {
+        onInteractionActivity?()
+        onMagnify?(event.magnification, viewerPoint(for: event))
     }
 
     override func mouseUp(with event: NSEvent) {
         onInteractionActivity?()
         super.mouseUp(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let nonTraversalModifiers = event.modifierFlags.intersection([.command, .control, .option])
+        if event.keyCode == 48, nonTraversalModifiers.isEmpty {
+            if event.modifierFlags.contains(.shift) {
+                window?.selectPreviousKeyView(nil)
+            } else {
+                window?.selectNextKeyView(nil)
+            }
+            return
+        }
+
+        guard let command = ViewerKeyboardCommand.resolve(
+            keyCode: event.keyCode,
+            characters: event.charactersIgnoringModifiers,
+            modifiers: ViewerKeyboardModifiers(event.modifierFlags)
+        ) else {
+            super.keyDown(with: event)
+            return
+        }
+        onInteractionActivity?()
+        onKeyboardCommand?(command)
+    }
+
+    private func viewerPoint(for event: NSEvent) -> CGPoint {
+        let local = convert(event.locationInWindow, from: nil)
+        return CGPoint(x: local.x, y: bounds.height - local.y)
+    }
+
+    private func configureInteractionSurface() {
+        focusRingType = .exterior
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityIdentifier("result.viewer")
+        setAccessibilityLabel("Interactive 3D splat viewer")
+        setViewerLoadState(.loading)
+        setAccessibilityHelp(
+            "Drag to orbit. Option-drag pans. Scroll or pinch zooms. Press F to fit or R to reset."
+        )
+        setAccessibilityChildren([])
     }
 }

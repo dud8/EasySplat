@@ -1,5 +1,7 @@
 #if os(iOS) || os(macOS)
 
+import Foundation
+import EasySplatCore
 import Metal
 import MetalKit
 import MetalSplatter
@@ -9,6 +11,160 @@ import SwiftUI
 
 private struct SendableMetalDevice: @unchecked Sendable {
     let value: any MTLDevice
+}
+
+private struct SendableSplatRenderer: @unchecked Sendable {
+    let value: SplatRenderer
+}
+
+private enum SceneBoundsApplicationResult: Equatable {
+    case fitted
+    case preservedView
+    case rejected
+}
+
+enum PreparedViewerModelLoad {
+    case unchanged
+    case replacement(model: ModelIdentifier?, renderer: SplatRenderer?)
+}
+
+enum ViewerMemoryAdmissionPolicy {
+    private static let mebibyte: UInt64 = 1_048_576
+    private static let physicalMemoryUsePercent: UInt64 = 65
+    private static let recommendedWorkingSetUsePercent: UInt64 = 80
+
+    private static func scaled(_ value: UInt64, numerator: UInt64, denominator: UInt64) -> UInt64 {
+        let whole = (value / denominator) * numerator
+        let remainder = ((value % denominator) * numerator) / denominator
+        return whole.addingReportingOverflow(remainder).overflow ? UInt64.max : whole + remainder
+    }
+
+    static func resolveBudgetBytes(
+        physicalMemoryBytes: UInt64,
+        recommendedMaxWorkingSetBytes: UInt64,
+        currentAllocatedBytes: UInt64,
+        availableHostMemoryBytes: UInt64? = nil,
+        memoryPressure: MemoryPressureState = .normal
+    ) -> Int {
+        let maximumRecoverableBytes = UInt64(
+            resolveMaximumRecoverableBytes(
+                physicalMemoryBytes: physicalMemoryBytes,
+                recommendedMaxWorkingSetBytes: recommendedMaxWorkingSetBytes
+            )
+        )
+        guard maximumRecoverableBytes > currentAllocatedBytes else { return 0 }
+        let metalCapacity = maximumRecoverableBytes - currentAllocatedBytes
+
+        let availableHostMemory = min(
+            availableHostMemoryBytes ?? physicalMemoryBytes,
+            physicalMemoryBytes
+        )
+        let hostReserve = min(
+            availableHostMemory,
+            max(512 * mebibyte, physicalMemoryBytes / 20)
+        )
+        let unpressuredHostCapacity = availableHostMemory - hostReserve
+        let hostCapacity: UInt64 = switch memoryPressure {
+        case .normal:
+            unpressuredHostCapacity
+        case .warning:
+            scaled(unpressuredHostCapacity, numerator: 3, denominator: 5)
+        case .critical:
+            UInt64.zero
+        case .unknown:
+            scaled(unpressuredHostCapacity, numerator: 4, denominator: 5)
+        }
+
+        return Int(clamping: min(min(metalCapacity, hostCapacity), UInt64(Int.max)))
+    }
+
+    static func resolveMaximumRecoverableBytes(
+        physicalMemoryBytes: UInt64,
+        recommendedMaxWorkingSetBytes: UInt64
+    ) -> Int {
+        let physicalLimit = scaled(
+            physicalMemoryBytes,
+            numerator: physicalMemoryUsePercent,
+            denominator: 100
+        )
+        let deviceLimit = recommendedMaxWorkingSetBytes > 0
+            ? scaled(
+                recommendedMaxWorkingSetBytes,
+                numerator: recommendedWorkingSetUsePercent,
+                denominator: 100
+            )
+            : UInt64.max
+        return Int(clamping: min(physicalLimit, deviceLimit))
+    }
+}
+
+final class ModelLoadCancellationToken: @unchecked Sendable {
+    private enum State {
+        case active
+        case cancelled
+        case completed
+    }
+
+    private let lock = NSLock()
+    private var state = State.active
+
+    var isCancelled: Bool {
+        lock.withLock { state == .cancelled }
+    }
+
+    func cancel() {
+        lock.withLock {
+            if state == .active {
+                state = .cancelled
+            }
+        }
+    }
+
+    func checkCancellation() throws {
+        if isCancelled {
+            throw CancellationError()
+        }
+    }
+
+    fileprivate func complete() throws {
+        try lock.withLock {
+            guard state == .active else {
+                throw CancellationError()
+            }
+            state = .completed
+        }
+    }
+}
+
+struct SerialModelLoadExecutor: @unchecked Sendable {
+    private let queue: DispatchQueue
+
+    init(queue: DispatchQueue) {
+        self.queue = queue
+    }
+
+    func perform<Value: Sendable>(
+        _ operation: @escaping @Sendable (ModelLoadCancellationToken) throws -> Value
+    ) async throws -> Value {
+        let cancellation = ModelLoadCancellationToken()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                queue.async {
+                    do {
+                        try cancellation.checkCancellation()
+                        let value = try operation(cancellation)
+                        try cancellation.complete()
+                        continuation.resume(returning: value)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
 }
 
 @MainActor
@@ -24,21 +180,30 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var model: ModelIdentifier?
     var modelRenderer: (any ModelRenderer)?
     private(set) var lastLoadError: String? = nil
+    var onSortFailure: ((String) -> Void)?
+    var onSortSuccess: (() -> Void)?
 
     let inFlightSemaphore = DispatchSemaphore(value: Constants.maxSimultaneousRenders)
 
-    private var yaw: Float = 0
-    private var pitch: Float = 0
-    private var distance: Float = Constants.defaultDistance
-    private var pan: SIMD2<Float> = .zero
-    private var center: SIMD3<Float> = .zero
-    private let defaultYaw: Float = 0
-    private let defaultPitch: Float = 0
-    private let defaultDistance: Float = Constants.defaultDistance
-    private let defaultPan: SIMD2<Float> = .zero
+    private(set) var cameraState: ViewerCameraState
+    private var sceneCenter: SIMD3<Float> = .zero
+    private var sourceOpeningDirection = SIMD3<Float>(0, 0, -1)
+    private(set) var isViewOnlyFlipActive = false
 
-    var drawableSize: CGSize = .zero
-    private static let modelLoadQueue = DispatchQueue(label: "com.easysplat.model-load", qos: .userInitiated)
+    var pan: SIMD2<Float> {
+        let displacement = cameraState.target - sceneCenter
+        return SIMD2<Float>(
+            simd_dot(displacement, cameraState.rightDirection),
+            simd_dot(displacement, cameraState.upDirection)
+        )
+    }
+
+    var interactionRevision: UInt64 { cameraState.interactionRevision }
+
+    private(set) var drawableSize: CGSize = .zero
+    private static let modelLoadExecutor = SerialModelLoadExecutor(
+        queue: DispatchQueue(label: "com.easysplat.model-load", qos: .userInitiated)
+    )
 
     init?(_ metalKitView: MTKView) {
         guard let device = metalKitView.device else { return nil }
@@ -46,6 +211,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         guard let queue = self.device.makeCommandQueue() else { return nil }
         self.commandQueue = queue
         self.metalKitView = metalKitView
+        self.drawableSize = metalKitView.drawableSize
+        self.cameraState = ViewerCameraState(
+            viewportSize: metalKitView.bounds.size,
+            verticalFOV: Float(Constants.fovy.radians)
+        )
         metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
         metalKitView.sampleCount = 1
@@ -56,22 +226,25 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     func load(_ model: ModelIdentifier?, forceReload: Bool = false) async throws {
-        if !forceReload, model == self.model {
-            return
-        }
-        self.model = model
+        let prepared = try await prepareModelLoad(model, forceReload: forceReload)
+        commitPreparedModelLoad(prepared)
+    }
 
-        modelRenderer = nil
+    func prepareModelLoad(
+        _ model: ModelIdentifier?,
+        forceReload: Bool = false
+    ) async throws -> PreparedViewerModelLoad {
+        if !forceReload, model == self.model {
+            return .unchanged
+        }
         lastLoadError = nil
         do {
             switch model {
             case .gaussianSplat(let url):
                 let splat = try await loadSplatRenderer(from: url)
-                modelRenderer = splat
-                requestDraw()
+                return .replacement(model: model, renderer: splat)
             case .none:
-                requestDraw()
-                break
+                return .replacement(model: nil, renderer: nil)
             }
         } catch {
             lastLoadError = error.localizedDescription
@@ -79,55 +252,171 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    func commitPreparedModelLoad(_ prepared: PreparedViewerModelLoad) {
+        guard case .replacement(let model, let renderer) = prepared else {
+            requestDraw()
+            return
+        }
+
+        if let renderer {
+            installSortCallbacks(on: renderer)
+        }
+        detachSortCallbacks(from: modelRenderer)
+        modelRenderer = renderer
+        self.model = model
+        requestDraw()
+    }
+
     private func loadSplatRenderer(from url: URL) async throws -> SplatRenderer {
         let device = SendableMetalDevice(value: self.device)
         let colorFormat = metalKitView.colorPixelFormat
         let depthFormat = metalKitView.depthStencilPixelFormat
         let sampleCount = metalKitView.sampleCount
+        let hostObservation = try? LiveTrainingResourceObserver().observe()
+        let installedMemoryBytes = hostObservation?.installedMemoryBytes
+            ?? ProcessInfo.processInfo.physicalMemory
+        let maximumWorkingSetBytes = ViewerMemoryAdmissionPolicy.resolveBudgetBytes(
+            physicalMemoryBytes: installedMemoryBytes,
+            recommendedMaxWorkingSetBytes: device.value.recommendedMaxWorkingSetSize,
+            currentAllocatedBytes: UInt64(max(0, device.value.currentAllocatedSize)),
+            availableHostMemoryBytes: hostObservation?.availableHostMemoryBytes,
+            memoryPressure: hostObservation?.memoryPressure ?? .normal
+        )
+        let maximumRecoverableWorkingSetBytes =
+            ViewerMemoryAdmissionPolicy.resolveMaximumRecoverableBytes(
+                physicalMemoryBytes: installedMemoryBytes,
+                recommendedMaxWorkingSetBytes: device.value.recommendedMaxWorkingSetSize
+            )
 
-        return try await withCheckedThrowingContinuation { continuation in
-            Self.modelLoadQueue.async {
-                do {
-                    let splat = try SplatRenderer(
-                        device: device.value,
-                        colorFormat: colorFormat,
-                        depthFormat: depthFormat,
-                        stencilFormat: depthFormat,
-                        sampleCount: sampleCount,
-                        maxViewCount: 1,
-                        maxSimultaneousRenders: Constants.maxSimultaneousRenders
-                    )
-                    try splat.readPLY(from: url)
-                    continuation.resume(returning: splat)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
+        let loaded = try await Self.modelLoadExecutor.perform { cancellation in
+            let splat = try SplatRenderer(
+                device: device.value,
+                colorFormat: colorFormat,
+                depthFormat: depthFormat,
+                stencilFormat: depthFormat,
+                sampleCount: sampleCount,
+                maxViewCount: 1,
+                maxSimultaneousRenders: Constants.maxSimultaneousRenders,
+                maximumWorkingSetBytes: maximumWorkingSetBytes,
+                maximumRecoverableWorkingSetBytes: maximumRecoverableWorkingSetBytes
+            )
+            try splat.readPLY(
+                from: url,
+                shouldCancel: { cancellation.isCancelled }
+            )
+            return SendableSplatRenderer(value: splat)
+        }
+        return loaded.value
+    }
+
+    private func reportSortFailure(_ message: String) {
+        onSortFailure?(message)
+    }
+
+    private func reportSortSuccess() {
+        onSortSuccess?()
+    }
+
+    private func installSortCallbacks(on renderer: SplatRenderer) {
+        renderer.onSortComplete = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.requestDraw()
             }
         }
+        renderer.onSortFailure = { [weak self] failure in
+            let message = failure.localizedDescription
+            Task { @MainActor [weak self] in
+                self?.reportSortFailure(message)
+            }
+        }
+        renderer.onSortSuccess = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.reportSortSuccess()
+            }
+        }
+    }
+
+    private func detachSortCallbacks(from renderer: (any ModelRenderer)?) {
+        guard let renderer = renderer as? SplatRenderer else { return }
+        renderer.onSortComplete = nil
+        renderer.onSortFailure = nil
+        renderer.onSortSuccess = nil
+    }
+
+    func retrySortOrdering() {
+        (modelRenderer as? SplatRenderer)?.resortIndices()
     }
 
     private func requestDraw() {
         metalKitView.draw()
     }
 
-    private var viewportCamera: ModelRenderer.CameraMatrices {
-        let aspect = max(drawableSize.width / max(drawableSize.height, 1), 0.1)
-        let projectionMatrix = matrix_perspective_right_hand(fovyRadians: Float(Constants.fovy.radians),
-                                                             aspectRatio: Float(aspect),
-                                                             nearZ: 0.1,
-                                                             farZ: 100.0)
-
-        let yawMatrix = matrix4x4_rotation(radians: yaw, axis: SIMD3<Float>(0, 1, 0))
-        let pitchMatrix = matrix4x4_rotation(radians: pitch, axis: SIMD3<Float>(1, 0, 0))
-        let translationMatrix = matrix4x4_translation(pan.x, pan.y, -distance)
-        let centerTranslation = matrix4x4_translation(-center.x, -center.y, -center.z)
-        // Turn common 3D GS PLY files rightside-up. This isn't generally meaningful, it just
-        // happens to be a useful default for the most common datasets at the moment.
-        let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
+    var viewportCamera: ModelRenderer.CameraMatrices {
+        let aspect = max(cameraState.viewportSize.width / cameraState.viewportSize.height, 0.001)
+        let clip = cameraState.clipPlanes
+        let projectionMatrix = matrix_perspective_right_hand(
+            fovyRadians: cameraState.verticalFOV,
+            aspectRatio: Float(aspect),
+            nearZ: clip.near,
+            farZ: clip.far
+        )
+        let viewMatrix = lookAtMatrix(
+            eye: cameraState.cameraPosition,
+            right: cameraState.rightDirection,
+            up: cameraState.upDirection,
+            forward: cameraState.forwardDirection
+        )
+        let modelMatrix = viewOnlyModelMatrix
 
         return (projection: projectionMatrix,
-                view: translationMatrix * pitchMatrix * yawMatrix * commonUpCalibration * centerTranslation,
-                screenSize: SIMD2(x: Int(drawableSize.width), y: Int(drawableSize.height)))
+                view: viewMatrix * modelMatrix,
+                screenSize: SIMD2(
+                    x: max(1, Int(drawableSize.width)),
+                    y: max(1, Int(drawableSize.height))
+                ))
+    }
+
+    private var viewOnlyModelMatrix: matrix_float4x4 {
+        guard isViewOnlyFlipActive else { return matrix_identity_float4x4 }
+        let rotation = flipRotationMatrix
+        return matrix4x4_translation(sceneCenter.x, sceneCenter.y, sceneCenter.z)
+            * rotation
+            * matrix4x4_translation(-sceneCenter.x, -sceneCenter.y, -sceneCenter.z)
+    }
+
+    private var flipRotationMatrix: matrix_float4x4 {
+        flipRotationMatrix(for: sourceOpeningDirection)
+    }
+
+    private func flipRotationMatrix(for openingDirection: SIMD3<Float>) -> matrix_float4x4 {
+        let axis = ViewerCameraState.stableHorizontalHeading(for: openingDirection)
+        let doubled = 2 * axis
+        return matrix_float4x4(columns: (
+            SIMD4<Float>(doubled.x * axis.x - 1, doubled.x * axis.y, doubled.x * axis.z, 0),
+            SIMD4<Float>(doubled.y * axis.x, doubled.y * axis.y - 1, doubled.y * axis.z, 0),
+            SIMD4<Float>(doubled.z * axis.x, doubled.z * axis.y, doubled.z * axis.z - 1, 0),
+            SIMD4<Float>(0, 0, 0, 1)
+        ))
+    }
+
+    private func lookAtMatrix(
+        eye: SIMD3<Float>,
+        right: SIMD3<Float>,
+        up: SIMD3<Float>,
+        forward: SIMD3<Float>
+    ) -> matrix_float4x4 {
+        let backward = -forward
+        return matrix_float4x4(columns: (
+            SIMD4<Float>(right.x, up.x, backward.x, 0),
+            SIMD4<Float>(right.y, up.y, backward.y, 0),
+            SIMD4<Float>(right.z, up.z, backward.z, 0),
+            SIMD4<Float>(
+                -simd_dot(right, eye),
+                -simd_dot(up, eye),
+                -simd_dot(backward, eye),
+                1
+            )
+        ))
     }
 
     func draw(in view: MTKView) {
@@ -160,48 +449,220 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         drawableSize = size
+        cameraState.updateViewportSize(view.bounds.size)
         requestDraw()
     }
 
     func orbit(deltaX: Float, deltaY: Float) {
-        yaw += deltaX * Constants.orbitSpeed
-        pitch = max(min(pitch + deltaY * Constants.orbitSpeed, .pi / 2 - 0.01), -.pi / 2 + 0.01)
+        cameraState.orbit(
+            deltaYaw: deltaX * Constants.orbitSpeed,
+            deltaPitch: deltaY * Constants.orbitSpeed
+        )
         requestDraw()
     }
 
-    func zoom(delta: Float) {
-        distance = max(Constants.minDistance, min(Constants.maxDistance, distance + delta * Constants.zoomSpeed))
+    func zoomByScroll(delta: Float, anchoredAt pointer: CGPoint?) {
+        cameraState.zoomByScroll(delta: delta, anchoredAt: pointer)
+        requestDraw()
+    }
+
+    func zoomByPinch(magnification: Float, anchoredAt pointer: CGPoint?) {
+        cameraState.zoomByPinch(magnification: magnification, anchoredAt: pointer)
+        requestDraw()
+    }
+
+    func keyboardZoomIn() {
+        cameraState.zoomIn()
+        requestDraw()
+    }
+
+    func keyboardZoomOut() {
+        cameraState.zoomOut()
         requestDraw()
     }
 
     func pan(deltaX: Float, deltaY: Float) {
-        pan += SIMD2<Float>(deltaX * Constants.panSpeed, -deltaY * Constants.panSpeed)
+        cameraState.pan(screenDelta: SIMD2<Float>(deltaX, -deltaY))
         requestDraw()
     }
 
     func resetCamera() {
-        yaw = defaultYaw
-        pitch = defaultPitch
-        distance = defaultDistance
-        pan = defaultPan
+        cameraState.reset()
         requestDraw()
     }
 
     func fitToView() {
-        distance = defaultDistance
-        yaw = 0
-        pitch = 0
-        pan = .zero
+        cameraState.fit()
         requestDraw()
     }
 
     func applyBounds(center: SIMD3<Float>, radius: Float) {
-        self.center = center
-        let fov = Float(Constants.fovy.radians)
-        let paddedRadius = max(radius, 0.01) * 1.2
-        let targetDistance = paddedRadius / tanf(fov * 0.5)
-        distance = max(Constants.minDistance, min(Constants.maxDistance, targetDistance))
+        _ = applyBounds(
+            center: center,
+            radius: radius,
+            openingDirection: nil,
+            ifInteractionRevisionMatches: interactionRevision
+        )
+    }
+
+    @discardableResult
+    func applyBounds(
+        center: SIMD3<Float>,
+        radius: Float,
+        openingDirection: SIMD3<Float>?,
+        ifInteractionRevisionMatches expectedRevision: UInt64
+    ) -> Bool {
+        let result = applyBoundsWithoutDrawing(
+            center: center,
+            radius: radius,
+            openingDirection: openingDirection,
+            ifInteractionRevisionMatches: expectedRevision
+        )
         requestDraw()
+        return result == .fitted
+    }
+
+    @discardableResult
+    func activateSceneConfiguration(
+        bounds: ViewerSceneBounds?,
+        openingDirection: SIMD3<Float>?,
+        isViewOnlyFlipActive: Bool,
+        ifInteractionRevisionMatches expectedRevision: UInt64,
+        requestDraw shouldRequestDraw: Bool = true
+    ) -> Bool {
+        let previousFlipState = self.isViewOnlyFlipActive
+        self.isViewOnlyFlipActive = isViewOnlyFlipActive
+        let result: SceneBoundsApplicationResult
+        if let bounds {
+            result = applyBoundsWithoutDrawing(
+                center: bounds.center,
+                radius: bounds.radius,
+                openingDirection: openingDirection,
+                ifInteractionRevisionMatches: expectedRevision
+            )
+        } else {
+            let sourceDirection = sanitizedDirection(openingDirection)
+            let effectiveDirection = isViewOnlyFlipActive
+                ? transformedDirection(
+                    sourceDirection,
+                    by: flipRotationMatrix(for: sourceDirection)
+                )
+                : sourceDirection
+            let current = cameraState
+            cameraState = ViewerCameraState(
+                target: current.target,
+                sceneRadius: current.sceneRadius,
+                openingDirection: effectiveDirection,
+                viewportSize: current.viewportSize,
+                verticalFOV: current.verticalFOV,
+                yaw: current.yaw,
+                pitch: current.pitch,
+                distance: current.distance,
+                interactionRevision: current.interactionRevision
+            )
+            sourceOpeningDirection = sourceDirection
+            result = .preservedView
+        }
+        guard result != .rejected else {
+            self.isViewOnlyFlipActive = previousFlipState
+            return false
+        }
+        if shouldRequestDraw {
+            requestDraw()
+        }
+        return true
+    }
+
+    private func applyBoundsWithoutDrawing(
+        center: SIMD3<Float>,
+        radius: Float,
+        openingDirection: SIMD3<Float>?,
+        ifInteractionRevisionMatches expectedRevision: UInt64
+    ) -> SceneBoundsApplicationResult {
+        let sourceDirection = sanitizedDirection(openingDirection)
+        let effectiveDirection = isViewOnlyFlipActive
+            ? transformedDirection(
+                sourceDirection,
+                by: flipRotationMatrix(for: sourceDirection)
+            )
+            : sourceDirection
+        let didFit = cameraState.applyBounds(
+            center: center,
+            radius: radius,
+            openingDirection: effectiveDirection,
+            ifInteractionRevisionMatches: expectedRevision
+        )
+        if !didFit {
+            guard cameraState.adoptBoundsPreservingView(
+                center: center,
+                radius: radius,
+                openingDirection: effectiveDirection
+            ) else {
+                return .rejected
+            }
+        }
+        sceneCenter = center
+        sourceOpeningDirection = sourceDirection
+        return didFit ? .fitted : .preservedView
+    }
+
+    @discardableResult
+    func setViewOnlyFlipActive(_ active: Bool) -> Bool {
+        guard active != isViewOnlyFlipActive else { return true }
+        let rotation = flipRotationMatrix
+        let current = cameraState
+        let transformedOffset = transformedVector(
+            current.target - sceneCenter,
+            by: rotation
+        )
+        let transformedTarget = sceneCenter + transformedOffset
+        let transformedForward = transformedDirection(
+            current.forwardDirection,
+            by: rotation
+        )
+        let effectiveDirection = active
+            ? transformedDirection(sourceOpeningDirection, by: rotation)
+            : sourceOpeningDirection
+
+        guard cameraState.applyViewOnlyPose(
+            target: transformedTarget,
+            forwardDirection: transformedForward,
+            openingDirection: effectiveDirection
+        ) else { return false }
+
+        isViewOnlyFlipActive = active
+        requestDraw()
+        return true
+    }
+
+    private func sanitizedDirection(_ direction: SIMD3<Float>?) -> SIMD3<Float> {
+        let candidate = direction ?? SIMD3<Float>(0, 0, -1)
+        let largest = max(abs(candidate.x), abs(candidate.y), abs(candidate.z))
+        guard candidate.x.isFinite,
+              candidate.y.isFinite,
+              candidate.z.isFinite,
+              largest.isFinite,
+              largest > 0 else {
+            return SIMD3<Float>(0, 0, -1)
+        }
+        let scaled = candidate / largest
+        return scaled / sqrt(simd_length_squared(scaled))
+    }
+
+    private func transformedDirection(
+        _ direction: SIMD3<Float>,
+        by matrix: matrix_float4x4
+    ) -> SIMD3<Float> {
+        let transformed = matrix * SIMD4<Float>(direction.x, direction.y, direction.z, 0)
+        return sanitizedDirection(SIMD3<Float>(transformed.x, transformed.y, transformed.z))
+    }
+
+    private func transformedVector(
+        _ vector: SIMD3<Float>,
+        by matrix: matrix_float4x4
+    ) -> SIMD3<Float> {
+        let transformed = matrix * SIMD4<Float>(vector.x, vector.y, vector.z, 0)
+        return SIMD3<Float>(transformed.x, transformed.y, transformed.z)
     }
 }
 

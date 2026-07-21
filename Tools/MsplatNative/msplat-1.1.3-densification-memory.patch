@@ -1,0 +1,82 @@
+diff --git a/core/include/model.hpp b/core/include/model.hpp
+index a496d0f..73f632d 100644
+--- a/core/include/model.hpp
++++ b/core/include/model.hpp
+@@ -60,6 +60,7 @@ struct Model{
+   int num_active = 0, buf_capacity = 0;
+   void refreshViews();
+   void ensureCapacity(int needed);
++  void ensureDensificationCompactScratch(int pointCount);
+ 
+   MTensor densify_split_flag, densify_dup_flag;
+   MTensor densify_split_prefix, densify_dup_prefix;
+diff --git a/core/src/model.cpp b/core/src/model.cpp
+index f09b740..996423c 100644
+--- a/core/src/model.cpp
++++ b/core/src/model.cpp
+@@ -160,8 +160,6 @@ void Model::setupOptimizers(){
+     densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
+     int max_blocks = (buf_capacity + 1023) / 1024;
+     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
+-    int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
+-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
+ 
+     refreshViews();
+@@ -198,6 +196,21 @@ void Model::refreshViews(){
+     }
+ }
+ 
++void Model::ensureDensificationCompactScratch(int pointCount){
++    if (pointCount <= 0 || pointCount > INT_MAX / 3 ||
++        buf_capacity < 3 * pointCount || featuresRest_buf.stride0() <= 0) {
++        throw std::runtime_error("Cannot allocate inconsistent densification scratch memory");
++    }
++    const int64_t requiredElements =
++        3LL * static_cast<int64_t>(pointCount) * featuresRest_buf.stride0();
++    if (densify_compact_scratch.defined() &&
++        densify_compact_scratch.numel() >= requiredElements) {
++        return;
++    }
++    densify_compact_scratch.reset();
++    densify_compact_scratch = gpu_zeros({requiredElements}, DType::Float32);
++}
++
+ void Model::ensureCapacity(int needed){
+     if (needed <= buf_capacity) return;
+     int new_cap = std::max(needed, buf_capacity * 2);
+@@ -224,8 +237,6 @@ void Model::ensureCapacity(int needed){
+     densify_keep_prefix = gpu_zeros({new_cap}, DType::Int32);
+     int max_blocks = (new_cap + 1023) / 1024;
+     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
+-    int64_t fr_stride = featuresRest_buf.stride0();
+-    densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
+     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
+ 
+     buf_capacity = new_cap;
+@@ -250,6 +261,7 @@ void Model::afterTrain(int step){
+         if (doDensification){
+             int numPointsBefore = num_active;
+             ensureCapacity(3 * num_active);  // worst case: every gaussian splits
++            ensureDensificationCompactScratch(num_active);
+ 
+             // Fill random samples for splits (CPU randn, shared memory)
+             {
+@@ -282,6 +294,8 @@ void Model::afterTrain(int step){
+             num_active = new_count;
+             refreshViews();
+             std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
++        } else if (step >= stopSplitAt) {
++            densify_compact_scratch.reset();
+         }
+ 
+         if (step < stopSplitAt && step % resetInterval == refineEvery){
+@@ -625,8 +639,6 @@ int Model::loadCheckpoint(const std::string &filename) {
+     densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
+     int max_blocks = (buf_capacity + 1023) / 1024;
+     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
+-    int64_t fr_stride = featuresRest_buf.stride0();
+-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
+ 
+     if (statsPresent == 1) {

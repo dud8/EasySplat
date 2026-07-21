@@ -4,6 +4,10 @@ title: "bug: "
 labels:
   - bug
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not upload client or private media, project notes, unredacted diagnostics, home or removable-volume paths, or credential-bearing URLs or tokens. Review and redact diagnostics before posting. Attach samples only when they are intentionally public and you have the right to permit redistribution.
   - type: textarea
     id: summary
     attributes:
@@ -15,7 +19,7 @@ body:
     id: reproduce
     attributes:
       label: Reproduction
-      description: Include exact steps, sample inputs, and relevant environment variables.
+      description: Include exact steps, a non-sensitive description of the input, and relevant configuration names. Never paste secret values.
     validations:
       required: true
   - type: textarea
@@ -27,4 +31,4 @@ body:
     id: logs
     attributes:
       label: Logs or screenshots
-      description: Paste the smallest relevant log excerpt or attach screenshots.
+      description: Paste the smallest relevant redacted log excerpt or attach a redacted screenshot.

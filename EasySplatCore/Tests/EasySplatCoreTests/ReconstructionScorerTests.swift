@@ -55,36 +55,96 @@ final class ReconstructionScorerTests: XCTestCase {
     }
 
     func testAcceptableThresholds() {
-        let score = ReconstructionScore(
-            registeredImages: 70,
+        let passing = ReconstructionScore(
+            registeredImages: 20,
+            totalImages: 22,
+            meanReprojectionError: 1.0,
+            pointCount: 10_000,
+            observationCount: 30_000,
+            meanTrackLength: 3.0
+        )
+        let failing = ReconstructionScore(
+            registeredImages: 19,
+            totalImages: 22,
+            meanReprojectionError: 1.0,
+            pointCount: 10_000,
+            observationCount: 30_000,
+            meanTrackLength: 3.0
+        )
+
+        XCTAssertTrue(ReconstructionScorer.isAcceptable(passing, capturePath: .orbit))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(failing, capturePath: .orbit))
+    }
+
+    func testEveryCapturePathUsesThePublishedRegistrationFloor() {
+        let belowFloor = ReconstructionScore(
+            registeredImages: 89,
             totalImages: 100,
             meanReprojectionError: 1.0,
             pointCount: 10_000,
             observationCount: 30_000,
             meanTrackLength: 3.0
         )
-        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, mode: .object))
-        let low = ReconstructionScore(
-            registeredImages: 40,
+        let atFloor = ReconstructionScore(
+            registeredImages: 90,
             totalImages: 100,
             meanReprojectionError: 1.0,
             pointCount: 10_000,
             observationCount: 30_000,
             meanTrackLength: 3.0
         )
-        XCTAssertFalse(ReconstructionScorer.isAcceptable(low, mode: .object))
+
+        for capturePath in [
+            CapturePath.automatic,
+            .orbit,
+            .walkthrough,
+            .largeArea,
+        ] {
+            XCTAssertFalse(ReconstructionScorer.isAcceptable(belowFloor, capturePath: capturePath))
+            XCTAssertTrue(ReconstructionScorer.isAcceptable(atFloor, capturePath: capturePath))
+        }
     }
 
     func testAcceptableRejectsTracklessSparseModel() {
         let score = ReconstructionScore(
-            registeredImages: 70,
+            registeredImages: 90,
             totalImages: 100,
             meanReprojectionError: 1.0,
             pointCount: 10_000,
             observationCount: 0,
             meanTrackLength: 0.0
         )
-        XCTAssertFalse(ReconstructionScorer.isAcceptable(score, mode: .object))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(score, capturePath: .orbit))
+    }
+
+    func testAcceptableRejectsImpossibleCountsAndResiduals() {
+        func score(registered: Int = 90, residual: Double?) -> ReconstructionScore {
+            ReconstructionScore(
+                registeredImages: registered,
+                totalImages: 100,
+                meanReprojectionError: residual,
+                pointCount: 100,
+                observationCount: 300,
+                meanTrackLength: 3
+            )
+        }
+
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            score(registered: 101, residual: 1),
+            capturePath: .automatic
+        ))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            score(residual: -0.1),
+            capturePath: .automatic
+        ))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            score(residual: .infinity),
+            capturePath: .automatic
+        ))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            score(residual: .nan),
+            capturePath: .automatic
+        ))
     }
 
     func testExpectedTotalImagesKeepsPartialSparseModelsFromPassing() {
@@ -104,7 +164,7 @@ final class ReconstructionScorerTests: XCTestCase {
 
         XCTAssertEqual(adjusted.registeredImages, 5)
         XCTAssertEqual(adjusted.totalImages, 60)
-        XCTAssertFalse(ReconstructionScorer.isAcceptable(adjusted, mode: .object))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(adjusted, capturePath: .orbit))
     }
 
     func testParseSparseTextModelCountsFeedForwardOutputWithoutTracks() throws {

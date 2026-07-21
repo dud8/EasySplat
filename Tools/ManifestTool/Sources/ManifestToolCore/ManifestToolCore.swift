@@ -1,32 +1,89 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 public struct ManifestDocument: Codable, Equatable {
-    public var version: String
-    public var publishedAt: Date
-    public var artifacts: [Artifact]
-    public var signatureEd25519: String
+    public enum ComponentRequirement: String, Codable, Equatable {
+        case required
+        case optional
+    }
 
-    public struct Artifact: Codable, Equatable {
-        public var name: String
-        public var url: String
-        public var sha256: String
-        public var sizeBytes: UInt64
-        public var contents: [String]
+    public struct AppVersionRange: Codable, Equatable {
+        public var minimum: String
+        public var maximumExclusive: String?
 
-        public init(name: String, url: String, sha256: String, sizeBytes: UInt64, contents: [String]) {
-            self.name = name
-            self.url = url
-            self.sha256 = sha256
-            self.sizeBytes = sizeBytes
-            self.contents = contents
+        public init(minimum: String, maximumExclusive: String?) {
+            self.minimum = minimum
+            self.maximumExclusive = maximumExclusive
         }
     }
 
-    public init(version: String, publishedAt: Date, artifacts: [Artifact], signatureEd25519: String) {
+    public var schemaVersion: Int
+    public var toolchainAPI: Int
+    public var keyID: String
+    public var version: String
+    public var publishedAt: Date
+    public var appVersionRange: AppVersionRange
+    public var components: [Component]
+    public var signatureEd25519: String
+
+    public struct Component: Codable, Equatable {
+        public var name: String
+        public var capabilities: [String]
+        public var url: String
+        public var sha256: String
+        public var sizeBytes: UInt64
+        public var expandedSizeBytes: UInt64
+        public var expandedClosureSHA256: String
+        public var contents: [String]
+        public var criticalFileHashes: [String: String]
+        public var dependencies: [String]
+        public var requirement: ComponentRequirement
+
+        public init(
+            name: String,
+            capabilities: [String],
+            url: String,
+            sha256: String,
+            sizeBytes: UInt64,
+            expandedSizeBytes: UInt64? = nil,
+            expandedClosureSHA256: String = String(repeating: "0", count: 64),
+            contents: [String],
+            criticalFileHashes: [String: String],
+            dependencies: [String],
+            requirement: ComponentRequirement
+        ) {
+            self.name = name
+            self.capabilities = capabilities
+            self.url = url
+            self.sha256 = sha256
+            self.sizeBytes = sizeBytes
+            self.expandedSizeBytes = expandedSizeBytes ?? sizeBytes
+            self.expandedClosureSHA256 = expandedClosureSHA256
+            self.contents = contents
+            self.criticalFileHashes = criticalFileHashes
+            self.dependencies = dependencies
+            self.requirement = requirement
+        }
+    }
+
+    public init(
+        schemaVersion: Int = 2,
+        toolchainAPI: Int = 2,
+        keyID: String,
+        version: String,
+        publishedAt: Date,
+        appVersionRange: AppVersionRange,
+        components: [Component],
+        signatureEd25519: String
+    ) {
+        self.schemaVersion = schemaVersion
+        self.toolchainAPI = toolchainAPI
+        self.keyID = keyID
         self.version = version
         self.publishedAt = publishedAt
-        self.artifacts = artifacts
+        self.appVersionRange = appVersionRange
+        self.components = components
         self.signatureEd25519 = signatureEd25519
     }
 }
@@ -36,31 +93,220 @@ public struct ManifestArtifactInput: Equatable {
     public var artifactURL: String
     public var zipURL: URL
     public var contents: [String]
+    public var capabilities: [String]
+    public var dependencies: [String]
+    public var requirement: ManifestDocument.ComponentRequirement
+    public var criticalFilePaths: [String]
+    public var deriveExactContents: Bool
 
-    public init(name: String, artifactURL: String, zipURL: URL, contents: [String]) {
+    public init(
+        name: String,
+        artifactURL: String,
+        zipURL: URL,
+        capabilities: [String],
+        dependencies: [String],
+        requirement: ManifestDocument.ComponentRequirement,
+        contents: [String] = [],
+        criticalFilePaths: [String] = [],
+        deriveExactContents: Bool = true
+    ) {
         self.name = name
         self.artifactURL = artifactURL
         self.zipURL = zipURL
         self.contents = contents
+        self.capabilities = capabilities
+        self.dependencies = dependencies
+        self.requirement = requirement
+        self.criticalFilePaths = criticalFilePaths
+        self.deriveExactContents = deriveExactContents
     }
 }
 
+public struct ReleaseSigningRequest: Codable, Equatable {
+    public var schemaVersion: Int
+    public var sourceRepository: String
+    public var sourceCommit: String
+    public var manifestSHA256: String
+    public var manifest: ManifestDocument
+
+    public init(
+        schemaVersion: Int = 2,
+        sourceRepository: String,
+        sourceCommit: String,
+        manifestSHA256: String,
+        manifest: ManifestDocument
+    ) {
+        self.schemaVersion = schemaVersion
+        self.sourceRepository = sourceRepository
+        self.sourceCommit = sourceCommit
+        self.manifestSHA256 = manifestSHA256
+        self.manifest = manifest
+    }
+}
+
+public enum BootstrapURLPolicy: String, Equatable {
+    case release
+    case loopbackDevelopment = "loopback-development"
+    case releaseOrLoopbackDevelopment = "release-or-loopback-development"
+}
+
 public enum ManifestBuilder {
+    public static let maximumEncodedManifestBytes = 8 * 1_024 * 1_024
+    public static let maximumReleaseSigningRequestBytes = 8 * 1_024 * 1_024
+    public static let maximumReleaseAssetBytes: UInt64 = 2_147_483_648
+    public static let maximumCoreDownloadBytes: UInt64 = 2_500_000_000
+    public static let maximumFullToolchainDownloadBytes: UInt64 = 6_000_000_000
+    public static let maximumExpandedComponentBytes: UInt64 = 16 * 1_024 * 1_024 * 1_024
+    static let installStateFilename = ".easysplat_toolchain_state.json"
+
     public static func build(
         version: String,
         publishedAt: Date,
-        artifacts: [ManifestArtifactInput],
+        appVersionRange: ManifestDocument.AppVersionRange,
+        components: [ManifestArtifactInput],
         privateKeyBase64: String
     ) throws -> ManifestDocument {
-        let builtArtifacts = try artifacts.map(makeArtifact(from:))
+        try requireValidToolchainVersion(version)
+        guard validAppVersionRange(appVersionRange) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 12,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Schema-2 app version range must contain strict SemVer bounds with maximumExclusive greater than minimum."
+                ]
+            )
+        }
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.criticalFilePaths.isEmpty }) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 9,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Schema-2 components must declare critical files to hash."
+                ]
+            )
+        }
+        let key = try privateKey(from: privateKeyBase64)
+        let builtComponents = try components.map(makeComponent)
+        try validateContentOwnership(builtComponents)
+        if components.map(\.name) == productionComponentNames,
+           ProductionProvenanceValidator.hasSourceSnapshotForTesting {
+            try ProductionProvenanceValidator.validate(
+                version: version,
+                sourceRepository: nil,
+                sourceCommit: nil,
+                inputs: components,
+                components: builtComponents
+            )
+        }
+        let publicKeyData = key.publicKey.rawRepresentation
+        let keyID = SHA256.hash(data: publicKeyData).map { String(format: "%02x", $0) }.joined()
         var manifest = ManifestDocument(
+            keyID: keyID,
             version: version,
             publishedAt: publishedAt,
-            artifacts: builtArtifacts,
+            appVersionRange: appVersionRange,
+            components: builtComponents,
             signatureEd25519: ""
         )
-        manifest.signatureEd25519 = try sign(data: canonicalData(for: manifest), privateKeyBase64: privateKeyBase64)
+        manifest.signatureEd25519 = try key.signature(for: canonicalData(for: manifest)).base64EncodedString()
+        try requireEncodedManifestWithinLimit(manifest)
         return manifest
+    }
+
+    public static func releaseComponentURLs(repository: String, version: String) -> [String: String] {
+        let base = "https://github.com/\(repository)/releases/download/toolchain-v\(version)"
+        return [
+            "macos-arm64-core": "\(base)/toolchain-macos-arm64-\(version)-core.zip",
+            "geometry-da3-base": "\(base)/toolchain-geometry-da3-base-\(version).zip",
+            "geometry-da3-small": "\(base)/toolchain-geometry-da3-small-\(version).zip",
+        ]
+    }
+
+    public static func requireDirectSigningAllowed(
+        components: [ManifestArtifactInput]
+    ) throws {
+        guard components.map(\.name) == productionComponentNames else { return }
+        guard components.allSatisfy({ explicitLoopbackURL($0.artifactURL) }) else {
+            try releaseFailure(
+                "Direct signing is limited to explicit loopback development manifests. "
+                    + "Use ManifestTool prepare-release and the reviewed signing-request authority "
+                    + "for production toolchains."
+            )
+        }
+    }
+
+    public static func prepareRelease(
+        repository: String,
+        sourceCommit: String,
+        version: String,
+        publishedAt: Date,
+        appVersionRange: ManifestDocument.AppVersionRange,
+        publicKeyBase64: String,
+        components: [ManifestArtifactInput]
+    ) throws -> ReleaseSigningRequest {
+        try requireValidToolchainVersion(version)
+        guard validAppVersionRange(appVersionRange) else {
+            try releaseFailure("Release app version bounds are invalid.")
+        }
+        let publicKeyData = try validatedPublicKeyData(publicKeyBase64)
+        let keyID = sha256Hex(data: publicKeyData)
+        let builtComponents = try components.map(makeComponent)
+        try validateContentOwnership(builtComponents)
+        if components.map(\.name) == productionComponentNames {
+            try ProductionProvenanceValidator.validate(
+                version: version,
+                sourceRepository: repository,
+                sourceCommit: sourceCommit,
+                inputs: components,
+                components: builtComponents
+            )
+        }
+        let manifest = ManifestDocument(
+            keyID: keyID,
+            version: version,
+            publishedAt: publishedAt,
+            appVersionRange: appVersionRange,
+            components: builtComponents,
+            signatureEd25519: ""
+        )
+        var signedSizeProbe = manifest
+        signedSizeProbe.signatureEd25519 = Data(repeating: 0, count: 64).base64EncodedString()
+        try requireEncodedManifestWithinLimit(signedSizeProbe)
+        let request = ReleaseSigningRequest(
+            sourceRepository: repository,
+            sourceCommit: sourceCommit,
+            manifestSHA256: sha256Hex(data: try canonicalData(for: manifest)),
+            manifest: manifest
+        )
+        try validateReleaseSigningRequest(
+            request,
+            expectedRepository: repository,
+            expectedSourceCommit: sourceCommit,
+            expectedVersion: version,
+            expectedAppVersionRange: appVersionRange,
+            publicKeyData: publicKeyData
+        )
+        try requireReleaseSigningRequestWithinLimit(request)
+        return request
+    }
+
+    public static func canonicalData(for request: ReleaseSigningRequest) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(request)
+    }
+
+    public static func writeReleaseSigningRequest(
+        _ request: ReleaseSigningRequest,
+        to url: URL
+    ) throws {
+        let data = try canonicalData(for: request)
+        guard data.count <= maximumReleaseSigningRequestBytes else {
+            try releaseFailure("Release signing request exceeds the 8 MiB authority acceptance limit.")
+        }
+        try data.write(to: url, options: [.atomic])
     }
 
     public static func generateKeypair() -> (publicKeyBase64: String, privateKeyBase64: String) {
@@ -90,11 +336,145 @@ public enum ManifestBuilder {
         return publicKey.isValidSignature(signatureData, for: canonical)
     }
 
+    public static func verifyRelease(
+        manifest: ManifestDocument,
+        publicKeyBase64: String,
+        expectedToolchainVersion: String,
+        expectedAppVersion: String,
+        expectedComponentURLs: [String: String],
+        componentArchives: [String: URL]
+    ) throws {
+        func fail(_ message: String) throws -> Never {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+
+        guard manifest.schemaVersion == 2, manifest.toolchainAPI == 2 else {
+            try fail("Release manifest must use schema 2 and toolchain API 2.")
+        }
+        guard semanticVersion(from: manifest.version) != nil,
+              semanticVersion(from: expectedToolchainVersion) != nil,
+              manifest.version == expectedToolchainVersion,
+              appVersion(expectedAppVersion, isWithin: manifest.appVersionRange) else {
+            try fail("Release manifest version or app compatibility range does not match the build.")
+        }
+        guard let publicKeyData = Data(base64Encoded: publicKeyBase64) else {
+            try fail("Release public key is not valid base64.")
+        }
+        let expectedKeyID = SHA256.hash(data: publicKeyData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        guard manifest.keyID == expectedKeyID,
+              verifySignature(for: manifest, publicKeyBase64: publicKeyBase64) else {
+            try fail("Release manifest signature or key identifier is invalid.")
+        }
+
+        let componentsByName = Dictionary(grouping: manifest.components, by: \.name)
+        let expectedNames = Set(expectedComponentURLs.keys)
+        guard Set(componentsByName.keys) == expectedNames,
+              componentsByName.values.allSatisfy({ $0.count == 1 }),
+              Set(componentArchives.keys) == expectedNames else {
+            try fail("Release manifest component set does not match the expected closure.")
+        }
+        if expectedNames == Set(productionComponentNames) {
+            try validateProductionReleasePolicy(manifest)
+        }
+        try validateContentOwnership(manifest.components)
+
+        for name in expectedNames.sorted() {
+            guard let component = componentsByName[name]?.first,
+                  let expectedURL = expectedComponentURLs[name],
+                  let archiveURL = componentArchives[name],
+                  component.url == expectedURL,
+                  URL(string: component.url)?.scheme?.lowercased() == "https" else {
+                try fail("Release component URL is missing, insecure, or unexpected: \(name)")
+            }
+            let size = try FileManager.default.attributesOfItem(atPath: archiveURL.path)[.size] as? UInt64 ?? 0
+            guard size == component.sizeBytes,
+                  try archiveExpandedSize(at: archiveURL) == component.expandedSizeBytes,
+                  try sha256Hex(url: archiveURL) == component.sha256 else {
+                try fail("Release component size or SHA-256 does not match the signed manifest: \(name)")
+            }
+            guard try archiveContents(at: archiveURL) == component.contents.sorted() else {
+                try fail("Release component contents do not match the signed manifest: \(name)")
+            }
+            let expandedClosure = try archiveExpandedClosure(
+                zipURL: archiveURL,
+                paths: component.contents
+            )
+            guard expandedClosure.fileHashes == component.criticalFileHashes,
+                  expandedClosure.sha256 == component.expandedClosureSHA256 else {
+                try fail("Release component expanded closure does not match: \(name)")
+            }
+        }
+    }
+
+    public static func verifyBootstrap(
+        manifest: ManifestDocument,
+        publicKeyBase64: String,
+        expectedAppVersion: String,
+        coreArchive: URL,
+        urlPolicy: BootstrapURLPolicy = .release
+    ) throws {
+        func fail(_ message: String) throws -> Never {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+
+        guard manifest.schemaVersion == 2, manifest.toolchainAPI == 2 else {
+            try fail("Bootstrap manifest must use schema 2 and toolchain API 2.")
+        }
+        guard semanticVersion(from: manifest.version) != nil,
+              appVersion(expectedAppVersion, isWithin: manifest.appVersionRange) else {
+            try fail("Bootstrap manifest app compatibility range does not match the build.")
+        }
+        guard let publicKeyData = Data(base64Encoded: publicKeyBase64),
+              publicKeyData.count == 32,
+              publicKeyData.base64EncodedString() == publicKeyBase64 else {
+            try fail("Bootstrap public key is not valid canonical base64.")
+        }
+        guard manifest.keyID == sha256Hex(data: publicKeyData),
+              verifySignature(for: manifest, publicKeyBase64: publicKeyBase64) else {
+            try fail("Bootstrap manifest signature or key identifier is invalid.")
+        }
+
+        let usesLoopback = manifest.components.allSatisfy({ explicitLoopbackURL($0.url) })
+        switch urlPolicy {
+        case .release:
+            try validateProductionReleasePolicy(manifest, requireCanonicalReleaseURLs: true)
+        case .loopbackDevelopment:
+            guard usesLoopback else {
+                try fail("Development bootstrap component URLs must use an explicit loopback host.")
+            }
+            try validateProductionReleasePolicy(manifest, allowExplicitLoopbackHTTP: true)
+        case .releaseOrLoopbackDevelopment:
+            try validateProductionReleasePolicy(
+                manifest,
+                requireCanonicalReleaseURLs: !usesLoopback,
+                allowExplicitLoopbackHTTP: usesLoopback
+            )
+        }
+        guard let core = manifest.components.first(where: { $0.name == "macos-arm64-core" }) else {
+            try fail("Bootstrap manifest does not contain the required core component.")
+        }
+        try verifyArchive(coreArchive, matches: core, purpose: "Bootstrap")
+    }
+
     public static func writeManifest(_ manifest: ManifestDocument, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(manifest).write(to: url, options: [.atomic])
+        let data = try encoder.encode(manifest)
+        guard data.count <= maximumEncodedManifestBytes else {
+            try releaseFailure("Signed manifest exceeds the 8 MiB application acceptance limit.")
+        }
+        try data.write(to: url, options: [.atomic])
     }
 
     public static func sha256Hex(url: URL) throws -> String {
@@ -109,95 +489,986 @@ public enum ManifestBuilder {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func makeArtifact(from input: ManifestArtifactInput) throws -> ManifestDocument.Artifact {
+    public static func sha256Hex(data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func validateContentOwnership(_ components: [ManifestDocument.Component]) throws {
+        let paths = components.flatMap(\.contents)
+        let ownershipKeys = paths.map(pathOwnershipKey)
+        let installStateKey = pathOwnershipKey(installStateFilename)
+        guard Set(ownershipKeys).count == ownershipKeys.count,
+              !ownershipKeys.contains(where: {
+                  $0 == installStateKey || $0.hasPrefix(installStateKey + "/")
+              }) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 13,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Release component content ownership overlaps or uses the reserved install-state path."
+                ]
+            )
+        }
+    }
+
+    static func pathOwnershipKey(_ path: String) -> String {
+        path
+            .precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .precomposedStringWithCanonicalMapping
+    }
+
+    private static func makeComponent(from input: ManifestArtifactInput) throws -> ManifestDocument.Component {
         let size = try FileManager.default.attributesOfItem(atPath: input.zipURL.path)[.size] as? UInt64 ?? 0
+        guard size > 0, size < maximumReleaseAssetBytes else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 10,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Release components must be smaller than GitHub's 2 GiB asset limit."
+                ]
+            )
+        }
         let sha = try sha256Hex(url: input.zipURL)
-        return ManifestDocument.Artifact(
+        let contents = input.deriveExactContents ? try archiveContents(at: input.zipURL) : input.contents
+        let expandedSize = try archiveExpandedSize(at: input.zipURL)
+        var requiredCriticalPaths = Set(input.criticalFilePaths)
+        if input.name == "macos-arm64-core" {
+            requiredCriticalPaths.formUnion(ManifestToolDefaults.criticalCoreFiles(in: contents))
+        } else if input.name == "geometry-da3-base" {
+            requiredCriticalPaths.formUnion(ManifestToolDefaults.criticalDa3BaseFiles(in: contents))
+        }
+        guard requiredCriticalPaths.isSubset(of: Set(contents)) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Critical file is missing from the component archive."]
+            )
+        }
+        let expandedClosure = try archiveExpandedClosure(
+            zipURL: input.zipURL,
+            paths: contents
+        )
+        return ManifestDocument.Component(
             name: input.name,
+            capabilities: input.capabilities,
             url: input.artifactURL,
             sha256: sha,
             sizeBytes: size,
-            contents: input.contents
+            expandedSizeBytes: expandedSize,
+            expandedClosureSHA256: expandedClosure.sha256,
+            contents: contents,
+            criticalFileHashes: expandedClosure.fileHashes,
+            dependencies: input.dependencies,
+            requirement: input.requirement
         )
     }
 
-    private static func sign(data: Data, privateKeyBase64: String) throws -> String {
+    private static func requireEncodedManifestWithinLimit(_ manifest: ManifestDocument) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        guard try encoder.encode(manifest).count <= maximumEncodedManifestBytes else {
+            try releaseFailure("Signed manifest exceeds the 8 MiB application acceptance limit.")
+        }
+    }
+
+    private static func requireReleaseSigningRequestWithinLimit(
+        _ request: ReleaseSigningRequest
+    ) throws {
+        guard try canonicalData(for: request).count <= maximumReleaseSigningRequestBytes else {
+            try releaseFailure("Release signing request exceeds the 8 MiB authority acceptance limit.")
+        }
+    }
+
+    private static func privateKey(from privateKeyBase64: String) throws -> Curve25519.Signing.PrivateKey {
         guard let keyData = Data(base64Encoded: privateKeyBase64) else {
             throw NSError(domain: "ManifestTool", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid private key base64"])
         }
-        let key = try Curve25519.Signing.PrivateKey(rawRepresentation: keyData)
-        return try key.signature(for: data).base64EncodedString()
+        return try Curve25519.Signing.PrivateKey(rawRepresentation: keyData)
+    }
+
+    private static func validateReleaseSigningRequest(
+        _ request: ReleaseSigningRequest,
+        expectedRepository: String,
+        expectedSourceCommit: String,
+        expectedVersion: String,
+        expectedAppVersionRange: ManifestDocument.AppVersionRange,
+        publicKeyData: Data
+    ) throws {
+        guard request.schemaVersion == 2 else {
+            try releaseFailure("Release signing request schema is invalid.")
+        }
+        try requireValidRepository(expectedRepository)
+        try requireValidSourceCommit(expectedSourceCommit)
+        guard request.sourceRepository == expectedRepository,
+              request.sourceCommit == expectedSourceCommit else {
+            try releaseFailure("Release signing request source identity is invalid.")
+        }
+
+        let manifest = request.manifest
+        guard manifest.schemaVersion == 2,
+              manifest.toolchainAPI == 2,
+              manifest.signatureEd25519.isEmpty,
+              manifest.version == expectedVersion,
+              manifest.appVersionRange == expectedAppVersionRange,
+              validAppVersionRange(manifest.appVersionRange),
+              semanticVersion(from: manifest.version) != nil else {
+            try releaseFailure("Release signing request version or app bounds are invalid.")
+        }
+        guard request.manifestSHA256 == sha256Hex(data: try canonicalData(for: manifest)) else {
+            try releaseFailure("Prepared release manifest was modified after derivation.")
+        }
+        guard manifest.keyID == sha256Hex(data: publicKeyData) else {
+            try releaseFailure("Release signing request key identifier is invalid.")
+        }
+
+        guard manifest.components.map(\.name) == productionComponentNames else {
+            try releaseFailure("Release signing request component set or order is invalid.")
+        }
+        let urls = releaseComponentURLs(repository: expectedRepository, version: expectedVersion)
+        for component in manifest.components {
+            guard component.url == urls[component.name] else {
+                try releaseFailure("Release signing request component URL is invalid: \(component.name)")
+            }
+        }
+        try validateProductionReleasePolicy(manifest)
+    }
+
+    private static let productionComponentNames = [
+        "macos-arm64-core",
+        "geometry-da3-base",
+        "geometry-da3-small",
+    ]
+
+    private static func explicitLoopbackURL(_ value: String) -> Bool {
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host?.lowercased(),
+              url.user == nil,
+              url.password == nil,
+              url.fragment == nil else {
+            return false
+        }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+
+    private static func validateProductionReleasePolicy(
+        _ manifest: ManifestDocument,
+        requireCanonicalReleaseURLs: Bool = false,
+        allowExplicitLoopbackHTTP: Bool = false
+    ) throws {
+        guard manifest.components.map(\.name) == productionComponentNames else {
+            try releaseFailure("Release component set or order is invalid.")
+        }
+        for component in manifest.components {
+            guard let url = URL(string: component.url),
+                  url.scheme?.lowercased() == "https"
+                    || (allowExplicitLoopbackHTTP && explicitLoopbackURL(component.url)),
+                  url.host?.isEmpty == false,
+                  url.user == nil,
+                  url.password == nil,
+                  url.fragment == nil,
+                  component.sha256.count == 64,
+                  component.sha256.allSatisfy(isLowercaseHex),
+                  component.sizeBytes > 0,
+                  component.sizeBytes < maximumReleaseAssetBytes,
+                  component.expandedSizeBytes > 0,
+                  component.expandedSizeBytes <= maximumExpandedComponentBytes,
+                  component.expandedClosureSHA256.count == 64,
+                  component.expandedClosureSHA256.allSatisfy(isLowercaseHex),
+                  component.contents == component.contents.sorted(),
+                  !component.contents.isEmpty,
+                  Set(component.contents).count == component.contents.count,
+                  !component.criticalFileHashes.isEmpty,
+                  Set(component.criticalFileHashes.keys) == Set(component.contents),
+                  component.criticalFileHashes.values.allSatisfy({
+                      $0.count == 64 && $0.allSatisfy(isLowercaseHex)
+                  }) else {
+                try releaseFailure("Release component metadata is invalid: \(component.name)")
+            }
+        }
+
+        let core = manifest.components[0]
+        let base = manifest.components[1]
+        let small = manifest.components[2]
+        if requireCanonicalReleaseURLs {
+            try validateCanonicalReleaseURLs(manifest)
+        }
+        guard core.capabilities == ManifestToolDefaults.coreCapabilities,
+              core.dependencies.isEmpty,
+              core.requirement == .required,
+              core.sizeBytes <= maximumCoreDownloadBytes,
+              core.contents.allSatisfy(ManifestToolDefaults.isAllowedCoreFile),
+              Set(core.contents.filter { $0.hasPrefix("lib/") }) == ["lib/libomp.dylib"],
+              ManifestToolDefaults.criticalCoreFiles(in: core.contents)
+                .isSubset(of: Set(core.criticalFileHashes.keys)),
+              base.capabilities == ["geometry.da3.runtime", "geometry.da3.base"],
+              base.dependencies == ["macos-arm64-core"],
+              base.requirement == .optional,
+              base.contents.allSatisfy(ManifestToolDefaults.isAllowedDa3BaseFile),
+              ManifestToolDefaults.criticalDa3BaseFiles(in: base.contents)
+                .isSubset(of: Set(base.criticalFileHashes.keys)),
+              small.capabilities == ["geometry.da3.small"],
+              small.dependencies == ["geometry-da3-base"],
+              small.requirement == .optional,
+              Set(small.contents) == Set(ManifestToolDefaults.da3SmallContents),
+              Set(small.criticalFileHashes.keys) == Set(small.contents) else {
+            try releaseFailure("Release component policy is invalid.")
+        }
+
+        var totalDownloadBytes: UInt64 = 0
+        for component in manifest.components {
+            let sum = totalDownloadBytes.addingReportingOverflow(component.sizeBytes)
+            guard !sum.overflow else {
+                try releaseFailure("Release component size total overflowed.")
+            }
+            totalDownloadBytes = sum.partialValue
+        }
+        guard totalDownloadBytes <= maximumFullToolchainDownloadBytes else {
+            try releaseFailure("Release exceeds the 6 GB full toolchain budget.")
+        }
+        try validateContentOwnership(manifest.components)
+    }
+
+    private static func validateCanonicalReleaseURLs(_ manifest: ManifestDocument) throws {
+        guard let coreURL = URLComponents(string: manifest.components[0].url),
+              coreURL.scheme?.lowercased() == "https",
+              coreURL.host?.lowercased() == "github.com",
+              coreURL.port == nil,
+              coreURL.query == nil,
+              coreURL.fragment == nil else {
+            try releaseFailure("Release component URLs are not canonical GitHub release assets.")
+        }
+        let path = coreURL.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard path.count == 6,
+              path[2] == "releases",
+              path[3] == "download",
+              path[4] == "toolchain-v\(manifest.version)" else {
+            try releaseFailure("Release component URLs are not canonical GitHub release assets.")
+        }
+        let repository = "\(path[0])/\(path[1])"
+        let expected = releaseComponentURLs(repository: repository, version: manifest.version)
+        guard manifest.components.allSatisfy({ $0.url == expected[$0.name] }) else {
+            try releaseFailure("Release component URLs are not canonical GitHub release assets.")
+        }
+    }
+
+    private static func verifyArchive(
+        _ archiveURL: URL,
+        matches component: ManifestDocument.Component,
+        purpose: String
+    ) throws {
+        let size = try FileManager.default.attributesOfItem(atPath: archiveURL.path)[.size] as? UInt64 ?? 0
+        guard size == component.sizeBytes,
+              try archiveExpandedSize(at: archiveURL) == component.expandedSizeBytes,
+              try sha256Hex(url: archiveURL) == component.sha256 else {
+            try releaseFailure("\(purpose) core archive size or SHA-256 does not match the signed manifest.")
+        }
+        guard try archiveContents(at: archiveURL) == component.contents else {
+            try releaseFailure("\(purpose) core archive contents do not match the signed manifest.")
+        }
+        let expandedClosure = try archiveExpandedClosure(
+            zipURL: archiveURL,
+            paths: component.contents
+        )
+        guard expandedClosure.fileHashes == component.criticalFileHashes,
+              expandedClosure.sha256 == component.expandedClosureSHA256 else {
+            try releaseFailure("\(purpose) core archive expanded closure does not match the signed manifest.")
+        }
+    }
+
+    private static func validatedPublicKeyData(_ publicKeyBase64: String) throws -> Data {
+        guard let data = Data(base64Encoded: publicKeyBase64),
+              data.count == 32,
+              data.base64EncodedString() == publicKeyBase64,
+              (try? Curve25519.Signing.PublicKey(rawRepresentation: data)) != nil else {
+            try releaseFailure("Tracked release public key is invalid.")
+        }
+        return data
+    }
+
+    private static func requireValidRepository(_ repository: String) throws {
+        let parts = repository.split(separator: "/", omittingEmptySubsequences: false)
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+        guard parts.count == 2,
+              parts.allSatisfy({ part in
+                  !part.isEmpty
+                      && part != "."
+                      && part != ".."
+                      && part.unicodeScalars.allSatisfy(allowed.contains)
+              }) else {
+            try releaseFailure("Release repository identity is invalid.")
+        }
+    }
+
+    private static func requireValidSourceCommit(_ sourceCommit: String) throws {
+        guard sourceCommit.count == 40, sourceCommit.allSatisfy(isLowercaseHex) else {
+            try releaseFailure("Release source commit must be a lowercase 40-character Git object ID.")
+        }
+    }
+
+    private static func isLowercaseHex(_ character: Character) -> Bool {
+        ("0"..."9").contains(character) || ("a"..."f").contains(character)
+    }
+
+    private static func releaseFailure(_ message: String) throws -> Never {
+        throw NSError(
+            domain: "ManifestTool",
+            code: 14,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    private struct SemanticVersion: Equatable {
+        enum PrereleaseIdentifier: Equatable {
+            case numeric(String)
+            case text(String)
+        }
+
+        var major: String
+        var minor: String
+        var patch: String
+        var prerelease: [PrereleaseIdentifier]
+    }
+
+    private static func validAppVersionRange(_ range: ManifestDocument.AppVersionRange) -> Bool {
+        guard let minimum = semanticVersion(from: range.minimum),
+              let maximumValue = range.maximumExclusive,
+              let maximum = semanticVersion(from: maximumValue) else {
+            return false
+        }
+        return compareSemanticVersions(minimum, maximum) == .orderedAscending
+    }
+
+    private static func requireValidToolchainVersion(_ version: String) throws {
+        guard semanticVersion(from: version) != nil else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 13,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Toolchain version must be strict SemVer."
+                ]
+            )
+        }
+    }
+
+    private static func appVersion(
+        _ value: String,
+        isWithin range: ManifestDocument.AppVersionRange
+    ) -> Bool {
+        guard validAppVersionRange(range),
+              let app = semanticVersion(from: value),
+              let minimum = semanticVersion(from: range.minimum),
+              let maximumValue = range.maximumExclusive,
+              let maximum = semanticVersion(from: maximumValue) else {
+            return false
+        }
+        return compareSemanticVersions(app, minimum) != .orderedAscending
+            && compareSemanticVersions(app, maximum) == .orderedAscending
+    }
+
+    private static func semanticVersion(from value: String) -> SemanticVersion? {
+        let buildParts = value.split(separator: "+", maxSplits: 1, omittingEmptySubsequences: false)
+        guard buildParts.count <= 2, !buildParts[0].isEmpty else { return nil }
+        if buildParts.count == 2,
+           !validSemanticIdentifiers(buildParts[1], allowNumericLeadingZero: true) {
+            return nil
+        }
+
+        let versionParts = buildParts[0].split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let core = versionParts[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard core.count == 3,
+              let major = semanticCoreNumber(core[0]),
+              let minor = semanticCoreNumber(core[1]),
+              let patch = semanticCoreNumber(core[2]) else {
+            return nil
+        }
+
+        var prerelease: [SemanticVersion.PrereleaseIdentifier] = []
+        if versionParts.count == 2 {
+            let raw = versionParts[1]
+            guard validSemanticIdentifiers(raw, allowNumericLeadingZero: false) else { return nil }
+            prerelease = raw.split(separator: ".", omittingEmptySubsequences: false).map { identifier in
+                if identifier.allSatisfy(\.isNumber) {
+                    return .numeric(String(identifier))
+                }
+                return .text(String(identifier))
+            }
+        }
+        return SemanticVersion(major: major, minor: minor, patch: patch, prerelease: prerelease)
+    }
+
+    private static func compareSemanticVersions(
+        _ lhs: SemanticVersion,
+        _ rhs: SemanticVersion
+    ) -> ComparisonResult {
+        for (left, right) in [(lhs.major, rhs.major), (lhs.minor, rhs.minor), (lhs.patch, rhs.patch)] {
+            let comparison = compareSemanticNumericIdentifiers(left, right)
+            if comparison != .orderedSame { return comparison }
+        }
+        if lhs.prerelease.isEmpty, rhs.prerelease.isEmpty { return .orderedSame }
+        if lhs.prerelease.isEmpty { return .orderedDescending }
+        if rhs.prerelease.isEmpty { return .orderedAscending }
+
+        for (left, right) in zip(lhs.prerelease, rhs.prerelease) {
+            switch (left, right) {
+            case let (.numeric(leftValue), .numeric(rightValue)):
+                let comparison = compareSemanticNumericIdentifiers(leftValue, rightValue)
+                if comparison != .orderedSame { return comparison }
+            case (.numeric, .text):
+                return .orderedAscending
+            case (.text, .numeric):
+                return .orderedDescending
+            case let (.text(leftValue), .text(rightValue)):
+                if leftValue > rightValue { return .orderedDescending }
+                if leftValue < rightValue { return .orderedAscending }
+            }
+        }
+        if lhs.prerelease.count > rhs.prerelease.count { return .orderedDescending }
+        if lhs.prerelease.count < rhs.prerelease.count { return .orderedAscending }
+        return .orderedSame
+    }
+
+    private static func semanticCoreNumber(_ value: Substring) -> String? {
+        guard !value.isEmpty,
+              value.unicodeScalars.allSatisfy({ ("0"..."9").contains(Character(String($0))) }),
+              value == "0" || value.first != "0" else {
+            return nil
+        }
+        return String(value)
+    }
+
+    private static func compareSemanticNumericIdentifiers(
+        _ lhs: String,
+        _ rhs: String
+    ) -> ComparisonResult {
+        if lhs.count > rhs.count { return .orderedDescending }
+        if lhs.count < rhs.count { return .orderedAscending }
+        if lhs > rhs { return .orderedDescending }
+        if lhs < rhs { return .orderedAscending }
+        return .orderedSame
+    }
+
+    private static func validSemanticIdentifiers(
+        _ value: Substring,
+        allowNumericLeadingZero: Bool
+    ) -> Bool {
+        let identifiers = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard !identifiers.isEmpty else { return false }
+        return identifiers.allSatisfy { identifier in
+            guard !identifier.isEmpty,
+                  identifier.unicodeScalars.allSatisfy({ scalar in
+                      ("0"..."9").contains(Character(String(scalar)))
+                          || ("A"..."Z").contains(Character(String(scalar)))
+                          || ("a"..."z").contains(Character(String(scalar)))
+                          || scalar == "-"
+                  }) else {
+                return false
+            }
+            if !allowNumericLeadingZero,
+               identifier.allSatisfy(\.isNumber),
+               identifier.count > 1,
+               identifier.first == "0" {
+                return false
+            }
+            return true
+        }
+    }
+
+    private static func archiveContents(at zipURL: URL) throws -> [String] {
+        try rejectArchiveLinksAndSpecialFiles(at: zipURL)
+        let output = try runUnzip(arguments: ["-Z1", zipURL.path])
+        let entries = String(decoding: output, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        try validateArchivePaths(entries)
+        guard !entries.isEmpty,
+              Set(entries).count == entries.count,
+              !entries.contains(where: { $0.hasSuffix("/") }) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Archive contents are empty, duplicated, or contain unsigned directory entries"
+                ]
+            )
+        }
+        return entries.sorted()
+    }
+
+    private static func rejectArchiveLinksAndSpecialFiles(at zipURL: URL) throws {
+        let process = Process()
+        let stdout = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        process.arguments = ["-l", zipURL.path]
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Unable to inspect component archive metadata"])
+        }
+        for line in String(decoding: output, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            if line.first == "l" {
+                throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Component archive contains a symbolic link"])
+            }
+            if let type = line.first, ["b", "c", "p", "s"].contains(type) {
+                throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Component archive contains a special file"])
+            }
+        }
+    }
+
+    private static func archiveExpandedSize(at zipURL: URL) throws -> UInt64 {
+        try rejectArchiveLinksAndSpecialFiles(at: zipURL)
+        let process = Process()
+        let stdout = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        process.arguments = ["-l", zipURL.path]
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to inspect expanded component size"]
+            )
+        }
+
+        var total: UInt64 = 0
+        var fileCount = 0
+        for line in String(decoding: output, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            guard line.first == "-" else { continue }
+            let fields = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: true)
+            guard fields.count == 10, let size = UInt64(fields[3]) else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to parse expanded component size"]
+                )
+            }
+            fileCount += 1
+            let sum = total.addingReportingOverflow(size)
+            guard !sum.overflow, sum.partialValue <= maximumExpandedComponentBytes else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 10,
+                    userInfo: [NSLocalizedDescriptionKey: "Expanded component exceeds the 16 GiB safety limit."]
+                )
+            }
+            total = sum.partialValue
+        }
+        guard fileCount > 0, total > 0 else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Component archive has no regular file payload."]
+            )
+        }
+        return total
+    }
+
+    private static func archiveExecutablePaths(at zipURL: URL) throws -> Set<String> {
+        let process = Process()
+        let stdout = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        process.arguments = ["-l", zipURL.path]
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to inspect component archive permissions"]
+            )
+        }
+
+        var paths = Set<String>()
+        for line in String(decoding: output, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            let permissions = line.prefix(10)
+            guard permissions.first == "-", permissions.contains("x") else { continue }
+            let fields = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: true)
+            guard fields.count == 10 else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to parse executable archive entry"]
+                )
+            }
+            paths.insert(String(fields[9]))
+        }
+        try validateArchivePaths(Array(paths))
+        return paths
+    }
+
+    private static func archiveExpandedClosure(
+        zipURL: URL,
+        paths: [String]
+    ) throws -> (sha256: String, fileHashes: [String: String]) {
+        guard !paths.isEmpty else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Component archive has no signed file closure"]
+            )
+        }
+        try validateArchivePaths(paths)
+        let modes = try archiveNormalizedFileModes(at: zipURL)
+        guard Set(modes.keys) == Set(paths) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Component archive mode closure is incomplete"]
+            )
+        }
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try runUnzip(arguments: ["-qq", zipURL.path, "-d", root.path])
+
+        var hasher = SHA256()
+        hasher.update(data: Data("EasySplat expanded component closure v1\n".utf8))
+        var hashes: [String: String] = [:]
+        var totalBytes: UInt64 = 0
+        for path in paths.sorted() {
+            let evidence = try stableRegularFileEvidence(
+                at: root.appendingPathComponent(path, isDirectory: false),
+                maximumBytes: maximumExpandedComponentBytes - totalBytes
+            )
+            let sum = totalBytes.addingReportingOverflow(evidence.size)
+            guard !sum.overflow, sum.partialValue <= maximumExpandedComponentBytes else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 10,
+                    userInfo: [NSLocalizedDescriptionKey: "Expanded component exceeds the 16 GiB safety limit."]
+                )
+            }
+            totalBytes = sum.partialValue
+            hashes[path] = evidence.sha256
+            hasher.update(data: Data(path.utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(String(modes[path]!).utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(String(evidence.size).utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: Data(evidence.sha256.utf8))
+            hasher.update(data: Data([10]))
+        }
+        return (
+            hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            hashes
+        )
+    }
+
+    private static func archiveNormalizedFileModes(at zipURL: URL) throws -> [String: UInt16] {
+        let process = Process()
+        let stdout = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        process.arguments = ["-l", zipURL.path]
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to inspect component archive permissions"]
+            )
+        }
+
+        var result: [String: UInt16] = [:]
+        for line in String(decoding: output, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            guard line.first == "-" else { continue }
+            let fields = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: true)
+            guard fields.count == 10 else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to parse component archive permissions"]
+                )
+            }
+            let permissions = String(fields[0].prefix(10))
+            let mode: UInt16
+            switch permissions {
+            case "-rw-r--r--": mode = 0o644
+            case "-rwxr-xr-x": mode = 0o755
+            default:
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Component archive file mode is not canonical: \(fields[9])"]
+                )
+            }
+            let path = String(fields[9])
+            guard result.updateValue(mode, forKey: path) == nil else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Component archive contains duplicate mode metadata"]
+                )
+            }
+        }
+        try validateArchivePaths(Array(result.keys))
+        return result
+    }
+
+    private static func stableRegularFileEvidence(
+        at url: URL,
+        maximumBytes: UInt64
+    ) throws -> (sha256: String, size: UInt64) {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Unable to open expanded component file safely"])
+        }
+        defer { Darwin.close(descriptor) }
+        var initial = stat()
+        guard fstat(descriptor, &initial) == 0,
+              (initial.st_mode & S_IFMT) == S_IFREG,
+              initial.st_nlink == 1,
+              initial.st_size >= 0,
+              UInt64(initial.st_size) <= maximumBytes else {
+            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Expanded component file is not a bounded ordinary single-link file"])
+        }
+
+        var digest = SHA256()
+        var bytesRead: UInt64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1_024 * 1_024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(descriptor, $0.baseAddress, $0.count)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count >= 0 else {
+                throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Unable to hash expanded component file safely"])
+            }
+            if count == 0 { break }
+            bytesRead += UInt64(count)
+            guard bytesRead <= maximumBytes else {
+                throw NSError(domain: "ManifestTool", code: 10, userInfo: [NSLocalizedDescriptionKey: "Expanded component exceeds its signed size bound"])
+            }
+            digest.update(data: Data(buffer[0..<count]))
+        }
+
+        var final = stat()
+        var finalPath = stat()
+        guard fstat(descriptor, &final) == 0,
+              lstat(url.path, &finalPath) == 0,
+              bytesRead == UInt64(initial.st_size),
+              sameFileIdentity(initial, final),
+              sameFileIdentity(initial, finalPath) else {
+            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Expanded component file changed while being hashed"])
+        }
+        return (
+            digest.finalize().map { String(format: "%02x", $0) }.joined(),
+            UInt64(initial.st_size)
+        )
+    }
+
+    private static func sameFileIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
+        lhs.st_dev == rhs.st_dev
+            && lhs.st_ino == rhs.st_ino
+            && lhs.st_nlink == rhs.st_nlink
+            && lhs.st_mode == rhs.st_mode
+            && lhs.st_size == rhs.st_size
+            && lhs.st_mtimespec.tv_sec == rhs.st_mtimespec.tv_sec
+            && lhs.st_mtimespec.tv_nsec == rhs.st_mtimespec.tv_nsec
+            && lhs.st_ctimespec.tv_sec == rhs.st_ctimespec.tv_sec
+            && lhs.st_ctimespec.tv_nsec == rhs.st_ctimespec.tv_nsec
+    }
+
+    private static func archiveCriticalFileHashes(zipURL: URL, paths: [String]) throws -> [String: String] {
+        guard !paths.isEmpty else { return [:] }
+        try validateArchivePaths(paths)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try runUnzip(arguments: ["-qq", zipURL.path, "-d", root.path])
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
+        var result: [String: String] = [:]
+        for path in paths {
+            let file = root.appendingPathComponent(path).resolvingSymlinksInPath().standardizedFileURL
+            guard file.path.hasPrefix(resolvedRoot + "/"),
+                  FileManager.default.fileExists(atPath: file.path) else {
+                throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Critical file is missing or escapes the archive root: \(path)"])
+            }
+            result[path] = try sha256Hex(url: file)
+        }
+        return result
+    }
+
+    private static func runUnzip(arguments: [String]) throws -> Data {
+        let process = Process()
+        let stdout = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        process.arguments = arguments
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Unable to inspect component archive"])
+        }
+        return data
+    }
+
+    private static func validateArchivePaths(_ paths: [String]) throws {
+        for path in paths {
+            let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+            guard !path.isEmpty,
+                  !path.hasPrefix("/"),
+                  !path.contains("\\"),
+                  parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+                throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Archive contains an unsafe path"])
+            }
+        }
     }
 }
 
 public enum ManifestToolDefaults {
-    public static let splitCoreContents = [
-        "bin/colmap",
-        "bin/brush",
-        "bin/brush.real",
-        "bin/msplat-train",
-        "lib/libcrypto.3.dylib",
-        "lib/libssl.3.dylib",
-        "msplat/bin/msplat-train",
-        "msplat/python/bin/python3",
-        "msplat/build_info.json",
-        "msplat/core_extension_path.txt",
-        "da3_mps/bin/easysplat_da3_sfm",
-        "da3_mps/python/bin/python3",
-        "da3_mps/build_info.json",
-        "da3_mps/app/easysplat_da3_sfm/run.py",
-        "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
-        "mapanything_mps/bin/easysplat_mapanything_sfm",
-        "mapanything_mps/python/bin/python3",
-        "mapanything_mps/build_info.json",
-        "mapanything_mps/app/easysplat_mapanything_sfm/run.py",
-        "mapanything_mps/vendor/mapanything/mapanything/models/mapanything/model.py",
-        "vggt_mps/bin/easysplat_vggt_sfm",
-        "vggt_mps/python/bin/python3",
-        "vggt_mps/build_info.json",
-        "vggt_mps/app/easysplat_vggt_sfm/run.py",
-        "vggt_mps/vendor/vggt/vggt/models/vggt.py",
-        "fastvggt_mps/bin/easysplat_fastvggt_sfm",
-        "fastvggt_mps/python/bin/python3",
-        "fastvggt_mps/build_info.json",
-        "fastvggt_mps/app/easysplat_fastvggt_sfm/run.py",
-        "fastvggt_mps/vendor/fastvggt/vggt/models/vggt.py",
+    public static let coreCapabilities = [
+        "runtime.core",
+        "geometry.colmap",
+        "training.msplat",
     ]
 
-    public static let splitModelsContents = [
+    public static let criticalCoreAnchors = [
+        "bin/colmap",
+        "bin/easysplat-train",
+        "bin/default.metallib",
+        "lib/libomp.dylib",
+        "provenance/colmap.json",
+        "provenance/colmap-support.json",
+        "provenance/ceres.json",
+        "provenance/openimageio.json",
+        "msplat/build_info.json",
+        "msplat/LICENSE",
+        "supply-chain/components.json",
+    ]
+
+    public static let criticalCoreFiles = criticalCoreAnchors
+
+    public static func isAllowedCoreFile(_ path: String) -> Bool {
+        criticalCoreAnchors.contains(path)
+            || path == "provenance/distribution-signing.json"
+            || (path.hasPrefix("licenses/") && path.count > "licenses/".count)
+    }
+
+    public static func criticalCoreFiles(in contents: [String]) -> Set<String> {
+        var required = Set(criticalCoreAnchors)
+        for path in contents {
+            let lowercased = path.lowercased()
+            let pathExtension = URL(fileURLWithPath: lowercased).pathExtension
+            let isLoadedLibrary = ["dylib", "so"].contains(pathExtension)
+                && lowercased.hasPrefix("lib/")
+            let isMetalLibrary = pathExtension == "metallib"
+            let isExecutablePayload = lowercased.hasPrefix("bin/")
+            let isReceiptOrLicense = lowercased.hasPrefix("provenance/")
+                || lowercased.hasPrefix("licenses/")
+                || lowercased.hasPrefix("msplat/")
+                || lowercased.hasPrefix("supply-chain/")
+            if isLoadedLibrary || isMetalLibrary || isExecutablePayload || isReceiptOrLicense {
+                required.insert(path)
+            }
+        }
+        return required
+    }
+
+    public static let da3BaseContents = [
+        "da3_mps/bin/easysplat_da3_sfm",
+        "da3_mps/python/bin/python3",
+        "da3_mps/app/easysplat_da3_sfm/run.py",
+        "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
+        "da3_mps/build_info.json",
         "da3_mps/models/DA3-BASE/config.json",
         "da3_mps/models/DA3-BASE/model.safetensors",
         "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+        "da3_mps/models/DA3-BASE/LICENSE",
+    ]
+
+    public static func criticalDa3BaseFiles(in contents: [String]) -> Set<String> {
+        var required = Set(da3BaseContents)
+        for path in contents {
+            let lowercased = path.lowercased()
+            guard lowercased.hasPrefix("da3_mps/") else { continue }
+            let pathExtension = URL(fileURLWithPath: lowercased).pathExtension
+            let isPythonCode = ["py", "pyc", "pth"].contains(pathExtension)
+                && (
+                    lowercased.hasPrefix("da3_mps/app/")
+                        || lowercased.hasPrefix("da3_mps/vendor/")
+                        || lowercased.hasPrefix("da3_mps/python/")
+                )
+            let isRuntimeConfiguration = ["yaml", "yml", "json", "toml"].contains(pathExtension)
+            let isLoadedLibrary = ["dylib", "so"].contains(pathExtension)
+            let pathComponents = lowercased.split(separator: "/")
+            let isExecutablePayload = pathComponents.dropLast().contains(where: {
+                $0 == "bin" || $0 == "libexec"
+            })
+            let filename = pathComponents.last.map(String.init) ?? ""
+            let isLicenseOrNotice = lowercased.hasPrefix("da3_mps/licenses/")
+                || filename.hasPrefix("license")
+                || filename.hasPrefix("copying")
+                || filename.hasPrefix("notice")
+            if isPythonCode || isRuntimeConfiguration || isLoadedLibrary
+                || isExecutablePayload || isLicenseOrNotice {
+                required.insert(path)
+            }
+        }
+        return required
+    }
+
+    public static func isAllowedDa3BaseFile(_ path: String) -> Bool {
+        path == "da3_mps/build_info.json"
+            || path.hasPrefix("da3_mps/bin/")
+            || path.hasPrefix("da3_mps/python/")
+            || path.hasPrefix("da3_mps/app/")
+            || path.hasPrefix("da3_mps/vendor/")
+            || path.hasPrefix("da3_mps/licenses/")
+            || path.hasPrefix("da3_mps/models/DA3-BASE/")
+    }
+
+    public static let da3SmallContents = [
         "da3_mps/models/DA3-SMALL/config.json",
         "da3_mps/models/DA3-SMALL/model.safetensors",
         "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
-        "mapanything_mps/models/map-anything-apache/config.json",
-        "mapanything_mps/models/map-anything-apache/model.safetensors",
-        "mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth",
-        "vggt_mps/models/vggt_model.pt",
-        "fastvggt_mps/models/fastvggt_model.pt",
+        "da3_mps/models/DA3-SMALL/LICENSE",
     ]
-
-    public static let monolithicContents = splitCoreContents + splitModelsContents
 }
 
 public enum ManifestKeyInput {
     public static func resolvePrivateKeyBase64(parser: inout ArgParser) throws -> String {
-        let inline = parser.value(for: "--private-key")
+        guard parser.value(for: "--private-key") == nil else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 5,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Private keys must be read from a file or environment variable, not a process argument."
+                ]
+            )
+        }
         let filePath = parser.value(for: "--private-key-file")
         let envName = parser.value(for: "--private-key-env")
-        let sources = [inline, filePath, envName].compactMap { $0 }
+        let sources = [filePath, envName].compactMap { $0 }
         guard sources.count == 1 else {
             throw NSError(
                 domain: "ManifestTool",
                 code: 5,
-                userInfo: [NSLocalizedDescriptionKey: "Specify exactly one private key source: --private-key, --private-key-file, or --private-key-env"]
+                userInfo: [NSLocalizedDescriptionKey: "Specify exactly one private key source: --private-key-file or --private-key-env"]
             )
         }
 
-        if let inline {
-            return inline.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
         if let filePath {
             let url = URL(fileURLWithPath: filePath)
             return try String(contentsOf: url, encoding: .utf8)
@@ -280,5 +1551,30 @@ public struct ArgParser {
         guard let index = args.firstIndex(of: key), index + 1 < args.count else { return nil }
         let value = args[index + 1]
         return value.hasPrefix("--") ? nil : value
+    }
+
+    public func requireOnly(_ allowed: Set<String>) throws {
+        guard args.count.isMultiple(of: 2) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Command options must be complete key-value pairs."]
+            )
+        }
+        var seen = Set<String>()
+        for index in stride(from: 0, to: args.count, by: 2) {
+            let key = args[index]
+            let value = args[index + 1]
+            guard key.hasPrefix("--"),
+                  allowed.contains(key),
+                  !value.hasPrefix("--"),
+                  seen.insert(key).inserted else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "Command contains an unknown, duplicate, or incomplete option: \(key)"]
+                )
+            }
+        }
     }
 }

@@ -1,431 +1,191 @@
 # EasySplat
 
-EasySplat is a macOS-only Apple Silicon app that turns videos, photo folders, or mixed inputs into 3D Gaussian splats.
+EasySplat turns video, photos, or both into a 3D Gaussian splat on an Apple Silicon Mac. Processing stays on the Mac. The result is a conventional PLY file.
 
-The default Fast app profile uses COLMAP `global_mapper` for the measured Apple Silicon quick path. Balanced and Ultra runs start with Depth Anything 3, then fall back to MapAnything and COLMAP when needed. The heavy lifting lives in a signed downloadable toolchain, not in the app bundle.
+The first stable release is `v0.2.0` for macOS 15 and later.
 
-This OSS build keeps distribution simple on purpose: the app itself is currently unsigned and not notarized, while the toolchain remains the signed trust boundary.
+## Install EasySplat
 
-## Quick start
+When `EasySplat-0.2.0.dmg` is present on [GitHub Releases](https://github.com/dud8/EasySplat/releases), open it and drag EasySplat to Applications. Until that signed asset is published, use the [source build](#build-from-source); do not download an EasySplat binary from another source.
 
-1. Download the latest `EasySplat-<version>.dmg` from GitHub Releases.
-2. Drag `EasySplat.app` into `/Applications`.
-3. First launch: right-click the app and choose `Open` because the app is currently unsigned.
-4. Let the app download the signed toolchain on first run.
+The release workflow publishes the GitHub build only after Developer ID signing, notarization, stapling, and Gatekeeper verification pass. Initial setup needs internet access because EasySplat downloads only the signed toolchain components required by the selected job. Successfully cached components can be reused offline. Each component is bound to a signed manifest and verified before installation.
 
-Each run creates a `.easysplatproj` bundle under `~/Documents/EasySplat Projects/`. The final viewer opens the exported `.ply` from that project bundle's `Output/` folder.
+## Make a splat
 
-## What each project stores
+1. Select **New Splat**.
+2. Choose a video or a folder of photos.
+3. Leave Options collapsed for the normal path.
+4. Select **Create Splat**.
 
-EasySplat treats each run like a durable project bundle:
+EasySplat prepares the input, reconstructs the cameras and scene, trains the splat with native Metal code, validates the result, and opens it in the built-in viewer.
 
-- `project.json` stores input choices, preset, pipeline state, checkpoints, recovery flags, persisted share metrics, the accepted reconstruction summary (registered frames, points, observations, mean track length, mean reprojection error where the mapper measures one, mapper), per-stage wall-clock timings, the AutoTuner snapshot used for the run, and a free-text notes field.
-- `last_opened.json` stores the last-opened timestamp outside `project.json` so home-screen activity updates cannot clobber concurrent pipeline writes.
-- `Logs/pipeline.log` stores the human-readable pipeline log.
-- `Logs/events.jsonl` stores structured pipeline events.
-- `Logs/app_events.jsonl` stores app-level events such as sharing activity.
-- interrupted runs keep checkpoint data plus `lastRunStartedAt`, which lets the app offer recovery on relaunch.
-- The viewer surfaces reconstruction quality (with a fleet-median comparison badge), the pipeline timing breakdown as a stacked bar, the AutoTuner decisions, and the originating capture preset for each finished run. The home screen shows fleet stats and a predicted run duration based on past successful runs at the same preset.
+One job runs at a time. You can stop safely and resume from the last durable stage. Training resumes only when a complete optimizer checkpoint was written and validated.
 
-## Repository map
+## Options that matter
 
-- `EasySplatApp/`: SwiftUI app target, app model, viewer shell, and bundled resource defaults.
-- `EasySplatCore/`: pipeline orchestration, project persistence, toolchain management, subprocess helpers, and SfM runners.
-- `EasySplatCore/Tests/EasySplatCoreTests/`: core unit and integration tests.
-- `EasySplatAppTests/`: app-model tests.
-- `EasySplatUITests/`: placeholder SwiftPM UI-test target.
-- `Tools/ManifestTool/`: Swift CLI for Ed25519 key generation and manifest signing.
-- `Tools/Da3Sfm/`: Depth Anything 3 to COLMAP bridge shipped in the toolchain.
-- `Tools/MapAnythingSfm/`: MapAnything fallback bridge shipped in the toolchain.
-- `Tools/VggtSfm/`: VGGT to COLMAP bridge shipped in the toolchain.
-- `Tools/FastVggtSfm/`: FastVGGT seed-export bridge shipped in the toolchain.
-- `ThirdParty/MetalSplatter/`: vendored viewer dependency.
-- `Toolchains/`: local toolchain build outputs, manifests, and dev-only signing keys.
-- `scripts/`: dev, test, packaging, benchmarking, and release automation.
+Defaults are Automatic capture, Balanced detail, and Automatic for every other choice.
 
-## Developer quick start
+| Option | Use it when |
+| --- | --- |
+| Capture Path | Choose **Around a subject** for an object orbit, **Through a space** for an interior or property walkthrough, or **Across a large area** for a long exterior or drone route. |
+| Detail | **Fast** favors turnaround and memory use. **Balanced** is the normal choice. **High Detail** uses a larger frame and training budget when the Mac can support it. |
+| Camera Source | Choose **Mixed cameras or lenses** when the capture combines devices, zoom settings, or lenses. |
+| Lens | Choose **Fisheye** for footage that is genuinely fisheye. Ordinary phone, mirrorless, and drone cameras should normally stay Automatic. |
+| Input Order | Use **Continuous sequence** only for one verified continuous route. Use **Unordered** for a photo set with no meaningful sequence. |
+| Resource Use | **Conserve Memory** lowers proactive budgets. **Maximum Performance** uses larger budgets within the Mac's memory tier. |
+| Photo Use | **Use all valid photos** keeps a curated photo set when it fits the resolved frame budget. Unreadable files and exact duplicates are still rejected. |
 
-Preferred local entry point:
+### Capture advice
+
+- Move steadily and keep neighboring views overlapping.
+- Walk a property as connected rooms, not isolated clips.
+- Circle an object at a consistent distance and include high and low angles.
+- Close large exterior or drone loops when possible.
+- Avoid motion blur, abrupt exposure changes, and long stretches with no texture.
+- Mirrors, windows, water, foliage, moving people, and moving vehicles are hard cases. EasySplat treats motion as an outlier; it does not reconstruct dynamic 4D scenes.
+
+If the overlap graph is disconnected, EasySplat stops and explains the capture problem. It does not combine unrelated spaces into a fake coordinate frame.
+
+## Hardware
+
+- macOS 15 or later
+- Apple Silicon only
+- 8 GB: Fast with Conserve Memory, selected automatically, for small objects or rooms
+- 16 GB: Fast and Balanced
+- 24 GB or more: Fast, Balanced, and High Detail, with room for larger captures
+
+Memory budgets are proactive. EasySplat does not deliberately run out of memory to discover a limit.
+
+## Current limits
+
+- EasySplat reconstructs static scenes. Moving people, vehicles, foliage, water, reflections, and changing light can leave gaps or artifacts.
+- PLY is the only public export format in `0.2.0`.
+- Only one reconstruction runs at a time.
+- The app opens projects written by the current project format. It leaves incompatible older project bundles untouched and omits them from the library.
+
+## Privacy
+
+EasySplat has no cloud processing, analytics, telemetry, advertising SDK, or crash SDK. Source media, notes, projects, checkpoints, and outputs remain local unless you explicitly export or share a result.
+
+Diagnostics exclude source images and notes by default. They remove project identity and scrub local paths and URL credentials before preview, copy, or save.
+
+## Projects and output
+
+Projects live under:
+
+```text
+~/Documents/EasySplat Projects/
+```
+
+Stable paths inside a project are:
+
+```text
+SfM/colmap/sparse/0
+SfM/geometry_manifest.json
+Training/training_manifest.json
+Output/splat.ply
+```
+
+Stored artifact paths are project-relative and resolved through the safe project-path resolver.
+
+## Troubleshooting
+
+- **The app will not open:** confirm that you downloaded the DMG from the official GitHub release, then download a fresh copy. Do not bypass a Gatekeeper warning for an unverified copy.
+- **Setup failed:** try again. A failed tool download does not create a bogus project and preserves the selected input.
+- **The scene will not reconstruct:** capture more overlap, remove unrelated clips, or choose the correct Capture Path, Lens, and Input Order.
+- **Memory pressure:** choose Fast and Conserve Memory, then reduce capture length if needed.
+- **A result will not export:** EasySplat exports only a validated finished PLY.
+
+Use **Copy Diagnostics** or **Save Diagnostics…** from a failed project when asking for help. Report reproducible bugs through [GitHub Issues](https://github.com/dud8/EasySplat/issues). Report security problems privately as described in [SECURITY.md](SECURITY.md).
+
+## Build from source
+
+Requirements:
+
+- macOS 15+
+- Apple Silicon
+- Xcode 26.6 (build 17F113), selected as the active developer directory
+- the Xcode Metal toolchain
+- Homebrew `cmake`, `ninja`, `ripgrep`, and `zstd`
+
+From the repository root, prepare the release-equivalent build tools and run the development app with the allowed repository-local toolchain path:
 
 ```bash
-./scripts/run.sh
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+xcodebuild -downloadComponent MetalToolchain
+brew install cmake ninja ripgrep zstd
+./scripts/run.sh --toolchain-root "$PWD/Toolchains/dev/2.0.0"
 ```
 
 Useful variants:
 
 ```bash
-./scripts/run.sh --fast
-./scripts/run.sh --rebuild
-./scripts/run.sh --version 0.1.0
-./scripts/run.sh --toolchain-root /absolute/path/to/toolchain
-./scripts/run.sh --port 8000
+./scripts/run.sh --fast --toolchain-root "$PWD/Toolchains/dev/2.0.0"
+./scripts/run.sh --rebuild --toolchain-root "$PWD/Toolchains/dev/2.0.0"
 ```
 
-What `./scripts/run.sh` does:
+`--fast` requires an existing valid core component and performs no build or download. `--rebuild` rebuilds the complete local capability set.
 
-- reuses a valid installed toolchain when possible;
-- rebuilds and re-packages toolchain artifacts when inputs changed or `--rebuild` is set;
-- generates a signed local `Toolchains/manifest.json`;
-- serves a temporary public directory containing only the manifest and zip artifacts on `127.0.0.1`;
-- exports `EASYSPLAT_TOOLCHAIN_MANIFEST_URL` and `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64` for the app run.
+The only supported development overrides are the local toolchain root, candidate route, stop-after stage, skip-training, and benchmark run seed. Product policy lives in typed run options and resolved plans, not backend-specific environment variables.
 
-Backward-compatible aliases still exist:
-
-- `./scripts/dev_run.sh`
-- `./scripts/run_dev.sh`
-- `./scripts/run_fast.sh`
-
-Other useful commands:
-
-```bash
-./scripts/test.sh
-./scripts/test_python_tools.sh
-swift test --package-path Tools/ManifestTool
-./scripts/benchmark_da3.sh --video /absolute/path/to/input.mp4
-./scripts/benchmark_mapanything.sh --video /absolute/path/to/input.mp4
-```
-
-Use `EASYSPLAT_MSPLAT_BIN=/path/to/msplat-train` only when comparing a local msplat build outside the signed toolchain.
-
-The app's default Fast profile uses the measured Apple Silicon path.
-
-## Runtime configuration
-
-`AppConfig` resolves app-facing URLs and trust inputs in this order:
-
-- project home URL: `EASYSPLAT_PROJECT_HOME_URL`, then `EasySplatApp/Resources/project_home_url.txt`, then `https://github.com/EasySplat/EasySplat`
-- toolchain manifest URL: `EASYSPLAT_TOOLCHAIN_MANIFEST_URL`, then `EasySplatApp/Resources/toolchain_manifest_url.txt`, then `<projectHomeURL>/releases/latest/download/manifest.json`
-- toolchain public key: `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64`, then `EasySplatApp/Resources/public_key_ed25519.txt`
-
-Most useful runtime overrides:
-
-| Variable | Purpose |
-| --- | --- |
-| `EASYSPLAT_PROJECT_HOME_URL` | Override the project homepage used for derived release URLs and share captions. |
-| `EASYSPLAT_TOOLCHAIN_MANIFEST_URL` | Override the manifest URL directly. |
-| `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64` | Override the embedded public key. |
-| `EASYSPLAT_LOCAL_TOOLCHAIN_ROOT` | Skip download/install and validate an already-present local toolchain. |
-| `EASYSPLAT_SFM_BACKEND` | Force `da3`, `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt`. |
-| `EASYSPLAT_SFM_MAPPER` | Steer mapper fallback inside the integrated path: `glomap` means COLMAP `global_mapper`; `colmap` means classic COLMAP `mapper`. |
-| `EASYSPLAT_SPEED_PROFILE` | Set `fast` for the measured Apple Silicon quick path: select about 30 frames with blur-filter headroom, use COLMAP `global_mapper` by default, keep 960px training frames, solve COLMAP at 512px with low overlap, and run msplat for accepted sparse solves with a 1,800-iteration budget. |
-| `EASYSPLAT_TRAINER` | Override trainer selection with `brush` or `msplat`; the fast profile auto-selects packaged msplat unless sparse quality is too low. |
-| `EASYSPLAT_MSPLAT_BIN` | Point at a local `msplat-train` binary for comparison testing instead of the packaged binary. |
-| `EASYSPLAT_FRAME_TARGET_COUNT` | Override the selected frame budget for speed-profile runs. |
-| `EASYSPLAT_FRAME_MAX_DIMENSION` | Override extracted frame size before SfM. |
-| `EASYSPLAT_COLMAP_MAX_IMAGE_SIZE` | Override COLMAP feature-extraction image size independently from extracted frame size. |
-| `EASYSPLAT_FRAME_TARGET_FPS` | Override video sampling FPS before the frame budget is applied. |
-| `EASYSPLAT_STOP_AFTER_SFM` | Stop the pipeline after reconstruction. |
-| `EASYSPLAT_SKIP_TRAINING` | Skip splat training. |
-| `EASYSPLAT_AUTOTUNE` | Enable or disable hardware-based parameter tuning. |
-| `EASYSPLAT_COLMAP_USE_GPU` | Toggle GPU use in COLMAP where supported. |
-| `EASYSPLAT_COLMAP_FORCE_CPU` / `EASYSPLAT_COLMAP_FORCE_GPU` | Override COLMAP device choice. |
-| `EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP` | Override COLMAP sequential matching overlap. |
-
-Common DA3 tuning knobs:
-
-- `EASYSPLAT_DA3_DEVICE=mps|cpu`
-- `EASYSPLAT_DA3_MODEL=DA3-BASE`
-- `EASYSPLAT_DA3_FALLBACK_MODEL=DA3-SMALL`
-- `EASYSPLAT_DA3_PROCESS_RES=<pixels>`
-- `EASYSPLAT_DA3_MAX_POINTS=<n>`
-- `EASYSPLAT_DA3_CAMERA_TYPE=SIMPLE_RADIAL|SIMPLE_PINHOLE|PINHOLE|OPENCV`
-- `EASYSPLAT_DA3_SHARED_CAMERA=0|1`
-- `EASYSPLAT_DA3_WINDOW_SIZE=<n>`
-- `EASYSPLAT_DA3_WINDOW_OVERLAP=<n>`
-- `EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH=<n>`
-
-`DA3-BASE` and `DA3-SMALL` are Apache-2.0 and are bundled in the default signed toolchain. `DA3METRIC-LARGE` is Apache-2.0 but optional for experiments; build it with `EASYSPLAT_DA3_INCLUDE_METRIC_LARGE=1`. Non-commercial DA3 variants are not bundled for the default path.
-
-Common MapAnything fallback tuning knobs:
-
-- `EASYSPLAT_MAPANYTHING_DEVICE=mps|cpu`
-- `EASYSPLAT_MAPANYTHING_CHECKPOINT=map-anything-apache`
-- `EASYSPLAT_MAPANYTHING_RESOLUTION=512|518`
-- `EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT=0|1`
-- `EASYSPLAT_MAPANYTHING_MINIBATCH_SIZE=<n>`
-- `EASYSPLAT_MAPANYTHING_MAX_POINTS=<n>`
-- `EASYSPLAT_MAPANYTHING_CAMERA_TYPE=SIMPLE_RADIAL|SIMPLE_PINHOLE|PINHOLE|OPENCV`
-- `EASYSPLAT_MAPANYTHING_SHARED_CAMERA=0|1`
-- `EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS=<n>`
-- `EASYSPLAT_MAPANYTHING_WINDOW_SIZE=<n>`
-- `EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP=<n>`
-- `EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH=<n>`
-
-Common global-mapper tuning knobs:
-
-- `EASYSPLAT_GLOBAL_MAPPER_THREADS=<n>`
-- `EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU=0|1`
-- `EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU=0|1`
-- `EASYSPLAT_GLOBAL_MAPPER_GPU_INDEX=<idx or -1>`
-- `EASYSPLAT_GLOBAL_MAPPER_GP_GPU_INDEX=<idx>`
-- `EASYSPLAT_GLOBAL_MAPPER_BA_GPU_INDEX=<idx>`
-- `EASYSPLAT_GLOBAL_MAPPER_MIN_NUM_MATCHES=<n>`
-- `EASYSPLAT_GLOBAL_MAPPER_BA_NUM_ITERATIONS=<n>`
-
-Common Brush overrides:
-
-- `EASYSPLAT_BRUSH_TOTAL_STEPS=<n>`
-- `EASYSPLAT_BRUSH_EXPORT_EVERY=<n>`
-- `EASYSPLAT_BRUSH_RUST_LOG=<level>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_MIN_STEPS=<n>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_MAX_STEPS=<n>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_MIN_SECONDS=<n>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_MAX_SECONDS=<n>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_DEFAULT_SECONDS=<n>`
-
-Common msplat overrides:
-
-- `EASYSPLAT_MSPLAT_BIN=/path/to/msplat-train`
-- `EASYSPLAT_MSPLAT_ITERS=<n>`
-- `EASYSPLAT_MSPLAT_NUM_DOWNSCALES=<n>`
-- `EASYSPLAT_MSPLAT_DOWNSCALE_FACTOR=<n>`
-
-The automatic fast profile uses a 2,000-step Brush run instead of msplat when the sparse solve has fewer than 1,500 points. Set `EASYSPLAT_TRAINER=msplat` to force msplat anyway.
-
-## SfM behavior
-
-Default behavior when `EASYSPLAT_SFM_BACKEND` is unset:
-
-- The Fast profile starts with COLMAP `global_mapper` because that is the measured Apple Silicon quick path.
-- Other profiles start with DA3 on MPS using bundled Apache-2.0 weights.
-- DA3 sparse output is scored against the full selected image count before the pipeline accepts it.
-- `DA3-SMALL` is retried automatically if `DA3-BASE` hits MPS memory pressure.
-- DA3 writes the canonical COLMAP text sparse model consumed by training and the viewer.
-- If DA3 fails or produces a low-quality sparse model, EasySplat falls back to MapAnything.
-- If MapAnything refinement still is not good enough, EasySplat falls back through COLMAP `global_mapper` and then COLMAP `mapper` when needed.
-
-Compatibility notes:
-
-- `EASYSPLAT_SFM_BACKEND=glomap` and `EASYSPLAT_SFM_BACKEND=global_mapper` are compatibility aliases for COLMAP's integrated `global_mapper` flow.
-- `mapanything` is still available as an explicit override path and as the first fallback after DA3.
-- `vggt` and `fastvggt` are still available as explicit override paths, but they are no longer the default product story.
-
-## Toolchain model
-
-The app validates a signed `manifest.json` with an embedded Ed25519 public key, then downloads either:
-
-- a split toolchain: `macos-arm64-core` and `macos-arm64-models`
-- or an older monolithic `macos-arm64` artifact
-
-The current split layout keeps binaries and Python runtimes in a smaller core zip while large model weights ship separately. Each packaged Python SfM bundle also includes `build_info.json` so releases can be traced back to the source snapshot, runtime, and model metadata used to build it.
-
-Installed toolchains live under:
+## Architecture
 
 ```text
-~/Library/Application Support/EasySplat/Toolchains/<version>/
+input
+  → preflight and topology policy
+  → bounded COLMAP feature matching and camera reconstruction
+  → canonical COLMAP model
+  → native msplat Metal training
+  → validated Output/splat.ply
 ```
 
-Local development scripts usually emit `Toolchains/manifest.json`. The GitHub toolchain release workflow publishes `Toolchains/out/manifest.json` as the release asset named `manifest.json`.
+COLMAP is the automatic geometry route in `0.2.0`. It is not a user-facing backend choice. A single-batch DA3 initializer remains available only to the typed benchmark override until it clears the full quality corpus. MetalSplatter is the native result viewer.
 
-## Development requirements
+The release toolchain is split into signed capabilities:
 
-- macOS 15+ on Apple Silicon
-- Xcode 16+ with the full XCTest toolchain
-- Homebrew
-- Rust toolchain for Brush (`cargo`)
-- network access and enough disk space for large model downloads
-- optional: `ffmpeg` / `ffprobe` if you use the benchmark scripts
+- `macos-arm64-core`
+- `geometry-da3-base`
+- `geometry-da3-small`
 
-To mirror the current GitHub Actions toolchain runner, install:
+Normal runs install only the capabilities they need. The automatic route uses native COLMAP from the core component and does not download DA3 or its Python runtime. The optional Base component carries the DA3 runtime; constrained DA3 runs select the Small weights before execution.
 
-```bash
-brew install cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp openimageio create-dmg
-```
+See [ONBOARDING.md](ONBOARDING.md) for maintainer architecture and [CONTRIBUTING.md](CONTRIBUTING.md) for change rules.
 
-If this is a fresh Xcode install:
-
-```bash
-sudo xcodebuild -license accept
-xcodebuild -downloadComponent MetalToolchain
-```
-
-`build_app.sh` and `build_dmg.sh` compile the vendored `MetalSplatter` shaders. If release builds fail with `cannot execute tool 'metal'`, the Metal Toolchain component is missing.
-
-## Release packaging
-
-Build only the app bundle:
-
-```bash
-./scripts/release/build_app.sh \
-  --manifest-url "https://example.com/releases/latest/download/manifest.json" \
-  --public-key-path /absolute/path/to/public_key_ed25519.txt \
-  --project-url "https://github.com/EasySplat/EasySplat" \
-  --version 0.1.0
-```
-
-`build_app.sh` requires:
-
-- `--manifest-url`: the manifest URL the shipped app should use
-- `--public-key-path`: the public key file copied into the built bundle
-- `--version`: bundle version
-- `--project-url`: optional project homepage override copied into the built bundle
-
-Build the full toolchain, app bundle, and DMG:
-
-```bash
-./scripts/release/build_dmg.sh --version 0.1.0
-```
-
-`build_dmg.sh` supports:
-
-- `--version <semver>`
-- `--manifest-url <url>`
-- `--core-artifact-url <url>`
-- `--models-artifact-url <url>`
-- `--project-url <url>`
-- `--port <port>`
-
-Hosted manifest/artifact example:
-
-```bash
-./scripts/release/build_dmg.sh \
-  --version 0.1.0 \
-  --manifest-url "https://your-host/manifest.json" \
-  --core-artifact-url "https://your-host/toolchain-macos-arm64-0.1.0-core.zip" \
-  --models-artifact-url "https://your-host/toolchain-macos-arm64-0.1.0-models.zip" \
-  --project-url "https://github.com/EasySplat/EasySplat"
-```
-
-Dev-only smoke test against a locally served manifest:
-
-```bash
-./scripts/release/build_dmg.sh \
-  --version 0.1.0 \
-  --manifest-url "http://localhost:8000/manifest.json" \
-  --core-artifact-url "http://localhost:8000/out/toolchain-macos-arm64-0.1.0-core.zip" \
-  --models-artifact-url "http://localhost:8000/out/toolchain-macos-arm64-0.1.0-models.zip"
-```
-
-Then serve only the public manifest and artifact files:
-
-```bash
-mkdir -p Toolchains/public/out
-cp Toolchains/manifest.json Toolchains/public/manifest.json
-ln -sf ../../out/toolchain-macos-arm64-0.1.0-core.zip Toolchains/public/out/
-ln -sf ../../out/toolchain-macos-arm64-0.1.0-models.zip Toolchains/public/out/
-python3 -m http.server --bind 127.0.0.1 8000 --directory Toolchains/public
-```
-
-Output paths:
-
-- app bundle: `build/Export/EasySplat.app`
-- DMG: `release/DMG/EasySplat-<version>.dmg`
-
-If `create-dmg` fails to unmount with `Resource busy`, retry with:
-
-```bash
-EASYSPLAT_DMG_SKIP_JENKINS=1 ./scripts/release/build_dmg.sh --version 0.1.0
-```
-
-Other DMG knobs:
-
-- `EASYSPLAT_DMG_HDIUTIL_RETRIES=<n>`
-- `EASYSPLAT_DMG_SANDBOX_SAFE=1`
-
-## Manual toolchain workflow
-
-Build the local toolchain pieces:
-
-```bash
-./scripts/toolchain/build_openssl.sh
-./scripts/toolchain/build_colmap.sh
-./scripts/toolchain/build_brush.sh
-./scripts/toolchain/build_msplat.sh
-./scripts/toolchain/build_da3_mps.sh
-./scripts/toolchain/build_mapanything_mps.sh
-./scripts/toolchain/build_vggt_mps.sh
-./scripts/toolchain/build_fastvggt_mps.sh
-./scripts/toolchain/package_toolchain.sh --version 0.1.0
-```
-
-`build_da3_mps.sh` uses a pinned git checkout by default. A no-git local DA3 source tree is only allowed for development with `EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1`; release scripts and CI reject that override.
-
-`build_msplat.sh` packages a version-pinned `msplat[cli]` package into the core toolchain so the fast Apple Silicon profile can use the Metal trainer without a local virtual environment.
-
-`scripts/toolchain/build_glomap.sh` is available for direct `glomap` work, but the packaged app path uses COLMAP's integrated `global_mapper` rather than a separately shipped `glomap` binary.
-
-Generate a dev keypair:
-
-```bash
-swift run --package-path Tools/ManifestTool ManifestTool generate-keypair \
-  --public-key-out Toolchains/public_key_ed25519.txt \
-  --private-key-out Toolchains/private_key_ed25519.txt
-```
-
-Generate a signed local manifest:
-
-```bash
-swift run --package-path Tools/ManifestTool ManifestTool \
-  --core-zip Toolchains/out/toolchain-macos-arm64-0.1.0-core.zip \
-  --core-url http://localhost:8000/out/toolchain-macos-arm64-0.1.0-core.zip \
-  --models-zip Toolchains/out/toolchain-macos-arm64-0.1.0-models.zip \
-  --models-url http://localhost:8000/out/toolchain-macos-arm64-0.1.0-models.zip \
-  --version 0.1.0 \
-  --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --private-key-file Toolchains/private_key_ed25519.txt \
-  --manifest-out Toolchains/manifest.json
-```
-
-Serve only the public manifest and artifact files locally:
-
-```bash
-mkdir -p Toolchains/public
-cp Toolchains/manifest.json Toolchains/public/manifest.json
-rm -rf Toolchains/public/out
-mkdir -p Toolchains/public/out
-ln -s ../../out/toolchain-macos-arm64-0.1.0-core.zip Toolchains/public/out/
-ln -s ../../out/toolchain-macos-arm64-0.1.0-models.zip Toolchains/public/out/
-python3 -m http.server --bind 127.0.0.1 8000 --directory Toolchains/public
-```
-
-Run the app against that manifest:
-
-```bash
-EASYSPLAT_TOOLCHAIN_MANIFEST_URL=http://localhost:8000/manifest.json \
-EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64="$(cat Toolchains/public_key_ed25519.txt)" \
-swift run EasySplatApp
-```
-
-Or skip manifest download entirely and validate a local install in place:
-
-```bash
-EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="/absolute/path/to/toolchain" \
-swift run EasySplatApp
-```
-
-## Tests
-
-Run all Swift tests:
+## Validation
 
 ```bash
 ./scripts/test.sh
-```
-
-Notes:
-
-- `./scripts/test.sh` uses `xcrun swift test --disable-swift-testing --enable-xctest` when Xcode is available.
-- It caches SwiftPM artifacts under `build/.swiftpm`.
-- `EasySplatUITests/` is only a SwiftPM placeholder; real XCUITest would require an Xcode project.
-
-Run the manifest tool tests:
-
-```bash
 swift test --package-path Tools/ManifestTool
-```
-
-Run the Python bridge tests for DA3, MapAnything, FastVGGT, and VGGT:
-
-```bash
 ./scripts/test_python_tools.sh
-PYTHON_BIN=/opt/homebrew/bin/python3 ./scripts/test_python_tools.sh
+./scripts/ci/check_repo_health.sh
+./scripts/ci/check_workflows.sh
+./scripts/ci/test_release_scripts.sh
+find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+./scripts/benchmark/run_suite.sh --profile release
+shellcheck $(git ls-files 'scripts/*.sh' 'scripts/**/*.sh')
+actionlint
+gitleaks git --redact
 ```
 
-Use `PYTHON_BIN` when the default `python3` does not already have the bridge test dependencies installed.
+The full release benchmark needs the external 26-scene corpus described by `scripts/benchmark/corpus.json`; large media is intentionally not stored in Git.
+Native trainer changes also run `./scripts/ci/test_msplat_native_build.sh`. The Release App workflow generates the pinned synthetic fixture under the hosted runner's temporary root, then reuses those exact bytes for packaged-app, remote-only, bundled-offline, and cached-only verification. It does not accept a repository variable or external fixture path. `scripts/release/release_fixture_manifest.json` binds the MIT generator, camera construction, per-image hashes and sizes, and aggregate closure digest.
 
-## More docs
+Fixture reproducibility proves input integrity only. The integrated geometry-conditioning gate rejects weak camera support, collapsed trajectories, inadequate parallax, and degenerate point distributions before training. Packaged release verification also requires the exact generated corpus to pass signed-core reconstruction for at least 11 of 12 views plus native msplat training on macOS 15 and macOS 26.
 
-- `ONBOARDING.md`: maintainer-level architecture, pipeline, persistence, and release context
-- `CONTRIBUTING.md`: contributor workflow and PR expectations
-- `SECURITY.md`: private disclosure guidance
-- `NOTICE.md`: bundled third-party attribution
-- `CODE_OF_CONDUCT.md`: community standards
+## Release builds
+
+Stable release packaging is performed only by the protected workflows. `build_dmg.sh --production` intentionally rejects a live source checkout.
+
+The release order is fixed: merge the reviewed release commit, make the repository public, manually dispatch CodeQL, create the immutable version tag, then run Release App.
+
+The toolchain is released first. From protected `main`, create `toolchain-v2.0.0`, run **Toolchain Producer**, obtain the schema-v2 payload and receipt from the external sign-only authority, run **Release Benchmark Evidence**, then run **Toolchain Publication**. Independently reverify the exact draft release ID, source ref, artifact IDs, sizes, and digests before publishing that draft.
+
+After the signed toolchain is live, create `v0.2.0` at the same protected `main` commit and run **Release App**. It builds an identity-free prepared product, hands only authenticated bytes to the isolated signing environment, verifies the final closure, and leaves an owned stable draft. Independently reverify that draft before publishing it. The required sign-only authority workflow and EasySplat's release workflows must not publish automatically.
+
+Before either tag is created, the reviewed commit must be merged, both repositories' `main` branches must be protected, exposed credentials must be rotated, and the owner must explicitly approve publication. Make EasySplat public only with that approval, then run all four CodeQL jobs on the exact protected-main commit. See [ONBOARDING.md](ONBOARDING.md#releases) for the operator sequence, required environments, and runner roles. `./scripts/run.sh` remains the development entry point.
+
+Release App verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, a quarantined install, the DMG, checksums, SBOM, licenses, and provenance. It can resume only its exact repository/tag/commit-owned draft and rejects different or foreign assets. Final publication remains a separate human action.
+
+## License
+
+EasySplat is released under the [MIT License](LICENSE). Redistributed source, runtime, and model components keep their own licenses; see [NOTICE.md](NOTICE.md) and each release's license bundle and SPDX SBOM.

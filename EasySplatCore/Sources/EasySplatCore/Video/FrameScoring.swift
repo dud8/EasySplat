@@ -6,7 +6,9 @@ public struct FrameScore: Sendable {
     public var blurScore: Double
     public var laplacianScore: Double
     public var brightness: Double
+    public var maximumColorComponent: Double
     public var clippedFraction: Double
+    public var lowLightExposureEV: Double
     public var dHash: UInt64
 }
 
@@ -19,24 +21,80 @@ public enum FrameScoring {
     }
 
     public static func scoreFrame(cgImage: CGImage) -> FrameScore {
-        let grayscale = grayscalePixels(cgImage: cgImage, width: 64, height: 64)
-        let blur = blurScore(pixels: grayscale, width: 64, height: 64)
-        let laplacian = laplacianVariance(pixels: grayscale, width: 64, height: 64)
-        let (brightness, clipped) = exposureScore(pixels: grayscale)
-        let hash = dHash(pixels: grayscale, width: 64, height: 64)
-        return FrameScore(blurScore: blur, laplacianScore: laplacian, brightness: brightness, clippedFraction: clipped, dHash: hash)
+        let luma = lumaPixels(cgImage: cgImage, width: 64, height: 64)
+        return scoreFrame(cgImage: cgImage, lumaPixels: luma)
+    }
+
+    static func scoreFrame(cgImage: CGImage, lumaPixels: [UInt8]) -> FrameScore {
+        var score = scoreLumaPixels(lumaPixels, width: 64, height: 64)
+        let maximumColorComponent = maximumColorComponent(cgImage: cgImage, width: 64, height: 64)
+        score.maximumColorComponent = maximumColorComponent
+        score.lowLightExposureEV = lowLightExposureEV(
+            brightness: score.brightness,
+            maximumColorComponent: maximumColorComponent
+        )
+        return score
+    }
+
+    static func lumaPixels(cgImage: CGImage, width: Int, height: Int) -> [UInt8] {
+        grayscalePixels(cgImage: cgImage, width: width, height: height)
+    }
+
+    static func scoreLumaPixels(
+        _ pixels: [UInt8],
+        width: Int,
+        height: Int
+    ) -> FrameScore {
+        guard width > 0,
+              height > 0,
+              pixels.count >= width * height else {
+            return FrameScore(
+                blurScore: 0,
+                laplacianScore: 0,
+                brightness: 0,
+                maximumColorComponent: 0,
+                clippedFraction: 1,
+                lowLightExposureEV: 0,
+                dHash: 0
+            )
+        }
+        let samples = pixels.count == width * height
+            ? pixels
+            : Array(pixels.prefix(width * height))
+        let exposure = exposureScore(pixels: samples)
+        let maximum = Double(samples.max() ?? 0) / 255
+        return FrameScore(
+            blurScore: blurScore(pixels: samples, width: width, height: height),
+            laplacianScore: laplacianVariance(
+                pixels: samples,
+                width: width,
+                height: height
+            ),
+            brightness: exposure.brightness,
+            maximumColorComponent: maximum,
+            clippedFraction: exposure.clippedFraction,
+            lowLightExposureEV: lowLightExposureEV(
+                brightness: exposure.brightness,
+                maximumColorComponent: maximum
+            ),
+            dHash: dHash(pixels: samples, width: width, height: height)
+        )
     }
 
     private static func loadCGImage(url: URL) -> CGImage? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 256,
-            kCGImageSourceShouldCache: false
-        ]
-        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                  source,
+                  CGImageSourceGetPrimaryImageIndex(source),
+                  nil
+              ) as? [CFString: Any] else {
+            return nil
+        }
+        return SDRImageDecoder.createOrientedThumbnail(
+            source: source,
+            properties: properties,
+            maximumPixelDimension: 256
+        )
     }
 
     private static func grayscalePixels(cgImage: CGImage, width: Int, height: Int) -> [UInt8] {
@@ -109,7 +167,9 @@ public enum FrameScoring {
         return variance
     }
 
-    private static func exposureScore(pixels: [UInt8]) -> (Double, Double) {
+    private static func exposureScore(
+        pixels: [UInt8]
+    ) -> (brightness: Double, clippedFraction: Double) {
         var sum: Int64 = 0
         var clipped: Int64 = 0
         for p in pixels {
@@ -119,6 +179,51 @@ public enum FrameScoring {
         let brightness = Double(sum) / Double(pixels.count) / 255.0
         let clippedFraction = Double(clipped) / Double(pixels.count)
         return (brightness, clippedFraction)
+    }
+
+    private static func maximumColorComponent(
+        cgImage: CGImage,
+        width: Int,
+        height: Int
+    ) -> Double {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        pixels.withUnsafeMutableBytes { raw in
+            if let context = CGContext(
+                data: raw.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                    | CGImageAlphaInfo.noneSkipLast.rawValue
+            ) {
+                context.interpolationQuality = .high
+                context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            }
+        }
+        var maximum: UInt8 = 0
+        for offset in stride(from: 0, to: pixels.count, by: 4) {
+            maximum = max(maximum, pixels[offset], pixels[offset + 1], pixels[offset + 2])
+        }
+        return Double(maximum) / 255.0
+    }
+
+    private static func lowLightExposureEV(
+        brightness: Double,
+        maximumColorComponent: Double
+    ) -> Double {
+        guard brightness >= 0.02,
+              brightness < 0.18,
+              maximumColorComponent > 0,
+              maximumColorComponent < 0.98 else {
+            return 0
+        }
+        let desiredEV = log2(0.24 / brightness)
+        let clippingSafeEV = log2(0.98 / maximumColorComponent)
+        let exposureEV = min(1.0, desiredEV, clippingSafeEV)
+        return exposureEV >= 0.15 ? exposureEV : 0
     }
 
     private static func dHash(pixels: [UInt8], width: Int, height: Int) -> UInt64 {

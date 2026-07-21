@@ -62,5 +62,51 @@ final class ColmapLogProgressTests: XCTestCase {
         XCTAssertEqual(done.message, "Solving cameras (finalizing reconstruction)")
         XCTAssertEqual(done.fraction, 0.99, accuracy: 0.0001)
     }
+
+    func testMappingProgressCountsEveryGlobalRefinementMarker() {
+        let tracker = ColmapMappingProgressTracker(totalImages: 250)
+
+        for index in 0..<4 {
+            XCTAssertNil(tracker.ingest(
+                "I20260713 00:10:\(20 + index).000 incremental_pipeline.cc:78] Retriangulation and Global bundle adjustment"
+            ))
+        }
+
+        XCTAssertEqual(tracker.globalRefinementInvocationCount, 4)
+    }
+
+    func testMappingProgressIgnoresLocalAndUnrelatedBundleAdjustmentLogs() {
+        let tracker = ColmapMappingProgressTracker(totalImages: 250)
+
+        XCTAssertNil(tracker.ingest("Running local bundle adjustment"))
+        XCTAssertNil(tracker.ingest("Global bundle adjustment"))
+        XCTAssertNil(tracker.ingest("Retriangulation and global bundle adjustment"))
+
+        XCTAssertEqual(tracker.globalRefinementInvocationCount, 0)
+    }
+
+    func testMappingProgressCountsRepeatedGlobalRefinementMarkers() {
+        let tracker = ColmapMappingProgressTracker(totalImages: 250)
+        let marker = "Retriangulation and Global bundle adjustment"
+
+        XCTAssertNil(tracker.ingest(marker))
+        XCTAssertNil(tracker.ingest(marker))
+
+        XCTAssertEqual(tracker.globalRefinementInvocationCount, 2)
+    }
+
+    func testMappingProgressCountsGlobalRefinementMarkersConcurrently() {
+        let tracker = ColmapMappingProgressTracker(totalImages: 250)
+        let markerCount = 256
+
+        DispatchQueue.concurrentPerform(iterations: markerCount) { index in
+            let line = index.isMultiple(of: 2)
+                ? "Retriangulation and Global bundle adjustment"
+                : "prefix Retriangulation and Global bundle adjustment suffix"
+            _ = tracker.ingest(line)
+        }
+
+        XCTAssertEqual(tracker.globalRefinementInvocationCount, markerCount)
+    }
 }
 #endif
