@@ -546,7 +546,7 @@ def rename_exclusive(source: Path, destination: Path) -> None:
             os.fsencode(source),
             -2,
             os.fsencode(destination),
-            0x00000004,
+            0x00000004 | 0x00000010,
         )
         if result != 0:
             error = ctypes.get_errno()

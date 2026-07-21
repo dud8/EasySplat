@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import runpy
 import shutil
 import stat
 import struct
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 from pathlib import Path
 
@@ -218,6 +220,59 @@ class ReleaseFixtureManifestTests(unittest.TestCase):
             source,
         )
 
+    def test_exclusive_publication_uses_macos_15_compatible_flags(self) -> None:
+        class FakeRename:
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, bytes, int, bytes, int]] = []
+                self.argtypes: object = None
+                self.restype: object = None
+
+            def __call__(
+                self,
+                source_directory_descriptor: int,
+                source_name: bytes,
+                destination_directory_descriptor: int,
+                destination_name: bytes,
+                flags: int,
+            ) -> int:
+                self.calls.append(
+                    (
+                        source_directory_descriptor,
+                        source_name,
+                        destination_directory_descriptor,
+                        destination_name,
+                        flags,
+                    )
+                )
+                return 0
+
+        namespace = runpy.run_path(
+            os.fspath(SCRIPT), run_name="release_fixture_generator_test"
+        )
+        rename = FakeRename()
+        library = type("FakeLibrary", (), {"renameatx_np": rename})()
+        with (
+            mock.patch.object(namespace["ctypes"], "CDLL", return_value=library),
+            mock.patch.object(namespace["sys"], "platform", "darwin"),
+        ):
+            namespace["rename_exclusive"](
+                Path("/private/tmp/staged-fixture"),
+                Path("/private/tmp/published-fixture"),
+            )
+
+        self.assertEqual(
+            rename.calls,
+            [
+                (
+                    -2,
+                    b"/private/tmp/staged-fixture",
+                    -2,
+                    b"/private/tmp/published-fixture",
+                    0x00000004 | 0x00000010,
+                )
+            ],
+        )
+
     def test_manifest_pins_twelve_pinhole_views_and_multidepth_scene(self) -> None:
         image = self.manifest["image"]
         camera = self.manifest["camera"]
@@ -289,7 +344,9 @@ class ReleaseFixtureManifestTests(unittest.TestCase):
 class GeneratedReleaseFixtureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        cls.temporary = tempfile.TemporaryDirectory(
+            dir=os.path.realpath(tempfile.gettempdir())
+        )
         cls.temp_root = Path(cls.temporary.name)
         cls.fixture = cls.temp_root / "fixture"
         run_generator("generate", "--output", os.fspath(cls.fixture))
