@@ -220,7 +220,7 @@ class ReleaseFixtureManifestTests(unittest.TestCase):
             source,
         )
 
-    def test_exclusive_publication_uses_macos_15_compatible_flags(self) -> None:
+    def test_exclusive_publication_uses_portable_macos_flags(self) -> None:
         class FakeRename:
             def __init__(self) -> None:
                 self.calls: list[tuple[int, bytes, int, bytes, int]] = []
@@ -256,22 +256,72 @@ class ReleaseFixtureManifestTests(unittest.TestCase):
             mock.patch.object(namespace["sys"], "platform", "darwin"),
         ):
             namespace["rename_exclusive"](
-                Path("/private/tmp/staged-fixture"),
-                Path("/private/tmp/published-fixture"),
+                37,
+                ".fixture.staging-token",
+                "fixture",
             )
 
         self.assertEqual(
             rename.calls,
             [
                 (
-                    -2,
-                    b"/private/tmp/staged-fixture",
-                    -2,
-                    b"/private/tmp/published-fixture",
-                    0x00000004 | 0x00000010,
+                    37,
+                    b".fixture.staging-token",
+                    37,
+                    b"fixture",
+                    0x00000004,
                 )
             ],
         )
+
+        for invalid_name in ("", ".", "..", "/absolute", "nested/name", "bad\0name"):
+            with self.subTest(invalid_name=invalid_name):
+                with self.assertRaises(namespace["FixtureError"]):
+                    namespace["rename_exclusive"](37, invalid_name, "fixture")
+                with self.assertRaises(namespace["FixtureError"]):
+                    namespace["rename_exclusive"](37, ".fixture.staging-token", invalid_name)
+        self.assertEqual(len(rename.calls), 1)
+
+    def test_generation_keeps_source_writable_until_atomic_publication(self) -> None:
+        namespace = runpy.run_path(
+            os.fspath(SCRIPT), run_name="release_fixture_generator_mode_test"
+        )
+        observed: list[tuple[int, int]] = []
+
+        def rename_with_macos_15_permissions(
+            parent_descriptor: int,
+            source_name: str,
+            destination_name: str,
+        ) -> None:
+            source = os.stat(
+                source_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            source_mode = stat.S_IMODE(source.st_mode)
+            observed.append((source_mode, source.st_ino))
+            if source_mode != 0o700:
+                raise PermissionError("macOS 15 rejects a read-only source directory")
+            os.rename(
+                source_name,
+                destination_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+
+        temporary_parent = os.path.realpath(
+            os.environ.get("RUNNER_TEMP", tempfile.gettempdir())
+        )
+        with tempfile.TemporaryDirectory(dir=temporary_parent) as temporary:
+            output = Path(temporary) / "fixture"
+            namespace["generate_fixture"].__globals__["rename_exclusive"] = (
+                rename_with_macos_15_permissions
+            )
+            namespace["generate_fixture"](output)
+            output_metadata = output.lstat()
+            self.assertEqual(observed, [(0o700, output_metadata.st_ino)])
+            self.assertEqual(stat.S_IMODE(output_metadata.st_mode), 0o555)
+            namespace["verify_fixture"](output)
 
     def test_manifest_pins_twelve_pinhole_views_and_multidepth_scene(self) -> None:
         image = self.manifest["image"]

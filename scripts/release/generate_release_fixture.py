@@ -516,6 +516,33 @@ def fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def open_bound_parent(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        rebound = path.lstat()
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        fail(f"cannot bind output parent: {error}")
+    identity_fields = ("st_dev", "st_ino", "st_mode", "st_uid")
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) & 0o022
+        or any(
+            getattr(opened, field) != getattr(rebound, field)
+            for field in identity_fields
+        )
+    ):
+        os.close(descriptor)
+        fail("output parent changed while it was opened")
+    return descriptor
+
+
 def remove_staging(path: Path) -> None:
     if not os.path.lexists(path):
         return
@@ -530,7 +557,19 @@ def remove_staging(path: Path) -> None:
     shutil.rmtree(path)
 
 
-def rename_exclusive(source: Path, destination: Path) -> None:
+def rename_exclusive(
+    parent_descriptor: int, source_name: str, destination_name: str
+) -> None:
+    for name in (source_name, destination_name):
+        if (
+            not name
+            or name in {".", ".."}
+            or os.path.isabs(name)
+            or os.path.basename(name) != name
+            or "/" in name
+            or "\0" in name
+        ):
+            fail("transactional publication requires plain leaf names")
     if sys.platform == "darwin":
         renameatx_np = ctypes.CDLL(None, use_errno=True).renameatx_np
         renameatx_np.argtypes = (
@@ -542,11 +581,11 @@ def rename_exclusive(source: Path, destination: Path) -> None:
         )
         renameatx_np.restype = ctypes.c_int
         result = renameatx_np(
-            -2,
-            os.fsencode(source),
-            -2,
-            os.fsencode(destination),
-            0x00000004 | 0x00000010,
+            parent_descriptor,
+            os.fsencode(source_name),
+            parent_descriptor,
+            os.fsencode(destination_name),
+            0x00000004,
         )
         if result != 0:
             error = ctypes.get_errno()
@@ -554,9 +593,18 @@ def rename_exclusive(source: Path, destination: Path) -> None:
                 fail("output path appeared before transactional publication")
             fail(f"cannot publish fixture transactionally: {os.strerror(error)}")
         return
-    if os.path.lexists(destination):
+    try:
+        os.stat(destination_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
         fail("output path appeared before transactional publication")
-    os.rename(source, destination)
+    os.rename(
+        source_name,
+        destination_name,
+        src_dir_fd=parent_descriptor,
+        dst_dir_fd=parent_descriptor,
+    )
 
 
 def generate_fixture(output: Path) -> dict[str, object]:
@@ -564,9 +612,13 @@ def generate_fixture(output: Path) -> dict[str, object]:
     manifest, manifest_bytes = load_authenticated_manifest()
     files = render_fixture_bytes()
     compare_rendered_bytes(manifest, files)
-    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=parent))
+    parent_descriptor = open_bound_parent(parent)
+    staging: Path | None = None
+    staging_descriptor = -1
+    renamed = False
     published = False
     try:
+        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=parent))
         staging.chmod(0o700)
         images = staging / IMAGE_DIRECTORY
         images.mkdir(mode=0o700)
@@ -574,16 +626,67 @@ def generate_fixture(output: Path) -> dict[str, object]:
             write_file(staging / relative, payload, 0o444)
         write_file(staging / PUBLISHED_MANIFEST_NAME, manifest_bytes, 0o444)
         images.chmod(0o555)
-        staging.chmod(0o555)
         fsync_directory(images)
         fsync_directory(staging)
-        verify_fixture(staging)
-        rename_exclusive(staging, output)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(
+            os, "O_NOFOLLOW", 0
+        )
+        staging_descriptor = os.open(
+            staging.name,
+            directory_flags,
+            dir_fd=parent_descriptor,
+        )
+        staged_identity = os.fstat(staging_descriptor)
+        staged_path_identity = os.stat(
+            staging.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(staged_identity.st_mode)
+            or staged_identity.st_uid != os.getuid()
+            or stat.S_IMODE(staged_identity.st_mode) != 0o700
+            or (staged_identity.st_dev, staged_identity.st_ino)
+            != (staged_path_identity.st_dev, staged_path_identity.st_ino)
+        ):
+            fail("staged fixture changed before transactional publication")
+        verify_fixture(staging, expected_root_mode=0o700)
+        rebound_staged_identity = os.stat(
+            staging.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (rebound_staged_identity.st_dev, rebound_staged_identity.st_ino)
+            != (staged_identity.st_dev, staged_identity.st_ino)
+            or stat.S_IMODE(rebound_staged_identity.st_mode) != 0o700
+        ):
+            fail("staged fixture changed while it was authenticated")
+
+        rename_exclusive(parent_descriptor, staging.name, output.name)
+        renamed = True
+        os.fchmod(staging_descriptor, 0o555)
+        os.fsync(staging_descriptor)
+        published_identity = os.stat(
+            output.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            (published_identity.st_dev, published_identity.st_ino)
+            != (staged_identity.st_dev, staged_identity.st_ino)
+            or stat.S_IMODE(published_identity.st_mode) != 0o555
+        ):
+            fail("published fixture identity changed while it was sealed")
+        os.fsync(parent_descriptor)
         published = True
-        fsync_directory(parent)
     finally:
-        if not published:
-            remove_staging(staging)
+        if staging_descriptor >= 0:
+            os.close(staging_descriptor)
+        os.close(parent_descriptor)
+        if not published and staging is not None:
+            remove_staging(output if renamed else staging)
     return verify_fixture(output)
 
 
@@ -658,7 +761,9 @@ def verified_attestation(
     }
 
 
-def verify_fixture(root: Path) -> dict[str, object]:
+def verify_fixture(
+    root: Path, *, expected_root_mode: int = 0o555
+) -> dict[str, object]:
     raw = os.fspath(root)
     if (
         not root.is_absolute()
@@ -674,14 +779,14 @@ def verify_fixture(root: Path) -> dict[str, object]:
         fail(f"cannot inspect fixture root: {error}")
     if (
         not stat.S_ISDIR(root_metadata.st_mode)
-        or stat.S_IMODE(root_metadata.st_mode) != 0o555
+        or stat.S_IMODE(root_metadata.st_mode) != expected_root_mode
         or root_metadata.st_uid != os.getuid()
         or not stat.S_ISDIR(image_metadata.st_mode)
         or stat.S_IMODE(image_metadata.st_mode) != 0o555
         or image_metadata.st_uid != os.getuid()
     ):
         fail(
-            "fixture root and image directory must be caller-owned read-only directories"
+            "fixture root and image directory have unsafe ownership or modes"
         )
     root_inventory = sorted(entry.name for entry in os.scandir(root))
     if root_inventory != [PUBLISHED_MANIFEST_NAME, IMAGE_DIRECTORY]:
