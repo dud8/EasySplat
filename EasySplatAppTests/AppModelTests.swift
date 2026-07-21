@@ -771,7 +771,8 @@ final class AppModelTests: XCTestCase {
         model.addInputs(urls: [input])
         model.startFromPendingSelection()
 
-        try await waitForViewState(model: model, state: .processing)
+        try await waitForPipelineState(model: model, stage: .trainSplat)
+        XCTAssertEqual(model.viewState, .processing)
 
         XCTAssertEqual(model.currentRunOptions?.capturePath, .walkthrough)
         XCTAssertEqual(model.currentRunOptions?.detailProfile, .highDetail)
