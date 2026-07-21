@@ -23,6 +23,7 @@ GEOMETRY_ADAM_FUSION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-geometry-adam-
 PARALLEL_RADIX_SCAN_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-parallel-radix-scan.patch"
 ALLOCATION_PRESSURE_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-allocation-pressure.patch"
 EXACT_PREFIX_HARDENING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-prefix-hardening.patch"
+QUATERNION_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-quaternion-stability.patch"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
@@ -75,6 +76,7 @@ require_file "$GEOMETRY_ADAM_FUSION_PATCH"
 require_file "$PARALLEL_RADIX_SCAN_PATCH"
 require_file "$ALLOCATION_PRESSURE_PATCH"
 require_file "$EXACT_PREFIX_HARDENING_PATCH"
+require_file "$QUATERNION_STABILITY_PATCH"
 for source in \
   "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
   "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -114,7 +116,7 @@ require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT
 require_contains '"overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$VALIDATOR"
 require_contains '"patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$VALIDATOR"
 require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$VALIDATOR"
-require_contains 'RASTER_TEST_SHA256="8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2"' "$BUILD_SCRIPT"
+require_contains 'RASTER_TEST_SHA256="342a18eb850d7671d2d2d39da80d13b146843b012f2aa8ff33f44eece356d802"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$BUILD_SCRIPT"
 require_contains 'NANOFLANN_SHA256="57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc"' "$BUILD_SCRIPT"
@@ -266,6 +268,21 @@ require_contains 'Metal command buffer failed while exact-raster tracking was ac
 require_contains 'event=exact_raster_gpu_timing_unavailable' "$EXACT_PREFIX_HARDENING_PATCH"
 require_contains 'g_exact_raster_timing_warning_emitted = false' "$EXACT_PREFIX_HARDENING_PATCH"
 require_contains 'g_exact_raster_timing_failure.clear()' "$EXACT_PREFIX_HARDENING_PATCH"
+require_contains 'QUATERNION_STABILITY_PATCH_SHA256="d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786"' "$BUILD_SCRIPT"
+actual_quaternion_stability_patch_sha256="$(shasum -a 256 "$QUATERNION_STABILITY_PATCH" | awk '{print $1}')"
+[ "$actual_quaternion_stability_patch_sha256" = "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786" ] \
+  || fail "quaternion-stability patch SHA-256 mismatch"
+require_contains '[ "$(sha256 "$QUATERNION_STABILITY_PATCH")" = "$QUATERNION_STABILITY_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$QUATERNION_STABILITY_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$QUATERNION_STABILITY_PATCH"' "$BUILD_SCRIPT"
+require_contains 'quaternion_stability_patch_sha256' "$BUILD_SCRIPT"
+require_contains 'normalize_quaternion' "$QUATERNION_STABILITY_PATCH"
+require_contains 'v_quat - normalized * dot(normalized, v_quat)' "$QUATERNION_STABILITY_PATCH"
+require_contains 'quaternion_vjp_for_testing_kernel' "$QUATERNION_STABILITY_PATCH"
+require_contains 'msplat_quaternion_vjp_for_testing' "$RASTER_TEST_SOURCE"
+require_contains 'verifyQuaternionVJP' "$RASTER_TEST_SOURCE"
+require_contains '--quaternion-vjp' "$RASTER_TEST_SOURCE"
+require_contains '"$NATIVE_BUILD_DIR/msplat_raster_tests" --quaternion-vjp' "$BUILD_SCRIPT"
 require_contains 'msplat_exact_prefix_sum_for_testing' "$RASTER_TEST_SOURCE"
 require_contains 'verifyExactPrefixOracle' "$RASTER_TEST_SOURCE"
 require_contains '{1023u, 1024u, 1025u, 2048u, 2049u}' "$RASTER_TEST_SOURCE"
@@ -285,6 +302,7 @@ require_contains 'msplat_set_geometry_adam_fusion_enabled_for_testing' "$RASTER_
 for symbol_contract in "$BUILD_SCRIPT" "$VALIDATOR"; do
   require_contains 'msplat_set_geometry_adam_fusion_enabled_for_testing' "$symbol_contract"
   require_contains 'msplat_exact_prefix_sum_for_testing' "$symbol_contract"
+  require_contains 'msplat_quaternion_vjp_for_testing' "$symbol_contract"
   require_contains 'msplat_exact_radix_sort_for_testing' "$symbol_contract"
   require_contains 'msplat_set_raster_memory_budget_and_fail_for_testing' "$symbol_contract"
   require_contains 'msplat_copy_last_raster_reference_debug' "$symbol_contract"
@@ -353,14 +371,16 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'parallel_radix_scan_patch_sha256' "$contract_file"
   require_contains 'allocation_pressure_patch_sha256' "$contract_file"
   require_contains 'exact_prefix_hardening_patch_sha256' "$contract_file"
+  require_contains 'quaternion_stability_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
   require_contains '"overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$contract_file"
   require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$contract_file"
-  require_contains '"raster_test_sha256": "8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2"' "$contract_file"
+  require_contains '"raster_test_sha256": "342a18eb850d7671d2d2d39da80d13b146843b012f2aa8ff33f44eece356d802"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
   require_contains '"allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$contract_file"
   require_contains '"exact_prefix_hardening_patch_sha256": "81e72d3a9f32a6b138e9546892e26323b24da7b8c81dc5ca8e4ba49167e5f59b"' "$contract_file"
+  require_contains '"quaternion_stability_patch_sha256": "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786"' "$contract_file"
 done
 require_contains 'scene_bounds_status' "$SWIFT_VALIDATOR"
 require_contains '"$PYTHON_BIN" - "$build_info"' "$BUILD_SCRIPT"
@@ -1108,7 +1128,7 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256 quaternion_stability_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
@@ -1124,10 +1144,11 @@ geometry_adam_fusion_patch_hash="$(shasum -a 256 "$GEOMETRY_ADAM_FUSION_PATCH" |
 parallel_radix_scan_patch_hash="$(shasum -a 256 "$PARALLEL_RADIX_SCAN_PATCH" | awk '{print $1}')"
 allocation_pressure_patch_hash="$(shasum -a 256 "$ALLOCATION_PRESSURE_PATCH" | awk '{print $1}')"
 exact_prefix_hardening_patch_hash="$(shasum -a 256 "$EXACT_PREFIX_HARDENING_PATCH" | awk '{print $1}')"
+quaternion_stability_patch_hash="$(shasum -a 256 "$QUATERNION_STABILITY_PATCH" | awk '{print $1}')"
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$source_notice_patch_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" "$allocation_pressure_patch_hash" "$exact_prefix_hardening_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$source_notice_patch_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" "$allocation_pressure_patch_hash" "$exact_prefix_hardening_patch_hash" "$quaternion_stability_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -1154,9 +1175,10 @@ expected = {
     "parallel_radix_scan_patch_sha256": sys.argv[12],
     "allocation_pressure_patch_sha256": sys.argv[13],
     "exact_prefix_hardening_patch_sha256": sys.argv[14],
-    "raster_test_sha256": sys.argv[15],
-    "executable_sha256": sys.argv[16],
-    "metallib_sha256": sys.argv[17],
+    "quaternion_stability_patch_sha256": sys.argv[15],
+    "raster_test_sha256": sys.argv[16],
+    "executable_sha256": sys.argv[17],
+    "metallib_sha256": sys.argv[18],
 }
 for key, value in expected.items():
     if payload.get(key) != value:
@@ -1605,6 +1627,7 @@ require_file "$RASTER_TEST_BIN"
   "$fixture_root/17-exact-budget-1279"
 "$RASTER_TEST_BIN" --prefix-oracle
 "$RASTER_TEST_BIN" --radix-oracle
+"$RASTER_TEST_BIN" --quaternion-vjp
 fixture_count=0
 while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do
   fixture_count=$((fixture_count + 1))

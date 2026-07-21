@@ -444,6 +444,7 @@ extension ToolchainManager {
             "parallel_radix_scan_patch_sha256",
             "allocation_pressure_patch_sha256",
             "exact_prefix_hardening_patch_sha256",
+            "quaternion_stability_patch_sha256",
             "patch_sha256",
             "source_notice_patch_sha256",
             "checkpoint_patch_sha256",
@@ -492,7 +493,7 @@ extension ToolchainManager {
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
             "overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23",
-            "raster_test_sha256": "8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2",
+            "raster_test_sha256": "342a18eb850d7671d2d2d39da80d13b146843b012f2aa8ff33f44eece356d802",
             "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
             "source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb",
             "exact_raster_patch_sha256": "c34a8860ed8ae9bc92c976aaa1c3f89eec8aa9be9cab4778f074491e98860855",
@@ -504,6 +505,7 @@ extension ToolchainManager {
             "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
             "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
             "exact_prefix_hardening_patch_sha256": "81e72d3a9f32a6b138e9546892e26323b24da7b8c81dc5ca8e4ba49167e5f59b",
+            "quaternion_stability_patch_sha256": "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786",
             "deployment_target": "macOS 15.0",
             "build_configuration": "Release",
         ]
@@ -533,6 +535,7 @@ extension ToolchainManager {
             "parallel_radix_scan_patch_sha256",
             "allocation_pressure_patch_sha256",
             "exact_prefix_hardening_patch_sha256",
+            "quaternion_stability_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]

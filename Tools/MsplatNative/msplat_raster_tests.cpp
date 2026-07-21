@@ -42,6 +42,11 @@ void msplat_exact_prefix_sum_for_testing(
     std::uint32_t count,
     std::uint64_t *output
 );
+void msplat_quaternion_vjp_for_testing(
+    const float *quaternion,
+    const float *rotationGradient,
+    float *quaternionGradient
+);
 
 namespace {
 
@@ -54,6 +59,123 @@ constexpr float absoluteTolerance = 2.0e-4f;
 constexpr float overflowReferenceOpacity = 1.0f / 240.0f;
 constexpr int stageTimingIterations = 512;
 constexpr int geometryAdamShDegreeInterval = 4;
+
+void quaternionRotation(
+    const double *quaternion,
+    double *rotation
+) {
+    const double norm = std::sqrt(
+        quaternion[0] * quaternion[0] +
+        quaternion[1] * quaternion[1] +
+        quaternion[2] * quaternion[2] +
+        quaternion[3] * quaternion[3]
+    );
+    if (!std::isfinite(norm) || norm <= 0) {
+        throw std::runtime_error("quaternion VJP oracle received an invalid quaternion");
+    }
+    const double w = quaternion[0] / norm;
+    const double x = quaternion[1] / norm;
+    const double y = quaternion[2] / norm;
+    const double z = quaternion[3] / norm;
+    const double values[] = {
+        1.0 - 2.0 * (y * y + z * z),
+        2.0 * (x * y + w * z),
+        2.0 * (x * z - w * y),
+        2.0 * (x * y - w * z),
+        1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z + w * x),
+        2.0 * (x * z + w * y),
+        2.0 * (y * z - w * x),
+        1.0 - 2.0 * (x * x + y * y),
+    };
+    std::copy(std::begin(values), std::end(values), rotation);
+}
+
+double quaternionRotationObjective(
+    const double *quaternion,
+    const float *rotationGradient
+) {
+    double rotation[9];
+    quaternionRotation(quaternion, rotation);
+    double result = 0;
+    for (int index = 0; index < 9; ++index) {
+        result += rotation[index] * static_cast<double>(rotationGradient[index]);
+    }
+    return result;
+}
+
+void verifyQuaternionVJP() {
+    const float quaternion[] = {2.0f, -0.7f, 1.3f, 0.4f};
+    const float rotationGradient[] = {
+        0.4f, -0.2f, 0.7f,
+        -0.6f, 0.3f, 0.1f,
+        0.8f, -0.5f, 0.9f,
+    };
+    float gradient[4];
+    msplat_quaternion_vjp_for_testing(quaternion, rotationGradient, gradient);
+
+    double radialDerivative = 0;
+    for (int index = 0; index < 4; ++index) {
+        if (!std::isfinite(gradient[index])) {
+            throw std::runtime_error("quaternion VJP contains a non-finite value");
+        }
+        radialDerivative += static_cast<double>(quaternion[index]) * gradient[index];
+    }
+    if (std::abs(radialDerivative) > 2.0e-4) {
+        throw std::runtime_error(
+            "quaternion VJP is not tangent to the scale-invariant rotation: " +
+            std::to_string(radialDerivative)
+        );
+    }
+
+    float scaledQuaternion[4];
+    float scaledGradient[4];
+    for (int index = 0; index < 4; ++index) {
+        scaledQuaternion[index] = quaternion[index] * 2.0f;
+    }
+    msplat_quaternion_vjp_for_testing(
+        scaledQuaternion,
+        rotationGradient,
+        scaledGradient
+    );
+    for (int index = 0; index < 4; ++index) {
+        const double expected = static_cast<double>(gradient[index]) * 0.5;
+        if (!std::isfinite(scaledGradient[index]) ||
+            std::abs(static_cast<double>(scaledGradient[index]) - expected) > 2.0e-4) {
+            throw std::runtime_error(
+                "quaternion VJP does not scale inversely with quaternion norm"
+            );
+        }
+    }
+
+    constexpr double epsilon = 1.0e-4;
+    for (int component = 0; component < 4; ++component) {
+        double positive[4];
+        double negative[4];
+        for (int index = 0; index < 4; ++index) {
+            positive[index] = quaternion[index];
+            negative[index] = quaternion[index];
+        }
+        positive[component] += epsilon;
+        negative[component] -= epsilon;
+        const double finiteDifference = (
+            quaternionRotationObjective(positive, rotationGradient) -
+            quaternionRotationObjective(negative, rotationGradient)
+        ) / (2.0 * epsilon);
+        const double actual = gradient[component];
+        const double tolerance = 3.0e-3 * std::max(1.0, std::abs(finiteDifference));
+        if (!std::isfinite(finiteDifference) || std::abs(actual - finiteDifference) > tolerance) {
+            throw std::runtime_error(
+                "quaternion VJP differs from finite differences at component " +
+                std::to_string(component) + ": actual=" + std::to_string(actual) +
+                " expected=" + std::to_string(finiteDifference)
+            );
+        }
+    }
+
+    cleanup_msplat_metal();
+    std::cout << "quaternion_vjp passed\n";
+}
 
 void verifyExactRadixPassPlanning() {
     struct PassCase {
@@ -2528,6 +2650,10 @@ int main(int argc, char **argv) {
             verifyExactRadixOracle();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--quaternion-vjp") {
+            verifyQuaternionVJP();
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--geometry-adam-benchmark") {
             benchmarkGeometryAdamFusion(argv[2]);
             return 0;
@@ -2547,6 +2673,7 @@ int main(int argc, char **argv) {
                 "<increasing-overflow dataset> <exact-budget dataset>\n"
                 "       msplat-raster-tests --prefix-oracle\n"
                 "       msplat-raster-tests --radix-oracle\n"
+                "       msplat-raster-tests --quaternion-vjp\n"
                 "       msplat-raster-tests --overflow-cpu-reference <overflow dataset>\n"
                 "       msplat-raster-tests --stage-timing <profile dataset>\n"
                 "       msplat-raster-tests --geometry-adam-benchmark <dataset>"

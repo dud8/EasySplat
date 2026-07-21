@@ -34,6 +34,7 @@ reject_raster_test_symbols() {
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_exact_radix_pass_count_for_testing \
     msplat_exact_prefix_sum_for_testing \
+    msplat_quaternion_vjp_for_testing \
     msplat_exact_radix_sort_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
     msplat_gpu_frequency_from_timestamp_pairs_for_testing \
@@ -104,6 +105,7 @@ expected_keys = {
     "build_timestamp",
     "allocation_pressure_patch_sha256",
     "exact_prefix_hardening_patch_sha256",
+    "quaternion_stability_patch_sha256",
     "cmake",
     "cmake_arguments",
     "checkpoint_patch_sha256",
@@ -148,7 +150,7 @@ exact_values = {
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
     "overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23",
-    "raster_test_sha256": "8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2",
+    "raster_test_sha256": "342a18eb850d7671d2d2d39da80d13b146843b012f2aa8ff33f44eece356d802",
     "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
     "source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
@@ -163,6 +165,7 @@ exact_values = {
     "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
     "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
     "exact_prefix_hardening_patch_sha256": "81e72d3a9f32a6b138e9546892e26323b24da7b8c81dc5ca8e4ba49167e5f59b",
+    "quaternion_stability_patch_sha256": "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -213,6 +216,7 @@ for key in (
     "parallel_radix_scan_patch_sha256",
     "allocation_pressure_patch_sha256",
     "exact_prefix_hardening_patch_sha256",
+    "quaternion_stability_patch_sha256",
     "raster_test_sha256",
     "executable_sha256",
     "metallib_sha256",

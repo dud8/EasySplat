@@ -19,7 +19,7 @@ INSTALL_STAGE_INODE=""
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 OVERLAY_SHA256="ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="8f492ba1dd1fabd480b6069fd4658f9f38d34169be78033a96c929956fcaa8b2"
+RASTER_TEST_SHA256="342a18eb850d7671d2d2d39da80d13b146843b012f2aa8ff33f44eece356d802"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"
@@ -48,6 +48,8 @@ ALLOCATION_PRESSURE_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-allocation-pres
 ALLOCATION_PRESSURE_PATCH_SHA256="d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"
 EXACT_PREFIX_HARDENING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-prefix-hardening.patch"
 EXACT_PREFIX_HARDENING_PATCH_SHA256="81e72d3a9f32a6b138e9546892e26323b24da7b8c81dc5ca8e4ba49167e5f59b"
+QUATERNION_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-quaternion-stability.patch"
+QUATERNION_STABILITY_PATCH_SHA256="d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
@@ -154,6 +156,7 @@ reject_raster_test_symbols() {
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_exact_radix_pass_count_for_testing \
     msplat_exact_prefix_sum_for_testing \
+    msplat_quaternion_vjp_for_testing \
     msplat_exact_radix_sort_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
     msplat_gpu_frequency_from_timestamp_pairs_for_testing \
@@ -236,6 +239,10 @@ preflight() {
     || die "missing exact-prefix hardening patch: $EXACT_PREFIX_HARDENING_PATCH"
   [ "$(sha256 "$EXACT_PREFIX_HARDENING_PATCH")" = "$EXACT_PREFIX_HARDENING_PATCH_SHA256" ] \
     || die "exact-prefix hardening patch SHA-256 mismatch"
+  [ -f "$QUATERNION_STABILITY_PATCH" ] \
+    || die "missing quaternion-stability patch: $QUATERNION_STABILITY_PATCH"
+  [ "$(sha256 "$QUATERNION_STABILITY_PATCH")" = "$QUATERNION_STABILITY_PATCH_SHA256" ] \
+    || die "quaternion-stability patch SHA-256 mismatch"
   for source in \
     "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
     "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -345,6 +352,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply "$EXACT_PREFIX_HARDENING_PATCH"
   git -C "$SOURCE_DIR" apply --unidiff-zero --check "$SOURCE_NOTICE_PATCH"
   git -C "$SOURCE_DIR" apply --unidiff-zero "$SOURCE_NOTICE_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$QUATERNION_STABILITY_PATCH"
+  git -C "$SOURCE_DIR" apply "$QUATERNION_STABILITY_PATCH"
 }
 
 configure_and_build() {
@@ -392,12 +401,13 @@ configure_and_build() {
     --stage-timing "$RASTER_TEST_FIXTURES/01-sphere-500"
   "$NATIVE_BUILD_DIR/msplat_raster_tests" --prefix-oracle
   "$NATIVE_BUILD_DIR/msplat_raster_tests" --radix-oracle
+  "$NATIVE_BUILD_DIR/msplat_raster_tests" --quaternion-vjp
 }
 
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256 quaternion_stability_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -419,10 +429,11 @@ write_build_info() {
   parallel_radix_scan_patch_sha256="$(sha256 "$PARALLEL_RADIX_SCAN_PATCH")"
   allocation_pressure_patch_sha256="$(sha256 "$ALLOCATION_PRESSURE_PATCH")"
   exact_prefix_hardening_patch_sha256="$(sha256 "$EXACT_PREFIX_HARDENING_PATCH")"
+  quaternion_stability_patch_sha256="$(sha256 "$QUATERNION_STABILITY_PATCH")"
 
   "$PYTHON_BIN" - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$source_notice_patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" "$parallel_radix_scan_patch_sha256" "$allocation_pressure_patch_sha256" "$exact_prefix_hardening_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$source_notice_patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" "$parallel_radix_scan_patch_sha256" "$allocation_pressure_patch_sha256" "$exact_prefix_hardening_patch_sha256" "$quaternion_stability_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -451,6 +462,7 @@ import sys
     parallel_radix_scan_patch_sha256,
     allocation_pressure_patch_sha256,
     exact_prefix_hardening_patch_sha256,
+    quaternion_stability_patch_sha256,
     nlohmann_json_sha256,
     nanoflann_sha256,
     cli11_sha256,
@@ -484,6 +496,7 @@ payload = {
     "parallel_radix_scan_patch_sha256": parallel_radix_scan_patch_sha256,
     "allocation_pressure_patch_sha256": allocation_pressure_patch_sha256,
     "exact_prefix_hardening_patch_sha256": exact_prefix_hardening_patch_sha256,
+    "quaternion_stability_patch_sha256": quaternion_stability_patch_sha256,
     "dependencies": {
         "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
         "nanoflann_v1.5.5_sha256": nanoflann_sha256,
