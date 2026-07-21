@@ -954,8 +954,8 @@ class PortableTreeIdentityTests(unittest.TestCase):
             root.mkdir()
             payload = root / "payload.bin"
             payload.write_bytes(b"portable payload\n")
-            os.chmod(root, 0o755)
-            os.chmod(payload, 0o644)
+            os.chmod(root, 0o700)
+            os.chmod(payload, 0o600)
             os.utime(payload, (946684800, 946684800))
             os.utime(root, (946684800, 946684800))
             expected = tree_digest(root)

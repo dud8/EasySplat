@@ -274,10 +274,16 @@ grep -Fq 'needs: live-policy-preflight' <<<"$minimum_release_block" \
   || fail "minimum compatibility must wait for live protected-main preflight"
 grep -Fq 'runs-on: macos-15' <<<"$minimum_release_block" \
   || fail "minimum deployment compatibility must run on macOS 15"
+grep -Fq 'ref: ${{ github.sha }}' <<<"$minimum_release_block" \
+  || fail "minimum compatibility checkout must use the workflow invocation SHA"
 grep -Fq 'needs: [live-policy-preflight, minimum-macos-compatibility]' <<<"$prepare_release_block" \
   || fail "release preparation must wait for hosted policy and compatibility"
-grep -Fq 'ref: ${{ needs.live-policy-preflight.outputs.source_commit }}' <<<"$prepare_release_block" \
-  || fail "build-authority checkout must bind the hosted preflight source commit"
+grep -Fq 'ref: ${{ github.sha }}' <<<"$prepare_release_block" \
+  || fail "build-authority checkout must use the workflow invocation SHA"
+if grep -Fq 'ref: ${{ needs.live-policy-preflight.outputs.source_commit }}' \
+    <<<"$minimum_release_block$prepare_release_block"; then
+  fail "hosted release checkouts must not consume a job output as their source ref"
+fi
 if grep -Eq '^[[:space:]]+environment:' <<<"$prepare_release_block"; then
   fail "release preparation must not inherit protected environment authority"
 fi

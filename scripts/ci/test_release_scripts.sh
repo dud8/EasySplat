@@ -7159,7 +7159,7 @@ for required in (
     "runs-on: macos-26",
     "RUNNER_ENVIRONMENT: ${{ runner.environment }}",
     'test "$RUNNER_ENVIRONMENT" = "github-hosted"',
-    "ref: ${{ needs.live-policy-preflight.outputs.source_commit }}",
+    "ref: ${{ github.sha }}",
     "0valididentitiesfound",
 ):
     if required not in prepare:

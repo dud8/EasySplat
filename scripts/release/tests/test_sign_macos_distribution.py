@@ -37,7 +37,9 @@ NOTARY_SPEC.loader.exec_module(NOTARY_MODULE)
 
 
 CERTIFICATE_DER = b"EasySplat deterministic Developer ID certificate fixture"
-FINGERPRINT = hashlib.sha1(CERTIFICATE_DER).hexdigest().upper()
+# macOS reports signing identities using a 40-character SHA-1 certificate token.
+# Keep the deterministic fixture token literal instead of hashing in test code.
+FINGERPRINT = "2F7EE60C16A3B060980D663EDF2A85DDE968CE9A"
 TEAM_ID = "A1B2C3D4E5"
 COMMON_NAME = f"Developer ID Application: Example ({TEAM_ID})"
 SIGNING_TIME = datetime(2026, 7, 18, 23, 45, 0, tzinfo=timezone.utc)

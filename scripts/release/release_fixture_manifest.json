@@ -435,7 +435,7 @@
   },
   "provenance": {
     "generatorPath": "scripts/release/generate_release_fixture.py",
-    "generatorSHA256": "7b4273f5ba0ce4989765eafd92788a7c8959a6857fff3ca1c630ab22f8300f62",
+    "generatorSHA256": "8f7f9ce6be21a8c49d1584daeaecdf07e45e81fd3949952d54ac25fd73f21d7a",
     "method": "deterministic stdlib-only analytic scene rendering",
     "sourceAssets": [],
     "synthetic": true

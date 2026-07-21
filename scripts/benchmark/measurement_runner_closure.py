@@ -91,7 +91,7 @@ def write_new_regular(path: Path, contents: bytes) -> None:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o644)
+        descriptor = os.open(path, flags, 0o600)
     except OSError as error:
         raise ClosureError("identity output could not be created safely") from error
     try:
@@ -175,20 +175,20 @@ def build(arguments: argparse.Namespace) -> None:
             reference_adapter,
         ),
     )
-    output.mkdir(parents=True, mode=0o755)
+    output.mkdir(parents=True, mode=0o700)
     shutil.copyfile(executable, output / EXECUTABLE_NAME, follow_symlinks=False)
-    os.chmod(output / EXECUTABLE_NAME, 0o755)
+    os.chmod(output / EXECUTABLE_NAME, 0o700)
     shutil.copyfile(adapter, output / ADAPTER_NAME, follow_symlinks=False)
-    os.chmod(output / ADAPTER_NAME, 0o644)
+    os.chmod(output / ADAPTER_NAME, 0o600)
     shutil.copyfile(support, output / SUPPORT_NAME, follow_symlinks=False)
-    os.chmod(output / SUPPORT_NAME, 0o644)
+    os.chmod(output / SUPPORT_NAME, 0o600)
     for source, name in (
         (candidate_adapter, CANDIDATE_ADAPTER_NAME),
         (baseline_adapter, BASELINE_ADAPTER_NAME),
         (reference_adapter, REFERENCE_ADAPTER_NAME),
     ):
         shutil.copyfile(source, output / name, follow_symlinks=False)
-        os.chmod(output / name, 0o755)
+        os.chmod(output / name, 0o700)
     identity = closure_identity(
         output,
         source_commit=arguments.source_commit,

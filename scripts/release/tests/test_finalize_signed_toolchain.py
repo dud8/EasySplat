@@ -1513,7 +1513,7 @@ class FinalizerTests(unittest.TestCase):
             def open_decoy_parent(
                 path: Any,
                 flags: int,
-                mode: int = 0o777,
+                _mode: int = 0o600,
                 *,
                 dir_fd: int | None = None,
             ) -> int:
@@ -1530,14 +1530,16 @@ class FinalizerTests(unittest.TestCase):
                     os.rename(fixture.root, held)
                     fixture.root.mkdir(mode=0o700)
                     try:
-                        descriptor = original_open(path, flags, mode)
+                        descriptor = original_open(path, flags)
                     finally:
                         fixture.root.rmdir()
                         os.rename(held, fixture.root)
                     return descriptor
+                if flags & os.O_CREAT:
+                    return original_open(path, flags, 0o600, dir_fd=dir_fd)
                 if dir_fd is None:
-                    return original_open(path, flags, mode)
-                return original_open(path, flags, mode, dir_fd=dir_fd)
+                    return original_open(path, flags)
+                return original_open(path, flags, dir_fd=dir_fd)
 
             with (
                 mock.patch.object(os, "open", side_effect=open_decoy_parent),

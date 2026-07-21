@@ -1094,7 +1094,7 @@ class BundleBoundaryTests(unittest.TestCase):
             def mutate_before_second_open(
                 path: object,
                 flags: int,
-                mode: int = 0o777,
+                _mode: int = 0o600,
                 *,
                 dir_fd: int | None = None,
             ) -> int:
@@ -1103,7 +1103,9 @@ class BundleBoundaryTests(unittest.TestCase):
                     first.write_bytes(b"CCCC")
                     second.write_bytes(b"EVIL")
                     mutated = True
-                return real_open(path, flags, mode, dir_fd=dir_fd)
+                if flags & os.O_CREAT:
+                    return real_open(path, flags, 0o600, dir_fd=dir_fd)
+                return real_open(path, flags, dir_fd=dir_fd)
 
             with mock.patch.object(
                 MODULE.os,

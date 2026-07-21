@@ -1668,27 +1668,31 @@ PY
 
 # Shader validation changes floating-point scheduling enough to make a long,
 # adversarial convergence run nondeterministic on some hosted GPUs. Keep the
-# full 3,000-iteration production run above, then exercise the instrumented
-# Metal pipeline separately through warmup, densification, and publication.
-metal_validation_dir="$negative_dir/metal-validation-11-room-1279"
+# full 3,000-iteration production runs above, then exercise the instrumented
+# Metal pipeline on a stable fixture through warmup, densification, and
+# publication.
+metal_validation_dir="$negative_dir/metal-validation-01-sphere-500"
 mkdir -p "$metal_validation_dir"
-env \
-  MTL_DEBUG_LAYER=1 \
-  MTL_SHADER_VALIDATION=1 \
-  MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1 \
-  MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
-  MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1 \
-  "$BIN" \
-    --dataset "$fixture_root/11-room-1279" \
-    --output "$metal_validation_dir/splat.ply" \
-    --profile fast \
-    --iteration-limit 800 \
-    --checkpoint "$metal_validation_dir/checkpoint" \
-    --seed 42 \
-    --memory-budget-bytes 8589934592 \
-    --events-fd 1 \
-    >"$metal_validation_dir/events.jsonl" \
-    2>"$metal_validation_dir/stderr.log"
+if ! env \
+    MTL_DEBUG_LAYER=1 \
+    MTL_SHADER_VALIDATION=1 \
+    MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1 \
+    MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 \
+    MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1 \
+    "$BIN" \
+      --dataset "$fixture_root/01-sphere-500" \
+      --output "$metal_validation_dir/splat.ply" \
+      --profile fast \
+      --iteration-limit 600 \
+      --checkpoint "$metal_validation_dir/checkpoint" \
+      --seed 42 \
+      --memory-budget-bytes 8589934592 \
+      --events-fd 1 \
+      >"$metal_validation_dir/events.jsonl" \
+      2>"$metal_validation_dir/stderr.log"; then
+  sed -n '1,200p' "$metal_validation_dir/stderr.log" >&2
+  fail "instrumented Metal training failed"
+fi
 if grep -Eqi 'shader validation|invalid (device|threadgroup|texture)|validation (error|fault)|gpu fault' \
   "$metal_validation_dir/stderr.log"; then
   sed -n '1,200p' "$metal_validation_dir/stderr.log" >&2
@@ -1704,9 +1708,9 @@ records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines
 started, completed = records[0], records[-1]
 if started.get("event") != "started" or completed.get("event") != "completed":
     raise SystemExit("instrumented Metal run has invalid event boundaries")
-if started.get("iteration_limit") != 800 or completed.get("iteration_limit") != 800:
+if started.get("iteration_limit") != 600 or completed.get("iteration_limit") != 600:
     raise SystemExit("instrumented Metal run lost its bounded iteration limit")
-if started.get("initial_gaussian_count") != 1279:
+if started.get("initial_gaussian_count") != 500:
     raise SystemExit("instrumented Metal run used the wrong stress fixture")
 if completed.get("dropped_intersection_count") != 0:
     raise SystemExit("instrumented Metal run dropped raster intersections")

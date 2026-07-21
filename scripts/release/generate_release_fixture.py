@@ -494,7 +494,7 @@ def inspect_safe_parent(path: Path) -> Path:
 def write_file(path: Path, payload: bytes, mode: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, mode)
+    descriptor = os.open(path, flags, 0o600)
     try:
         view = memoryview(payload)
         while view:
