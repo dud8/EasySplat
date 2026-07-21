@@ -771,6 +771,110 @@ Model makeModel(const InputData &inputData, int shDegreeInterval = 1000) {
     );
 }
 
+void verifyPartialThreadgroupLossAccounting(const std::string &dataset) {
+    constexpr int width = 33;
+    constexpr int height = 35;
+    constexpr int step = 1;
+    constexpr float edgeDelta = 0.25f;
+
+    auto measureLoss = [&](bool perturbBottomRightPixel, float ssimWeight) {
+        cleanup_msplat_metal();
+        msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+        msplat_set_raster_fallback_count(0);
+        msplat_set_force_exact_for_testing(false);
+        msplat_set_geometry_adam_fusion_enabled_for_testing(true);
+
+        float loss = std::numeric_limits<float>::quiet_NaN();
+        {
+            InputData inputData = inputDataFromX(dataset);
+            if (inputData.cameras.empty() || inputData.points.count <= 0) {
+                throw std::runtime_error(
+                    "partial-threadgroup loss fixture has no camera or sparse points"
+                );
+            }
+            Camera &camera = inputData.cameras.front();
+            const float scaleX = static_cast<float>(width) /
+                static_cast<float>(camera.width);
+            const float scaleY = static_cast<float>(height) /
+                static_cast<float>(camera.height);
+            camera.fx *= scaleX;
+            camera.cx *= scaleX;
+            camera.fy *= scaleY;
+            camera.cy *= scaleY;
+            camera.width = width;
+            camera.height = height;
+            camera.image = {};
+            camera.imagePyramids.clear();
+            camera.mtensorImageCache.clear();
+            camera.cachedViewMat = MTensor();
+            camera.cachedProjViewMat = MTensor();
+            camera.cachedFovX = 0;
+            camera.cachedFovY = 0;
+
+            Model model = makeModel(inputData);
+            MTensor rendered = model.render(camera, step);
+            msplat_commit();
+            msplat_gpu_sync();
+
+            std::vector<float> targetPixels = copyTensor(rendered);
+            const std::size_t expectedPixelCount =
+                static_cast<std::size_t>(width) * height * 3;
+            if (targetPixels.size() != expectedPixelCount) {
+                throw std::runtime_error(
+                    "partial-threadgroup render has an unexpected pixel count"
+                );
+            }
+            if (perturbBottomRightPixel) {
+                const std::size_t edge =
+                    (static_cast<std::size_t>(height - 1) * width + width - 1) * 3;
+                for (int channel = 0; channel < 3; ++channel) {
+                    targetPixels[edge + channel] += edgeDelta;
+                }
+            }
+
+            MTensor target = gpu_empty({height, width, 3}, DType::Float32);
+            std::memcpy(
+                target.data_ptr(),
+                targetPixels.data(),
+                targetPixels.size() * sizeof(float)
+            );
+            msplat_set_raster_iteration_context(step, 0);
+            model.fullIteration(camera, step, target, ssimWeight);
+            msplat_record_last_loss(
+                0,
+                1,
+                1.0f / static_cast<float>(width * height)
+            );
+            msplat_commit();
+            msplat_sync_loss_window(1, &loss);
+        }
+        cleanup_msplat_metal();
+        return loss;
+    };
+
+    const float identityLoss = measureLoss(false, 0.2f);
+    if (!std::isfinite(identityLoss) || std::abs(identityLoss) > 1.0e-6f) {
+        throw std::runtime_error(
+            "partial SSIM threadgroup identity loss was not zero: " +
+            std::to_string(identityLoss)
+        );
+    }
+
+    const float edgeLoss = measureLoss(true, 0.0f);
+    const float expectedEdgeLoss = edgeDelta / static_cast<float>(width * height);
+    const float edgeTolerance = std::max(1.0e-7f, expectedEdgeLoss * 1.0e-3f);
+    if (!std::isfinite(edgeLoss) ||
+        std::abs(edgeLoss - expectedEdgeLoss) > edgeTolerance) {
+        throw std::runtime_error(
+            "partial threadgroup omitted an edge loss contribution: actual=" +
+            std::to_string(edgeLoss) +
+            " expected=" + std::to_string(expectedEdgeLoss)
+        );
+    }
+
+    std::cout << "partial threadgroup loss accounting passed\n";
+}
+
 void setUniformOpacity(Model &model, float opacity) {
     if (!(opacity > 1.0f / 255.0f && opacity < 1.0f)) {
         throw std::runtime_error("test opacity must survive the raster alpha threshold");
@@ -2702,6 +2806,8 @@ int main(int argc, char **argv) {
         requireNear("color_second_moment", fast.colorSecondMoment, exact.colorSecondMoment);
         requireNear("opacity_first_moment", fast.opacityFirstMoment, exact.opacityFirstMoment);
         requireNear("opacity_second_moment", fast.opacitySecondMoment, exact.opacitySecondMoment);
+
+        verifyPartialThreadgroupLossAccounting(dataset);
 
         const RasterResult culledFast = runSingleStep(dataset, false, true);
         const RasterResult culledExact = runSingleStep(dataset, true, true);

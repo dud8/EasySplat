@@ -356,3 +356,103 @@ diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
 +        output[index] = static_cast<float>(std::max(0.0, value));
      }
  }
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -2578,32 +2578,38 @@ static void forward_pipeline(
+     // Fused loss: ssim_h_fwd → fused_v_fwd_h_bwd → ssim_v_bwd
+     // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
+     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
+-        MTLSize grid = MTLSizeMake(img_width, img_height, 1);
+         MTLSize tg = MTLSizeMake(8, 8, 1);
++        // Each SSIM stage cooperatively fills threadgroup memory with all 64
++        // threads. Dispatch complete groups and let the kernels mask edge pixels.
++        MTLSize loss_threadgroups = MTLSizeMake(
++            (static_cast<NSUInteger>(img_width) + tg.width - 1) / tg.width,
++            (static_cast<NSUInteger>(img_height) + tg.height - 1) / tg.height,
++            1
++        );
+         // Pass 1: H conv on images → ssim_h_buf
+         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
+         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
+         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
+-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
++        [enc dispatchThreadgroups:loss_threadgroups threadsPerThreadgroup:tg];
+         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+         // Pass 2: Fused V fwd + H bwd
+         [enc setComputePipelineState:ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
+         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+         ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
+         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
+         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
+         ENC_BUF(enc, loss_intermediates, 6); ENC_BUF(enc, loss_sum, 7);
+-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
++        [enc dispatchThreadgroups:loss_threadgroups threadsPerThreadgroup:tg];
+         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+         // Pass 3: V bwd
+         [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
+         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+         ENC_BUF(enc, loss_intermediates, 2);
+         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
+         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
+         ENC_BUF(enc, v_rendered, 6);
+-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
++        [enc dispatchThreadgroups:loss_threadgroups threadsPerThreadgroup:tg];
+     };
+ 
+     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -4110,6 +4110,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
+     constexpr uint TILE_DIM = SSIM_TG + 2 * SSIM_HALF_WIN;
+     constexpr uint TILE_PIXELS = TILE_DIM * TILE_DIM;
+     float ssim_sum = 0.0f, l1_sum = 0.0f;
++    uint valid_pixel_count = 0;
+ 
+     for (uint c = 0; c < 3; c++) {
+         threadgroup float tg_hp[TILE_DIM][TILE_DIM][5];
+@@ -4146,13 +4147,22 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
+             float iCD = 1.0f / (Cd * D);
+             float dmu = 2.0f*B*(mu_x*Cd - A*mu_y) / (Cd*Cd*D);
+             float dsyq = -A*B*iCD/D, dsxy = 2.0f*A*iCD;
+-            tg_f1[dy][dx] = dmu - 2.0f*mu_y*dsyq - mu_x*dsxy;
+-            tg_f2[dy][dx] = 2.0f*dsyq;
+-            tg_f3[dy][dx] = dsxy;
+-            if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
+-                int gpx = base_gx + (int)dx, gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
+-                if (gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H) {
+-                    ssim_sum += (A * B) / (Cd * D);
+-                    l1_sum += fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
+-                }
++            const int gpx = base_gx + (int)dx;
++            const int gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
++            const bool valid_center =
++                gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H;
++            if (valid_center) {
++                tg_f1[dy][dx] = dmu - 2.0f*mu_y*dsyq - mu_x*dsxy;
++                tg_f2[dy][dx] = 2.0f*dsyq;
++                tg_f3[dy][dx] = dsxy;
++            } else {
++                tg_f1[dy][dx] = 0.0f;
++                tg_f2[dy][dx] = 0.0f;
++                tg_f3[dy][dx] = 0.0f;
++            }
++            if (valid_center &&
++                dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
++                if (c == 0) ++valid_pixel_count;
++                ssim_sum += (A * B) / (Cd * D);
++                l1_sum += fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
+             }
+@@ -4172,7 +4182,9 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+ 
+-    float pixel_loss = (px < W && py < H) ? ssim_weight*(1.0f-ssim_sum/3.0f) + (1.0f-ssim_weight)*l1_sum/3.0f : 0.0f;
++    float pixel_loss =
++        ssim_weight * (float(valid_pixel_count) - ssim_sum / 3.0f) +
++        (1.0f - ssim_weight) * l1_sum / 3.0f;
+     threadgroup float tg_sum[256];
+     tg_sum[tr] = pixel_loss;
+     threadgroup_barrier(mem_flags::mem_threadgroup);
