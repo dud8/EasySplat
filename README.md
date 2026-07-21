@@ -6,9 +6,9 @@ The first stable release is `v0.2.0` for macOS 15 and later.
 
 ## Install EasySplat
 
-Download `EasySplat-0.2.0.dmg` from [GitHub Releases](https://github.com/dud8/EasySplat/releases), open it, and drag EasySplat to Applications. Launch the app normally from Applications.
+When `EasySplat-0.2.0.dmg` is present on [GitHub Releases](https://github.com/dud8/EasySplat/releases), open it and drag EasySplat to Applications. Until that signed asset is published, use the [source build](#build-from-source); do not download an EasySplat binary from another source.
 
-The GitHub build is Developer ID signed, notarized, stapled, and checked by Gatekeeper during release verification. Initial setup needs internet access because EasySplat downloads only the signed toolchain components required by the selected job. Successfully cached components can be reused offline. Each component is bound to a signed manifest and verified before installation.
+The release workflow publishes the GitHub build only after Developer ID signing, notarization, stapling, and Gatekeeper verification pass. Initial setup needs internet access because EasySplat downloads only the signed toolchain components required by the selected job. Successfully cached components can be reused offline. Each component is bound to a signed manifest and verified before installation.
 
 ## Make a splat
 
