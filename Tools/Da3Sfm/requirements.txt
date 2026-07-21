@@ -1,5 +1,5 @@
 numpy==2.3.5
-pillow==12.1.0
+pillow==12.3.0
 safetensors==0.7.0
 torch==2.10.0
 torchvision==0.25.0
