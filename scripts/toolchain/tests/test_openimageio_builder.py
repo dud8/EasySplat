@@ -881,6 +881,12 @@ class WrapperHostileEnvironmentTests(unittest.TestCase):
         wrapper = BUILDER.read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            tools = root / "tools"
+            tools.mkdir()
+            for name in ("cmake", "ninja", "rg"):
+                path = tools / name
+                path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                path.chmod(0o755)
             copied_wrapper = root / BUILDER.name
             copied_impl = root / IMPLEMENTATION.name
             copied_freezer = root / CONTROL_FREEZER.name
@@ -903,6 +909,7 @@ class WrapperHostileEnvironmentTests(unittest.TestCase):
             environment = dict(os.environ)
             environment.update(
                 {
+                    "PATH": f"{tools}:/usr/bin:/bin:/usr/sbin:/sbin",
                     "EASYSPLAT_BOOTSTRAP_CMAKE": "/tmp/forged-cmake",
                     "EASYSPLAT_BOOTSTRAP_NINJA": "/tmp/forged-ninja",
                     "EASYSPLAT_BOOTSTRAP_RG": "/tmp/forged-rg",
@@ -916,8 +923,9 @@ class WrapperHostileEnvironmentTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 env=environment,
-                check=True,
+                check=False,
             )
+            self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("forged", result.stdout)
             self.assertNotIn("DYLD_", result.stdout)
             self.assertNotIn("CMAKE_PROJECT_INCLUDE", result.stdout)
