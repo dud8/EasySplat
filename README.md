@@ -8,7 +8,7 @@ The first stable release is `v0.2.0` for macOS 15 and later.
 
 Download `EasySplat-0.2.0.dmg` from [GitHub Releases](https://github.com/dud8/EasySplat/releases), open it, and drag EasySplat to Applications. Launch the app normally from Applications.
 
-The GitHub build is Developer ID signed, notarized, stapled, and checked by Gatekeeper during release verification. EasySplat then downloads only the toolchain components needed for the selected job. Each component is bound to a signed manifest and verified before installation.
+The GitHub build is Developer ID signed, notarized, stapled, and checked by Gatekeeper during release verification. Initial setup needs internet access because EasySplat downloads only the signed toolchain components required by the selected job. Successfully cached components can be reused offline. Each component is bound to a signed manifest and verified before installation.
 
 ## Make a splat
 
@@ -174,11 +174,13 @@ Fixture reproducibility proves input integrity only. The integrated geometry-con
 
 ## Release builds
 
-Stable release packaging is performed only by the protected **Release App** workflow. It checks out the exact `v0.2.0` commit on protected `main`, builds an identity-free prepared product, and hands those authenticated bytes to the isolated signing environment. `build_dmg.sh --production` intentionally rejects a live source checkout.
+Stable release packaging is performed only by the protected workflows. `build_dmg.sh --production` intentionally rejects a live source checkout.
 
-The signed manifest, public key, and component archives must already come from Toolchain Publication. Toolchain Producer builds the native components on an identity-free host, signs and notarizes them in isolation, then emits a request over those final bytes. The external authority signs that exact request. Release benchmarks bind the resulting closure; Toolchain Publication verifies its authority and benchmark evidence before staging the release. `./scripts/run.sh` remains the development entry point.
+The toolchain is released first. From protected `main`, create `toolchain-v2.0.0`, run **Toolchain Producer**, obtain the schema-v2 payload and receipt from the external sign-only authority, run **Release Benchmark Evidence**, then run **Toolchain Publication**. Independently reverify the exact draft release ID, source ref, artifact IDs, sizes, and digests before publishing that draft.
 
-The release order is fixed: merge the reviewed release commit into protected `main`; make the repository public only after the owner approves publication and rotates any exposed credentials; manually dispatch CodeQL on that exact `main` commit and confirm all four CodeQL checks pass; create the immutable version tag at the same commit; then run Release App. Creating a tag while the old private-repository workflows are still on `main` is unsupported.
+After the signed toolchain is live, create `v0.2.0` at the same protected `main` commit and run **Release App**. It builds an identity-free prepared product, hands only authenticated bytes to the isolated signing environment, verifies the final closure, and leaves an owned stable draft. Independently reverify that draft before publishing it. The required sign-only authority workflow and EasySplat's release workflows must not publish automatically.
+
+Before either tag is created, the reviewed commit must be merged, both repositories' `main` branches must be protected, exposed credentials must be rotated, and the owner must explicitly approve publication. Make EasySplat public only with that approval, then run all four CodeQL jobs on the exact protected-main commit. See [ONBOARDING.md](ONBOARDING.md#releases) for the operator sequence, required environments, and runner roles. `./scripts/run.sh` remains the development entry point.
 
 Release App verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, a quarantined install, the DMG, checksums, SBOM, licenses, and provenance. It can resume only its exact repository/tag/commit-owned draft and rejects different or foreign assets. Final publication remains a separate human action.
 

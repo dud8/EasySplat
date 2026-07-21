@@ -223,12 +223,28 @@ The full benchmark requires external media matching `scripts/benchmark/corpus.js
 
 ## Releases
 
-Production packaging runs only through the protected Release App workflow. Its identity-free job builds and seals the app, dSYM, and signed toolchain closure; the isolated signing job accepts only that authenticated prepared product. `build_dmg.sh --production` is intentionally incomplete without the workflow-supplied prepared-root digest, merged source commit, and independently built `ManifestTool`. It never builds a toolchain, creates a release key, or falls back to an unsigned artifact. Use `./scripts/run.sh` for local toolchain builds and development.
+Production uses two separately published releases: toolchain `2.0.0`, then app `0.2.0`. Final artifacts must come from the merged tagged commit, never a feature-branch candidate.
 
-The release order is fixed: merge the reviewed release commit into protected `main`; make the repository public only after explicit owner approval, the history/license audit, and credential rotation; manually dispatch CodeQL on that exact protected-main commit and confirm all four CodeQL checks pass; create the immutable version tag at that commit; then run Release App. Do not create either release-tag family while the legacy workflows remain on `main`.
+Before starting:
 
-The fine-grained `EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN` and `EASYSPLAT_RELEASE_ADMIN_TOKEN` credentials need repository **Contents: write** to stage draft assets and **Administration: read** to verify the live immutable-release setting. Keep each credential in its own protected publication environment; neither belongs in build, test, signing, or repository variables.
+- Protect `main` in both `dud8/EasySplat` and `dud8/easysplat-release-authority`.
+- Complete the history and license audit, rotate exposed credentials, and obtain explicit owner approval before changing visibility or publishing anything.
+- Provision the protected EasySplat environments `toolchain-release`, `toolchain-signing`, `benchmark-release`, `toolchain-publication`, `release-verification`, `release-signing`, and `release-publication`. Keep policy, publication, and signing credentials in their owning environment, not in repository variables or build jobs.
+- Register isolated Apple Silicon runners for `easysplat-toolchain-builder`, `easysplat-toolchain-signing`, `easysplat-toolchain-verifier`, `easysplat-benchmark-reference`, `easysplat-benchmark-constrained`, `easysplat-benchmark-8gb`, and `easysplat-signing`, each with the `easysplat-ephemeral` label. Provision the benchmark corpus variables only in `benchmark-release`.
+- In the authority repository, provide a protected signing environment and a completed-success `.github/workflows/sign-toolchain-authority.yml`. It must sign only the schema-v2 request and emit `toolchain-authority-payload-<version>` containing exactly `manifest.json` and `toolchain-authority-envelope.json`, plus `toolchain-authority-receipt-<version>` containing exactly `toolchain-authority-receipt.json`. It must not create, modify, or publish a GitHub release.
 
-The app release workflow is manual. Build, signing, notarization, and packaged verification run on isolated Apple Silicon release hosts. The workflow verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, and a quarantined clean installation before assembling the final release closure.
+Run the release in this order:
 
-Publication is a separate human-approved step. The workflow may resume only the exact draft owned by the same repository, tag, and source commit; it rejects published, foreign, or byte-different release state and never creates or moves the version tag. Final artifacts must come from the merged tagged commit, not a feature-branch candidate.
+1. Merge the reviewed source into protected EasySplat `main`.
+2. After explicit owner approval and credential rotation, make EasySplat public. Dispatch **CodeQL** on that exact commit and require all four language jobs to pass.
+3. Create `toolchain-v2.0.0` at that commit. Do not let a workflow create or move the tag.
+4. Run **Toolchain Producer**. Its identity-free builder creates the components; the isolated signing job signs and notarizes those authenticated bytes and emits the final request.
+5. Run the external sign-only authority workflow against the exact producer request. Record its commit, run attempt, payload artifact ID/name/digest, and receipt artifact ID/name/digest.
+6. Run **Release Benchmark Evidence** with that exact producer and authority closure.
+7. Run **Toolchain Publication**. It verifies the producer, authority, benchmark, protected refs, immutable-release policy, and eight-asset closure, then leaves a mutable stable draft plus `manual-publication-request.json`.
+8. As a separate human action, re-fetch the exact toolchain draft ID and compare its repository, tag, source commit, owner body, state, verified-publication artifact, and every remote asset ID, size, and SHA-256 digest with the preserved request. Publish only an exact match.
+9. Create `v0.2.0` at the same protected-main commit and run **Release App**. `build_dmg.sh --production` accepts only the workflow-bound prepared-root digest, source commit, and independently built `ManifestTool`; it cannot rebuild from a mutable checkout or fall back to unsigned output.
+10. Require the workflow's signing, notarization, hardened-runtime, nested-code, stapling, Gatekeeper, quarantined-install, DMG, checksum, SBOM, license, provenance, toolchain, and offline-cache checks to pass. It leaves an owned stable app draft.
+11. As a separate human action, independently re-fetch the exact app draft and match its release identity and asset IDs, sizes, and digests before publication.
+
+The fine-grained `EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN` and `EASYSPLAT_RELEASE_ADMIN_TOKEN` credentials need repository **Contents: write** to stage draft assets and **Administration: read** to verify the immutable-release setting. Neither EasySplat workflow publishes automatically. Use `./scripts/run.sh` only for local toolchain builds and development.
