@@ -30,6 +30,31 @@ class LocalLauncherTests(unittest.TestCase):
             for name, contents in sorted(files.items()):
                 archive.writestr(name, contents)
 
+    @staticmethod
+    def write_signed_native_executable(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["/usr/bin/xcrun", "clang", "-x", "c", "-", "-o", str(path)],
+            input="int main(void) { return 0; }\n",
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        path.chmod(0o755)
+        subprocess.run(
+            [
+                "/usr/bin/codesign",
+                "--force",
+                "--sign",
+                "-",
+                "--timestamp=none",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
     def copy_launcher(self, fixture: Path, validator_source: str) -> Path:
         launcher = fixture / "scripts/run.sh"
         launcher.parent.mkdir(parents=True)
@@ -59,21 +84,7 @@ class LocalLauncherTests(unittest.TestCase):
                 directory.mkdir(parents=True, exist_ok=True)
 
             colmap = toolchain / "bin/colmap"
-            shutil.copyfile("/usr/bin/true", colmap)
-            colmap.chmod(0o755)
-            subprocess.run(
-                [
-                    "/usr/bin/codesign",
-                    "--force",
-                    "--sign",
-                    "-",
-                    "--timestamp=none",
-                    str(colmap),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            self.write_signed_native_executable(colmap)
             self.write_executable(
                 toolchain / "bin/easysplat-train",
                 "#!/usr/bin/env bash\nexit 0\n",
@@ -174,21 +185,7 @@ class LocalLauncherTests(unittest.TestCase):
                 (fixture / "Tools/MsplatNative").mkdir(parents=True)
 
                 signed_colmap = fixture / "signed-colmap"
-                shutil.copyfile("/usr/bin/true", signed_colmap)
-                signed_colmap.chmod(0o755)
-                subprocess.run(
-                    [
-                        "/usr/bin/codesign",
-                        "--force",
-                        "--sign",
-                        "-",
-                        "--timestamp=none",
-                        str(signed_colmap),
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
+                self.write_signed_native_executable(signed_colmap)
 
                 core_files = {
                     "bin/colmap": signed_colmap.read_bytes(),
