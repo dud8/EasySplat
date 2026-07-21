@@ -1,8 +1,8 @@
 diff --git a/core/metal/bindings.h b/core/metal/bindings.h
-index 8028a5a..bd4296c 100644
+index 51b2f931d427394934c3a43b31cd62936ad8c417..926ab439047ff98d256ca4513cdf630064a6e3f0 100644
 --- a/core/metal/bindings.h
 +++ b/core/metal/bindings.h
-@@ -87,6 +87,11 @@ void msplat_set_raster_memory_budget_and_fail_for_testing(uint64_t budget_bytes)
+@@ -93,6 +93,11 @@ void msplat_set_raster_memory_budget_and_fail_for_testing(uint64_t budget_bytes)
  void msplat_fail_next_sync_for_testing();
  uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
  uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count);
@@ -14,7 +14,7 @@ index 8028a5a..bd4296c 100644
  void msplat_exact_radix_sort_for_testing(
      const uint64_t* keys,
      const uint32_t* values,
-@@ -121,6 +126,20 @@ void msplat_copy_last_raster_debug(
+@@ -128,6 +133,20 @@ void msplat_copy_last_raster_debug(
      float* opacity_gradients,
      int point_count
  );
@@ -36,10 +36,10 @@ index 8028a5a..bd4296c 100644
  MsplatRasterStats msplat_get_raster_stats();
  bool msplat_raster_memory_budget_was_exceeded();
 diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
-index d5140c1..fb938d3 100644
+index d80b1c14a86f425d54b68fa7c4dfe6aeff992d36..75de08c650699a4293a25e05302f8c383a5b8ff4 100644
 --- a/core/metal/msplat_metal.metal
 +++ b/core/metal/msplat_metal.metal
-@@ -1003,6 +1003,22 @@ kernel void exact_block_reduce_u64_kernel(
+@@ -1004,6 +1004,22 @@ kernel void exact_block_reduce_u64_kernel(
      if (lane == 0) block_totals[group] = values[0];
  }
  
@@ -62,7 +62,7 @@ index d5140c1..fb938d3 100644
  kernel void exact_block_scan_propagate_u64_kernel(
      constant uint& count [[buffer(0)]],
      device const int32_t* input [[buffer(1)]],
-@@ -1017,16 +1033,13 @@ kernel void exact_block_scan_propagate_u64_kernel(
+@@ -1018,16 +1034,13 @@ kernel void exact_block_scan_propagate_u64_kernel(
      uint index = group * EXACT_PREFIX_TG_SIZE + lane;
      inclusive[lane] = index < count ? (uint64_t)max(input[index], 0) : 0u;
      threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -86,10 +86,18 @@ index d5140c1..fb938d3 100644
  
  kernel void prepare_exact_raster_kernel(
 diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
-index 1f68342..c4ac9d2 100644
+index a9fdd8ff54162221920dc27daf5b2a54a8e1683d..037f3d2e89ab2f5505be309c2a6984d3cd0c3ac0 100644
 --- a/core/metal/msplat_metal.mm
 +++ b/core/metal/msplat_metal.mm
-@@ -210,6 +210,10 @@ struct MetalContext {
+@@ -16,6 +16,7 @@
+ #import <array>
+ #import <mutex>
+ #include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -211,6 +212,10 @@ struct MetalContext {
          }
          return _currentCB;
      }
@@ -100,7 +108,7 @@ index 1f68342..c4ac9d2 100644
      void commitCB() {
          if (_currentCB) {
              if (g_gpu_timing_enabled) {
-@@ -316,6 +320,7 @@ struct MetalContext {
+@@ -320,6 +325,7 @@ struct MetalContext {
      id<MTLComputePipelineState> clear_exact_tile_bins_kernel_cpso;
      id<MTLComputePipelineState> count_exact_tile_intersections_kernel_cpso;
      id<MTLComputePipelineState> exact_block_reduce_u64_kernel_cpso;
@@ -108,7 +116,7 @@ index 1f68342..c4ac9d2 100644
      id<MTLComputePipelineState> exact_block_scan_propagate_u64_kernel_cpso;
      id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
      id<MTLComputePipelineState> radix_sort_histogram_kernel_cpso;
-@@ -456,6 +461,7 @@ MetalContext* init_msplat_metal_context() {
+@@ -460,6 +466,7 @@ MetalContext* init_msplat_metal_context() {
      ctx->count_exact_tile_intersections_kernel_cpso =
          load(@"count_exact_tile_intersections_kernel");
      ctx->exact_block_reduce_u64_kernel_cpso       = load(@"exact_block_reduce_u64_kernel");
@@ -116,15 +124,16 @@ index 1f68342..c4ac9d2 100644
      ctx->exact_block_scan_propagate_u64_kernel_cpso =
          load(@"exact_block_scan_propagate_u64_kernel");
      ctx->map_gaussian_to_intersects_kernel_cpso   = load(@"map_gaussian_to_intersects_kernel");
-@@ -716,6 +722,7 @@ static std::mutex g_exact_raster_metric_mutex;
+@@ -725,6 +732,8 @@ static std::mutex g_exact_raster_metric_mutex;
  static uint64_t g_pending_exact_raster_timing_handlers = 0;
  static double g_exact_fallback_elapsed_seconds = 0;
  static bool g_exact_raster_timing_invalid = false;
 +static std::string g_exact_raster_timing_failure;
++static bool g_exact_raster_timing_warning_emitted = false;
  static uint64_t g_exact_buffer_growth_count = 0;
  static uint64_t g_exact_buffer_bytes_added = 0;
  static uint64_t g_peak_exact_intersection_capacity = 0;
-@@ -1175,18 +1182,45 @@ static void attach_exact_raster_timing_handler() {
+@@ -1184,18 +1193,47 @@ static void attach_exact_raster_timing_handler() {
          ++g_pending_exact_raster_timing_handlers;
      }
      timingFlags[slot] = 0;
@@ -157,22 +166,26 @@ index 1f68342..c4ac9d2 100644
                  const double ended = completedCommandBuffer.GPUEndTime;
                  if (std::isfinite(started) && std::isfinite(ended) && ended > started) {
                      g_exact_fallback_elapsed_seconds += ended - started;
-                 } else {
-                     g_exact_raster_timing_invalid = true;
-+                    if (g_exact_raster_timing_failure.empty()) {
-+                        g_exact_raster_timing_failure =
-+                            "msplat: exact raster GPU timing was unavailable";
-+                        g_exact_raster_timing_failure +=
-+                            " iteration=" + std::to_string(iteration) +
-+                            " camera=" + std::to_string(cameraIndex) +
-+                            " status=" + std::to_string(static_cast<long long>(status)) +
-+                            " gpu_start=" + std::to_string(started) +
-+                            " gpu_end=" + std::to_string(ended);
-+                    }
+-                } else {
+-                    g_exact_raster_timing_invalid = true;
++                } else if (!g_exact_raster_timing_warning_emitted) {
++                    std::fprintf(
++                        stderr,
++                        "msplat: warning event=exact_raster_gpu_timing_unavailable "
++                        "iteration=%llu camera=%llu status=%lld gpu_start=%.17g "
++                        "gpu_end=%.17g\n",
++                        static_cast<unsigned long long>(iteration),
++                        static_cast<unsigned long long>(cameraIndex),
++                        static_cast<long long>(status),
++                        started,
++                        ended
++                    );
++                    std::fflush(stderr);
++                    g_exact_raster_timing_warning_emitted = true;
                  }
              }
              --g_pending_exact_raster_timing_handlers;
-@@ -1198,7 +1232,11 @@ static void attach_exact_raster_timing_handler() {
+@@ -1207,7 +1245,11 @@ static void attach_exact_raster_timing_handler() {
  static void throw_if_exact_raster_timing_invalid() {
      std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
      if (g_exact_raster_timing_invalid) {
@@ -185,7 +198,7 @@ index 1f68342..c4ac9d2 100644
      }
  }
  
-@@ -1241,6 +1279,74 @@ uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count) {
+@@ -1250,6 +1292,74 @@ uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count) {
      return exact_radix_pass_count(tile_count);
  }
  
@@ -260,7 +273,7 @@ index 1f68342..c4ac9d2 100644
  void msplat_exact_radix_sort_for_testing(
      const uint64_t* keys,
      const uint32_t* values,
-@@ -1873,6 +1979,47 @@ void msplat_copy_last_raster_debug(
+@@ -1882,6 +1992,47 @@ void msplat_copy_last_raster_debug(
      std::memcpy(opacity_gradients, g_tcache.v_opacity.data<float>(),
                  static_cast<size_t>(point_count) * sizeof(float));
  }
@@ -308,15 +321,16 @@ index 1f68342..c4ac9d2 100644
  #endif
  
  static void throw_if_raster_failed() {
-@@ -1973,6 +2120,7 @@ void cleanup_msplat_metal() {
+@@ -1982,6 +2133,8 @@ void cleanup_msplat_metal() {
          g_pending_exact_raster_timing_handlers = 0;
          g_exact_fallback_elapsed_seconds = 0;
          g_exact_raster_timing_invalid = false;
 +        g_exact_raster_timing_failure.clear();
++        g_exact_raster_timing_warning_emitted = false;
          g_exact_buffer_growth_count = 0;
          g_exact_buffer_bytes_added = 0;
          g_peak_exact_intersection_capacity = 0;
-@@ -2049,6 +2197,12 @@ static void encode_exact_raster_fallback(
+@@ -2058,6 +2211,12 @@ static void encode_exact_raster_fallback(
                            threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
      [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
  

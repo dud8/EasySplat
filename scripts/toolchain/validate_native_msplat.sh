@@ -162,7 +162,7 @@ exact_values = {
     "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
     "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
     "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
-    "exact_prefix_hardening_patch_sha256": "e7437861085e86e8671898b8c5833568e0420bdf1c0559175ddcdb34ed159ace",
+    "exact_prefix_hardening_patch_sha256": "0f6ee3db885249b9e1e429e30c3ac277b6ed1f1e730d823e38ed97c9afa6f333",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
