@@ -680,7 +680,7 @@ require_contains '"status":"ok"' "$self_check_stdout"
 require_contains '"scene_bounds_status":"ok"' "$self_check_stdout"
 
 decode_dir="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-msplat-decode.XXXXXX")"
-/usr/bin/python3 - "$decode_dir/source.png" <<'PY'
+python3 - "$decode_dir/source.png" <<'PY'
 from PIL import Image, ImageCms
 import sys
 
@@ -738,7 +738,7 @@ PY
 
 display_p3_profile="/System/Library/ColorSync/Profiles/Display P3.icc"
 [ -f "$display_p3_profile" ] || fail "macOS Display P3 profile is unavailable"
-/usr/bin/python3 - "$decode_dir/display-p3.png" "$display_p3_profile" <<'PY'
+python3 - "$decode_dir/display-p3.png" "$display_p3_profile" <<'PY'
 from pathlib import Path
 from PIL import Image
 import sys
@@ -753,7 +753,7 @@ PY
   >"$decode_dir/display-p3.json" \
   2>"$decode_dir/display-p3.stderr"
 [ ! -s "$decode_dir/display-p3.stderr" ] || fail "Display P3 decode polluted stderr"
-/usr/bin/python3 - \
+python3 - \
   "$decode_dir/display-p3.json" \
   "$decode_dir/display-p3.rgb8" <<'PY'
 import hashlib
@@ -985,7 +985,7 @@ printf '\001\003\003\007checkpoint-state\000' >"$allocation_checkpoint/optimizer
 allocation_output_hash_before="$(shasum -a 256 "$allocation_output" | awk '{print $1}')"
 
 snapshot_checkpoint_tree() {
-  /usr/bin/python3 - "$1" <<'PY'
+  python3 - "$1" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -1037,7 +1037,7 @@ allocation_pressure_status=$?
 set -e
 [ "$allocation_pressure_status" = 71 ] \
   || fail "allocation-pressure test CLI exited with $allocation_pressure_status instead of 71"
-/usr/bin/python3 - "$allocation_pressure_dir/events.jsonl" <<'PY'
+python3 - "$allocation_pressure_dir/events.jsonl" <<'PY'
 import json
 from pathlib import Path
 import sys
