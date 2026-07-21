@@ -372,9 +372,18 @@ public final class MsplatRunner: Sendable {
                 "event output size \(completion.outputBytes) does not match file size \(size.int64Value)"
             )
         }
-        guard ProjectArtifactValidator.validatePlyFile(at: stagingOutputPath) == .valid,
-              let header = ProjectArtifactValidator.readPlyHeader(at: stagingOutputPath),
-              header.vertexCount == completion.gaussianCount else {
+        switch ProjectArtifactValidator.validatePlyFile(at: stagingOutputPath) {
+        case .valid:
+            break
+        case .missing:
+            throw MsplatEventProtocolError("event stream completed without a published output")
+        case .corrupt(let reason):
+            throw MsplatEventProtocolError("published output is invalid: \(reason)")
+        }
+        guard let header = ProjectArtifactValidator.readPlyHeader(at: stagingOutputPath) else {
+            throw MsplatEventProtocolError("published output has an invalid PLY header")
+        }
+        guard header.vertexCount == completion.gaussianCount else {
             throw MsplatEventProtocolError(
                 "published output does not match the completed Gaussian count"
             )

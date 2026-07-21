@@ -147,7 +147,10 @@ public enum SplatRenderEncodingValidator {
         guard covarianceA.allHalfRepresentable, covarianceB.allHalfRepresentable else {
             throw SplatRenderEncodingValidationError.unrepresentableCovariance
         }
-        try validateQuantizedCovariance(covarianceA: covarianceA, covarianceB: covarianceB)
+        let quantizedCovariance = try stabilizedQuantizedCovariance(
+            covarianceA: covarianceA,
+            covarianceB: covarianceB
+        )
 
         let color = try encodedColor(point.color)
         let opacity = stableSigmoid(point.opacity)
@@ -160,8 +163,8 @@ public enum SplatRenderEncodingValidator {
         return SplatRenderEncoding(
             position: point.position,
             linearColorOpacity: linearColorOpacity,
-            covarianceA: covarianceA,
-            covarianceB: covarianceB,
+            covarianceA: quantizedCovariance.a,
+            covarianceB: quantizedCovariance.b,
             sphericalHarmonics: sphericalHarmonics(point.color)
         )
     }
@@ -193,31 +196,80 @@ public enum SplatRenderEncodingValidator {
         return normalized
     }
 
-    private static func validateQuantizedCovariance(
+    private static func stabilizedQuantizedCovariance(
         covarianceA: SIMD3<Float>,
         covarianceB: SIMD3<Float>
-    ) throws {
-        let xx = Double(Float(Float16(covarianceA.x)))
-        let xy = Double(Float(Float16(covarianceA.y)))
-        let xz = Double(Float(Float16(covarianceA.z)))
-        let yy = Double(Float(Float16(covarianceB.x)))
-        let yz = Double(Float(Float16(covarianceB.y)))
-        let zz = Double(Float(Float16(covarianceB.z)))
+    ) throws -> (a: SIMD3<Float>, b: SIMD3<Float>) {
+        var xx = Float16(covarianceA.x)
+        let xy = Float16(covarianceA.y)
+        let xz = Float16(covarianceA.z)
+        var yy = Float16(covarianceB.x)
+        let yz = Float16(covarianceB.y)
+        var zz = Float16(covarianceB.z)
+
+        for _ in 0..<2 where !quantizedCovarianceIsPositiveSemidefinite(
+            xx: xx,
+            xy: xy,
+            xz: xz,
+            yy: yy,
+            yz: yz,
+            zz: zz
+        ) {
+            // Half-precision component rounding can make a valid covariance
+            // microscopically indefinite. A bounded diagonal ULP adjustment
+            // restores the storage invariant without changing its orientation.
+            xx = xx.nextUp
+            yy = yy.nextUp
+            zz = zz.nextUp
+        }
+
+        guard xx.isFinite,
+              yy.isFinite,
+              zz.isFinite,
+              quantizedCovarianceIsPositiveSemidefinite(
+                  xx: xx,
+                  xy: xy,
+                  xz: xz,
+                  yy: yy,
+                  yz: yz,
+                  zz: zz
+              ) else {
+            throw SplatRenderEncodingValidationError.indefiniteQuantizedCovariance
+        }
+
+        return (
+            SIMD3<Float>(Float(xx), Float(xy), Float(xz)),
+            SIMD3<Float>(Float(yy), Float(yz), Float(zz))
+        )
+    }
+
+    private static func quantizedCovarianceIsPositiveSemidefinite(
+        xx: Float16,
+        xy: Float16,
+        xz: Float16,
+        yy: Float16,
+        yz: Float16,
+        zz: Float16
+    ) -> Bool {
+        let xx = Double(Float(xx))
+        let xy = Double(Float(xy))
+        let xz = Double(Float(xz))
+        let yy = Double(Float(yy))
+        let yz = Double(Float(yz))
+        let zz = Double(Float(zz))
         let xyMinor = xx * yy - xy * xy
         let xzMinor = xx * zz - xz * xz
         let yzMinor = yy * zz - yz * yz
         let determinant = xx * (yy * zz - yz * yz)
             - xy * (xy * zz - yz * xz)
             + xz * (xy * yz - yy * xz)
-        guard xx >= 0,
-              yy >= 0,
-              zz >= 0,
-              xyMinor >= 0,
-              xzMinor >= 0,
-              yzMinor >= 0,
-              determinant >= 0 else {
-            throw SplatRenderEncodingValidationError.indefiniteQuantizedCovariance
-        }
+        return xx >= 0
+            && yy >= 0
+            && zz >= 0
+            && xyMinor >= 0
+            && xzMinor >= 0
+            && yzMinor >= 0
+            && determinant >= 0
     }
 
     private static func encodedColor(_ color: SplatScenePoint.Color) throws -> SIMD3<Float> {

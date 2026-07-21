@@ -1115,6 +1115,54 @@ final class MsplatRunnerTests: XCTestCase {
         }
     }
 
+    func testRunTrainReportsViewerIncompatibilitySeparatelyFromGaussianCount() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        var invalidText = String(decoding: fixtureOutputData, as: UTF8.self)
+        let firstScale = try XCTUnwrap(invalidText.range(of: "-4 -4 -4"))
+        invalidText.replaceSubrange(firstScale, with: "100 -4 -4")
+        let invalidOutput = Data(invalidText.utf8)
+        let stdout = validEvents().replacingOccurrences(
+            of: "\"output_bytes\":\(fixtureOutputData.count)",
+            with: "\"output_bytes\":\(invalidOutput.count)"
+        )
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: stdout,
+                    stderr: ""
+                ),
+                onRun: { arguments in
+                    guard let output = argumentValue("--output", in: arguments) else {
+                        return XCTFail("Missing staged output argument")
+                    }
+                    try? invalidOutput.write(to: URL(fileURLWithPath: output))
+                }
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected viewer-incompatible output to fail")
+        } catch {
+            let message = error.localizedDescription
+            XCTAssertTrue(message.contains("splat viewer"), message)
+            XCTAssertFalse(message.contains("Gaussian count"), message)
+        }
+    }
+
     func testRunTrainRejectsStagedOutputSymlinkBeforeReadingIt() async throws {
         let context = try makeContext()
         defer { context.cleanup() }

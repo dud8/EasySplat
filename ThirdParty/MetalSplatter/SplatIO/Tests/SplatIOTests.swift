@@ -182,6 +182,19 @@ final class SplatIOTests: XCTestCase {
         }
     }
 
+    func testReadAcceptsQuantizationStabilizedMsplatGeometry() throws {
+        let content = ContentCounter()
+        let url = try makeLinearColorPLY(
+            body: "3.061717 -0.23588018 -1.3190962 255 128 0 -8.549295 -5.457474 -4.375433 -2.2156999 0.6233696 -0.8226921 -0.4068475 -0.17318434"
+        )
+
+        SplatPLYSceneReader(url).read(to: content)
+
+        XCTAssertTrue(content.didFinish)
+        XCTAssertFalse(content.didFail)
+        XCTAssertEqual(content.pointCount, 1)
+    }
+
     func testReadCanDeferRenderValidationToAnEncodingDelegate() throws {
         let content = ContentCounter()
         let url = try makeLinearColorPLY(
