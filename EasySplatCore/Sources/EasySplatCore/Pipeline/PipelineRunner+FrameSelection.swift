@@ -818,7 +818,7 @@ extension PipelineRunner {
             ) != nil
         )
         guard needsTranscode else {
-            try FileManager.default.copyItem(at: source, to: destination)
+            _ = try copyFileContents(from: source, to: destination)
             return SelectedFrameNormalizationResult(
                 lowLightExposureEV: nil,
                 evidence: SelectedFrameNormalization(

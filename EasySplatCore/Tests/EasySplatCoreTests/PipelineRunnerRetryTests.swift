@@ -118,6 +118,54 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(selection.manifest.first?.photoRetainedRank, 7)
     }
 
+    func testCopySelectedSanitizesReadOnlyRuntimeSnapshotPermissions() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: paths.importedPhotosURL,
+            withIntermediateDirectories: true
+        )
+        let source = paths.importedPhotosURL.appendingPathComponent("photo-0000.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: source,
+            size: 16,
+            value: 128,
+            utType: .jpeg
+        ))
+        let digest = try GeometryArtifactStore.sha256(of: source)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o400],
+            ofItemAtPath: source.path
+        )
+        let runner = makeRunner(projectURL: root)
+
+        let selection = try runner.copySelected(
+            groups: [.init(
+                id: "photos",
+                frames: [source],
+                isVideo: false,
+                sourceBindingsByFileName: [
+                    source.lastPathComponent: .init(
+                        projectRelativePath: try paths.projectRelativePath(for: source),
+                        sha256: digest,
+                        photoRetainedRank: 0
+                    ),
+                ]
+            )],
+            to: paths.framesSelectedURL,
+            manifestURL: paths.framesSelectedManifestURL,
+            maxDimension: 64,
+            projectPaths: paths
+        )
+
+        let selected = try XCTUnwrap(selection.frames.first)
+        let attributes = try FileManager.default.attributesOfItem(atPath: selected.path)
+        let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(permissions.intValue & 0o7777, 0o600)
+    }
+
     func testCopySelectedRejectsNegativePhotoRetainedRank() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

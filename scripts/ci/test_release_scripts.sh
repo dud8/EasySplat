@@ -706,7 +706,7 @@ grep -Fq 'inputManifestSHA256' \
 grep -Fq 'outside-write-probe' "$packaged_smoke"
 grep -Fq 'release-verification-pipeline-passed.json' \
   "$packaged_smoke" "$ROOT/EasySplatApp/AppConfig.swift"
-grep -Fq '/usr/bin/env -C "$verifier_home" -i \' "$packaged_smoke"
+grep -Fq "/usr/bin/env -C \"\$verifier_home\" -i \\" "$packaged_smoke"
 grep -Fq 'cleanup_packaged_app_verification_processes || true' \
   "$packaged_smoke"
 grep -Fq '"$PACKAGED_PROJECT_VERIFIER" verify-packaged-project' \
@@ -2675,16 +2675,39 @@ test -f "$sandbox_test_root/home/inside"
 test ! -e "$sandbox_test_root/outside"
 
 atomic_writer_source="$sandbox_test_root/AtomicWriter.swift"
-atomic_writer="$sandbox_test_root/EasySplatReleaseVerifier"
+atomic_writer_root="$TMP_DIR/release-verifier-executable"
+atomic_writer="$atomic_writer_root/EasySplatReleaseVerifier"
+mkdir -p "$atomic_writer_root"
 cat >"$atomic_writer_source" <<'SWIFT'
+import Darwin
 import Foundation
 
 @main
 struct AtomicWriter {
     static func main() throws {
-        guard CommandLine.arguments.count == 3 else { exit(64) }
+        guard CommandLine.arguments.count == 4 else { exit(64) }
         let inside = URL(fileURLWithPath: CommandLine.arguments[1])
         let outside = URL(fileURLWithPath: CommandLine.arguments[2])
+        let malformedScratch = URL(fileURLWithPath: CommandLine.arguments[3])
+        try openDirectoryChain(
+            URL(fileURLWithPath: CommandLine.arguments[0])
+                .deletingLastPathComponent().path
+        )
+        try openDirectoryChain(inside.deletingLastPathComponent().path)
+        for prefix in ["EasySplat-selected-lineage-", "EasySplat-finished-dataset-replay-"] {
+            let replay = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "\(prefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(
+                at: replay,
+                withIntermediateDirectories: false
+            )
+            try Data("replay".utf8).write(
+                to: replay.appendingPathComponent("frame.png")
+            )
+            try FileManager.default.removeItem(at: replay)
+        }
         try Data("first".utf8).write(to: inside, options: .atomic)
         try Data("second".utf8).write(to: inside, options: .atomic)
         do {
@@ -2692,6 +2715,35 @@ struct AtomicWriter {
             exit(65)
         } catch {
             guard !FileManager.default.fileExists(atPath: outside.path) else { exit(66) }
+        }
+        do {
+            _ = try Data(contentsOf: malformedScratch)
+            exit(67)
+        } catch {}
+        do {
+            try Data("escape".utf8).write(to: malformedScratch)
+            exit(68)
+        } catch {}
+    }
+
+    private static func openDirectoryChain(_ path: String) throws {
+        var descriptor = Darwin.open(
+            "/",
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else { throw POSIXError(.EACCES) }
+        defer { Darwin.close(descriptor) }
+        for component in path.split(separator: "/") {
+            let next = component.withCString {
+                Darwin.openat(
+                    descriptor,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                )
+            }
+            guard next >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno)!) }
+            Darwin.close(descriptor)
+            descriptor = next
         }
     }
 }
@@ -2703,11 +2755,18 @@ atomic_cache_root="$sandbox_test_root/atomic-cache"
 mkdir -p "$atomic_home" "$atomic_output_root" "$atomic_cache_root"
 atomic_inside="$atomic_output_root/project.json"
 atomic_outside="$sandbox_test_root/atomic-outside.json"
+atomic_malformed_scratch="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)EasySplat-selected-lineage-audit-$RANDOM"
+printf '%s' 'sealed' >"$atomic_malformed_scratch"
 run_release_verifier deny "$atomic_home" "$atomic_output_root" "$atomic_cache_root" \
-  "$atomic_writer" "$atomic_inside" "$atomic_outside"
+  "$atomic_writer" "$atomic_inside" "$atomic_outside" "$atomic_malformed_scratch"
 test "$(cat "$atomic_inside")" = "second"
 test ! -e "$atomic_outside"
+test "$(cat "$atomic_malformed_scratch")" = "sealed"
+rm -f "$atomic_malformed_scratch"
 grep -Fq 'NSIRD_EasySplatReleaseVerifier_' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat-selected-lineage-' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat-video-lineage-' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat-finished-dataset-replay-' "$atomic_home/release-verifier.sb"
 
 expected_manifest_probe="$sandbox_test_root/expected-manifest-reader.py"
 cat >"$expected_manifest_probe" <<'PY'

@@ -849,8 +849,9 @@ extension PhotoInputPreflight {
                 relativePath: item.0,
                 resolver: contentTypeResolver
             )
-            let declaredType = UTType(filenameExtension: url.pathExtension)
-            guard detectedType != nil || declaredType?.conforms(to: .image) == true else {
+            guard detectedType != nil
+                    || UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true
+            else {
                 continue
             }
             guard sources.count < limits.maximumPhotoCount else {
@@ -1046,10 +1047,16 @@ extension PhotoInputPreflight {
             throw PhotoInputPreflightFailure(issue: .sourceChanged(relativePath: source.safeDisplayName))
         }
         let descriptorURL = URL(fileURLWithPath: "/dev/fd/\(descriptor)")
-        guard let type = source.detectedTypeIdentifier ?? contentTypeResolver(descriptorURL),
-              let contentType = UTType(type) else {
+        guard let type = source.detectedTypeIdentifier ?? contentTypeResolver(descriptorURL) else {
             return nil
         }
+        // The release verifier blocks Launch Services brokers. Classify the
+        // four directly supported raster types without consulting that service.
+        let controlledExtension = controlledPhotoExtension(for: type)
+        let rawContentType = controlledExtension == nil ? UTType(type) : nil
+        guard controlledExtension != nil
+                || rawContentType?.conforms(to: .rawImage) == true
+        else { return nil }
         let projectionTag = projectionProbe(descriptorURL)
         var projectionFinal = stat()
         var projectionRebound = stat()
@@ -1070,7 +1077,7 @@ extension PhotoInputPreflight {
             .map { String(format: "%02x", $0) }
             .joined()
         let analysisProxyDimension = min(maximumDecodedDimension, 256)
-        if contentType.conforms(to: .rawImage) {
+        if rawContentType?.conforms(to: .rawImage) == true {
             let proxyBudget = rawProxyBudget(
                 sourceBytes: source.evidence.size,
                 maximumDimension: analysisProxyDimension
@@ -1134,13 +1141,12 @@ extension PhotoInputPreflight {
                 )
             )
         }
-        guard contentType.conforms(to: .image),
+        guard let controlledExtension,
               let imageSource = CGImageSourceCreateWithURL(
                 descriptorURL as CFURL,
                 [kCGImageSourceShouldCache: false] as CFDictionary
               ),
               CGImageSourceGetCount(imageSource) > 0,
-              let controlledExtension = controlledPhotoExtension(for: type),
               let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil)
                 as? [CFString: Any],
               let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,

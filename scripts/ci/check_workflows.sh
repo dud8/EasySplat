@@ -84,6 +84,15 @@ for contract in \
   grep -Fq "$contract" <<<"$native_msplat_block" \
     || fail "native Metal validation must install its hash-locked Python fixture dependencies: $contract"
 done
+for contract in \
+  'RIPGREP_VERSION: "15.2.0"' \
+  'RIPGREP_SHA256: "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4"' \
+  'https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-aarch64-apple-darwin.tar.gz' \
+  'echo "$RIPGREP_SHA256  $archive" | /usr/bin/shasum -a 256 -c -' \
+  'printf '\''%s\n'\'' "$ripgrep_root" >> "$GITHUB_PATH"'; do
+  grep -Fq "$contract" <<<"$native_msplat_block" \
+    || fail "native Metal release integration must install verified arm64 ripgrep: $contract"
+done
 if grep -Fq '          cache: pip' <<<"$native_msplat_block"; then
   fail "native Metal validation must not depend on a mutable pip cache"
 fi

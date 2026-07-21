@@ -2615,6 +2615,140 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         }
     }
 
+    func testValidateFinishedProjectSnapshotBindingAllowsProtectedMetadataChangeTimeOnly() throws {
+        let fixture = try makeFinishedProjectFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertNoThrow(
+            try ProjectArtifactValidator.test_validateFinishedProjectSnapshotBinding(
+                at: fixture.paths.root,
+                expectedInput: .photoFolder(fixture.input),
+                context: fixture.validationContext,
+                mutation: {
+                    var before = stat()
+                    XCTAssertEqual(lstat(fixture.paths.metadataURL.path, &before), 0)
+                    try self.setProjectArtifactMode(fixture.paths.metadataURL)
+                    var after = stat()
+                    XCTAssertEqual(lstat(fixture.paths.metadataURL.path, &after), 0)
+                    XCTAssertNotEqual(
+                        before.st_ctimespec.tv_nsec,
+                        after.st_ctimespec.tv_nsec
+                    )
+                }
+            )
+        )
+    }
+
+    func testProtectedFileIdentityRejectsSameSizeRewriteWithRestoredModificationTime() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("protected.json")
+        try Data("abcdef".utf8).write(to: file)
+        try setPrivateMode(file)
+        var original = stat()
+        XCTAssertEqual(lstat(file.path, &original), 0)
+
+        let matches = try ProjectArtifactValidator.test_protectedFileIdentityMatchesAfterMutation(
+            at: file,
+            mutation: {
+                let descriptor = Darwin.open(file.path, O_WRONLY | O_NOFOLLOW | O_CLOEXEC)
+                XCTAssertGreaterThanOrEqual(descriptor, 0)
+                defer { Darwin.close(descriptor) }
+                var replacement = UInt8(ascii: "z")
+                XCTAssertEqual(
+                    withUnsafePointer(to: &replacement) {
+                        Darwin.pwrite(descriptor, $0, 1, 0)
+                    },
+                    1
+                )
+                XCTAssertEqual(Darwin.fsync(descriptor), 0)
+                var originalByte = UInt8(ascii: "a")
+                XCTAssertEqual(
+                    withUnsafePointer(to: &originalByte) {
+                        Darwin.pwrite(descriptor, $0, 1, 0)
+                    },
+                    1
+                )
+                XCTAssertEqual(Darwin.fsync(descriptor), 0)
+                let times = [original.st_atimespec, original.st_mtimespec]
+                XCTAssertEqual(
+                    times.withUnsafeBufferPointer {
+                        utimensat(AT_FDCWD, file.path, $0.baseAddress, 0)
+                    },
+                    0
+                )
+            }
+        )
+        XCTAssertFalse(matches)
+        XCTAssertEqual(try Data(contentsOf: file), Data("abcdef".utf8))
+    }
+
+    func testProtectedFileIdentityAllowsAttributeOnlyMutation() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("protected.json")
+        try Data("abcdef".utf8).write(to: file)
+        try setPrivateMode(file)
+
+        let matches = try ProjectArtifactValidator.test_protectedFileIdentityMatchesAfterMutation(
+            at: file,
+            mutation: {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: file.path
+                )
+            }
+        )
+
+        XCTAssertTrue(matches)
+    }
+
+    func testProtectedFileIdentityRejectsAncestorRenameAndRestore() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("Project", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: project,
+            withIntermediateDirectories: false
+        )
+        let file = project.appendingPathComponent("protected.json")
+        try Data("abcdef".utf8).write(to: file)
+        try setPrivateMode(file)
+        let displaced = root.appendingPathComponent("Displaced", isDirectory: true)
+
+        let matches = try ProjectArtifactValidator.test_protectedFileIdentityMatchesAfterMutation(
+            at: file,
+            mutation: {
+                try FileManager.default.moveItem(at: project, to: displaced)
+                try FileManager.default.moveItem(at: displaced, to: project)
+            }
+        )
+
+        XCTAssertFalse(matches)
+    }
+
+    func testProtectedDirectoryGuardRejectsAttributeMutation() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let protected = root.appendingPathComponent("Protected", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: protected,
+            withIntermediateDirectories: false
+        )
+
+        let accepted = try ProjectArtifactValidator.test_protectedDirectoryRejectsMutation(
+            at: protected,
+            mutation: {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: protected.path
+                )
+            }
+        )
+
+        XCTAssertFalse(accepted)
+    }
+
     func testValidateFinishedProjectSnapshotBindingRejectsFeatureEvidenceReplacement() throws {
         let fixture = try makeFinishedProjectFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

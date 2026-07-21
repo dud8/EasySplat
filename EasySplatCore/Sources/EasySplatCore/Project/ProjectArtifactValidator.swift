@@ -549,6 +549,32 @@ public enum ProjectArtifactValidator {
         }
     }
 
+    static func test_protectedFileIdentityMatchesAfterMutation(
+        at url: URL,
+        mutation: () throws -> Void
+    ) throws -> Bool {
+        let mutationGuard = try FinishedProjectProtectedPathMutationGuard(
+            urls: [url.deletingLastPathComponent(), url]
+        )
+        defer { mutationGuard.close() }
+        let initial = try safeFinishedProjectProtectedFileIdentity(at: url)
+        try mutation()
+        return try safeFinishedProjectProtectedFileIdentity(at: url) == initial
+            && mutationGuard.observedOnlyAttributeChanges()
+    }
+
+    static func test_protectedDirectoryRejectsMutation(
+        at url: URL,
+        mutation: () throws -> Void
+    ) throws -> Bool {
+        let mutationGuard = try FinishedProjectProtectedPathMutationGuard(
+            urls: [url]
+        )
+        defer { mutationGuard.close() }
+        try mutation()
+        return mutationGuard.observedNoChanges()
+    }
+
     static func test_requireExactVideoCoverage(
         _ manifest: [PipelineRunner.SelectedFrameMapping],
         sourceFiles: [String],
@@ -741,6 +767,9 @@ public enum ProjectArtifactValidator {
         let paths = ProjectPaths(root: canonicalProject)
         let canonicalModel = paths.colmapSparseModelURL
         let canonicalOutput = paths.outputSplatURL
+        let binaryModelFiles = ["cameras.bin", "images.bin", "points3D.bin"].map {
+            canonicalModel.appendingPathComponent($0)
+        }
         var protectedFiles = [
             paths.metadataURL,
             paths.geometryManifestURL,
@@ -755,8 +784,27 @@ public enum ProjectArtifactValidator {
             canonicalModel.appendingPathComponent("points3D.txt"),
             canonicalOutput,
         ]
-        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-            let binary = canonicalModel.appendingPathComponent(name)
+        let possibleProtectedFiles = protectedFiles
+            + binaryModelFiles
+            + [paths.da3CoverageManifestURL, paths.photoSelectionArtifactURL]
+        let protectedDirectoryMutationGuard: FinishedProjectProtectedPathMutationGuard
+        let metadataMutationGuard: FinishedProjectProtectedPathMutationGuard
+        do {
+            protectedDirectoryMutationGuard = try FinishedProjectProtectedPathMutationGuard(
+                urls: protectedAncestorDirectories(
+                    projectRoot: canonicalProject,
+                    files: possibleProtectedFiles
+                )
+            )
+            metadataMutationGuard = try FinishedProjectProtectedPathMutationGuard(
+                urls: [paths.metadataURL]
+            )
+        } catch {
+            throw finishedProjectError("the project artifacts could not be guarded during validation")
+        }
+        defer { protectedDirectoryMutationGuard.close() }
+        defer { metadataMutationGuard.close() }
+        for binary in binaryModelFiles {
             if FileManager.default.fileExists(atPath: binary.path)
                 || (try? FileManager.default.destinationOfSymbolicLink(
                     atPath: binary.path
@@ -776,9 +824,18 @@ public enum ProjectArtifactValidator {
         if metadata.photoInputReceipts?.isEmpty == false {
             protectedFiles.append(paths.photoSelectionArtifactURL)
         }
+        let protectedFileMutationGuard: FinishedProjectProtectedPathMutationGuard
+        do {
+            protectedFileMutationGuard = try FinishedProjectProtectedPathMutationGuard(
+                urls: protectedFiles.filter { $0 != paths.metadataURL }
+            )
+        } catch {
+            throw finishedProjectError("the project artifacts could not be guarded during validation")
+        }
+        defer { protectedFileMutationGuard.close() }
         let initialIdentities = try Dictionary(
             uniqueKeysWithValues: protectedFiles.map { url in
-                (url.path, try safeFinishedProjectFileIdentity(at: url))
+                (url.path, try safeFinishedProjectProtectedFileIdentity(at: url))
             }
         )
         let photoSelectionProjection: PhotoSelectionProjection?
@@ -1069,7 +1126,7 @@ public enum ProjectArtifactValidator {
 
         for url in protectedFiles {
             guard let initial = initialIdentities[url.path],
-                  try safeFinishedProjectFileIdentity(at: url) == initial else {
+                  try safeFinishedProjectProtectedFileIdentity(at: url) == initial else {
                 throw finishedProjectError("\(url.lastPathComponent) changed during validation")
             }
         }
@@ -1100,6 +1157,11 @@ public enum ProjectArtifactValidator {
             allowPendingVideoLineage: allowPendingVideoLineage
         ) == initialSelectedLineage else {
             throw finishedProjectError("selected-frame lineage changed during validation")
+        }
+        guard metadataMutationGuard.observedOnlyAttributeChanges(),
+              protectedFileMutationGuard.observedOnlyAttributeChanges(),
+              protectedDirectoryMutationGuard.observedNoChanges() else {
+            throw finishedProjectError("a project artifact changed during validation")
         }
         return FinishedProjectValidationResult(
             evidence: FinishedProjectArtifactEvidence(
@@ -1343,24 +1405,135 @@ public enum ProjectArtifactValidator {
     private struct FinishedProjectFileIdentity: Equatable, Hashable {
         let device: dev_t
         let inode: ino_t
+        let owner: uid_t
+        let group: gid_t
         let linkCount: nlink_t
         let mode: mode_t
+        let flags: UInt32
         let size: off_t
         let modifiedSeconds: time_t
         let modifiedNanoseconds: Int64
         let changedSeconds: time_t
         let changedNanoseconds: Int64
+        let createdSeconds: time_t
+        let createdNanoseconds: Int64
 
         init(_ status: stat) {
             device = status.st_dev
             inode = status.st_ino
+            owner = status.st_uid
+            group = status.st_gid
             linkCount = status.st_nlink
             mode = status.st_mode
+            flags = status.st_flags
             size = status.st_size
             modifiedSeconds = status.st_mtimespec.tv_sec
             modifiedNanoseconds = Int64(status.st_mtimespec.tv_nsec)
             changedSeconds = status.st_ctimespec.tv_sec
             changedNanoseconds = Int64(status.st_ctimespec.tv_nsec)
+            createdSeconds = status.st_birthtimespec.tv_sec
+            createdNanoseconds = Int64(status.st_birthtimespec.tv_nsec)
+        }
+    }
+
+    /// Release validation hashes protected artifacts so macOS may attach its
+    /// sandbox consent label without turning a metadata-only ctime update into a
+    /// false content mutation. Other file-identity consumers remain ctime-strict.
+    private struct FinishedProjectProtectedFileIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let owner: uid_t
+        let group: gid_t
+        let linkCount: nlink_t
+        let mode: mode_t
+        let flags: UInt32
+        let size: off_t
+        let modifiedSeconds: time_t
+        let modifiedNanoseconds: Int64
+        let createdSeconds: time_t
+        let createdNanoseconds: Int64
+        let sha256: String
+
+        init(identity: FinishedProjectFileIdentity, sha256: String) {
+            device = identity.device
+            inode = identity.inode
+            owner = identity.owner
+            group = identity.group
+            linkCount = identity.linkCount
+            mode = identity.mode
+            flags = identity.flags
+            size = identity.size
+            modifiedSeconds = identity.modifiedSeconds
+            modifiedNanoseconds = identity.modifiedNanoseconds
+            createdSeconds = identity.createdSeconds
+            createdNanoseconds = identity.createdNanoseconds
+            self.sha256 = sha256
+        }
+    }
+
+    /// Keeps vnode watches armed while protected artifacts are parsed. Hashes
+    /// permit macOS consent-label ctime churn; the watches still reject any
+    /// write-and-restore attempt between the matching hash snapshots.
+    private final class FinishedProjectProtectedPathMutationGuard {
+        private var descriptors: [Int32] = []
+        private var monitor: VnodeMutationMonitor?
+
+        init(urls: [URL]) throws {
+            var openedDescriptors: [Int32] = []
+            do {
+                for url in urls {
+                    let descriptor = Darwin.open(
+                        url.path,
+                        O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+                    )
+                    guard descriptor >= 0 else {
+                        throw finishedProjectError(
+                            "\(url.lastPathComponent) changed during validation"
+                        )
+                    }
+                    openedDescriptors.append(descriptor)
+                }
+                let watches = zip(urls, openedDescriptors).map { url, descriptor in
+                    VnodeMutationMonitor.Watch(
+                        descriptor: descriptor,
+                        label: url.path,
+                        ownership: .borrowed
+                    )
+                }
+                monitor = try VnodeMutationMonitor(watches: watches)
+                descriptors = openedDescriptors
+            } catch {
+                for descriptor in openedDescriptors.reversed() {
+                    Darwin.close(descriptor)
+                }
+                throw error
+            }
+        }
+
+        deinit {
+            close()
+        }
+
+        func observedOnlyAttributeChanges() -> Bool {
+            guard let snapshot = monitor?.poll(), snapshot.failure == nil else {
+                return false
+            }
+            return snapshot.mutations.allSatisfy { mutation in
+                mutation.flags == [.attribute]
+            }
+        }
+
+        func observedNoChanges() -> Bool {
+            monitor?.poll().isTrustworthy == true
+        }
+
+        func close() {
+            monitor?.close()
+            monitor = nil
+            for descriptor in descriptors.reversed() {
+                Darwin.close(descriptor)
+            }
+            descriptors.removeAll(keepingCapacity: false)
         }
     }
 
@@ -1421,7 +1594,7 @@ public enum ProjectArtifactValidator {
     }
 
     private struct FinishedProjectValidationSnapshot: Equatable {
-        let protectedFileIdentities: [String: FinishedProjectFileIdentity]
+        let protectedFileIdentities: [String: FinishedProjectProtectedFileIdentity]
         let importedInputBinding: ImportedInputBinding
         let retainedDataset: RetainedMsplatDatasetSnapshot
         let selectedLineage: SelectedFrameLineageSnapshot
@@ -2739,11 +2912,13 @@ public enum ProjectArtifactValidator {
                     leaf: name,
                     expectedStatus: entryStatus
                 )
-                let declaredImage = UTType(
-                    filenameExtension: (name as NSString).pathExtension
-                )?.conforms(to: .image) == true
-                guard detectedType.flatMap(UTType.init)?.conforms(to: .image) == true
-                        || declaredImage else {
+                let detectedImage = detectedType.map {
+                    isSupportedFinishedProjectPhotoType($0)
+                } == true
+                let declaredImage = detectedType == nil
+                    && UTType(filenameExtension: (name as NSString).pathExtension)?
+                        .conforms(to: .image) == true
+                guard detectedImage || declaredImage else {
                     continue
                 }
                 guard entryStatus.st_size > 0 else {
@@ -2958,6 +3133,20 @@ public enum ProjectArtifactValidator {
         let typeIdentifier: String
     }
 
+    private static func isSupportedFinishedProjectRasterType(
+        _ typeIdentifier: String
+    ) -> Bool {
+        ["public.jpeg", "public.png", "public.heic", "public.heif"]
+            .contains(typeIdentifier)
+    }
+
+    private static func isSupportedFinishedProjectPhotoType(
+        _ typeIdentifier: String
+    ) -> Bool {
+        isSupportedFinishedProjectRasterType(typeIdentifier)
+            || UTType(typeIdentifier)?.conforms(to: .rawImage) == true
+    }
+
     private static func finishedProjectImageSource(
         descriptor: Int32,
         declaredFilename: String
@@ -3022,7 +3211,10 @@ public enum ProjectArtifactValidator {
         }
         let source = imageSource.source
         let typeIdentifier = imageSource.typeIdentifier
-        guard let type = UTType(typeIdentifier),
+        let isRaster = isSupportedFinishedProjectRasterType(typeIdentifier)
+        let isRaw = !isRaster
+            && UTType(typeIdentifier)?.conforms(to: .rawImage) == true
+        guard isRaster || isRaw,
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
                 as? [CFString: Any],
               let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
@@ -3042,7 +3234,7 @@ public enum ProjectArtifactValidator {
             )
         }
         let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
-        if type.conforms(to: .rawImage) {
+        if isRaw {
             return FinishedProjectPhotoEvidence(
                 typeIdentifier: typeIdentifier,
                 pixelWidth: width.intValue,
@@ -3051,8 +3243,7 @@ public enum ProjectArtifactValidator {
                 isReadable: true
             )
         }
-        guard [UTType.jpeg.identifier, UTType.png.identifier, UTType.heic.identifier, "public.heif"]
-                .contains(typeIdentifier),
+        guard isRaster,
               CGImageSourceCreateThumbnailAtIndex(
                 source,
                 0,
@@ -3163,13 +3354,18 @@ public enum ProjectArtifactValidator {
     ) {
         updateExpectedInputContinuityHasher(&hasher, integer: identity.device)
         updateExpectedInputContinuityHasher(&hasher, integer: identity.inode)
+        updateExpectedInputContinuityHasher(&hasher, integer: identity.owner)
+        updateExpectedInputContinuityHasher(&hasher, integer: identity.group)
         updateExpectedInputContinuityHasher(&hasher, integer: identity.linkCount)
         updateExpectedInputContinuityHasher(&hasher, integer: identity.mode)
+        updateExpectedInputContinuityHasher(&hasher, integer: identity.flags)
         updateExpectedInputContinuityHasher(&hasher, integer: identity.size)
         updateExpectedInputContinuityHasher(&hasher, integer: identity.modifiedSeconds)
         updateExpectedInputContinuityHasher(&hasher, integer: identity.modifiedNanoseconds)
         updateExpectedInputContinuityHasher(&hasher, integer: identity.changedSeconds)
         updateExpectedInputContinuityHasher(&hasher, integer: identity.changedNanoseconds)
+        updateExpectedInputContinuityHasher(&hasher, integer: identity.createdSeconds)
+        updateExpectedInputContinuityHasher(&hasher, integer: identity.createdNanoseconds)
     }
 
     private static func updateExpectedInputContinuityHasher(
@@ -3730,6 +3926,117 @@ public enum ProjectArtifactValidator {
             )
         }
         return FinishedProjectFileIdentity(status)
+    }
+
+    private static func protectedAncestorDirectories(
+        projectRoot: URL,
+        files: [URL]
+    ) -> [URL] {
+        let root = projectRoot.standardizedFileURL
+        let rootPrefix = root.path + "/"
+        var directoriesByPath = [root.path: root]
+        for file in files {
+            var directory = file.deletingLastPathComponent().standardizedFileURL
+            while directory.path == root.path || directory.path.hasPrefix(rootPrefix) {
+                directoriesByPath[directory.path] = directory
+                guard directory.path != root.path else { break }
+                directory = directory.deletingLastPathComponent().standardizedFileURL
+            }
+        }
+        return directoriesByPath.values.sorted {
+            let leftDepth = $0.pathComponents.count
+            let rightDepth = $1.pathComponents.count
+            return leftDepth == rightDepth ? $0.path < $1.path : leftDepth < rightDepth
+        }
+    }
+
+    private static func safeFinishedProjectProtectedFileIdentity(
+        at url: URL
+    ) throws -> FinishedProjectProtectedFileIdentity {
+        let initialPathIdentity = try safeFinishedProjectFileIdentity(at: url)
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else {
+            throw finishedProjectError("\(url.lastPathComponent) changed during validation")
+        }
+        defer { Darwin.close(descriptor) }
+
+        var initialDescriptorStatus = stat()
+        guard fstat(descriptor, &initialDescriptorStatus) == 0 else {
+            throw finishedProjectError("\(url.lastPathComponent) changed during validation")
+        }
+        let initialDescriptorIdentity = FinishedProjectFileIdentity(
+            initialDescriptorStatus
+        )
+        guard sameStableFinishedProjectFileMetadata(
+            initialPathIdentity,
+            initialDescriptorIdentity
+        ) else {
+            throw finishedProjectError("\(url.lastPathComponent) changed during validation")
+        }
+
+        var hasher = SHA256()
+        var offset: off_t = 0
+        var buffer = [UInt8](repeating: 0, count: 1_048_576)
+        while offset < initialDescriptorStatus.st_size {
+            let requested = min(
+                buffer.count,
+                Int(initialDescriptorStatus.st_size - offset)
+            )
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.pread(descriptor, bytes.baseAddress, requested, offset)
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0, count <= requested else {
+                throw finishedProjectError("\(url.lastPathComponent) changed during validation")
+            }
+            hasher.update(data: Data(buffer[0..<count]))
+            offset += off_t(count)
+        }
+
+        var finalDescriptorStatus = stat()
+        guard fstat(descriptor, &finalDescriptorStatus) == 0,
+              offset == initialDescriptorStatus.st_size else {
+            throw finishedProjectError("\(url.lastPathComponent) changed during validation")
+        }
+        let finalDescriptorIdentity = FinishedProjectFileIdentity(
+            finalDescriptorStatus
+        )
+        let finalPathIdentity = try safeFinishedProjectFileIdentity(at: url)
+        guard sameStableFinishedProjectFileMetadata(
+            initialDescriptorIdentity,
+            finalDescriptorIdentity
+        ), sameStableFinishedProjectFileMetadata(
+            finalDescriptorIdentity,
+            finalPathIdentity
+        ) else {
+            throw finishedProjectError("\(url.lastPathComponent) changed during validation")
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return FinishedProjectProtectedFileIdentity(
+            identity: finalDescriptorIdentity,
+            sha256: digest
+        )
+    }
+
+    private static func sameStableFinishedProjectFileMetadata(
+        _ lhs: FinishedProjectFileIdentity,
+        _ rhs: FinishedProjectFileIdentity
+    ) -> Bool {
+        lhs.device == rhs.device
+            && lhs.inode == rhs.inode
+            && lhs.owner == rhs.owner
+            && lhs.group == rhs.group
+            && lhs.linkCount == rhs.linkCount
+            && lhs.mode == rhs.mode
+            && lhs.flags == rhs.flags
+            && lhs.size == rhs.size
+            && lhs.modifiedSeconds == rhs.modifiedSeconds
+            && lhs.modifiedNanoseconds == rhs.modifiedNanoseconds
+            && lhs.createdSeconds == rhs.createdSeconds
+            && lhs.createdNanoseconds == rhs.createdNanoseconds
     }
 
     private static func finishedProjectError(

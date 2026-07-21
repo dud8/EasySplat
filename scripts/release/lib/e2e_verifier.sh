@@ -244,6 +244,25 @@ if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", process_name):
 replacement_pattern = (
     "^" + re.escape(replacement_parent) + "/NSIRD_" + re.escape(process_name) + "_.*$"
 )
+hex_character = r"[0-9A-Fa-f]"
+uuid_pattern = (
+    hex_character * 8 + "-" + hex_character * 4 + "-"
+    + hex_character * 4 + "-" + hex_character * 4 + "-"
+    + hex_character * 12
+)
+verification_scratch_patterns = [
+    "^" + re.escape(os.path.dirname(replacement_parent))
+    + "/" + re.escape(prefix)
+    + uuid_pattern + r"(/.*)?$"
+    for prefix in (
+        "EasySplat-selected-lineage-",
+        "EasySplat-video-lineage-",
+        "EasySplat-finished-dataset-replay-",
+    )
+]
+verification_scratch_filters = " ".join(
+    f'(regex #"{pattern}")' for pattern in verification_scratch_patterns
+)
 
 blocked_directory_roots = {
     "/",
@@ -458,6 +477,24 @@ for path in [*read_subpaths, *read_literals, replacement_parent, invoking_cwd]:
 metadata_filters = " ".join(
     f"(literal {json.dumps(path)})" for path in unique(metadata_paths)
 )
+directory_data_paths = ["/"]
+for path in read_subpaths:
+    current = Path(path)
+    while True:
+        directory_data_paths.append(str(current))
+        if current.parent == current:
+            break
+        current = current.parent
+for path in read_literals:
+    current = Path(path).parent
+    while True:
+        directory_data_paths.append(str(current))
+        if current.parent == current:
+            break
+        current = current.parent
+directory_data_filters = " ".join(
+    f"(literal {json.dumps(path)})" for path in unique(directory_data_paths)
+)
 write_filters = " ".join(
     f"(subpath {json.dumps(path)})" for path in isolated_roots
 )
@@ -469,15 +506,18 @@ profile_path.write_text(
         '(allow network-outbound (remote unix-socket (path-literal "/private/var/run/syslog")))',
         "(allow process-fork)",
         f"(allow process-exec {process_filters})",
-        # AMFI reads the root directory vnode while validating every launched
-        # executable. This permits that one directory read, not descendants.
-        '(allow file-read-data (literal "/"))',
+        # Descriptor-bound project publication and runtime loading open each
+        # declared directory chain without following links. Directory-data
+        # rights remain literal, so sibling file contents stay unreadable.
+        f"(allow file-read-data {directory_data_filters})",
         f"(allow file-read-metadata {metadata_filters})",
         f"(allow file-read* {' '.join(read_filters)})",
         f'(allow file-read* (regex #"{replacement_pattern}"))',
+        f"(allow file-read* {verification_scratch_filters})",
         f"(allow file-write* {write_filters})",
         '(allow file-write-data (literal "/dev/null"))',
         f'(allow file-write-create file-write-unlink (regex #"{replacement_pattern}"))',
+        f"(allow file-write* {verification_scratch_filters})",
         "(allow mach-lookup)",
         f"(deny mach-lookup (global-name {json.dumps(deny_marker)}))",
         f"(allow mach-lookup (global-name {json.dumps(allow_marker)}))",

@@ -933,6 +933,9 @@ private enum ReleaseVerifier {
             manifestURL: arguments.inputManifest,
             inputRoot: arguments.inputRoot
         )
+        let expectedInputSnapshot = try ProjectArtifactValidator.captureExpectedInputSnapshot(
+            resolvedInput.expectedInput
+        )
         let input: InputSpec = switch resolvedInput.expectedInput {
         case .videoFiles(let files):
             .video(files: files.map(\.path))
@@ -1040,32 +1043,45 @@ private enum ReleaseVerifier {
 
         let projectParent = arguments.output.deletingLastPathComponent()
         try fileManager.createDirectory(at: projectParent, withIntermediateDirectories: true)
-        let projectName: String
+        let projectTitle: String
         switch arguments.installationPolicy {
         case .remoteOnly:
-            projectName = "Online.easysplatproj"
+            projectTitle = "Online"
         case .bundledBootstrapOnly:
-            projectName = "Offline.easysplatproj"
+            projectTitle = "Offline"
         case .cachedOnly:
-            projectName = "Cached.easysplatproj"
+            projectTitle = "Cached"
         }
-        let projectURL = projectParent.appendingPathComponent(projectName, isDirectory: true)
-        if fileManager.fileExists(atPath: projectURL.path)
-            || (try? fileManager.destinationOfSymbolicLink(atPath: projectURL.path)) != nil {
+        let projectName = "\(projectTitle).easysplatproj"
+        let expectedProjectURL = projectParent.appendingPathComponent(
+            projectName,
+            isDirectory: true
+        )
+        if fileManager.fileExists(atPath: expectedProjectURL.path)
+            || (try? fileManager.destinationOfSymbolicLink(
+                atPath: expectedProjectURL.path
+            )) != nil {
             throw VerificationError.invalidEvidence(
-                "Release-verification project path must start absent: \(projectURL.lastPathComponent)"
+                "Release-verification project path must start absent: "
+                    + expectedProjectURL.lastPathComponent
             )
         }
-        let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
-        let metadata = ProjectMetadata(
-            title: "Release Verification",
-            input: input,
-            requestedRunOptions: options,
-            resolvedRunPlan: plan
+        let preparedProject = try await ReleaseVerificationProjectBuilder.prepare(
+            resolvedInput: resolvedInput,
+            requestedOptions: options,
+            resolvedRunPlan: plan,
+            projectParent: projectParent,
+            title: projectTitle
         )
-        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-
+        defer { preparedProject.publication.attestation.discard() }
+        guard preparedProject.publication.projectURL
+            .resolvingSymlinksInPath().standardizedFileURL
+            == expectedProjectURL.resolvingSymlinksInPath().standardizedFileURL else {
+            throw VerificationError.invalidEvidence(
+                "Release-verification project publication chose an unexpected destination."
+            )
+        }
+        let projectURL = preparedProject.publication.projectURL
         let runner = PipelineRunner(
             projectURL: projectURL,
             config: .init(
@@ -1074,7 +1090,9 @@ private enum ReleaseVerifier {
                 resolvedRunPlan: plan
             )
         )
-        try await runner.run { event in
+        try await runner.run(
+            freshPublicationAttestation: preparedProject.publication.attestation
+        ) { event in
             switch event {
             case .stageStarted(let stage):
                 print("Stage: \(stage.rawValue)")
@@ -1100,7 +1118,10 @@ private enum ReleaseVerifier {
         guard try PackagedProjectInputResolver.resolve(
             manifestURL: arguments.inputManifest,
             inputRoot: arguments.inputRoot
-        ) == resolvedInput else {
+        ) == resolvedInput,
+              try ProjectArtifactValidator.captureExpectedInputSnapshot(
+                resolvedInput.expectedInput
+              ) == expectedInputSnapshot else {
             throw VerificationError.invalidEvidence(
                 "The typed release input changed while release verification was running."
             )
@@ -1127,7 +1148,10 @@ private enum ReleaseVerifier {
         guard try PackagedProjectInputResolver.resolve(
             manifestURL: arguments.inputManifest,
             inputRoot: arguments.inputRoot
-        ) == resolvedInput else {
+        ) == resolvedInput,
+              try ProjectArtifactValidator.captureExpectedInputSnapshot(
+                resolvedInput.expectedInput
+              ) == expectedInputSnapshot else {
             throw VerificationError.invalidEvidence(
                 "The typed release input changed during signed dataset replay."
             )
