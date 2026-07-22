@@ -389,6 +389,7 @@ public final class PipelineRunner: @unchecked Sendable {
         var acceptedPairGraphEvidence: PairGraphEvidence?
         var acceptedDa3PairGraphEvidence: PairGraphEvidence?
         var latestRejectedCaptureConnectionFailure: CaptureConnectionFailure?
+        var latestRejectedInspection: ColmapPairGraphInspection?
         var matchingDurationSeconds = 0.0
         let resumeValidationMode = effectiveLastCompletedStage != nil
         let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
@@ -2650,6 +2651,91 @@ public final class PipelineRunner: @unchecked Sendable {
                 try restoreAcceptedPairEvidence(evidence)
             }
 
+            // Shared tail for every accepted pair graph: advisory logs,
+            // evidence persistence, checkpoint, and stage completion. Called
+            // from the in-attempt acceptance and from the terminal
+            // dominant-component acceptance, so both persist byte-identical
+            // evidence shapes.
+            func finalizeAcceptedPairGraph(
+                _ inspection: ColmapPairGraphInspection,
+                acceptedAttemptNumber: Int
+            ) throws {
+                let imageNames = selectedFrames.map(\.lastPathComponent)
+                let unmatchedViewCount = inspection.isolatedViewCount
+                    - inspection.descriptorlessViewCount
+                let componentViewCounts = inspection.verifiedGraph.components
+                    .map(\.count)
+                    .sorted(by: >)
+                let dominantViewCount = componentViewCounts.first ?? 0
+                let minorVerifiedViewCount = imageNames.count
+                    - dominantViewCount
+                    - inspection.isolatedViewCount
+                if unmatchedViewCount > 0 {
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "\(unmatchedViewCount) view\(unmatchedViewCount == 1 ? "" : "s") had no verified overlap and may stay unregistered.",
+                        isError: false
+                    ))
+                }
+                if inspection.descriptorlessViewCount > 0 {
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "\(inspection.descriptorlessViewCount) view\(inspection.descriptorlessViewCount == 1 ? "" : "s") had no usable descriptors and may stay unregistered.",
+                        isError: false
+                    ))
+                }
+                if minorVerifiedViewCount > 0 {
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "\(minorVerifiedViewCount) view\(minorVerifiedViewCount == 1 ? "" : "s") matched only within small disconnected fragments and may stay unregistered.",
+                        isError: false
+                    ))
+                }
+
+                let evidence = PairGraphEvidence(
+                    selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                        orderedImageNames: imageNames,
+                        projectPaths: paths
+                    ),
+                    imageNames: imageNames,
+                    pairingPolicy: resolvedRunPlan.pairingPolicy,
+                    planBinding: PairGraphPlanBinding(resolvedRunPlan),
+                    attempts: pairGraphAttempts,
+                    acceptedAttemptNumber: acceptedAttemptNumber,
+                    acceptedInspection: inspection,
+                    retrievalWasScheduled: retrievalWasScheduled,
+                    usedLocalVocabularyRetrieval:
+                        pairGraphAttempts.last?.retrieval != nil,
+                    matchingDurationSeconds: matchingDurationSeconds,
+                    fallbackReasons: mappingFallbackReasons
+                )
+                try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
+                try PairGraphEvidenceStore.save(
+                    evidence,
+                    to: paths.pairGraphEvidenceURL,
+                    projectPaths: paths
+                )
+                acceptedPairGraphEvidence = evidence
+                activeMapperGraphContext = try evidence.mapperWorkerInvocationContext()
+                try persistGeometryRecovery()
+                writeCheckpoint(
+                    stage: .sfmMatching,
+                    progress: 1,
+                    message: "Image matching completed",
+                    details: .sfmMatching(SfmMatchingCheckpoint(
+                        databasePath: try paths.projectRelativePath(
+                            for: paths.colmapDatabaseURL
+                        ),
+                        expectedPairs: inspection.scheduledPairCount,
+                        processedPairs: inspection.attemptedPairCount
+                    ))
+                )
+                emit(.stageFinished(stage: .sfmMatching))
+                markStageComplete(.sfmMatching)
+                try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
+                try stopIfRequested(after: .sfmMatching)
+            }
+
             let runMatching: (Bool) async throws -> Void = { force in
                 if recoveredAcceptedExactEvidence {
                     recoveredAcceptedExactEvidence = false
@@ -3177,6 +3263,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 ))
                 matchingDurationSeconds += duration
                 latestCompletedPairPlan = pairPlan
+                latestRejectedInspection = graphWasAccepted ? nil : inspection
                 latestRejectedCaptureConnectionFailure = graphWasAccepted
                     ? nil
                     : try CaptureConnectionFailure(
@@ -3221,79 +3308,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     ))
                     throw ColmapPairPlanningError.disconnectedVerifiedGraph
                 }
-                let unmatchedViewCount = inspection.isolatedViewCount
-                    - inspection.descriptorlessViewCount
-                let componentViewCounts = inspection.verifiedGraph.components
-                    .map(\.count)
-                    .sorted(by: >)
-                let dominantViewCount = componentViewCounts.first ?? 0
-                let minorVerifiedViewCount = imageNames.count
-                    - dominantViewCount
-                    - inspection.isolatedViewCount
-                if unmatchedViewCount > 0 {
-                    emit(.stageLog(
-                        stage: .sfmMatching,
-                        line: "\(unmatchedViewCount) view\(unmatchedViewCount == 1 ? "" : "s") had no verified overlap and may stay unregistered.",
-                        isError: false
-                    ))
-                }
-                if inspection.descriptorlessViewCount > 0 {
-                    emit(.stageLog(
-                        stage: .sfmMatching,
-                        line: "\(inspection.descriptorlessViewCount) view\(inspection.descriptorlessViewCount == 1 ? "" : "s") had no usable descriptors and may stay unregistered.",
-                        isError: false
-                    ))
-                }
-                if minorVerifiedViewCount > 0 {
-                    emit(.stageLog(
-                        stage: .sfmMatching,
-                        line: "\(minorVerifiedViewCount) view\(minorVerifiedViewCount == 1 ? "" : "s") matched only within small disconnected fragments and may stay unregistered.",
-                        isError: false
-                    ))
-                }
-
-                let evidence = PairGraphEvidence(
-                    selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
-                        orderedImageNames: imageNames,
-                        projectPaths: paths
-                    ),
-                    imageNames: imageNames,
-                    pairingPolicy: resolvedRunPlan.pairingPolicy,
-                    planBinding: PairGraphPlanBinding(resolvedRunPlan),
-                    attempts: pairGraphAttempts,
-                    acceptedAttemptNumber: attemptNumber,
-                    acceptedInspection: inspection,
-                    retrievalWasScheduled: retrievalWasScheduled,
-                    usedLocalVocabularyRetrieval:
-                        pairGraphAttempts.last?.retrieval != nil,
-                    matchingDurationSeconds: matchingDurationSeconds,
-                    fallbackReasons: mappingFallbackReasons
+                try finalizeAcceptedPairGraph(
+                    inspection,
+                    acceptedAttemptNumber: attemptNumber
                 )
-                try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
-                try PairGraphEvidenceStore.save(
-                    evidence,
-                    to: paths.pairGraphEvidenceURL,
-                    projectPaths: paths
-                )
-                acceptedPairGraphEvidence = evidence
-                activeMapperGraphContext = try evidence.mapperWorkerInvocationContext()
-                try persistGeometryRecovery()
-                writeCheckpoint(
-                    stage: .sfmMatching,
-                    progress: 1,
-                    message: "Image matching completed",
-                    details: .sfmMatching(SfmMatchingCheckpoint(
-                        databasePath: try paths.projectRelativePath(
-                            for: paths.colmapDatabaseURL
-                        ),
-                        expectedPairs: inspection.scheduledPairCount,
-                        processedPairs: inspection.attemptedPairCount
-                    ))
-                )
-                emit(.stageFinished(stage: .sfmMatching))
-                markStageComplete(.sfmMatching)
-                try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
-                try stopIfRequested(after: .sfmMatching)
             }
 
             let retryWithCpuIfNeeded: (Error) throws -> Bool = { error in
@@ -3503,6 +3521,42 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                         if pairPlanningError == .disconnectedVerifiedGraph,
                            let captureFailure = latestRejectedCaptureConnectionFailure {
+                            // Every recovery rung is exhausted. If the graph
+                            // still holds one viable dominant component,
+                            // build from it instead of failing the run; the
+                            // disconnected views stay out of the splat.
+                            if let rejectedInspection = latestRejectedInspection,
+                               rejectedInspection.hasViableDominantVerifiedComponent,
+                               let terminalAttemptIndex = pairGraphAttempts.indices.last,
+                               pairGraphAttempts[terminalAttemptIndex].artifact.outcome == .rejected {
+                                pairGraphAttempts[terminalAttemptIndex].artifact.outcome = .completed
+                                let acceptedAttemptNumber = pairGraphAttempts[terminalAttemptIndex]
+                                    .artifact.attemptNumber
+                                latestRejectedCaptureConnectionFailure = nil
+                                latestRejectedInspection = nil
+                                let componentViewCounts = rejectedInspection.verifiedGraph.components
+                                    .map(\.count)
+                                    .sorted(by: >)
+                                let dominantViewCount = componentViewCounts.first ?? 0
+                                let excludedViewCount = selectedFrames.count - dominantViewCount
+                                let secondGroupViewCount = componentViewCounts.dropFirst().first ?? 0
+                                var continuationLine = "Matching could not connect every photo. Continuing with the largest connected group: \(dominantViewCount) of \(selectedFrames.count) photos. \(excludedViewCount) photo\(excludedViewCount == 1 ? " stays" : "s stay") out of the splat."
+                                if secondGroupViewCount > 1 {
+                                    continuationLine += " The largest separate group has \(secondGroupViewCount) photos."
+                                }
+                                emit(.stageLog(
+                                    stage: .sfmMatching,
+                                    line: continuationLine,
+                                    isError: true
+                                ))
+                                try finalizeAcceptedPairGraph(
+                                    rejectedInspection,
+                                    acceptedAttemptNumber: acceptedAttemptNumber
+                                )
+                                forceSfMRun = false
+                                forceMatchingRun = false
+                                break
+                            }
                             throw captureFailure
                         }
                         throw error
@@ -3640,10 +3694,23 @@ public final class PipelineRunner: @unchecked Sendable {
                         var preferredValidationError: Error?
                         var preferredLowQualityScore: ReconstructionScore?
                         var preferredFragmentationEvidence: MappingFragmentationEvidence?
+                        // Coverage is judged against the views matching
+                        // admitted (the dominant component for a partial
+                        // acceptance), never against views already excluded.
+                        let admittedViewCount = acceptedPairGraphEvidence?
+                            .admittedViewCount ?? selectedFrames.count
+                        let admittedImageIDs: Set<UInt32>? = acceptedPairGraphEvidence
+                            .flatMap { $0.dominantComponentImageNames() }
+                            .map { admittedNames in
+                                Set(memberships.imageNamesByID.compactMap { id, name in
+                                    admittedNames.contains(name) ? id : nil
+                                })
+                            }
                         for selected in rankedCandidates {
                             let score = selected.score
                             guard ReconstructionScorer.isAcceptable(
                                 score,
+                                admittedTotalImages: admittedViewCount,
                                 capturePath: resolvedRunPlan.capturePath
                             ) else {
                                 if preferredLowQualityScore == nil {
@@ -3673,7 +3740,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                     candidates: candidates,
                                     memberships: memberships.models,
                                     residualValidatedModelOrders: residualValidatedModelOrders,
-                                    totalSelectedViewCount: selectedFrames.count
+                                    totalSelectedViewCount: selectedFrames.count,
+                                    admittedImageIDs: admittedImageIDs
                                 ) {
                                     if preferredFragmentationEvidence == nil {
                                         preferredFragmentationEvidence = fragmentation
@@ -4147,6 +4215,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 let publishedConditioningAnalysis = try validatedConditionedGeometry(
                     modelDirectory: canonicalSparseModel,
                     selectedFrames: selectedFrames,
+                    admittedViewCount: acceptedPairGraphEvidence?
+                        .admittedViewCount ?? selectedFrames.count,
                     requireStrongObservationCoverage: acceptedDa3ModelSubdirectory != nil
                 )
                 try requirePublishedGeometry(

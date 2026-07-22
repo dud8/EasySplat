@@ -189,6 +189,29 @@ public enum ReconstructionScorer {
         return true
     }
 
+    /// Acceptance against the views matching admitted to mapping. The score's
+    /// own totalImages stays the selected count so logs and summaries remain
+    /// honest; only the coverage ratio is judged on the admitted subset.
+    public static func isAcceptable(
+        _ score: ReconstructionScore,
+        admittedTotalImages: Int,
+        capturePath: CapturePath
+    ) -> Bool {
+        guard admittedTotalImages > 0,
+              admittedTotalImages <= score.totalImages else {
+            return isAcceptable(score, capturePath: capturePath)
+        }
+        let admittedScore = ReconstructionScore(
+            registeredImages: score.registeredImages,
+            totalImages: max(score.registeredImages, admittedTotalImages),
+            meanReprojectionError: score.meanReprojectionError,
+            pointCount: score.pointCount,
+            observationCount: score.observationCount,
+            meanTrackLength: score.meanTrackLength
+        )
+        return isAcceptable(admittedScore, capturePath: capturePath)
+    }
+
     public static func applyingExpectedTotalImages(
         _ score: ReconstructionScore,
         expectedTotalImages: Int

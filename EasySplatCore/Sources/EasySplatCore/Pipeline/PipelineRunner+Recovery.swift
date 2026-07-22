@@ -559,8 +559,9 @@ extension PipelineRunner {
         }
         if let failure = error as? CaptureConnectionFailure {
             let attempt = failure.attempt
+            let largestGroup = failure.componentViewCounts.first ?? 0
             return (
-                "EasySplat found separate parts of the capture. Add views between the gaps with clear shared detail, and keep the scene still.",
+                "EasySplat could not connect this capture into one scene. The largest connected group is \(largestGroup) of \(failure.selectedViewCount) photos. Add photos that overlap the missing areas with clear shared detail, and keep the scene still.",
                 "Capture connection failed after all recovery attempts: policy \(failure.pairingPolicy.rawValue); \(failure.selectedViewCount) selected views; attempt \(attempt.attemptNumber); matcher \(attempt.matcher.rawValue); recovery \(attempt.recoveryLevel.rawValue); scheduled \(attempt.scheduledPairCount); attempted \(attempt.attemptedPairCount); raw matched \(attempt.rawMatchedPairCount); verified \(attempt.spatiallyVerifiedPairCount); \(failure.connectedComponentCount) components; \(failure.isolatedViewCount) isolated; \(failure.descriptorlessViewCount) descriptorless; component sizes \(failure.componentViewCounts); degree p10/median/p90 \(failure.degreeP10)/\(failure.degreeMedian)/\(failure.degreeP90)."
             )
         }

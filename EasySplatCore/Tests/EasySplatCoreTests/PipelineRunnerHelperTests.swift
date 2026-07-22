@@ -258,6 +258,66 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }
     }
 
+    func testMappingFragmentationIgnoresOmittedViewsOutsideTheAdmittedComponent() {
+        func candidate(order: Int, imageIDs: Set<UInt32>) -> MappedSparseModelCandidate {
+            MappedSparseModelCandidate(
+                url: URL(fileURLWithPath: "/tmp/\(order)"),
+                order: order,
+                score: ReconstructionScore(
+                    registeredImages: imageIDs.count,
+                    totalImages: 22,
+                    meanReprojectionError: 0.7,
+                    pointCount: imageIDs.count * 10,
+                    observationCount: imageIDs.count * 30,
+                    meanTrackLength: 3
+                )
+            )
+        }
+
+        // A split capture: matching admitted the 12-view dominant component;
+        // the 10-view separate group still reconstructs as a credible sibling.
+        let selectedIDs = Set((1...12).map(UInt32.init))
+        let siblingIDs = Set((13...22).map(UInt32.init))
+        let selected = candidate(order: 0, imageIDs: selectedIDs)
+        let sibling = candidate(order: 1, imageIDs: siblingIDs)
+        let memberships: [ColmapSparseModelMembership] = [
+            .init(modelOrder: 0, imageIDs: selectedIDs),
+            .init(modelOrder: 1, imageIDs: siblingIDs),
+        ]
+
+        // Unscoped, the credible sibling counts as recoverable loss.
+        XCTAssertNotNil(PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: [selected, sibling],
+            memberships: memberships,
+            residualValidatedModelOrders: [1],
+            totalSelectedViewCount: 22
+        ))
+
+        // Scoped to the admitted component, the sibling's views are expected
+        // losses and the selected model is accepted.
+        XCTAssertNil(PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: [selected, sibling],
+            memberships: memberships,
+            residualValidatedModelOrders: [1],
+            totalSelectedViewCount: 22,
+            admittedImageIDs: selectedIDs
+        ))
+
+        // Admitted views the mapper dropped into a sibling still count.
+        let admittedIncludingDropped = selectedIDs.union([13, 14, 15])
+        let evidence = PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: [selected, sibling],
+            memberships: memberships,
+            residualValidatedModelOrders: [1],
+            totalSelectedViewCount: 22,
+            admittedImageIDs: admittedIncludingDropped
+        )
+        XCTAssertEqual(evidence?.omittedRecoverableViewCount, 3)
+    }
+
     func testMappingFragmentationUsesCredibleMembershipUnionDeterministically() {
         func candidate(
             order: Int,

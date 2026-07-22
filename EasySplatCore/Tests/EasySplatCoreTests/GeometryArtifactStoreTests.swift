@@ -1377,6 +1377,80 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testValidatesViablePartialCoverageBelowTheStrictFloor() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeDescriptorlessGeometryFixture(at: paths)
+        var artifact = makeDescriptorlessMeasuredArtifact(fixture: fixture)
+
+        // Two extra views never connected: 9 of 12 (75%) is below the strict
+        // floor, admitted through the viable dominant component, and judged
+        // on the admitted denominator (9/9).
+        func reshapeSelection(_ artifact: inout GeometryArtifact, viewCount: Int) throws {
+            let imageNames = (1...viewCount).map { String(format: "frame_%06d.jpg", $0) }
+            for (offset, imageName) in imageNames.enumerated() {
+                let frameURL = paths.framesSelectedURL.appendingPathComponent(imageName)
+                if !FileManager.default.fileExists(atPath: frameURL.path) {
+                    try Data("selected frame \(offset + 1)".utf8).write(
+                        to: frameURL,
+                        options: [.atomic]
+                    )
+                }
+            }
+            artifact.orderedImageNames = imageNames
+            artifact.orderedImageTimestamps = Array(repeating: nil, count: viewCount)
+            artifact.totalViewCount = viewCount
+            artifact.selectedFramesDigest = try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: imageNames,
+                projectPaths: paths
+            )
+            artifact.cameraGroupingReceipt = ColmapCameraGroupingReceipt(
+                mode: .allSelectedImagesShared,
+                cameraCountBefore: viewCount,
+                cameraCountAfter: 1,
+                groupedVideoSourceCount: 0,
+                groups: [
+                    ColmapCameraGroupReceipt(
+                        sourceGroupID: "all-selected-images",
+                        memberCount: viewCount,
+                        canonicalCameraID: 1
+                    )
+                ]
+            )
+        }
+        try reshapeSelection(&artifact, viewCount: 12)
+        artifact.pairGraph.measurement?.connectedComponentCount = 4
+        artifact.pairGraph.measurement?.isolatedViewCount = 3
+        artifact.pairGraph.measurement?.componentViewCounts = [9, 1, 1, 1]
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+
+        // Registering more views than the admitted component stays invalid.
+        var overRegistered = artifact
+        overRegistered.registeredViewCount = 10
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(overRegistered, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        // Tied largest groups have no admitted component; the coverage
+        // fraction falls back to the selected count and fails.
+        var tiedGroups = artifact
+        try reshapeSelection(&tiedGroups, viewCount: 18)
+        tiedGroups.pairGraph.measurement?.connectedComponentCount = 2
+        tiedGroups.pairGraph.measurement?.isolatedViewCount = 0
+        tiedGroups.pairGraph.measurement?.descriptorlessViewCount = 0
+        tiedGroups.pairGraph.measurement?.componentViewCounts = [9, 9]
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(tiedGroups, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidResiduals)
+        }
+    }
+
     func testMappingArtifactAcceptsOverlappingModelsAndDetailedRecovery() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

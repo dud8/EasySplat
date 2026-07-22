@@ -19,6 +19,11 @@ struct ColmapVerifiedGraphSnapshot: Sendable, Equatable {
 enum PairGraphConnectivityPolicy {
     static let minimumDominantFractionWithVerifiedMinority = 0.95
 
+    /// Smallest dominant component the pipeline will build from when the
+    /// strict coverage fractions fail. Below this, an incremental solve has
+    /// too little pair redundancy to seed reliably.
+    static let minimumViableDominantViewCount = 8
+
     static func dominantViewCount(
         totalViewCount: Int,
         componentViewCounts: [Int],
@@ -26,6 +31,78 @@ enum PairGraphConnectivityPolicy {
         isolatedViewCount: Int,
         descriptorlessViewCount: Int
     ) -> Int? {
+        guard let partition = validatedPartition(
+            totalViewCount: totalViewCount,
+            componentViewCounts: componentViewCounts,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        ) else {
+            return nil
+        }
+        let requiredFraction = partition.hasMinorVerifiedComponent
+            ? minimumDominantFractionWithVerifiedMinority
+            : ReconstructionScorer.minimumRegisteredViewFraction
+        guard Double(partition.dominantViewCount) / Double(totalViewCount) >= requiredFraction else {
+            return nil
+        }
+        return partition.dominantViewCount
+    }
+
+    /// Relaxed acceptance for the terminal recovery attempt: a strictly
+    /// largest component big enough to reconstruct, with no coverage
+    /// fraction. The excluded views stay out of the splat.
+    static func viableDominantViewCount(
+        totalViewCount: Int,
+        componentViewCounts: [Int],
+        connectedComponentCount: Int,
+        isolatedViewCount: Int,
+        descriptorlessViewCount: Int
+    ) -> Int? {
+        guard let partition = validatedPartition(
+            totalViewCount: totalViewCount,
+            componentViewCounts: componentViewCounts,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        ), partition.dominantViewCount >= minimumViableDominantViewCount else {
+            return nil
+        }
+        return partition.dominantViewCount
+    }
+
+    /// Validity contract for persisted graphs: everything the strict gate
+    /// ever accepted plus everything the terminal viable acceptance can now
+    /// persist. Legacy artifacts always satisfy the strict branch.
+    static func admissibleDominantViewCount(
+        totalViewCount: Int,
+        componentViewCounts: [Int],
+        connectedComponentCount: Int,
+        isolatedViewCount: Int,
+        descriptorlessViewCount: Int
+    ) -> Int? {
+        dominantViewCount(
+            totalViewCount: totalViewCount,
+            componentViewCounts: componentViewCounts,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        ) ?? viableDominantViewCount(
+            totalViewCount: totalViewCount,
+            componentViewCounts: componentViewCounts,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        )
+    }
+
+    private static func validatedPartition(
+        totalViewCount: Int,
+        componentViewCounts: [Int],
+        connectedComponentCount: Int,
+        isolatedViewCount: Int,
+        descriptorlessViewCount: Int
+    ) -> (dominantViewCount: Int, hasMinorVerifiedComponent: Bool)? {
         guard totalViewCount >= 2,
               !componentViewCounts.isEmpty,
               componentViewCounts.count <= totalViewCount,
@@ -63,13 +140,7 @@ enum PairGraphConnectivityPolicy {
             return nil
         }
         let hasMinorVerifiedComponent = componentViewCounts.dropFirst().contains { $0 > 1 }
-        let requiredFraction = hasMinorVerifiedComponent
-            ? minimumDominantFractionWithVerifiedMinority
-            : ReconstructionScorer.minimumRegisteredViewFraction
-        guard Double(dominantViewCount) / Double(totalViewCount) >= requiredFraction else {
-            return nil
-        }
-        return dominantViewCount
+        return (dominantViewCount, hasMinorVerifiedComponent)
     }
 }
 
@@ -111,12 +182,49 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
     func hasAcceptableDominantVerifiedComponent(
         allowMinorVerifiedComponents: Bool
     ) -> Bool {
+        guard let partition = structurallyValidatedPartition(),
+              PairGraphConnectivityPolicy.dominantViewCount(
+                  totalViewCount: partition.totalViewCount,
+                  componentViewCounts: partition.sortedComponentSizes,
+                  connectedComponentCount: connectedComponentCount,
+                  isolatedViewCount: isolatedViewCount,
+                  descriptorlessViewCount: descriptorlessViewCount
+              ) != nil else {
+            return false
+        }
+        let hasMinorVerifiedComponent = partition.sortedComponentSizes
+            .dropFirst()
+            .contains { $0 > 1 }
+        guard hasMinorVerifiedComponent else {
+            return true
+        }
+        return allowMinorVerifiedComponents
+    }
+
+    /// Terminal-recovery acceptance: the structural graph checks still hold
+    /// and the largest component clears the viability floor, regardless of
+    /// how much of the capture it covers.
+    var hasViableDominantVerifiedComponent: Bool {
+        guard let partition = structurallyValidatedPartition() else {
+            return false
+        }
+        return PairGraphConnectivityPolicy.viableDominantViewCount(
+            totalViewCount: partition.totalViewCount,
+            componentViewCounts: partition.sortedComponentSizes,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        ) != nil
+    }
+
+    private func structurallyValidatedPartition(
+    ) -> (totalViewCount: Int, sortedComponentSizes: [Int])? {
         let components = verifiedGraph.components
         guard connectedComponentCount == components.count,
               isolatedViewCount == components.count(where: { $0.count == 1 }),
               spatiallyVerifiedPairCount == verifiedGraph.verifiedPairs.count,
               components.allSatisfy({ !$0.isEmpty }) else {
-            return false
+            return nil
         }
 
         var componentIndexByImageName: [String: Int] = [:]
@@ -125,14 +233,14 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
         for (componentIndex, component) in components.enumerated() {
             let names = Set(component)
             guard names.count == component.count else {
-                return false
+                return nil
             }
             for name in names {
                 guard componentIndexByImageName.updateValue(
                     componentIndex,
                     forKey: name
                 ) == nil else {
-                    return false
+                    return nil
                 }
             }
             componentNames.append(names)
@@ -144,7 +252,7 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
         )
         guard descriptorlessNames.count == descriptorlessImageNames.count,
               descriptorlessNames.isSubset(of: singletonNames) else {
-            return false
+            return nil
         }
 
         var adjacency = Dictionary(
@@ -158,11 +266,11 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
                   let firstComponent = componentIndexByImageName[first],
                   let secondComponent = componentIndexByImageName[second],
                   firstComponent == secondComponent else {
-                return false
+                return nil
             }
             let edge = Set([first, second])
             guard verifiedEdges.insert(edge).inserted else {
-                return false
+                return nil
             }
             adjacency[first, default: []].insert(second)
             adjacency[second, default: []].insert(first)
@@ -170,7 +278,7 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
 
         for names in componentNames {
             guard let start = names.first else {
-                return false
+                return nil
             }
             var reached: Set<String> = [start]
             var pending = [start]
@@ -181,30 +289,12 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
                 }
             }
             guard reached == names else {
-                return false
+                return nil
             }
         }
 
         let sortedComponentSizes = components.map(\.count).sorted(by: >)
-        guard PairGraphConnectivityPolicy.dominantViewCount(
-            totalViewCount: componentIndexByImageName.count,
-            componentViewCounts: sortedComponentSizes,
-            connectedComponentCount: connectedComponentCount,
-            isolatedViewCount: isolatedViewCount,
-            descriptorlessViewCount: descriptorlessViewCount
-        ) != nil else {
-            return false
-        }
-
-        let hasMinorVerifiedComponent = sortedComponentSizes.dropFirst().contains { $0 > 1 }
-        guard hasMinorVerifiedComponent else {
-            return true
-        }
-        guard allowMinorVerifiedComponents,
-              sortedComponentSizes.first != nil else {
-            return false
-        }
-        return true
+        return (componentIndexByImageName.count, sortedComponentSizes)
     }
 }
 

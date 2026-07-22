@@ -5,6 +5,7 @@ extension PipelineRunner {
         modelDirectory: URL,
         selectedFrames: [URL],
         minimumRegisteredViewCount: Int? = nil,
+        admittedViewCount: Int? = nil,
         requireStrongObservationCoverage: Bool
     ) throws -> GeometryConditioningAnalysis {
         let analysis: GeometryConditioningAnalysis
@@ -33,6 +34,14 @@ extension PipelineRunner {
                 )
             }
             requiredRegisteredViews = minimumRegisteredViewCount
+        } else if let admittedViewCount,
+                  admittedViewCount > 0,
+                  admittedViewCount <= selectedFrames.count {
+            // A run that continued with the dominant connected component is
+            // judged on the views matching admitted, not the full selection.
+            requiredRegisteredViews = Int(ceil(
+                Double(admittedViewCount) * ReconstructionScorer.minimumRegisteredViewFraction
+            ))
         } else {
             requiredRegisteredViews = Int(ceil(
                 Double(selectedFrames.count) * ReconstructionScorer.minimumRegisteredViewFraction

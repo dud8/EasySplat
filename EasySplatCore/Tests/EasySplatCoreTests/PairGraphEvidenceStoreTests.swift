@@ -792,6 +792,54 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         )
     }
 
+    func testSaveAcceptsViablePartialGraphsBelowTheStrictCoverageFloor() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        // Stray singletons: [8, 1, 1] of 10 is 80% coverage.
+        try PairGraphEvidenceStore.save(
+            makePartialUnorderedExactEvidence(imageCount: 10, verifiedGroups: [8]),
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+
+        // A split capture: [12, 10] of 22 carries a substantial second group
+        // under the unordered policy at the normal recovery level.
+        let split = makePartialUnorderedExactEvidence(
+            imageCount: 22,
+            verifiedGroups: [12, 10]
+        )
+        try PairGraphEvidenceStore.save(
+            split,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(split.admittedViewCount, 12)
+        XCTAssertEqual(
+            split.dominantComponentImageNames(),
+            Set(split.imageNames.prefix(12))
+        )
+    }
+
+    func testSaveRejectsPartialGraphsWithoutAViableDominantComponent() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        // Dominant group below the viability floor.
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            makePartialUnorderedExactEvidence(imageCount: 9, verifiedGroups: [7]),
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        // Tied largest groups: no strictly dominant component to build from.
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            makePartialUnorderedExactEvidence(imageCount: 10, verifiedGroups: [5, 5]),
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
     func testSaveRejectsSecondExactAttemptAfterRejectedExactRetry() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -1881,6 +1929,116 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             verifiedGraph: ColmapVerifiedGraphSnapshot(
                 verifiedPairs: scheduledPairs,
                 components: [imageNames]
+            )
+        )
+        return PairGraphEvidence(
+            selectedFramesDigest: String(repeating: "a", count: 64),
+            imageNames: imageNames,
+            pairingPolicy: .unorderedRetrieval,
+            attempts: attempts,
+            acceptedAttemptNumber: 2,
+            acceptedInspection: inspection,
+            matchingDurationSeconds: 1,
+            fallbackReasons: ["exact descriptor matching"]
+        )
+    }
+
+    /// Exhaustive unordered schedule whose verified graph splits into the
+    /// given prefix groups (sizes descending) plus isolated singletons for
+    /// the remaining images, accepted by the terminal exact attempt.
+    private func makePartialUnorderedExactEvidence(
+        imageCount: Int,
+        verifiedGroups: [Int]
+    ) -> PairGraphEvidence {
+        let imageNames = (0..<imageCount).map { String(format: "image_%02d.jpg", $0) }
+        var scheduledPairs: [ColmapScheduledPair] = []
+        for first in 0..<imageCount {
+            for second in (first + 1)..<imageCount {
+                scheduledPairs.append(ColmapScheduledPair(
+                    imageNames[first],
+                    imageNames[second],
+                    role: .local
+                ))
+            }
+        }
+        var groupIndexByName: [String: Int] = [:]
+        var groups: [[String]] = []
+        var nextStart = 0
+        for size in verifiedGroups {
+            let members = Array(imageNames[nextStart..<(nextStart + size)])
+            for member in members {
+                groupIndexByName[member] = groups.count
+            }
+            groups.append(members)
+            nextStart += size
+        }
+        let verifiedPairs = scheduledPairs.filter { pair in
+            guard let first = groupIndexByName[pair.firstImageName],
+                  let second = groupIndexByName[pair.secondImageName] else {
+                return false
+            }
+            return first == second
+        }
+        let isolatedNames = Array(imageNames[nextStart...])
+        let components = groups + isolatedNames.map { [$0] }
+        let dominantCount = verifiedGroups.first ?? 0
+        let degrees = (
+            verifiedGroups.flatMap { Array(repeating: $0 - 1, count: $0) }
+                + Array(repeating: 0, count: isolatedNames.count)
+        ).sorted()
+        func nearestRank(_ fraction: Double) -> Int {
+            let rank = Int((fraction * Double(degrees.count)).rounded(.up))
+            return degrees[max(0, rank - 1)]
+        }
+        var attempts = [
+            makeAttempt(
+                number: 1,
+                matcher: .faiss,
+                recoveryLevel: .normal,
+                outcome: .rejected,
+                scheduledPairs: scheduledPairs,
+                durationSeconds: 0.5
+            ),
+            makeAttempt(
+                number: 2,
+                matcher: .exact,
+                recoveryLevel: .normal,
+                outcome: .completed,
+                exactRecoveryReason: .faissGeometryRejectedAfterRetries,
+                scheduledPairs: scheduledPairs,
+                durationSeconds: 0.5
+            ),
+        ]
+        for index in attempts.indices {
+            attempts[index].artifact.attemptedPairCount = scheduledPairs.count
+            attempts[index].artifact.rawMatchedPairCount = verifiedPairs.count
+            attempts[index].artifact.spatiallyVerifiedPairCount = verifiedPairs.count
+        }
+        let inspection = ColmapPairGraphInspection(
+            scheduledPairCount: scheduledPairs.count,
+            attemptedPairCount: scheduledPairs.count,
+            rawMatchedPairCount: verifiedPairs.count,
+            spatiallyVerifiedPairCount: verifiedPairs.count,
+            localPairCount: scheduledPairs.count,
+            retrievalPairCount: 0,
+            loopRevisitPairCount: 0,
+            connectedComponentCount: components.count,
+            isolatedViewCount: isolatedNames.count,
+            articulationViewCount: 0,
+            biconnectedBlockCount: 1,
+            largestBiconnectedBlockViewCount: dominantCount,
+            secondLargestBiconnectedBlockViewCount: 0,
+            degreeP10: nearestRank(0.10),
+            degreeMedian: nearestRank(0.50),
+            degreeP90: nearestRank(0.90),
+            featureDatabaseDigest: String(repeating: "b", count: 64),
+            matchingDatabaseDigest: String(repeating: "c", count: 64),
+            descriptorlessImageNames: [],
+            attemptedPairs: scheduledPairs,
+            rawMatchedPairs: verifiedPairs,
+            verifiedGraph: ColmapVerifiedGraphSnapshot(
+                verifiedPairs: verifiedPairs,
+                components: components
             )
         )
         return PairGraphEvidence(

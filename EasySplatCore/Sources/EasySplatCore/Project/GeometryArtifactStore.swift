@@ -424,13 +424,14 @@ enum GeometryArtifactStore {
         }
         guard isSHA256(artifact.inputDigest) else { throw Error.invalidDigest("input") }
         guard isSHA256(artifact.selectedFramesDigest) else { throw Error.invalidDigest("selected frames") }
+        let coverageDenominator = registeredCoverageDenominator(for: artifact)
         guard artifact.residualProvenance == "colmap-text-tracks-v1",
               artifact.observationCount > 0,
               artifact.pointCount > 0,
               artifact.totalViewCount > 0,
               artifact.registeredViewCount > 0,
               artifact.registeredViewCount <= artifact.totalViewCount,
-              Double(artifact.registeredViewCount) / Double(artifact.totalViewCount)
+              Double(artifact.registeredViewCount) / Double(coverageDenominator)
                   >= ReconstructionScorer.minimumRegisteredViewFraction,
               artifact.orderedImageNames.count == artifact.totalViewCount,
               artifact.orderedImageTimestamps.count == artifact.totalViewCount,
@@ -597,7 +598,8 @@ enum GeometryArtifactStore {
               measured.registeredViewCount == artifact.registeredViewCount,
               Set(measured.registeredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
               Set(measured.measuredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
-              Double(measured.measuredImageNames.count) / Double(artifact.totalViewCount)
+              Double(measured.measuredImageNames.count)
+                  / Double(registeredCoverageDenominator(for: artifact))
                   >= ReconstructionScorer.minimumRegisteredViewFraction,
               learnedSupportIsValid,
               measured.pointCount == artifact.pointCount,
@@ -843,6 +845,27 @@ enum GeometryArtifactStore {
             && isSHA256(component.payloadSHA256)
     }
 
+    /// Registered-view coverage is measured against the views matching
+    /// admitted to mapping, not the full selected set: a run that continued
+    /// with the dominant connected component is judged on that component.
+    /// Fully connected artifacts keep the selected count as denominator.
+    private static func registeredCoverageDenominator(
+        for artifact: GeometryArtifact
+    ) -> Int {
+        guard artifact.pairGraph.status == .measured,
+              let measurement = artifact.pairGraph.measurement,
+              let admitted = PairGraphConnectivityPolicy.admissibleDominantViewCount(
+                  totalViewCount: artifact.totalViewCount,
+                  componentViewCounts: measurement.componentViewCounts,
+                  connectedComponentCount: measurement.connectedComponentCount,
+                  isolatedViewCount: measurement.isolatedViewCount,
+                  descriptorlessViewCount: measurement.descriptorlessViewCount
+              ) else {
+            return artifact.totalViewCount
+        }
+        return admitted
+    }
+
     private static func validatePairGraph(
         _ artifact: PairGraphArtifact,
         totalViewCount: Int,
@@ -894,7 +917,7 @@ enum GeometryArtifactStore {
                   descriptorlessViewCount < totalViewCount else {
                 throw Error.invalidPairGraph
             }
-            guard let dominantViewCount = PairGraphConnectivityPolicy.dominantViewCount(
+            guard let dominantViewCount = PairGraphConnectivityPolicy.admissibleDominantViewCount(
                 totalViewCount: totalViewCount,
                 componentViewCounts: measurement.componentViewCounts,
                 connectedComponentCount: measurement.connectedComponentCount,
@@ -1003,9 +1026,11 @@ enum GeometryArtifactStore {
                     == measurement.spatiallyVerifiedPairCount else {
                 throw Error.invalidPairGraph
             }
-            if hasMinorVerifiedComponent {
-                guard isOrdered(measurement.pairingPolicy),
-                      acceptedAttempt.recoveryLevel != .normal else {
+            if hasMinorVerifiedComponent, isOrdered(measurement.pairingPolicy) {
+                // Ordered policies only ever accept minor verified components
+                // past the normal recovery level. Unordered policies reach
+                // them through the terminal viable acceptance at any level.
+                guard acceptedAttempt.recoveryLevel != .normal else {
                     throw Error.invalidPairGraph
                 }
             }

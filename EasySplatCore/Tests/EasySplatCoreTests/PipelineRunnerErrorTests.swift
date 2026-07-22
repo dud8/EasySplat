@@ -430,7 +430,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
 
         XCTAssertEqual(
             message.userMessage,
-            "EasySplat found separate parts of the capture. Add views between the gaps with clear shared detail, and keep the scene still."
+            "EasySplat could not connect this capture into one scene. The largest connected group is 243 of 256 photos. Add photos that overlap the missing areas with clear shared detail, and keep the scene still."
         )
         for hiddenImplementationTerm in ["faiss", "exact", "colmap", "unordered", "graph"] {
             XCTAssertFalse(message.userMessage.lowercased().contains(hiddenImplementationTerm))
@@ -453,6 +453,38 @@ final class PipelineRunnerErrorTests: XCTestCase {
             )
         )
         XCTAssertTrue(message.debugMessage.contains("degree p10/median/p90 0/8/19"))
+    }
+
+    func testTerminalConnectionFailureNamesTheLargestGroupForFullyDisconnectedCaptures() throws {
+        let runner = makeRunner()
+        let failure = try CaptureConnectionFailure(
+            pairingPolicy: .unorderedRetrieval,
+            selectedViewCount: 8,
+            attempt: PairMatchingAttemptArtifact(
+                attemptNumber: 2,
+                matcher: .exact,
+                recoveryLevel: .normal,
+                outcome: .rejected,
+                exactRecoveryReason: .faissGeometryRejectedAfterRetries,
+                scheduledPairCount: 28,
+                attemptedPairCount: 28,
+                rawMatchedPairCount: 0,
+                spatiallyVerifiedPairCount: 0,
+                durationSeconds: 1
+            ),
+            connectedComponentCount: 8,
+            isolatedViewCount: 8,
+            descriptorlessViewCount: 0,
+            componentViewCounts: Array(repeating: 1, count: 8),
+            degreeP10: 0,
+            degreeMedian: 0,
+            degreeP90: 0
+        )
+
+        XCTAssertEqual(
+            runner.test_failureMessages(for: failure, stage: .sfmMatching).userMessage,
+            "EasySplat could not connect this capture into one scene. The largest connected group is 1 of 8 photos. Add photos that overlap the missing areas with clear shared detail, and keep the scene still."
+        )
     }
 
     func testCaptureConnectionFailureRejectsImpossibleTopologyAndDegreeEvidence() {

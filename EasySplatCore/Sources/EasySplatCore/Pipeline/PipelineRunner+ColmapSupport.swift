@@ -313,7 +313,8 @@ extension PipelineRunner {
         candidates: [MappedSparseModelCandidate],
         memberships: [ColmapSparseModelMembership],
         residualValidatedModelOrders: Set<Int>,
-        totalSelectedViewCount: Int
+        totalSelectedViewCount: Int,
+        admittedImageIDs: Set<UInt32>? = nil
     ) -> MappingFragmentationEvidence? {
         guard totalSelectedViewCount > 0 else { return nil }
 
@@ -346,7 +347,14 @@ extension PipelineRunner {
         }
 
         guard credibleUnion.count <= totalSelectedViewCount else { return nil }
-        let omittedCount = credibleUnion.subtracting(selectedImageIDs).count
+        // Views matching already excluded from the admitted component are
+        // expected losses, not mapper fragmentation; only count omitted views
+        // the pair graph said belong with the selected reconstruction.
+        var omitted = credibleUnion.subtracting(selectedImageIDs)
+        if let admittedImageIDs {
+            omitted.formIntersection(admittedImageIDs)
+        }
+        let omittedCount = omitted.count
         guard omittedCount > ColmapMappingPolicy.maximumAcceptedRecoverableViewLoss else {
             return nil
         }

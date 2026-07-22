@@ -2172,6 +2172,239 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(state.attempts.map(\.artifact.spatiallyVerifiedPairCount), [0, 0])
     }
 
+    func testDisconnectedCaptureContinuesWithDominantComponent() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "DominantComponentContinuation",
+            photoCount: 12
+        )
+        let verifyDominantGroup: ([String], Int) throws -> Void = { arguments, dominantCount in
+            let lines = try self.pairListLines(for: arguments)
+            let names = Set(lines.flatMap {
+                $0.split(whereSeparator: \.isWhitespace).map(String.init)
+            })
+            let dominant = Set(names.sorted().prefix(dominantCount))
+            let dominantLines = Set(lines.filter { line in
+                let fields = line.split(whereSeparator: \.isWhitespace).map(String.init)
+                return fields.count == 2
+                    && dominant.contains(fields[0])
+                    && dominant.contains(fields[1])
+            })
+            try self.writeSelectiveVerifiedPairResults(
+                for: arguments,
+                verifiedPairLines: dominantLines
+            )
+        }
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "0"
+                        )
+                        try verifyDominantGroup(arguments, 8)
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "1"
+                        )
+                        try verifyDominantGroup(arguments, 8)
+                    }
+                ),
+            ],
+            stopAfterStage: .sfmMatching
+        )
+
+        let events = PipelineEventSink()
+        try await run.pipeline.run { events.append($0) }
+
+        let stageLogs = events.stageLogs()
+        let continuation = stageLogs.first {
+            $0.line.contains("Continuing with the largest connected group")
+        }
+        XCTAssertEqual(
+            continuation?.line,
+            "Matching could not connect every photo. Continuing with the largest connected group: 8 of 12 photos. 4 photos stay out of the splat."
+        )
+        XCTAssertEqual(continuation?.isError, true)
+        XCTAssertTrue(stageLogs.contains {
+            $0.line == "4 views had no verified overlap and may stay unregistered."
+        })
+
+        let stoppedMetadata = try ProjectMetadataStore.load(
+            from: fixture.paths.metadataURL
+        )
+        XCTAssertEqual(stoppedMetadata.state.stage, .sfmMatching)
+        XCTAssertNil(stoppedMetadata.state.lastError)
+        XCTAssertEqual(
+            run.runner.calls.filter { $0.1.first == "matches_importer" }.count,
+            2
+        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+
+        let imageNames = selectedImageNames(in: fixture.paths)
+        let pairEvidence = try PairGraphEvidenceStore.loadVerified(
+            from: fixture.paths.pairGraphEvidenceURL,
+            expectedImageNames: imageNames,
+            databaseURL: fixture.paths.colmapDatabaseURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(pairEvidence.attempts.map(\.artifact.matcher), [.faiss, .exact])
+        XCTAssertEqual(pairEvidence.attempts.map(\.artifact.outcome), [.rejected, .completed])
+        XCTAssertEqual(pairEvidence.acceptedAttemptNumber, 2)
+        XCTAssertEqual(
+            pairEvidence.acceptedInspection.componentViewCounts,
+            [8, 1, 1, 1, 1]
+        )
+        XCTAssertEqual(pairEvidence.admittedViewCount, 8)
+        XCTAssertEqual(
+            pairEvidence.dominantComponentImageNames(),
+            Set(imageNames.sorted().prefix(8))
+        )
+    }
+
+    func testSplitCaptureContinuesWithLargestGroupAndNamesTheOther() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "SplitCaptureContinuation",
+            photoCount: 22
+        )
+        let verifySplitGroups: ([String]) throws -> Void = { arguments in
+            let lines = try self.pairListLines(for: arguments)
+            let names = Set(lines.flatMap {
+                $0.split(whereSeparator: \.isWhitespace).map(String.init)
+            })
+            let sorted = names.sorted()
+            let firstGroup = Set(sorted.prefix(12))
+            let secondGroup = Set(sorted.dropFirst(12))
+            let internalLines = Set(lines.filter { line in
+                let fields = line.split(whereSeparator: \.isWhitespace).map(String.init)
+                guard fields.count == 2 else { return false }
+                return (firstGroup.contains(fields[0]) && firstGroup.contains(fields[1]))
+                    || (secondGroup.contains(fields[0]) && secondGroup.contains(fields[1]))
+            })
+            try self.writeSelectiveVerifiedPairResults(
+                for: arguments,
+                verifiedPairLines: internalLines
+            )
+        }
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try verifySplitGroups($0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try verifySplitGroups($0) }
+                ),
+            ],
+            stopAfterStage: .sfmMatching
+        )
+
+        let events = PipelineEventSink()
+        try await run.pipeline.run { events.append($0) }
+
+        let stageLogs = events.stageLogs()
+        XCTAssertTrue(stageLogs.map(\.line).contains(
+            "Matching could not connect every photo. Continuing with the largest connected group: 12 of 22 photos. 10 photos stay out of the splat. The largest separate group has 10 photos."
+        ))
+        XCTAssertTrue(stageLogs.contains {
+            $0.line.contains("matched only within small disconnected fragments")
+        })
+
+        let stoppedMetadata = try ProjectMetadataStore.load(
+            from: fixture.paths.metadataURL
+        )
+        XCTAssertEqual(stoppedMetadata.state.stage, .sfmMatching)
+        XCTAssertNil(stoppedMetadata.state.lastError)
+
+        let imageNames = selectedImageNames(in: fixture.paths)
+        let pairEvidence = try PairGraphEvidenceStore.loadVerified(
+            from: fixture.paths.pairGraphEvidenceURL,
+            expectedImageNames: imageNames,
+            databaseURL: fixture.paths.colmapDatabaseURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(pairEvidence.attempts.map(\.artifact.outcome), [.rejected, .completed])
+        XCTAssertEqual(pairEvidence.acceptedInspection.componentViewCounts, [12, 10])
+        XCTAssertEqual(pairEvidence.admittedViewCount, 12)
+        XCTAssertEqual(
+            pairEvidence.dominantComponentImageNames(),
+            Set(imageNames.sorted().prefix(12))
+        )
+    }
+
     func testDescriptorlessSingletonDoesNotTriggerMatchingRecovery() async throws {
         let temp = makeTempRoot()
         let fixture = try makePhotoRecoveryProject(
@@ -9954,6 +10187,15 @@ private final class PipelineEventSink: @unchecked Sendable {
         return events.contains { event in
             guard case .stageStarted(let eventStage) = event else { return false }
             return eventStage == stage
+        }
+    }
+
+    func stageLogs() -> [(line: String, isError: Bool)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events.compactMap { event in
+            guard case let .stageLog(_, line, isError) = event else { return nil }
+            return (line, isError)
         }
     }
 }
