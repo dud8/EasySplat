@@ -1,0 +1,255 @@
+name: Temporary LichtFeld Studio v0.5.3 Windows Build
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build-windows-portable:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    concurrency:
+      group: temporary-lichtfeld-v0.5.3-windows-build
+      cancel-in-progress: false
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_BUILD_TYPE: release
+      RELEASE_TAG: lichtfeld-v0.5.3-windows-temp
+      PACKAGE_NAME: LichtFeld-Studio-windows-v0.5.3-portable.zip
+      STATUS_ISSUE: "5"
+
+    steps:
+      - name: Check for an existing finished package
+        id: precheck
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $assets = @(gh release view $env:RELEASE_TAG --json assets --jq '.assets[].name' 2>$null)
+          $complete = ($assets -contains $env:PACKAGE_NAME) -and ($assets -contains "$($env:PACKAGE_NAME).sha256")
+          "skip=$($complete.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Publish build-start status
+        if: steps.precheck.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $runUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          @"
+          Status: building
+
+          Workflow run ID: $env:GITHUB_RUN_ID
+          Workflow run: $runUrl
+          Started (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+
+          Target: official MrNeRF/LichtFeld-Studio v0.5.3 portable Release build.
+          "@ | Set-Content "$env:RUNNER_TEMP\status.md" -Encoding utf8
+          gh issue edit $env:STATUS_ISSUE --body-file "$env:RUNNER_TEMP\status.md"
+
+      - name: Report an existing finished package
+        if: steps.precheck.outputs.skip == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $assetUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/$env:PACKAGE_NAME"
+          @"
+          Status: completed
+
+          Package: $assetUrl
+          Checked (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+          "@ | Set-Content "$env:RUNNER_TEMP\status.md" -Encoding utf8
+          gh issue edit $env:STATUS_ISSUE --body-file "$env:RUNNER_TEMP\status.md"
+
+      - name: Checkout official LichtFeld Studio v0.5.3 source
+        if: steps.precheck.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: MrNeRF/LichtFeld-Studio
+          ref: v0.5.3
+          path: src
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Record exact upstream commit
+        if: steps.precheck.outputs.skip != 'true'
+        id: source
+        shell: pwsh
+        working-directory: src
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Building MrNeRF/LichtFeld-Studio v0.5.3 at $sha"
+
+      - name: Install CUDA Toolkit 12.8
+        if: steps.precheck.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda-12.8.exe'
+          Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe' -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '-y -s -accepteula -toolkit -override -noDisplayDriver' -Wait
+
+      - name: Set CUDA environment
+        if: steps.precheck.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Set up vcpkg
+        if: steps.precheck.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          Add-Content -Path "$env:VCPKG_ROOT\triplets\x64-windows.cmake" -Value 'set(VCPKG_MAX_CONCURRENCY 2)'
+
+      - name: Cache vcpkg binary packages
+        if: steps.precheck.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: C:\Users\runneradmin\AppData\Local\vcpkg\archives
+          key: lichtfeld-v0.5.3-vcpkg-${{ runner.os }}-${{ hashFiles('src/vcpkg.json', 'src/vcpkg-configuration.json') }}
+          restore-keys: |
+            lichtfeld-v0.5.3-vcpkg-${{ runner.os }}-
+
+      - name: Configure release build
+        if: steps.precheck.outputs.skip != 'true'
+        shell: cmd
+        working-directory: src
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON
+
+      - name: Build release
+        if: steps.precheck.outputs.skip != 'true'
+        shell: cmd
+        working-directory: src
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build build -j 4
+
+      - name: Install, verify, package, and hash
+        if: steps.precheck.outputs.skip != 'true'
+        id: package
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --install build --prefix dist
+          $exe = Join-Path $PWD 'dist\bin\LichtFeld-Studio.exe'
+          if (-not (Test-Path $exe)) {
+            Get-ChildItem dist -Recurse | Select-Object FullName, Length
+            throw "Expected executable was not installed: $exe"
+          }
+          $exeBytes = (Get-Item $exe).Length
+          if ($exeBytes -lt 100000) { throw "Executable is implausibly small: $exeBytes bytes" }
+          Copy-Item LICENSE 'dist\LICENSE-LichtFeld-Studio.txt' -Force
+          if (Test-Path THIRD_PARTY_LICENSES.md) {
+            Copy-Item THIRD_PARTY_LICENSES.md 'dist\THIRD_PARTY_LICENSES.md' -Force
+          }
+          @"
+          LichtFeld Studio portable Windows build
+          Version: v0.5.3
+          Source: https://github.com/MrNeRF/LichtFeld-Studio
+          Source tag: v0.5.3
+          Source commit: ${{ steps.source.outputs.sha }}
+          Build type: Release / BUILD_PORTABLE=ON
+          Toolchain: Windows Server 2022, Visual Studio 2022 MSVC, CUDA Toolkit 12.8
+          Built at (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+          License: GPL-3.0-or-later
+          "@ | Set-Content 'dist\BUILD_INFO.txt' -Encoding utf8
+          Compress-Archive -Path 'dist\*' -DestinationPath $env:PACKAGE_NAME -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $env:PACKAGE_NAME).Hash.ToLowerInvariant()
+          "$hash  $env:PACKAGE_NAME" | Set-Content "$env:PACKAGE_NAME.sha256" -Encoding ascii
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          Write-Host "Executable bytes: $exeBytes"
+          Write-Host "Package SHA-256: $hash"
+
+      - name: Upload workflow artifact
+        if: steps.precheck.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: LichtFeld-Studio-windows-v0.5.3-portable
+          path: |
+            src/${{ env.PACKAGE_NAME }}
+            src/${{ env.PACKAGE_NAME }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Publish temporary release assets
+        if: steps.precheck.outputs.skip != 'true'
+        shell: pwsh
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @"
+          Temporary CI-built portable package from the official MrNeRF/LichtFeld-Studio v0.5.3 source tag.
+
+          Source commit: ${{ steps.source.outputs.sha }}
+          SHA-256: ${{ steps.package.outputs.sha256 }}
+          Build: Release, BUILD_PORTABLE=ON, Windows Server 2022, Visual Studio 2022 MSVC, CUDA 12.8.
+          "@ | Set-Content "$env:RUNNER_TEMP\release-notes.md" -Encoding utf8
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:RELEASE_TAG --title 'Temporary LichtFeld Studio v0.5.3 Windows build' --notes-file "$env:RUNNER_TEMP\release-notes.md" --prerelease
+          }
+          gh release upload $env:RELEASE_TAG $env:PACKAGE_NAME "$env:PACKAGE_NAME.sha256" --clobber
+
+      - name: Publish completion status
+        if: success() && steps.precheck.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $assetUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/$env:PACKAGE_NAME"
+          @"
+          Status: completed
+
+          Source commit: ${{ steps.source.outputs.sha }}
+          Package SHA-256: ${{ steps.package.outputs.sha256 }}
+          Package: $assetUrl
+          Completed (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+          "@ | Set-Content "$env:RUNNER_TEMP\status.md" -Encoding utf8
+          gh issue edit $env:STATUS_ISSUE --body-file "$env:RUNNER_TEMP\status.md"
+
+      - name: Publish failure status
+        if: failure()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $runUrl = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          @"
+          Status: failed
+
+          Workflow run ID: $env:GITHUB_RUN_ID
+          Workflow run: $runUrl
+          Failed (UTC): $((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))
+          "@ | Set-Content "$env:RUNNER_TEMP\status.md" -Encoding utf8
+          gh issue edit $env:STATUS_ISSUE --body-file "$env:RUNNER_TEMP\status.md"
