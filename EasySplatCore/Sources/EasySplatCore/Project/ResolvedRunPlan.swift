@@ -24,17 +24,48 @@ public struct GeometryWorkerBudget: Codable, Sendable, Equatable {
     public var coupledMatchingWorkers: Int
     public var vocabularyRetrievalWorkers: Int
     public var maximumConcurrentVideoSourceAnalysisTasks: Int
+    /// Memory ceiling handed to the native vocabulary retriever. Sized to the
+    /// host's installed RAM by the resolver; bounded by the tool's own
+    /// `[64 MiB, 256 GiB]` limits (see `ColmapVocabularyRetrievalOptions`).
+    public var retrievalMemoryBudgetBytes: Int64
 
     public init(
         featureExtractionWorkers: Int,
         coupledMatchingWorkers: Int,
         vocabularyRetrievalWorkers: Int,
-        maximumConcurrentVideoSourceAnalysisTasks: Int
+        maximumConcurrentVideoSourceAnalysisTasks: Int,
+        retrievalMemoryBudgetBytes: Int64 = ColmapVocabularyRetrievalOptions.defaultMemoryBudgetBytes
     ) {
         self.featureExtractionWorkers = featureExtractionWorkers
         self.coupledMatchingWorkers = coupledMatchingWorkers
         self.vocabularyRetrievalWorkers = vocabularyRetrievalWorkers
         self.maximumConcurrentVideoSourceAnalysisTasks = maximumConcurrentVideoSourceAnalysisTasks
+        self.retrievalMemoryBudgetBytes = retrievalMemoryBudgetBytes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case featureExtractionWorkers
+        case coupledMatchingWorkers
+        case vocabularyRetrievalWorkers
+        case maximumConcurrentVideoSourceAnalysisTasks
+        case retrievalMemoryBudgetBytes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        featureExtractionWorkers = try container.decode(Int.self, forKey: .featureExtractionWorkers)
+        coupledMatchingWorkers = try container.decode(Int.self, forKey: .coupledMatchingWorkers)
+        vocabularyRetrievalWorkers = try container.decode(
+            Int.self, forKey: .vocabularyRetrievalWorkers
+        )
+        maximumConcurrentVideoSourceAnalysisTasks = try container.decode(
+            Int.self, forKey: .maximumConcurrentVideoSourceAnalysisTasks
+        )
+        // Plans persisted before retrieval budgeting decode at the tool's former
+        // built-in default, preserving their historical behavior exactly.
+        retrievalMemoryBudgetBytes = try container.decodeIfPresent(
+            Int64.self, forKey: .retrievalMemoryBudgetBytes
+        ) ?? ColmapVocabularyRetrievalOptions.defaultMemoryBudgetBytes
     }
 }
 
@@ -346,6 +377,15 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
             geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks,
         ]
         guard counts.allSatisfy({ (1...64).contains($0) }) else {
+            throw ResolvedRunPlanValidationError.invalidGeometryWorkerBudget
+        }
+        let retrievalBudgetBounds = ClosedRange(
+            uncheckedBounds: (
+                lower: ColmapVocabularyRetrievalOptions.minimumMemoryBudgetBytes,
+                upper: ColmapVocabularyRetrievalOptions.maximumMemoryBudgetBytes
+            )
+        )
+        guard retrievalBudgetBounds.contains(geometryWorkerBudget.retrievalMemoryBudgetBytes) else {
             throw ResolvedRunPlanValidationError.invalidGeometryWorkerBudget
         }
     }

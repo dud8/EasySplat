@@ -530,6 +530,74 @@ extension PhotoInputPreflight {
         )
     }
 
+    /// Admits an explicit set of photo files, which may originate from several
+    /// different folders. Each file is validated with the same symlink, hardlink,
+    /// and regular-file guards the folder walk applies to its entries.
+    public static func prepare(
+        photos: [URL],
+        stagingParent: URL,
+        photoSelection: PhotoSelection,
+        inputOrdering: InputOrdering,
+        keyframeBudget: Int,
+        requiredAtomicWorkspaceReserveBytes: Int64,
+        limits: PhotoInputPreflightLimits = .init(),
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> PreparedPhotoInput {
+        try await prepare(
+            photos: photos,
+            stagingParent: stagingParent,
+            photoSelection: photoSelection,
+            inputOrdering: inputOrdering,
+            keyframeBudget: keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: requiredAtomicWorkspaceReserveBytes,
+            limits: limits,
+            availableCapacity: defaultPhotoAvailableCapacity,
+            contentTypeResolver: defaultPhotoContentType,
+            rawDecoder: RawPhotoDecoder(),
+            projectionProbe: NativeProjectionMetadataProbe.tag(inImageAt:),
+            progress: progress
+        )
+    }
+
+    static func prepare(
+        photos: [URL],
+        stagingParent: URL,
+        photoSelection: PhotoSelection,
+        inputOrdering: InputOrdering,
+        keyframeBudget: Int,
+        requiredAtomicWorkspaceReserveBytes: Int64,
+        limits: PhotoInputPreflightLimits,
+        availableCapacity: @escaping PhotoAvailableCapacity,
+        contentTypeResolver: @escaping PhotoContentTypeResolver = defaultPhotoContentType,
+        rawDecoder: any RawPhotoDecoding = RawPhotoDecoder(),
+        projectionProbe: @escaping ProjectionProbe = NativeProjectionMetadataProbe.tag(inImageAt:),
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> PreparedPhotoInput {
+        try Task.checkCancellation()
+        guard limits.isValid, keyframeBudget > 0, requiredAtomicWorkspaceReserveBytes >= 0 else {
+            throw PhotoInputPreflightFailure(issue: .invalidLimits)
+        }
+        let sources = try securedSources(
+            from: photos,
+            limits: limits,
+            contentTypeResolver: contentTypeResolver
+        )
+        return try await prepareFromSecuredSources(
+            sources: sources,
+            stagingParent: stagingParent,
+            photoSelection: photoSelection,
+            inputOrdering: inputOrdering,
+            keyframeBudget: keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: requiredAtomicWorkspaceReserveBytes,
+            limits: limits,
+            availableCapacity: availableCapacity,
+            contentTypeResolver: contentTypeResolver,
+            rawDecoder: rawDecoder,
+            projectionProbe: projectionProbe,
+            progress: progress
+        )
+    }
+
     static func prepare(
         folder: URL,
         stagingParent: URL,
@@ -553,6 +621,40 @@ extension PhotoInputPreflight {
             limits: limits,
             contentTypeResolver: contentTypeResolver
         )
+        return try await prepareFromSecuredSources(
+            sources: sources,
+            stagingParent: stagingParent,
+            photoSelection: photoSelection,
+            inputOrdering: inputOrdering,
+            keyframeBudget: keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: requiredAtomicWorkspaceReserveBytes,
+            limits: limits,
+            availableCapacity: availableCapacity,
+            contentTypeResolver: contentTypeResolver,
+            rawDecoder: rawDecoder,
+            projectionProbe: projectionProbe,
+            progress: progress
+        )
+    }
+
+    /// Shared admission pipeline once a secured, deduplicated source set exists.
+    /// Both the folder walk and the explicit file-list path converge here, so
+    /// analysis, selection, and staging stay identical regardless of how the
+    /// sources were gathered.
+    private static func prepareFromSecuredSources(
+        sources: [Source],
+        stagingParent: URL,
+        photoSelection: PhotoSelection,
+        inputOrdering: InputOrdering,
+        keyframeBudget: Int,
+        requiredAtomicWorkspaceReserveBytes: Int64,
+        limits: PhotoInputPreflightLimits,
+        availableCapacity: @escaping PhotoAvailableCapacity,
+        contentTypeResolver: @escaping PhotoContentTypeResolver,
+        rawDecoder: any RawPhotoDecoding,
+        projectionProbe: @escaping ProjectionProbe,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> PreparedPhotoInput {
         let container: URL
         let root: URL
         do {
@@ -873,6 +975,91 @@ extension PhotoInputPreflight {
                 relativePath: item.0,
                 safeDisplayName: safePhotoDisplayName(url.lastPathComponent, index: sources.count),
                 evidence: item.1,
+                detectedTypeIdentifier: detectedType
+            ))
+        }
+        return sources
+    }
+
+    /// Builds admission sources from an explicit file list, which may span several
+    /// folders. Applies the same per-entry guards as the folder walk (`lstat`,
+    /// reject symbolic links, require a regular file with a single hard link) plus
+    /// the same content-type, per-file, and total-byte limits. Sorting by path
+    /// gives a deterministic order independent of how the caller collected the URLs.
+    private static func securedSources(
+        from photoURLs: [URL],
+        limits: PhotoInputPreflightLimits,
+        contentTypeResolver: PhotoContentTypeResolver
+    ) throws -> [Source] {
+        let orderedURLs = photoURLs
+            .map { $0.standardizedFileURL }
+            .sorted { $0.path < $1.path }
+        var validated: [(url: URL, relativePath: String, evidence: PhotoFileEvidence)] = []
+        var seenIdentities = Set<[UInt64]>()
+        for url in orderedURLs {
+            try Task.checkCancellation()
+            guard url.isFileURL else {
+                throw PhotoInputPreflightFailure(issue: .folderUnavailable)
+            }
+            let relativePath = url.lastPathComponent
+            var status = stat()
+            guard lstat(url.path, &status) == 0 else {
+                throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relativePath))
+            }
+            let kind = status.st_mode & S_IFMT
+            if kind == S_IFLNK {
+                throw PhotoInputPreflightFailure(issue: .symbolicLink(relativePath: relativePath))
+            }
+            guard kind == S_IFREG else {
+                throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relativePath))
+            }
+            guard status.st_nlink == 1 else {
+                throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relativePath))
+            }
+            let identity: [UInt64] = [UInt64(status.st_dev), UInt64(status.st_ino)]
+            guard seenIdentities.insert(identity).inserted else {
+                // The same underlying file was named more than once; keep one.
+                continue
+            }
+            guard validated.count < limits.maximumTraversalEntryCount else {
+                throw PhotoInputPreflightFailure(issue: .traversalLimitExceeded)
+            }
+            validated.append((url, relativePath, PhotoFileEvidence(status)))
+        }
+
+        var total: Int64 = 0
+        var sources: [Source] = []
+        for item in validated {
+            let detectedType = try securelyDetectedType(
+                at: item.url,
+                evidence: item.evidence,
+                relativePath: item.relativePath,
+                resolver: contentTypeResolver
+            )
+            guard detectedType != nil
+                    || UTType(filenameExtension: item.url.pathExtension)?.conforms(to: .image) == true
+            else {
+                continue
+            }
+            guard sources.count < limits.maximumPhotoCount else {
+                throw PhotoInputPreflightFailure(issue: .tooManyPhotos(maximum: limits.maximumPhotoCount))
+            }
+            guard item.evidence.size > 0, item.evidence.size <= limits.maximumSinglePhotoBytes else {
+                throw PhotoInputPreflightFailure(
+                    issue: .totalBytesExceeded(maximum: limits.maximumTotalBytes)
+                )
+            }
+            let (next, overflow) = total.addingReportingOverflow(item.evidence.size)
+            guard !overflow, next <= limits.maximumTotalBytes else {
+                throw PhotoInputPreflightFailure(issue: .totalBytesExceeded(maximum: limits.maximumTotalBytes))
+            }
+            total = next
+            sources.append(Source(
+                discoveryIndex: sources.count,
+                url: item.url,
+                relativePath: item.relativePath,
+                safeDisplayName: safePhotoDisplayName(item.url.lastPathComponent, index: sources.count),
+                evidence: item.evidence,
                 detectedTypeIdentifier: detectedType
             ))
         }

@@ -1016,6 +1016,7 @@ final class ColmapRunnerTests: XCTestCase {
                     XCTAssertEqual(self.value(for: "--num_rounds", in: args), "1")
                     XCTAssertEqual(self.value(for: "--num_checks", in: args), "64")
                     XCTAssertEqual(self.value(for: "--num_threads", in: args), "6")
+                    XCTAssertEqual(self.value(for: "--memory_budget_bytes", in: args), "8589934592")
                 }
             )
         ])
@@ -1031,7 +1032,8 @@ final class ColmapRunnerTests: XCTestCase {
                 returnedNeighborCount: 16,
                 minimumFrameSeparation: 25,
                 queryStride: 10,
-                threadCount: 6
+                threadCount: 6,
+                memoryBudgetBytes: 8_589_934_592
             ),
             pairContext: ColmapPairWorkerInvocationContext(
                 attemptOrdinal: 1,
@@ -1164,6 +1166,24 @@ final class ColmapRunnerTests: XCTestCase {
             queryStride: 1,
             threadCount: 0
         ))
+        for outOfRange in [
+            ColmapVocabularyRetrievalOptions.minimumMemoryBudgetBytes - 1,
+            ColmapVocabularyRetrievalOptions.maximumMemoryBudgetBytes + 1,
+        ] {
+            XCTAssertThrowsError(try ColmapVocabularyRetrievalOptions(
+                candidateCount: 20,
+                returnedNeighborCount: 8,
+                minimumFrameSeparation: 0,
+                queryStride: 1,
+                threadCount: 1,
+                memoryBudgetBytes: outOfRange
+            )) { error in
+                XCTAssertEqual(
+                    error as? ColmapVocabularyRetrievalOptionsValidationError,
+                    .memoryBudgetOutOfRange
+                )
+            }
+        }
     }
 
     func testExactRecoveryUsesBruteForceMatching() async throws {

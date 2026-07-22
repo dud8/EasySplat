@@ -622,8 +622,39 @@ public enum RunPlanResolver {
             featureExtractionWorkers: min(logicalCPUs, caps.extraction),
             coupledMatchingWorkers: min(halfLogicalCPUs, caps.matching),
             vocabularyRetrievalWorkers: min(halfLogicalCPUs, caps.retrieval),
-            maximumConcurrentVideoSourceAnalysisTasks: min(logicalCPUs, caps.videoSourceAnalysis)
+            maximumConcurrentVideoSourceAnalysisTasks: min(logicalCPUs, caps.videoSourceAnalysis),
+            retrievalMemoryBudgetBytes: resolvedRetrievalMemoryBudget(
+                memoryGB: memoryGB,
+                resourcePolicy: resourcePolicy
+            )
         )
+    }
+
+    /// Sizes the vocabulary retriever's memory ceiling to installed RAM. The
+    /// native tool otherwise falls back to a fixed 2 GiB default, which a denser
+    /// recovery retry can exceed on machines with far more memory to spare.
+    private static func resolvedRetrievalMemoryBudget(
+        memoryGB: Double,
+        resourcePolicy: ResourcePolicy
+    ) -> Int64 {
+        guard memoryGB.isFinite, memoryGB > 0 else {
+            return ColmapVocabularyRetrievalOptions.defaultMemoryBudgetBytes
+        }
+        let bytesPerGibibyte = 1_073_741_824.0
+        let physicalBytesValue = (memoryGB * bytesPerGibibyte).rounded()
+        let physicalMemoryBytes = physicalBytesValue >= Double(UInt64.max)
+            ? UInt64.max
+            : UInt64(physicalBytesValue)
+        // Reuse the trainer's RAM-headroom and policy-fraction sizing, but ignore
+        // the Metal working set: vocabulary retrieval runs entirely on the CPU, so
+        // passing no Metal budget makes `resolve` fall back to physical headroom.
+        let scaledBudget = TrainingMemoryBudget.resolve(
+            physicalMemoryBytes: physicalMemoryBytes,
+            recommendedMetalWorkingSetBytes: nil,
+            resourcePolicy: resourcePolicy
+        )
+        let floored = max(scaledBudget, ColmapVocabularyRetrievalOptions.minimumMemoryBudgetBytes)
+        return min(floored, ColmapVocabularyRetrievalOptions.maximumMemoryBudgetBytes)
     }
 
     private static func requiredCapabilities(route: SfmBackend, model: String) -> [String] {

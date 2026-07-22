@@ -18,7 +18,7 @@ final class DropZoneStateTextTests: XCTestCase {
         )
         XCTAssertEqual(
             DropZoneView.displaySubtitle(restingSubtitle: "Videos or photos", isTargeted: true),
-            "Video or photos folder"
+            "Videos, photos, or a folder"
         )
     }
 }

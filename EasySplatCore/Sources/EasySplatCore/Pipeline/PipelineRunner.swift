@@ -2806,7 +2806,9 @@ public final class PipelineRunner: @unchecked Sendable {
                             returnedNeighborCount: request.returnedNeighborCount,
                             minimumFrameSeparation: request.minimumFrameSeparation,
                             queryStride: resolvedRunPlan.retrievalQueryStride,
-                            threadCount: vocabularyRetrievalWorkers
+                            threadCount: vocabularyRetrievalWorkers,
+                            memoryBudgetBytes: resolvedRunPlan.geometryWorkerBudget
+                                .retrievalMemoryBudgetBytes
                         ),
                         pairContext: ColmapPairWorkerInvocationContext(
                             attemptOrdinal: attemptNumber,

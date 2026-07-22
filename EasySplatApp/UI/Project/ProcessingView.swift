@@ -217,7 +217,7 @@ struct ProcessingView: View {
     private var canTryAgain: Bool {
         Self.canTryAgain(
             projectExists: model.currentProjectURL != nil,
-            pendingInputExists: !model.pendingVideoURLs.isEmpty || model.pendingPhotosFolderURL != nil
+            pendingInputExists: !model.pendingVideoURLs.isEmpty || !model.pendingPhotoURLs.isEmpty
         )
     }
 

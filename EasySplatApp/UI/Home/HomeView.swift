@@ -10,11 +10,11 @@ struct HomeView: View {
     @State private var optionsExpanded = false
 
     private var hasInput: Bool {
-        !model.pendingVideoURLs.isEmpty || model.pendingPhotosFolderURL != nil
+        !model.pendingVideoURLs.isEmpty || !model.pendingPhotoURLs.isEmpty
     }
 
     private var hasPhotos: Bool {
-        model.pendingPhotosFolderURL != nil
+        !model.pendingPhotoURLs.isEmpty
     }
 
     var body: some View {
@@ -24,14 +24,14 @@ struct HomeView: View {
                     Text("Create a 3D splat")
                         .font(.largeTitle.weight(.semibold))
                         .accessibilityAddTraits(.isHeader)
-                    Text("Choose a video or a folder of photos.")
+                    Text("Choose videos, photos, or a folder of them.")
                         .font(.title3)
                         .foregroundStyle(.secondary)
                 }
 
                 DropZoneView(
                     title: "Choose Input…",
-                    subtitle: "or drop a video or photos folder here",
+                    subtitle: "or drop videos, photos, or a folder here",
                     onChoose: { presentInputImporter(replacing: false) },
                     onDropURLs: { model.addInputs(urls: $0) }
                 )
@@ -100,6 +100,7 @@ struct HomeView: View {
             isPresented: $showInputImporter,
             allowedContentTypes: [
                 .folder,
+                .image,
                 .movie,
                 .video,
                 .mpeg4Movie,
@@ -136,9 +137,10 @@ struct HomeView: View {
                 .buttonStyle(.borderless)
             }
 
-            if let folder = model.pendingPhotosFolderURL {
-                inputRow(name: folder.lastPathComponent, systemImage: "folder") {
-                    model.removePhotoFolder()
+            if !model.pendingPhotoURLs.isEmpty {
+                let count = model.pendingPhotoURLs.count
+                inputRow(name: "\(count) \(count == 1 ? "photo" : "photos")", systemImage: "photo") {
+                    model.removeAllPhotos()
                 }
             }
 

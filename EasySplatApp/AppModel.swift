@@ -86,7 +86,7 @@ final class AppModel: ObservableObject {
     @Published var cachedFreeDiskBytes: Int64? = nil
     @Published var requestedRunOptions = RequestedRunOptions()
     @Published var pendingVideoURLs: [URL] = []
-    @Published var pendingPhotosFolderURL: URL? = nil
+    @Published var pendingPhotoURLs: [URL] = []
     @Published var projectSummaries: [ProjectSummary] = []
     @Published var selectionWarning: String? = nil
     @Published var shareStatusMessage: String? = nil
@@ -123,7 +123,6 @@ final class AppModel: ObservableObject {
     var notesSaveTask: Task<Void, Never>?
     var projectSummaryRefreshTask: Task<Void, Never>?
     var pendingNotesSave: (url: URL, text: String)?
-    var photoFolderCountTask: Task<Void, Never>?
     var exitIntent: ExitIntent = .none
     weak var pendingCloseWindow: NSWindow?
     var allowNextWindowClose = false

@@ -90,6 +90,73 @@ final class PhotoInputAdmissionTests: XCTestCase {
         XCTAssertFalse(prepared.photos.contains { $0.stagedURL.pathExtension == "dng" })
     }
 
+    func testPhotoListAdmissionMergesFilesFromMultipleFolders() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        let folderA = root.appendingPathComponent("ShootA", isDirectory: true)
+        let folderB = root.appendingPathComponent("ShootB", isDirectory: true)
+        for dir in [library, folderA, folderB] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        var photos: [URL] = []
+        for (folderIndex, folder) in [folderA, folderB].enumerated() {
+            for offset in 0..<2 {
+                let url = folder.appendingPathComponent("shot-\(folderIndex)-\(offset).png")
+                try writeTaggedRGBPNG(at: url, width: 24 + folderIndex * 4 + offset, height: 32 + offset)
+                photos.append(url)
+            }
+        }
+
+        let prepared = try await PhotoInputPreflight.prepare(
+            photos: photos,
+            stagingParent: library,
+            photoSelection: .useAllValidPhotos,
+            inputOrdering: .automatic,
+            keyframeBudget: 10,
+            requiredAtomicWorkspaceReserveBytes: 0,
+            limits: .init(minimumFreeSpaceReserveBytes: 0),
+            availableCapacity: { _ in 128 * 1_024 * 1_024 },
+            progress: { _, _ in }
+        )
+        defer { prepared.discard() }
+
+        XCTAssertEqual(prepared.summary.validPhotoCount, 4, "Photos from both folders should be admitted.")
+        XCTAssertEqual(prepared.photos.count, 4)
+    }
+
+    func testPhotoListAdmissionRejectsSymbolicLink() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let real = source.appendingPathComponent("real.png")
+        try writeTaggedRGBPNG(at: real, width: 24, height: 24)
+        let link = source.appendingPathComponent("link.png")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await PhotoInputPreflight.prepare(
+                photos: [link],
+                stagingParent: library,
+                photoSelection: .useAllValidPhotos,
+                inputOrdering: .automatic,
+                keyframeBudget: 10,
+                requiredAtomicWorkspaceReserveBytes: 0,
+                limits: .init(minimumFreeSpaceReserveBytes: 0),
+                availableCapacity: { _ in 128 * 1_024 * 1_024 },
+                progress: { _, _ in }
+            )
+        } errorHandler: { error in
+            guard let failure = error as? PhotoInputPreflightFailure,
+                  case .symbolicLink = failure.issue else {
+                return XCTFail("Expected a symbolic-link rejection, got \(error)")
+            }
+        }
+    }
+
     func testRawAdmissionDeduplicatesOriginalsButAllowsIdenticalDevelopedPNGs() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

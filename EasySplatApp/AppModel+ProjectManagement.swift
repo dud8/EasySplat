@@ -123,8 +123,7 @@ extension AppModel {
         let timingBoundary = timingBoundary ?? .capture()
         guard !isRunActive else { return }
         guard let inputSpec = buildInputSpec() else { return }
-        photoFolderCountTask?.cancel()
-        photoFolderCountTask = nil
+        let photoURLs = pendingPhotoURLs
         let title = projectTitle(for: inputSpec)
         let token = UUID()
         currentTaskToken = token
@@ -132,6 +131,7 @@ extension AppModel {
         currentTask = Task {
             await startProject(
                 input: inputSpec,
+                photoURLs: photoURLs,
                 title: title,
                 taskToken: token,
                 timingBoundary: timingBoundary

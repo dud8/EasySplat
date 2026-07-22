@@ -232,6 +232,7 @@ extension AppModel {
     @discardableResult
     func startProject(
         input: InputSpec,
+        photoURLs: [URL]? = nil,
         title: String,
         taskToken: UUID? = nil,
         timingBoundary: RunTimingBoundary? = nil
@@ -275,7 +276,7 @@ extension AppModel {
             )
             defer { idleSleepAssertion.release() }
 
-            if let photosFolder = input.photosFolder {
+            if input.hasPhotos {
                 statusTitle = "Checking photos"
                 statusDetail = nil
                 progress = nil
@@ -286,31 +287,50 @@ extension AppModel {
                 let photoBudget = resolvedRunPlan.photoSelection == .automatic
                     ? resolvedRunPlan.keyframeBudget
                     : max(1, resolvedRunPlan.keyframeBudget - reservedVideoFrames)
+                let photoReserveBytes = VideoInputPreflight.requiredAtomicWorkspaceReserveBytes(
+                    keyframeBudget: resolvedRunPlan.keyframeBudget,
+                    maximumImageDimension: resolvedRunPlan.maximumImageDimension,
+                    maximumFeatureCount: resolvedRunPlan.colmapMaximumFeatureCount,
+                    maximumMatchCount: resolvedRunPlan.colmapMaximumMatchCount,
+                    retrievalCandidateCount: resolvedRunPlan.retrievalCandidateCount
+                )
+                let photoLimits = PhotoInputPreflightLimits(
+                    maximumDecodedDimension: min(4_096, resolvedRunPlan.maximumImageDimension)
+                )
+                let onPhotoProgress: @Sendable (Double, String) -> Void = { [weak self] fraction, message in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isCurrentTaskToken(taskToken) else { return }
+                        self.progress = fraction
+                        self.statusTitle = "Checking photos"
+                        self.statusDetail = message
+                    }
+                }
                 do {
-                    preparedPhotoInput = try await PhotoInputPreflight.prepare(
-                        folder: URL(fileURLWithPath: photosFolder, isDirectory: true),
-                        stagingParent: projectBaseDirectory(),
-                        photoSelection: resolvedRunPlan.photoSelection,
-                        inputOrdering: resolvedRunPlan.inputOrdering,
-                        keyframeBudget: photoBudget,
-                        requiredAtomicWorkspaceReserveBytes: VideoInputPreflight
-                            .requiredAtomicWorkspaceReserveBytes(
-                                keyframeBudget: resolvedRunPlan.keyframeBudget,
-                                maximumImageDimension: resolvedRunPlan.maximumImageDimension,
-                                maximumFeatureCount: resolvedRunPlan.colmapMaximumFeatureCount,
-                                maximumMatchCount: resolvedRunPlan.colmapMaximumMatchCount,
-                                retrievalCandidateCount: resolvedRunPlan.retrievalCandidateCount
-                            ),
-                        limits: .init(
-                            maximumDecodedDimension: min(4_096, resolvedRunPlan.maximumImageDimension)
+                    // Selection supplies an explicit file list (which may span
+                    // several folders); callers that still name a single folder
+                    // fall back to the hardened folder walk.
+                    if let photoURLs {
+                        preparedPhotoInput = try await PhotoInputPreflight.prepare(
+                            photos: photoURLs,
+                            stagingParent: projectBaseDirectory(),
+                            photoSelection: resolvedRunPlan.photoSelection,
+                            inputOrdering: resolvedRunPlan.inputOrdering,
+                            keyframeBudget: photoBudget,
+                            requiredAtomicWorkspaceReserveBytes: photoReserveBytes,
+                            limits: photoLimits,
+                            progress: onPhotoProgress
                         )
-                    ) { [weak self] fraction, message in
-                        Task { @MainActor [weak self] in
-                            guard let self, self.isCurrentTaskToken(taskToken) else { return }
-                            self.progress = fraction
-                            self.statusTitle = "Checking photos"
-                            self.statusDetail = message
-                        }
+                    } else if let photosFolder = input.photosFolder {
+                        preparedPhotoInput = try await PhotoInputPreflight.prepare(
+                            folder: URL(fileURLWithPath: photosFolder, isDirectory: true),
+                            stagingParent: projectBaseDirectory(),
+                            photoSelection: resolvedRunPlan.photoSelection,
+                            inputOrdering: resolvedRunPlan.inputOrdering,
+                            keyframeBudget: photoBudget,
+                            requiredAtomicWorkspaceReserveBytes: photoReserveBytes,
+                            limits: photoLimits,
+                            progress: onPhotoProgress
+                        )
                     }
                 } catch let failure as PhotoInputPreflightFailure
                     where input.hasVideos && failure.issue == .noValidPhotos {

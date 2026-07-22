@@ -118,12 +118,50 @@ final class RunPlanResolverTests: XCTestCase {
                 developmentOverrides: .none
             )
 
+            let budget = plan.geometryWorkerBudget
+            let context = "\(fixture.memoryGB) GB, \(fixture.cpuCount) CPUs, \(fixture.resourcePolicy)"
+            XCTAssertEqual(budget.featureExtractionWorkers, fixture.expected.featureExtractionWorkers, context)
+            XCTAssertEqual(budget.coupledMatchingWorkers, fixture.expected.coupledMatchingWorkers, context)
+            XCTAssertEqual(budget.vocabularyRetrievalWorkers, fixture.expected.vocabularyRetrievalWorkers, context)
             XCTAssertEqual(
-                plan.geometryWorkerBudget,
-                fixture.expected,
-                "\(fixture.memoryGB) GB, \(fixture.cpuCount) CPUs, \(fixture.resourcePolicy)"
+                budget.maximumConcurrentVideoSourceAnalysisTasks,
+                fixture.expected.maximumConcurrentVideoSourceAnalysisTasks,
+                context
             )
         }
+    }
+
+    func testRetrievalMemoryBudgetScalesWithInstalledRAM() {
+        func resolvedRetrievalBudget(memoryGB: Double, policy: ResourcePolicy) -> Int64 {
+            RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(detailProfile: .balanced, resourcePolicy: policy),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(memoryGB: memoryGB, cpuCount: 16, gpuWorkingSetGB: nil),
+                developmentOverrides: .none
+            ).geometryWorkerBudget.retrievalMemoryBudgetBytes
+        }
+
+        let lowerBound = ColmapVocabularyRetrievalOptions.minimumMemoryBudgetBytes
+        let upperBound = ColmapVocabularyRetrievalOptions.maximumMemoryBudgetBytes
+        let failedDefault = ColmapVocabularyRetrievalOptions.defaultMemoryBudgetBytes
+
+        for memoryGB in [16.0, 48.0, 64.0] {
+            let budget = resolvedRetrievalBudget(memoryGB: memoryGB, policy: .automatic)
+            XCTAssertGreaterThanOrEqual(budget, lowerBound, "\(memoryGB) GB budget below the tool floor")
+            XCTAssertLessThanOrEqual(budget, upperBound, "\(memoryGB) GB budget above the tool ceiling")
+            // The reported failure hard-capped retrieval at the 2 GiB default; a
+            // machine-scaled budget must clear it comfortably on any modern Mac.
+            XCTAssertGreaterThan(
+                budget, failedDefault,
+                "\(memoryGB) GB should exceed the old fixed 2 GiB default"
+            )
+        }
+
+        // More RAM never yields a smaller ceiling.
+        XCTAssertGreaterThanOrEqual(
+            resolvedRetrievalBudget(memoryGB: 64, policy: .automatic),
+            resolvedRetrievalBudget(memoryGB: 16, policy: .automatic)
+        )
     }
 
     func testIncompleteRunPlanIsRejected() throws {

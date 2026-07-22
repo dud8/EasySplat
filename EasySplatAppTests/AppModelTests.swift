@@ -127,7 +127,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotNil(model.currentProjectURL)
         XCTAssertNotNil(model.outputPlyURL)
         XCTAssertTrue(model.pendingVideoURLs.isEmpty)
-        XCTAssertNil(model.pendingPhotosFolderURL)
+        XCTAssertTrue(model.pendingPhotoURLs.isEmpty)
         guard let projectURL = model.currentProjectURL else {
             XCTFail("Missing project URL")
             return
@@ -462,17 +462,14 @@ final class AppModelTests: XCTestCase {
             MockPipelineRunner(projectURL: url, config: config)
         }
         model.addInputs(urls: [folder])
-        for _ in 0..<100 where model.selectionWarning == nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        XCTAssertEqual(model.pendingPhotoURLs.count, 2, "Folder photos should be ingested as a file list.")
         let warning = try XCTUnwrap(model.selectionWarning)
-        XCTAssertTrue(warning.contains("Thin"), "Warning should name the folder, got: \(warning)")
         XCTAssertTrue(warning.contains("2 photos"), "Warning should mention the actual count, got: \(warning)")
         XCTAssertTrue(warning.contains("Add at least 3"), "Warning should explain the hard floor, got: \(warning)")
         XCTAssertFalse(warning.contains("will still attempt"), "Warning must not promise a run below the hard floor.")
 
-        model.removePhotoFolder()
-        XCTAssertNil(model.pendingPhotosFolderURL)
+        model.removeAllPhotos()
+        XCTAssertTrue(model.pendingPhotoURLs.isEmpty)
         XCTAssertNil(model.selectionWarning)
     }
 
@@ -490,17 +487,13 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
 
         model.addInputs(urls: [video, folder])
-        for _ in 0..<100 where model.photoFolderCountTask != nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
 
         XCTAssertEqual(model.pendingVideoURLs, [video])
-        XCTAssertEqual(model.pendingPhotosFolderURL, folder)
-        XCTAssertNil(model.photoFolderCountTask)
+        XCTAssertEqual(model.pendingPhotoURLs.count, 2)
         XCTAssertNil(model.selectionWarning)
     }
 
-    func testAddInputsKeepsFirstPhotoFolderAndWarnsAboutTheRest() throws {
+    func testAddInputsMergesPhotosFromMultipleFolders() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
         let first = base.appendingPathComponent("First", isDirectory: true)
@@ -508,17 +501,16 @@ final class AppModelTests: XCTestCase {
         try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
         for index in 0..<AppModel.minimumRecommendedPhotos {
-            try Data("image".utf8).write(to: first.appendingPathComponent("photo-\(index).jpg"))
+            try Data("image-a-\(index)".utf8).write(to: first.appendingPathComponent("photo-\(index).jpg"))
+            try Data("image-b-\(index)".utf8).write(to: second.appendingPathComponent("photo-\(index).jpg"))
         }
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
 
         model.addInputs(urls: [first, second])
 
-        XCTAssertEqual(model.pendingPhotosFolderURL, first)
-        XCTAssertEqual(
-            model.selectionWarning,
-            "Ignored 1 additional photo folder. EasySplat uses one photo folder per splat."
-        )
+        XCTAssertEqual(model.pendingPhotoURLs.count, AppModel.minimumRecommendedPhotos * 2)
+        XCTAssertTrue(model.pendingVideoURLs.isEmpty)
+        XCTAssertNil(model.selectionWarning, "Both folders should merge; no folder is discarded.")
     }
 
     func testAddingSeparateClipsPreservesExplicitContinuousOrdering() {
@@ -543,6 +535,7 @@ final class AppModelTests: XCTestCase {
         let video = root.appendingPathComponent("capture.mov")
         let photos = root.appendingPathComponent("Photos", isDirectory: true)
         try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+        try Data("photo".utf8).write(to: photos.appendingPathComponent("frame.jpg"))
         try Data("video".utf8).write(to: video)
         let model = AppModel(toolchainManager: MockToolchainManager())
         defer { model.clearPendingInputs() }
@@ -2114,7 +2107,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.currentRunOptions)
         XCTAssertNil(model.currentInput)
         XCTAssertEqual(model.pendingVideoURLs, [input])
-        XCTAssertNil(model.pendingPhotosFolderURL)
+        XCTAssertTrue(model.pendingPhotoURLs.isEmpty)
         XCTAssertTrue(model.projectSummaries.isEmpty)
         let projectBundles = try FileManager.default.contentsOfDirectory(
             at: tempBase,
@@ -2249,6 +2242,7 @@ final class AppModelTests: XCTestCase {
         let photos = tempBase.appendingPathComponent("Photos", isDirectory: true)
         try Data("video".utf8).write(to: video)
         try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+        try Data("photo".utf8).write(to: photos.appendingPathComponent("frame.jpg"))
         let toolchain = CapabilityRecordingToolchainManager()
         let model = AppModel(toolchainManager: toolchain, projectBaseURL: tempBase) { _, _ in
             XCTFail("Pipeline runner should not start for unsupported continuous mixed input.")
@@ -2589,11 +2583,11 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.pendingVideoURLs.isEmpty)
         XCTAssertEqual(
             model.selectionWarning,
-            "Ignored 1 file(s). Supported: video files and a photo folder."
+            "Ignored 1 file. Supported: photos, videos, or folders of them."
         )
     }
 
-    func testAddInputsDeduplicatesFolderAliasesAndCountsOnlyDistinctAdditionalFolders() throws {
+    func testAddInputsMergesFolderPhotosAndDeduplicatesAliases() throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
@@ -2606,7 +2600,7 @@ final class AppModelTests: XCTestCase {
         for folder in [nested, second, third] {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             for index in 0..<AppModel.minimumRecommendedPhotos {
-                try Data("image".utf8).write(
+                try Data("image-\(folder.lastPathComponent)-\(index)".utf8).write(
                     to: folder.appendingPathComponent("photo-\(index).jpg")
                 )
             }
@@ -2615,21 +2609,19 @@ final class AppModelTests: XCTestCase {
         let alternateSpelling = URL(fileURLWithPath: selected.path + "/nested/..", isDirectory: true)
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
 
+        // `selected`, its `nested/..` spelling, and the `alias` symlink all resolve
+        // to the same photos, so only their distinct files count once. `second` and
+        // `third` contribute their own. The photos live one level down in `nested`.
         model.addInputs(urls: [selected, alternateSpelling, alias, second, third])
 
-        XCTAssertEqual(model.pendingPhotosFolderURL, selected)
-        XCTAssertEqual(
-            model.selectionWarning,
-            "Ignored 2 additional photo folders. EasySplat uses one photo folder per splat."
-        )
+        XCTAssertEqual(model.pendingPhotoURLs.count, AppModel.minimumRecommendedPhotos * 3)
+        XCTAssertNil(model.selectionWarning, "All folders merge; none is discarded.")
 
+        // Re-adding the same sources contributes nothing new.
         model.addInputs(urls: [alias, second])
 
-        XCTAssertEqual(model.pendingPhotosFolderURL, selected)
-        XCTAssertEqual(
-            model.selectionWarning,
-            "Ignored 1 additional photo folder. EasySplat uses one photo folder per splat."
-        )
+        XCTAssertEqual(model.pendingPhotoURLs.count, AppModel.minimumRecommendedPhotos * 3)
+        XCTAssertNil(model.selectionWarning)
     }
 
     func testAddInputsAcceptsSupportedVideoExtensionsWithoutSystemTypeRegistration() throws {

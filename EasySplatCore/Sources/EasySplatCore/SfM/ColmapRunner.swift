@@ -888,6 +888,7 @@ public enum ColmapVocabularyRetrievalOptionsValidationError: Error, LocalizedErr
     case minimumFrameSeparationOutOfRange
     case queryStrideOutOfRange
     case threadCountOutOfRange
+    case memoryBudgetOutOfRange
 
     public var errorDescription: String? {
         switch self {
@@ -903,24 +904,36 @@ public enum ColmapVocabularyRetrievalOptionsValidationError: Error, LocalizedErr
             return "Vocabulary query stride must be between 1 and 1,000,000."
         case .threadCountOutOfRange:
             return "Vocabulary retrieval thread count must be between 1 and 64."
+        case .memoryBudgetOutOfRange:
+            return "Vocabulary retrieval memory budget must be between 64 MiB and 256 GiB."
         }
     }
 }
 
 /// Bounded inputs for EasySplat's project-local SIFT vocabulary process boundary.
 public struct ColmapVocabularyRetrievalOptions: Sendable, Equatable {
+    /// Memory-budget limits mirror the native `local_vocab_retriever`
+    /// constants (`kMinimumMemoryBudgetBytes` / `kMaximumMemoryBudgetBytes` /
+    /// `kDefaultMemoryBudgetBytes`). The default matches the tool's built-in
+    /// value so callers that omit an explicit budget keep the historical size.
+    public static let minimumMemoryBudgetBytes: Int64 = 64 * 1_048_576
+    public static let maximumMemoryBudgetBytes: Int64 = 256 * 1_024 * 1_048_576
+    public static let defaultMemoryBudgetBytes: Int64 = 2 * 1_024 * 1_048_576
+
     public let candidateCount: Int
     public let returnedNeighborCount: Int
     public let minimumFrameSeparation: Int
     public let queryStride: Int
     public let threadCount: Int
+    public let memoryBudgetBytes: Int64
 
     public init(
         candidateCount: Int,
         returnedNeighborCount: Int,
         minimumFrameSeparation: Int,
         queryStride: Int,
-        threadCount: Int
+        threadCount: Int,
+        memoryBudgetBytes: Int64 = ColmapVocabularyRetrievalOptions.defaultMemoryBudgetBytes
     ) throws {
         guard (1...256).contains(candidateCount) else {
             throw ColmapVocabularyRetrievalOptionsValidationError.candidateCountOutOfRange
@@ -940,11 +953,16 @@ public struct ColmapVocabularyRetrievalOptions: Sendable, Equatable {
         guard (1...64).contains(threadCount) else {
             throw ColmapVocabularyRetrievalOptionsValidationError.threadCountOutOfRange
         }
+        guard (Self.minimumMemoryBudgetBytes...Self.maximumMemoryBudgetBytes)
+            .contains(memoryBudgetBytes) else {
+            throw ColmapVocabularyRetrievalOptionsValidationError.memoryBudgetOutOfRange
+        }
         self.candidateCount = candidateCount
         self.returnedNeighborCount = returnedNeighborCount
         self.minimumFrameSeparation = minimumFrameSeparation
         self.queryStride = queryStride
         self.threadCount = threadCount
+        self.memoryBudgetBytes = memoryBudgetBytes
     }
 }
 
@@ -1441,6 +1459,7 @@ public final class ColmapRunner: @unchecked Sendable {
             "--num_rounds", "1",
             "--num_checks", "64",
             "--num_threads", "\(options.threadCount)",
+            "--memory_budget_bytes", "\(options.memoryBudgetBytes)",
         ]
         if let queryImageListPath {
             args.append(contentsOf: ["--query_image_list_path", queryImageListPath.path])

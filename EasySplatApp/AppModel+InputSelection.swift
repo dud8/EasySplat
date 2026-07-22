@@ -39,81 +39,82 @@ extension AppModel {
         addInputs(urls: [url])
     }
 
+    /// Accepts any mix of photo files, video files, and folders. A folder is
+    /// expanded into the compatible photos and videos it contains, so a single
+    /// capture folder with both kinds of media brings all of it in. Photos and
+    /// videos coming from different folders are merged into one selection.
     func addInputs(urls: [URL]) {
-        var videoIdentities = Set(
-            pendingVideoURLs.compactMap { url -> SelectedInputIdentity? in
-                let input = Self.classifyInput(url)
-                return input.kind == .regularFile ? input.identity : nil
-            }
-        )
-        var folderIdentities: Set<SelectedInputIdentity> = []
-        if let pendingPhotosFolderURL {
-            let input = Self.classifyInput(pendingPhotosFolderURL)
-            if input.kind == .directory, let identity = input.identity {
-                folderIdentities.insert(identity)
-            }
-        }
+        var videoIdentities = Set(pendingVideoURLs.compactMap { Self.classifyInput($0).identity })
+        var photoIdentities = Set(pendingPhotoURLs.compactMap { Self.classifyInput($0).identity })
 
         var newVideos: [URL] = []
-        var ignoredFiles: [URL] = []
-        var selectedFolder = pendingPhotosFolderURL
-        var selectedFolderWasAdded = false
-        var additionalFolderCount = 0
+        var newPhotos: [URL] = []
+        var ignoredFileCount = 0
+
+        func admitVideo(_ url: URL) {
+            guard let identity = Self.classifyInput(url).identity,
+                  videoIdentities.insert(identity).inserted else { return }
+            newVideos.append(url)
+        }
+        func admitPhoto(_ url: URL) {
+            guard let identity = Self.classifyInput(url).identity,
+                  photoIdentities.insert(identity).inserted else { return }
+            newPhotos.append(url)
+        }
+
         for url in urls {
             let input = Self.classifyInput(url)
             switch input.kind {
             case .directory:
-                guard let identity = input.identity,
-                      folderIdentities.insert(identity).inserted else {
-                    continue
-                }
-                if selectedFolder == nil {
-                    selectedFolder = url
-                    selectedFolderWasAdded = true
-                } else {
-                    additionalFolderCount += 1
-                }
+                let expanded = Self.expandFolder(url)
+                expanded.videos.forEach(admitVideo)
+                expanded.images.forEach(admitPhoto)
             case .regularFile:
-                guard Self.isSupportedVideo(url),
-                      let identity = input.identity,
-                      videoIdentities.insert(identity).inserted else {
-                    if !Self.isSupportedVideo(url) {
-                        ignoredFiles.append(url)
-                    }
-                    continue
+                if Self.isSupportedVideo(url) {
+                    admitVideo(url)
+                } else if Self.isSupportedImage(url) {
+                    admitPhoto(url)
+                } else {
+                    ignoredFileCount += 1
                 }
-                newVideos.append(url)
             case .unsupported:
-                ignoredFiles.append(url)
+                ignoredFileCount += 1
             }
         }
 
-        if !newVideos.isEmpty {
-            pendingVideoURLs.append(contentsOf: newVideos)
-        }
-        pendingPhotosFolderURL = selectedFolder
+        pendingVideoURLs.append(contentsOf: newVideos)
+        pendingPhotoURLs.append(contentsOf: newPhotos)
 
         var warnings: [String] = []
-        if !ignoredFiles.isEmpty {
-            warnings.append("Ignored \(ignoredFiles.count) file(s). Supported: video files and a photo folder.")
-        }
-        if additionalFolderCount > 0 {
-            let noun = additionalFolderCount == 1 ? "folder" : "folders"
+        if ignoredFileCount > 0 {
+            let noun = ignoredFileCount == 1 ? "file" : "files"
             warnings.append(
-                "Ignored \(additionalFolderCount) additional photo \(noun). EasySplat uses one photo folder per splat."
+                "Ignored \(ignoredFileCount) \(noun). Supported: photos, videos, or folders of them."
             )
         }
-
         if requestedRunOptions.inputOrdering == .continuous,
            let input = buildInputSpec(),
            !RunPlanResolver.supports(inputOrdering: .continuous, input: input) {
             requestedRunOptions.inputOrdering = .automatic
             warnings.append("Continuous sequence can't combine videos and photos. Input Order was reset to Automatic.")
         }
-        selectionWarning = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
-        if selectedFolderWasAdded, let selectedFolder {
-            schedulePhotoFolderCount(for: selectedFolder)
+        if let hint = lowPhotoCountWarning() {
+            warnings.append(hint)
         }
+        selectionWarning = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+    }
+
+    /// A short quality hint when a photo-only selection is thin. Photos beside a
+    /// video are optional, so no floor applies then.
+    private func lowPhotoCountWarning() -> String? {
+        guard pendingVideoURLs.isEmpty else { return nil }
+        let count = pendingPhotoURLs.count
+        guard count > 0, count < Self.minimumRecommendedPhotos else { return nil }
+        let countText = "\(count) \(count == 1 ? "photo" : "photos")"
+        if count < RunPlanResolver.minimumReconstructionImageCount {
+            return "Selected \(countText). Add at least \(RunPlanResolver.minimumReconstructionImageCount) from different viewpoints."
+        }
+        return "Selected \(countText). \(Self.minimumRecommendedPhotos) or more is recommended for reliable coverage."
     }
 
     private static func classifyInput(_ url: URL) -> ClassifiedInput {
@@ -143,7 +144,7 @@ extension AppModel {
         let kind: SelectedInputKind
         if url.hasDirectoryPath {
             kind = .directory
-        } else if isSupportedVideo(url) {
+        } else if isSupportedVideo(url) || isSupportedImage(url) {
             kind = .regularFile
         } else {
             kind = .unsupported
@@ -189,6 +190,76 @@ extension AppModel {
             return false
         }
         return type.conforms(to: .movie) || type.conforms(to: .video)
+    }
+
+    /// Matches what photo admission accepts: anything conforming to `public.image`
+    /// by its extension, which includes JPEG, PNG, HEIC, and camera RAW.
+    static func isSupportedImage(_ url: URL) -> Bool {
+        guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else {
+            return false
+        }
+        return type.conforms(to: .image)
+    }
+
+    /// Enumerates a selected folder for the photos and videos it holds. Mirrors
+    /// the pipeline's photo discovery: bounded depth, hidden files skipped, and a
+    /// project bundle's own output directories excluded so a re-selected project
+    /// doesn't ingest its generated frames. Symlinks are skipped here so photo
+    /// admission's fail-closed symlink rejection is never tripped by expansion.
+    private static func expandFolder(_ folder: URL) -> (images: [URL], videos: [URL]) {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: folder,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .nameKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants],
+            errorHandler: { _, _ in true }
+        ) else {
+            return ([], [])
+        }
+        let maxDepth = 3
+        let maxVisitedEntries = 50_000
+        let normalizedRoot = folder.standardizedFileURL
+        let looksLikeProjectRoot = fileManager.fileExists(
+            atPath: folder.appendingPathComponent("project.json").path
+        )
+        let excludedProjectDirectories: Set<String> = looksLikeProjectRoot
+            ? ["Frames", "SfM", "Training", "Output", "Logs"]
+            : []
+
+        var images: [URL] = []
+        var videos: [URL] = []
+        var visited = 0
+        for case let url as URL in enumerator {
+            guard visited < maxVisitedEntries else { break }
+            visited += 1
+            if enumerator.level > maxDepth {
+                enumerator.skipDescendants()
+                continue
+            }
+            let values = try? url.resourceValues(
+                forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .nameKey]
+            )
+            if values?.isSymbolicLink == true {
+                if values?.isDirectory == true { enumerator.skipDescendants() }
+                continue
+            }
+            if values?.isDirectory == true {
+                if !excludedProjectDirectories.isEmpty,
+                   url.deletingLastPathComponent().standardizedFileURL == normalizedRoot,
+                   let name = values?.name,
+                   excludedProjectDirectories.contains(name) {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            guard values?.isRegularFile == true else { continue }
+            if isSupportedVideo(url) {
+                videos.append(url)
+            } else if isSupportedImage(url) {
+                images.append(url)
+            }
+        }
+        return (images, videos)
     }
 
     /// Recommended floor used by the pre-flight check. Phrased as a quality
@@ -244,32 +315,56 @@ extension AppModel {
     }
 
     func clearPendingInputs() {
-        photoFolderCountTask?.cancel()
-        photoFolderCountTask = nil
         pendingVideoURLs = []
-        pendingPhotosFolderURL = nil
+        pendingPhotoURLs = []
         selectionWarning = nil
     }
 
-    func removePhotoFolder() {
-        photoFolderCountTask?.cancel()
-        photoFolderCountTask = nil
-        pendingPhotosFolderURL = nil
+    func removeAllPhotos() {
+        pendingPhotoURLs = []
         selectionWarning = nil
     }
 
     func buildInputSpec() -> InputSpec? {
         let videos = pendingVideoURLs
-        if !videos.isEmpty, let photosFolder = pendingPhotosFolderURL {
-            return .mixed(videos: videos.map(\.path), photosFolder: photosFolder.path)
+        let photosFolder = nominalPhotosFolderPath(for: pendingPhotoURLs)
+        if !videos.isEmpty, let photosFolder {
+            return .mixed(videos: videos.map(\.path), photosFolder: photosFolder)
         }
         if !videos.isEmpty {
             return .video(files: videos.map(\.path))
         }
-        if let photosFolder = pendingPhotosFolderURL {
-            return .photos(folder: photosFolder.path)
+        if let photosFolder {
+            return .photos(folder: photosFolder)
         }
         return nil
+    }
+
+    /// A representative directory path for a set of selected photos, used only to
+    /// label the project and satisfy the pre-adoption input shape. Adoption
+    /// replaces it with the controlled `Originals/Photos` location, so this value
+    /// is never persisted and never walked (the file list drives preflight).
+    private func nominalPhotosFolderPath(for photos: [URL]) -> String? {
+        guard let first = photos.first else { return nil }
+        guard photos.count > 1 else {
+            return first.deletingLastPathComponent().path
+        }
+        let componentLists = photos.map {
+            $0.deletingLastPathComponent().standardizedFileURL.pathComponents
+        }
+        let shortest = componentLists.map(\.count).min() ?? 0
+        var shared: [String] = []
+        for index in 0..<shortest {
+            let component = componentLists[0][index]
+            guard componentLists.allSatisfy({ $0[index] == component }) else { break }
+            shared.append(component)
+        }
+        guard shared.count > 1 else {
+            // No meaningful common ancestor (e.g. different volumes); fall back
+            // to the first photo's parent so the label stays a real directory.
+            return first.deletingLastPathComponent().path
+        }
+        return NSString.path(withComponents: shared)
     }
 
     func projectTitle(for input: InputSpec) -> String {
@@ -280,42 +375,5 @@ extension AppModel {
             return URL(fileURLWithPath: photosFolder).lastPathComponent
         }
         return "Project"
-    }
-
-    private func schedulePhotoFolderCount(for folder: URL) {
-        photoFolderCountTask?.cancel()
-        let folderIdentity = folder.standardizedFileURL
-        let scan = Task.detached(priority: .utility) {
-            Self.countImageFiles(in: folder)
-        }
-        photoFolderCountTask = Task { [weak self] in
-            let count = await withTaskCancellationHandler {
-                await scan.value
-            } onCancel: {
-                scan.cancel()
-            }
-            guard !Task.isCancelled, let self else { return }
-            self.photoFolderCountTask = nil
-            guard self.pendingPhotosFolderURL?.standardizedFileURL == folderIdentity,
-                  let count,
-                  count < Self.minimumRecommendedPhotos else {
-                return
-            }
-            // A photo folder is optional beside video input, so its count is
-            // neither a reconstruction floor nor a useful warning.
-            guard self.pendingVideoURLs.isEmpty else { return }
-            let countText = "\(count) \(count == 1 ? "photo" : "photos")"
-            let message: String
-            if count < RunPlanResolver.minimumReconstructionImageCount {
-                message = "\"\(folder.lastPathComponent)\" has \(countText). Add at least \(RunPlanResolver.minimumReconstructionImageCount) from different viewpoints."
-            } else {
-                message = "\"\(folder.lastPathComponent)\" has \(countText). \(Self.minimumRecommendedPhotos) or more is recommended for reliable coverage."
-            }
-            if let warning = self.selectionWarning, !warning.isEmpty {
-                self.selectionWarning = warning + "\n" + message
-            } else {
-                self.selectionWarning = message
-            }
-        }
     }
 }
