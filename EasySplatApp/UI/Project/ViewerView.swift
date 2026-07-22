@@ -17,6 +17,7 @@ struct ViewerView: View {
     @State private var viewerAlert: ViewerAlert?
     @State private var isExporting = false
     @State private var isUprightHintDismissed = false
+    @State private var isPartialCoverageHintDismissed = false
     @State private var isRetrainSheetPresented = false
     @State private var retrainProfile: DetailProfile = .balanced
 
@@ -47,7 +48,13 @@ struct ViewerView: View {
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(Theme.Spacing.large)
-                    .overlay(alignment: .bottom) { uprightHint }
+                    .overlay(alignment: .bottom) {
+                        VStack(spacing: Theme.Spacing.small) {
+                            partialCoverageHint
+                            uprightHint
+                        }
+                        .padding(.bottom, Theme.Spacing.extraLarge)
+                    }
                 } else {
                     ProgressView("Opening splat…")
                 }
@@ -77,6 +84,7 @@ struct ViewerView: View {
         .onAppear { requestArtifactLoad() }
         .onChange(of: model.currentProjectURL) { _, _ in
             isUprightHintDismissed = false
+            isPartialCoverageHintDismissed = false
             requestArtifactLoad()
         }
         .onChange(of: model.outputPlyURL) { _, _ in requestArtifactLoad() }
@@ -236,9 +244,70 @@ struct ViewerView: View {
             .padding(.vertical, Theme.Spacing.small)
             .background(.ultraThinMaterial)
             .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
-            .padding(.bottom, Theme.Spacing.extraLarge)
             .accessibilityIdentifier("result.uprightHint")
         }
+    }
+
+    private var partialCoverage: (registered: Int, total: Int, separateGroupViewCount: Int)? {
+        guard let geometry = artifactSnapshot?.geometryArtifact else { return nil }
+        return Self.partialCoverageSummary(
+            registeredViewCount: geometry.registeredViewCount,
+            totalViewCount: geometry.totalViewCount,
+            componentViewCounts: geometry.pairGraph.measurement?.componentViewCounts
+        )
+    }
+
+    @ViewBuilder
+    private var partialCoverageHint: some View {
+        if !isPartialCoverageHintDismissed, let coverage = partialCoverage {
+            HStack(spacing: Theme.Spacing.small) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.yellow)
+                Text(Self.partialCoverageMessage(coverage))
+                    .font(.caption)
+                Button {
+                    isPartialCoverageHintDismissed = true
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss coverage warning")
+            }
+            .padding(.horizontal, Theme.Spacing.medium)
+            .padding(.vertical, Theme.Spacing.small)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
+            .accessibilityIdentifier("result.partialCoverageHint")
+        }
+    }
+
+    /// Present only when the splat was built from part of the capture: the
+    /// registered fraction sits below the 0.90 floor a fully connected run
+    /// always clears (mirrors core's minimum registered view fraction).
+    static func partialCoverageSummary(
+        registeredViewCount: Int,
+        totalViewCount: Int,
+        componentViewCounts: [Int]?
+    ) -> (registered: Int, total: Int, separateGroupViewCount: Int)? {
+        guard totalViewCount > 0,
+              registeredViewCount > 0,
+              registeredViewCount <= totalViewCount,
+              Double(registeredViewCount) / Double(totalViewCount) < 0.90 else {
+            return nil
+        }
+        let separateGroup = componentViewCounts?.dropFirst().first ?? 0
+        return (registeredViewCount, totalViewCount, separateGroup > 1 ? separateGroup : 0)
+    }
+
+    static func partialCoverageMessage(
+        _ coverage: (registered: Int, total: Int, separateGroupViewCount: Int)
+    ) -> String {
+        if coverage.separateGroupViewCount > 1 {
+            return "This splat covers \(coverage.registered) of \(coverage.total) photos. A separate group of \(coverage.separateGroupViewCount) photos couldn't be connected to it. Add photos that bridge the two areas, then use Re-train in the More menu."
+        }
+        return "This splat covers \(coverage.registered) of \(coverage.total) photos. To include the rest, add photos that overlap the missing areas, then use Re-train in the More menu."
     }
 
     private var resultInspector: some View {
@@ -328,10 +397,17 @@ struct ViewerView: View {
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
             if let geometry = artifactSnapshot?.geometryArtifact {
-                LabeledContent(
-                    "Registered",
-                    value: "\(geometry.registeredViewCount) of \(geometry.totalViewCount)"
-                )
+                LabeledContent("Registered") {
+                    HStack(spacing: Theme.Spacing.small) {
+                        if partialCoverage != nil {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.yellow)
+                                .accessibilityLabel("Built from part of the capture")
+                        }
+                        Text("\(geometry.registeredViewCount) of \(geometry.totalViewCount)")
+                    }
+                }
                 LabeledContent("Points", value: geometry.pointCount.formatted())
                 LabeledContent("Observations", value: geometry.observationCount.formatted())
                 LabeledContent(
