@@ -726,7 +726,11 @@ extension AppModel {
         )
     }
 
-    func resumeProjectTask(at url: URL, taskToken: UUID? = nil) async {
+    func resumeProjectTask(
+        at url: URL,
+        taskToken: UUID? = nil,
+        bypassFinishedOutput: Bool = false
+    ) async {
         guard isCurrentTaskToken(taskToken) else { return }
         defer { finishRun(taskToken: taskToken) }
         reset()
@@ -752,7 +756,8 @@ extension AppModel {
             currentProjectURL = url
             currentRunOptions = metadata.requestedRunOptions
             currentInput = metadata.input
-            if let outputURL = try await validatedFinishedOutputURL(projectURL: url) {
+            if !bypassFinishedOutput,
+               let outputURL = try await validatedFinishedOutputURL(projectURL: url) {
                 guard isCurrentTaskToken(taskToken) else { return }
                 outputPlyURL = outputURL
                 currentStageTimings = metadata.stageTimings ?? []

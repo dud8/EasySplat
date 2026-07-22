@@ -150,6 +150,30 @@ extension AppModel {
         return true
     }
 
+    /// Re-runs a finished project at the requested detail profile. The pipeline
+    /// re-resolves the plan and rolls back only the stages the plan diff
+    /// invalidates; the published output is replaced when the new export lands.
+    @discardableResult
+    func retrainProject(at url: URL, profile: DetailProfile) -> Bool {
+        guard !isRunActive else { return false }
+        guard flushPendingNotesSave() else { return false }
+        guard mutateProjectMetadata(at: url, mutation: { metadata in
+            metadata.requestedRunOptions.detailProfile = profile
+        }) != nil else {
+            statusTitle = "Couldn’t update project options"
+            statusDetail = "The project was not changed. Check folder permissions and try again."
+            lastError = statusTitle
+            return false
+        }
+        let token = UUID()
+        currentTaskToken = token
+        isRunActive = true
+        currentTask = Task {
+            await resumeProjectTask(at: url, taskToken: token, bypassFinishedOutput: true)
+        }
+        return true
+    }
+
     static func validationRecovery(for error: RunPlanResolver.ValidationError) -> RunValidationRecovery? {
         switch error {
         case .continuousMixedInputUnsupported:

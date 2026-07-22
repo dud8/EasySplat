@@ -17,6 +17,8 @@ struct ViewerView: View {
     @State private var viewerAlert: ViewerAlert?
     @State private var isExporting = false
     @State private var isUprightHintDismissed = false
+    @State private var isRetrainSheetPresented = false
+    @State private var retrainProfile: DetailProfile = .balanced
 
     var body: some View {
         Group {
@@ -71,6 +73,7 @@ struct ViewerView: View {
                 dismissButton: .default(Text("OK"))
             )
         }
+        .sheet(isPresented: $isRetrainSheetPresented) { retrainSheet }
         .onAppear { requestArtifactLoad() }
         .onChange(of: model.currentProjectURL) { _, _ in
             isUprightHintDismissed = false
@@ -142,6 +145,14 @@ struct ViewerView: View {
                     .accessibilityHint("Changes only the viewer. The exported PLY is unchanged.")
                 }
 
+                Button("Re-train…", systemImage: "arrow.clockwise.square") {
+                    retrainProfile = artifactSnapshot?.metadata.requestedRunOptions
+                        .detailProfile ?? .balanced
+                    isRetrainSheetPresented = true
+                }
+                .disabled(model.currentProjectURL == nil || model.isRunActive)
+                .accessibilityIdentifier("result.retrain")
+
                 Button("View Releases…", systemImage: "arrow.triangle.2.circlepath") {
                     let releases = AppConfig.projectHomeURL
                         .appendingPathComponent("releases", isDirectory: true)
@@ -159,6 +170,50 @@ struct ViewerView: View {
             }
             .help("More result actions")
         }
+    }
+
+    private var retrainSheet: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
+            Text("Re-train")
+                .font(.headline)
+            Picker("Detail", selection: $retrainProfile) {
+                Text("Fast").tag(DetailProfile.fast)
+                Text("Balanced")
+                    .tag(DetailProfile.balanced)
+                    .disabled(!RunPlanResolver.supports(
+                        detail: .balanced,
+                        memoryGB: model.hardwareProfile.memoryGB
+                    ))
+                Text("High Detail")
+                    .tag(DetailProfile.highDetail)
+                    .disabled(!RunPlanResolver.supports(
+                        detail: .highDetail,
+                        memoryGB: model.hardwareProfile.memoryGB
+                    ))
+            }
+            .accessibilityIdentifier("result.retrainDetail")
+            Text("The current splat is replaced when the new one finishes. Processing re-runs as needed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    isRetrainSheetPresented = false
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Re-train") {
+                    isRetrainSheetPresented = false
+                    if let projectURL = model.currentProjectURL {
+                        model.retrainProject(at: projectURL, profile: retrainProfile)
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("result.retrainConfirm")
+            }
+        }
+        .padding(Theme.Spacing.large)
+        .frame(width: 320)
     }
 
     @ViewBuilder

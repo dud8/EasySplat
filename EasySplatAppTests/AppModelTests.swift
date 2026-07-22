@@ -2897,6 +2897,147 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.isRunActive)
     }
 
+    func testRetrainProjectBypassesFinishedOutputAndRestartsFramePreparation() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = tempBase.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
+        try writeMinimalPly(at: output)
+
+        var metadata = ProjectMetadata(
+            title: "Project",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try persistCompletedAppTestArtifacts(
+            metadata: metadata,
+            paths: paths,
+            trainingArtifact: makeCompletedTrainingArtifact(for: output, metadata: metadata)
+        )
+
+        let runner = ResumeRecordingPipelineRunner(projectURL: projectURL)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
+            runner
+        }
+
+        XCTAssertTrue(model.retrainProject(at: projectURL, profile: .highDetail))
+        try await waitForViewState(model: model, state: .viewer)
+
+        // The changed profile moves frame budgets, so the run must restart at
+        // frame preparation instead of short-circuiting to the viewer.
+        XCTAssertEqual(runner.resumeFrom, .extractFrames)
+        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(persisted.requestedRunOptions.detailProfile, .highDetail)
+    }
+
+    func testRetrainSameProfileRestartsAtTheTrainingBoundaryForNewBudgets() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = tempBase.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
+        try writeMinimalPly(at: output)
+
+        var metadata = ProjectMetadata(
+            title: "Project",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        // A project finished under the previous fixed balanced budget: only the
+        // trainer fields differ from what current hardware resolves.
+        var legacyPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        legacyPlan.trainerIterationLimit = 7_000
+        legacyPlan.plateauWindow = 800
+        metadata.resolvedRunPlan = legacyPlan
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try persistCompletedAppTestArtifacts(
+            metadata: metadata,
+            paths: paths,
+            trainingArtifact: makeCompletedTrainingArtifact(for: output, metadata: metadata)
+        )
+
+        let runner = ResumeRecordingPipelineRunner(projectURL: projectURL)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
+            runner
+        }
+
+        XCTAssertTrue(model.retrainProject(at: projectURL, profile: .balanced))
+        try await waitForViewState(model: model, state: .viewer)
+
+        XCTAssertEqual(runner.resumeFrom, .sfmMapping)
+        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(persisted.requestedRunOptions.detailProfile, .balanced)
+    }
+
+    func testRetrainIsIgnoredWhileRunIsActive() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let firstURL = try makeProject(at: tempBase, name: "First", lastError: nil, withOutput: false)
+        let secondURL = try makeProject(at: tempBase, name: "Second", lastError: nil, withOutput: true)
+        var callCount = 0
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
+            callCount += 1
+            return BlockingPipelineRunner()
+        }
+
+        model.resumeProject(at: firstURL)
+        try await waitForViewState(model: model, state: .processing)
+        try await waitForCurrentProjectURL(model: model, url: firstURL)
+        let secondProfileBefore = try ProjectMetadataStore.load(
+            from: ProjectPaths(root: secondURL).metadataURL
+        ).requestedRunOptions.detailProfile
+
+        XCTAssertFalse(model.retrainProject(at: secondURL, profile: .highDetail))
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(model.currentProjectURL, firstURL)
+        let secondProfileAfter = try ProjectMetadataStore.load(
+            from: ProjectPaths(root: secondURL).metadataURL
+        ).requestedRunOptions.detailProfile
+        XCTAssertEqual(secondProfileAfter, secondProfileBefore)
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+        XCTAssertFalse(model.isRunActive)
+    }
+
     func testLoadPipelineLogTailWithInvalidUtf8() throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
