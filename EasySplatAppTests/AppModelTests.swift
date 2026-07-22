@@ -2015,7 +2015,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.requestedRunOptions.detailProfile, .balanced)
         await model.startProject(input: .video(files: [input.path]), title: "BalancedDefault")
 
-        XCTAssertEqual(capturedPlan?.trainerIterationLimit, 7_000)
+        XCTAssertEqual(capturedPlan?.trainerIterationLimit, 30_000)
         let projectURL = try XCTUnwrap(model.currentProjectURL)
         let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
         XCTAssertEqual(metadata.requestedRunOptions.detailProfile, .balanced)
@@ -2687,7 +2687,7 @@ final class AppModelTests: XCTestCase {
             paths: paths,
             trainingArtifact: makeCompletedTrainingArtifact(
                 for: output,
-                detailProfile: .highDetail
+                metadata: metadata
             )
         )
 
@@ -3381,7 +3381,7 @@ final class AppModelTests: XCTestCase {
         )
         let trainingArtifact = try makeCompletedTrainingArtifact(
             for: paths.outputURL.appendingPathComponent("splat.ply"),
-            detailProfile: .balanced,
+            metadata: metadata,
             sceneBounds: SplatSceneBounds(
                 center: ScenePoint3D(x: 0, y: 0, z: 0),
                 radius: 3 * Foundation.exp(-4.0)
@@ -3422,11 +3422,6 @@ final class AppModelTests: XCTestCase {
         let outside = base.appendingPathComponent("outside.ply")
         try writeMinimalPly(at: outside)
         try writeMinimalPly(at: paths.outputSplatURL)
-        var artifact = try makeCompletedTrainingArtifact(
-            for: paths.outputSplatURL,
-            detailProfile: .balanced
-        )
-        artifact.outputPath = "../outside.ply"
         var metadata = ProjectMetadata(
             title: "EscapingOutput",
             input: .video(files: []),
@@ -3439,6 +3434,11 @@ final class AppModelTests: XCTestCase {
             hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
             developmentOverrides: .none
         )
+        var artifact = try makeCompletedTrainingArtifact(
+            for: paths.outputSplatURL,
+            metadata: metadata
+        )
+        artifact.outputPath = "../outside.ply"
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(metadata).write(to: paths.metadataURL, options: .atomic)
@@ -5522,7 +5522,7 @@ final class AppModelTests: XCTestCase {
                 paths: paths,
                 trainingArtifact: makeCompletedTrainingArtifact(
                     for: outputURL,
-                    detailProfile: .balanced
+                    metadata: metadata
                 )
             )
         }
@@ -5889,7 +5889,7 @@ final class MockPipelineRunner: PipelineRunning {
         try writeMinimalPly(at: outputURL)
         let trainingArtifact = try makeCompletedTrainingArtifact(
             for: outputURL,
-            detailProfile: metadata.effectiveDetailProfile
+            metadata: metadata
         )
         metadata.state = PipelineState(stage: .done, lastError: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -6004,7 +6004,7 @@ final class ResumeRecordingPipelineRunner: PipelineRunning {
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         let trainingArtifact = try makeCompletedTrainingArtifact(
             for: outputURL,
-            detailProfile: metadata.effectiveDetailProfile
+            metadata: metadata
         )
         metadata.state = PipelineState(stage: .done, lastError: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -6052,7 +6052,7 @@ final class DirectoryOutputRepairingPipelineRunner: PipelineRunning {
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         let trainingArtifact = try makeCompletedTrainingArtifact(
             for: outputURL,
-            detailProfile: metadata.effectiveDetailProfile
+            metadata: metadata
         )
         metadata.state = PipelineState(stage: .done, lastError: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -6132,13 +6132,17 @@ private struct InjectedPublicationFailure: Error {}
 
 private func makeCompletedTrainingArtifact(
     for outputURL: URL,
-    detailProfile: DetailProfile,
+    metadata: ProjectMetadata,
     sceneBounds suppliedSceneBounds: SplatSceneBounds? = nil
 ) throws -> TrainingArtifact {
-    let budget: (iterationLimit: Int, plateauWindow: Int) = switch detailProfile {
-    case .fast: (3_000, 400)
-    case .balanced: (7_000, 800)
-    case .highDetail: (15_000, 1_500)
+    // Snapshot load rejects artifacts whose trainer budget disagrees with the
+    // persisted plan, so mirror the plan when one exists.
+    let detailProfile = metadata.effectiveDetailProfile
+    let budget: (iterationLimit: Int, plateauWindow: Int)
+    if let plan = metadata.resolvedRunPlan {
+        budget = (plan.trainerIterationLimit, plan.plateauWindow)
+    } else {
+        budget = (7_000, 800)
     }
     guard let header = ProjectArtifactValidator.readPlyHeader(at: outputURL),
           let fileSize = try outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize else {

@@ -5626,6 +5626,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let receipt = try makeMsplatCheckpointFixture(
             at: paths.msplatCheckpointURL,
             iteration: 500,
+            iterationLimit: 30_000,
+            plateauWindow: 2_000,
             inputDigest: datasetIdentity.inputDigest,
             geometryDigest: datasetIdentity.geometryDigest,
             memoryBudgetBytes: memoryBudgetBytes
@@ -5653,8 +5655,8 @@ final class PipelineIntegrationTests: XCTestCase {
                 datasetGeometryDigest: receipt.geometryDigest
             ),
             detailProfile: .balanced,
-            iterationLimit: 7_000,
-            plateauWindow: 800,
+            iterationLimit: 30_000,
+            plateauWindow: 2_000,
             cameraOrderSeed: 42,
             completedIteration: receipt.iteration,
             checkpointPath: "Training/checkpoints/msplat",
@@ -5681,7 +5683,7 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             details: .trainSplat(TrainSplatCheckpoint(
                 progressStep: receipt.iteration,
-                progressTotal: 7_000
+                progressTotal: 30_000
             ))
         )
         try TrainingArtifactStore.persist(artifact, paths: paths)
@@ -5754,10 +5756,10 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         try FileManager.default.removeItem(at: outputProbe)
         let resumedEvents = """
-        {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":500,"iteration_limit":7000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"resumed":true,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":500,"iteration_limit":30000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":2000,"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"resumed":true,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","dropped_intersection_count":0,"event":"checkpoint_loaded","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":500,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-        {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":7000,"iteration_limit":7000,"iterations_per_second":1600,"schema_version":2,"sequence":3}
-        {"dropped_intersection_count":0,"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":7000,"iteration_limit":7000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(outputBytes),"peak_memory_bytes":805306368,"plateau_window":800,"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":30000,"iteration_limit":30000,"iterations_per_second":1600,"schema_version":2,"sequence":3}
+        {"dropped_intersection_count":0,"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":30000,"iteration_limit":30000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(outputBytes),"peak_memory_bytes":805306368,"plateau_window":2000,"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         let retryRunner = MockSubprocessRunner(scripts: [
             converterScript(),

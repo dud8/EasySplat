@@ -127,11 +127,9 @@ public enum TrainingArtifactStore {
         _ artifact: TrainingArtifact,
         projectPaths: ProjectPaths
     ) throws {
-        let expectedBudget: (iterationLimit: Int, plateauWindow: Int) = switch artifact.detailProfile {
-        case .fast: (3_000, 400)
-        case .balanced: (7_000, 800)
-        case .highDetail: (15_000, 1_500)
-        }
+        let sanctionedBudgets = RunPlanResolver.sanctionedTrainerBudgets(
+            for: artifact.detailProfile
+        )
         let derivation = artifact.datasetDerivation
         guard artifact.schemaVersion == TrainingArtifact.currentSchemaVersion,
               !artifact.trainerVersion.isEmpty,
@@ -156,8 +154,10 @@ public enum TrainingArtifactStore {
               derivation.registeredImageNames.allSatisfy(isSafeImageName),
               derivation.datasetInputDigest == artifact.inputDigest,
               derivation.datasetGeometryDigest == artifact.geometryDigest,
-              artifact.iterationLimit == expectedBudget.iterationLimit,
-              artifact.plateauWindow == expectedBudget.plateauWindow,
+              sanctionedBudgets.contains(where: {
+                  $0.iterations == artifact.iterationLimit
+                      && $0.plateau == artifact.plateauWindow
+              }),
               artifact.completedIteration >= 0,
               artifact.completedIteration <= artifact.iterationLimit,
               artifact.gaussianCount > 0,

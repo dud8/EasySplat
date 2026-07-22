@@ -554,6 +554,9 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             resolvedRunPlan: makeResolvedRunPlan(for: geometry, requestedOptions: options),
             state: PipelineState(stage: .trainSplat, lastError: nil)
         )
+        let plan = try XCTUnwrap(metadata.resolvedRunPlan)
+        training.iterationLimit = plan.trainerIterationLimit
+        training.plateauWindow = plan.plateauWindow
         try saveControlledPhotoMetadata(metadata, to: paths.metadataURL)
         let persistedGeometry = try persistGeometrySidecar(geometry, paths: paths)
         training.datasetDerivation.sourceSelectedFramesDigest =

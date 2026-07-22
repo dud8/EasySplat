@@ -307,7 +307,7 @@ public enum RunPlanResolver {
                 memoryTier: memoryTier
             )
         )
-        let trainerBudget = trainerBudget(for: options.detailProfile)
+        let trainerBudget = trainerBudget(for: options.detailProfile, memoryTier: memoryTier)
         let baseTrainingMemoryBudget = TrainingMemoryBudget.resolve(
             hardware: hardware,
             resourcePolicy: options.resourcePolicy
@@ -496,10 +496,12 @@ public enum RunPlanResolver {
         let resourceScale: Double
         if memoryTier == .constrained {
             resourceScale = 0.64
-        } else if resourcePolicy == .maximumPerformance {
-            resourceScale = 1.2
         } else {
-            resourceScale = 1.0
+            // Fast stays a quick preview on every machine; only the quality
+            // tiers spend the extra headroom on more keyframes.
+            let tierScale = memoryTier == .performance && detail != .fast ? 1.4 : 1.0
+            let policyScale = resourcePolicy == .maximumPerformance ? 1.2 : 1.0
+            resourceScale = tierScale * policyScale
         }
         return max(30, Int((detailBase * captureScale * resourceScale).rounded()))
     }
@@ -522,8 +524,9 @@ public enum RunPlanResolver {
             }
             return min(base, cap)
         }
-        guard resourcePolicy == .maximumPerformance else { return base }
-        return Int((Double(base) * 1.125).rounded())
+        let tierBase = memoryTier == .performance && detail == .balanced ? 1_920 : base
+        guard resourcePolicy == .maximumPerformance else { return tierBase }
+        return Int((Double(tierBase) * 1.125).rounded())
     }
 
     private static func resolvedAnalysisFrameRate(detail: DetailProfile, capturePath: CapturePath) -> Int {
@@ -565,11 +568,40 @@ public enum RunPlanResolver {
         return max(20, Int((base * captureScale * memoryScale).rounded()))
     }
 
-    private static func trainerBudget(for detail: DetailProfile) -> (iterations: Int, plateau: Int) {
+    // Persisted training manifests are validated against this closed set: every
+    // tier-resolved tuple plus the fixed pre-tier values, so projects trained
+    // before budgets scaled with hardware still load.
+    static func sanctionedTrainerBudgets(
+        for detail: DetailProfile
+    ) -> [(iterations: Int, plateau: Int)] {
+        let tiers: [MemoryTier] = [.constrained, .standard, .performance]
+        var budgets = tiers.map { trainerBudget(for: detail, memoryTier: $0) }
         switch detail {
-        case .fast: return (3_000, 400)
-        case .balanced: return (7_000, 800)
-        case .highDetail: return (15_000, 1_500)
+        case .fast:
+            break
+        case .balanced:
+            budgets.append((7_000, 800))
+        case .highDetail:
+            budgets.append((15_000, 1_500))
+        }
+        return budgets
+    }
+
+    // Iteration limits are ceilings, not targets: the trainer's plateau detector is
+    // the intended stop, and densification runs until iterationLimit / 2, so the
+    // ceiling also bounds how far the gaussian count can grow.
+    private static func trainerBudget(
+        for detail: DetailProfile,
+        memoryTier: MemoryTier
+    ) -> (iterations: Int, plateau: Int) {
+        switch (detail, memoryTier) {
+        case (.fast, _): return (3_000, 400)
+        case (.balanced, .constrained): return (12_000, 1_200)
+        case (.balanced, .standard): return (20_000, 1_600)
+        case (.balanced, .performance): return (30_000, 2_000)
+        case (.highDetail, .constrained): return (20_000, 1_600)
+        case (.highDetail, .standard): return (30_000, 2_000)
+        case (.highDetail, .performance): return (40_000, 2_500)
         }
     }
 
