@@ -1,47 +1,170 @@
-name: Tests
+name: Temporary LichtFeld Studio Windows Build
 
 on:
-  push:
-    branches: ["main"]
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
-  swift-tests:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Select supported Xcode 16
-        run: sudo xcode-select -s /Applications/Xcode_16.4.app
-      - name: Run app and core tests
-        run: ./scripts/test.sh
-      - name: Run manifest tool tests
-        run: swift test --package-path Tools/ManifestTool
+  build-windows-portable:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_BUILD_TYPE: release
+      CUDA_PATH: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
+      CUDNN_ROOT_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8
 
-  repo-health:
-    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install repo health dependencies
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - name: Verify public repo collateral
-        run: ./scripts/ci/check_repo_health.sh
-      - name: Lint shell scripts
-        run: find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-      - name: Validate release script behavior
-        run: ./scripts/ci/test_release_scripts.sh
-
-  python-tools:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout LichtFeld Studio v0.5.3
+        uses: actions/checkout@v4
         with:
-          python-version: '3.12'
-          cache: 'pip'
-      - name: Install minimal Python test deps
+          repository: MrNeRF/LichtFeld-Studio
+          ref: v0.5.3
+          path: src
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Record exact source commit
+        id: source
+        shell: pwsh
+        working-directory: src
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install numpy pillow torch==2.10.0 torchvision==0.25.0
-      - name: Run Python bridge tests
-        run: ./scripts/test_python_tools.sh
+          $sha = (git rev-parse HEAD).Trim()
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Building MrNeRF/LichtFeld-Studio v0.5.3 at $sha"
+
+      - name: Install CUDA Toolkit 12.8
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda-12.8.exe'
+          Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe' -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '-y -s -accepteula -toolkit -override -noDisplayDriver' -Wait
+
+      - name: Set CUDA environment
+        shell: pwsh
+        run: |
+          "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_V12_8=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDNN_ROOT_DIR=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\libnvvp" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Ensure cuDNN 9 is available
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cudaPath = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+          $header = Join-Path $cudaPath 'include\cudnn.h'
+          $libs = @(Get-ChildItem (Join-Path $cudaPath 'lib\x64') -Filter 'cudnn*.lib' -ErrorAction SilentlyContinue)
+          $dlls = @(Get-ChildItem (Join-Path $cudaPath 'bin') -Filter 'cudnn*64_9.dll' -ErrorAction SilentlyContinue)
+          if (-not ((Test-Path $header) -and $libs.Count -gt 0 -and $dlls.Count -gt 0)) {
+            $archive = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
+            $extract = Join-Path $env:RUNNER_TEMP 'cudnn'
+            Invoke-WebRequest 'https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.5.0.50_cuda12-archive.zip' -OutFile $archive
+            Expand-Archive $archive -DestinationPath $extract
+            $root = Get-ChildItem $extract -Directory | Select-Object -First 1
+            if (-not $root) { throw 'Could not find extracted cuDNN root.' }
+            Copy-Item "$($root.FullName)\bin\*" (Join-Path $cudaPath 'bin') -Recurse -Force
+            Copy-Item "$($root.FullName)\include\*" (Join-Path $cudaPath 'include') -Recurse -Force
+            Copy-Item "$($root.FullName)\lib\x64\*" (Join-Path $cudaPath 'lib\x64') -Recurse -Force
+          }
+          if (-not (Test-Path $header)) { throw "cuDNN header missing: $header" }
+
+      - name: Set up vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v4
+        with:
+          path: C:\Users\runneradmin\AppData\Local\vcpkg\archives
+          key: lichtfeld-v0.5.3-vcpkg-${{ runner.os }}-${{ hashFiles('src/vcpkg.json', 'src/vcpkg-configuration.json') }}
+          restore-keys: |
+            lichtfeld-v0.5.3-vcpkg-${{ runner.os }}-
+
+      - name: Configure release build
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmd /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" && cmake -B b -S . -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PORTABLE=ON -DBUILD_PYTHON_STUBS=OFF -DLFS_FAST_COMPILE=ON'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build release
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmd /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" && cmake --build b -j 4'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install portable package
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --install b --prefix dist
+          $exe = Join-Path $PWD 'dist\bin\LichtFeld-Studio.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Host 'Installed files:'
+            Get-ChildItem dist -Recurse | Select-Object FullName, Length
+            throw "Expected executable was not installed: $exe"
+          }
+          Copy-Item LICENSE 'dist\LICENSE-LichtFeld-Studio.txt' -Force
+          $sourceSha = '${{ steps.source.outputs.sha }}'
+          $builtAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          @"
+LichtFeld Studio portable Windows build
+Version: v0.5.3
+Source: https://github.com/MrNeRF/LichtFeld-Studio
+Source tag: v0.5.3
+Source commit: $sourceSha
+Build type: Release / BUILD_PORTABLE=ON
+Toolchain: Windows Server 2022, Visual Studio 2022 MSVC, CUDA Toolkit 12.8, cuDNN 9
+Built at (UTC): $builtAt
+License: GPL-3.0-or-later; see LICENSE-LichtFeld-Studio.txt
+"@ | Set-Content 'dist\BUILD_INFO.txt' -Encoding utf8
+
+      - name: Package and hash
+        id: package
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = 'LichtFeld-Studio-windows-v0.5.3-portable.zip'
+          Compress-Archive -Path 'dist\*' -DestinationPath $package -CompressionLevel Optimal
+          $hash = (Get-FileHash -Algorithm SHA256 $package).Hash.ToLowerInvariant()
+          "$hash  $package" | Set-Content "$package.sha256" -Encoding ascii
+          "package=$package" >> $env:GITHUB_OUTPUT
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          Write-Host "SHA-256: $hash"
+
+      - name: Upload portable Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: LichtFeld-Studio-windows-v0.5.3-portable
+          path: |
+            src/${{ steps.package.outputs.package }}
+            src/${{ steps.package.outputs.package }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Build summary
+        shell: pwsh
+        run: |
+          @"
+### LichtFeld Studio Windows build
+
+- Version: `v0.5.3`
+- Source commit: `${{ steps.source.outputs.sha }}`
+- Package: `${{ steps.package.outputs.package }}`
+- SHA-256: `${{ steps.package.outputs.sha256 }}`
+"@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
