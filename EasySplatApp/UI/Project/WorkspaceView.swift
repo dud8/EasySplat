@@ -16,6 +16,9 @@ struct WorkspaceView: View {
             case .home:
                 HomeView()
                     .transition(.opacity)
+            case .opening:
+                OpeningSplatView()
+                    .transition(.opacity)
             case .processing:
                 ProcessingView(onBackToProjects: onBackToProjects)
                     .transition(.opacity)
@@ -37,5 +40,13 @@ struct WorkspaceView: View {
     ) -> TimeInterval? {
         guard !reduceMotion else { return nil }
         return Theme.Motion.standardWorkspaceDuration
+    }
+}
+
+private struct OpeningSplatView: View {
+    var body: some View {
+        ProgressView("Opening splat…")
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityIdentifier("workspace.opening")
     }
 }

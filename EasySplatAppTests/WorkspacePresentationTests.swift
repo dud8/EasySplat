@@ -34,6 +34,11 @@ final class WorkspacePresentationTests: XCTestCase {
         )
     }
 
+    func testRunStopCopyNamesTheRunInsteadOfTrailingOff() {
+        XCTAssertEqual(ProcessingView.stopToolbarTitle(projectExists: true), "Stop Run…")
+        XCTAssertEqual(ProcessingView.stopToolbarTitle(projectExists: false), "Stop Setup…")
+    }
+
     func testProfessionalOptionLabelsStayPlainAndSpecific() {
         XCTAssertEqual(HomeView.detailLabel(.highDetail), "High Detail")
         XCTAssertEqual(HomeView.captureLabel(.orbit), "Around a subject")

@@ -294,10 +294,16 @@ final class ProcessingTimingTextTests: XCTestCase {
     }
 
     func testFormatElapsedClampsRoundsAndFormats() {
-        XCTAssertEqual(ProcessingView.formatElapsed(0), "0m 00s")
-        XCTAssertEqual(ProcessingView.formatElapsed(-5), "0m 00s", "Negative elapsed clamps to zero.")
+        XCTAssertEqual(ProcessingView.formatElapsed(0), "0s")
+        XCTAssertEqual(ProcessingView.formatElapsed(-5), "0s", "Negative elapsed clamps to zero.")
+        XCTAssertEqual(ProcessingView.formatElapsed(5), "5s")
+        XCTAssertEqual(ProcessingView.formatElapsed(27), "27s", "Sub-minute durations drop the zero-minute prefix.")
+        XCTAssertEqual(ProcessingView.formatElapsed(59.6), "1m 00s", "Rounding can carry into the next minute.")
         XCTAssertEqual(ProcessingView.formatElapsed(65), "1m 05s")
+        XCTAssertEqual(ProcessingView.formatElapsed(67), "1m 07s")
         XCTAssertEqual(ProcessingView.formatElapsed(90.6), "1m 31s", "Rounds to the nearest second.")
+        XCTAssertEqual(ProcessingView.formatElapsed(1261), "21m 01s")
+        XCTAssertEqual(ProcessingView.formatElapsed(1591), "26m 31s")
         XCTAssertEqual(ProcessingView.formatElapsed(3661), "1h 01m 01s", "Hours appear only when non-zero.")
     }
 
@@ -322,7 +328,11 @@ final class ProcessingTimingTextTests: XCTestCase {
     func testTimingTextSilenceAtLeastOneSecondReadsAgo() {
         XCTAssertEqual(
             ProcessingView.timingText(elapsed: 65, silenceSeconds: 5),
-            "Elapsed 1m 05s · Last update 0m 05s ago"
+            "Elapsed 1m 05s · Last update 5s ago"
+        )
+        XCTAssertEqual(
+            ProcessingView.timingText(elapsed: 1591, silenceSeconds: 67),
+            "Elapsed 26m 31s · Last update 1m 07s ago"
         )
     }
 }

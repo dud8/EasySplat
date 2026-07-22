@@ -710,7 +710,7 @@ extension AppModel {
         guard isCurrentTaskToken(taskToken) else { return }
         defer { finishRun(taskToken: taskToken) }
         reset()
-        viewState = .processing
+        viewState = .opening
         phaseStartedAt = Date()
         statusTitle = "Preparing project"
         statusDetail = nil
@@ -744,6 +744,8 @@ extension AppModel {
                 refreshProjectSummaries()
                 return
             }
+            // No validated finished output, so this resume re-runs the pipeline.
+            viewState = .processing
             refreshProjectSummaries()
             let developmentOverrides = AppConfig.currentDevelopmentOverrides
             let requestedOptions = metadata.requestedRunOptions

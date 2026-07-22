@@ -56,7 +56,7 @@ Show:
 - native determinate or indeterminate progress
 - elapsed time and last update
 - a collapsed Technical Details disclosure
-- Stop… in the toolbar
+- Stop Run… in the toolbar
 
 Stage-local progress must not masquerade as overall completion. Backend names and raw logs stay in Technical Details.
 
@@ -114,7 +114,7 @@ Write short, specific actions:
 
 Avoid marketing adjectives, fake reassurance, backend names, explanations of obvious controls, and prose inside buttons.
 
-Use an ellipsis only when the action opens another decision, such as Export… or Stop….
+Use an ellipsis only when the action opens another decision, such as Export… or Stop Run….
 
 ## Accessibility
 

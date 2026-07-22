@@ -42,6 +42,10 @@ struct ProjectSidebar: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            SidebarSearchField(text: $searchText, prompt: "Search Projects")
+                .padding(.horizontal, Theme.Spacing.medium)
+                .padding(.top, Theme.Spacing.small)
+
             Button(action: onNewSplat) {
                 Label("New Splat", systemImage: "plus")
                     .frame(maxWidth: .infinity)
@@ -79,7 +83,6 @@ struct ProjectSidebar: View {
                 }
             }
             .listStyle(.sidebar)
-            .searchable(text: $searchText, placement: .sidebar, prompt: "Search Projects")
         }
         .confirmationDialog(
             "Move project to Trash?",

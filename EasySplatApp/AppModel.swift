@@ -51,6 +51,7 @@ final class AppModel: ObservableObject {
 
     enum ViewState: Equatable {
         case home
+        case opening
         case processing
         case viewer
     }

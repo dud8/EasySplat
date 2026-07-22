@@ -285,7 +285,10 @@ struct ProcessingView: View {
         if hours > 0 {
             return String(format: "%dh %02dm %02ds", hours, minutes, seconds)
         }
-        return String(format: "%dm %02ds", minutes, seconds)
+        if minutes > 0 {
+            return String(format: "%dm %02ds", minutes, seconds)
+        }
+        return "\(seconds)s"
     }
 
     private var stoppingStatusText: String {
@@ -309,7 +312,7 @@ struct ProcessingView: View {
     }
 
     nonisolated static func stopToolbarTitle(projectExists: Bool) -> String {
-        projectExists ? "Stop…" : "Stop Setup…"
+        projectExists ? "Stop Run…" : "Stop Setup…"
     }
 
     nonisolated static func stopDialogTitle(projectExists: Bool, isTraining: Bool) -> String {

@@ -54,6 +54,8 @@ struct HomeView: View {
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
+                                .truncationMode(.tail)
+                                .help(optionsSummary)
                         }
                     }
                 }
@@ -192,10 +194,13 @@ struct HomeView: View {
                 .accessibilityIdentifier("home.detail")
             }
             if let explanation = Self.detailAvailabilityHelp(memoryGB: memoryGB) {
-                Text(explanation)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    Text(explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 260, alignment: .leading)
+                }
             }
 
             optionRow("Camera Source") {
@@ -298,7 +303,8 @@ struct HomeView: View {
             content()
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(width: 260, alignment: .trailing)
+                .accessibilityLabel(Text(title))
+                .frame(width: 260, alignment: .leading)
         }
     }
 

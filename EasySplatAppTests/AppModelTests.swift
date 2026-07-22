@@ -2715,6 +2715,88 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(toolchainManager.lastRequest)
     }
 
+    func testResumeProjectShowsOpeningStateWhileValidatingFinishedOutput() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: tempBase, name: "Finished", lastError: nil, withOutput: true)
+        let output = ProjectPaths(root: projectURL).outputURL.appendingPathComponent("splat.ply")
+
+        let validationStarted = DispatchSemaphore(value: 0)
+        let allowValidationToFinish = DispatchSemaphore(value: 0)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { url, config in
+                MockPipelineRunner(projectURL: url, config: config)
+            },
+            finishedOutputValidator: { _ in
+                validationStarted.signal()
+                _ = allowValidationToFinish.wait(timeout: .now() + 2)
+                return output
+            }
+        )
+
+        model.resumeProject(at: projectURL)
+        let validationStartResult = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: validationStarted.wait(timeout: .now() + 1))
+            }
+        }
+        XCTAssertEqual(validationStartResult, .success)
+        XCTAssertEqual(model.viewState, .opening)
+
+        // Opening a finished project must never present the pipeline progress
+        // screen while its output is being validated.
+        let deadline = Date().addingTimeInterval(0.2)
+        while Date() < deadline {
+            XCTAssertNotEqual(model.viewState, .processing)
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        allowValidationToFinish.signal()
+        try await waitForViewState(model: model, state: .viewer)
+        XCTAssertEqual(model.outputPlyURL, output)
+    }
+
+    func testResumeProjectFallsThroughToProcessingWhenOutputValidationFails() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: tempBase, name: "Unfinished", lastError: nil, withOutput: false)
+
+        let validationStarted = DispatchSemaphore(value: 0)
+        let allowValidationToFinish = DispatchSemaphore(value: 0)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { _, _ in BlockingPipelineRunner() },
+            finishedOutputValidator: { _ in
+                validationStarted.signal()
+                _ = allowValidationToFinish.wait(timeout: .now() + 2)
+                return nil
+            }
+        )
+
+        model.resumeProject(at: projectURL)
+        let validationStartResult = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: validationStarted.wait(timeout: .now() + 1))
+            }
+        }
+        XCTAssertEqual(validationStartResult, .success)
+        XCTAssertEqual(model.viewState, .opening)
+
+        allowValidationToFinish.signal()
+        try await waitForViewState(model: model, state: .processing)
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+        XCTAssertFalse(model.isRunActive)
+    }
+
     func testResumeProjectRunsPipelineWhenOutputPathIsDirectory() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
