@@ -1,0 +1,1 @@
+Temporary CI trigger for the LichtFeld Studio v0.5.3 Windows build.
