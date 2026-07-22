@@ -300,6 +300,28 @@ enum CanonicalOrientationEstimator {
             )
         }
 
+        // A residual tail (blurred or shaky frames) can push p90 past the strict
+        // gate while the axis itself is well determined. Accept up to 15 degrees
+        // as sign-unverified so the scene still trains upright and the viewer
+        // offers the flip as a fallback. Never .verified from this tier.
+        let relaxedResidualTailPasses = eligible.count >= minimumSupport
+            && rightEstimate.eigenvalues[1] >= 0.03
+            && rightEstimate.eigengap >= 25
+            && percentile(rightResiduals, fraction: 0.5) <= 3
+            && percentile(rightResiduals, fraction: 0.9) <= 15
+            && bootstrapVariation <= 5
+        if relaxedResidualTailPasses, !trajectoryConflicts {
+            let signVerified = signed.medianAbsoluteAgreement >= 0.20 && signed.signAgreement >= 0.75
+            let vertical = signVerified ? signed.axis : canonicalizedUndirected(rightEstimate.axis)
+            return solution(
+                status: .axisAlignedSignUnverified,
+                method: .cameraRightNullspace,
+                evidence: evidence,
+                transform: rotationMapping(vertical, to: .unitY),
+                openingCamera: openingCamera
+            )
+        }
+
         let failedOnlyForEigenspace = eligible.count >= minimumSupport
             && (rightEstimate.eigenvalues[1] < 0.03 || rightEstimate.eigengap < 25)
             && !trajectoryConflicts

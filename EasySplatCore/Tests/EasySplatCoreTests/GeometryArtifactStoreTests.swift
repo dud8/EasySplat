@@ -1884,6 +1884,84 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testSignUnverifiedOrientationAcceptsRelaxedResidualTail() {
+        func orientation(
+            status: CanonicalOrientationStatus,
+            p90: Double,
+            signAgreement: Double
+        ) -> CanonicalOrientationArtifact {
+            CanonicalOrientationArtifact(
+                status: status,
+                method: .cameraRightNullspace,
+                sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ(w: 0, x: 1, y: 0, z: 0),
+                evidence: CanonicalOrientationEvidence(
+                    supportCount: 24,
+                    eigenvalue0: 0.001,
+                    eigenvalue1: 0.1,
+                    eigenvalue2: 0.899,
+                    eigengap: 100,
+                    medianResidualDegrees: 2,
+                    p90ResidualDegrees: p90,
+                    medianAbsoluteImageUpAgreement: 0.85,
+                    signAgreement: signAgreement,
+                    bootstrapP95VariationDegrees: 1.5,
+                    trajectoryPlaneAgreementDegrees: nil
+                ),
+                canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
+            )
+        }
+
+        // The relaxed tier: only the p90 tail missed, sign evidence strong.
+        XCTAssertTrue(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .axisAlignedSignUnverified, p90: 10, signAgreement: 1),
+            registeredViewCount: 237
+        ))
+        // Legacy pattern: strict residuals with ambiguous sign.
+        XCTAssertTrue(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .axisAlignedSignUnverified, p90: 4, signAgreement: 0.5),
+            registeredViewCount: 237
+        ))
+        // Strict residuals with strong sign must be .verified, never sign-unverified.
+        XCTAssertFalse(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .axisAlignedSignUnverified, p90: 4, signAgreement: 1),
+            registeredViewCount: 237
+        ))
+        // The relaxed tier never upgrades to .verified.
+        XCTAssertFalse(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .verified, p90: 10, signAgreement: 1),
+            registeredViewCount: 237
+        ))
+        // Beyond the relaxed bound stays invalid.
+        XCTAssertFalse(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .axisAlignedSignUnverified, p90: 16, signAgreement: 1),
+            registeredViewCount: 237
+        ))
+    }
+
+    func testUprightFlipEligibilityFollowsOrientationStatus() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+
+        // A structurally valid unresolved orientation offers the best-effort flip.
+        XCTAssertEqual(artifact.canonicalOrientation.status, .unresolved)
+        XCTAssertTrue(artifact.allowsViewOnlyUprightFlip)
+
+        artifact.registeredViewCount = 24
+        artifact.canonicalOrientation = resolvedOrientationSolution().artifact
+        XCTAssertEqual(artifact.canonicalOrientation.status, .verified)
+        XCTAssertFalse(artifact.allowsViewOnlyUprightFlip)
+
+        var relaxed = resolvedOrientationSolution().artifact
+        relaxed.status = .axisAlignedSignUnverified
+        relaxed.evidence?.p90ResidualDegrees = 10
+        artifact.canonicalOrientation = relaxed
+        XCTAssertTrue(artifact.allowsViewOnlyUprightFlip)
+    }
+
     func testRejectsOverflowingPairRoleCounts() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

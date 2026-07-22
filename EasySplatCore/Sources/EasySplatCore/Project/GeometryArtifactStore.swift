@@ -1295,7 +1295,6 @@ enum GeometryArtifactStore {
                       evidence.eigenvalue1 >= 0.03,
                       evidence.eigengap >= 25,
                       evidence.medianResidualDegrees <= 3,
-                      evidence.p90ResidualDegrees <= 8,
                       evidence.bootstrapP95VariationDegrees <= 5 else {
                     throw Error.invalidCanonicalOrientation
                 }
@@ -1306,7 +1305,8 @@ enum GeometryArtifactStore {
                     throw Error.invalidCanonicalOrientation
                 }
                 if artifact.status == .verified {
-                    guard let medianAgreement = evidence.medianAbsoluteImageUpAgreement,
+                    guard evidence.p90ResidualDegrees <= 8,
+                          let medianAgreement = evidence.medianAbsoluteImageUpAgreement,
                           medianAgreement >= 0.20,
                           let signAgreement = evidence.signAgreement,
                           signAgreement >= 0.75,
@@ -1314,9 +1314,18 @@ enum GeometryArtifactStore {
                         throw Error.invalidCanonicalOrientation
                     }
                 } else {
+                    // Two ways to land here: the strict gate passed but the sign
+                    // was ambiguous, or only the p90 residual tail missed (the
+                    // relaxed tier, which keeps its best sign guess).
                     guard let medianAgreement = evidence.medianAbsoluteImageUpAgreement,
-                          let signAgreement = evidence.signAgreement,
-                          medianAgreement < 0.20 || signAgreement < 0.75 else {
+                          let signAgreement = evidence.signAgreement else {
+                        throw Error.invalidCanonicalOrientation
+                    }
+                    let strictWithAmbiguousSign = evidence.p90ResidualDegrees <= 8
+                        && (medianAgreement < 0.20 || signAgreement < 0.75)
+                    let relaxedResidualTail = evidence.p90ResidualDegrees > 8
+                        && evidence.p90ResidualDegrees <= 15
+                    guard strictWithAmbiguousSign || relaxedResidualTail else {
                         throw Error.invalidCanonicalOrientation
                     }
                 }

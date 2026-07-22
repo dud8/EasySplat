@@ -761,11 +761,17 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var canonicalOrientation: CanonicalOrientationArtifact
 
     public var allowsViewOnlyUprightFlip: Bool {
-        canonicalOrientation.status == .axisAlignedSignUnverified
-            && GeometryArtifactStore.isCanonicalOrientationValid(
+        switch canonicalOrientation.status {
+        case .axisAlignedSignUnverified, .unresolved:
+            // Unresolved scenes train in the raw source frame; the flip is a
+            // best-effort 180-degree correction for the common inverted case.
+            return GeometryArtifactStore.isCanonicalOrientationValid(
                 canonicalOrientation,
                 registeredViewCount: registeredViewCount
             )
+        case .verified:
+            return false
+        }
     }
 
     public init(

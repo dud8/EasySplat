@@ -16,6 +16,7 @@ struct ViewerView: View {
     @State private var artifactLoadError: String?
     @State private var viewerAlert: ViewerAlert?
     @State private var isExporting = false
+    @State private var isUprightHintDismissed = false
 
     var body: some View {
         Group {
@@ -44,6 +45,7 @@ struct ViewerView: View {
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(Theme.Spacing.large)
+                    .overlay(alignment: .bottom) { uprightHint }
                 } else {
                     ProgressView("Opening splat…")
                 }
@@ -70,7 +72,10 @@ struct ViewerView: View {
             )
         }
         .onAppear { requestArtifactLoad() }
-        .onChange(of: model.currentProjectURL) { _, _ in requestArtifactLoad() }
+        .onChange(of: model.currentProjectURL) { _, _ in
+            isUprightHintDismissed = false
+            requestArtifactLoad()
+        }
         .onChange(of: model.outputPlyURL) { _, _ in requestArtifactLoad() }
         .onDisappear { artifactLoader.cancel() }
     }
@@ -153,6 +158,31 @@ struct ViewerView: View {
                 Label("More", systemImage: "ellipsis.circle")
             }
             .help("More result actions")
+        }
+    }
+
+    @ViewBuilder
+    private var uprightHint: some View {
+        if !isUprightHintDismissed,
+           artifactSnapshot?.geometryArtifact?.canonicalOrientation.status == .unresolved {
+            HStack(spacing: Theme.Spacing.small) {
+                Text("If this splat looks upside down, use Flip Upright in the More menu.")
+                    .font(.caption)
+                Button {
+                    isUprightHintDismissed = true
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss orientation hint")
+            }
+            .padding(.horizontal, Theme.Spacing.medium)
+            .padding(.vertical, Theme.Spacing.small)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
+            .padding(.bottom, Theme.Spacing.extraLarge)
+            .accessibilityIdentifier("result.uprightHint")
         }
     }
 
