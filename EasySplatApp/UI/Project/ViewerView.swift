@@ -250,10 +250,12 @@ struct ViewerView: View {
 
     private var partialCoverage: (registered: Int, total: Int, separateGroupViewCount: Int)? {
         guard let geometry = artifactSnapshot?.geometryArtifact else { return nil }
+        let measurement = geometry.pairGraph.measurement
         return Self.partialCoverageSummary(
             registeredViewCount: geometry.registeredViewCount,
             totalViewCount: geometry.totalViewCount,
-            componentViewCounts: geometry.pairGraph.measurement?.componentViewCounts
+            builtFromDominantComponent: measurement?.usedViableDominantAcceptance ?? false,
+            componentViewCounts: measurement?.componentViewCounts
         )
     }
 
@@ -283,18 +285,19 @@ struct ViewerView: View {
         }
     }
 
-    /// Present only when the splat was built from part of the capture: the
-    /// registered fraction sits below the 0.90 floor a fully connected run
-    /// always clears (mirrors core's minimum registered view fraction).
+    /// Present only when the splat was built from part of the capture, keyed
+    /// off the persisted pair-graph acceptance rather than a registration
+    /// fraction so near-threshold continuations still warn.
     static func partialCoverageSummary(
         registeredViewCount: Int,
         totalViewCount: Int,
+        builtFromDominantComponent: Bool,
         componentViewCounts: [Int]?
     ) -> (registered: Int, total: Int, separateGroupViewCount: Int)? {
-        guard totalViewCount > 0,
+        guard builtFromDominantComponent,
+              totalViewCount > 0,
               registeredViewCount > 0,
-              registeredViewCount <= totalViewCount,
-              Double(registeredViewCount) / Double(totalViewCount) < 0.90 else {
+              registeredViewCount <= totalViewCount else {
             return nil
         }
         let separateGroup = componentViewCounts?.dropFirst().first ?? 0
