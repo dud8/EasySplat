@@ -2179,23 +2179,6 @@ final class PipelineIntegrationTests: XCTestCase {
             name: "DominantComponentContinuation",
             photoCount: 12
         )
-        let verifyDominantGroup: ([String], Int) throws -> Void = { arguments, dominantCount in
-            let lines = try self.pairListLines(for: arguments)
-            let names = Set(lines.flatMap {
-                $0.split(whereSeparator: \.isWhitespace).map(String.init)
-            })
-            let dominant = Set(names.sorted().prefix(dominantCount))
-            let dominantLines = Set(lines.filter { line in
-                let fields = line.split(whereSeparator: \.isWhitespace).map(String.init)
-                return fields.count == 2
-                    && dominant.contains(fields[0])
-                    && dominant.contains(fields[1])
-            })
-            try self.writeSelectiveVerifiedPairResults(
-                for: arguments,
-                verifiedPairLines: dominantLines
-            )
-        }
         let run = makePhotoRecoveryPipeline(
             projectURL: fixture.projectURL,
             toolchain: fixture.toolchain,
@@ -2228,7 +2211,10 @@ final class PipelineIntegrationTests: XCTestCase {
                             ),
                             "0"
                         )
-                        try verifyDominantGroup(arguments, 8)
+                        try self.writeGroupedVerifiedPairResults(
+                            for: arguments,
+                            groupSizes: [8]
+                        )
                     }
                 ),
                 .init(
@@ -2248,7 +2234,10 @@ final class PipelineIntegrationTests: XCTestCase {
                             ),
                             "1"
                         )
-                        try verifyDominantGroup(arguments, 8)
+                        try self.writeGroupedVerifiedPairResults(
+                            for: arguments,
+                            groupSizes: [8]
+                        )
                     }
                 ),
             ],
@@ -2312,25 +2301,6 @@ final class PipelineIntegrationTests: XCTestCase {
             name: "SplitCaptureContinuation",
             photoCount: 22
         )
-        let verifySplitGroups: ([String]) throws -> Void = { arguments in
-            let lines = try self.pairListLines(for: arguments)
-            let names = Set(lines.flatMap {
-                $0.split(whereSeparator: \.isWhitespace).map(String.init)
-            })
-            let sorted = names.sorted()
-            let firstGroup = Set(sorted.prefix(12))
-            let secondGroup = Set(sorted.dropFirst(12))
-            let internalLines = Set(lines.filter { line in
-                let fields = line.split(whereSeparator: \.isWhitespace).map(String.init)
-                guard fields.count == 2 else { return false }
-                return (firstGroup.contains(fields[0]) && firstGroup.contains(fields[1]))
-                    || (secondGroup.contains(fields[0]) && secondGroup.contains(fields[1]))
-            })
-            try self.writeSelectiveVerifiedPairResults(
-                for: arguments,
-                verifiedPairLines: internalLines
-            )
-        }
         let run = makePhotoRecoveryPipeline(
             projectURL: fixture.projectURL,
             toolchain: fixture.toolchain,
@@ -2355,7 +2325,12 @@ final class PipelineIntegrationTests: XCTestCase {
                         stdout: "",
                         stderr: ""
                     ),
-                    onRun: { try verifySplitGroups($0) }
+                    onRun: {
+                        try self.writeGroupedVerifiedPairResults(
+                            for: $0,
+                            groupSizes: [12, 10]
+                        )
+                    }
                 ),
                 .init(
                     path: fixture.toolchain.colmap.path,
@@ -2366,7 +2341,12 @@ final class PipelineIntegrationTests: XCTestCase {
                         stdout: "",
                         stderr: ""
                     ),
-                    onRun: { try verifySplitGroups($0) }
+                    onRun: {
+                        try self.writeGroupedVerifiedPairResults(
+                            for: $0,
+                            groupSizes: [12, 10]
+                        )
+                    }
                 ),
             ],
             stopAfterStage: .sfmMatching
@@ -2402,6 +2382,218 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(
             pairEvidence.dominantComponentImageNames(),
             Set(imageNames.sorted().prefix(12))
+        )
+    }
+
+    func testTerminalConnectionFailureRescuesOnResumeByReinspection() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "TerminalRescueOnResume",
+            photoCount: 12
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: {
+                        try self.writeGroupedVerifiedPairResults(
+                            for: $0,
+                            groupSizes: [8]
+                        )
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: {
+                        try self.writeGroupedVerifiedPairResults(
+                            for: $0,
+                            groupSizes: [8]
+                        )
+                    }
+                ),
+            ],
+            stopAfterStage: .sfmMatching
+        )
+        try await run.pipeline.run { _ in }
+
+        // Degrade the project to the state an older build left behind after a
+        // terminal connection failure: matches preserved in the database, a
+        // terminal recovery sidecar with rejected attempts, no accepted
+        // evidence, and a failed matching state.
+        try degradeAcceptedMatchingToTerminalFailureState(at: fixture.paths)
+        let selectedNames = selectedImageNames(in: fixture.paths)
+        let terminal = try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: selectedNames,
+            projectPaths: fixture.paths
+        ).restoredRecovery()
+        XCTAssertEqual(terminal.mode, .terminalExact)
+        XCTAssertEqual(
+            terminal.attempts.map(\.artifact.outcome),
+            [.rejected, .rejected]
+        )
+
+        // A plain resume re-inspects the preserved database instead of
+        // staying terminal, and continues with the dominant group without
+        // re-running the matcher.
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [],
+            stopAfterStage: .sfmMatching
+        )
+        let events = PipelineEventSink()
+        try await resumed.pipeline.run(resumeFrom: .sfmMatching) { events.append($0) }
+
+        XCTAssertFalse(resumed.runner.calls.contains {
+            $0.1.first == "matches_importer"
+        })
+        XCTAssertNotNil(events.stageLog(
+            containing: "Continuing with the largest connected group: 8 of 12 photos"
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+        let stoppedMetadata = try ProjectMetadataStore.load(
+            from: fixture.paths.metadataURL
+        )
+        XCTAssertEqual(stoppedMetadata.state.stage, .sfmMatching)
+        XCTAssertNil(stoppedMetadata.state.lastError)
+        let pairEvidence = try PairGraphEvidenceStore.loadVerified(
+            from: fixture.paths.pairGraphEvidenceURL,
+            expectedImageNames: selectedNames,
+            databaseURL: fixture.paths.colmapDatabaseURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(pairEvidence.attempts.map(\.artifact.matcher), [.faiss, .exact])
+        XCTAssertEqual(pairEvidence.attempts.map(\.artifact.outcome), [.rejected, .completed])
+        XCTAssertEqual(
+            pairEvidence.acceptedInspection.componentViewCounts,
+            [8, 1, 1, 1, 1]
+        )
+    }
+
+    func testInterruptedTerminalAcceptanceReconcilesRestampedEvidenceOnResume() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "TerminalAcceptanceCrashWindow",
+            photoCount: 12
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: {
+                        try self.writeGroupedVerifiedPairResults(
+                            for: $0,
+                            groupSizes: [8]
+                        )
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: {
+                        try self.writeGroupedVerifiedPairResults(
+                            for: $0,
+                            groupSizes: [8]
+                        )
+                    }
+                ),
+            ],
+            stopAfterStage: .sfmMatching
+        )
+        try await run.pipeline.run { _ in }
+
+        // Recreate the state left by a stop between saving the accepted
+        // evidence and clearing the recovery sidecar: the sidecar still holds
+        // the rejected form of the restamped terminal attempt.
+        try writeTerminalRejectedSidecar(at: fixture.paths)
+
+        // Resume must reconcile the restamped evidence against the stale
+        // sidecar instead of rejecting it as conflicting, and must not
+        // re-run the matcher.
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [],
+            stopAfterStage: .sfmMatching
+        )
+        do {
+            try await resumed.pipeline.run(resumeFrom: .sfmMatching) { _ in }
+        } catch {
+            XCTAssertFalse(
+                error is PairGraphRecoveryStoreError,
+                "Resume rejected the restamped terminal evidence: \(error)"
+            )
+        }
+        XCTAssertFalse(resumed.runner.calls.contains {
+            $0.1.first == "matches_importer"
+        })
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+        XCTAssertEqual(
+            try PairGraphEvidenceStore.load(
+                from: fixture.paths.pairGraphEvidenceURL,
+                projectPaths: fixture.paths
+            ).attempts.map(\.artifact.outcome),
+            [.rejected, .completed]
         )
     }
 
@@ -9186,6 +9378,109 @@ final class PipelineIntegrationTests: XCTestCase {
         return try String(contentsOfFile: pairListPath, encoding: .utf8)
             .split(separator: "\n")
             .map(String.init)
+    }
+
+    /// Rewrites the recovery sidecar as the pipeline leaves it right before a
+    /// terminal dominant-component acceptance clears it: the accepted
+    /// evidence's attempt history with the final attempt still rejected.
+    private func writeTerminalRejectedSidecar(at paths: ProjectPaths) throws {
+        let evidence = try PairGraphEvidenceStore.load(
+            from: paths.pairGraphEvidenceURL,
+            projectPaths: paths
+        )
+        var sidecarAttempts = evidence.attempts
+        sidecarAttempts[sidecarAttempts.count - 1].artifact.outcome = .rejected
+        let lastAttempt = sidecarAttempts[sidecarAttempts.count - 1]
+        let selectedManifest = try JSONDecoder().decode(
+            [PipelineRunner.SelectedFrameMapping].self,
+            from: Data(contentsOf: paths.framesSelectedManifestURL)
+        )
+        try PairGraphRecoveryStore.save(
+            PairGraphRecoveryState(
+                selectedFramesDigest: evidence.selectedFramesDigest,
+                imageNames: evidence.imageNames,
+                groups: try PipelineRunner.colmapPairGroups(
+                    imageNames: selectedImageNames(in: paths),
+                    manifest: selectedManifest
+                ),
+                pairingPolicy: evidence.pairingPolicy,
+                planBinding: evidence.planBinding,
+                mode: .terminalExact,
+                exactRecoveryReason: .faissGeometryRejectedAfterRetries,
+                computeMode: .gpu,
+                phase: .matching,
+                activeRecoveryLevel: lastAttempt.artifact.recoveryLevel,
+                activePlan: try ColmapPairPlan.persisted(
+                    imageNames: evidence.imageNames,
+                    scheduledPairs: lastAttempt.scheduledPairs
+                ),
+                activeRetrieval: lastAttempt.retrieval,
+                attempts: sidecarAttempts,
+                retrievalWasScheduled: evidence.retrievalWasScheduled,
+                usedLocalVocabularyRetrieval: evidence.usedLocalVocabularyRetrieval,
+                matchingDurationSeconds: evidence.matchingDurationSeconds,
+                fallbackReasons: evidence.fallbackReasons
+            ),
+            to: paths.pairGraphRecoveryURL,
+            projectPaths: paths
+        )
+    }
+
+    /// Degrades a project whose matching stage terminally accepted the
+    /// dominant component into the state an older build persisted after a
+    /// terminal connection failure: terminal sidecar with rejected attempts,
+    /// no accepted evidence, and a failed matching state.
+    private func degradeAcceptedMatchingToTerminalFailureState(
+        at paths: ProjectPaths
+    ) throws {
+        try writeTerminalRejectedSidecar(at: paths)
+        try FileManager.default.removeItem(at: paths.pairGraphEvidenceURL)
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        metadata.state = PipelineState(
+            stage: .sfmMatching,
+            lastError: "EasySplat could not connect this capture into one scene."
+        )
+        metadata.checkpoint = nil
+        metadata.lastRunStartedAt = nil
+        metadata.lastFailureAt = Date()
+        try ProjectMetadataStore.savePreservingUserEditableFields(
+            metadata,
+            to: paths.metadataURL
+        )
+    }
+
+    /// Verifies only the pairs internal to the given prefix groups (sizes
+    /// over the sorted image names); every remaining image stays isolated.
+    private func writeGroupedVerifiedPairResults(
+        for arguments: [String],
+        groupSizes: [Int]
+    ) throws {
+        let lines = try pairListLines(for: arguments)
+        let names = Set(lines.flatMap {
+            $0.split(whereSeparator: \.isWhitespace).map(String.init)
+        })
+        let sorted = names.sorted()
+        var groupIndexByName: [String: Int] = [:]
+        var start = 0
+        for (groupIndex, size) in groupSizes.enumerated() {
+            for name in sorted[start..<(start + size)] {
+                groupIndexByName[name] = groupIndex
+            }
+            start += size
+        }
+        let internalLines = Set(lines.filter { line in
+            let fields = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard fields.count == 2,
+                  let first = groupIndexByName[fields[0]],
+                  let second = groupIndexByName[fields[1]] else {
+                return false
+            }
+            return first == second
+        })
+        try writeSelectiveVerifiedPairResults(
+            for: arguments,
+            verifiedPairLines: internalLines
+        )
     }
 
     private func writeSelectiveVerifiedPairResults(

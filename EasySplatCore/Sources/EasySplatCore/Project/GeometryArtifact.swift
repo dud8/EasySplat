@@ -255,6 +255,47 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
     }
 }
 
+public extension PairGraphMeasurement {
+    /// True when this graph could only have been accepted through the
+    /// terminal dominant-component continuation: the strict connectivity
+    /// policy would have refused it, so the splat covers part of the
+    /// capture. Strict acceptances, including ordered captures that
+    /// legitimately carried minor fragments past the normal recovery
+    /// level, stay false.
+    var usedViableDominantAcceptance: Bool {
+        let totalViewCount = componentViewCounts.reduce(0, +)
+        guard PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: totalViewCount,
+            componentViewCounts: componentViewCounts,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        ) != nil else {
+            return PairGraphConnectivityPolicy.viableDominantViewCount(
+                totalViewCount: totalViewCount,
+                componentViewCounts: componentViewCounts,
+                connectedComponentCount: connectedComponentCount,
+                isolatedViewCount: isolatedViewCount,
+                descriptorlessViewCount: descriptorlessViewCount
+            ) != nil
+        }
+        let hasMinorVerifiedComponent = componentViewCounts
+            .dropFirst()
+            .contains { $0 > 1 }
+        guard hasMinorVerifiedComponent else {
+            return false
+        }
+        let isOrdered: Bool
+        switch pairingPolicy {
+        case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
+            isOrdered = true
+        case .unorderedRetrieval, .segmentedMixed:
+            isOrdered = false
+        }
+        return !(isOrdered && matcherAttempts.last?.recoveryLevel != .normal)
+    }
+}
+
 public struct PairGraphArtifact: Codable, Sendable, Equatable {
     public var status: PairGraphMeasurementStatus
     public var measurement: PairGraphMeasurement?

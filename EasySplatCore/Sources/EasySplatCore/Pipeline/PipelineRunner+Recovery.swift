@@ -305,7 +305,12 @@ extension PipelineRunner {
                 )) != nil
             if databaseIsSymlink {
                 try self.removeItemIfPresent(paths.colmapDatabaseURL)
-            } else if FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path) {
+            } else if FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path),
+                      !preservingPairGraphRecovery {
+                // A preserved terminal recovery refers to the matches the
+                // exact attempt left in the database; resume re-inspects them
+                // instead of re-running the matcher. Any genuine re-matching
+                // clears these tables itself before importing.
                 try ColmapDatabaseMatchStore.clearMatchingResults(
                     at: paths.colmapDatabaseURL
                 )

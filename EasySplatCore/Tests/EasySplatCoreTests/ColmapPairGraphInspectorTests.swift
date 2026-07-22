@@ -119,6 +119,75 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         )
     }
 
+    func testViableAcceptanceClassifierMatchesTheStrictPolicy() {
+        func measurement(
+            _ counts: [Int],
+            policy: ResolvedPairingPolicy = .unorderedRetrieval,
+            recoveryLevel: PairGraphRecoveryLevel = .normal
+        ) -> PairGraphMeasurement {
+            PairGraphMeasurement(
+                pairingPolicy: policy,
+                scheduledPairCount: 231,
+                attemptedPairCount: 231,
+                rawMatchedPairCount: 100,
+                spatiallyVerifiedPairCount: 100,
+                localPairCount: 231,
+                retrievalPairCount: 0,
+                loopRevisitPairCount: 0,
+                connectedComponentCount: counts.count,
+                isolatedViewCount: counts.count(where: { $0 == 1 }),
+                descriptorlessViewCount: 0,
+                componentViewCounts: counts,
+                articulationViewCount: 0,
+                biconnectedBlockCount: 1,
+                largestBiconnectedBlockViewCount: counts.first ?? 0,
+                secondLargestBiconnectedBlockViewCount: 0,
+                degreeP10: 0,
+                degreeMedian: 1,
+                degreeP90: 2,
+                matcherAttempts: [PairMatchingAttemptArtifact(
+                    attemptNumber: 1,
+                    matcher: .faiss,
+                    recoveryLevel: recoveryLevel,
+                    outcome: .completed,
+                    scheduledPairCount: 231,
+                    attemptedPairCount: 231,
+                    rawMatchedPairCount: 100,
+                    spatiallyVerifiedPairCount: 100,
+                    durationSeconds: 1
+                )],
+                pairListDigest: String(repeating: "d", count: 64),
+                featureDatabaseDigest: String(repeating: "e", count: 64),
+                matchingDatabaseDigest: String(repeating: "f", count: 64),
+                matchingDurationSeconds: 1
+            )
+        }
+
+        // Below the strict fraction: only the terminal continuation accepts.
+        XCTAssertTrue(measurement([18, 1, 1, 1, 1]).usedViableDominantAcceptance)
+        XCTAssertTrue(measurement([12, 10]).usedViableDominantAcceptance)
+        XCTAssertTrue(measurement([20, 2]).usedViableDominantAcceptance)
+
+        // Strict fraction passes ([57, 3] is exactly 95%), but unordered
+        // minors were never strictly acceptable, nor were ordered minors at
+        // the normal recovery level.
+        XCTAssertTrue(measurement([57, 3]).usedViableDominantAcceptance)
+        XCTAssertTrue(
+            measurement([57, 3], policy: .orderedOrbit).usedViableDominantAcceptance
+        )
+
+        // Strict acceptances stay quiet.
+        XCTAssertFalse(measurement([9, 1]).usedViableDominantAcceptance)
+        XCTAssertFalse(measurement([22]).usedViableDominantAcceptance)
+        XCTAssertFalse(
+            measurement(
+                [57, 3],
+                policy: .orderedOrbit,
+                recoveryLevel: .expanded
+            ).usedViableDominantAcceptance
+        )
+    }
+
     func testOrderedDominantComponentPolicyAcceptsMinorVerifiedComponents() {
         let inspection = makeInspection(componentSizes: [239, 2, 2, 1, 1, 1, 1, 1, 1, 1])
 

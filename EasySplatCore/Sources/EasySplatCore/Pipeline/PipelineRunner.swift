@@ -2098,6 +2098,7 @@ public final class PipelineRunner: @unchecked Sendable {
             var recoveredAcceptedExactEvidence = false
             var restartingAfterInvalidRecoveryState = false
             var recoveredPolicyRecoverySidecar = false
+            var resumingTerminalExactInspection = false
 
             func selectedFramesDigestForExactRecovery() throws -> String {
                 if let selectedFramesDigestForRecovery {
@@ -2285,7 +2286,22 @@ public final class PipelineRunner: @unchecked Sendable {
                         reason
                     )
                 case .terminalExact:
-                    throw PairGraphRecoveryStoreError.terminalExactRecovery
+                    // The exact retry already ran and its matches are still in
+                    // the database. Re-inspect on resume instead of staying
+                    // terminal: a viable dominant component now continues the
+                    // run, matching the live terminal acceptance.
+                    guard let reason = recovered.exactRecoveryReason else {
+                        throw PairGraphRecoveryStoreError.invalidState
+                    }
+                    colmapMatchOptions.descriptorMatcher = .exact
+                    didRetryWithExactMatcher = true
+                    latestPreparedPairPlan = recovered.activePlan
+                    latestCompletedPairPlan = recovered.activePlan
+                    pairAttemptMode = .sameScheduleExact(
+                        recovered.activePlan,
+                        reason
+                    )
+                    resumingTerminalExactInspection = true
                 }
                 for reason in recovered.fallbackReasons {
                     recordMappingFallback(reason)
@@ -2322,6 +2338,39 @@ public final class PipelineRunner: @unchecked Sendable {
                 case .terminalExact:
                     return false
                 }
+            }
+
+            func evidenceCompletesTerminalDominantAcceptance(
+                _ evidence: PairGraphEvidence,
+                recovered: RestoredPairGraphRecovery
+            ) -> Bool {
+                // A terminal dominant-component acceptance restamps the final
+                // rejected attempt as completed in place, so the accepted
+                // evidence and the recovery sidecar hold equally many attempts
+                // whose last entries differ only in outcome. Reconcile that
+                // shape when a run stopped between saving the evidence and
+                // clearing the sidecar.
+                guard recovered.phase == .matching,
+                      evidence.attempts.count == recovered.attempts.count,
+                      evidence.planBinding == recovered.planBinding,
+                      evidence.retrievalWasScheduled
+                        == recovered.retrievalWasScheduled,
+                      evidence.fallbackReasons == recovered.fallbackReasons,
+                      let accepted = evidence.attempts.last,
+                      let pending = recovered.attempts.last,
+                      pending.artifact.outcome == .rejected,
+                      accepted.artifact.outcome == .completed,
+                      Array(evidence.attempts.dropLast())
+                        == Array(recovered.attempts.dropLast()),
+                      accepted.scheduledPairs == pending.scheduledPairs,
+                      accepted.retrieval == pending.retrieval,
+                      evidence.usedLocalVocabularyRetrieval
+                        == (accepted.retrieval != nil) else {
+                    return false
+                }
+                var restamped = pending.artifact
+                restamped.outcome = .completed
+                return accepted.artifact == restamped
             }
 
             func evidenceSupersedesPendingExactRecovery(
@@ -2393,6 +2442,9 @@ public final class PipelineRunner: @unchecked Sendable {
                             completedEvidence,
                             recovered: recovered
                         ) || evidenceSupersedesPendingExactRecovery(
+                            completedEvidence,
+                            recovered: recovered
+                        ) || evidenceCompletesTerminalDominantAcceptance(
                             completedEvidence,
                             recovered: recovered
                         ) else {
@@ -2792,6 +2844,72 @@ public final class PipelineRunner: @unchecked Sendable {
                     line: "Tool log: \(paths.colmapLogURL.lastPathComponent)",
                     isError: false
                 ))
+
+                if resumingTerminalExactInspection {
+                    // A prior run exhausted matching recovery and stopped with
+                    // its exact matches preserved in the database. Re-inspect
+                    // instead of re-running the matcher: a viable dominant
+                    // component continues the run exactly like the live
+                    // terminal acceptance; anything else stays terminal.
+                    resumingTerminalExactInspection = false
+                    guard let restoredPlan = latestPreparedPairPlan else {
+                        throw PairGraphRecoveryStoreError.invalidState
+                    }
+                    // A failed (crashed or incomplete) terminal attempt has no
+                    // complete match tables to re-inspect; only a rejected
+                    // attempt preserved a full graph worth reconsidering.
+                    guard pairGraphAttempts.last?.artifact.outcome == .rejected else {
+                        throw PairGraphRecoveryStoreError.terminalExactRecovery
+                    }
+                    let restoredInspection: ColmapPairGraphInspection
+                    do {
+                        restoredInspection = try ColmapPairGraphInspector(
+                            databaseURL: paths.colmapDatabaseURL
+                        ).inspect(
+                            schedule: ColmapPairSchedule(
+                                imageNames: selectedFrames.map(\.lastPathComponent),
+                                pairs: restoredPlan.pairs
+                            ),
+                            completion: .succeeded
+                        )
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        throw PairGraphRecoveryStoreError.terminalExactRecovery
+                    }
+                    guard restoredInspection.hasViableDominantVerifiedComponent,
+                          let terminalAttemptIndex = pairGraphAttempts.indices.last,
+                          pairGraphAttempts[terminalAttemptIndex].artifact.outcome == .rejected,
+                          restoredInspection.scheduledPairCount
+                            == pairGraphAttempts[terminalAttemptIndex].artifact.scheduledPairCount,
+                          restoredInspection.attemptedPairCount
+                            == pairGraphAttempts[terminalAttemptIndex].artifact.attemptedPairCount,
+                          restoredInspection.rawMatchedPairCount
+                            == pairGraphAttempts[terminalAttemptIndex].artifact.rawMatchedPairCount,
+                          restoredInspection.spatiallyVerifiedPairCount
+                            == pairGraphAttempts[terminalAttemptIndex].artifact.spatiallyVerifiedPairCount
+                    else {
+                        throw PairGraphRecoveryStoreError.terminalExactRecovery
+                    }
+                    pairGraphAttempts[terminalAttemptIndex].artifact.outcome = .completed
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: Self.dominantComponentContinuationLine(
+                            componentViewCounts: restoredInspection
+                                .verifiedGraph.components
+                                .map(\.count)
+                                .sorted(by: >),
+                            selectedViewCount: selectedFrames.count
+                        ),
+                        isError: true
+                    ))
+                    try finalizeAcceptedPairGraph(
+                        restoredInspection,
+                        acceptedAttemptNumber: pairGraphAttempts[terminalAttemptIndex]
+                            .artifact.attemptNumber
+                    )
+                    return
+                }
 
                 let imageNames = selectedFrames.map(\.lastPathComponent)
                 let groups = selectedPairGroups
@@ -3534,19 +3652,15 @@ public final class PipelineRunner: @unchecked Sendable {
                                     .artifact.attemptNumber
                                 latestRejectedCaptureConnectionFailure = nil
                                 latestRejectedInspection = nil
-                                let componentViewCounts = rejectedInspection.verifiedGraph.components
-                                    .map(\.count)
-                                    .sorted(by: >)
-                                let dominantViewCount = componentViewCounts.first ?? 0
-                                let excludedViewCount = selectedFrames.count - dominantViewCount
-                                let secondGroupViewCount = componentViewCounts.dropFirst().first ?? 0
-                                var continuationLine = "Matching could not connect every photo. Continuing with the largest connected group: \(dominantViewCount) of \(selectedFrames.count) photos. \(excludedViewCount) photo\(excludedViewCount == 1 ? " stays" : "s stay") out of the splat."
-                                if secondGroupViewCount > 1 {
-                                    continuationLine += " The largest separate group has \(secondGroupViewCount) photos."
-                                }
                                 emit(.stageLog(
                                     stage: .sfmMatching,
-                                    line: continuationLine,
+                                    line: Self.dominantComponentContinuationLine(
+                                        componentViewCounts: rejectedInspection
+                                            .verifiedGraph.components
+                                            .map(\.count)
+                                            .sorted(by: >),
+                                        selectedViewCount: selectedFrames.count
+                                    ),
                                     isError: true
                                 ))
                                 try finalizeAcceptedPairGraph(

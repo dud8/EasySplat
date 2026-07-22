@@ -101,6 +101,20 @@ extension PipelineRunner {
         case invalidRetrievalOutput
     }
 
+    static func dominantComponentContinuationLine(
+        componentViewCounts: [Int],
+        selectedViewCount: Int
+    ) -> String {
+        let dominantViewCount = componentViewCounts.first ?? 0
+        let excludedViewCount = selectedViewCount - dominantViewCount
+        let secondGroupViewCount = componentViewCounts.dropFirst().first ?? 0
+        var line = "Matching could not connect every photo. Continuing with the largest connected group: \(dominantViewCount) of \(selectedViewCount) photos. \(excludedViewCount) photo\(excludedViewCount == 1 ? " stays" : "s stay") out of the splat."
+        if secondGroupViewCount > 1 {
+            line += " The largest separate group has \(secondGroupViewCount) photos."
+        }
+        return line
+    }
+
     static func allowsMinorVerifiedComponents(
         pairingPolicy: ResolvedPairingPolicy,
         recoveryLevel: PairRecoveryLevel
