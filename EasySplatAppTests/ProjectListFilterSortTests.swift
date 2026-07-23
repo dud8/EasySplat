@@ -301,6 +301,14 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(sorted.map(\.title), ["Apple", "monkey", "zebra"])
     }
 
+    func testOnlyExceptionalStatesEarnARowCaption() {
+        XCTAssertNil(ProjectSidebar.rowCaption(status: .ready, isInterrupted: false))
+        XCTAssertEqual(ProjectSidebar.rowCaption(status: .inProgress, isInterrupted: false), "In Progress")
+        XCTAssertEqual(ProjectSidebar.rowCaption(status: .failed, isInterrupted: false), "Failed")
+        XCTAssertEqual(ProjectSidebar.rowCaption(status: .ready, isInterrupted: true), "Unfinished")
+        XCTAssertEqual(ProjectSidebar.rowCaption(status: .inProgress, isInterrupted: true), "Unfinished")
+    }
+
 }
 
 private struct SidebarTestToolchainManager: ToolchainManaging {

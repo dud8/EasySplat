@@ -206,7 +206,12 @@ struct ProjectSidebar: View {
                 .help(project.title)
 
             HStack(spacing: Theme.Spacing.small) {
-                Text(statusText(for: project))
+                if let caption = Self.rowCaption(
+                    status: project.status,
+                    isInterrupted: project.isInterrupted
+                ) {
+                    Text(caption)
+                }
                 Spacer(minLength: Theme.Spacing.small)
                 Text(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted))
             }
@@ -280,11 +285,15 @@ struct ProjectSidebar: View {
     }
 
     private func statusText(for project: ProjectSummary) -> String {
-        if project.isInterrupted {
-            return "Unfinished"
-        }
-        switch project.status {
-        case .ready: return "Ready"
+        Self.rowCaption(status: project.status, isInterrupted: project.isInterrupted) ?? "Ready"
+    }
+
+    /// Visible status caption for a row; ready rows carry none. The full
+    /// status stays in the row's accessibility label.
+    nonisolated static func rowCaption(status: ProjectStatus, isInterrupted: Bool) -> String? {
+        if isInterrupted { return "Unfinished" }
+        switch status {
+        case .ready: return nil
         case .inProgress: return "In Progress"
         case .failed: return "Failed"
         }

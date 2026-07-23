@@ -21,6 +21,8 @@ Only one reconstruction may run. Disable New Splat while it is active. Do not im
 
 Accent color belongs to selection, active progress, and the primary action — nowhere else. Sidebar filter, sort, and row actions render in label colors, not accent.
 
+Ready rows carry only the title and date. Only exceptional states — In Progress, Failed, Unfinished — earn a status caption; VoiceOver still hears the full status on every row.
+
 Use source-list rows, toolbars, context menus, `LabeledContent`, dividers, disclosures, and system panels. Do not build a dashboard or a grid of cards.
 
 ## New project
