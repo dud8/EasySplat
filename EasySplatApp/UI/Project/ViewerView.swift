@@ -250,12 +250,11 @@ struct ViewerView: View {
 
     private var partialCoverage: (registered: Int, total: Int, separateGroupViewCount: Int)? {
         guard let geometry = artifactSnapshot?.geometryArtifact else { return nil }
-        let measurement = geometry.pairGraph.measurement
         return Self.partialCoverageSummary(
             registeredViewCount: geometry.registeredViewCount,
             totalViewCount: geometry.totalViewCount,
-            builtFromDominantComponent: measurement?.usedViableDominantAcceptance ?? false,
-            componentViewCounts: measurement?.componentViewCounts
+            builtFromPartialAcceptance: geometry.usedPartialCoverageAcceptance,
+            componentViewCounts: geometry.pairGraph.measurement?.componentViewCounts
         )
     }
 
@@ -286,15 +285,16 @@ struct ViewerView: View {
     }
 
     /// Present only when the splat was built from part of the capture, keyed
-    /// off the persisted pair-graph acceptance rather than a registration
-    /// fraction so near-threshold continuations still warn.
+    /// off the persisted acceptance state (dominant-group continuation or a
+    /// partial camera solve) rather than a registration fraction so
+    /// near-threshold continuations still warn.
     static func partialCoverageSummary(
         registeredViewCount: Int,
         totalViewCount: Int,
-        builtFromDominantComponent: Bool,
+        builtFromPartialAcceptance: Bool,
         componentViewCounts: [Int]?
     ) -> (registered: Int, total: Int, separateGroupViewCount: Int)? {
-        guard builtFromDominantComponent,
+        guard builtFromPartialAcceptance,
               totalViewCount > 0,
               registeredViewCount > 0,
               registeredViewCount <= totalViewCount else {

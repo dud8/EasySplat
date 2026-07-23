@@ -17,7 +17,7 @@ final class ResultFactsDisplayTests: XCTestCase {
         let strays = ViewerView.partialCoverageSummary(
             registeredViewCount: 18,
             totalViewCount: 22,
-            builtFromDominantComponent: true,
+            builtFromPartialAcceptance: true,
             componentViewCounts: [18, 1, 1, 1, 1]
         )
         XCTAssertEqual(strays?.registered, 18)
@@ -32,7 +32,7 @@ final class ResultFactsDisplayTests: XCTestCase {
         let split = ViewerView.partialCoverageSummary(
             registeredViewCount: 12,
             totalViewCount: 22,
-            builtFromDominantComponent: true,
+            builtFromPartialAcceptance: true,
             componentViewCounts: [12, 10]
         )
         XCTAssertEqual(split?.separateGroupViewCount, 10)
@@ -41,13 +41,27 @@ final class ResultFactsDisplayTests: XCTestCase {
             "This splat covers 12 of 22 photos. A separate group of 10 photos couldn't be connected to it. Add photos that bridge the two areas, then use Re-train in the More menu."
         )
 
+        // A partial camera solve on a fully connected capture warns without
+        // naming a separate group.
+        let solveShortfall = ViewerView.partialCoverageSummary(
+            registeredViewCount: 16,
+            totalViewCount: 22,
+            builtFromPartialAcceptance: true,
+            componentViewCounts: [22]
+        )
+        XCTAssertEqual(solveShortfall?.separateGroupViewCount, 0)
+        XCTAssertEqual(
+            ViewerView.partialCoverageMessage(try XCTUnwrap(solveShortfall)),
+            "This splat covers 16 of 22 photos. To include the rest, add photos that overlap the missing areas, then use Re-train in the More menu."
+        )
+
         // A near-threshold continuation still warns even though registration
         // sits above 90%.
         XCTAssertEqual(
             ViewerView.partialCoverageSummary(
                 registeredViewCount: 20,
                 totalViewCount: 22,
-                builtFromDominantComponent: true,
+                builtFromPartialAcceptance: true,
                 componentViewCounts: [20, 2]
             )?.separateGroupViewCount,
             2
@@ -57,19 +71,19 @@ final class ResultFactsDisplayTests: XCTestCase {
         XCTAssertNil(ViewerView.partialCoverageSummary(
             registeredViewCount: 9,
             totalViewCount: 10,
-            builtFromDominantComponent: false,
+            builtFromPartialAcceptance: false,
             componentViewCounts: [9, 1]
         ))
         XCTAssertNil(ViewerView.partialCoverageSummary(
             registeredViewCount: 22,
             totalViewCount: 22,
-            builtFromDominantComponent: false,
+            builtFromPartialAcceptance: false,
             componentViewCounts: [22]
         ))
         XCTAssertNil(ViewerView.partialCoverageSummary(
             registeredViewCount: 0,
             totalViewCount: 0,
-            builtFromDominantComponent: true,
+            builtFromPartialAcceptance: true,
             componentViewCounts: nil
         ))
     }
