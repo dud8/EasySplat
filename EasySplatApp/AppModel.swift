@@ -98,6 +98,13 @@ final class AppModel: ObservableObject {
     /// the save-panel flow and observes this token.
     @Published var exportMenuRequestCount = 0
 
+    /// Result inspector visibility, shared by the View menu, the toolbar
+    /// button, and the result workspace.
+    @Published var isResultInspectorPresented = false
+
+    /// Last settled workspace width, kept current by WorkspaceView.
+    var workspaceWidthHint: CGFloat = 0
+
     @Published var cachedFreeDiskBytes: Int64? = nil
     @Published var requestedRunOptions = RequestedRunOptions()
     @Published var pendingVideoURLs: [URL] = []

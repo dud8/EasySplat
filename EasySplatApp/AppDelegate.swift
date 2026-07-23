@@ -237,6 +237,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         )
         sidebarItem.keyEquivalentModifierMask = [.command, .control]
         viewMenu.addItem(sidebarItem)
+        let inspectorItem = NSMenuItem(
+            title: "Show Inspector",
+            action: #selector(toggleInspector(_:)),
+            keyEquivalent: "i"
+        )
+        inspectorItem.keyEquivalentModifierMask = [.command, .control]
+        inspectorItem.target = self
+        viewMenu.addItem(inspectorItem)
         viewMenu.addItem(.separator())
         let fullScreenItem = NSMenuItem(
             title: "Enter Full Screen",
@@ -290,6 +298,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if menuItem.action == #selector(exportSplat(_:)) {
             return model.viewState == .viewer && model.outputPlyURL != nil
         }
+        if menuItem.action == #selector(toggleInspector(_:)) {
+            menuItem.title = model.isResultInspectorPresented ? "Hide Inspector" : "Show Inspector"
+            return model.viewState == .viewer
+        }
         return true
     }
 
@@ -299,6 +311,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc private func exportSplat(_ sender: Any?) {
         model.requestExportFromMenu()
+    }
+
+    @objc private func toggleInspector(_ sender: Any?) {
+        guard model.viewState == .viewer else { return }
+        model.isResultInspectorPresented.toggle()
+        UserDefaults.standard.set(
+            model.isResultInspectorPresented,
+            forKey: ViewerView.inspectorPreferenceKey
+        )
     }
 
     @objc private func showAbout(_ sender: Any?) {

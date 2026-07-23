@@ -3406,6 +3406,39 @@ final class ResultWorkspaceTests: XCTestCase {
         view.onKeyboardCommand = { [renderer] _ in _ = renderer }
         view.onInteractionActivity = { [renderer] in _ = renderer }
     }
+
+    func testInspectorDefaultsClosedWhenTheCanvasWouldBeCrushed() {
+        // The 920pt minimum window minus the 260pt sidebar leaves 660.
+        XCTAssertFalse(ViewerView.initialInspectorPresentation(
+            storedPreference: nil,
+            workspaceWidth: 660
+        ))
+        // Sidebar collapsed at the minimum window: the full 920 has room.
+        XCTAssertTrue(ViewerView.initialInspectorPresentation(
+            storedPreference: nil,
+            workspaceWidth: 920
+        ))
+        let threshold = ViewerView.inspectorIdealWidth + ViewerView.minimumComfortableCanvasWidth
+        XCTAssertTrue(ViewerView.initialInspectorPresentation(
+            storedPreference: nil,
+            workspaceWidth: threshold
+        ))
+        XCTAssertFalse(ViewerView.initialInspectorPresentation(
+            storedPreference: nil,
+            workspaceWidth: threshold - 1
+        ))
+    }
+
+    func testARememberedInspectorChoiceBeatsTheWidthRule() {
+        XCTAssertTrue(ViewerView.initialInspectorPresentation(
+            storedPreference: true,
+            workspaceWidth: 400
+        ))
+        XCTAssertFalse(ViewerView.initialInspectorPresentation(
+            storedPreference: false,
+            workspaceWidth: 1400
+        ))
+    }
 }
 
 @MainActor

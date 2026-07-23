@@ -77,7 +77,9 @@ Failure actions are Try Again, Back to Projects, and an overflow menu for Finder
 
 ## Result
 
-The splat canvas owns the workspace, edge to edge — no padding or corner treatment between the canvas and the window chrome. The toolbar contains Export…, Share, Inspector, and a small overflow menu. The inspector shows facts with `LabeledContent` and dividers:
+The splat canvas owns the workspace, edge to edge — no padding or corner treatment between the canvas and the window chrome. The toolbar contains Export…, Share, Inspector, and a small overflow menu.
+
+The inspector opens by default only when the workspace leaves the canvas useful room beside it; below that it starts closed. An explicit show or hide — toolbar or View menu (⌃⌘I) — is remembered and always wins. The inspector shows facts with `LabeledContent` and dividers:
 
 - Output
 - Capture
@@ -116,7 +118,7 @@ The app icon is a midnight squircle with one cyan-white point-cloud orbit. It ha
 
 ## Shell
 
-- Commands live in the menu bar first; toolbar buttons mirror them. File holds New Splat (⌘N), Export… (⌘E), and Close; View holds Show or Hide Sidebar (⌃⌘S) and Enter Full Screen.
+- Commands live in the menu bar first; toolbar buttons mirror them. File holds New Splat (⌘N), Export… (⌘E), and Close; View holds Show or Hide Sidebar (⌃⌘S), Show Inspector / Hide Inspector (⌃⌘I) on the result screen, and Enter Full Screen.
 - About uses the standard about panel. The one-line description lives in its credits, in small secondary type. Hardware details belong in diagnostics, not About.
 - The Help menu holds EasySplat Help (opens the project page) and Copy Diagnostics for Current Project.
 - View Releases… lives in the application menu, under About.

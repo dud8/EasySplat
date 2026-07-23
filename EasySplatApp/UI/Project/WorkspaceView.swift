@@ -28,6 +28,13 @@ struct WorkspaceView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { width in
+            // Measured here: the viewer's own first layout reports transient
+            // narrow widths.
+            model.workspaceWidthHint = width
+        }
         .animation(
             animationDuration.map { Theme.Motion.workspace(duration: $0) },
             value: model.viewState

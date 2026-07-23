@@ -8,7 +8,8 @@ struct ViewerView: View {
 
     @EnvironmentObject private var model: AppModel
     @StateObject private var artifactLoader = ViewerArtifactLoader<ProjectArtifactSnapshot>()
-    @State private var isInspectorPresented = true
+    @AppStorage(ViewerView.inspectorPreferenceKey) private var storedInspectorPreference: Bool?
+    @State private var hasResolvedInitialInspector = false
     @State private var isTechnicalExpanded = false
     @State private var resetCameraToken = 0
     @State private var artifactSnapshot: ProjectArtifactSnapshot?
@@ -68,9 +69,9 @@ struct ViewerView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle(projectTitle)
         .toolbar { resultToolbar }
-        .inspector(isPresented: $isInspectorPresented) {
+        .inspector(isPresented: inspectorPresentation) {
             resultInspector
-                .inspectorColumnWidth(min: 240, ideal: 280, max: 360)
+                .inspectorColumnWidth(min: 240, ideal: Self.inspectorIdealWidth, max: 360)
         }
         .alert(item: $viewerAlert) { alert in
             Alert(
@@ -80,7 +81,10 @@ struct ViewerView: View {
             )
         }
         .sheet(isPresented: $isRetrainSheetPresented) { retrainSheet }
-        .onAppear { requestArtifactLoad() }
+        .onAppear {
+            resolveInitialInspectorIfNeeded(workspaceWidth: model.workspaceWidthHint)
+            requestArtifactLoad()
+        }
         .onChange(of: model.currentProjectURL) { _, _ in
             isUprightHintDismissed = false
             isPartialCoverageHintDismissed = false
@@ -123,11 +127,11 @@ struct ViewerView: View {
             }
 
             Button {
-                isInspectorPresented.toggle()
+                inspectorPresentation.wrappedValue.toggle()
             } label: {
                 Label("Inspector", systemImage: "sidebar.right")
             }
-            .help(isInspectorPresented ? "Hide Inspector" : "Show Inspector")
+            .help(model.isResultInspectorPresented ? "Hide Inspector" : "Show Inspector")
             .accessibilityIdentifier("result.inspector")
 
             Menu {
@@ -737,6 +741,44 @@ struct ViewerView: View {
                 message: error.localizedDescription
             )
         }
+    }
+
+    /// Closed until the seed has run so the panel never flashes. Changes made
+    /// while the result is on screen are the user's and are remembered;
+    /// pre-seed and teardown writes are not.
+    private var inspectorPresentation: Binding<Bool> {
+        Binding(
+            get: { hasResolvedInitialInspector && model.isResultInspectorPresented },
+            set: { newValue in
+                model.isResultInspectorPresented = newValue
+                if hasResolvedInitialInspector, model.viewState == .viewer {
+                    storedInspectorPreference = newValue
+                }
+            }
+        )
+    }
+
+    private func resolveInitialInspectorIfNeeded(workspaceWidth: CGFloat) {
+        guard !hasResolvedInitialInspector else { return }
+        model.isResultInspectorPresented = Self.initialInspectorPresentation(
+            storedPreference: storedInspectorPreference,
+            workspaceWidth: workspaceWidth
+        )
+        hasResolvedInitialInspector = true
+    }
+
+    nonisolated static let inspectorPreferenceKey = "EasySplatResultInspectorShown"
+    nonisolated static let inspectorIdealWidth: CGFloat = 280
+    nonisolated static let minimumComfortableCanvasWidth: CGFloat = 440
+
+    /// The inspector opens by default only when it leaves the canvas a useful
+    /// share of the workspace. A remembered explicit choice always wins.
+    nonisolated static func initialInspectorPresentation(
+        storedPreference: Bool?,
+        workspaceWidth: CGFloat
+    ) -> Bool {
+        if let storedPreference { return storedPreference }
+        return workspaceWidth - inspectorIdealWidth >= minimumComfortableCanvasWidth
     }
 
     nonisolated static func inputContainsPhotos(_ input: InputSpec?) -> Bool {
