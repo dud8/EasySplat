@@ -1,7 +1,13 @@
 import AppKit
 import Combine
 import EasySplatCore
+import OSLog
 import UserNotifications
+
+private let runStatusLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "com.easysplat.app",
+    category: "RunStatus"
+)
 
 /// Surfaces long-run status outside the window: a progress bar on the Dock
 /// icon while training runs, and a notification when a run ends while the
@@ -116,7 +122,15 @@ final class RunStatusPresenter {
         sawFailureDuringRun = false
         guard notificationsAvailable, !hasRequestedAuthorization else { return }
         hasRequestedAuthorization = true
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { granted, error in
+            if let error {
+                runStatusLogger.error(
+                    "Notification authorization failed: \(error.localizedDescription, privacy: .public)"
+                )
+            } else if !granted {
+                runStatusLogger.notice("Notification authorization declined")
+            }
+        }
     }
 
     private func runDidEnd() {
@@ -140,7 +154,13 @@ final class RunStatusPresenter {
             content: content,
             trigger: nil
         )
-        UNUserNotificationCenter.current().add(request)
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                runStatusLogger.error(
+                    "Notification delivery failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
     }
 
     private var projectTitle: String? {
