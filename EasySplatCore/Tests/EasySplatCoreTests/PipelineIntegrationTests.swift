@@ -5672,6 +5672,82 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path }))
     }
 
+    func testCanonicalPromotionInvalidatesSubjectOnlyAfterDurableReplacement() throws {
+        let fixture = try makeSubjectIsolationFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        let oldSubject = try fixture.makeArtifact(outputIdentity: UUID())
+        _ = try SubjectIsolationArtifactStore.publish(
+            oldSubject,
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+        let oldSubjectBytes = try Data(contentsOf: fixture.paths.isolatedOutputURL)
+        let oldManifestBytes = try Data(contentsOf: fixture.paths.isolationManifestURL)
+        let oldCanonicalBytes = try Data(contentsOf: fixture.paths.outputSplatURL)
+
+        let invalidReplacement = fixture.paths.outputURL.appendingPathComponent("invalid.ply")
+        try Data("not a ply".utf8).write(to: invalidReplacement)
+        XCTAssertThrowsError(
+            try SplatExport.copyIfExists(
+                from: invalidReplacement,
+                to: fixture.paths.outputSplatURL
+            )
+        )
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.outputSplatURL), oldCanonicalBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolatedOutputURL), oldSubjectBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolationManifestURL), oldManifestBytes)
+
+        try TestFileBuilder.writeMinimalPly(at: fixture.paths.msplatOutputURL, vertexCount: 2)
+        let replacementEvidence = try ProjectArtifactValidator.validatedPlyEvidence(
+            at: fixture.paths.msplatOutputURL
+        )
+        var replacementTraining = fixture.training
+        replacementTraining.trainerVersion = "replacement-trainer"
+        replacementTraining.outputPath = "Training/msplat/splat.ply"
+        replacementTraining.outputSHA256 = replacementEvidence.sha256
+        replacementTraining.outputBytes = Int64(replacementEvidence.byteCount)
+        replacementTraining.gaussianCount = replacementEvidence.vertexCount
+        replacementTraining.sceneBounds = replacementEvidence.sceneBounds
+        try TrainingArtifactStore.persist(replacementTraining, paths: fixture.paths)
+
+        XCTAssertThrowsError(
+            try PipelineRunner.promoteMsplatCompletionToPublicOutput(
+                paths: fixture.paths
+            )
+        )
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.outputSplatURL), oldCanonicalBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolatedOutputURL), oldSubjectBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolationManifestURL), oldManifestBytes)
+
+        try SplatExport.copyIfExists(
+            from: fixture.paths.msplatOutputURL,
+            to: fixture.paths.outputSplatURL
+        )
+        let publication = try PipelineRunner.promoteMsplatCompletionToPublicOutput(
+            paths: fixture.paths
+        )
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: fixture.paths.isolatedOutputURL.path
+        ))
+
+        XCTAssertTrue(
+            try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
+                paths: fixture.paths,
+                publication: publication
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.isolatedOutputURL.path
+        ))
+        XCTAssertEqual(
+            try ProjectArtifactValidator.validatedPlyEvidence(
+                at: fixture.paths.outputSplatURL
+            ),
+            replacementEvidence
+        )
+    }
+
     func testPipelineCanTrainWithNativeMsplat() async throws {
         let temp = makeTempRoot()
 

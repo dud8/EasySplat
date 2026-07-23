@@ -21,6 +21,7 @@ public enum IsolationArtifactLoadResult: Sendable, Equatable {
 public enum SubjectIsolationArtifactStoreError: Error, LocalizedError, Equatable {
     case invalidArtifact
     case publicationConflict
+    case canonicalPublicationUnchanged
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +29,8 @@ public enum SubjectIsolationArtifactStoreError: Error, LocalizedError, Equatable
             "The subject-isolation artifact is invalid."
         case .publicationConflict:
             "The subject-isolation artifact changed during publication."
+        case .canonicalPublicationUnchanged:
+            "The canonical splat publication has not changed since subject isolation."
         }
     }
 }
@@ -36,7 +39,6 @@ public enum SubjectIsolationArtifactStore {
     private static let maximumManifestBytes = 1_048_576
     private static let maximumMaskBytes = 64 * 1_048_576
     private static let maximumIdentityBytes = 1_024
-    private static let maximumImageDimension = 65_535
 
     public static func load(paths: ProjectPaths) -> IsolationArtifactLoadResult {
         let fileManager = FileManager.default
@@ -73,12 +75,16 @@ public enum SubjectIsolationArtifactStore {
         stagedOutputURL: URL,
         stagedMasksURL: URL,
         paths: ProjectPaths,
-        shouldCancel: @escaping () -> Bool = { Task.isCancelled }
+        shouldCancel: @escaping @Sendable () -> Bool = { Task.isCancelled }
     ) throws -> ValidatedSplatOutput {
         try throwIfCancelled(shouldCancel)
         try paths.ensureIsolationDirectories()
         try validateManifest(artifact, paths: paths)
-        guard try staleReason(for: artifact, paths: paths) == nil else {
+        guard try staleReason(
+            for: artifact,
+            paths: paths,
+            shouldCancel: shouldCancel
+        ) == nil else {
             throw SubjectIsolationArtifactStoreError.invalidArtifact
         }
         try validateStagingLocation(
@@ -88,7 +94,8 @@ public enum SubjectIsolationArtifactStore {
         )
 
         let stagedOutput = try ProjectArtifactValidator.validatedPlyEvidence(
-            at: stagedOutputURL
+            at: stagedOutputURL,
+            shouldCancel: shouldCancel
         )
         try requireOutput(stagedOutput, matches: artifact.output)
         let stagedMaskURLs = try stagedMaskFiles(at: stagedMasksURL)
@@ -96,7 +103,7 @@ public enum SubjectIsolationArtifactStore {
             throw SubjectIsolationArtifactStoreError.invalidArtifact
         }
         for (mask, url) in zip(artifact.masks, stagedMaskURLs) {
-            try validateMask(mask, at: url)
+            try validateMask(mask, at: url, shouldCancel: shouldCancel)
         }
 
         let manifestData = try encodedManifest(artifact)
@@ -146,23 +153,31 @@ public enum SubjectIsolationArtifactStore {
             try copyPrivateRegularFile(
                 from: source,
                 to: destination,
-                maximumBytes: maximumMaskBytes
+                maximumBytes: maximumMaskBytes,
+                shouldCancel: shouldCancel
             )
-            try validateMask(mask, at: destination)
+            try validateMask(mask, at: destination, shouldCancel: shouldCancel)
             publishedMaskURLs.append(destination)
         }
+        try throwIfCancelled(shouldCancel)
         try synchronizeDirectory(paths.isolationMasksURL)
 
         _ = try ProjectArtifactValidator.publishValidatedPly(
             from: stagedOutputURL,
             to: outputTemporary,
-            expected: ExpectedPlyArtifactIdentity(
+            expected: Optional(ExpectedPlyArtifactIdentity(
                 byteCount: artifact.output.byteCount,
                 vertexCount: artifact.output.gaussianCount,
                 sha256: artifact.output.sha256
-            )
+            )),
+            systemCalls: .system(),
+            shouldCancel: shouldCancel
         )
-        try writePrivateFile(manifestData, to: manifestTemporary)
+        try writePrivateFile(
+            manifestData,
+            to: manifestTemporary,
+            shouldCancel: shouldCancel
+        )
         try throwIfCancelled(shouldCancel)
 
         outputBackup = try moveAsideIfPresent(paths.isolatedOutputURL)
@@ -176,7 +191,12 @@ public enum SubjectIsolationArtifactStore {
         manifestWasPublished = true
         try synchronizeDirectory(paths.isolationURL)
 
-        let validated = try validatePublishedFiles(artifact, paths: paths)
+        try throwIfCancelled(shouldCancel)
+        let validated = try validatePublishedFiles(
+            artifact,
+            paths: paths,
+            shouldCancel: shouldCancel
+        )
         guard try loadManifest(paths: paths) == artifact else {
             throw SubjectIsolationArtifactStoreError.invalidArtifact
         }
@@ -210,23 +230,60 @@ public enum SubjectIsolationArtifactStore {
         return true
     }
 
-    /// Call only after the replacement canonical PLY has been published and
-    /// durably synchronized. The evidence check prevents early invalidation.
+    static func captureCanonicalPublication(
+        paths: ProjectPaths
+    ) throws -> CanonicalSplatPublication {
+        let training = try TrainingArtifactStore.load(
+            from: paths.trainingManifestURL,
+            projectPaths: paths
+        )
+        guard training.completionStatus == .completed,
+              training.outputPath == "Output/splat.ply" else {
+            throw SubjectIsolationArtifactStoreError.invalidArtifact
+        }
+        let outputEvidence = try ProjectArtifactValidator.validatedPlyEvidence(
+            at: paths.outputSplatURL
+        )
+        try TrainingArtifactStore.validateCompletedOutput(
+            training,
+            at: paths.outputSplatURL
+        )
+        let trainingManifest = try BoundedFileReader.readRegularFile(
+            at: paths.trainingManifestURL,
+            maximumBytes: maximumManifestBytes
+        )
+        return CanonicalSplatPublication(
+            outputEvidence: outputEvidence,
+            trainingManifestSHA256: sha256(trainingManifest),
+            trainingInputDigest: training.inputDigest,
+            trainingGeometryDigest: training.geometryDigest,
+            selectedFramesDigest: training.datasetDerivation.sourceSelectedFramesDigest,
+            selectedImageOrder: training.datasetDerivation.registeredImageNames
+        )
+    }
+
+    /// Call only with a publication receipt captured after the replacement
+    /// canonical PLY and its completed training receipt are durably persisted.
     @discardableResult
     public static func invalidateAfterCanonicalRetraining(
         paths: ProjectPaths,
-        publishedCanonicalOutput: ValidatedPlyArtifactEvidence
+        publication: CanonicalSplatPublication
     ) throws -> Bool {
-        let current = try ProjectArtifactValidator.validatedPlyEvidence(
-            at: paths.outputSplatURL
-        )
-        guard current == publishedCanonicalOutput else {
+        guard try captureCanonicalPublication(paths: paths) == publication else {
             throw SubjectIsolationArtifactStoreError.invalidArtifact
         }
         guard FileManager.default.fileExists(atPath: paths.isolationManifestURL.path) else {
             return false
         }
         let artifact = try loadManifest(paths: paths)
+        guard artifact.sourcePlySHA256 != publication.outputEvidence.sha256
+                || artifact.trainingManifestSHA256 != publication.trainingManifestSHA256
+                || artifact.dataset.inputDigest != publication.trainingInputDigest
+                || artifact.dataset.geometryDigest != publication.trainingGeometryDigest
+                || artifact.dataset.selectedFramesDigest != publication.selectedFramesDigest
+                || artifact.dataset.selectedImageOrder != publication.selectedImageOrder else {
+            throw SubjectIsolationArtifactStoreError.canonicalPublicationUnchanged
+        }
         _ = try validatePublishedFiles(artifact, paths: paths)
         try removeValidated(artifact, paths: paths)
         return true
@@ -331,9 +388,14 @@ public enum SubjectIsolationArtifactStore {
                   isSHA256(mask.imageSHA256),
                   isSHA256(mask.maskSHA256),
                   mask.pixelWidth > 0,
-                  mask.pixelWidth <= maximumImageDimension,
+                  mask.pixelWidth <= IsolationArtifact.maximumMaskDimension,
                   mask.pixelHeight > 0,
-                  mask.pixelHeight <= maximumImageDimension,
+                  mask.pixelHeight <= IsolationArtifact.maximumMaskDimension,
+                  mask.pixelWidth.multipliedReportingOverflow(
+                    by: mask.pixelHeight
+                  ).overflow == false,
+                  mask.pixelWidth * mask.pixelHeight
+                    <= IsolationArtifact.maximumDecodedMaskPixelCount,
                   mask.backgroundLabel == 0,
                   mask.subjectLabel > 0 else {
                 throw SubjectIsolationArtifactStoreError.invalidArtifact
@@ -349,15 +411,21 @@ public enum SubjectIsolationArtifactStore {
 
     private static func staleReason(
         for artifact: IsolationArtifact,
-        paths: ProjectPaths
+        paths: ProjectPaths,
+        shouldCancel: @escaping @Sendable () -> Bool = { false }
     ) throws -> IsolationArtifactStaleReason? {
-        let source = try ProjectArtifactValidator.validatedPlyEvidence(at: paths.outputSplatURL)
+        try throwIfCancelled(shouldCancel)
+        let source = try ProjectArtifactValidator.validatedPlyEvidence(
+            at: paths.outputSplatURL,
+            shouldCancel: shouldCancel
+        )
         guard source.sha256 == artifact.sourcePlySHA256 else {
             return .sourceOutput
         }
         let trainingData = try BoundedFileReader.readRegularFile(
             at: paths.trainingManifestURL,
-            maximumBytes: maximumManifestBytes
+            maximumBytes: maximumManifestBytes,
+            shouldCancel: shouldCancel
         )
         guard sha256(trainingData) == artifact.trainingManifestSHA256 else {
             return .trainingManifest
@@ -378,6 +446,7 @@ public enum SubjectIsolationArtifactStore {
             "Training/msplat_dataset/images"
         )
         for mask in artifact.masks {
+            try throwIfCancelled(shouldCancel)
             let imageURL = imageDirectory.appendingPathComponent(mask.imageIdentity)
             guard try GeometryArtifactStore.sha256(
                 of: imageURL,
@@ -391,16 +460,19 @@ public enum SubjectIsolationArtifactStore {
 
     private static func validatePublishedFiles(
         _ artifact: IsolationArtifact,
-        paths: ProjectPaths
+        paths: ProjectPaths,
+        shouldCancel: @escaping @Sendable () -> Bool = { false }
     ) throws -> ValidatedSplatOutput {
         for mask in artifact.masks {
             try validateMask(
                 mask,
-                at: try paths.resolveProjectRelativePath(mask.relativePath)
+                at: try paths.resolveProjectRelativePath(mask.relativePath),
+                shouldCancel: shouldCancel
             )
         }
         let evidence = try ProjectArtifactValidator.validatedPlyEvidence(
-            at: paths.isolatedOutputURL
+            at: paths.isolatedOutputURL,
+            shouldCancel: shouldCancel
         )
         try requireOutput(evidence, matches: artifact.output)
         return ValidatedSplatOutput(
@@ -413,24 +485,52 @@ public enum SubjectIsolationArtifactStore {
         )
     }
 
-    private static func validateMask(_ mask: IsolationArtifact.Mask, at url: URL) throws {
+    private static func validateMask(
+        _ mask: IsolationArtifact.Mask,
+        at url: URL,
+        shouldCancel: @escaping @Sendable () -> Bool = { false },
+        beforeDecode: () -> Void = {}
+    ) throws {
         let data = try BoundedFileReader.readRegularFile(
             at: url,
-            maximumBytes: maximumMaskBytes
+            maximumBytes: maximumMaskBytes,
+            shouldCancel: shouldCancel
         )
-        guard sha256(data) == mask.maskSHA256,
+        try throwIfCancelled(shouldCancel)
+        guard try sha256(data, shouldCancel: shouldCancel) == mask.maskSHA256,
               let source = CGImageSourceCreateWithData(data as CFData, nil),
               CGImageSourceGetCount(source) == 1,
               CGImageSourceGetType(source) as String? == UTType.png.identifier,
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                source,
+                0,
+                nil
+              ) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.intValue == mask.pixelWidth,
+              height.intValue == mask.pixelHeight,
+              width.intValue > 0,
+              width.intValue <= IsolationArtifact.maximumMaskDimension,
+              height.intValue > 0,
+              height.intValue <= IsolationArtifact.maximumMaskDimension,
+              width.intValue.multipliedReportingOverflow(by: height.intValue).overflow == false,
+              width.intValue * height.intValue
+                <= IsolationArtifact.maximumDecodedMaskPixelCount else {
+            throw SubjectIsolationArtifactStoreError.invalidArtifact
+        }
+        try throwIfCancelled(shouldCancel)
+        beforeDecode()
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
               image.width == mask.pixelWidth,
               image.height == mask.pixelHeight,
               image.bitsPerComponent == 8,
               image.colorSpace?.model == .monochrome,
-              containsOnlyExpectedLabels(
+              try containsOnlyExpectedLabels(
                 image,
                 background: mask.backgroundLabel,
-                subject: mask.subjectLabel
+                subject: mask.subjectLabel,
+                shouldCancel: shouldCancel
               ) else {
             throw SubjectIsolationArtifactStoreError.invalidArtifact
         }
@@ -439,8 +539,9 @@ public enum SubjectIsolationArtifactStore {
     private static func containsOnlyExpectedLabels(
         _ image: CGImage,
         background: UInt8,
-        subject: UInt8
-    ) -> Bool {
+        subject: UInt8,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> Bool {
         guard image.bitsPerPixel == 8,
               image.bytesPerRow >= image.width,
               let data = image.dataProvider?.data else {
@@ -450,6 +551,7 @@ public enum SubjectIsolationArtifactStore {
         guard let bytes else { return false }
         var foundSubject = false
         for row in 0..<image.height {
+            try throwIfCancelled(shouldCancel)
             let rowStart = row * image.bytesPerRow
             for column in 0..<image.width {
                 let value = bytes[rowStart + column]
@@ -461,6 +563,22 @@ public enum SubjectIsolationArtifactStore {
         }
         return foundSubject
     }
+
+#if DEBUG
+    static func test_validateMask(
+        _ mask: IsolationArtifact.Mask,
+        at url: URL,
+        shouldCancel: @escaping @Sendable () -> Bool,
+        beforeDecode: () -> Void = {}
+    ) throws {
+        try validateMask(
+            mask,
+            at: url,
+            shouldCancel: shouldCancel,
+            beforeDecode: beforeDecode
+        )
+    }
+#endif
 
     private static func requireOutput(
         _ evidence: ValidatedPlyArtifactEvidence,
@@ -701,7 +819,26 @@ public enum SubjectIsolationArtifactStore {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func throwIfCancelled(_ shouldCancel: () -> Bool) throws {
+    private static func sha256(
+        _ data: Data,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> String {
+        var hasher = SHA256()
+        let chunkSize = 1_048_576
+        var offset = 0
+        while offset < data.count {
+            try throwIfCancelled(shouldCancel)
+            let end = min(offset + chunkSize, data.count)
+            hasher.update(data: data[offset..<end])
+            offset = end
+        }
+        try throwIfCancelled(shouldCancel)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func throwIfCancelled(
+        _ shouldCancel: @escaping @Sendable () -> Bool
+    ) throws {
         if shouldCancel() {
             throw CancellationError()
         }
@@ -710,22 +847,30 @@ public enum SubjectIsolationArtifactStore {
     private static func copyPrivateRegularFile(
         from source: URL,
         to destination: URL,
-        maximumBytes: Int
+        maximumBytes: Int,
+        shouldCancel: @escaping @Sendable () -> Bool
     ) throws {
         let data = try BoundedFileReader.readRegularFile(
             at: source,
-            maximumBytes: maximumBytes
+            maximumBytes: maximumBytes,
+            shouldCancel: shouldCancel
         )
-        try writePrivateFile(data, to: destination)
+        try writePrivateFile(data, to: destination, shouldCancel: shouldCancel)
         guard try BoundedFileReader.readRegularFile(
             at: destination,
-            maximumBytes: maximumBytes
+            maximumBytes: maximumBytes,
+            shouldCancel: shouldCancel
         ) == data else {
             throw SubjectIsolationArtifactStoreError.invalidArtifact
         }
     }
 
-    private static func writePrivateFile(_ data: Data, to destination: URL) throws {
+    private static func writePrivateFile(
+        _ data: Data,
+        to destination: URL,
+        shouldCancel: @escaping @Sendable () -> Bool = { false }
+    ) throws {
+        try throwIfCancelled(shouldCancel)
         let parent = destination.deletingLastPathComponent()
         let directory = Darwin.open(
             parent.path,
@@ -758,6 +903,7 @@ public enum SubjectIsolationArtifactStore {
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
+                try throwIfCancelled(shouldCancel)
                 let count = Darwin.write(
                     descriptor,
                     bytes.baseAddress?.advanced(by: offset),
@@ -770,6 +916,7 @@ public enum SubjectIsolationArtifactStore {
                 offset += count
             }
         }
+        try throwIfCancelled(shouldCancel)
         guard fchmod(descriptor, S_IRUSR | S_IWUSR) == 0,
               fsync(descriptor) == 0 else {
             throw SubjectIsolationArtifactStoreError.invalidArtifact

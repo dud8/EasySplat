@@ -29,6 +29,31 @@ public struct ValidatedSplatOutput: Sendable, Equatable {
     }
 }
 
+public struct CanonicalSplatPublication: Sendable, Equatable {
+    public let outputEvidence: ValidatedPlyArtifactEvidence
+    public let trainingManifestSHA256: String
+    public let trainingInputDigest: String
+    public let trainingGeometryDigest: String
+    public let selectedFramesDigest: String
+    public let selectedImageOrder: [String]
+
+    init(
+        outputEvidence: ValidatedPlyArtifactEvidence,
+        trainingManifestSHA256: String,
+        trainingInputDigest: String,
+        trainingGeometryDigest: String,
+        selectedFramesDigest: String,
+        selectedImageOrder: [String]
+    ) {
+        self.outputEvidence = outputEvidence
+        self.trainingManifestSHA256 = trainingManifestSHA256
+        self.trainingInputDigest = trainingInputDigest
+        self.trainingGeometryDigest = trainingGeometryDigest
+        self.selectedFramesDigest = selectedFramesDigest
+        self.selectedImageOrder = selectedImageOrder
+    }
+}
+
 public struct SubjectAnchor: Codable, Sendable, Equatable {
     public var imageIdentity: String
     public var normalizedX: Double
@@ -98,6 +123,8 @@ public enum SubjectIsolationOutcome: Sendable, Equatable {
 public struct IsolationArtifact: Codable, Sendable, Equatable {
     public static let currentSchemaVersion = 1
     public static let maximumMaskCount = 24
+    public static let maximumMaskDimension = 4_096
+    public static let maximumDecodedMaskPixelCount = 16_777_216
 
     public struct DatasetIdentity: Codable, Sendable, Equatable {
         public var inputDigest: String

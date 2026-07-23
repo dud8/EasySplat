@@ -1,5 +1,7 @@
 import CryptoKit
+import CoreGraphics
 import Foundation
+import ImageIO
 import UniformTypeIdentifiers
 import XCTest
 @testable import EasySplatCore
@@ -159,17 +161,14 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
 
         try fixture.rebuildStaging(vertexCount: 2, maskValue: 2)
         let second = try fixture.makeArtifact(outputIdentity: UUID(), vertexCount: 2, maskValue: 2)
-        var checks = 0
+        let probe = CancellationProbe(cancelAfter: 2)
         XCTAssertThrowsError(
             try SubjectIsolationArtifactStore.publish(
                 second,
                 stagedOutputURL: fixture.stagedOutputURL,
                 stagedMasksURL: fixture.stagedMasksURL,
                 paths: fixture.paths,
-                shouldCancel: {
-                    checks += 1
-                    return checks >= 2
-                }
+                shouldCancel: { probe.shouldCancel() }
             )
         ) { error in
             XCTAssertTrue(error is CancellationError)
@@ -194,6 +193,137 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
         }
         XCTAssertEqual(replacedArtifact.output.identity, second.output.identity)
         XCTAssertEqual(replacedOutput.gaussianCount, 2)
+    }
+
+    func testCancellationAfterOutputPublicationRestoresPreviousSubjectAndCanonicalBytes() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let canonicalBytes = try Data(contentsOf: fixture.paths.outputSplatURL)
+        let first = try fixture.makeArtifact(outputIdentity: UUID())
+        _ = try SubjectIsolationArtifactStore.publish(
+            first,
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+        let firstSubjectBytes = try Data(contentsOf: fixture.paths.isolatedOutputURL)
+
+        try fixture.rebuildStaging(vertexCount: 2, maskValue: 2)
+        let replacement = try fixture.makeArtifact(
+            outputIdentity: UUID(),
+            vertexCount: 2,
+            maskValue: 2
+        )
+        let isolatedOutputURL = fixture.paths.isolatedOutputURL
+        let replacementSHA256 = replacement.output.sha256
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.publish(
+                replacement,
+                stagedOutputURL: fixture.stagedOutputURL,
+                stagedMasksURL: fixture.stagedMasksURL,
+                paths: fixture.paths,
+                shouldCancel: {
+                    (try? GeometryArtifactStore.sha256(
+                        of: isolatedOutputURL
+                    )) == replacementSHA256
+                }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+
+        guard case .valid(let restored, _) =
+                SubjectIsolationArtifactStore.load(paths: fixture.paths) else {
+            return XCTFail("Cancellation must restore the previous valid subject.")
+        }
+        XCTAssertEqual(restored.output.identity, first.output.identity)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolatedOutputURL), firstSubjectBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.outputSplatURL), canonicalBytes)
+    }
+
+    func testMaskValidationRejectsCompressedPixelBombBeforeDecode() throws {
+        let fixture = try makeFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        let bomb = fixture.stagedMasksURL.appendingPathComponent("mask-0.png")
+        XCTAssertTrue(try writeGrayscalePNG(
+            at: bomb,
+            width: IsolationArtifact.maximumMaskDimension + 1,
+            height: IsolationArtifact.maximumMaskDimension + 1,
+            value: 1
+        ))
+        var mask = try fixture.makeArtifact().masks[0]
+        mask.pixelWidth = IsolationArtifact.maximumMaskDimension + 1
+        mask.pixelHeight = IsolationArtifact.maximumMaskDimension + 1
+        mask.maskSHA256 = try GeometryArtifactStore.sha256(of: bomb)
+        var reachedDecode = false
+
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.test_validateMask(
+                mask,
+                at: bomb,
+                shouldCancel: { false },
+                beforeDecode: { reachedDecode = true }
+            )
+        )
+        XCTAssertFalse(reachedDecode)
+        XCTAssertEqual(IsolationArtifact.maximumDecodedMaskPixelCount, 16_777_216)
+    }
+
+    func testMaskValidationAcceptsExactLegalDimensionBoundary() throws {
+        let fixture = try makeFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        let boundary = fixture.stagedMasksURL.appendingPathComponent("mask-0.png")
+        XCTAssertTrue(try writeGrayscalePNG(
+            at: boundary,
+            width: IsolationArtifact.maximumMaskDimension,
+            height: IsolationArtifact.maximumMaskDimension,
+            value: 1
+        ))
+        var mask = try fixture.makeArtifact().masks[0]
+        mask.pixelWidth = IsolationArtifact.maximumMaskDimension
+        mask.pixelHeight = IsolationArtifact.maximumMaskDimension
+        mask.maskSHA256 = try GeometryArtifactStore.sha256(of: boundary)
+
+        XCTAssertNoThrow(
+            try SubjectIsolationArtifactStore.test_validateMask(
+                mask,
+                at: boundary,
+                shouldCancel: { false }
+            )
+        )
+    }
+
+    func testMaskValidationChecksCancellationDuringBoundedReadAndPixelScan() throws {
+        let fixture = try makeFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        let mask = try fixture.makeArtifact().masks[0]
+        let readProbe = CancellationProbe(cancelAfter: 3)
+
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.test_validateMask(
+                mask,
+                at: fixture.stagedMasksURL.appendingPathComponent("mask-0.png"),
+                shouldCancel: { readProbe.shouldCancel() }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertGreaterThanOrEqual(readProbe.checkCount, 3)
+
+        let scanProbe = CancellationProbe(cancelAfter: 9)
+        var reachedDecode = false
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.test_validateMask(
+                mask,
+                at: fixture.stagedMasksURL.appendingPathComponent("mask-0.png"),
+                shouldCancel: { scanProbe.shouldCancel() },
+                beforeDecode: { reachedDecode = true }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertTrue(reachedDecode)
+        XCTAssertGreaterThanOrEqual(scanProbe.checkCount, 9)
     }
 
     func testRemovalAndRetrainInvalidationNeverMutateCanonicalBytes() throws {
@@ -224,10 +354,21 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
             from: replacementCanonical,
             to: fixture.paths.outputSplatURL
         )
+        var replacementTraining = fixture.training
+        replacementTraining.trainerVersion = "replacement-trainer"
+        replacementTraining.outputSHA256 = replacementEvidence.sha256
+        replacementTraining.outputBytes = Int64(replacementEvidence.byteCount)
+        replacementTraining.gaussianCount = replacementEvidence.vertexCount
+        replacementTraining.sceneBounds = replacementEvidence.sceneBounds
+        try TrainingArtifactStore.persist(replacementTraining, paths: fixture.paths)
+        let replacementPublication =
+            try SubjectIsolationArtifactStore.captureCanonicalPublication(
+                paths: fixture.paths
+            )
         XCTAssertTrue(
             try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
                 paths: fixture.paths,
-                publishedCanonicalOutput: replacementEvidence
+                publication: replacementPublication
             )
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.isolatedOutputURL.path))
@@ -249,15 +390,50 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
         let uncommitted = fixture.paths.outputURL.appendingPathComponent("uncommitted.ply")
         try TestFileBuilder.writeMinimalPly(at: uncommitted, vertexCount: 2)
         let uncommittedEvidence = try ProjectArtifactValidator.validatedPlyEvidence(at: uncommitted)
+        let current = try SubjectIsolationArtifactStore.captureCanonicalPublication(
+            paths: fixture.paths
+        )
+        let uncommittedPublication = CanonicalSplatPublication(
+            outputEvidence: uncommittedEvidence,
+            trainingManifestSHA256: current.trainingManifestSHA256,
+            trainingInputDigest: current.trainingInputDigest,
+            trainingGeometryDigest: current.trainingGeometryDigest,
+            selectedFramesDigest: current.selectedFramesDigest,
+            selectedImageOrder: current.selectedImageOrder
+        )
 
         XCTAssertThrowsError(
             try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
                 paths: fixture.paths,
-                publishedCanonicalOutput: uncommittedEvidence
+                publication: uncommittedPublication
             )
         )
         guard case .valid = SubjectIsolationArtifactStore.load(paths: fixture.paths) else {
             return XCTFail("Subject state must remain until canonical publication is proven.")
+        }
+    }
+
+    func testRetrainInvalidationRejectsCurrentPreRetrainPublicationIdentity() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        _ = try SubjectIsolationArtifactStore.publish(
+            fixture.makeArtifact(),
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+        let currentPublication = try SubjectIsolationArtifactStore.captureCanonicalPublication(
+            paths: fixture.paths
+        )
+
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
+                paths: fixture.paths,
+                publication: currentPublication
+            )
+        )
+        guard case .valid = SubjectIsolationArtifactStore.load(paths: fixture.paths) else {
+            return XCTFail("Pre-retrain proof must not remove the current subject.")
         }
     }
 }
@@ -268,7 +444,7 @@ private enum IdentityMutation: CaseIterable {
     case dataset
 }
 
-private struct SubjectIsolationFixture {
+struct SubjectIsolationFixture {
     let root: URL
     let paths: ProjectPaths
     let runID: UUID
@@ -388,7 +564,7 @@ private struct SubjectIsolationFixture {
     }
 }
 
-private func makeFixture(maskCount: Int = 3) throws -> SubjectIsolationFixture {
+func makeSubjectIsolationFixture(maskCount: Int = 3) throws -> SubjectIsolationFixture {
     let root = try TestFileBuilder.makeTempDir()
     let paths = ProjectPaths(root: root)
     try paths.ensureDirectories()
@@ -431,4 +607,68 @@ private func makeFixture(maskCount: Int = 3) throws -> SubjectIsolationFixture {
     )
     try fixture.rebuildStaging(vertexCount: 1, maskValue: 1)
     return fixture
+}
+
+private func makeFixture(maskCount: Int = 3) throws -> SubjectIsolationFixture {
+    try makeSubjectIsolationFixture(maskCount: maskCount)
+}
+
+private final class CancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let cancelAfter: Int
+    private var count = 0
+
+    init(cancelAfter: Int) {
+        self.cancelAfter = cancelAfter
+    }
+
+    var checkCount: Int {
+        lock.withLock { count }
+    }
+
+    func shouldCancel() -> Bool {
+        lock.withLock {
+            count += 1
+            return count >= cancelAfter
+        }
+    }
+}
+
+private func writeGrayscalePNG(
+    at url: URL,
+    width: Int,
+    height: Int,
+    value: UInt8
+) throws -> Bool {
+    let pixelCount = try XCTUnwrap(
+        width.multipliedReportingOverflow(by: height).overflow
+            ? nil
+            : width * height
+    )
+    var pixels = [UInt8](repeating: value, count: pixelCount)
+    let data = Data(bytes: &pixels, count: pixels.count)
+    guard let provider = CGDataProvider(data: data as CFData),
+          let image = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 8,
+            bytesPerRow: width,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+          ),
+          let destination = CGImageDestinationCreateWithURL(
+            url as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+          ) else {
+        return false
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    return CGImageDestinationFinalize(destination)
 }

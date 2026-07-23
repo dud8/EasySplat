@@ -4795,7 +4795,25 @@ public final class PipelineRunner: @unchecked Sendable {
                 try stopIfRequested(after: .exportSplat)
             }
 
-            _ = try promoteMsplatCompletionToPublicOutput(paths: paths)
+            let canonicalPublication = try Self.promoteMsplatCompletionToPublicOutput(
+                paths: paths
+            )
+            do {
+                _ = try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
+                    paths: paths,
+                    publication: canonicalPublication
+                )
+            } catch SubjectIsolationArtifactStoreError.canonicalPublicationUnchanged {
+                // A completed resume can legitimately re-promote the same canonical
+                // publication. Its matching subject artifact remains current.
+            } catch {
+                emit(.stageLog(
+                    stage: .done,
+                    line: "Could not retire the previous subject isolation: "
+                        + error.localizedDescription,
+                    isError: true
+                ))
+            }
             metadata.state = PipelineState(stage: .done, lastError: nil)
             metadata.lastRunStartedAt = nil
             try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)

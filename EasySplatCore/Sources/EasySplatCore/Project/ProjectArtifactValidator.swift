@@ -250,7 +250,22 @@ public enum ProjectArtifactValidator {
     public static func validatedPlyEvidence(
         at url: URL
     ) throws -> ValidatedPlyArtifactEvidence {
-        try validatedPlyEvidence(at: url, beforeBoundsMeasurement: {})
+        try validatedPlyEvidence(
+            at: url,
+            beforeBoundsMeasurement: {},
+            shouldCancel: { false }
+        )
+    }
+
+    static func validatedPlyEvidence(
+        at url: URL,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> ValidatedPlyArtifactEvidence {
+        try validatedPlyEvidence(
+            at: url,
+            beforeBoundsMeasurement: {},
+            shouldCancel: shouldCancel
+        )
     }
 
 #if DEBUG
@@ -260,15 +275,18 @@ public enum ProjectArtifactValidator {
     ) throws -> ValidatedPlyArtifactEvidence {
         try validatedPlyEvidence(
             at: url,
-            beforeBoundsMeasurement: beforeBoundsMeasurement
+            beforeBoundsMeasurement: beforeBoundsMeasurement,
+            shouldCancel: { false }
         )
     }
 #endif
 
     private static func validatedPlyEvidence(
         at url: URL,
-        beforeBoundsMeasurement: () throws -> Void
+        beforeBoundsMeasurement: () throws -> Void,
+        shouldCancel: @escaping @Sendable () -> Bool
     ) throws -> ValidatedPlyArtifactEvidence {
+        try throwIfCancellationRequested(shouldCancel)
         let parentURL = url.deletingLastPathComponent()
         let parent = Darwin.open(
             parentURL.path,
@@ -309,7 +327,8 @@ public enum ProjectArtifactValidator {
         let evidence = try validatedPlyEvidence(
             descriptor: descriptor,
             label: url.lastPathComponent,
-            beforeBoundsMeasurement: beforeBoundsMeasurement
+            beforeBoundsMeasurement: beforeBoundsMeasurement,
+            shouldCancel: shouldCancel
         )
         var finalDescriptor = stat()
         var finalPath = stat()
