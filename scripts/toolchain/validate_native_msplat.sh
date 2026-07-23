@@ -160,7 +160,7 @@ exact_values = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
-    "overlay_sha256": "701e758b248f973929c4c10a14bd684e81fd5e45f2f9dc958ad0d242e0f61e2d",
+    "overlay_sha256": "c4ebdfa026353eeb894ad7d4d8f0b7a68e67f61d99c4eaae929321e6e6bf1489",
     "raster_test_sha256": "06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d",
     "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
     "isolation_source_sha256": "40444aa0fc5a07f6919b28ef4dac1517a6627daa81331013b71ba49ff465c9fc",

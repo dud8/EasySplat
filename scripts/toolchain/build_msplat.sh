@@ -11,6 +11,12 @@ INSTALL_PARENT="$BUILD_DIR/install"
 INSTALL_DIR="$INSTALL_PARENT/msplat"
 STAGE_DIR="$INSTALL_PARENT/msplat.stage.$$"
 PROMOTER_SOURCE="$ROOT/scripts/toolchain/atomic_swap_install.py"
+BUILD_LOCK_PATH="$ROOT/Toolchains/.msplat-build.lock"
+BUILD_LOCK_PROMOTER_SOURCE="$ROOT/scripts/toolchain/atomic_swap_install.py"
+BUILD_LOCK_PROMOTER_SHA256=""
+BUILD_LOCK_DEVICE=""
+BUILD_LOCK_INODE=""
+BUILD_LOCK_OWNED=0
 PROMOTER_RUNTIME_DIR=""
 PROMOTER_RUNTIME=""
 PROMOTER_RUNTIME_SOURCE_SHA256=""
@@ -31,7 +37,7 @@ INSTALL_STAGE_DEVICE=""
 INSTALL_STAGE_INODE=""
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
-OVERLAY_SHA256="701e758b248f973929c4c10a14bd684e81fd5e45f2f9dc958ad0d242e0f61e2d"
+OVERLAY_SHA256="c4ebdfa026353eeb894ad7d4d8f0b7a68e67f61d99c4eaae929321e6e6bf1489"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
 RASTER_TEST_SHA256="06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d"
 ISOLATION_HEADER="$ROOT/Tools/MsplatNative/isolation.hpp"
@@ -116,6 +122,7 @@ cleanup() {
   local promoter_cleanup_status=0
   local snapshot_cleanup_status=0
   local snapshot_cleanup_attempted=0
+  local lock_cleanup_status=0
   trap - EXIT
   trap 'CLEANUP_DEFERRED_SIGNAL=2' INT
   trap 'CLEANUP_DEFERRED_SIGNAL=15' TERM
@@ -175,6 +182,13 @@ cleanup() {
     printf '%s\n' \
       "native msplat cleanup preserved an unverified build-input snapshot: $BUILD_INPUT_SNAPSHOT_DIR" >&2
   fi
+  if [ "$BUILD_LOCK_OWNED" = "1" ]; then
+    release_build_lock || lock_cleanup_status=$?
+    if [ "$lock_cleanup_status" -ne 0 ]; then
+      printf '%s\n' \
+        "native msplat cleanup preserved an unverified build lock: $BUILD_LOCK_PATH" >&2
+    fi
+  fi
   if [ "$status" -eq 0 ] && [ "$install_cleanup_status" -ne 0 ]; then
     status="$install_cleanup_status"
   fi
@@ -183,6 +197,9 @@ cleanup() {
   fi
   if [ "$status" -eq 0 ] && [ "$snapshot_cleanup_status" -ne 0 ]; then
     status="$snapshot_cleanup_status"
+  fi
+  if [ "$status" -eq 0 ] && [ "$lock_cleanup_status" -ne 0 ]; then
+    status="$lock_cleanup_status"
   fi
   if [ "$CLEANUP_DEFERRED_SIGNAL" -ne 0 ]; then
     status=$((128 + CLEANUP_DEFERRED_SIGNAL))
@@ -252,6 +269,131 @@ replay_deferred_build_signal() {
   fi
 }
 
+release_build_lock() {
+  [ "$BUILD_LOCK_OWNED" = "1" ] || return 0
+  [ -f "$BUILD_LOCK_PROMOTER_SOURCE" ] && \
+    [ ! -L "$BUILD_LOCK_PROMOTER_SOURCE" ] && \
+    [ "$(sha256 "$BUILD_LOCK_PROMOTER_SOURCE")" = "$BUILD_LOCK_PROMOTER_SHA256" ] \
+    || return 1
+  "$PYTHON_BIN" - \
+    --remove-bound-build-lock \
+    "$BUILD_LOCK_PATH" \
+    "$BUILD_LOCK_DEVICE" \
+    "$BUILD_LOCK_INODE" \
+    "$$" < "$BUILD_LOCK_PROMOTER_SOURCE" || return $?
+  BUILD_LOCK_OWNED=0
+}
+
+acquire_build_lock() {
+  local identity
+  BUILD_LOCK_PROMOTER_SHA256="$(sha256 "$BUILD_LOCK_PROMOTER_SOURCE")"
+  begin_deferred_build_signals
+  if ! /usr/bin/shlock -f "$BUILD_LOCK_PATH" -p "$$"; then
+    replay_deferred_build_signal
+    die "another native msplat build already holds $BUILD_LOCK_PATH"
+  fi
+  if ! identity="$(
+    "$PYTHON_BIN" - "$BUILD_LOCK_PATH" "$$" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+owner_pid = int(sys.argv[2])
+before = os.lstat(path)
+descriptor = os.open(
+    path,
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    opened = os.fstat(descriptor)
+    content = os.read(descriptor, 64)
+    after = os.fstat(descriptor)
+    named = os.lstat(path)
+finally:
+    os.close(descriptor)
+fields = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_nlink",
+    "st_uid",
+    "st_gid",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
+    "st_flags",
+)
+if (
+    not stat.S_ISREG(opened.st_mode)
+    or any(getattr(before, field) != getattr(item, field)
+           for item in (opened, after, named)
+           for field in fields)
+    or opened.st_nlink != 1
+    or opened.st_uid != os.getuid()
+    or opened.st_gid != os.getgid()
+    or stat.S_IMODE(opened.st_mode) != 0o644
+    or opened.st_flags != 0
+    or content != f"{owner_pid}\n".encode("ascii")
+):
+    raise SystemExit("native build lock identity is invalid")
+print(f"{opened.st_dev}:{opened.st_ino}")
+PY
+  )"; then
+    replay_deferred_build_signal
+    die "could not bind the native msplat build lock"
+  fi
+  if [[ ! "$identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+    replay_deferred_build_signal
+    die "native msplat build lock identity is malformed"
+  fi
+  BUILD_LOCK_DEVICE="${identity%%:*}"
+  BUILD_LOCK_INODE="${identity#*:}"
+  BUILD_LOCK_OWNED=1
+  replay_deferred_build_signal
+}
+
+run_build_lock_probe() {
+  local probe_dir="${EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR:-}"
+  local iteration
+  [ -n "$probe_dir" ] || return 1
+  "$PYTHON_BIN" - "$probe_dir" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+entry = os.lstat(root)
+if (
+    not stat.S_ISDIR(entry.st_mode)
+    or entry.st_uid != os.getuid()
+    or entry.st_gid != os.getgid()
+    or stat.S_IMODE(entry.st_mode) != 0o700
+):
+    raise SystemExit("build-lock probe directory is not private")
+descriptor = os.open(
+    root / "acquired",
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+os.close(descriptor)
+PY
+  for iteration in {1..200}; do
+    if [ -f "$probe_dir/release" ] && [ ! -L "$probe_dir/release" ]; then
+      return 0
+    fi
+    /bin/sleep 0.05
+  done
+  die "timed out waiting for the native build-lock probe release"
+}
+
 abandon_unbound_private_promoter() {
   local reason="$1"
   local path="$PROMOTER_RUNTIME_DIR"
@@ -272,7 +414,6 @@ recover_stale_private_promoters() {
     [ -e "$path" ] || [ -L "$path" ] || continue
     if ! identity="$(
       "$PYTHON_BIN" - "$path" "$PROMOTER_RUNTIME_SOURCE_SHA256" <<'PY'
-import hashlib
 import os
 import re
 import stat
@@ -280,7 +421,6 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-expected_digest = sys.argv[2]
 if not re.fullmatch(r"promoter[.]stage[.][A-Za-z0-9]{6}", root.name):
     raise SystemExit("stale private promoter name is ambiguous")
 entry = os.lstat(root)
@@ -291,30 +431,6 @@ if (
     or stat.S_IMODE(entry.st_mode) != 0o700
 ):
     raise SystemExit("stale private promoter root is not strictly owned")
-children = sorted(root.iterdir(), key=lambda path: os.fsencode(path.name))
-if len(children) > 1:
-    raise SystemExit("stale private promoter tree has unexpected entries")
-if children:
-    child = children[0]
-    if child.name != "atomic_swap_install.py":
-        raise SystemExit("stale private promoter entry is unexpected")
-    child_entry = os.lstat(child)
-    if (
-        not stat.S_ISREG(child_entry.st_mode)
-        or child_entry.st_nlink != 1
-        or child_entry.st_uid != os.getuid()
-        or child_entry.st_gid != os.getgid()
-        or stat.S_IMODE(child_entry.st_mode) != 0o700
-    ):
-        raise SystemExit("stale private promoter executable is invalid")
-    attributes = set(os.listxattr(child, follow_symlinks=False))
-    if not attributes.issubset({"com.apple.provenance"}):
-        raise SystemExit("stale private promoter metadata is ambiguous")
-    if hashlib.sha256(child.read_bytes()).hexdigest() != expected_digest:
-        raise SystemExit("stale private promoter executable digest changed")
-root_attributes = set(os.listxattr(root, follow_symlinks=False))
-if not root_attributes.issubset({"com.apple.provenance"}):
-    raise SystemExit("stale private promoter root metadata is ambiguous")
 print(f"{entry.st_dev}:{entry.st_ino}")
 PY
     )"; then
@@ -323,11 +439,11 @@ PY
     [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || \
       die "stale private promoter identity is malformed: $path"
     run_promoter_source_from_stdin \
-      --remove-owned-tree \
+      --remove-private-promoter-tree \
       "$path" \
       "${identity%%:*}" \
       "${identity#*:}" \
-      --allow-symlinks || \
+      "$PROMOTER_RUNTIME_SOURCE_SHA256" || \
       die "could not recover stale private promoter: $path"
   done
 }
@@ -468,6 +584,9 @@ preflight() {
   for command in cmake ninja git curl shasum xcrun ditto file; do
     require_command "$command"
   done
+  [ -x /usr/bin/shlock ] || die "required command is missing: /usr/bin/shlock"
+  [ -d "$ROOT/Toolchains" ] && [ ! -L "$ROOT/Toolchains" ] \
+    || die "Toolchains must be an ordinary directory"
   [ -x "$PYTHON_BIN" ] || die "selected Python executable is unavailable"
   [ -f "$PROMOTER_SOURCE" ] && [ ! -L "$PROMOTER_SOURCE" ] \
     || die "atomic install promoter must be a regular file"
@@ -1602,6 +1721,11 @@ promote_install() {
 }
 
 preflight
+acquire_build_lock
+if [ -n "${EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR:-}" ]; then
+  run_build_lock_probe
+  exit 0
+fi
 mkdir -p "$BUILD_DIR" "$INSTALL_PARENT"
 snapshot_build_inputs
 revalidate_snapshotted_pins

@@ -5,6 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT/scripts/toolchain/build_msplat.sh"
+ATOMIC_PROMOTER="$ROOT/scripts/toolchain/atomic_swap_install.py"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
 ISOLATION_HEADER="$ROOT/Tools/MsplatNative/isolation.hpp"
@@ -103,6 +104,7 @@ require_json_hash() {
 }
 
 require_file "$BUILD_SCRIPT"
+require_file "$ATOMIC_PROMOTER"
 require_file "$OVERLAY"
 require_file "$RASTER_TEST_SOURCE"
 for source in \
@@ -282,6 +284,13 @@ require_contains 'class IsolationDatasetSnapshot' "$OVERLAY"
 require_contains 'copyAuthenticatedFile(' "$OVERLAY"
 require_contains 'verifySnapshotIdentity(' "$OVERLAY"
 require_contains 'IsolationDatasetSnapshot snapshot(' "$OVERLAY"
+require_contains 'claimIsolationSnapshotRoot(' "$OVERLAY"
+require_contains 'removeIsolationSnapshotContentsAt(' "$OVERLAY"
+require_contains '::renameatx_np(' "$OVERLAY"
+require_contains '::fstatat(' "$OVERLAY"
+require_contains '::openat(' "$OVERLAY"
+require_contains '::unlinkat(' "$OVERLAY"
+require_absent 'fs::remove_all(root_' "$OVERLAY"
 require_absent \
   'loaders::loadColmap(\n                canonicalSparse.string()' \
   "$OVERLAY"
@@ -644,6 +653,17 @@ require_absent "trap '' INT TERM HUP" "$BUILD_SCRIPT"
 require_contains 'capture_deferred_build_signal' "$BUILD_SCRIPT"
 require_contains 'replay_deferred_build_signal' "$BUILD_SCRIPT"
 require_contains 'recover_stale_private_promoters' "$BUILD_SCRIPT"
+require_contains 'BUILD_LOCK_PATH="$ROOT/Toolchains/.msplat-build.lock"' "$BUILD_SCRIPT"
+require_contains 'acquire_build_lock' "$BUILD_SCRIPT"
+require_contains 'release_build_lock' "$BUILD_SCRIPT"
+require_contains '/usr/bin/shlock -f "$BUILD_LOCK_PATH" -p "$$"' "$BUILD_SCRIPT"
+require_contains 'EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR' "$BUILD_SCRIPT"
+require_contains '--remove-private-promoter-tree' "$BUILD_SCRIPT"
+require_contains 'def remove_private_promoter_tree(' "$ATOMIC_PROMOTER"
+require_contains 'def remove_bound_build_lock(' "$ATOMIC_PROMOTER"
+require_contains 'def _after_private_promoter_validation(' "$ATOMIC_PROMOTER"
+require_contains '--remove-private-promoter-tree' "$ATOMIC_PROMOTER"
+require_contains '--remove-bound-build-lock' "$ATOMIC_PROMOTER"
 require_contains 'abandon_unbound_private_promoter' "$BUILD_SCRIPT"
 require_contains '/bin/rmdir "$path"' "$BUILD_SCRIPT"
 require_contains 'restore_build_signal_traps' "$BUILD_SCRIPT"
@@ -670,6 +690,7 @@ if boundary < 0:
     raise SystemExit("native build never crosses the immutable input snapshot boundary")
 calls = [
     source.rfind("\npreflight\n"),
+    source.rfind("\nacquire_build_lock\n"),
     boundary,
     source.rfind("\nrevalidate_snapshotted_pins\n"),
     source.rfind("\nrecover_stale_private_promoters\n"),
@@ -911,6 +932,255 @@ require_contains 'sync_failure_timing_lifecycle passed' "$RASTER_TEST_SOURCE"
 require_contains 'msplat_fail_next_sync_for_testing' "$RASTER_TEST_SOURCE"
 require_contains 'msplat_pending_exact_raster_timing_handlers_for_testing' "$RASTER_TEST_SOURCE"
 require_contains 'invalidHistory' "$RASTER_TEST_SOURCE"
+
+python3 - "$ATOMIC_PROMOTER" <<'PY'
+import hashlib
+import importlib.util
+import os
+import shutil
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+source = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("atomic_swap_install", source)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+expected_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+
+def create_promoter(parent, suffix):
+    root = parent / f"promoter.stage.{suffix}"
+    root.mkdir(mode=0o700)
+    executable = root / "atomic_swap_install.py"
+    shutil.copyfile(source, executable)
+    executable.chmod(0o700)
+    metadata = root.lstat()
+    return root, metadata
+
+
+with tempfile.TemporaryDirectory(prefix="easysplat-promoter-recovery.") as temporary:
+    parent = Path(temporary)
+    valid, valid_metadata = create_promoter(parent, "ABC123")
+    module.remove_private_promoter_tree(
+        valid,
+        valid_metadata.st_dev,
+        valid_metadata.st_ino,
+        expected_digest,
+    )
+    if valid.exists():
+        raise SystemExit("strict private-promoter recovery left a valid root")
+
+    injected, injected_metadata = create_promoter(parent, "DEF456")
+
+    def inject_unverified_entry(_parent, _original, directory):
+        descriptor = os.open(
+            "injected",
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        os.write(descriptor, b"preserve me\n")
+        os.close(descriptor)
+
+    module._after_private_promoter_validation = inject_unverified_entry
+    try:
+        module.remove_private_promoter_tree(
+            injected,
+            injected_metadata.st_dev,
+            injected_metadata.st_ino,
+            expected_digest,
+        )
+    except module.PromotionRecoveryError:
+        pass
+    else:
+        raise SystemExit("injected private-promoter content was accepted")
+    if (
+        not (injected / "injected").is_file()
+        or (injected / "injected").read_bytes() != b"preserve me\n"
+        or hashlib.sha256(
+            (injected / "atomic_swap_install.py").read_bytes()
+        ).hexdigest()
+        != expected_digest
+    ):
+        raise SystemExit("private-promoter recovery deleted injected state")
+
+    swapped, swapped_metadata = create_promoter(parent, "GHI789")
+
+    def install_root_replacement(parent_descriptor, original_name, _directory):
+        os.mkdir(original_name, mode=0o700, dir_fd=parent_descriptor)
+        replacement = os.open(
+            original_name,
+            module.DIRECTORY_OPEN_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            sentinel = os.open(
+                "replacement",
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=replacement,
+            )
+            os.write(sentinel, b"replacement\n")
+            os.close(sentinel)
+        finally:
+            os.close(replacement)
+
+    module._after_private_promoter_validation = install_root_replacement
+    module.remove_private_promoter_tree(
+        swapped,
+        swapped_metadata.st_dev,
+        swapped_metadata.st_ino,
+        expected_digest,
+    )
+    replacement = swapped / "replacement"
+    if replacement.read_bytes() != b"replacement\n":
+        raise SystemExit("private-promoter recovery removed a root replacement")
+PY
+
+python3 - "$BUILD_SCRIPT" "$ATOMIC_PROMOTER" "$ROOT" <<'PY'
+import hashlib
+import os
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+build_script = Path(sys.argv[1])
+promoter_source = Path(sys.argv[2])
+root = Path(sys.argv[3])
+build_root = root / "Toolchains" / "build" / "msplat"
+build_root.mkdir(parents=True, exist_ok=True)
+lock_path = root / "Toolchains" / ".msplat-build.lock"
+
+with tempfile.TemporaryDirectory(prefix="easysplat-build-lock.") as temporary:
+    probe_root = Path(temporary)
+    probe_a = probe_root / "a"
+    probe_b = probe_root / "b"
+    probe_a.mkdir(mode=0o700)
+    probe_b.mkdir(mode=0o700)
+    log_a = (probe_root / "a.log").open("wb")
+    env_a = os.environ.copy()
+    env_a["EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR"] = str(probe_a)
+    first = subprocess.Popen(
+        ["/bin/bash", str(build_script)],
+        cwd=root,
+        env=env_a,
+        stdout=log_a,
+        stderr=subprocess.STDOUT,
+    )
+    live_promoter = None
+    live_identity = None
+    try:
+        deadline = time.monotonic() + 15
+        while not (probe_a / "acquired").is_file():
+            if first.poll() is not None:
+                log_a.close()
+                raise SystemExit(
+                    "first build-lock probe exited before acquiring the lock: "
+                    + (probe_root / "a.log").read_text(errors="replace")
+                )
+            if time.monotonic() >= deadline:
+                raise SystemExit("first build-lock probe did not acquire the lock")
+            time.sleep(0.05)
+
+        for _ in range(128):
+            candidate = build_root / (
+                "promoter.stage."
+                + "".join(
+                    secrets.choice(
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    )
+                    for _ in range(6)
+                )
+            )
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            live_promoter = candidate
+            break
+        if live_promoter is None:
+            raise SystemExit("could not create a live private-promoter fixture")
+        live_executable = live_promoter / "atomic_swap_install.py"
+        shutil.copyfile(promoter_source, live_executable)
+        live_executable.chmod(0o700)
+        live_identity = live_promoter.lstat()
+        live_digest = hashlib.sha256(live_executable.read_bytes()).hexdigest()
+
+        env_b = os.environ.copy()
+        env_b["EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR"] = str(probe_b)
+        second = subprocess.run(
+            ["/bin/bash", str(build_script)],
+            cwd=root,
+            env=env_b,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if (
+            second.returncode != 1
+            or "another native msplat build already holds" not in second.stderr
+        ):
+            raise SystemExit(
+                "parallel native builder did not fail on the live build lock"
+            )
+        after = live_promoter.lstat()
+        if (
+            not stat.S_ISDIR(after.st_mode)
+            or (after.st_dev, after.st_ino)
+            != (live_identity.st_dev, live_identity.st_ino)
+            or hashlib.sha256(live_executable.read_bytes()).hexdigest()
+            != live_digest
+        ):
+            raise SystemExit("parallel native builder changed the live promoter")
+
+        (probe_a / "release").write_bytes(b"release\n")
+        if first.wait(timeout=30) != 0:
+            log_a.close()
+            raise SystemExit(
+                "first build-lock probe failed during release: "
+                + (probe_root / "a.log").read_text(errors="replace")
+            )
+        if lock_path.exists() or lock_path.is_symlink():
+            raise SystemExit("native build-lock probe left its owned lock behind")
+    finally:
+        if first.poll() is None:
+            (probe_a / "release").write_bytes(b"release\n")
+            try:
+                first.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                first.terminate()
+                first.wait(timeout=10)
+        log_a.close()
+        if live_promoter is not None and live_identity is not None:
+            current = live_promoter.lstat()
+            if (current.st_dev, current.st_ino) != (
+                live_identity.st_dev,
+                live_identity.st_ino,
+            ):
+                raise SystemExit(
+                    "refusing to clean a replaced live-promoter fixture"
+                )
+            executable = live_promoter / "atomic_swap_install.py"
+            executable.unlink()
+            live_promoter.rmdir()
+PY
 
 if [ "${1:-}" = "--source-only" ]; then
   echo "native msplat source contracts passed"
@@ -1367,6 +1637,29 @@ for alias_case in source mask; do
   grep -Eqi 'event.*descriptor|alias|distinct' \
     "$negative_dir/isolation-events-alias-$alias_case.stderr" \
     || fail "event descriptor $alias_case alias diagnostic is not useful"
+done
+
+for alias_case in source mask; do
+  if [ "$alias_case" = source ]; then
+    alias_path="$isolation_source"
+  else
+    alias_path="$isolation_manifest"
+  fi
+  alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+  case_events_fd=2
+  set +e
+  run_complete_isolation_case \
+    >"$negative_dir/isolation-events-fd2-alias-$alias_case.stdout" \
+    2<>"$alias_path"
+  alias_status=$?
+  set -e
+  [ "$alias_status" = 1 ] \
+    || fail "fd2 event descriptor $alias_case alias exited with $alias_status instead of 1"
+  [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+    || fail "fd2 event descriptor alias changed the isolation $alias_case input"
+  grep -Eqi 'event.*descriptor|alias|distinct' \
+    "$negative_dir/isolation-events-fd2-alias-$alias_case.stdout" \
+    || fail "fd2 event descriptor $alias_case alias diagnostic is not useful"
 done
 case_events_fd=1
 

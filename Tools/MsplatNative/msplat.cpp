@@ -13,6 +13,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstring>
+#include <dirent.h>
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
@@ -820,6 +821,304 @@ void copyAuthenticatedFile(
     }
 }
 
+class ScopedDescriptor {
+public:
+    explicit ScopedDescriptor(int descriptor = -1) : descriptor_(descriptor) {}
+
+    ~ScopedDescriptor() {
+        if (descriptor_ >= 0) (void)::close(descriptor_);
+    }
+
+    ScopedDescriptor(const ScopedDescriptor &) = delete;
+    ScopedDescriptor &operator=(const ScopedDescriptor &) = delete;
+
+    int get() const { return descriptor_; }
+
+private:
+    int descriptor_;
+};
+
+bool sameIsolationSnapshotEntry(
+    const struct stat &expected,
+    const struct stat &actual
+) {
+    return (expected.st_mode & S_IFMT) == (actual.st_mode & S_IFMT) &&
+        expected.st_dev == actual.st_dev &&
+        expected.st_ino == actual.st_ino &&
+        expected.st_uid == actual.st_uid;
+}
+
+[[noreturn]] void throwIsolationSnapshotCleanupError(
+    const std::string &operation
+) {
+    const int savedError = errno;
+    throw std::runtime_error(
+        operation + ": " + std::string(std::strerror(savedError))
+    );
+}
+
+void restoreIsolationSnapshotClaim(
+    int parentDescriptor,
+    const std::string &claimedName,
+    const std::string &originalName
+) noexcept {
+    (void)::renameatx_np(
+        parentDescriptor,
+        claimedName.c_str(),
+        parentDescriptor,
+        originalName.c_str(),
+        RENAME_EXCL
+    );
+}
+
+std::string claimIsolationSnapshotEntry(
+    int parentDescriptor,
+    const std::string &originalName,
+    const struct stat &expected,
+    std::string_view claimPrefix
+) {
+    const auto token = static_cast<unsigned long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count()
+    );
+    for (unsigned int attempt = 0; attempt < 128; ++attempt) {
+        const std::string claimedName =
+            std::string(claimPrefix) + "." +
+            std::to_string(static_cast<long long>(::getpid())) + "." +
+            std::to_string(token) + "." +
+            std::to_string(attempt);
+        if (::renameatx_np(
+                parentDescriptor,
+                originalName.c_str(),
+                parentDescriptor,
+                claimedName.c_str(),
+                RENAME_EXCL
+            ) != 0) {
+            if (errno == EEXIST) continue;
+            throwIsolationSnapshotCleanupError(
+                "cannot claim private isolation snapshot entry"
+            );
+        }
+
+        struct stat claimedMetadata {};
+        if (::fstatat(
+                parentDescriptor,
+                claimedName.c_str(),
+                &claimedMetadata,
+                AT_SYMLINK_NOFOLLOW
+            ) != 0 ||
+            !sameIsolationSnapshotEntry(expected, claimedMetadata)) {
+            restoreIsolationSnapshotClaim(
+                parentDescriptor,
+                claimedName,
+                originalName
+            );
+            throw std::runtime_error(
+                "private isolation snapshot entry changed while claiming it"
+            );
+        }
+        return claimedName;
+    }
+    throw std::runtime_error(
+        "cannot reserve a private isolation snapshot cleanup name"
+    );
+}
+
+std::vector<std::string> isolationSnapshotEntryNames(int directoryDescriptor) {
+    const int duplicate = ::fcntl(
+        directoryDescriptor,
+        F_DUPFD_CLOEXEC,
+        0
+    );
+    if (duplicate < 0) {
+        throwIsolationSnapshotCleanupError(
+            "cannot duplicate private isolation snapshot directory"
+        );
+    }
+    DIR *directory = ::fdopendir(duplicate);
+    if (directory == nullptr) {
+        const int savedError = errno;
+        (void)::close(duplicate);
+        errno = savedError;
+        throwIsolationSnapshotCleanupError(
+            "cannot enumerate private isolation snapshot directory"
+        );
+    }
+
+    std::vector<std::string> names;
+    errno = 0;
+    while (dirent *entry = ::readdir(directory)) {
+        const std::string name(entry->d_name);
+        if (name != "." && name != "..") names.push_back(name);
+        errno = 0;
+    }
+    const int enumerationError = errno;
+    const int closeStatus = ::closedir(directory);
+    if (enumerationError != 0) {
+        errno = enumerationError;
+        throwIsolationSnapshotCleanupError(
+            "cannot enumerate private isolation snapshot directory"
+        );
+    }
+    if (closeStatus != 0) {
+        throwIsolationSnapshotCleanupError(
+            "cannot close private isolation snapshot directory"
+        );
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+void removeIsolationSnapshotContentsAt(int directoryDescriptor) {
+    for (const std::string &name :
+         isolationSnapshotEntryNames(directoryDescriptor)) {
+        struct stat expected {};
+        if (::fstatat(
+                directoryDescriptor,
+                name.c_str(),
+                &expected,
+                AT_SYMLINK_NOFOLLOW
+            ) != 0) {
+            throwIsolationSnapshotCleanupError(
+                "cannot inspect private isolation snapshot entry"
+            );
+        }
+        const std::string claimedName = claimIsolationSnapshotEntry(
+            directoryDescriptor,
+            name,
+            expected,
+            ".easysplat-isolation-entry"
+        );
+        bool removed = false;
+        try {
+            if (S_ISDIR(expected.st_mode)) {
+                {
+                    ScopedDescriptor child(::openat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                    ));
+                    if (child.get() < 0) {
+                        throwIsolationSnapshotCleanupError(
+                            "cannot open private isolation snapshot directory"
+                        );
+                    }
+                    struct stat opened {};
+                    if (::fstat(child.get(), &opened) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, opened)) {
+                        throw std::runtime_error(
+                            "private isolation snapshot directory changed while opening it"
+                        );
+                    }
+                    removeIsolationSnapshotContentsAt(child.get());
+                    struct stat openedAfter {};
+                    struct stat namedAfter {};
+                    if (::fstat(child.get(), &openedAfter) != 0 ||
+                        ::fstatat(
+                            directoryDescriptor,
+                            claimedName.c_str(),
+                            &namedAfter,
+                            AT_SYMLINK_NOFOLLOW
+                        ) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, openedAfter) ||
+                        !sameIsolationSnapshotEntry(expected, namedAfter)) {
+                        throw std::runtime_error(
+                            "private isolation snapshot directory changed during cleanup"
+                        );
+                    }
+                }
+                if (::unlinkat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        AT_REMOVEDIR
+                    ) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot remove private isolation snapshot directory"
+                    );
+                }
+            } else if (S_ISREG(expected.st_mode)) {
+                {
+                    ScopedDescriptor file(::openat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+                    ));
+                    if (file.get() < 0) {
+                        throwIsolationSnapshotCleanupError(
+                            "cannot open private isolation snapshot file"
+                        );
+                    }
+                    struct stat opened {};
+                    struct stat namedAfter {};
+                    if (::fstat(file.get(), &opened) != 0 ||
+                        ::fstatat(
+                            directoryDescriptor,
+                            claimedName.c_str(),
+                            &namedAfter,
+                            AT_SYMLINK_NOFOLLOW
+                        ) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, opened) ||
+                        !sameIsolationSnapshotEntry(expected, namedAfter)) {
+                        throw std::runtime_error(
+                            "private isolation snapshot file changed during cleanup"
+                        );
+                    }
+                }
+                if (::unlinkat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        0
+                    ) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot remove private isolation snapshot file"
+                    );
+                }
+            } else if (S_ISLNK(expected.st_mode)) {
+                if (::unlinkat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        0
+                    ) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot remove private isolation snapshot link"
+                    );
+                }
+            } else {
+                throw std::runtime_error(
+                    "unsupported entry in private isolation snapshot"
+                );
+            }
+            removed = true;
+        } catch (...) {
+            if (!removed) {
+                restoreIsolationSnapshotClaim(
+                    directoryDescriptor,
+                    claimedName,
+                    name
+                );
+            }
+            throw;
+        }
+    }
+    if (::fsync(directoryDescriptor) != 0) {
+        throwIsolationSnapshotCleanupError(
+            "cannot sync private isolation snapshot directory"
+        );
+    }
+}
+
+std::string claimIsolationSnapshotRoot(
+    int parentDescriptor,
+    const std::string &rootName,
+    const struct stat &expected
+) {
+    return claimIsolationSnapshotEntry(
+        parentDescriptor,
+        rootName,
+        expected,
+        ".easysplat-isolation-cleanup"
+    );
+}
+
 class IsolationDatasetSnapshot {
 public:
     explicit IsolationDatasetSnapshot(const fs::path &dataset) {
@@ -976,14 +1275,103 @@ private:
 
     void removeSafely() noexcept {
         if (root_.empty()) return;
-        struct stat status {};
-        if (::lstat(root_.c_str(), &status) == 0 &&
-            S_ISDIR(status.st_mode) &&
-            static_cast<std::uint64_t>(status.st_dev) == rootDevice_ &&
-            static_cast<std::uint64_t>(status.st_ino) == rootInode_ &&
-            status.st_uid == ::getuid()) {
-            std::error_code ignored;
-            fs::remove_all(root_, ignored);
+        try {
+            const fs::path parentPath = root_.parent_path();
+            const std::string rootName = root_.filename().string();
+            ScopedDescriptor parent(::open(
+                parentPath.c_str(),
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            ));
+            if (parent.get() < 0 || rootName.empty()) {
+                root_.clear();
+                return;
+            }
+
+            struct stat expected {};
+            if (::fstatat(
+                    parent.get(),
+                    rootName.c_str(),
+                    &expected,
+                    AT_SYMLINK_NOFOLLOW
+                ) != 0 ||
+                !S_ISDIR(expected.st_mode) ||
+                static_cast<std::uint64_t>(expected.st_dev) != rootDevice_ ||
+                static_cast<std::uint64_t>(expected.st_ino) != rootInode_ ||
+                expected.st_uid != ::getuid()) {
+                root_.clear();
+                return;
+            }
+
+            const std::string claimedName = claimIsolationSnapshotRoot(
+                parent.get(),
+                rootName,
+                expected
+            );
+            bool removed = false;
+            try {
+                {
+                    ScopedDescriptor claimed(::openat(
+                        parent.get(),
+                        claimedName.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                    ));
+                    if (claimed.get() < 0) {
+                        throwIsolationSnapshotCleanupError(
+                            "cannot open claimed private isolation snapshot"
+                        );
+                    }
+                    struct stat opened {};
+                    if (::fstat(claimed.get(), &opened) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, opened)) {
+                        throw std::runtime_error(
+                            "claimed private isolation snapshot identity changed"
+                        );
+                    }
+                    removeIsolationSnapshotContentsAt(claimed.get());
+                    struct stat openedAfter {};
+                    struct stat namedAfter {};
+                    if (::fstat(claimed.get(), &openedAfter) != 0 ||
+                        ::fstatat(
+                            parent.get(),
+                            claimedName.c_str(),
+                            &namedAfter,
+                            AT_SYMLINK_NOFOLLOW
+                        ) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, openedAfter) ||
+                        !sameIsolationSnapshotEntry(expected, namedAfter)) {
+                        throw std::runtime_error(
+                            "claimed private isolation snapshot changed during cleanup"
+                        );
+                    }
+                }
+                if (::unlinkat(
+                        parent.get(),
+                        claimedName.c_str(),
+                        AT_REMOVEDIR
+                    ) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot remove claimed private isolation snapshot"
+                    );
+                }
+                if (::fsync(parent.get()) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot sync private isolation snapshot parent"
+                    );
+                }
+                removed = true;
+            } catch (...) {
+                if (!removed) {
+                    restoreIsolationSnapshotClaim(
+                        parent.get(),
+                        claimedName,
+                        rootName
+                    );
+                }
+                throw;
+            }
+        } catch (...) {
+            // Cleanup is best-effort and must never escape the destructor. Any
+            // identity uncertainty preserves the claimed tree or replacement.
         }
         root_.clear();
     }
@@ -2584,6 +2972,10 @@ int main(int argc, char *argv[]) {
         return parserExit == 0 ? 0 : 1;
     }
 
+    if (eventsFileDescriptor == STDERR_FILENO) {
+        std::cerr.rdbuf(std::cout.rdbuf());
+    }
+
     std::optional<EventWriter> events;
     std::optional<BoundEventFileIdentity> boundEventFile;
     bool isolationEventEmissionSafe = true;
@@ -2610,7 +3002,6 @@ int main(int argc, char *argv[]) {
         }
         events.emplace(eventsFileDescriptor);
         if (eventsFileDescriptor == STDOUT_FILENO) std::cout.rdbuf(std::cerr.rdbuf());
-        if (eventsFileDescriptor == STDERR_FILENO) std::cerr.rdbuf(std::cout.rdbuf());
 
         const bool isolationOnlyArgumentProvided =
             sourcePlyOption->count() != 0 ||
