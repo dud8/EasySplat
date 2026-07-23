@@ -15,7 +15,7 @@
 namespace easysplat::isolation {
 
 inline constexpr std::size_t kNeighborCount = 16;
-inline constexpr double kContributionFloor = 0.04;
+inline constexpr double kContributionFloor = static_cast<double>(0.04f);
 inline constexpr double kViewAssignmentThreshold = 0.55;
 inline constexpr double kForegroundThreshold = 0.65;
 inline constexpr double kBackgroundThreshold = 0.35;
@@ -243,9 +243,20 @@ struct BinaryPly {
     std::uint64_t sourceInode = 0;
 };
 
-BinaryPly inspectBinaryPly(
+BinaryPly inspectBinaryPlyHeader(
     const std::filesystem::path &path,
     std::size_t memoryBudgetBytes
+);
+
+void validateBinaryPlyRows(
+    const BinaryPly &ply,
+    const std::function<bool()> &isCancelled = {}
+);
+
+BinaryPly inspectBinaryPly(
+    const std::filesystem::path &path,
+    std::size_t memoryBudgetBytes,
+    const std::function<bool()> &isCancelled = {}
 );
 
 std::vector<std::uint8_t> readVertexRows(

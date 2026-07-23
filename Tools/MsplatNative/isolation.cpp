@@ -1032,7 +1032,7 @@ void enforceMemoryBudget(
     }
 }
 
-BinaryPly inspectBinaryPly(
+BinaryPly inspectBinaryPlyHeader(
     const fs::path &path,
     std::size_t memoryBudgetBytes
 ) {
@@ -1220,29 +1220,6 @@ BinaryPly inspectBinaryPly(
             result.vertexDataOffset + payloadBytes != result.sourceBytes) {
             throw PlyValidationError("binary PLY byte count does not match its header");
         }
-        std::vector<std::uint8_t> row(result.rowBytes);
-        for (std::uint64_t index = 0; index < result.vertexCount; ++index) {
-            readExact(
-                descriptor,
-                row.data(),
-                row.size(),
-                result.vertexDataOffset + index * result.rowBytes
-            );
-            for (std::size_t offset : result.allFloatOffsets) {
-                if (!std::isfinite(rowFloat(row, offset))) {
-                    throw PlyValidationError(
-                        "binary PLY contains a non-finite float attribute"
-                    );
-                }
-            }
-            for (std::size_t offset : result.allDoubleOffsets) {
-                if (!std::isfinite(rowDouble(row, offset))) {
-                    throw PlyValidationError(
-                        "binary PLY contains a non-finite float attribute"
-                    );
-                }
-            }
-        }
         verifyStableSource(result, descriptor);
         closeDescriptor(descriptor);
         return result;
@@ -1250,6 +1227,72 @@ BinaryPly inspectBinaryPly(
         closeDescriptor(descriptor);
         throw;
     }
+}
+
+void validateBinaryPlyRows(
+    const BinaryPly &ply,
+    const std::function<bool()> &isCancelled
+) {
+    int descriptor = ::open(
+        ply.path.c_str(),
+        O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+    );
+    if (descriptor < 0) {
+        throw PlyValidationError("cannot reopen source PLY for attribute validation");
+    }
+    try {
+        verifyStableSource(ply, descriptor);
+        std::vector<std::uint8_t> row(ply.rowBytes);
+        constexpr std::size_t kCancellationChunkBytes = 64U * 1024U;
+        for (std::uint64_t index = 0; index < ply.vertexCount; ++index) {
+            std::size_t rowOffset = 0;
+            while (rowOffset < row.size()) {
+                if (isCancelled && isCancelled()) throw CancellationError();
+                const std::size_t chunk = std::min(
+                    kCancellationChunkBytes,
+                    row.size() - rowOffset
+                );
+                readExact(
+                    descriptor,
+                    row.data() + rowOffset,
+                    chunk,
+                    ply.vertexDataOffset +
+                        index * ply.rowBytes +
+                        rowOffset
+                );
+                rowOffset += chunk;
+            }
+            for (std::size_t offset : ply.allFloatOffsets) {
+                if (!std::isfinite(rowFloat(row, offset))) {
+                    throw PlyValidationError(
+                        "binary PLY contains a non-finite float attribute"
+                    );
+                }
+            }
+            for (std::size_t offset : ply.allDoubleOffsets) {
+                if (!std::isfinite(rowDouble(row, offset))) {
+                    throw PlyValidationError(
+                        "binary PLY contains a non-finite float attribute"
+                    );
+                }
+            }
+        }
+        verifyStableSource(ply, descriptor);
+        closeDescriptor(descriptor);
+    } catch (...) {
+        closeDescriptor(descriptor);
+        throw;
+    }
+}
+
+BinaryPly inspectBinaryPly(
+    const fs::path &path,
+    std::size_t memoryBudgetBytes,
+    const std::function<bool()> &isCancelled
+) {
+    BinaryPly result = inspectBinaryPlyHeader(path, memoryBudgetBytes);
+    validateBinaryPlyRows(result, isCancelled);
+    return result;
 }
 
 std::vector<std::uint8_t> readVertexRows(
@@ -1388,7 +1431,8 @@ FilteredPlyReceipt writeFilteredBinaryPly(
         if (isCancelled && isCancelled()) throw CancellationError();
         const BinaryPly staged = inspectBinaryPly(
             temporary,
-            std::max<std::size_t>(4096, header.size())
+            std::max<std::size_t>(4096, header.size()),
+            isCancelled
         );
         if (staged.vertexCount != selectedIndices.size() ||
             staged.rowBytes != source.rowBytes) {

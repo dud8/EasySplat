@@ -114,6 +114,50 @@ private:
     std::uint64_t sequence_ = 0;
 };
 
+using BoundEventFileIdentity =
+    std::pair<std::uint64_t, std::uint64_t>;
+
+std::optional<BoundEventFileIdentity> boundEventFileIdentity(int descriptor) {
+    if (descriptor < 0) return std::nullopt;
+    struct stat status {};
+    if (::fstat(descriptor, &status) != 0) {
+        throw std::runtime_error(
+            "cannot bind event file descriptor: " +
+            std::string(std::strerror(errno))
+        );
+    }
+    if (!S_ISREG(status.st_mode)) return std::nullopt;
+    return BoundEventFileIdentity {
+        static_cast<std::uint64_t>(status.st_dev),
+        static_cast<std::uint64_t>(status.st_ino),
+    };
+}
+
+void rejectEventDescriptorAliases(
+    const std::optional<BoundEventFileIdentity> &eventIdentity,
+    const std::vector<fs::path> &protectedPaths
+) {
+    if (!eventIdentity.has_value()) return;
+    for (const fs::path &path : protectedPaths) {
+        if (path.empty()) continue;
+        struct stat status {};
+        if (::lstat(path.c_str(), &status) != 0) {
+            if (errno == ENOENT) continue;
+            throw std::runtime_error(
+                "cannot inspect protected isolation path before event emission"
+            );
+        }
+        if (static_cast<std::uint64_t>(status.st_dev) ==
+                eventIdentity->first &&
+            static_cast<std::uint64_t>(status.st_ino) ==
+                eventIdentity->second) {
+            throw std::runtime_error(
+                "event file descriptor must not alias an isolation artifact"
+            );
+        }
+    }
+}
+
 struct TrainingProfileConfig {
     const char *name;
     int iterationLimit;
@@ -447,6 +491,7 @@ bool rasterRecoveryMetricsAreValid(
 
 void throwSystemError(const std::string &operation, const fs::path &path);
 void requirePlainDirectory(const fs::path &path);
+void syncDirectory(const fs::path &path);
 
 class Sha256Accumulator {
 public:
@@ -682,6 +727,271 @@ TrainingIdentity computeTrainingIdentity(
 
     return TrainingIdentity {digestFiles(images, imageNames, true), geometryDigest.finish()};
 }
+
+void copyAuthenticatedFile(
+    const fs::path &source,
+    const fs::path &destination
+) {
+    const struct stat namedBefore = requireRegularFile(source, true);
+    OpenFile input(source);
+    struct stat openedBefore {};
+    if (::fstat(input.descriptor, &openedBefore) != 0 ||
+        !sameStableFileMetadata(namedBefore, openedBefore)) {
+        throw std::runtime_error(
+            "dataset input changed while opening snapshot source: " +
+            source.string()
+        );
+    }
+    int output = ::open(
+        destination.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600
+    );
+    if (output < 0) {
+        throwSystemError("cannot create authenticated dataset snapshot", destination);
+    }
+    bool created = true;
+    try {
+        std::array<std::uint8_t, 1024 * 1024> buffer {};
+        std::uint64_t consumed = 0;
+        while (true) {
+            if (cancellationSignal != 0) {
+                throw easysplat::isolation::CancellationError();
+            }
+            const ssize_t count = ::read(
+                input.descriptor,
+                buffer.data(),
+                buffer.size()
+            );
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) {
+                throwSystemError("cannot read authenticated dataset input", source);
+            }
+            if (count == 0) break;
+            std::size_t written = 0;
+            while (written < static_cast<std::size_t>(count)) {
+                const ssize_t amount = ::write(
+                    output,
+                    buffer.data() + written,
+                    static_cast<std::size_t>(count) - written
+                );
+                if (amount < 0 && errno == EINTR) continue;
+                if (amount <= 0) {
+                    throwSystemError(
+                        "cannot write authenticated dataset snapshot",
+                        destination
+                    );
+                }
+                written += static_cast<std::size_t>(amount);
+            }
+            consumed += static_cast<std::uint64_t>(count);
+        }
+        if (openedBefore.st_size < 0 ||
+            consumed != static_cast<std::uint64_t>(openedBefore.st_size)) {
+            throw std::runtime_error(
+                "dataset input changed while copying snapshot source: " +
+                source.string()
+            );
+        }
+        struct stat openedAfter {};
+        struct stat namedAfter {};
+        if (::fstat(input.descriptor, &openedAfter) != 0 ||
+            ::lstat(source.c_str(), &namedAfter) != 0 ||
+            !sameStableFileMetadata(openedBefore, openedAfter) ||
+            !sameStableFileMetadata(openedBefore, namedAfter)) {
+            throw std::runtime_error(
+                "dataset input changed while copying snapshot source: " +
+                source.string()
+            );
+        }
+        if (::fsync(output) != 0) {
+            throwSystemError("cannot sync authenticated dataset snapshot", destination);
+        }
+        if (::close(output) != 0) {
+            output = -1;
+            throwSystemError("cannot close authenticated dataset snapshot", destination);
+        }
+        output = -1;
+        created = false;
+    } catch (...) {
+        if (output >= 0) (void)::close(output);
+        if (created) (void)::unlink(destination.c_str());
+        throw;
+    }
+}
+
+class IsolationDatasetSnapshot {
+public:
+    explicit IsolationDatasetSnapshot(const fs::path &dataset) {
+        std::string pattern = (
+            fs::temp_directory_path() /
+            ("easysplat-isolation-dataset." +
+             std::to_string(static_cast<long long>(::getpid())) +
+             ".XXXXXX")
+        ).string();
+        std::vector<char> mutablePattern(pattern.begin(), pattern.end());
+        mutablePattern.push_back('\0');
+        char *created = ::mkdtemp(mutablePattern.data());
+        if (created == nullptr) {
+            throwSystemError(
+                "cannot create private isolation dataset snapshot",
+                fs::temp_directory_path()
+            );
+        }
+        root_ = fs::path(created);
+        try {
+            if (::chmod(root_.c_str(), 0700) != 0) {
+                throwSystemError(
+                    "cannot protect private isolation dataset snapshot",
+                    root_
+                );
+            }
+            struct stat rootStatus {};
+            if (::lstat(root_.c_str(), &rootStatus) != 0 ||
+                !S_ISDIR(rootStatus.st_mode) ||
+                rootStatus.st_uid != ::getuid() ||
+                rootStatus.st_nlink < 2) {
+                throw std::runtime_error(
+                    "private isolation dataset snapshot identity is invalid"
+                );
+            }
+            rootDevice_ = static_cast<std::uint64_t>(rootStatus.st_dev);
+            rootInode_ = static_cast<std::uint64_t>(rootStatus.st_ino);
+            fs::create_directories(sparsePath());
+            fs::create_directory(imagesPath());
+            if (::chmod((root_ / "sparse").c_str(), 0700) != 0 ||
+                ::chmod(sparsePath().c_str(), 0700) != 0 ||
+                ::chmod(imagesPath().c_str(), 0700) != 0) {
+                throwSystemError(
+                    "cannot protect isolation dataset snapshot directories",
+                    root_
+                );
+            }
+
+            const fs::path sourceSparse = dataset / "sparse" / "0";
+            for (const char *name : {
+                     "cameras.bin",
+                     "images.bin",
+                     "points3D.bin",
+                     "easysplat_orientation.json",
+                 }) {
+                copyAuthenticatedFile(
+                    sourceSparse / name,
+                    sparsePath() / name
+                );
+            }
+
+            std::vector<std::string> imageNames;
+            for (const fs::directory_entry &entry :
+                 fs::directory_iterator(dataset / "images")) {
+                imageNames.push_back(entry.path().filename().string());
+            }
+            std::sort(imageNames.begin(), imageNames.end());
+            if (imageNames.empty() ||
+                std::adjacent_find(imageNames.begin(), imageNames.end()) !=
+                    imageNames.end()) {
+                throw std::runtime_error(
+                    "dataset image set is empty or ambiguous during snapshot"
+                );
+            }
+            for (const std::string &name : imageNames) {
+                if (!isSupportedTrainingImageName(name)) {
+                    throw std::runtime_error(
+                        "unsupported entry in dataset images: " + name
+                    );
+                }
+                copyAuthenticatedFile(
+                    dataset / "images" / name,
+                    imagesPath() / name
+                );
+            }
+            syncDirectory(sparsePath());
+            syncDirectory(imagesPath());
+            syncDirectory(root_ / "sparse");
+            syncDirectory(root_);
+        } catch (...) {
+            removeSafely();
+            throw;
+        }
+    }
+
+    ~IsolationDatasetSnapshot() {
+        removeSafely();
+    }
+
+    IsolationDatasetSnapshot(const IsolationDatasetSnapshot &) = delete;
+    IsolationDatasetSnapshot &operator=(const IsolationDatasetSnapshot &) = delete;
+
+    const fs::path &rootPath() const { return root_; }
+    fs::path sparsePath() const { return root_ / "sparse" / "0"; }
+    fs::path imagesPath() const { return root_ / "images"; }
+
+    void verifySnapshotIdentity(
+        const TrainingIdentity &expected,
+        const std::string &orientationContentDigest
+    ) const {
+        verifyRootIdentity();
+        const TrainingIdentity actual = computeTrainingIdentity(
+            root_,
+            orientationContentDigest
+        );
+        verifyRootIdentity();
+        if (actual.inputDigest != expected.inputDigest ||
+            actual.geometryDigest != expected.geometryDigest) {
+            throw std::runtime_error(
+                "private isolation dataset snapshot digest mismatch"
+            );
+        }
+    }
+
+    void verifyCameraResources(const InputData &inputData) const {
+        verifyRootIdentity();
+        const fs::path expectedParent = imagesPath().lexically_normal();
+        for (const Camera &camera : inputData.cameras) {
+            const fs::path path = fs::path(camera.filePath).lexically_normal();
+            if (path.parent_path() != expectedParent) {
+                throw std::runtime_error(
+                    "COLMAP camera escaped the authenticated image snapshot"
+                );
+            }
+            (void)requireRegularFile(path, true);
+        }
+        verifyRootIdentity();
+    }
+
+private:
+    void verifyRootIdentity() const {
+        struct stat status {};
+        if (root_.empty() ||
+            ::lstat(root_.c_str(), &status) != 0 ||
+            !S_ISDIR(status.st_mode) ||
+            static_cast<std::uint64_t>(status.st_dev) != rootDevice_ ||
+            static_cast<std::uint64_t>(status.st_ino) != rootInode_ ||
+            status.st_uid != ::getuid()) {
+            throw std::runtime_error(
+                "private isolation dataset snapshot identity changed"
+            );
+        }
+    }
+
+    void removeSafely() noexcept {
+        if (root_.empty()) return;
+        struct stat status {};
+        if (::lstat(root_.c_str(), &status) == 0 &&
+            S_ISDIR(status.st_mode) &&
+            static_cast<std::uint64_t>(status.st_dev) == rootDevice_ &&
+            static_cast<std::uint64_t>(status.st_ino) == rootInode_ &&
+            status.st_uid == ::getuid()) {
+            std::error_code ignored;
+            fs::remove_all(root_, ignored);
+        }
+        root_.clear();
+    }
+
+    fs::path root_;
+    std::uint64_t rootDevice_ = 0;
+    std::uint64_t rootInode_ = 0;
+};
 
 std::pair<std::uint64_t, std::uint64_t> stableColmapRecordCount(
     const fs::path &path,
@@ -2275,6 +2585,8 @@ int main(int argc, char *argv[]) {
     }
 
     std::optional<EventWriter> events;
+    std::optional<BoundEventFileIdentity> boundEventFile;
+    bool isolationEventEmissionSafe = true;
     int terminalIteration = 0;
     try {
         struct sigaction ignoreBrokenPipe {};
@@ -2284,8 +2596,21 @@ int main(int argc, char *argv[]) {
         if (sigaction(SIGPIPE, &ignoreBrokenPipe, nullptr) != 0) {
             throw std::runtime_error("failed to configure event-pipe handling");
         }
+        boundEventFile = boundEventFileIdentity(eventsFileDescriptor);
+        if (isolate) {
+            rejectEventDescriptorAliases(
+                boundEventFile,
+                {
+                    fs::path(sourcePlyPath),
+                    fs::path(maskManifestPath),
+                    fs::path(analysisCachePath),
+                    fs::path(outputPath),
+                }
+            );
+        }
         events.emplace(eventsFileDescriptor);
         if (eventsFileDescriptor == STDOUT_FILENO) std::cout.rdbuf(std::cerr.rdbuf());
+        if (eventsFileDescriptor == STDERR_FILENO) std::cerr.rdbuf(std::cout.rdbuf());
 
         const bool isolationOnlyArgumentProvided =
             sourcePlyOption->count() != 0 ||
@@ -2389,6 +2714,7 @@ int main(int argc, char *argv[]) {
             if (fs::path(outputPath).extension() != ".ply") {
                 throw std::runtime_error("--output must end in .ply");
             }
+            isolationEventEmissionSafe = false;
 
             struct sigaction action {};
             action.sa_handler = observeCancellation;
@@ -2415,10 +2741,6 @@ int main(int argc, char *argv[]) {
             requirePlainDirectory(canonicalSparse);
             requirePlainDirectory(canonicalImages);
             msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
-            enforceIsolationColmapLoadBudget(
-                canonicalSparse,
-                memoryBudgetBytes
-            );
 
             const OrientationOverlay orientation = readOrientationOverlay(datasetPath);
             throwIfIsolationCancelled();
@@ -2434,22 +2756,43 @@ int main(int argc, char *argv[]) {
                 );
             }
 
-            InputData inputData = loaders::loadColmap(
-                canonicalSparse.string(),
-                canonicalImages.string()
+            IsolationDatasetSnapshot snapshot(isolationDataset);
+            const OrientationOverlay snapshotOrientation =
+                readOrientationOverlay(snapshot.rootPath());
+            if (snapshotOrientation.contentDigest != orientation.contentDigest) {
+                throw std::runtime_error(
+                    "orientation changed while creating the isolation dataset snapshot"
+                );
+            }
+            snapshot.verifySnapshotIdentity(
+                identity,
+                snapshotOrientation.contentDigest
             );
-            applyOrientationOverlay(inputData, orientation);
+            enforceIsolationColmapLoadBudget(
+                snapshot.sparsePath(),
+                memoryBudgetBytes
+            );
+            InputData inputData = loaders::loadColmap(
+                snapshot.sparsePath().string(),
+                snapshot.imagesPath().string()
+            );
+            applyOrientationOverlay(inputData, snapshotOrientation);
             throwIfIsolationCancelled();
             const TrainingIdentity loadedIdentity = computeTrainingIdentity(
-                datasetPath,
-                orientation.contentDigest
+                snapshot.rootPath(),
+                snapshotOrientation.contentDigest
             );
             if (loadedIdentity.inputDigest != expectedInputDigest ||
                 loadedIdentity.geometryDigest != expectedGeometryDigest) {
                 throw std::runtime_error(
-                    "prepared dataset changed while loading isolation cameras"
+                    "private dataset snapshot changed while loading isolation cameras"
                 );
             }
+            snapshot.verifySnapshotIdentity(
+                identity,
+                snapshotOrientation.contentDigest
+            );
+            snapshot.verifyCameraResources(inputData);
             if (inputData.cameras.empty()) {
                 throw std::runtime_error("input dataset contains no isolation cameras");
             }
@@ -2467,6 +2810,7 @@ int main(int argc, char *argv[]) {
                 expectedTrainingManifestDigest,
                 static_cast<std::size_t>(memoryBudgetBytes),
                 std::nullopt,
+                boundEventFile,
             };
             if (anchorImageOption->count() == 1) {
                 request.anchor = easysplat::isolation::Anchor {
@@ -2479,6 +2823,7 @@ int main(int argc, char *argv[]) {
                     request,
                     inputData,
                     [&](const std::string &event, json fields) {
+                        isolationEventEmissionSafe = true;
                         events->emit(event, std::move(fields));
                     },
                     []() { return cancellationSignal != 0; }
@@ -3279,7 +3624,7 @@ int main(int argc, char *argv[]) {
         if (!events->enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
         return 0;
     } catch (const easysplat::isolation::CancellationError &error) {
-        if (events) {
+        if (events && isolationEventEmissionSafe) {
             try {
                 events->emit("isolation_cancelled", {
                     {"signal", cancellationSignal},
@@ -3293,7 +3638,7 @@ int main(int argc, char *argv[]) {
         std::cerr << "easysplat-train: " << error.what() << '\n';
         return 130;
     } catch (const easysplat::isolation::MemoryLimitError &error) {
-        if (isolate && events) {
+        if (isolate && events && isolationEventEmissionSafe) {
             try {
                 events->emit("isolation_memory_refused", {
                     {"budget_bytes", memoryBudgetBytes},
@@ -3312,7 +3657,7 @@ int main(int argc, char *argv[]) {
             (msplat_raster_resource_limit_was_exceeded() ||
              msplat_raster_memory_budget_was_exceeded())) {
             const MsplatRasterStats stats = msplat_get_raster_stats();
-            if (events) {
+            if (events && isolationEventEmissionSafe) {
                 try {
                     json fields = {
                         {"allocation_bytes", stats.allocation_bytes},
@@ -3337,7 +3682,7 @@ int main(int argc, char *argv[]) {
             return 75;
         }
         if (isolate) {
-            if (events) {
+            if (events && isolationEventEmissionSafe) {
                 try {
                     events->emit("isolation_failed", {
                         {"message", error.what()},

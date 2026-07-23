@@ -18,23 +18,30 @@ PROMOTER_RUNTIME_DEVICE=""
 PROMOTER_RUNTIME_INODE=""
 PROMOTER_RUNTIME_OWNED=0
 PROMOTER_RUNTIME_READY=0
+BUILD_INPUT_SNAPSHOT_DIR=""
+BUILD_INPUT_SNAPSHOT_DEVICE=""
+BUILD_INPUT_SNAPSHOT_INODE=""
+BUILD_INPUT_SNAPSHOT_OWNED=0
+BUILD_INPUT_SNAPSHOT_READY=0
+DEFERRED_BUILD_SIGNAL=0
+CLEANUP_DEFERRED_SIGNAL=0
 PYTHON_BIN="/usr/bin/python3"
 INSTALL_STAGE_OWNED=0
 INSTALL_STAGE_DEVICE=""
 INSTALL_STAGE_INODE=""
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
-OVERLAY_SHA256="975b515aa10c8aca854e0cd3a638cb71e3b6e51aed156410242bae9af0e295e1"
+OVERLAY_SHA256="701e758b248f973929c4c10a14bd684e81fd5e45f2f9dc958ad0d242e0f61e2d"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
 RASTER_TEST_SHA256="06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d"
 ISOLATION_HEADER="$ROOT/Tools/MsplatNative/isolation.hpp"
-ISOLATION_HEADER_SHA256="267442c64a2eabe21662fd0c51dfa7bddeb2afaefdc58bc69d115699f1b6aa5f"
+ISOLATION_HEADER_SHA256="ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8"
 ISOLATION_SOURCE="$ROOT/Tools/MsplatNative/isolation.cpp"
-ISOLATION_SOURCE_SHA256="a13a277555e94861e78d04c127729a6a30b0204e4db60b3b3de743a7009de751"
+ISOLATION_SOURCE_SHA256="40444aa0fc5a07f6919b28ef4dac1517a6627daa81331013b71ba49ff465c9fc"
 ISOLATION_RUNTIME_HEADER="$ROOT/Tools/MsplatNative/isolation_runtime.hpp"
-ISOLATION_RUNTIME_HEADER_SHA256="192cbccaa5ab6b87a533ff27bca720a0512ffda5182a6e35080584d2091477b8"
+ISOLATION_RUNTIME_HEADER_SHA256="f3fae8409eeb24446bd9b5f4970b64522f01b1048c25827b712f4bef087b7d82"
 ISOLATION_RUNTIME_SOURCE="$ROOT/Tools/MsplatNative/isolation_runtime.cpp"
-ISOLATION_RUNTIME_SOURCE_SHA256="0c77172b7ac5f0f314fc0907cc4d86bca01fd62756f52b477e435da520c984fa"
+ISOLATION_RUNTIME_SOURCE_SHA256="d1a1aa29a11e0f581b647554ace492710936c4e6ccc14c85c4fbc292625fbfc5"
 ISOLATION_MASK_HEADER="$ROOT/Tools/MsplatNative/isolation_mask.hpp"
 ISOLATION_MASK_HEADER_SHA256="51956923935621ef2e3681f33e11b1f63a6d1ed969234ee9e50edab927f712d7"
 ISOLATION_MASK_SOURCE="$ROOT/Tools/MsplatNative/isolation_mask.mm"
@@ -42,7 +49,7 @@ ISOLATION_MASK_SOURCE_SHA256="ad9844c13dd427517311f0ad0725ffa348beb4c590d6febc6e
 ISOLATION_METAL_SOURCE="$ROOT/Tools/MsplatNative/isolation_lift.metal"
 ISOLATION_METAL_SOURCE_SHA256="c063a934eee67eb22e04483f32e798e6844ee722dde9daddeed79f5db56c13bc"
 ISOLATION_TEST_SOURCE="$ROOT/Tools/MsplatNative/isolation_tests.cpp"
-ISOLATION_TEST_SOURCE_SHA256="f2f58c26d52178ee5324e51fe3486501d7ad3e78d8e8c06ac4da1060ef937e54"
+ISOLATION_TEST_SOURCE_SHA256="c2929e9ddf86b83527fb717277d6cc0d3da379f95ff4652a212daffb0aa94d71"
 ISOLATION_MASK_TEST_SOURCE="$ROOT/Tools/MsplatNative/isolation_mask_tests.mm"
 ISOLATION_MASK_TEST_SOURCE_SHA256="f4900f77878a22417c1bd397ee87d2730c21344d9ba9ab7e1579bfa083e7d2bc"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
@@ -107,8 +114,12 @@ cleanup() {
   local status=$?
   local install_cleanup_status=0
   local promoter_cleanup_status=0
+  local snapshot_cleanup_status=0
+  local snapshot_cleanup_attempted=0
   trap - EXIT
-  trap '' INT TERM HUP
+  trap 'CLEANUP_DEFERRED_SIGNAL=2' INT
+  trap 'CLEANUP_DEFERRED_SIGNAL=15' TERM
+  trap 'CLEANUP_DEFERRED_SIGNAL=1' HUP
   if [ "$STAGE_CLEANUP_ALLOWED" = "1" ] && [ "$INSTALL_STAGE_OWNED" = "1" ]; then
     if [ -n "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ] && \
       [ "$PROMOTER_RUNTIME_READY" = "1" ]; then
@@ -125,6 +136,11 @@ cleanup() {
       printf '%s\n' \
         "native msplat cleanup preserved an unverified staged install: $STAGE_DIR" >&2
     fi
+  fi
+  if [ "$BUILD_INPUT_SNAPSHOT_OWNED" = "1" ] && \
+    [ "$PROMOTER_RUNTIME_READY" = "1" ]; then
+    snapshot_cleanup_attempted=1
+    cleanup_build_input_snapshot || snapshot_cleanup_status=$?
   fi
   if [ "$PROMOTER_RUNTIME_OWNED" = "1" ]; then
     if [ "$PROMOTER_RUNTIME_READY" = "1" ]; then
@@ -151,11 +167,25 @@ cleanup() {
         "native msplat cleanup preserved an unverified private promoter: $PROMOTER_RUNTIME_DIR" >&2
     fi
   fi
+  if [ "$BUILD_INPUT_SNAPSHOT_OWNED" = "1" ] && \
+    [ "$snapshot_cleanup_attempted" = "0" ]; then
+    cleanup_build_input_snapshot || snapshot_cleanup_status=$?
+  fi
+  if [ "$snapshot_cleanup_status" -ne 0 ]; then
+    printf '%s\n' \
+      "native msplat cleanup preserved an unverified build-input snapshot: $BUILD_INPUT_SNAPSHOT_DIR" >&2
+  fi
   if [ "$status" -eq 0 ] && [ "$install_cleanup_status" -ne 0 ]; then
     status="$install_cleanup_status"
   fi
   if [ "$status" -eq 0 ] && [ "$promoter_cleanup_status" -ne 0 ]; then
     status="$promoter_cleanup_status"
+  fi
+  if [ "$status" -eq 0 ] && [ "$snapshot_cleanup_status" -ne 0 ]; then
+    status="$snapshot_cleanup_status"
+  fi
+  if [ "$CLEANUP_DEFERRED_SIGNAL" -ne 0 ]; then
+    status=$((128 + CLEANUP_DEFERRED_SIGNAL))
   fi
   exit "$status"
 }
@@ -199,26 +229,115 @@ restore_build_signal_traps() {
   trap 'exit 129' HUP
 }
 
+capture_deferred_build_signal() {
+  local signal="$1"
+  if [ "$DEFERRED_BUILD_SIGNAL" -eq 0 ]; then
+    DEFERRED_BUILD_SIGNAL="$signal"
+  fi
+}
+
+begin_deferred_build_signals() {
+  DEFERRED_BUILD_SIGNAL=0
+  trap 'capture_deferred_build_signal 2' INT
+  trap 'capture_deferred_build_signal 15' TERM
+  trap 'capture_deferred_build_signal 1' HUP
+}
+
+replay_deferred_build_signal() {
+  local signal="$DEFERRED_BUILD_SIGNAL"
+  restore_build_signal_traps
+  DEFERRED_BUILD_SIGNAL=0
+  if [ "$signal" -ne 0 ]; then
+    exit $((128 + signal))
+  fi
+}
+
 abandon_unbound_private_promoter() {
   local reason="$1"
   local path="$PROMOTER_RUNTIME_DIR"
   if [ -n "$path" ] && [ -d "$path" ] && [ ! -L "$path" ]; then
     /bin/rmdir "$path" || {
-      restore_build_signal_traps
+      replay_deferred_build_signal
       die "$reason; preserved an unverified private promoter: $path"
     }
   fi
   PROMOTER_RUNTIME_DIR=""
-  restore_build_signal_traps
+  replay_deferred_build_signal
   die "$reason"
+}
+
+recover_stale_private_promoters() {
+  local path identity
+  for path in "$BUILD_DIR"/promoter.stage.*; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    if ! identity="$(
+      "$PYTHON_BIN" - "$path" "$PROMOTER_RUNTIME_SOURCE_SHA256" <<'PY'
+import hashlib
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected_digest = sys.argv[2]
+if not re.fullmatch(r"promoter[.]stage[.][A-Za-z0-9]{6}", root.name):
+    raise SystemExit("stale private promoter name is ambiguous")
+entry = os.lstat(root)
+if (
+    not stat.S_ISDIR(entry.st_mode)
+    or entry.st_uid != os.getuid()
+    or entry.st_gid != os.getgid()
+    or stat.S_IMODE(entry.st_mode) != 0o700
+):
+    raise SystemExit("stale private promoter root is not strictly owned")
+children = sorted(root.iterdir(), key=lambda path: os.fsencode(path.name))
+if len(children) > 1:
+    raise SystemExit("stale private promoter tree has unexpected entries")
+if children:
+    child = children[0]
+    if child.name != "atomic_swap_install.py":
+        raise SystemExit("stale private promoter entry is unexpected")
+    child_entry = os.lstat(child)
+    if (
+        not stat.S_ISREG(child_entry.st_mode)
+        or child_entry.st_nlink != 1
+        or child_entry.st_uid != os.getuid()
+        or child_entry.st_gid != os.getgid()
+        or stat.S_IMODE(child_entry.st_mode) != 0o700
+    ):
+        raise SystemExit("stale private promoter executable is invalid")
+    attributes = set(os.listxattr(child, follow_symlinks=False))
+    if not attributes.issubset({"com.apple.provenance"}):
+        raise SystemExit("stale private promoter metadata is ambiguous")
+    if hashlib.sha256(child.read_bytes()).hexdigest() != expected_digest:
+        raise SystemExit("stale private promoter executable digest changed")
+root_attributes = set(os.listxattr(root, follow_symlinks=False))
+if not root_attributes.issubset({"com.apple.provenance"}):
+    raise SystemExit("stale private promoter root metadata is ambiguous")
+print(f"{entry.st_dev}:{entry.st_ino}")
+PY
+    )"; then
+      die "ambiguous stale private promoter requires manual recovery: $path"
+    fi
+    [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || \
+      die "stale private promoter identity is malformed: $path"
+    run_promoter_source_from_stdin \
+      --remove-owned-tree \
+      "$path" \
+      "${identity%%:*}" \
+      "${identity#*:}" \
+      --allow-symlinks || \
+      die "could not recover stale private promoter: $path"
+  done
 }
 
 prepare_private_promoter() {
   local identity runtime_hash
   PROMOTER_RUNTIME_SOURCE_SHA256="$(sha256 "$PROMOTER_SOURCE")"
-  trap '' INT TERM HUP
+  begin_deferred_build_signals
   if ! PROMOTER_RUNTIME_DIR="$(mktemp -d "$BUILD_DIR/promoter.stage.XXXXXX")"; then
-    restore_build_signal_traps
+    replay_deferred_build_signal
     die "could not create private atomic install promoter directory"
   fi
   if ! identity="$(
@@ -247,7 +366,7 @@ PY
   PROMOTER_RUNTIME_DEVICE="${identity%%:*}"
   PROMOTER_RUNTIME_INODE="${identity#*:}"
   PROMOTER_RUNTIME_OWNED=1
-  restore_build_signal_traps
+  replay_deferred_build_signal
   PROMOTER_RUNTIME="$PROMOTER_RUNTIME_DIR/atomic_swap_install.py"
 
   install -m 0700 "$PROMOTER_SOURCE" "$PROMOTER_RUNTIME"
@@ -458,6 +577,330 @@ preflight() {
     "$TILE_SPAN_TEST_ROOT/tests/gpu_tile_culling_tests.mm"; do
     [ -f "$source" ] || die "missing tile-span property source: $source"
   done
+}
+
+unlock_build_input_snapshot() {
+  "$PYTHON_BIN" - \
+    "$BUILD_INPUT_SNAPSHOT_DIR" \
+    "$BUILD_INPUT_SNAPSHOT_DEVICE" \
+    "$BUILD_INPUT_SNAPSHOT_INODE" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected = (int(sys.argv[2]), int(sys.argv[3]))
+root_status = os.lstat(root)
+if (
+    not stat.S_ISDIR(root_status.st_mode)
+    or (root_status.st_dev, root_status.st_ino) != expected
+    or root_status.st_uid != os.getuid()
+    or root_status.st_gid != os.getgid()
+    or stat.S_IMODE(root_status.st_mode) != 0o500
+):
+    raise SystemExit("build-input snapshot root identity is invalid")
+
+directories = [root]
+for current, directory_names, file_names in os.walk(root, followlinks=False):
+    directory_names.sort()
+    file_names.sort()
+    current_path = Path(current)
+    for name in directory_names:
+        path = current_path / name
+        entry = os.lstat(path)
+        if (
+            not stat.S_ISDIR(entry.st_mode)
+            or entry.st_uid != os.getuid()
+            or entry.st_gid != os.getgid()
+            or stat.S_IMODE(entry.st_mode) != 0o500
+        ):
+            raise SystemExit(f"build-input snapshot directory is invalid: {path}")
+        directories.append(path)
+    for name in file_names:
+        path = current_path / name
+        entry = os.lstat(path)
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or entry.st_uid != os.getuid()
+            or entry.st_gid != os.getgid()
+            or stat.S_IMODE(entry.st_mode) != 0o400
+        ):
+            raise SystemExit(f"build-input snapshot file is invalid: {path}")
+
+for directory in directories:
+    os.chmod(directory, 0o700, follow_symlinks=False)
+PY
+}
+
+cleanup_build_input_snapshot() {
+  unlock_build_input_snapshot || return $?
+  if [ "$PROMOTER_RUNTIME_READY" = "1" ]; then
+    run_promoter \
+      --remove-owned-tree \
+      "$BUILD_INPUT_SNAPSHOT_DIR" \
+      "$BUILD_INPUT_SNAPSHOT_DEVICE" \
+      "$BUILD_INPUT_SNAPSHOT_INODE" \
+      --allow-symlinks || return $?
+  elif [ -n "$PROMOTER_SOURCE" ] && [ -f "$PROMOTER_SOURCE" ] && \
+    [ ! -L "$PROMOTER_SOURCE" ]; then
+    run_promoter_source_from_stdin \
+      --remove-owned-tree \
+      "$BUILD_INPUT_SNAPSHOT_DIR" \
+      "$BUILD_INPUT_SNAPSHOT_DEVICE" \
+      "$BUILD_INPUT_SNAPSHOT_INODE" \
+      --allow-symlinks || return $?
+  else
+    return 1
+  fi
+  BUILD_INPUT_SNAPSHOT_OWNED=0
+}
+
+snapshot_build_inputs() {
+  local identity
+  if ! BUILD_INPUT_SNAPSHOT_DIR="$(
+    mktemp -d "$BUILD_DIR/build-inputs.stage.XXXXXX"
+  )"; then
+    die "could not create private native build-input snapshot"
+  fi
+  if ! identity="$(
+    "$PYTHON_BIN" - "$BUILD_INPUT_SNAPSHOT_DIR" \
+      "$PROMOTER_SOURCE" "toolchain/atomic_swap_install.py" "" \
+      "$OVERLAY" "native/msplat.cpp" "$OVERLAY_SHA256" \
+      "$RASTER_TEST_SOURCE" "native/msplat_raster_tests.cpp" "$RASTER_TEST_SHA256" \
+      "$ISOLATION_HEADER" "native/isolation.hpp" "$ISOLATION_HEADER_SHA256" \
+      "$ISOLATION_SOURCE" "native/isolation.cpp" "$ISOLATION_SOURCE_SHA256" \
+      "$ISOLATION_RUNTIME_HEADER" "native/isolation_runtime.hpp" "$ISOLATION_RUNTIME_HEADER_SHA256" \
+      "$ISOLATION_RUNTIME_SOURCE" "native/isolation_runtime.cpp" "$ISOLATION_RUNTIME_SOURCE_SHA256" \
+      "$ISOLATION_MASK_HEADER" "native/isolation_mask.hpp" "$ISOLATION_MASK_HEADER_SHA256" \
+      "$ISOLATION_MASK_SOURCE" "native/isolation_mask.mm" "$ISOLATION_MASK_SOURCE_SHA256" \
+      "$ISOLATION_METAL_SOURCE" "native/isolation_lift.metal" "$ISOLATION_METAL_SOURCE_SHA256" \
+      "$ISOLATION_TEST_SOURCE" "native/isolation_tests.cpp" "$ISOLATION_TEST_SOURCE_SHA256" \
+      "$ISOLATION_MASK_TEST_SOURCE" "native/isolation_mask_tests.mm" "$ISOLATION_MASK_TEST_SOURCE_SHA256" \
+      "$FIXTURE_GENERATOR" "ci/generate_msplat_sparse_fixtures.py" "" \
+      "$UPSTREAM_PATCH" "patches/msplat-1.1.3-easysplat.patch" "$UPSTREAM_PATCH_SHA256" \
+      "$SOURCE_NOTICE_PATCH" "patches/msplat-1.1.3-source-notices.patch" "$SOURCE_NOTICE_PATCH_SHA256" \
+      "$CHECKPOINT_PATCH" "patches/msplat-1.1.3-checkpoint.patch" "" \
+      "$NUMERIC_STABILITY_PATCH" "patches/msplat-1.1.3-numeric-stability.patch" "$NUMERIC_STABILITY_PATCH_SHA256" \
+      "$METAL_SAFETY_PATCH" "patches/msplat-1.1.3-metal-safety.patch" "$METAL_SAFETY_PATCH_SHA256" \
+      "$EXACT_RASTER_PATCH" "patches/msplat-1.1.3-exact-raster.patch" "$EXACT_RASTER_PATCH_SHA256" \
+      "$STAGE_TIMING_PATCH" "patches/msplat-1.1.3-stage-timing.patch" "$STAGE_TIMING_PATCH_SHA256" \
+      "$MEMORY_EFFICIENCY_PATCH" "patches/msplat-1.1.3-memory-efficiency.patch" "$MEMORY_EFFICIENCY_PATCH_SHA256" \
+      "$DENSIFICATION_MEMORY_PATCH" "patches/msplat-1.1.3-densification-memory.patch" "$DENSIFICATION_MEMORY_PATCH_SHA256" \
+      "$ROW_SPAN_CULLING_PATCH" "patches/msplat-1.1.3-row-span-culling.patch" "$ROW_SPAN_CULLING_PATCH_SHA256" \
+      "$GEOMETRY_ADAM_FUSION_PATCH" "patches/msplat-1.1.3-geometry-adam-fusion.patch" "$GEOMETRY_ADAM_FUSION_PATCH_SHA256" \
+      "$PARALLEL_RADIX_SCAN_PATCH" "patches/msplat-1.1.3-parallel-radix-scan.patch" "$PARALLEL_RADIX_SCAN_PATCH_SHA256" \
+      "$ALLOCATION_PRESSURE_PATCH" "patches/msplat-1.1.3-allocation-pressure.patch" "$ALLOCATION_PRESSURE_PATCH_SHA256" \
+      "$EXACT_PREFIX_HARDENING_PATCH" "patches/msplat-1.1.3-exact-prefix-hardening.patch" "$EXACT_PREFIX_HARDENING_PATCH_SHA256" \
+      "$QUATERNION_STABILITY_PATCH" "patches/msplat-1.1.3-quaternion-stability.patch" "$QUATERNION_STABILITY_PATCH_SHA256" \
+      "$ISOLATION_PATCH" "patches/msplat-1.1.3-isolation.patch" "$ISOLATION_PATCH_SHA256" \
+      "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" "tile/include/tile_culling.hpp" "" \
+      "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" "tile/include/gpu_tile_culling.hpp" "" \
+      "$TILE_SPAN_TEST_ROOT/src/tile_culling.metal" "tile/src/tile_culling.metal" "" \
+      "$TILE_SPAN_TEST_ROOT/src/gpu_tile_culling.mm" "tile/src/gpu_tile_culling.mm" "" \
+      "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp" "tile/tests/tile_culling_tests.cpp" "" \
+      "$TILE_SPAN_TEST_ROOT/tests/gpu_tile_culling_tests.mm" "tile/tests/gpu_tile_culling_tests.mm" "" <<'PY'
+import hashlib
+import os
+import shutil
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+arguments = sys.argv[2:]
+if len(arguments) % 3:
+    raise SystemExit("build-input snapshot manifest is malformed")
+
+
+def stable(entry, opened):
+    return (
+        stat.S_ISREG(entry.st_mode)
+        and stat.S_ISREG(opened.st_mode)
+        and entry.st_nlink == 1
+        and opened.st_nlink == 1
+        and (entry.st_dev, entry.st_ino) == (opened.st_dev, opened.st_ino)
+        and entry.st_size == opened.st_size
+        and entry.st_mtime_ns == opened.st_mtime_ns
+        and entry.st_ctime_ns == opened.st_ctime_ns
+    )
+
+
+try:
+    root_status = os.lstat(root)
+    if (
+        not stat.S_ISDIR(root_status.st_mode)
+        or root_status.st_uid != os.getuid()
+        or root_status.st_gid != os.getgid()
+        or stat.S_IMODE(root_status.st_mode) != 0o700
+    ):
+        raise RuntimeError("build-input snapshot root is not private")
+    seen = set()
+    for offset in range(0, len(arguments), 3):
+        source = Path(arguments[offset])
+        relative = Path(arguments[offset + 1])
+        expected = arguments[offset + 2]
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.as_posix() in seen
+        ):
+            raise RuntimeError("build-input snapshot destination is unsafe")
+        seen.add(relative.as_posix())
+        before = os.lstat(source)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        source_descriptor = os.open(source, flags)
+        try:
+            opened = os.fstat(source_descriptor)
+            if not stable(before, opened):
+                raise RuntimeError(f"build input changed while opening: {source}")
+            destination = root / relative
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            output_descriptor = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            digest = hashlib.sha256()
+            consumed = 0
+            try:
+                while True:
+                    block = os.read(source_descriptor, 1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+                    consumed += len(block)
+                    cursor = 0
+                    while cursor < len(block):
+                        cursor += os.write(output_descriptor, block[cursor:])
+                os.fsync(output_descriptor)
+                os.fchmod(output_descriptor, 0o400)
+            finally:
+                os.close(output_descriptor)
+            after_open = os.fstat(source_descriptor)
+            after_named = os.lstat(source)
+            if (
+                consumed != opened.st_size
+                or not stable(opened, after_open)
+                or not stable(opened, after_named)
+            ):
+                raise RuntimeError(f"build input changed while copying: {source}")
+            if expected and digest.hexdigest() != expected:
+                raise RuntimeError(f"snapshotted build-input digest mismatch: {source}")
+        finally:
+            os.close(source_descriptor)
+
+    for current, directory_names, _ in os.walk(root, topdown=False):
+        directory_names.sort()
+        for name in directory_names:
+            os.chmod(Path(current) / name, 0o500, follow_symlinks=False)
+        os.chmod(current, 0o500, follow_symlinks=False)
+    final_root = os.lstat(root)
+    if (final_root.st_dev, final_root.st_ino) != (
+        root_status.st_dev,
+        root_status.st_ino,
+    ):
+        raise RuntimeError("build-input snapshot root changed")
+    print(f"{final_root.st_dev}:{final_root.st_ino}")
+except Exception:
+    for current, directory_names, _ in os.walk(root, topdown=False):
+        for name in directory_names:
+            try:
+                os.chmod(Path(current) / name, 0o700, follow_symlinks=False)
+            except OSError:
+                pass
+        try:
+            os.chmod(current, 0o700, follow_symlinks=False)
+        except OSError:
+            pass
+    shutil.rmtree(root, ignore_errors=True)
+    raise
+PY
+  )"; then
+    BUILD_INPUT_SNAPSHOT_DIR=""
+    die "could not create authenticated native build-input snapshot"
+  fi
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || \
+    die "native build-input snapshot identity is malformed"
+  BUILD_INPUT_SNAPSHOT_DEVICE="${identity%%:*}"
+  BUILD_INPUT_SNAPSHOT_INODE="${identity#*:}"
+  BUILD_INPUT_SNAPSHOT_OWNED=1
+
+  PROMOTER_SOURCE="$BUILD_INPUT_SNAPSHOT_DIR/toolchain/atomic_swap_install.py"
+  OVERLAY="$BUILD_INPUT_SNAPSHOT_DIR/native/msplat.cpp"
+  RASTER_TEST_SOURCE="$BUILD_INPUT_SNAPSHOT_DIR/native/msplat_raster_tests.cpp"
+  ISOLATION_HEADER="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation.hpp"
+  ISOLATION_SOURCE="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation.cpp"
+  ISOLATION_RUNTIME_HEADER="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation_runtime.hpp"
+  ISOLATION_RUNTIME_SOURCE="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation_runtime.cpp"
+  ISOLATION_MASK_HEADER="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation_mask.hpp"
+  ISOLATION_MASK_SOURCE="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation_mask.mm"
+  ISOLATION_METAL_SOURCE="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation_lift.metal"
+  ISOLATION_TEST_SOURCE="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation_tests.cpp"
+  ISOLATION_MASK_TEST_SOURCE="$BUILD_INPUT_SNAPSHOT_DIR/native/isolation_mask_tests.mm"
+  FIXTURE_GENERATOR="$BUILD_INPUT_SNAPSHOT_DIR/ci/generate_msplat_sparse_fixtures.py"
+  UPSTREAM_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-easysplat.patch"
+  SOURCE_NOTICE_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-source-notices.patch"
+  CHECKPOINT_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-checkpoint.patch"
+  NUMERIC_STABILITY_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-numeric-stability.patch"
+  METAL_SAFETY_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-metal-safety.patch"
+  EXACT_RASTER_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-exact-raster.patch"
+  STAGE_TIMING_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-stage-timing.patch"
+  MEMORY_EFFICIENCY_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-memory-efficiency.patch"
+  DENSIFICATION_MEMORY_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-densification-memory.patch"
+  ROW_SPAN_CULLING_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-row-span-culling.patch"
+  GEOMETRY_ADAM_FUSION_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-geometry-adam-fusion.patch"
+  PARALLEL_RADIX_SCAN_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-parallel-radix-scan.patch"
+  ALLOCATION_PRESSURE_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-allocation-pressure.patch"
+  EXACT_PREFIX_HARDENING_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-exact-prefix-hardening.patch"
+  QUATERNION_STABILITY_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-quaternion-stability.patch"
+  ISOLATION_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-isolation.patch"
+  TILE_SPAN_TEST_ROOT="$BUILD_INPUT_SNAPSHOT_DIR/tile"
+  BUILD_INPUT_SNAPSHOT_READY=1
+}
+
+revalidate_snapshotted_pins() {
+  local source expected description
+  while IFS='|' read -r source expected description; do
+    [ "$(sha256 "$source")" = "$expected" ] || \
+      die "snapshotted $description SHA-256 mismatch"
+  done <<EOF
+$OVERLAY|$OVERLAY_SHA256|CLI overlay
+$RASTER_TEST_SOURCE|$RASTER_TEST_SHA256|raster test
+$ISOLATION_HEADER|$ISOLATION_HEADER_SHA256|isolation header
+$ISOLATION_SOURCE|$ISOLATION_SOURCE_SHA256|isolation source
+$ISOLATION_RUNTIME_HEADER|$ISOLATION_RUNTIME_HEADER_SHA256|isolation runtime header
+$ISOLATION_RUNTIME_SOURCE|$ISOLATION_RUNTIME_SOURCE_SHA256|isolation runtime source
+$ISOLATION_MASK_HEADER|$ISOLATION_MASK_HEADER_SHA256|isolation mask header
+$ISOLATION_MASK_SOURCE|$ISOLATION_MASK_SOURCE_SHA256|isolation mask source
+$ISOLATION_METAL_SOURCE|$ISOLATION_METAL_SOURCE_SHA256|isolation Metal source
+$ISOLATION_TEST_SOURCE|$ISOLATION_TEST_SOURCE_SHA256|isolation test source
+$ISOLATION_MASK_TEST_SOURCE|$ISOLATION_MASK_TEST_SOURCE_SHA256|isolation mask test source
+$UPSTREAM_PATCH|$UPSTREAM_PATCH_SHA256|upstream patch
+$SOURCE_NOTICE_PATCH|$SOURCE_NOTICE_PATCH_SHA256|source notice patch
+$NUMERIC_STABILITY_PATCH|$NUMERIC_STABILITY_PATCH_SHA256|numeric-stability patch
+$METAL_SAFETY_PATCH|$METAL_SAFETY_PATCH_SHA256|Metal-safety patch
+$EXACT_RASTER_PATCH|$EXACT_RASTER_PATCH_SHA256|exact-raster patch
+$STAGE_TIMING_PATCH|$STAGE_TIMING_PATCH_SHA256|stage-timing patch
+$MEMORY_EFFICIENCY_PATCH|$MEMORY_EFFICIENCY_PATCH_SHA256|memory-efficiency patch
+$DENSIFICATION_MEMORY_PATCH|$DENSIFICATION_MEMORY_PATCH_SHA256|densification-memory patch
+$ROW_SPAN_CULLING_PATCH|$ROW_SPAN_CULLING_PATCH_SHA256|row-span culling patch
+$GEOMETRY_ADAM_FUSION_PATCH|$GEOMETRY_ADAM_FUSION_PATCH_SHA256|geometry-Adam patch
+$PARALLEL_RADIX_SCAN_PATCH|$PARALLEL_RADIX_SCAN_PATCH_SHA256|parallel radix-scan patch
+$ALLOCATION_PRESSURE_PATCH|$ALLOCATION_PRESSURE_PATCH_SHA256|allocation-pressure patch
+$EXACT_PREFIX_HARDENING_PATCH|$EXACT_PREFIX_HARDENING_PATCH_SHA256|exact-prefix patch
+$QUATERNION_STABILITY_PATCH|$QUATERNION_STABILITY_PATCH_SHA256|quaternion patch
+$ISOLATION_PATCH|$ISOLATION_PATCH_SHA256|isolation patch
+EOF
 }
 
 download_verified() {
@@ -1160,6 +1603,10 @@ promote_install() {
 
 preflight
 mkdir -p "$BUILD_DIR" "$INSTALL_PARENT"
+snapshot_build_inputs
+revalidate_snapshotted_pins
+PROMOTER_RUNTIME_SOURCE_SHA256="$(sha256 "$PROMOTER_SOURCE")"
+recover_stale_private_promoters
 prepare_private_promoter
 recover_stale_promotions
 create_owned_install_stage

@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace easysplat::isolation {
 
@@ -26,6 +27,7 @@ struct IsolationRequest {
     std::string expectedTrainingManifestDigest;
     std::size_t memoryBudgetBytes = 0;
     std::optional<Anchor> anchor;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> eventFileIdentity;
 };
 
 enum class IsolationRunOutcome {

@@ -270,17 +270,25 @@ require_contains 'requirePlainDirectory(isolationDataset / "sparse");' "$OVERLAY
 require_contains 'requirePlainDirectory(canonicalSparse);' "$OVERLAY"
 require_contains 'requirePlainDirectory(canonicalImages);' "$OVERLAY"
 require_contains \
-  'canonicalSparse.string(),' \
+  'snapshot.sparsePath().string(),' \
   "$OVERLAY"
 require_contains \
-  'canonicalImages.string()' \
+  'snapshot.imagesPath().string()' \
   "$OVERLAY"
 require_contains \
   'InputData inputData = loaders::loadColmap(' \
   "$OVERLAY"
+require_contains 'class IsolationDatasetSnapshot' "$OVERLAY"
+require_contains 'copyAuthenticatedFile(' "$OVERLAY"
+require_contains 'verifySnapshotIdentity(' "$OVERLAY"
+require_contains 'IsolationDatasetSnapshot snapshot(' "$OVERLAY"
+require_absent \
+  'loaders::loadColmap(\n                canonicalSparse.string()' \
+  "$OVERLAY"
 require_contains \
   'const TrainingIdentity loadedIdentity = computeTrainingIdentity(' \
   "$OVERLAY"
+require_contains 'snapshot.rootPath(),' "$OVERLAY"
 require_contains 'stableColmapRecordCount(' "$OVERLAY"
 require_contains 'enforceIsolationColmapLoadBudget(' "$OVERLAY"
 require_contains 'imageParserBytesPerInputByte = 2;' "$OVERLAY"
@@ -293,6 +301,20 @@ require_contains \
 require_contains 'app.parse(argc, argv);' "$OVERLAY"
 require_contains 'return parserExit == 0 ? 0 : 1;' "$OVERLAY"
 require_absent 'CLI11_PARSE(app, argc, argv);' "$OVERLAY"
+require_contains 'inspectBinaryPlyHeader(' "$ISOLATION_RUNTIME_SOURCE"
+require_contains 'validateBinaryPlyRows(' "$ISOLATION_RUNTIME_SOURCE"
+require_order \
+  'enforceMemoryBudget(requiredBytes, request.memoryBudgetBytes);' \
+  'validateBinaryPlyRows(source, isCancelled);' \
+  "$ISOLATION_RUNTIME_SOURCE"
+require_contains 'eventFileIdentity' "$ISOLATION_RUNTIME_HEADER"
+require_contains 'boundEventFileIdentity' "$OVERLAY"
+require_contains 'rejectEventDescriptorAliases(' "$OVERLAY"
+require_contains 'request.eventFileIdentity' "$ISOLATION_RUNTIME_SOURCE"
+require_contains 'eventsFileDescriptor == STDERR_FILENO' "$OVERLAY"
+require_contains 'filteringUnitTotal' "$ISOLATION_RUNTIME_SOURCE"
+require_absent '{"completed_unit_count", 0}' "$ISOLATION_RUNTIME_SOURCE"
+require_absent '{"total_unit_count", 1}' "$ISOLATION_RUNTIME_SOURCE"
 require_contains \
   'cmake --build "$NATIVE_BUILD_DIR" --target msplat metallib msplat_raster_tests msplat_isolation_tests msplat_isolation_mask_tests' \
   "$BUILD_SCRIPT"
@@ -618,7 +640,10 @@ require_contains '[ "$(sha256 "$PROMOTER_RUNTIME")" = "$PROMOTER_RUNTIME_SOURCE_
 require_contains 'entry.st_nlink != 1' "$BUILD_SCRIPT"
 require_contains 'PROMOTER_RUNTIME_DEVICE="${identity%%:*}"' "$BUILD_SCRIPT"
 require_contains 'PROMOTER_RUNTIME_INODE="${identity#*:}"' "$BUILD_SCRIPT"
-require_contains "trap '' INT TERM HUP" "$BUILD_SCRIPT"
+require_absent "trap '' INT TERM HUP" "$BUILD_SCRIPT"
+require_contains 'capture_deferred_build_signal' "$BUILD_SCRIPT"
+require_contains 'replay_deferred_build_signal' "$BUILD_SCRIPT"
+require_contains 'recover_stale_private_promoters' "$BUILD_SCRIPT"
 require_contains 'abandon_unbound_private_promoter' "$BUILD_SCRIPT"
 require_contains '/bin/rmdir "$path"' "$BUILD_SCRIPT"
 require_contains 'restore_build_signal_traps' "$BUILD_SCRIPT"
@@ -630,8 +655,35 @@ require_contains '"$PROMOTER_RUNTIME_DEVICE"' "$BUILD_SCRIPT"
 require_contains '"$PROMOTER_RUNTIME_INODE"' "$BUILD_SCRIPT"
 require_contains 'PROMOTER_RUNTIME_READY=1' "$BUILD_SCRIPT"
 require_contains 'prepare_private_promoter' "$BUILD_SCRIPT"
+require_contains 'snapshot_build_inputs' "$BUILD_SCRIPT"
+require_contains 'BUILD_INPUT_SNAPSHOT_READY=1' "$BUILD_SCRIPT"
 require_absent '"$PYTHON_BIN" "$PROMOTER_SOURCE"' "$BUILD_SCRIPT"
 require_absent '/usr/bin/xattr -c' "$BUILD_SCRIPT"
+
+python3 - "$BUILD_SCRIPT" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+boundary = source.rfind("\nsnapshot_build_inputs\n")
+if boundary < 0:
+    raise SystemExit("native build never crosses the immutable input snapshot boundary")
+calls = [
+    source.rfind("\npreflight\n"),
+    boundary,
+    source.rfind("\nrevalidate_snapshotted_pins\n"),
+    source.rfind("\nrecover_stale_private_promoters\n"),
+    source.rfind("\nprepare_private_promoter\n"),
+]
+if any(call < 0 for call in calls) or calls != sorted(calls):
+    raise SystemExit("native build snapshots and revalidates inputs out of order")
+downstream = source[boundary:]
+for live_root in ('"$ROOT/Tools/', '"$ROOT/scripts/ci/'):
+    if live_root in downstream:
+        raise SystemExit(
+            f"native build reads a live checkout input after snapshot: {live_root}"
+        )
+PY
 
 for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.so' 'core_extension_path.txt' '/msplat-train'; do
   require_absent "$forbidden" "$BUILD_SCRIPT"
@@ -1183,6 +1235,7 @@ case_memory_budget=1
 case_output="$isolation_output"
 case_dataset="$isolation_dataset"
 case_include_events=1
+case_events_fd=1
 case_anchor_args=()
 case_extra_args=()
 run_complete_isolation_case() {
@@ -1201,7 +1254,7 @@ run_complete_isolation_case() {
     --memory-budget-bytes "$case_memory_budget"
   )
   if [ "$case_include_events" = 1 ]; then
-    arguments+=(--events-fd 1)
+    arguments+=(--events-fd "$case_events_fd")
   fi
   if [ "${#case_anchor_args[@]}" -gt 0 ]; then
     arguments+=("${case_anchor_args[@]}")
@@ -1290,6 +1343,55 @@ expect_isolation_rejection \
   'dataset|required|more than once|at most' \
   run_complete_isolation_case
 case_extra_args=()
+
+printf 'mask manifest sentinel\n' >"$isolation_manifest"
+for alias_case in source mask; do
+  if [ "$alias_case" = source ]; then
+    alias_path="$isolation_source"
+  else
+    alias_path="$isolation_manifest"
+  fi
+  alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+  case_events_fd=3
+  set +e
+  run_complete_isolation_case \
+    3<>"$alias_path" \
+    >"$negative_dir/isolation-events-alias-$alias_case.stdout" \
+    2>"$negative_dir/isolation-events-alias-$alias_case.stderr"
+  alias_status=$?
+  set -e
+  [ "$alias_status" = 1 ] \
+    || fail "event descriptor $alias_case alias exited with $alias_status instead of 1"
+  [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+    || fail "event descriptor alias changed the isolation $alias_case input"
+  grep -Eqi 'event.*descriptor|alias|distinct' \
+    "$negative_dir/isolation-events-alias-$alias_case.stderr" \
+    || fail "event descriptor $alias_case alias diagnostic is not useful"
+done
+case_events_fd=1
+
+set +e
+"$BIN" --isolate --profile fast --events-fd 2 \
+  >"$negative_dir/events-fd2.stdout" \
+  2>"$negative_dir/events-fd2.jsonl"
+events_fd2_status=$?
+set -e
+[ "$events_fd2_status" = 1 ] \
+  || fail "fd2 JSONL purity probe exited with $events_fd2_status instead of 1"
+python3 - "$negative_dir/events-fd2.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+if len(lines) != 1:
+    raise SystemExit(f"fd2 event stream contains {len(lines)} lines instead of one")
+event = json.loads(lines[0])
+if event.get("event") != "isolation_failed":
+    raise SystemExit("fd2 event stream did not contain the typed isolation failure")
+PY
+[ -s "$negative_dir/events-fd2.stdout" ] \
+  || fail "fd2 event stream did not redirect human diagnostics to stdout"
 
 isolation_dataset_target="$negative_dir/isolation-dataset-target"
 mkdir "$isolation_dataset_target"

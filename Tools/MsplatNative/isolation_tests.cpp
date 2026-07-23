@@ -118,16 +118,30 @@ void testAlphaTransmittanceLifting() {
 }
 
 void testPolicyThresholdBoundaries() {
+    const double metalContributionFloor = static_cast<double>(0.04f);
     const LiftedView contributionBoundary = liftContributions(
         "threshold.png",
         1,
         {
-            {0, 1, 0.20, 0.20, 1.0},       // exactly 0.04, retained
-            {0, 7, 0.20, 0.199999, 1.0},   // below 0.04, ignored
+            {0, 1, metalContributionFloor, 1.0, 1.0},
+            {
+                0,
+                7,
+                std::nextafter(metalContributionFloor, 0.0),
+                1.0,
+                1.0,
+            },
         }
     );
     require(contributionBoundary.labels == std::vector<std::uint16_t>({0, 1}),
-            "0.04 contribution boundary changed");
+            "Metal float contribution boundary changed");
+    const ReducedView contributionBoundaryReduced =
+        reduceLiftedView(contributionBoundary);
+    require(
+        contributionBoundaryReduced.gaussians[0].sufficientlyObserved &&
+            contributionBoundaryReduced.gaussians[0].assignedInstance == 1,
+        "Metal float contribution boundary did not produce an observation assignment"
+    );
 
     LiftedView assignment;
     assignment.identity = "assignment.png";
@@ -1001,6 +1015,41 @@ void testMemoryAdmissionAndCancellationPreserveSource() {
     fs::remove(output);
     writeFixturePly(source);
     const auto sourceBefore = readBytes(source);
+    const BinaryPly header = inspectBinaryPlyHeader(source, 1 << 20);
+    require(
+        header.vertexCount == 3 && header.rowBytes == 70,
+        "header-only PLY inspection changed the admitted layout"
+    );
+    requireThrows<MemoryLimitError>(
+        [&] {
+            enforceMemoryBudget(
+                requiredWorkingSetBytes(
+                    static_cast<std::size_t>(header.vertexCount),
+                    8,
+                    4096,
+                    4096,
+                    header.rowBytes
+                ),
+                4096
+            );
+        },
+        "oversized isolation working set reached PLY row traversal"
+    );
+    int scanPolls = 0;
+    requireThrows<CancellationError>(
+        [&] {
+            validateBinaryPlyRows(
+                header,
+                [&] { return ++scanPolls == 1; }
+            );
+        },
+        "PLY attribute scan ignored cancellation"
+    );
+    require(scanPolls == 1, "PLY attribute scan did not poll cancellation promptly");
+    require(
+        readBytes(source) == sourceBefore,
+        "cancelled PLY attribute scan changed the source PLY"
+    );
     const BinaryPly ply = inspectBinaryPly(source, 1 << 20);
     int polls = 0;
     bool cancelled = false;

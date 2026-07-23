@@ -187,7 +187,11 @@ fs::path resolvedPathKey(const fs::path &path) {
     }
 }
 
-void requireDistinctIsolationPaths(const std::vector<IsolationPath> &paths) {
+void requireDistinctIsolationPaths(
+    const std::vector<IsolationPath> &paths,
+    const std::optional<std::pair<std::uint64_t, std::uint64_t>>
+        &eventFileIdentity
+) {
     struct CheckedPath {
         fs::path resolved;
         std::optional<std::pair<std::uint64_t, std::uint64_t>> identity;
@@ -215,6 +219,14 @@ void requireDistinctIsolationPaths(const std::vector<IsolationPath> &paths) {
     }
 
     for (std::size_t left = 0; left < checked.size(); ++left) {
+        if (eventFileIdentity.has_value() &&
+            checked[left].identity == eventFileIdentity) {
+            throw std::invalid_argument(
+                "event file descriptor and " +
+                checked[left].description +
+                " must be distinct"
+            );
+        }
         for (std::size_t right = left + 1; right < checked.size(); ++right) {
             const bool sameResolvedPath =
                 checked[left].resolved == checked[right].resolved;
@@ -1558,7 +1570,10 @@ IsolationRunResult runIsolation(
             "mask for " + view.identity,
         });
     }
-    requireDistinctIsolationPaths(isolationPaths);
+    requireDistinctIsolationPaths(
+        isolationPaths,
+        request.eventFileIdentity
+    );
     if (manifest.views.size() < 2 ||
         manifest.views.size() > kMaximumViewCount) {
         throw MaskValidationError("isolation mask view count is invalid");
@@ -1596,7 +1611,7 @@ IsolationRunResult runIsolation(
             "source PLY digest does not match the authenticated request"
         );
     }
-    const BinaryPly source = inspectBinaryPly(
+    const BinaryPly source = inspectBinaryPlyHeader(
         request.sourcePly,
         request.memoryBudgetBytes
     );
@@ -1665,6 +1680,7 @@ IsolationRunResult runIsolation(
         source.rowBytes
     );
     enforceMemoryBudget(requiredBytes, request.memoryBudgetBytes);
+    validateBinaryPlyRows(source, isCancelled);
     requireUnchangedFile(request.sourcePly, sourceDigest, isCancelled);
 
     const std::vector<std::string> workIdentities =
@@ -1719,6 +1735,8 @@ IsolationRunResult runIsolation(
         {"work_view_count", workViewCount},
     });
     const std::size_t reusedWorkViewCount = cache.views.size();
+    const std::size_t filteringUnitTotal =
+        workViewCount + 1 + (request.anchor.has_value() ? 1 : 0);
 
     InferenceGaussians gaussians = loadInferenceGaussians(
         source,
@@ -1748,7 +1766,7 @@ IsolationRunResult runIsolation(
                 {"image_identity", view.identity},
                 {"phase", "filtering"},
                 {"status", "running"},
-                {"total_unit_count", workViewCount},
+                {"total_unit_count", filteringUnitTotal},
             });
             ++workIndex;
             continue;
@@ -1779,7 +1797,7 @@ IsolationRunResult runIsolation(
             {"image_identity", view.identity},
             {"phase", "filtering"},
             {"status", "running"},
-            {"total_unit_count", workViewCount},
+            {"total_unit_count", filteringUnitTotal},
         });
         ++workIndex;
     }
@@ -1790,14 +1808,6 @@ IsolationRunResult runIsolation(
     }
     requireUnchangedFile(request.sourcePly, sourceDigest, isCancelled);
     checkCancellation(isCancelled);
-    emit("isolation_progress", {
-        {"cache_reused", reusedWorkViewCount > 0},
-        {"completed_unit_count", 0},
-        {"image_identity", ""},
-        {"phase", "filtering"},
-        {"status", "running"},
-        {"total_unit_count", 1},
-    });
     const std::vector<GaussianEvidence> evidence =
         classifyGaussians(cache.views);
     checkCancellation(isCancelled);
@@ -1808,7 +1818,25 @@ IsolationRunResult runIsolation(
         std::nullopt
     );
     checkCancellation(isCancelled);
+    emit("isolation_progress", {
+        {"cache_reused", reusedWorkViewCount > 0},
+        {"completed_unit_count", workViewCount + 1},
+        {"image_identity", ""},
+        {"phase", "filtering"},
+        {"status", "running"},
+        {"total_unit_count", filteringUnitTotal},
+    });
     if (selection.outcome == SelectionOutcome::noSubject) {
+        if (request.anchor.has_value()) {
+            emit("isolation_progress", {
+                {"cache_reused", true},
+                {"completed_unit_count", filteringUnitTotal},
+                {"image_identity", request.anchor->imageIdentity},
+                {"phase", "filtering"},
+                {"status", "running"},
+                {"total_unit_count", filteringUnitTotal},
+            });
+        }
         emit("isolation_no_subject", {
             {"components", componentListJson(selection.components)},
             {"source_gaussian_count", gaussianCount},
@@ -1857,6 +1885,14 @@ IsolationRunResult runIsolation(
             anchorWeights
         );
         checkCancellation(isCancelled);
+        emit("isolation_progress", {
+            {"cache_reused", true},
+            {"completed_unit_count", filteringUnitTotal},
+            {"image_identity", request.anchor->imageIdentity},
+            {"phase", "filtering"},
+            {"status", "running"},
+            {"total_unit_count", filteringUnitTotal},
+        });
     }
     if (selection.outcome == SelectionOutcome::ambiguous) {
         emit("isolation_ambiguity", {
