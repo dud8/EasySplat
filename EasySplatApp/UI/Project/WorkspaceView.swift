@@ -12,15 +12,20 @@ struct WorkspaceView: View {
             reduceMotion: reduceMotion
         )
         ZStack {
+            // Non-result states reset the window title AppKit keeps from the
+            // last-viewed splat.
             switch model.viewState {
             case .home:
                 HomeView()
+                    .navigationTitle("EasySplat")
                     .transition(.opacity)
             case .opening:
                 OpeningSplatView()
+                    .navigationTitle("EasySplat")
                     .transition(.opacity)
             case .processing:
                 ProcessingView(onBackToProjects: onBackToProjects)
+                    .navigationTitle("EasySplat")
                     .transition(.opacity)
             case .viewer:
                 ViewerView(onNewSplat: onNewSplat)
