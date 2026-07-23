@@ -195,6 +195,71 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
         XCTAssertEqual(replacedOutput.gaussianCount, 2)
     }
 
+    func testCancellationAfterMaskCommitRemovesNewMaskAndAllowsExactRetry() throws {
+        let fixture = try makeFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        let canonicalBytes = try Data(contentsOf: fixture.paths.outputSplatURL)
+        let first = try fixture.makeArtifact(outputIdentity: UUID())
+        _ = try SubjectIsolationArtifactStore.publish(
+            first,
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+        let firstSubjectBytes = try Data(contentsOf: fixture.paths.isolatedOutputURL)
+        let firstManifestBytes = try Data(contentsOf: fixture.paths.isolationManifestURL)
+        let firstMaskURL = try fixture.paths.resolveProjectRelativePath(
+            first.masks[0].relativePath
+        )
+        let firstMaskBytes = try Data(contentsOf: firstMaskURL)
+
+        try fixture.rebuildStaging(vertexCount: 2, maskValue: 2)
+        let replacement = try fixture.makeArtifact(
+            outputIdentity: UUID(),
+            vertexCount: 2,
+            maskValue: 2
+        )
+        let replacementMaskURL = try fixture.paths.resolveProjectRelativePath(
+            replacement.masks[0].relativePath
+        )
+        let probe = CommittedMaskCancellationProbe(
+            destination: replacementMaskURL,
+            expectedSHA256: replacement.masks[0].maskSHA256
+        )
+
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.publish(
+                replacement,
+                stagedOutputURL: fixture.stagedOutputURL,
+                stagedMasksURL: fixture.stagedMasksURL,
+                paths: fixture.paths,
+                shouldCancel: { probe.shouldCancel() }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(probe.completedDestinationCheckCount, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: replacementMaskURL.path))
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.outputSplatURL), canonicalBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolatedOutputURL), firstSubjectBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolationManifestURL), firstManifestBytes)
+        XCTAssertEqual(try Data(contentsOf: firstMaskURL), firstMaskBytes)
+
+        XCTAssertNoThrow(
+            try SubjectIsolationArtifactStore.publish(
+                replacement,
+                stagedOutputURL: fixture.stagedOutputURL,
+                stagedMasksURL: fixture.stagedMasksURL,
+                paths: fixture.paths
+            )
+        )
+        guard case .valid(let retried, _) =
+                SubjectIsolationArtifactStore.load(paths: fixture.paths) else {
+            return XCTFail("The exact staged generation must publish after rollback.")
+        }
+        XCTAssertEqual(retried.output.identity, replacement.output.identity)
+    }
+
     func testCancellationAfterOutputPublicationRestoresPreviousSubjectAndCanonicalBytes() throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
@@ -324,6 +389,25 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
         }
         XCTAssertTrue(reachedDecode)
         XCTAssertGreaterThanOrEqual(scanProbe.checkCount, 9)
+    }
+
+    func testDatasetImageHashChecksCancellationWithinOneLargeFile() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let imageURL = root.appendingPathComponent("retained-image.png")
+        try Data(repeating: 0xA5, count: 4 * 1_048_576).write(to: imageURL)
+        let probe = CancellationProbe(cancelAfter: 4)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.sha256(
+                of: imageURL,
+                maximumBytes: 512 * 1_048_576,
+                shouldCancel: { probe.shouldCancel() }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(probe.checkCount, 4)
     }
 
     func testRemovalAndRetrainInvalidationNeverMutateCanonicalBytes() throws {
@@ -630,6 +714,32 @@ private final class CancellationProbe: @unchecked Sendable {
         lock.withLock {
             count += 1
             return count >= cancelAfter
+        }
+    }
+}
+
+private final class CommittedMaskCancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let destination: URL
+    private let expectedSHA256: String
+    private var completedCheckCount = 0
+
+    init(destination: URL, expectedSHA256: String) {
+        self.destination = destination
+        self.expectedSHA256 = expectedSHA256
+    }
+
+    var completedDestinationCheckCount: Int {
+        lock.withLock { completedCheckCount }
+    }
+
+    func shouldCancel() -> Bool {
+        guard (try? GeometryArtifactStore.sha256(of: destination)) == expectedSHA256 else {
+            return false
+        }
+        return lock.withLock {
+            completedCheckCount += 1
+            return completedCheckCount == 2
         }
     }
 }

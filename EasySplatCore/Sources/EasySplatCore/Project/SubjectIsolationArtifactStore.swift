@@ -156,8 +156,8 @@ public enum SubjectIsolationArtifactStore {
                 maximumBytes: maximumMaskBytes,
                 shouldCancel: shouldCancel
             )
-            try validateMask(mask, at: destination, shouldCancel: shouldCancel)
             publishedMaskURLs.append(destination)
+            try validateMask(mask, at: destination, shouldCancel: shouldCancel)
         }
         try throwIfCancelled(shouldCancel)
         try synchronizeDirectory(paths.isolationMasksURL)
@@ -450,7 +450,8 @@ public enum SubjectIsolationArtifactStore {
             let imageURL = imageDirectory.appendingPathComponent(mask.imageIdentity)
             guard try GeometryArtifactStore.sha256(
                 of: imageURL,
-                maximumBytes: 512 * 1_048_576
+                maximumBytes: 512 * 1_048_576,
+                shouldCancel: shouldCancel
             ) == mask.imageSHA256 else {
                 return .datasetIdentity
             }
@@ -856,13 +857,6 @@ public enum SubjectIsolationArtifactStore {
             shouldCancel: shouldCancel
         )
         try writePrivateFile(data, to: destination, shouldCancel: shouldCancel)
-        guard try BoundedFileReader.readRegularFile(
-            at: destination,
-            maximumBytes: maximumBytes,
-            shouldCancel: shouldCancel
-        ) == data else {
-            throw SubjectIsolationArtifactStoreError.invalidArtifact
-        }
     }
 
     private static func writePrivateFile(
