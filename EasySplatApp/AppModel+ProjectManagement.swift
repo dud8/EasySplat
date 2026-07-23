@@ -167,6 +167,10 @@ extension AppModel {
         currentTaskToken = token
         currentRunOrigin = .resume
         isRunActive = true
+        // Record the target before the task's first suspension so the project
+        // is locked (rename/trash) for the entire open, not just after its
+        // metadata loads.
+        currentProjectURL = url
         currentTask = Task { await resumeProjectTask(at: url, taskToken: token) }
         return true
     }
@@ -190,6 +194,7 @@ extension AppModel {
         currentTaskToken = token
         currentRunOrigin = .retrain
         isRunActive = true
+        currentProjectURL = url
         currentTask = Task {
             await resumeProjectTask(at: url, taskToken: token, bypassFinishedOutput: true)
         }
