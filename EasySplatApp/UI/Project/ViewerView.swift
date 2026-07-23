@@ -47,7 +47,6 @@ struct ViewerView: View {
                         overlayDensity: .compact
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(Theme.Spacing.large)
                     .overlay(alignment: .bottom) {
                         VStack(spacing: Theme.Spacing.small) {
                             partialCoverageHint
@@ -88,6 +87,7 @@ struct ViewerView: View {
             requestArtifactLoad()
         }
         .onChange(of: model.outputPlyURL) { _, _ in requestArtifactLoad() }
+        .onChange(of: model.exportMenuRequestCount) { _, _ in presentExportPanel() }
         .onDisappear { artifactLoader.cancel() }
     }
 
@@ -160,12 +160,6 @@ struct ViewerView: View {
                 }
                 .disabled(model.currentProjectURL == nil || model.isRunActive)
                 .accessibilityIdentifier("result.retrain")
-
-                Button("View Releases…", systemImage: "arrow.triangle.2.circlepath") {
-                    let releases = AppConfig.projectHomeURL
-                        .appendingPathComponent("releases", isDirectory: true)
-                    NSWorkspace.shared.open(releases)
-                }
 
                 Divider()
 
@@ -370,7 +364,7 @@ struct ViewerView: View {
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
             if let input = model.currentInput {
-                LabeledContent("Input", value: inputDescription(input))
+                LabeledContent("Input", value: input.displaySummary)
             }
             let options = displayedRunOptions
             LabeledContent("Path", value: capturePathLabel(options.capturePath))
@@ -742,17 +736,6 @@ struct ViewerView: View {
                 title: "Couldn’t update view",
                 message: error.localizedDescription
             )
-        }
-    }
-
-    private func inputDescription(_ input: InputSpec) -> String {
-        switch input {
-        case .video(let files):
-            return files.count == 1 ? "1 video" : "\(files.count) videos"
-        case .photos:
-            return "Photo folder"
-        case .mixed(let videos, _):
-            return "\(videos.count) video\(videos.count == 1 ? "" : "s") and photos"
         }
     }
 

@@ -25,7 +25,7 @@ struct SplatViewerView: View {
     var body: some View {
         let isCompactOverlay = overlayDensity == .compact
         let toolbarSpacing: CGFloat = isCompactOverlay ? 6 : 8
-        let toolbarPadding: CGFloat = isCompactOverlay ? 8 : 12
+        let toolbarPadding: CGFloat = 12
         let toolbarControlSize: ControlSize = isCompactOverlay ? .small : .regular
 
         ZStack(alignment: .topLeading) {
@@ -37,7 +37,6 @@ struct SplatViewerView: View {
                 sceneConfiguration: sceneConfiguration,
                 onLoadStateChanged: onLoadStateChanged
             )
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
 
             HStack(spacing: toolbarSpacing) {
                 Button("Fit") { controller.fitToView() }
