@@ -83,6 +83,21 @@ final class AppModel: ObservableObject {
     @Published var isRunActive = false
     @Published var actionFailure: ActionFailurePresentation?
 
+    /// How the active run was started. Fresh runs are the only ones the
+    /// historical duration estimate describes; resumes and retrains skip
+    /// stages and would make it misleading.
+    enum RunOrigin {
+        case fresh
+        case resume
+        case retrain
+    }
+
+    var currentRunOrigin: RunOrigin = .fresh
+
+    /// Bumped by the File > Export… menu command; the result workspace owns
+    /// the save-panel flow and observes this token.
+    @Published var exportMenuRequestCount = 0
+
     @Published var cachedFreeDiskBytes: Int64? = nil
     @Published var requestedRunOptions = RequestedRunOptions()
     @Published var pendingVideoURLs: [URL] = []

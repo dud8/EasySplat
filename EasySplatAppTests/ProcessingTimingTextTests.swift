@@ -30,6 +30,73 @@ final class ProcessingTimingTextTests: XCTestCase {
         XCTAssertEqual(ProcessingPhase.finish.heading, "Step 4 of 4 · Finishing")
     }
 
+    func testPhaseRailMarksEarlierPhasesDoneAndLaterPhasesPending() {
+        XCTAssertEqual(ProcessingView.railState(of: .prepare, current: .reconstruct), .completed)
+        XCTAssertEqual(ProcessingView.railState(of: .reconstruct, current: .reconstruct), .current)
+        XCTAssertEqual(ProcessingView.railState(of: .train, current: .reconstruct), .pending)
+        XCTAssertEqual(ProcessingView.railState(of: .finish, current: .reconstruct), .pending)
+        XCTAssertEqual(ProcessingView.railState(of: .prepare, current: .prepare), .current)
+        XCTAssertEqual(ProcessingView.railState(of: .finish, current: .finish), .current)
+    }
+
+    func testPhaseRailStatesNeverShareASymbol() {
+        let symbols = [
+            ProcessingView.railSymbolName(for: .completed),
+            ProcessingView.railSymbolName(for: .current),
+            ProcessingView.railSymbolName(for: .pending)
+        ]
+        XCTAssertEqual(Set(symbols).count, symbols.count)
+    }
+
+    func testContextLineJoinsOnlyThePartsThatExist() {
+        XCTAssertEqual(
+            ProcessingView.contextLine(projectTitle: "Harbor House", inputSummary: "2 videos"),
+            "Harbor House — 2 videos"
+        )
+        XCTAssertEqual(
+            ProcessingView.contextLine(projectTitle: "Harbor House", inputSummary: nil),
+            "Harbor House"
+        )
+        XCTAssertEqual(
+            ProcessingView.contextLine(projectTitle: nil, inputSummary: "Photo folder"),
+            "Photo folder"
+        )
+        XCTAssertNil(ProcessingView.contextLine(projectTitle: nil, inputSummary: nil))
+    }
+
+    func testWindowSubtitleMirrorsThePhaseOnlyWhileARunIsActive() {
+        XCTAssertEqual(
+            ProcessingPhase.windowSubtitle(stage: .sfmMatching, isRunActive: true),
+            "Step 2 of 4 · Reconstructing scene"
+        )
+        XCTAssertEqual(
+            ProcessingPhase.windowSubtitle(stage: nil, isRunActive: true),
+            "Step 1 of 4 · Preparing input"
+        )
+        XCTAssertEqual(ProcessingPhase.windowSubtitle(stage: .trainSplat, isRunActive: false), "")
+        XCTAssertEqual(ProcessingPhase.windowSubtitle(stage: nil, isRunActive: false), "")
+    }
+
+    func testInputDisplaySummaryCoversEveryShape() {
+        XCTAssertEqual(InputSpec.video(files: ["/tmp/a.mov"]).displaySummary, "1 video")
+        XCTAssertEqual(
+            InputSpec.video(files: ["/tmp/a.mov", "/tmp/b.mov"]).displaySummary,
+            "2 videos"
+        )
+        XCTAssertEqual(InputSpec.photos(folder: "/tmp/photos").displaySummary, "Photo folder")
+        XCTAssertEqual(
+            InputSpec.mixed(videos: ["/tmp/a.mov"], photosFolder: "/tmp/photos").displaySummary,
+            "1 video and photos"
+        )
+        XCTAssertEqual(
+            InputSpec.mixed(
+                videos: ["/tmp/a.mov", "/tmp/b.mov"],
+                photosFolder: "/tmp/photos"
+            ).displaySummary,
+            "2 videos and photos"
+        )
+    }
+
     func testTechnicalLogStaysPinnedOnlyNearTheBottom() {
         // Content shorter than the viewport → always pinned.
         XCTAssertTrue(ProcessingView.isPinnedToBottom(

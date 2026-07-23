@@ -34,6 +34,26 @@ enum ProcessingPhase: Int, Equatable {
             return .finish
         }
     }
+
+    /// Short label for the phase rail; the full phrase stays in the heading.
+    var railLabel: String {
+        switch self {
+        case .prepare: return "Prepare"
+        case .reconstruct: return "Reconstruct"
+        case .train: return "Train"
+        case .finish: return "Finish"
+        }
+    }
+
+    static let allPhases: [ProcessingPhase] = [.prepare, .reconstruct, .train, .finish]
+
+    /// Window subtitle shown while a run is active, so the current phase is
+    /// visible from Mission Control and the Dock without raising the window.
+    static func windowSubtitle(stage: PipelineStage?, isRunActive: Bool) -> String {
+        guard isRunActive else { return "" }
+        let phase = stage.map(ProcessingPhase.forStage) ?? .prepare
+        return phase.heading
+    }
 }
 
 struct ProcessingView: View {
@@ -50,10 +70,24 @@ struct ProcessingView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text(phase.heading)
-                    .font(.title2.weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-                    .accessibilityIdentifier("processing.phase")
+                VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+                    Text(phase.phrase)
+                        .font(.title2.weight(.semibold))
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityIdentifier("processing.phase")
+
+                    if let context = contextLine {
+                        Text(context)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(context)
+                            .accessibilityIdentifier("processing.context")
+                    }
+                }
+
+                phaseRail
 
                 if model.lastError != nil {
                     failureContent
@@ -96,6 +130,94 @@ struct ProcessingView: View {
         }
     }
 
+    enum PhaseRailState: Equatable {
+        case completed
+        case current
+        case pending
+    }
+
+    nonisolated static func railState(
+        of phase: ProcessingPhase,
+        current: ProcessingPhase
+    ) -> PhaseRailState {
+        if phase.rawValue < current.rawValue { return .completed }
+        if phase == current { return .current }
+        return .pending
+    }
+
+    private var phaseRail: some View {
+        HStack(spacing: Theme.Spacing.large) {
+            ForEach(ProcessingPhase.allPhases, id: \.rawValue) { railPhase in
+                railEntry(railPhase, state: Self.railState(of: railPhase, current: phase))
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(phase.heading)
+        .accessibilityIdentifier("processing.phaseRail")
+    }
+
+    private func railEntry(_ railPhase: ProcessingPhase, state: PhaseRailState) -> some View {
+        HStack(spacing: Theme.Spacing.small / 2) {
+            Image(systemName: Self.railSymbolName(for: state))
+                .font(.caption)
+                .foregroundStyle(state == .current ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(.secondary))
+            Text(railPhase.railLabel)
+                .font(.subheadline.weight(state == .current ? .semibold : .regular))
+                .foregroundStyle(state == .current ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+        }
+    }
+
+    nonisolated static func railSymbolName(for state: PhaseRailState) -> String {
+        switch state {
+        case .completed: return "checkmark.circle.fill"
+        case .current: return "circle.fill"
+        case .pending: return "circle"
+        }
+    }
+
+    private var contextLine: String? {
+        Self.contextLine(
+            projectTitle: projectTitle,
+            inputSummary: model.currentInput?.displaySummary
+        )
+    }
+
+    nonisolated static func contextLine(projectTitle: String?, inputSummary: String?) -> String? {
+        switch (projectTitle, inputSummary) {
+        case let (.some(title), .some(input)):
+            return "\(title) — \(input)"
+        case let (.some(title), nil):
+            return title
+        case let (nil, .some(input)):
+            return input
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    private var projectTitle: String? {
+        guard let projectURL = model.currentProjectURL else { return nil }
+        if let summary = model.projectSummaries.first(where: {
+            ProjectSummary.hasSameLocation($0.url, projectURL)
+        }) {
+            return summary.title
+        }
+        return projectURL.deletingPathExtension().lastPathComponent
+    }
+
+    private var durationExpectation: String? {
+        // The predictor describes full create-to-viewer time; resumes and
+        // retrains skip stages, so the estimate would mislead there.
+        guard model.currentRunOrigin == .fresh, let input = model.currentInput else { return nil }
+        let options = model.currentRunOptions ?? model.requestedRunOptions
+        return RunDurationPredictor.predict(
+            options: options,
+            input: input,
+            from: model.projectSummaries,
+            excluding: model.currentProjectURL
+        )?.displayText
+    }
+
     private var progressContent: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let progress = Self.phaseProgress(stage: model.stage, progress: model.progress) {
@@ -106,6 +228,7 @@ struct ProcessingView: View {
                     .accessibilityIdentifier("processing.progress")
             } else {
                 ProgressView()
+                    .progressViewStyle(.linear)
                     .accessibilityLabel("In progress")
                     .accessibilityIdentifier("processing.progress")
             }
@@ -117,6 +240,13 @@ struct ProcessingView: View {
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("processing.timing")
                 }
+            }
+
+            if let expectation = durationExpectation {
+                Text(expectation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("processing.expectation")
             }
 
             if model.isStopping {

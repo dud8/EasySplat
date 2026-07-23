@@ -119,6 +119,25 @@ extension AppModel {
         }
     }
 
+    /// Returns to a clean new-splat workspace. Backs the File > New Splat
+    /// menu command and the sidebar toolbar button.
+    @discardableResult
+    func beginNewSplat() -> Bool {
+        guard !isRunActive else { return false }
+        guard flushPendingNotesSave() else { return false }
+        reset()
+        clearPendingInputs()
+        viewState = .home
+        return true
+    }
+
+    /// Asks the result workspace to run its export flow. Only meaningful with
+    /// a finished splat on screen.
+    func requestExportFromMenu() {
+        guard viewState == .viewer, outputPlyURL != nil else { return }
+        exportMenuRequestCount += 1
+    }
+
     func startFromPendingSelection(timingBoundary: RunTimingBoundary? = nil) {
         let timingBoundary = timingBoundary ?? .capture()
         guard !isRunActive else { return }
@@ -127,6 +146,7 @@ extension AppModel {
         let title = projectTitle(for: inputSpec)
         let token = UUID()
         currentTaskToken = token
+        currentRunOrigin = .fresh
         isRunActive = true
         currentTask = Task {
             await startProject(
@@ -145,6 +165,7 @@ extension AppModel {
         guard flushPendingNotesSave() else { return false }
         let token = UUID()
         currentTaskToken = token
+        currentRunOrigin = .resume
         isRunActive = true
         currentTask = Task { await resumeProjectTask(at: url, taskToken: token) }
         return true
@@ -167,6 +188,7 @@ extension AppModel {
         }
         let token = UUID()
         currentTaskToken = token
+        currentRunOrigin = .retrain
         isRunActive = true
         currentTask = Task {
             await resumeProjectTask(at: url, taskToken: token, bypassFinishedOutput: true)

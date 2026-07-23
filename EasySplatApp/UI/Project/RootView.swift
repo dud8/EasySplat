@@ -61,10 +61,7 @@ struct RootView: View {
 
     @MainActor
     static func prepareNewSplat(model: AppModel, selectedProjectURL: inout URL?) {
-        guard model.flushPendingNotesSave() else { return }
-        model.reset()
-        model.clearPendingInputs()
-        model.viewState = .home
+        guard model.beginNewSplat() else { return }
         selectedProjectURL = nil
     }
 
