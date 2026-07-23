@@ -308,13 +308,16 @@ require_contains \
   '"COLMAP loader allocation exceeds the isolation memory budget"' \
   "$OVERLAY"
 require_contains 'app.parse(argc, argv);' "$OVERLAY"
-require_contains 'scanEventsDescriptorIntent(argc, argv)' "$OVERLAY"
+require_contains 'scanPreparseIntent(argc, argv)' "$OVERLAY"
 require_contains 'maximumPreparseArgumentCount = 4096' "$OVERLAY"
 require_contains 'maximumPreparseTokenBytes = 128' "$OVERLAY"
+require_contains 'if (*token == "--") break;' "$OVERLAY"
+require_contains 'suppressParseDiagnostics' "$OVERLAY"
 require_contains 'const int parserExit = app.exit(' "$OVERLAY"
 require_contains 'capturedStandardOutput,' "$OVERLAY"
 require_contains 'capturedStandardError' "$OVERLAY"
 require_contains 'emitCapturedParseDiagnostics(' "$OVERLAY"
+require_absent 'EventsDescriptorIntent' "$OVERLAY"
 require_absent 'app.exit(error);' "$OVERLAY"
 require_contains 'return parserExit == 0 ? 0 : 1;' "$OVERLAY"
 require_absent 'CLI11_PARSE(app, argc, argv);' "$OVERLAY"
@@ -1508,6 +1511,22 @@ expect_isolation_rejection() {
     || fail "$label isolation diagnostic is not useful"
 }
 
+expect_isolation_parse_suppression() {
+  local label="$1"
+  shift
+  set +e
+  "$@" \
+    >"$negative_dir/$label.stdout" \
+    2>"$negative_dir/$label.stderr"
+  local status=$?
+  set -e
+  [ "$status" = 1 ] \
+    || fail "$label isolation parse rejection exited with $status instead of 1"
+  [ ! -s "$negative_dir/$label.stdout" ] \
+    && [ ! -s "$negative_dir/$label.stderr" ] \
+    || fail "$label isolation parser emitted unauthenticated diagnostics"
+}
+
 case_source_digest="$valid_isolation_digest"
 case_memory_budget=1
 case_output="$isolation_output"
@@ -1616,11 +1635,13 @@ expect_isolation_rejection \
   'exactly once' \
   run_complete_isolation_case
 case_extra_args=(--dataset "$isolation_dataset")
-expect_isolation_rejection \
+expect_isolation_parse_suppression \
   isolation-duplicate-dataset \
-  'dataset|required|more than once|at most' \
   run_complete_isolation_case
 case_extra_args=()
+expect_isolation_parse_suppression \
+  isolation-help-before-validation \
+  "$BIN" --isolate --help
 
 printf 'mask manifest sentinel\n' >"$isolation_manifest"
 for alias_case in source mask; do
@@ -1669,9 +1690,51 @@ for alias_case in source mask; do
       || fail "fd2 parser diagnostics changed the isolation $alias_case input"
     [ "$(stat -f '%d:%i:%l' "$alias_path")" = "$alias_identity_before" ] \
       || fail "fd2 parser diagnostics replaced the isolation $alias_case input"
-    grep -Fq -- '--unknown-isolation-option' \
-      "$negative_dir/isolation-parser-fd2-$alias_case-$argument_order.stdout" \
-      || fail "fd2 parser $alias_case diagnostic did not use safe stdout"
+    [ ! -s "$negative_dir/isolation-parser-fd2-$alias_case-$argument_order.stdout" ] \
+      || fail "fd2 parser $alias_case diagnostic escaped isolation suppression"
+  done
+done
+
+for alias_case in source mask; do
+  if [ "$alias_case" = source ]; then
+    alias_path="$isolation_source"
+  else
+    alias_path="$isolation_manifest"
+  fi
+  for argument_order in before after; do
+    alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+    alias_identity_before="$(stat -f '%d:%i:%l' "$alias_path")"
+    if [ "$argument_order" = before ]; then
+      parser_arguments=(
+        --unknown-isolation-option
+        --isolate
+        --events-fd 2
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+      )
+    else
+      parser_arguments=(
+        --isolate
+        --events-fd 1
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+        --unknown-isolation-option
+      )
+    fi
+    set +e
+    if [ "$alias_case" = source ]; then
+      "$BIN" "${parser_arguments[@]}" 1<>"$alias_path" 2>&1
+    else
+      "$BIN" "${parser_arguments[@]}" 2<>"$alias_path" 1>&2
+    fi
+    alias_status=$?
+    set -e
+    [ "$alias_status" = 1 ] \
+      || fail "dual-stdio parser $alias_case alias exited with $alias_status instead of 1"
+    [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+      || fail "dual-stdio parser diagnostics changed the isolation $alias_case input"
+    [ "$(stat -f '%d:%i:%l' "$alias_path")" = "$alias_identity_before" ] \
+      || fail "dual-stdio parser diagnostics replaced the isolation $alias_case input"
   done
 done
 
@@ -1704,11 +1767,56 @@ parser_fd1_status=$?
 parser_ordinary_status=$?
 set -e
 [ "$parser_fd1_status" = 1 ] && [ ! -s "$negative_dir/isolation-parser-fd1.stdout" ] \
-  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/isolation-parser-fd1.stderr" \
-  || fail "fd1 parser diagnostics did not preserve the JSONL channel"
+  && [ ! -s "$negative_dir/isolation-parser-fd1.stderr" ] \
+  || fail "fd1 parser diagnostics escaped isolation suppression"
 [ "$parser_ordinary_status" = 1 ] && [ ! -s "$negative_dir/parser-ordinary.stdout" ] \
   && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-ordinary.stderr" \
   || fail "ordinary parser diagnostics did not preserve stderr behavior"
+
+set +e
+"$BIN" -- --isolate \
+  >"$negative_dir/parser-terminator.stdout" \
+  2>"$negative_dir/parser-terminator.stderr"
+parser_terminator_status=$?
+"$BIN" --events-fd 3 --unknown-isolation-option \
+  >"$negative_dir/parser-fd3.stdout" \
+  2>"$negative_dir/parser-fd3.stderr"
+parser_fd3_status=$?
+"$BIN" --events-fd -1 --unknown-isolation-option \
+  >"$negative_dir/parser-invalid-fd.stdout" \
+  2>"$negative_dir/parser-invalid-fd.stderr"
+parser_invalid_fd_status=$?
+"$BIN" --events-fd 999999999999999999999 \
+  >"$negative_dir/parser-overflow-fd.stdout" \
+  2>"$negative_dir/parser-overflow-fd.stderr"
+parser_overflow_fd_status=$?
+"$BIN" --events-fd=03 --unknown-isolation-option \
+  >"$negative_dir/parser-nonstandard-fd3.stdout" \
+  2>"$negative_dir/parser-nonstandard-fd3.stderr"
+parser_nonstandard_fd3_status=$?
+"$BIN" --events-fd 3 --events-fd 4 \
+  >"$negative_dir/parser-duplicate-fd3.stdout" \
+  2>"$negative_dir/parser-duplicate-fd3.stderr"
+parser_duplicate_fd3_status=$?
+set -e
+[ "$parser_terminator_status" = 1 ] && [ ! -s "$negative_dir/parser-terminator.stdout" ] \
+  && grep -Fq -- '--isolate' "$negative_dir/parser-terminator.stderr" \
+  || fail "argument terminator did not preserve ordinary parser diagnostics"
+[ "$parser_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-fd3.stdout" ] \
+  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-fd3.stderr" \
+  || fail "fd3 parser diagnostics were unnecessarily suppressed"
+[ "$parser_invalid_fd_status" = 1 ] && [ ! -s "$negative_dir/parser-invalid-fd.stdout" ] \
+  && [ -s "$negative_dir/parser-invalid-fd.stderr" ] \
+  || fail "invalid non-stdio descriptor diagnostics were unnecessarily suppressed"
+[ "$parser_overflow_fd_status" = 1 ] && [ ! -s "$negative_dir/parser-overflow-fd.stdout" ] \
+  && [ -s "$negative_dir/parser-overflow-fd.stderr" ] \
+  || fail "overflow descriptor diagnostics were unnecessarily suppressed"
+[ "$parser_nonstandard_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-nonstandard-fd3.stdout" ] \
+  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-nonstandard-fd3.stderr" \
+  || fail "nonstandard fd3 diagnostics were unnecessarily suppressed"
+[ "$parser_duplicate_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-duplicate-fd3.stdout" ] \
+  && [ -s "$negative_dir/parser-duplicate-fd3.stderr" ] \
+  || fail "duplicate fd3+ diagnostics were unnecessarily suppressed"
 
 for alias_case in source mask; do
   if [ "$alias_case" = source ]; then

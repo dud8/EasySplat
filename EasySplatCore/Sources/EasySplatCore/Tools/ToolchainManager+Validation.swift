@@ -503,7 +503,7 @@ extension ToolchainManager {
             "source_url": "https://github.com/rayanht/msplat.git",
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
-            "overlay_sha256": "5b64efb49182364eb3e30a9c23220177c95067e6b5c394ae3c2d073bf2fe6aa9",
+            "overlay_sha256": "f014ad829ef740f116efe705d4092066eacab03722185b1dfff26b58cb558225",
             "raster_test_sha256": "06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d",
             "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
             "isolation_source_sha256": "40444aa0fc5a07f6919b28ef4dac1517a6627daa81331013b71ba49ff465c9fc",
