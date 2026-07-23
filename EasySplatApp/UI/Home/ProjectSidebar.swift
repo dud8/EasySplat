@@ -205,15 +205,22 @@ struct ProjectSidebar: View {
                 .truncationMode(.middle)
                 .help(project.title)
 
-            HStack(spacing: Theme.Spacing.small) {
-                if let caption = Self.rowCaption(
-                    status: project.status,
-                    isInterrupted: project.isInterrupted
-                ) {
-                    Text(caption)
+            let caption = Self.rowCaption(
+                status: project.status,
+                isInterrupted: project.isInterrupted
+            )
+            let date = project.lastActivityAt.formatted(date: .abbreviated, time: .omitted)
+            // At tight widths the date yields rather than truncating both.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: Theme.Spacing.small) {
+                    if let caption { Text(caption).fixedSize() }
+                    Spacer(minLength: Theme.Spacing.small)
+                    Text(date).fixedSize()
                 }
-                Spacer(minLength: Theme.Spacing.small)
-                Text(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted))
+                HStack(spacing: Theme.Spacing.small) {
+                    if let caption { Text(caption) }
+                    Spacer(minLength: 0)
+                }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
