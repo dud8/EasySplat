@@ -30,6 +30,21 @@ final class ProcessingTimingTextTests: XCTestCase {
         XCTAssertEqual(ProcessingPhase.finish.heading, "Step 4 of 4 · Finishing")
     }
 
+    func testTechnicalLogStaysPinnedOnlyNearTheBottom() {
+        // Content shorter than the viewport → always pinned.
+        XCTAssertTrue(ProcessingView.isPinnedToBottom(
+            contentOffsetY: 0, contentHeight: 100, containerHeight: 260, tolerance: 24))
+        // Scrolled to the exact bottom → pinned.
+        XCTAssertTrue(ProcessingView.isPinnedToBottom(
+            contentOffsetY: 740, contentHeight: 1000, containerHeight: 260, tolerance: 24))
+        // Within tolerance of the bottom → still pinned.
+        XCTAssertTrue(ProcessingView.isPinnedToBottom(
+            contentOffsetY: 720, contentHeight: 1000, containerHeight: 260, tolerance: 24))
+        // Scrolled up past the tolerance → released.
+        XCTAssertFalse(ProcessingView.isPinnedToBottom(
+            contentOffsetY: 500, contentHeight: 1000, containerHeight: 260, tolerance: 24))
+    }
+
     func testVisibleProgressNeverPresentsInternalStageFractionsAsPhaseProgress() {
         XCTAssertNil(ProcessingView.phaseProgress(stage: .importInput, progress: 0.8))
         XCTAssertNil(ProcessingView.phaseProgress(stage: .extractFrames, progress: 0.2))

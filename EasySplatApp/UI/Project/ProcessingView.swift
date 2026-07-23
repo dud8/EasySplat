@@ -189,14 +189,7 @@ struct ProcessingView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                ScrollView {
-                    Text(technicalText)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(maxHeight: 260)
+                AutoScrollingLog(text: technicalText)
 
                 HStack {
                     Spacer()
@@ -249,6 +242,17 @@ struct ProcessingView: View {
         case .importInput, .extractFrames, .selectFrames, .sfmFeatures, .sfmMatching, .sfmMapping:
             return nil
         }
+    }
+
+    nonisolated static func isPinnedToBottom(
+        contentOffsetY: CGFloat,
+        contentHeight: CGFloat,
+        containerHeight: CGFloat,
+        tolerance: CGFloat
+    ) -> Bool {
+        // Content shorter than the viewport is always "at the bottom".
+        let maxOffset = max(0, contentHeight - containerHeight)
+        return contentOffsetY >= maxOffset - tolerance
     }
 
     private var technicalText: String {
@@ -332,5 +336,64 @@ struct ProcessingView: View {
             return "EasySplat will stop at a safe point. It will resume from a validated optimizer checkpoint when one is available; otherwise training restarts from the reconstructed scene."
         }
         return "EasySplat will stop at a safe point and keep the last completed stage. You can resume this project later."
+    }
+}
+
+/// A scrolling log that follows the newest line, but releases and lets the user
+/// read history the moment they scroll up — re-following once they return to the bottom.
+private struct AutoScrollingLog: View {
+    let text: String
+    var maxHeight: CGFloat = 260
+
+    @State private var isPinnedToBottom = true
+    @State private var lastContentHeight: CGFloat = 0
+
+    private static let bottomAnchorID = "technicalDetailsBottom"
+    private static let bottomTolerance: CGFloat = 24   // ~1.5 caption lines of slack
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(spacing: 0) {
+                    Text(text)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Color.clear.frame(height: 0).id(Self.bottomAnchorID)
+                }
+            }
+            .frame(maxHeight: maxHeight)
+            .onScrollGeometryChange(for: Sample.self) { geometry in
+                Sample(
+                    offsetY: geometry.contentOffset.y,
+                    contentHeight: geometry.contentSize.height,
+                    containerHeight: geometry.containerSize.height
+                )
+            } action: { _, sample in
+                if sample.contentHeight != lastContentHeight {
+                    // The log grew or shrank — honor the existing pin; follow only if pinned.
+                    if isPinnedToBottom {
+                        proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
+                    }
+                } else {
+                    // A pure scroll — the user's position decides whether we keep following.
+                    isPinnedToBottom = ProcessingView.isPinnedToBottom(
+                        contentOffsetY: sample.offsetY,
+                        contentHeight: sample.contentHeight,
+                        containerHeight: sample.containerHeight,
+                        tolerance: Self.bottomTolerance
+                    )
+                }
+                lastContentHeight = sample.contentHeight
+            }
+            .onAppear { proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom) }
+        }
+    }
+
+    private struct Sample: Equatable {
+        var offsetY: CGFloat
+        var contentHeight: CGFloat
+        var containerHeight: CGFloat
     }
 }
