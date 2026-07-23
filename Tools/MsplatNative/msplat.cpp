@@ -115,6 +115,131 @@ private:
     std::uint64_t sequence_ = 0;
 };
 
+constexpr int maximumPreparseArgumentCount = 4096;
+constexpr std::size_t maximumPreparseTokenBytes = 128;
+
+enum class EventsDescriptorIntent {
+    ordinaryStreams,
+    stdoutReserved,
+    stderrReserved,
+    ambiguous,
+};
+
+std::optional<std::string_view> boundedPreparseToken(const char *argument) {
+    if (argument == nullptr) return std::nullopt;
+    const std::size_t length = ::strnlen(
+        argument,
+        maximumPreparseTokenBytes + 1
+    );
+    if (length > maximumPreparseTokenBytes) return std::nullopt;
+    return std::string_view(argument, length);
+}
+
+std::optional<int> parseCanonicalEventsDescriptor(std::string_view value) {
+    if (value.empty() || value.size() > 10 ||
+        (value.size() > 1 && value.front() == '0')) {
+        return std::nullopt;
+    }
+    std::uint64_t descriptor = 0;
+    for (const char character : value) {
+        if (character < '0' || character > '9') return std::nullopt;
+        descriptor = descriptor * 10 +
+            static_cast<std::uint64_t>(character - '0');
+        if (descriptor >
+            static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            return std::nullopt;
+        }
+    }
+    return static_cast<int>(descriptor);
+}
+
+EventsDescriptorIntent scanEventsDescriptorIntent(int argc, char *argv[]) {
+    if (argc < 0 || argc > maximumPreparseArgumentCount || argv == nullptr) {
+        return EventsDescriptorIntent::ambiguous;
+    }
+
+    std::optional<int> descriptor;
+    bool sawEventsOption = false;
+    bool ambiguous = false;
+    constexpr std::string_view option = "--events-fd";
+    for (int index = 1; index < argc; ++index) {
+        const auto token = boundedPreparseToken(argv[index]);
+        if (!token.has_value()) {
+            if (argv[index] != nullptr &&
+                std::strncmp(
+                    argv[index],
+                    option.data(),
+                    option.size()
+                ) == 0) {
+                sawEventsOption = true;
+                ambiguous = true;
+            }
+            continue;
+        }
+
+        std::optional<std::string_view> value;
+        if (*token == option) {
+            sawEventsOption = true;
+            if (index + 1 >= argc) {
+                ambiguous = true;
+                continue;
+            }
+            value = boundedPreparseToken(argv[++index]);
+        } else if (token->size() > option.size() &&
+                   token->substr(0, option.size()) == option &&
+                   (*token)[option.size()] == '=') {
+            sawEventsOption = true;
+            value = token->substr(option.size() + 1);
+        } else {
+            continue;
+        }
+
+        const auto parsed = value.has_value()
+            ? parseCanonicalEventsDescriptor(*value)
+            : std::nullopt;
+        if (!parsed.has_value() || descriptor.has_value()) {
+            ambiguous = true;
+            continue;
+        }
+        descriptor = *parsed;
+    }
+
+    if (ambiguous || (sawEventsOption && !descriptor.has_value())) {
+        return EventsDescriptorIntent::ambiguous;
+    }
+    if (!descriptor.has_value()) {
+        return EventsDescriptorIntent::ordinaryStreams;
+    }
+    if (*descriptor == STDOUT_FILENO) {
+        return EventsDescriptorIntent::stdoutReserved;
+    }
+    if (*descriptor == STDERR_FILENO) {
+        return EventsDescriptorIntent::stderrReserved;
+    }
+    return EventsDescriptorIntent::ordinaryStreams;
+}
+
+void emitCapturedParseDiagnostics(
+    EventsDescriptorIntent intent,
+    const std::string &standardOutput,
+    const std::string &standardError
+) {
+    switch (intent) {
+    case EventsDescriptorIntent::stdoutReserved:
+        std::cerr << standardOutput << standardError << std::flush;
+        return;
+    case EventsDescriptorIntent::stderrReserved:
+        std::cout << standardOutput << standardError << std::flush;
+        return;
+    case EventsDescriptorIntent::ambiguous:
+        return;
+    case EventsDescriptorIntent::ordinaryStreams:
+        std::cout << standardOutput << std::flush;
+        std::cerr << standardError << std::flush;
+        return;
+    }
+}
+
 using BoundEventFileIdentity =
     std::pair<std::uint64_t, std::uint64_t>;
 
@@ -2815,6 +2940,8 @@ bool savePlyAtomically(Model &model, const fs::path &output, int step) {
 } // namespace
 
 int main(int argc, char *argv[]) {
+    const EventsDescriptorIntent eventsDescriptorIntent =
+        scanEventsDescriptorIntent(argc, argv);
     CLI::App app{"EasySplat native msplat trainer"};
     app.set_help_flag("-h,--help", "Show this help message");
     app.set_version_flag("--version", APP_VERSION);
@@ -2968,7 +3095,18 @@ int main(int argc, char *argv[]) {
     try {
         app.parse(argc, argv);
     } catch (const CLI::ParseError &error) {
-        const int parserExit = app.exit(error);
+        std::ostringstream capturedStandardOutput;
+        std::ostringstream capturedStandardError;
+        const int parserExit = app.exit(
+            error,
+            capturedStandardOutput,
+            capturedStandardError
+        );
+        emitCapturedParseDiagnostics(
+            eventsDescriptorIntent,
+            capturedStandardOutput.str(),
+            capturedStandardError.str()
+        );
         return parserExit == 0 ? 0 : 1;
     }
 

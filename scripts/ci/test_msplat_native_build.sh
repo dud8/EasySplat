@@ -308,6 +308,14 @@ require_contains \
   '"COLMAP loader allocation exceeds the isolation memory budget"' \
   "$OVERLAY"
 require_contains 'app.parse(argc, argv);' "$OVERLAY"
+require_contains 'scanEventsDescriptorIntent(argc, argv)' "$OVERLAY"
+require_contains 'maximumPreparseArgumentCount = 4096' "$OVERLAY"
+require_contains 'maximumPreparseTokenBytes = 128' "$OVERLAY"
+require_contains 'const int parserExit = app.exit(' "$OVERLAY"
+require_contains 'capturedStandardOutput,' "$OVERLAY"
+require_contains 'capturedStandardError' "$OVERLAY"
+require_contains 'emitCapturedParseDiagnostics(' "$OVERLAY"
+require_absent 'app.exit(error);' "$OVERLAY"
 require_contains 'return parserExit == 0 ? 0 : 1;' "$OVERLAY"
 require_absent 'CLI11_PARSE(app, argc, argv);' "$OVERLAY"
 require_contains 'inspectBinaryPlyHeader(' "$ISOLATION_RUNTIME_SOURCE"
@@ -1615,6 +1623,93 @@ expect_isolation_rejection \
 case_extra_args=()
 
 printf 'mask manifest sentinel\n' >"$isolation_manifest"
+for alias_case in source mask; do
+  if [ "$alias_case" = source ]; then
+    alias_path="$isolation_source"
+  else
+    alias_path="$isolation_manifest"
+  fi
+  for argument_order in before after equals; do
+    alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+    alias_identity_before="$(stat -f '%d:%i:%l' "$alias_path")"
+    if [ "$argument_order" = before ]; then
+      parser_arguments=(
+        --isolate
+        --unknown-isolation-option
+        --events-fd 2
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+      )
+    elif [ "$argument_order" = after ]; then
+      parser_arguments=(
+        --isolate
+        --events-fd 2
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+        --unknown-isolation-option
+      )
+    else
+      parser_arguments=(
+        --isolate
+        --events-fd=2
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+        --unknown-isolation-option
+      )
+    fi
+    set +e
+    "$BIN" "${parser_arguments[@]}" \
+      >"$negative_dir/isolation-parser-fd2-$alias_case-$argument_order.stdout" \
+      2<>"$alias_path"
+    alias_status=$?
+    set -e
+    [ "$alias_status" = 1 ] \
+      || fail "fd2 parser $alias_case alias exited with $alias_status instead of 1"
+    [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+      || fail "fd2 parser diagnostics changed the isolation $alias_case input"
+    [ "$(stat -f '%d:%i:%l' "$alias_path")" = "$alias_identity_before" ] \
+      || fail "fd2 parser diagnostics replaced the isolation $alias_case input"
+    grep -Fq -- '--unknown-isolation-option' \
+      "$negative_dir/isolation-parser-fd2-$alias_case-$argument_order.stdout" \
+      || fail "fd2 parser $alias_case diagnostic did not use safe stdout"
+  done
+done
+
+parser_source_hash_before="$(shasum -a 256 "$isolation_source" | awk '{print $1}')"
+parser_mask_hash_before="$(shasum -a 256 "$isolation_manifest" | awk '{print $1}')"
+parser_source_identity_before="$(stat -f '%d:%i:%l' "$isolation_source")"
+parser_mask_identity_before="$(stat -f '%d:%i:%l' "$isolation_manifest")"
+set +e
+"$BIN" --isolate --events-fd 1 --events-fd 2 --unknown-isolation-option \
+  1<>"$isolation_source" 2<>"$isolation_manifest"
+parser_ambiguous_status=$?
+set -e
+[ "$parser_ambiguous_status" = 1 ] \
+  || fail "ambiguous parser event descriptors exited with $parser_ambiguous_status"
+[ "$(shasum -a 256 "$isolation_source" | awk '{print $1}')" = "$parser_source_hash_before" ] \
+  && [ "$(stat -f '%d:%i:%l' "$isolation_source")" = "$parser_source_identity_before" ] \
+  || fail "ambiguous parser diagnostics changed the fd1 isolation artifact"
+[ "$(shasum -a 256 "$isolation_manifest" | awk '{print $1}')" = "$parser_mask_hash_before" ] \
+  && [ "$(stat -f '%d:%i:%l' "$isolation_manifest")" = "$parser_mask_identity_before" ] \
+  || fail "ambiguous parser diagnostics changed the fd2 isolation artifact"
+
+set +e
+"$BIN" --isolate --events-fd 1 --unknown-isolation-option \
+  >"$negative_dir/isolation-parser-fd1.stdout" \
+  2>"$negative_dir/isolation-parser-fd1.stderr"
+parser_fd1_status=$?
+"$BIN" --unknown-isolation-option \
+  >"$negative_dir/parser-ordinary.stdout" \
+  2>"$negative_dir/parser-ordinary.stderr"
+parser_ordinary_status=$?
+set -e
+[ "$parser_fd1_status" = 1 ] && [ ! -s "$negative_dir/isolation-parser-fd1.stdout" ] \
+  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/isolation-parser-fd1.stderr" \
+  || fail "fd1 parser diagnostics did not preserve the JSONL channel"
+[ "$parser_ordinary_status" = 1 ] && [ ! -s "$negative_dir/parser-ordinary.stdout" ] \
+  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-ordinary.stderr" \
+  || fail "ordinary parser diagnostics did not preserve stderr behavior"
+
 for alias_case in source mask; do
   if [ "$alias_case" = source ]; then
     alias_path="$isolation_source"
