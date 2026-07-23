@@ -95,49 +95,51 @@ extension AppModel {
     func maybeAppendProgressLog(stage: PipelineStage, message: String) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        let now = Date()
 
         if stage == .trainSplat {
-            if trimmed.hasPrefix("Preparing training dataset (images)") {
-                if let ratio = parseProgressRatio(trimmed) {
-                    let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
-                    if bucket == lastTrainingImagesBucket {
-                        return
-                    }
-                    lastTrainingImagesBucket = bucket
-                }
-            } else if trimmed.hasPrefix("Preparing training dataset (sparse)") {
-                if let ratio = parseProgressRatio(trimmed) {
-                    let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
-                    if bucket == lastTrainingSparseBucket {
-                        return
-                    }
-                    lastTrainingSparseBucket = bucket
-                }
-            } else if trimmed.hasPrefix("Training model") {
-                if let ratio = parseProgressRatio(trimmed) {
-                    let bucket = bucketedSteps(current: ratio.current, bucketSize: trainingStepLogInterval)
-                    if bucket == lastTrainingStepsBucket {
-                        return
-                    }
-                    lastTrainingStepsBucket = bucket
-                } else {
-                    return
-                }
+            // Bucketed training milestones gate on the bucket alone: an
+            // advance always logs, a repeat never does.
+            if trimmed.hasPrefix("Preparing training dataset (images)"),
+               let ratio = parseProgressRatio(trimmed) {
+                let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
+                guard bucket != lastTrainingImagesBucket else { return }
+                lastTrainingImagesBucket = bucket
+                appendProgressLogLine(stage: stage, message: trimmed, at: now)
+                return
+            }
+            if trimmed.hasPrefix("Preparing training dataset (sparse)"),
+               let ratio = parseProgressRatio(trimmed) {
+                let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
+                guard bucket != lastTrainingSparseBucket else { return }
+                lastTrainingSparseBucket = bucket
+                appendProgressLogLine(stage: stage, message: trimmed, at: now)
+                return
+            }
+            if trimmed.hasPrefix("Training model") {
+                guard let ratio = parseProgressRatio(trimmed) else { return }
+                let bucket = bucketedSteps(current: ratio.current, bucketSize: trainingStepLogInterval)
+                guard bucket != lastTrainingStepsBucket else { return }
+                lastTrainingStepsBucket = bucket
+                appendProgressLogLine(stage: stage, message: trimmed, at: now)
+                return
             }
         }
 
-        let now = Date()
-        let minInterval: TimeInterval = stage == .trainSplat && trimmed.hasPrefix("Training model")
-            ? trainingProgressLogMinInterval
-            : 1.5
-        if stage == lastProgressLogStage && trimmed == lastProgressLogMessage && now.timeIntervalSince(lastProgressLogAt) < minInterval {
+        // The interval gates same-stage messages regardless of content:
+        // per-event counters ("fallback 22624: …") make every message unique,
+        // and matching on identical text alone let them flood the log.
+        if stage == lastProgressLogStage && now.timeIntervalSince(lastProgressLogAt) < 1.5 {
             return
         }
+        appendProgressLogLine(stage: stage, message: trimmed, at: now)
+    }
 
+    private func appendProgressLogLine(stage: PipelineStage, message: String, at now: Date) {
         lastProgressLogStage = stage
-        lastProgressLogMessage = trimmed
+        lastProgressLogMessage = message
         lastProgressLogAt = now
-        appendLogLine("[\(stage.displayName)] \(trimmed)")
+        appendLogLine("[\(stage.displayName)] \(message)")
     }
 
     func parseProgressRatio(_ message: String) -> (current: Int, total: Int)? {

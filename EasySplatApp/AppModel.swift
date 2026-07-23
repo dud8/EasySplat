@@ -227,23 +227,32 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// How many log lines the live Technical Details pane renders. The full
+    /// buffers stay available through `errorDetailsText` for Copy Details and
+    /// failure forensics; re-laying-out the whole log on every pipeline event
+    /// is what froze the UI during heavy training.
+    static let technicalLogTailLimit = 300
+
+    /// Recoverable errors must stay visible in the live pane even after they
+    /// scroll out of the general tail, so they get their own bounded section.
+    static let technicalErrorTailLimit = 20
+
     var processingDetailsText: String? {
-        if lastError != nil {
-            if let details = errorDetails, !details.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return details
-            }
-            return statusDetail
+        var parts: [String] = []
+        if let statusDetail, !statusDetail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(statusDetail)
         }
-        if let liveErrors = liveErrorDetailsText {
-            if let detail = statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return "\(detail)\n\nRecent Error Output:\n\(liveErrors)"
-            }
-            return "Recent Error Output:\n\(liveErrors)"
+        if !errorLogLines.isEmpty {
+            parts.append(
+                "Recent Error Output:\n"
+                    + errorLogLines.suffix(Self.technicalErrorTailLimit).joined(separator: "\n")
+            )
         }
-        if let detail = statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return detail
+        if !logLines.isEmpty {
+            parts.append(logLines.suffix(Self.technicalLogTailLimit).joined(separator: "\n"))
         }
-        return nil
+        let combined = parts.joined(separator: "\n\n")
+        return combined.isEmpty ? nil : combined
     }
 
     var errorDetailsText: String? {
@@ -262,13 +271,6 @@ final class AppModel: ObservableObject {
         }
         let combined = parts.joined(separator: "\n\n")
         return combined.isEmpty ? nil : combined
-    }
-
-    private var liveErrorDetailsText: String? {
-        guard !errorLogLines.isEmpty else { return nil }
-        let tail = errorLogLines.suffix(300)
-        let text = tail.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
     }
 
     init(

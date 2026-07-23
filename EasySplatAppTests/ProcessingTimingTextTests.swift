@@ -97,6 +97,55 @@ final class ProcessingTimingTextTests: XCTestCase {
         )
     }
 
+    func testLiveTechnicalDetailsRenderABoundedTailWhileCopyKeepsTheFullLog() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(projectBaseURL: base)
+        model.statusDetail = "Training splat · 30,000 of 40,000"
+        model.logLines = (1...1_000).map { "line \($0)" }
+
+        // A recoverable error buried 1,000 lines ago must stay visible live.
+        model.errorLogLines = ["[err] Could not record an intermediate training checkpoint"]
+
+        let live = model.processingDetailsText ?? ""
+        XCTAssertTrue(live.contains("Training splat · 30,000 of 40,000"))
+        XCTAssertTrue(live.contains("line 1000"), "The newest line must stay visible")
+        XCTAssertFalse(live.contains("line 1\n"), "The oldest lines must not render live")
+        XCTAssertTrue(
+            live.contains("Could not record an intermediate training checkpoint"),
+            "Recent errors stay visible after scrolling out of the general tail"
+        )
+        let renderedLogLines = live.split(separator: "\n").count
+        XCTAssertLessThanOrEqual(
+            renderedLogLines,
+            AppModel.technicalLogTailLimit + AppModel.technicalErrorTailLimit + 4
+        )
+
+        let full = model.errorDetailsText ?? ""
+        XCTAssertTrue(full.contains("line 1\n"), "Copy Details keeps the whole buffer")
+        XCTAssertTrue(full.contains("line 1000"))
+    }
+
+    func testProgressLogGatesUniqueCounterFloodsButNeverBucketAdvances() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(projectBaseURL: base)
+
+        // Per-event counters make every message unique; only the first inside
+        // the interval may land.
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Exact raster fallback 1: 5 intersections")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Exact raster fallback 2: 6 intersections")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Exact raster fallback 3: 7 intersections")
+        XCTAssertEqual(model.logLines.filter { $0.contains("Exact raster fallback") }.count, 1)
+
+        // Bucketed training milestones ignore the interval: an advance always
+        // logs, a repeat never does.
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training model · 120/40,000")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training model · 121/40,000")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training model · 240/40,000")
+        XCTAssertEqual(model.logLines.filter { $0.contains("Training model") }.count, 2)
+    }
+
     func testTechnicalLogStaysPinnedOnlyNearTheBottom() {
         // Content shorter than the viewport → always pinned.
         XCTAssertTrue(ProcessingView.isPinnedToBottom(

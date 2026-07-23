@@ -324,7 +324,8 @@ struct ProcessingView: View {
                 HStack {
                     Spacer()
                     Button("Copy Details") {
-                        model.copyTechnicalDetails(technicalText)
+                        // Copies the full log, not just the rendered tail.
+                        model.copyTechnicalDetails(model.errorDetailsText ?? technicalText)
                     }
                     .controlSize(.small)
                 }
@@ -385,8 +386,10 @@ struct ProcessingView: View {
         return contentOffsetY >= maxOffset - tolerance
     }
 
+    /// The live pane renders a bounded tail; the full forensic dump only
+    /// renders once a run has failed and the text has stopped growing.
     private var technicalText: String {
-        let text = model.errorDetailsText ?? model.processingDetailsText
+        let text = model.lastError != nil ? model.errorDetailsText : model.processingDetailsText
         let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? "No technical details yet." : trimmed
     }

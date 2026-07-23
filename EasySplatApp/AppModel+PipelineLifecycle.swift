@@ -1151,9 +1151,18 @@ extension AppModel {
     }
 }
 
+/// Forwards pipeline events to the model on the main actor, coalescing
+/// bursts: events buffer under a lock and a single scheduled drain delivers
+/// everything pending in one main-actor turn. When the main thread is busy
+/// the batch grows instead of the task queue, so a chatty trainer (many
+/// events per second) costs one SwiftUI invalidation per drain rather than
+/// one per event. Ordering is preserved by the single buffer.
 private final class EventForwarder: @unchecked Sendable {
     private weak var model: AppModel?
     private let taskToken: UUID?
+    private let lock = NSLock()
+    private var pending: [PipelineEvent] = []
+    private var drainScheduled = false
 
     init(model: AppModel, taskToken: UUID?) {
         self.model = model
@@ -1161,10 +1170,29 @@ private final class EventForwarder: @unchecked Sendable {
     }
 
     func handle(_ event: PipelineEvent) {
-        Task { @MainActor in
-            guard let model = self.model, model.isCurrentTaskToken(self.taskToken) else { return }
-            model.handle(event: event)
+        lock.lock()
+        pending.append(event)
+        let shouldSchedule = !drainScheduled
+        if shouldSchedule {
+            drainScheduled = true
         }
+        lock.unlock()
+        guard shouldSchedule else { return }
+        Task { @MainActor in
+            for event in self.takePendingBatch() {
+                guard let model = self.model, model.isCurrentTaskToken(self.taskToken) else { return }
+                model.handle(event: event)
+            }
+        }
+    }
+
+    private func takePendingBatch() -> [PipelineEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        let batch = pending
+        pending.removeAll(keepingCapacity: true)
+        drainScheduled = false
+        return batch
     }
 }
 
