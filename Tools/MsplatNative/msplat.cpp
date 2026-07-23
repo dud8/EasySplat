@@ -132,6 +132,14 @@ std::optional<std::string_view> boundedPreparseToken(const char *argument) {
     return std::string_view(argument, length);
 }
 
+bool reservesStandardEventDescriptor(std::string_view value) {
+    int descriptor = -1;
+    if (!CLI::detail::lexical_cast(std::string(value), descriptor)) {
+        return false;
+    }
+    return descriptor == STDOUT_FILENO || descriptor == STDERR_FILENO;
+}
+
 PreparseIntent scanPreparseIntent(int argc, char *argv[]) {
     if (argc < 0 || argc > maximumPreparseArgumentCount || argv == nullptr) {
         return {true};
@@ -141,20 +149,28 @@ PreparseIntent scanPreparseIntent(int argc, char *argv[]) {
     for (int index = 1; index < argc; ++index) {
         if (argv[index] == nullptr) return {true};
         const auto token = boundedPreparseToken(argv[index]);
-        if (!token.has_value()) continue;
+        if (!token.has_value()) return {true};
         if (*token == "--") break;
         if (*token == "--isolate") {
             intent.suppressParseDiagnostics = true;
             continue;
         }
-        if (*token == "--events-fd=1" || *token == "--events-fd=2") {
-            intent.suppressParseDiagnostics = true;
+        constexpr std::string_view eventsOption = "--events-fd";
+        if (token->size() > eventsOption.size() &&
+            token->substr(0, eventsOption.size()) == eventsOption &&
+            (*token)[eventsOption.size()] == '=') {
+            if (reservesStandardEventDescriptor(
+                    token->substr(eventsOption.size() + 1)
+                )) {
+                intent.suppressParseDiagnostics = true;
+            }
             continue;
         }
-        if (*token != "--events-fd" || index + 1 >= argc) continue;
+        if (*token != eventsOption || index + 1 >= argc) continue;
         if (argv[index + 1] == nullptr) return {true};
         const auto value = boundedPreparseToken(argv[index + 1]);
-        if (value.has_value() && (*value == "1" || *value == "2")) {
+        if (!value.has_value()) return {true};
+        if (reservesStandardEventDescriptor(*value)) {
             intent.suppressParseDiagnostics = true;
         }
     }
@@ -3030,7 +3046,9 @@ int main(int argc, char *argv[]) {
             capturedStandardOutput,
             capturedStandardError
         );
-        if (preparseIntent.suppressParseDiagnostics) return 1;
+        if (preparseIntent.suppressParseDiagnostics) {
+            return parserExit == 0 ? 0 : 1;
+        }
         emitCapturedParseDiagnostics(
             capturedStandardOutput.str(),
             capturedStandardError.str()

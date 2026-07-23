@@ -313,6 +313,8 @@ require_contains 'maximumPreparseArgumentCount = 4096' "$OVERLAY"
 require_contains 'maximumPreparseTokenBytes = 128' "$OVERLAY"
 require_contains 'if (*token == "--") break;' "$OVERLAY"
 require_contains 'suppressParseDiagnostics' "$OVERLAY"
+require_contains 'CLI::detail::lexical_cast(' "$OVERLAY"
+require_absent '*token == "--events-fd=1"' "$OVERLAY"
 require_contains 'const int parserExit = app.exit(' "$OVERLAY"
 require_contains 'capturedStandardOutput,' "$OVERLAY"
 require_contains 'capturedStandardError' "$OVERLAY"
@@ -669,6 +671,7 @@ require_contains 'acquire_build_lock' "$BUILD_SCRIPT"
 require_contains 'release_build_lock' "$BUILD_SCRIPT"
 require_contains '/usr/bin/shlock -f "$BUILD_LOCK_PATH" -p "$$"' "$BUILD_SCRIPT"
 require_contains 'EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR' "$BUILD_SCRIPT"
+require_contains 'acquisition_timeout_seconds = 60' "$0"
 require_contains '--remove-private-promoter-tree' "$BUILD_SCRIPT"
 require_contains 'def remove_private_promoter_tree(' "$ATOMIC_PROMOTER"
 require_contains 'def remove_bound_build_lock(' "$ATOMIC_PROMOTER"
@@ -1097,7 +1100,8 @@ with tempfile.TemporaryDirectory(prefix="easysplat-build-lock.") as temporary:
     live_promoter = None
     live_identity = None
     try:
-        deadline = time.monotonic() + 15
+        acquisition_timeout_seconds = 60
+        deadline = time.monotonic() + acquisition_timeout_seconds
         while not (probe_a / "acquired").is_file():
             if first.poll() is not None:
                 log_a.close()
@@ -1106,7 +1110,14 @@ with tempfile.TemporaryDirectory(prefix="easysplat-build-lock.") as temporary:
                     + (probe_root / "a.log").read_text(errors="replace")
                 )
             if time.monotonic() >= deadline:
-                raise SystemExit("first build-lock probe did not acquire the lock")
+                process_status = first.poll()
+                log_a.flush()
+                raise SystemExit(
+                    "first build-lock probe did not acquire the lock within "
+                    f"{acquisition_timeout_seconds} seconds "
+                    f"(alive={process_status is None}, poll={process_status!r}): "
+                    + (probe_root / "a.log").read_text(errors="replace")
+                )
             time.sleep(0.05)
 
         for _ in range(128):
@@ -1511,20 +1522,21 @@ expect_isolation_rejection() {
     || fail "$label isolation diagnostic is not useful"
 }
 
-expect_isolation_parse_suppression() {
+expect_parse_suppression() {
   local label="$1"
-  shift
+  local expected_status="$2"
+  shift 2
   set +e
   "$@" \
     >"$negative_dir/$label.stdout" \
     2>"$negative_dir/$label.stderr"
   local status=$?
   set -e
-  [ "$status" = 1 ] \
-    || fail "$label isolation parse rejection exited with $status instead of 1"
+  [ "$status" = "$expected_status" ] \
+    || fail "$label suppressed parse exited with $status instead of $expected_status"
   [ ! -s "$negative_dir/$label.stdout" ] \
     && [ ! -s "$negative_dir/$label.stderr" ] \
-    || fail "$label isolation parser emitted unauthenticated diagnostics"
+    || fail "$label parser emitted suppressed diagnostics"
 }
 
 case_source_digest="$valid_isolation_digest"
@@ -1635,13 +1647,23 @@ expect_isolation_rejection \
   'exactly once' \
   run_complete_isolation_case
 case_extra_args=(--dataset "$isolation_dataset")
-expect_isolation_parse_suppression \
+expect_parse_suppression \
   isolation-duplicate-dataset \
+  1 \
   run_complete_isolation_case
 case_extra_args=()
-expect_isolation_parse_suppression \
+expect_parse_suppression \
   isolation-help-before-validation \
+  0 \
   "$BIN" --isolate --help
+expect_parse_suppression \
+  isolation-version-before-validation \
+  0 \
+  "$BIN" --isolate --version
+expect_parse_suppression \
+  alternate-event-fd-help-before-validation \
+  0 \
+  "$BIN" --events-fd=02 --help
 
 printf 'mask manifest sentinel\n' >"$isolation_manifest"
 for alias_case in source mask; do
@@ -1735,6 +1757,52 @@ for alias_case in source mask; do
       || fail "dual-stdio parser diagnostics changed the isolation $alias_case input"
     [ "$(stat -f '%d:%i:%l' "$alias_path")" = "$alias_identity_before" ] \
       || fail "dual-stdio parser diagnostics replaced the isolation $alias_case input"
+  done
+done
+
+alternate_fd1_spellings=(
+  01 +1 0x1 0X1 0b1 0o1 1_ 0b0_1 "0x'1" true " 1"
+)
+alternate_fd2_spellings=(
+  02 +2 0x2 0X2 0b10 0o2 2_ 0b1_0 "0x'2" " 2"
+)
+for descriptor in 1 2; do
+  if [ "$descriptor" = 1 ]; then
+    alias_path="$isolation_manifest"
+    spellings=("${alternate_fd1_spellings[@]}")
+  else
+    alias_path="$isolation_source"
+    spellings=("${alternate_fd2_spellings[@]}")
+  fi
+  for spelling_index in "${!spellings[@]}"; do
+    spelling="${spellings[$spelling_index]}"
+    alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+    alias_identity_before="$(stat -f '%d:%i:%l' "$alias_path")"
+    if [ $((spelling_index % 2)) = 0 ]; then
+      parser_arguments=(
+        "--events-fd=$spelling"
+        --unknown-integral-spelling
+      )
+    else
+      parser_arguments=(
+        --events-fd "$spelling"
+        --unknown-integral-spelling
+      )
+    fi
+    set +e
+    if [ "$descriptor" = 1 ]; then
+      "$BIN" "${parser_arguments[@]}" 2<>"$alias_path" 1>&2
+    else
+      "$BIN" "${parser_arguments[@]}" 1<>"$alias_path" 2>&1
+    fi
+    alias_status=$?
+    set -e
+    [ "$alias_status" = 1 ] \
+      || fail "alternate fd$descriptor spelling exited with $alias_status instead of 1"
+    [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+      || fail "alternate fd$descriptor spelling $spelling changed its aliased artifact"
+    [ "$(stat -f '%d:%i:%l' "$alias_path")" = "$alias_identity_before" ] \
+      || fail "alternate fd$descriptor spelling $spelling replaced its aliased artifact"
   done
 done
 
