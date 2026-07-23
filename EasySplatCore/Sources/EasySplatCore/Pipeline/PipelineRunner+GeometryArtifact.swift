@@ -326,6 +326,235 @@ extension PipelineRunner {
         metadata = persistedMetadata
     }
 
+    /// Authors the imported-kind geometry artifact for the `adoptDirect` route.
+    /// The canonical model at `SfM/colmap/sparse/0` is the dataset's own model
+    /// (name-finalized against the selected frames); conditioning is measured on
+    /// it exactly as a native run measures its solver output. The artifact carries
+    /// no pair-graph, worker-execution, feature-database, or camera-grouping
+    /// evidence — its authenticated seed/source receipt stands in for those.
+    func persistImportedGeometryArtifact(
+        metadata: inout ProjectMetadata,
+        paths: ProjectPaths,
+        resolvedPlan: ResolvedRunPlan,
+        receipt: DatasetPoseSeedReceipt,
+        selectedFrames: [URL],
+        selectedFrameManifest: [SelectedFrameMapping],
+        inputSnapshots: [RuntimeInputSnapshotLease.Snapshot],
+        peakMemoryBytes: Int64,
+        colmapRuntimeClosure: ColmapRuntimeClosureEvidence,
+        acceptedAnalysis: GeometryConditioningAnalysis,
+        currentMappingDurationSeconds: () -> TimeInterval?
+    ) throws {
+        guard receipt.route == .adoptDirect else {
+            throw PipelineError.invalidInput
+        }
+        let modelDirectory = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try requireTextSparseModelFiles(at: modelDirectory)
+        try requirePublishedGeometry(
+            acceptedAnalysis,
+            matches: acceptedAnalysis,
+            at: modelDirectory
+        )
+        guard peakMemoryBytes > 0 else {
+            throw PipelineError.geometryResidualsUnavailable("Peak resident memory could not be measured")
+        }
+
+        let orderedFrames = selectedFrames.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let mappingByName = Dictionary(
+            selectedFrameManifest.map { ($0.outputFileName, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let orderedTimestamps = orderedFrames.map {
+            mappingByName[$0.lastPathComponent]?.timestampSeconds
+        }
+
+        let toolchainVersion = config.toolchain.root.lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !toolchainVersion.isEmpty else {
+            throw PipelineError.geometryProvenanceUnavailable("toolchain version was empty")
+        }
+        guard let seedClosure = GeometryArtifactStore.datasetReceiptClosureDigest(
+                  receipt.seedFiles,
+                  domain: GeometryArtifactStore.importedSeedClosureDomain
+              ),
+              let sourceClosure = GeometryArtifactStore.datasetReceiptClosureDigest(
+                  receipt.sourceFiles,
+                  domain: GeometryArtifactStore.importedSourceClosureDomain
+              ) else {
+            throw PipelineError.geometryProvenanceUnavailable(
+                "The imported dataset seed receipt could not be digested"
+            )
+        }
+        let importedEvidence = ImportedGeometryEvidence(
+            datasetKind: receipt.kind.rawValue,
+            route: receipt.route.rawValue,
+            seedFiles: receipt.seedFiles,
+            sourceFiles: receipt.sourceFiles,
+            seedClosureSHA256: seedClosure,
+            sourceClosureSHA256: sourceClosure,
+            imageCount: orderedFrames.count
+        )
+        let provenance = GeometryProvenance(
+            toolchainVersion: toolchainVersion,
+            solver: GeometryComponentProvenance(
+                identifier: "imported",
+                version: receipt.kind.rawValue,
+                revision: sourceClosure,
+                payloadSHA256: seedClosure
+            ),
+            runtime: nil,
+            model: nil
+        )
+
+        let orientationEstimationClock = ContinuousClock()
+        let orientationEstimationStart = orientationEstimationClock.now
+        let isOrderedInput: Bool
+        switch resolvedPlan.pairingPolicy {
+        case .unorderedRetrieval, .segmentedMixed:
+            isOrderedInput = false
+        case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
+            isOrderedInput = true
+        }
+        let allowCameraUpFallback = resolvedPlan.pairingPolicy == .orderedContinuous
+            || resolvedPlan.pairingPolicy == .orderedWalkthrough
+        let orientation = CanonicalOrientationEstimator.estimate(
+            cameras: acceptedAnalysis.residuals.cameraSamples,
+            orderedImageNames: orderedFrames.map(\.lastPathComponent),
+            orderedInput: isOrderedInput,
+            allowCameraUpFallback: allowCameraUpFallback,
+            deterministicSeed: resolvedPlan.runSeed
+        )
+        let orientationEstimationDuration = orientationEstimationClock.now - orientationEstimationStart
+        try Task.checkCancellation()
+        try GeometryModelSnapshot.validate(acceptedAnalysis.modelSnapshot, at: modelDirectory)
+        let sourceSnapshot = acceptedAnalysis.modelSnapshot
+        let sourceModelHashes = sourceSnapshot.modelHashes
+        guard let sourceModelClosureSHA256 = GeometryArtifactStore.modelClosureDigest(
+            sourceModelHashes,
+            expectedNames: ["cameras.txt", "images.txt", "points3D.txt"]
+        ) else {
+            throw PipelineError.geometryResidualsUnavailable(
+                "The accepted geometry model closure could not be measured"
+            )
+        }
+        let residuals = acceptedAnalysis.residuals
+
+        var timings = Dictionary(uniqueKeysWithValues: (metadata.stageTimings ?? []).map {
+            ($0.stage.rawValue, $0.durationSeconds)
+        })
+        if let mappingDuration = currentMappingDurationSeconds() {
+            timings[PipelineStage.sfmMapping.rawValue] = mappingDuration
+        }
+        timings["orientation_estimation_seconds"] = max(
+            0,
+            TimeInterval(orientationEstimationDuration.components.seconds)
+                + TimeInterval(orientationEstimationDuration.components.attoseconds) / 1e18
+        )
+
+        // Sentinel evidence: the imported route runs no matching, no worker
+        // ledger, and no incremental mapping. These fields are structurally
+        // present but bypassed by the imported validation leg; they carry the
+        // truthful shape of a single directly-adopted model.
+        let workerExecution = GeometryWorkerExecutionArtifact(
+            colmapRuntimeClosure: colmapRuntimeClosure,
+            resolvedBudget: resolvedPlan.geometryWorkerBudget,
+            featureExtractionInvocations: [],
+            matchingInvocations: [],
+            vocabularyRetrievalInvocations: [],
+            mappingAndRefinementInvocations: [],
+            videoSourceAnalysis: VideoSourceAnalysisExecutionEvidence(
+                videoSourceCount: 0,
+                startedAnalysisTaskCount: 0,
+                peakInFlightAnalysisTaskCount: 0
+            )
+        )
+        let mapping = MappingArtifact(
+            modelCount: 1,
+            largestModelRegisteredViewCount: residuals.registeredViewCount,
+            secondLargestModelRegisteredViewCount: 0,
+            unionRegisteredViewCount: residuals.registeredViewCount,
+            attemptCount: 1,
+            acceptedMappingAttemptOrdinal: 1,
+            acceptedRefinementKind: .seededBundleAdjustment,
+            acceptedRefinementInvocationCount: 0,
+            incrementalCadence: nil,
+            canonicalModelPublication: CanonicalModelPublicationArtifact(
+                kind: .directText,
+                sourceModelHashes: sourceModelHashes,
+                conversion: nil
+            ),
+            fallbackReason: nil
+        )
+        let cameraInitializationReceipt = ColmapCameraInitializationReceipt(
+            recipe: resolvedPlan.cameraInitializationRecipe,
+            cameraModel: residuals.cameraModel,
+            singleCamera: resolvedPlan.cameraGrouping == .sameCameraAndLens,
+            pixelWidth: nil,
+            pixelHeight: nil,
+            diagonalFieldOfViewDegrees: nil,
+            cameraParameters: nil,
+            priorFocalLength: false
+        )
+
+        let artifact = GeometryArtifact(
+            schemaVersion: GeometryArtifact.currentSchemaVersion,
+            source: .imported,
+            importedEvidence: importedEvidence,
+            solverVersion: "imported \(receipt.kind.rawValue); adoptDirect",
+            runtimeVersion: "toolchain \(toolchainVersion)",
+            modelVersion: "none",
+            inputDigest: try GeometryArtifactStore.inputDigest(snapshots: inputSnapshots),
+            selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: orderedFrames.map(\.lastPathComponent),
+                projectPaths: paths
+            ),
+            orderedImageNames: orderedFrames.map(\.lastPathComponent),
+            orderedImageTimestamps: orderedTimestamps,
+            sourceModelPath: "SfM/colmap/sparse/0",
+            poseConvention: "world-to-camera",
+            quaternionOrder: "wxyz",
+            handedness: "right-handed",
+            scaleType: "arbitrary-sim3",
+            cameraModel: residuals.cameraModel,
+            cameraGrouping: resolvedPlan.cameraGrouping,
+            cameraGroupingReceipt: nil,
+            cameraInitializationReceipt: cameraInitializationReceipt,
+            featureDatabaseDigest: nil,
+            registeredViewCount: residuals.registeredViewCount,
+            totalViewCount: orderedFrames.count,
+            observationCount: residuals.observationCount,
+            pointCount: residuals.pointCount,
+            residualProvenance: residuals.provenance,
+            medianPixelResidual: residuals.medianPixelResidual,
+            p90PixelResidual: residuals.p90PixelResidual,
+            conditioning: GeometryConditioningArtifact(
+                sourceModelClosureSHA256: sourceModelClosureSHA256,
+                measurement: acceptedAnalysis.measurement
+            ),
+            timings: timings,
+            peakMemoryBytes: peakMemoryBytes,
+            modelHashes: sourceModelHashes,
+            provenance: provenance,
+            workerExecution: workerExecution,
+            pairGraph: .notEvaluated(),
+            mapping: mapping,
+            learnedPointInitializer: nil,
+            canonicalOrientation: orientation.artifact
+        )
+        try Task.checkCancellation()
+        var persistedMetadata = metadata
+        persistedMetadata.geometryRecovery = nil
+        try GeometryArtifactStore.persist(
+            artifact,
+            metadata: &persistedMetadata,
+            paths: paths,
+            measuredResiduals: residuals,
+            verifiedSourceSnapshot: sourceSnapshot,
+            measuredAnalysis: acceptedAnalysis
+        )
+        metadata = persistedMetadata
+    }
+
     private func geometryProvenance(
         acceptedDa3ModelSubdirectory: String?,
         colmapRuntimeClosure: ColmapRuntimeClosureEvidence

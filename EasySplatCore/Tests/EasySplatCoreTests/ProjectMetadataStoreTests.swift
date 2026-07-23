@@ -354,10 +354,10 @@ final class ProjectMetadataStoreTests: XCTestCase {
                 return
             }
             XCTAssertEqual(v, ProjectMetadataStore.supportedFormatVersion + 1)
+            let accepted = ProjectMetadataStore.acceptedFormatVersions.sorted()
+                .map(String.init).joined(separator: " and ")
             XCTAssertTrue(
-                error.localizedDescription.contains(
-                    "opens format \(ProjectMetadataStore.supportedFormatVersion) projects only"
-                )
+                error.localizedDescription.contains("opens format \(accepted) projects only")
             )
         }
     }
@@ -453,12 +453,16 @@ final class ProjectMetadataStoreTests: XCTestCase {
         XCTAssertThrowsError(try ProjectMetadataStore.load(from: url))
     }
 
-    func testSaveRejectsNonCurrentFormatVersion() throws {
+    func testSaveRejectsUnknownFormatVersion() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
+        // Accepted older formats migrate on save (see
+        // ProjectMetadataFormatMigrationTests); anything outside the accepted
+        // set is still rejected before any bytes land.
+        let unknownVersion = (ProjectMetadataStore.acceptedFormatVersions.min() ?? 31) - 1
         let metadata = ProjectMetadata(
-            formatVersion: ProjectMetadataStore.supportedFormatVersion - 1,
+            formatVersion: unknownVersion,
             title: "Wrong schema",
             input: .video(files: []),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
@@ -468,7 +472,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             guard case ProjectMetadataStore.SaveError.invalidFormatVersion(let version) = error else {
                 return XCTFail("Expected invalidFormatVersion, got \(error)")
             }
-            XCTAssertEqual(version, ProjectMetadataStore.supportedFormatVersion - 1)
+            XCTAssertEqual(version, unknownVersion)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }

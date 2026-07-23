@@ -785,7 +785,9 @@ struct ViewerView: View {
         switch input {
         case .photos, .mixed:
             return true
-        case .video, nil:
+        case .video, .dataset, nil:
+            // Dataset images are photo-carried internally, but the Photo Use
+            // row describes a selection choice datasets never make.
             return false
         }
     }

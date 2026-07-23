@@ -10,7 +10,7 @@ struct DropZoneView: View {
 
     @State private var isTargeted = false
     nonisolated static let releaseInProgressTitle = "Release to add"
-    nonisolated static let releaseInProgressSubtitle = "Videos, photos, or a folder"
+    nonisolated static let releaseInProgressSubtitle = "Videos, photos, folders, or datasets"
 
     nonisolated static func displayTitle(restingTitle: String, isTargeted: Bool) -> String {
         isTargeted ? releaseInProgressTitle : restingTitle

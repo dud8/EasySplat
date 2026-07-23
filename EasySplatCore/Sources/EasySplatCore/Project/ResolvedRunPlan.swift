@@ -106,6 +106,10 @@ public enum ResolvedRunPlanValidationError: Error, LocalizedError, Equatable {
 
 public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var geometryBackend: SfmBackend
+    /// Set exactly when `geometryBackend == .importedPoses`: whether imported
+    /// geometry is adopted directly or re-triangulated from a pose seed.
+    /// Optional so pre-dataset plans decode unchanged.
+    public var datasetGeometryRoute: DatasetGeometryRoute?
     public var modelIdentifier: String
     public var memoryTier: String
     public var chunkSize: Int
@@ -149,6 +153,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
 
     public init(
         geometryBackend: SfmBackend,
+        datasetGeometryRoute: DatasetGeometryRoute? = nil,
         modelIdentifier: String,
         memoryTier: String,
         chunkSize: Int,
@@ -191,6 +196,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         runSeed: UInt64 = 42
     ) {
         self.geometryBackend = geometryBackend
+        self.datasetGeometryRoute = datasetGeometryRoute
         self.modelIdentifier = modelIdentifier
         self.memoryTier = memoryTier
         self.chunkSize = chunkSize
@@ -335,9 +341,12 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     }
 
     private func validateGeometryBackendConfiguration() throws {
+        guard (geometryBackend == .importedPoses) == (datasetGeometryRoute != nil) else {
+            throw ResolvedRunPlanValidationError.incompatibleGeometryBackendConfiguration
+        }
         let expectedCapabilities: [String]
         switch geometryBackend {
-        case .colmap:
+        case .colmap, .importedPoses:
             guard modelIdentifier == "none" else {
                 throw ResolvedRunPlanValidationError.incompatibleGeometryBackendConfiguration
             }

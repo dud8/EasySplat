@@ -4,8 +4,19 @@ import Foundation
 public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
-    /// The current project format EasySplat reads and writes.
-    public static let supportedFormatVersion: Int = 31
+    /// The project format EasySplat writes. Older formats in
+    /// `acceptedFormatVersions` are still read; every save stamps this
+    /// version, so projects migrate forward on their next write without a
+    /// separate migration pass.
+    public static let supportedFormatVersion: Int = 32
+    /// Formats this build can decode. Format 31 predates dataset inputs and
+    /// decodes with the dataset fields absent.
+    public static let acceptedFormatVersions: Set<Int> = [31, 32]
+    /// Fields a pre-32 payload must not contain. Enforced during decode so a
+    /// format-31 file cannot smuggle format-32 state past the field envelope.
+    private static let fieldsIntroducedInFormat32: Set<String> = [
+        ProjectMetadata.CodingKeys.datasetPoseSeed.rawValue
+    ]
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
@@ -19,7 +30,9 @@ public enum ProjectMetadataStore {
         public var errorDescription: String? {
             switch self {
             case .unsupportedFormatVersion(let version):
-                return "Project format \(version) is not supported. This version of EasySplat opens format \(ProjectMetadataStore.supportedFormatVersion) projects only."
+                let accepted = ProjectMetadataStore.acceptedFormatVersions.sorted()
+                    .map(String.init).joined(separator: " and ")
+                return "Project format \(version) is not supported. This version of EasySplat opens format \(accepted) projects only."
             case .invalidArtifactPath(let field, let path):
                 return "Project metadata contains an invalid project-relative artifact path for \(field): \(path)"
             case .invalidArtifactNamespace(let field, let path):
@@ -109,6 +122,7 @@ public enum ProjectMetadataStore {
             metadata,
             paths: ProjectPaths(root: url.deletingLastPathComponent())
         )
+        try DatasetPoseSeedReceiptValidator.validateMetadata(metadata)
         return metadata
     }
 
@@ -141,6 +155,7 @@ public enum ProjectMetadataStore {
         let paths = ProjectPaths(root: metadataURL.deletingLastPathComponent())
         try VideoInputReceiptValidator.validateMetadata(metadata, paths: paths)
         try PhotoInputReceiptValidator.validateMetadata(metadata, paths: paths)
+        try DatasetPoseSeedReceiptValidator.validateMetadata(metadata)
         return metadata
     }
 
@@ -148,19 +163,35 @@ public enum ProjectMetadataStore {
         // Read the schema envelope before the strict payload so unsupported projects fail
         // clearly without partially interpreting another format.
         let envelope = try JSONDecoder().decode(FormatVersionEnvelope.self, from: data)
-        guard envelope.formatVersion == supportedFormatVersion else {
+        guard acceptedFormatVersions.contains(envelope.formatVersion) else {
             throw LoadError.unsupportedFormatVersion(envelope.formatVersion)
         }
         let fieldEnvelope = try JSONDecoder().decode(FieldEnvelope.self, from: data)
-        let allowedFields = Set(ProjectMetadata.CodingKeys.allCases.map(\.rawValue))
+        var allowedFields = Set(ProjectMetadata.CodingKeys.allCases.map(\.rawValue))
+        if envelope.formatVersion < 32 {
+            allowedFields.subtract(fieldsIntroducedInFormat32)
+        }
         guard fieldEnvelope.fields.isSubset(of: allowedFields) else {
             throw LoadError.unexpectedFields
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let metadata = try decoder.decode(ProjectMetadata.self, from: data)
-        guard metadata.formatVersion == supportedFormatVersion else {
+        guard metadata.formatVersion == envelope.formatVersion else {
             throw SaveError.invalidFormatVersion(metadata.formatVersion)
+        }
+        // The field envelope only blocks top-level format-32 keys. Format-32
+        // state also lives nested inside the input spec, the resolved run plan,
+        // and the recovery payload, so a pre-32 envelope carrying a dataset
+        // input or an imported-pose plan must be rejected here too.
+        if envelope.formatVersion < 32 {
+            let carriesFormat32State = metadata.input.isDataset
+                || metadata.resolvedRunPlan?.geometryBackend == .importedPoses
+                || metadata.resolvedRunPlan?.datasetGeometryRoute != nil
+                || metadata.geometryRecovery?.activeBackend == .importedPoses
+            guard !carriesFormat32State else {
+                throw LoadError.unexpectedFields
+            }
         }
         return metadata
     }
@@ -195,10 +226,13 @@ public enum ProjectMetadataStore {
 
     private static func saveWithoutLock(_ metadata: ProjectMetadata, to url: URL) throws {
         try ProjectPaths(root: url.deletingLastPathComponent()).validateRootDirectory()
-        let persistedMetadata = metadata
-        guard persistedMetadata.formatVersion == supportedFormatVersion else {
+        var persistedMetadata = metadata
+        guard acceptedFormatVersions.contains(persistedMetadata.formatVersion) else {
             throw SaveError.invalidFormatVersion(persistedMetadata.formatVersion)
         }
+        // Saving is the migration boundary: an accepted older-format project
+        // is rewritten as the current format.
+        persistedMetadata.formatVersion = supportedFormatVersion
         try validateArtifactPaths(in: persistedMetadata, metadataURL: url)
         try VideoInputReceiptValidator.validateMetadata(
             persistedMetadata,
@@ -208,6 +242,7 @@ public enum ProjectMetadataStore {
             persistedMetadata,
             paths: ProjectPaths(root: url.deletingLastPathComponent())
         )
+        try DatasetPoseSeedReceiptValidator.validateMetadata(persistedMetadata)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601

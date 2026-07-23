@@ -2668,7 +2668,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
     pairEvidence: PairGraphEvidence,
     selectedImageNames: [String]
   ) throws -> GeometryRecoveryState {
-    guard metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion,
+    guard ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion),
       metadata.lastRunStartedAt == nil,
       metadata.resolvedRunPlan == resolvedPlan,
       let recovery = metadata.geometryRecovery,
@@ -2838,7 +2838,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
       try metadataBinding.dataSnapshot(),
       metadataURL: decisionPaths.metadataURL
     )
-    guard metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion,
+    guard ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion),
       metadata.state.stage == .sfmMatching,
       metadata.state.lastError == nil,
       metadata.lastRunStartedAt == nil,
@@ -3452,7 +3452,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
       try metadataBinding.dataSnapshot(),
       metadataURL: paths.metadataURL
     )
-    guard metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion,
+    guard ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion),
       metadata.state.stage == .sfmMatching,
       metadata.state.lastError == nil,
       metadata.lastRunStartedAt == nil,

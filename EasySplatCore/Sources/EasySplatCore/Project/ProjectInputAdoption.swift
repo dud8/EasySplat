@@ -7,6 +7,11 @@ public enum ProjectInputAdoptionError: Error, Equatable, Sendable {
     case photoInputAlreadyAdopted
     case invalidPhotoSelectionEvidence
     case emptyPhotosRequireAdoptedMixedVideoInput
+    case unexpectedDatasetInput
+    case datasetInputAlreadyAdopted
+    /// Dataset adoption is retain-all: every declared image must be admitted and mapped to
+    /// the file it became. A dropped image is a hard failure, never a silent skip.
+    case datasetImageAdmissionIncomplete
 }
 
 /// Converts immutable preflight snapshots into the project-relative input and receipt
@@ -18,6 +23,10 @@ public struct ProjectInputAdoption: Sendable {
     public private(set) var videoInputIntegrityHandoff: VideoInputIntegrityHandoff?
     public private(set) var photoInputReceipts: [PhotoInputReceipt]?
     public private(set) var photoSelectionReceipt: PhotoSelectionReceipt?
+    public private(set) var datasetPoseSeed: DatasetPoseSeedReceipt?
+
+    /// Ceiling on any single geometry metadata file copied verbatim into `Import/source`.
+    private static let maximumControlledSourceBytes = 256 * 1024 * 1024
 
     public init(requestedInput: InputSpec) {
         input = requestedInput
@@ -25,6 +34,7 @@ public struct ProjectInputAdoption: Sendable {
         videoInputIntegrityHandoff = nil
         photoInputReceipts = nil
         photoSelectionReceipt = nil
+        datasetPoseSeed = nil
     }
 
     public mutating func adoptVideos(
@@ -91,6 +101,17 @@ public struct ProjectInputAdoption: Sendable {
         guard photoInputReceipts == nil, photoSelectionReceipt == nil else {
             throw ProjectInputAdoptionError.photoInputAlreadyAdopted
         }
+        try admitPreparedPhotos(prepared, into: paths)
+    }
+
+    /// Adopts a prepared photo input into `Originals/Photos`, produces the per-photo receipts
+    /// and selection receipt, and rewrites `input` to the controlled folder. Shared verbatim
+    /// by `adoptPhotos` and `adoptDataset` so dataset images ride the same admission and
+    /// receipt machinery as ordinary photos.
+    private mutating func admitPreparedPhotos(
+        _ prepared: PreparedPhotoInput,
+        into paths: ProjectPaths
+    ) throws {
         let artifact = prepared.selectionArtifact
         do {
             try PhotoSelectionArtifactStore.validate(artifact)
@@ -160,6 +181,96 @@ public struct ProjectInputAdoption: Sendable {
         )
     }
 
+    /// Adopts a pre-processed dataset import. The declared images ride the photo admission
+    /// machinery into `Originals/Photos`; on top of that this persists the converted COLMAP
+    /// seed and original geometry metadata under `Import/`, and binds every declared image to
+    /// the file it became through the `DatasetPoseSeedReceipt`. Retain-all: an image the photo
+    /// admission drops is a hard failure, not a skip.
+    public mutating func adoptDataset(
+        _ prepared: PreparedDatasetInput,
+        into paths: ProjectPaths,
+        photoInput: PreparedPhotoInput
+    ) throws {
+        guard input.isDataset else {
+            throw ProjectInputAdoptionError.unexpectedDatasetInput
+        }
+        guard datasetPoseSeed == nil,
+              photoInputReceipts == nil,
+              photoSelectionReceipt == nil else {
+            throw ProjectInputAdoptionError.datasetInputAlreadyAdopted
+        }
+
+        // Dataset images are photos to the rest of the system: run them through the exact
+        // admission, copy, and receipt path ordinary photos use.
+        try admitPreparedPhotos(photoInput, into: paths)
+        guard let receipts = photoInputReceipts, receipts.count == prepared.stagedImages.count else {
+            throw ProjectInputAdoptionError.datasetImageAdmissionIncomplete
+        }
+        var adoptedFileNameBySourceSHA256: [String: String] = [:]
+        for receipt in receipts {
+            adoptedFileNameBySourceSHA256[receipt.source.sha256] =
+                (receipt.projectRelativePath as NSString).lastPathComponent
+        }
+
+        // Persist the converted seed and verbatim source metadata under Import/. These live
+        // outside Originals deliberately so the geometry artifact store never sweeps them.
+        try createControlledDirectory(paths.importURL)
+        try createControlledDirectory(paths.importSeedURL)
+        try createControlledDirectory(paths.importSourceURL)
+        for url in prepared.seedFileURLs {
+            try copyControlledFile(
+                from: url,
+                to: paths.importSeedURL.appendingPathComponent(url.lastPathComponent)
+            )
+        }
+        var sourceRelativePaths: [String] = []
+        for url in prepared.sourceFileURLs {
+            let destination = paths.importSourceURL.appendingPathComponent(url.lastPathComponent)
+            try copyControlledFile(from: url, to: destination)
+            sourceRelativePaths.append(try paths.projectRelativePath(for: destination))
+        }
+
+        // Bind each declared image to the controlled file it became under Originals/Photos.
+        let entries = try prepared.stagedImages.map { staged -> DatasetReceiptEntry in
+            guard let adoptedFileName = adoptedFileNameBySourceSHA256[staged.sha256] else {
+                throw ProjectInputAdoptionError.datasetImageAdmissionIncomplete
+            }
+            return DatasetReceiptEntry(
+                entryID: staged.entryID,
+                declaredPath: staged.declaredPath,
+                adoptedFileName: adoptedFileName,
+                sourceSHA256: staged.sha256
+            )
+        }
+        datasetPoseSeed = try DatasetPoseSeedReceipt.build(
+            kind: prepared.plan.kind,
+            route: prepared.plan.route,
+            entries: entries,
+            sourceRelativePaths: sourceRelativePaths,
+            projectRoot: paths.root
+        )
+    }
+
+    private func createControlledDirectory(_ url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+    }
+
+    private func copyControlledFile(from source: URL, to destination: URL) throws {
+        let data = try BoundedFileReader.readRegularFile(
+            at: source,
+            maximumBytes: Self.maximumControlledSourceBytes
+        )
+        try data.write(to: destination, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: destination.path
+        )
+    }
+
     public mutating func adoptEmptyMixedPhotoFolder(into paths: ProjectPaths) throws {
         guard case .mixed = input,
               videoInputReceipts?.isEmpty == false,
@@ -183,7 +294,7 @@ public struct ProjectInputAdoption: Sendable {
             .video(files: files)
         case .mixed(_, let photosFolder):
             .mixed(videos: files, photosFolder: photosFolder)
-        case .photos:
+        case .photos, .dataset:
             input
         }
     }
@@ -194,6 +305,8 @@ public struct ProjectInputAdoption: Sendable {
             .photos(folder: folder)
         case .mixed(let videos, _):
             .mixed(videos: videos, photosFolder: folder)
+        case .dataset(let kind, _):
+            .dataset(kind: kind, imagesFolder: folder)
         case .video:
             input
         }

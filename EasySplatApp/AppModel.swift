@@ -109,6 +109,10 @@ final class AppModel: ObservableObject {
     @Published var requestedRunOptions = RequestedRunOptions()
     @Published var pendingVideoURLs: [URL] = []
     @Published var pendingPhotoURLs: [URL] = []
+    /// A pre-processed dataset selection. Exclusive with `pendingVideoURLs`
+    /// and `pendingPhotoURLs`: setting it clears any pending media, and while
+    /// it is set new media selections are rejected.
+    @Published var pendingDataset: PendingDataset? = nil
     @Published var projectSummaries: [ProjectSummary] = []
     @Published var selectionWarning: String? = nil
     @Published var shareStatusMessage: String? = nil

@@ -1611,7 +1611,7 @@ private extension ProjectPublicationTransaction {
         )
         let record = try JSONDecoder().decode(TransactionRecord.self, from: data)
         guard record.schemaVersion == transactionSchemaVersion,
-              record.projectFormatVersion == ProjectMetadataStore.supportedFormatVersion,
+              ProjectMetadataStore.acceptedFormatVersions.contains(record.projectFormatVersion),
               record.title.utf8.count <= 1_048_576,
               transactionRecordIsStructurallyValid(record) else {
             throw ProjectPublicationError.unsafeTransactionEnvelope
@@ -1766,7 +1766,7 @@ private extension ProjectPublicationTransaction {
         )
         let ready = try JSONDecoder().decode(ReadyRecord.self, from: data)
         guard ready.schemaVersion == readySchemaVersion,
-              ready.projectFormatVersion == ProjectMetadataStore.supportedFormatVersion,
+              ProjectMetadataStore.acceptedFormatVersions.contains(ready.projectFormatVersion),
               ready.manifest.count <= 20_050 else {
             throw ProjectPublicationError.invalidReadinessReceipt
         }
@@ -2041,7 +2041,7 @@ private extension ProjectPublicationTransaction {
         expectedTitle: String,
         expectedMetadata: ProjectMetadata?
     ) throws {
-        guard metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion,
+        guard ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion),
               metadata.id == expectedProjectID,
               metadata.title == expectedTitle,
               metadata.title.utf8.count <= 1_048_576,
@@ -2544,7 +2544,7 @@ private extension ProjectPublicationTransaction {
         guard ready.schemaVersion == readySchemaVersion,
               ready.transactionID == expectedTransactionID,
               ready.projectID == expectedProjectID,
-              ready.projectFormatVersion == ProjectMetadataStore.supportedFormatVersion,
+              ProjectMetadataStore.acceptedFormatVersions.contains(ready.projectFormatVersion),
               ready.bundle == expectedBundle else {
             throw ProjectPublicationError.invalidReadinessReceipt
         }
@@ -2970,7 +2970,7 @@ private extension ProjectPublicationTransaction {
                 guard record.transactionID == leafTransactionID,
                       record.library == baseIdentity,
                       record.envelope == envelopeIdentity,
-                      record.projectFormatVersion == ProjectMetadataStore.supportedFormatVersion else {
+                      ProjectMetadataStore.acceptedFormatVersions.contains(record.projectFormatVersion) else {
                     throw ProjectPublicationError.unsafeTransactionEnvelope
                 }
 
@@ -3758,7 +3758,7 @@ private extension ProjectPublicationTransaction {
               cleanup.library == record.library,
               cleanup.envelope == record.envelope,
               cleanup.originalEnvelopeLeaf == transactionLeaf(for: cleanup.transactionID),
-              record.projectFormatVersion == ProjectMetadataStore.supportedFormatVersion,
+              ProjectMetadataStore.acceptedFormatVersions.contains(record.projectFormatVersion),
               transactionRecordIsStructurallyValid(record),
               cleanup.outerFiles.count <= 4 else {
             throw ProjectPublicationError.unsafeTransactionContainer
@@ -3790,7 +3790,7 @@ private extension ProjectPublicationTransaction {
                   ready.schemaVersion == readySchemaVersion,
                   ready.transactionID == record.transactionID,
                   ready.projectID == record.projectID,
-                  ready.projectFormatVersion == ProjectMetadataStore.supportedFormatVersion,
+                  ProjectMetadataStore.acceptedFormatVersions.contains(ready.projectFormatVersion),
                   ready.bundle == record.bundle,
                   ready.manifest.count <= 20_050,
                   ready.metadataSHA256 == record.validatedMetadataSHA256,

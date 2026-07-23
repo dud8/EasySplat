@@ -600,6 +600,15 @@ extension PipelineRunner {
         }
     }
 
+    /// Dataset frames are copied byte-for-byte, so their output name must
+    /// describe the untouched bytes rather than fold `.jpeg`/HEIC into the
+    /// normalized-photo `.jpg` default. Preflight already bounds and de-rotates
+    /// dataset images, so the source extension is the honest output extension.
+    func datasetSelectedFrameOutputExtension(for source: URL) -> String {
+        let ext = source.pathExtension.lowercased()
+        return ext.isEmpty ? "jpg" : ext
+    }
+
     func selectedImagesHaveUniformPixelDimensions(_ images: [URL]) throws -> Bool {
         try selectedImageUniformPixelDimensions(images) != nil
     }
@@ -655,6 +664,7 @@ extension PipelineRunner {
         manifestURL: URL,
         maxDimension: CGFloat,
         projectPaths: ProjectPaths? = nil,
+        datasetPreservesSourceBytes: Bool = false,
         progress: ((Double, String) -> Void)? = nil
     ) throws -> (frames: [URL], manifest: [SelectedFrameMapping]) {
         let fm = FileManager.default
@@ -674,13 +684,16 @@ extension PipelineRunner {
                         throw PipelineError.invalidInput
                     }
                 }
-                let destExt = selectedFrameOutputExtension(for: frame)
+                let destExt = datasetPreservesSourceBytes
+                    ? datasetSelectedFrameOutputExtension(for: frame)
+                    : selectedFrameOutputExtension(for: frame)
                 let dest = directory.appendingPathComponent(String(format: "frame_%06d.%@", index, destExt))
                 if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
                 let normalization = try copySelectedFrame(
                     source: frame,
                     destination: dest,
                     maxDimension: maxDimension,
+                    preservesSourceBytes: datasetPreservesSourceBytes,
                     context: &lowLightContext
                 )
                 let sourceProjectRelativePath: String?
@@ -750,7 +763,11 @@ extension PipelineRunner {
         let evidence: SelectedFrameNormalization
     }
 
-    static let maximumSelectedFrameDecodeDimension = 4_096
+    // Dataset frames pass through unscaled up to the preflight ceiling, so the
+    // content-identity decode must admit that full grid. Tracking the dataset
+    // bound keeps the pixel-hash pass valid for imported images while leaving
+    // the smaller normalized-photo dimensions (always passed explicitly) intact.
+    static let maximumSelectedFrameDecodeDimension = RunPlanResolver.maximumDatasetImagePixelDimension
     private static let maximumSelectedFrameEncodedBytes: UInt64 = 512 * 1_024 * 1_024
 
     struct SelectedFrameContentIdentity: Equatable, Sendable {
@@ -778,9 +795,16 @@ extension PipelineRunner {
         source: URL,
         destination: URL,
         maxDimension: CGFloat,
+        preservesSourceBytes: Bool,
         context: inout CIContext?
     ) throws -> SelectedFrameNormalizationResult {
-        let exposureEV = (try? FrameScoring.scoreFrame(at: source).lowLightExposureEV) ?? 0
+        // Dataset frames are copied verbatim: their imported calibration
+        // describes the original grid, so no exposure lift is scored and no
+        // transcode is ever taken. The decode validation below still runs so a
+        // corrupt file is rejected before it reaches the geometry solver.
+        let exposureEV = preservesSourceBytes
+            ? 0
+            : ((try? FrameScoring.scoreFrame(at: source).lowLightExposureEV) ?? 0)
         guard let sourceRef = CGImageSourceCreateWithURL(source as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(
                   sourceRef,
@@ -806,17 +830,19 @@ extension PipelineRunner {
             resolvedMaximumDimension = largestDimension
         }
         let boundedDimension = min(largestDimension, resolvedMaximumDimension)
-        let needsTranscode = Self.selectedFrameRequiresTranscode(
-            exposureEV: exposureEV,
-            sourceExtension: source.pathExtension,
-            orientation: orientation,
-            largestDimension: largestDimension,
-            boundedDimension: boundedDimension,
-            requiresSDRBridge: SDRImageDecoder.bridgeReason(
-                source: sourceRef,
-                properties: properties
-            ) != nil
-        )
+        let needsTranscode = preservesSourceBytes
+            ? false
+            : Self.selectedFrameRequiresTranscode(
+                exposureEV: exposureEV,
+                sourceExtension: source.pathExtension,
+                orientation: orientation,
+                largestDimension: largestDimension,
+                boundedDimension: boundedDimension,
+                requiresSDRBridge: SDRImageDecoder.bridgeReason(
+                    source: sourceRef,
+                    properties: properties
+                ) != nil
+            )
         guard needsTranscode else {
             _ = try copyFileContents(from: source, to: destination)
             return SelectedFrameNormalizationResult(

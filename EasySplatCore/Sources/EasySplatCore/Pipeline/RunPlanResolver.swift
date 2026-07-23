@@ -248,14 +248,44 @@ public enum RunPlanResolver {
         return completedIndex < boundaryIndex ? lastCompletedStage : safeBoundary
     }
 
+    /// The most posed images a dataset import may carry. Enforced at
+    /// preflight with user-facing copy; re-clamped here so the resolved
+    /// keyframe budget can never exceed it.
+    public static let maximumDatasetImageCount = 1_000
+
+    /// Ceiling on any single dataset image dimension, enforced at preflight.
+    /// Keeps training-side pixel bounds and memory budgets meaningful.
+    public static let maximumDatasetImagePixelDimension = 8_192
+
+    /// Dataset facts the resolver needs without coupling to receipt storage.
+    public struct DatasetImportContext: Sendable, Equatable {
+        public let route: DatasetGeometryRoute
+        public let imageCount: Int
+        /// Largest single dimension across the dataset's images. Dataset
+        /// pixels are never resized (imported calibration describes the
+        /// original pixel grid), so the plan's image-dimension bound must
+        /// admit them or training-prep validation would reject the run late.
+        public let maximumImagePixelDimension: Int?
+
+        public init(route: DatasetGeometryRoute, imageCount: Int, maximumImagePixelDimension: Int? = nil) {
+            self.route = route
+            self.imageCount = imageCount
+            self.maximumImagePixelDimension = maximumImagePixelDimension
+        }
+    }
+
     public static func resolve(
         requestedOptions options: RequestedRunOptions,
         input: InputSpec,
         hardware: HardwareProfile,
         developmentOverrides: DevelopmentOverrides,
-        trainingMemoryRetryBudgetBytes: Int64? = nil
+        trainingMemoryRetryBudgetBytes: Int64? = nil,
+        datasetImport: DatasetImportContext? = nil
     ) -> ResolvedRunPlan {
-        let capturePath = options.capturePath
+        // Dataset imports made the pose/pairing decisions at capture time:
+        // the capture-path knob is inert and ordering is canonically
+        // unordered regardless of any stale request.
+        let capturePath = input.isDataset ? .automatic : options.capturePath
         let inputOrdering = resolvedInputOrdering(options.inputOrdering, input: input)
         let pairingPolicy = resolvedPairingPolicy(
             capturePath: capturePath,
@@ -285,21 +315,41 @@ public enum RunPlanResolver {
         )
         let cameraGrouping = resolvedCameraGrouping(options.cameraGrouping, input: input)
         let lensProjection = options.lensProjection
-        let route = developmentOverrides.candidateRoute ?? .colmap
+        let route: SfmBackend
+        if input.isDataset, datasetImport != nil {
+            route = .importedPoses
+        } else {
+            route = developmentOverrides.candidateRoute ?? .colmap
+        }
         let model = resolvedModel(route: route, memoryTier: memoryTier)
-        let keyframeBudget = route == .da3
-            ? 29
-            : resolvedKeyframeBudget(
+        let keyframeBudget: Int
+        if let datasetImport, input.isDataset {
+            // Every posed image must survive selection; the budget IS the
+            // reconciled image count, bounded by the admission ceiling.
+            keyframeBudget = min(max(datasetImport.imageCount, 1), maximumDatasetImageCount)
+        } else if route == .da3 {
+            keyframeBudget = 29
+        } else {
+            keyframeBudget = resolvedKeyframeBudget(
                 detail: options.detailProfile,
                 capturePath: capturePath,
                 memoryTier: memoryTier,
                 resourcePolicy: options.resourcePolicy
             )
-        let maximumImageDimension = resolvedMaximumImageDimension(
+        }
+        var maximumImageDimension = resolvedMaximumImageDimension(
             detail: options.detailProfile,
             memoryTier: memoryTier,
             resourcePolicy: options.resourcePolicy
         )
+        if input.isDataset, let datasetDimension = datasetImport?.maximumImagePixelDimension {
+            // Dataset images pass through unscaled; the bound is a validation
+            // ceiling for them, not a resize target.
+            maximumImageDimension = min(
+                max(maximumImageDimension, datasetDimension),
+                maximumDatasetImagePixelDimension
+            )
+        }
         let colmapMaximumImageDimension = min(
             maximumImageDimension,
             resolvedColmapMaximumImageDimension(
@@ -337,6 +387,7 @@ public enum RunPlanResolver {
 
         return ResolvedRunPlan(
             geometryBackend: route,
+            datasetGeometryRoute: input.isDataset ? datasetImport?.route : nil,
             modelIdentifier: model,
             memoryTier: memoryTier.rawValue,
             chunkSize: route == .da3 ? 29 : 0,
@@ -367,7 +418,7 @@ public enum RunPlanResolver {
             requiredToolchainCapabilities: requiredCapabilities(route: route, model: model),
             capturePath: capturePath,
             inputOrdering: inputOrdering,
-            photoSelection: options.photoSelection,
+            photoSelection: input.isDataset ? .useAllValidPhotos : options.photoSelection,
             pairingPolicy: pairingPolicy,
             temporalPairing: pairingConfiguration.temporalPairing,
             temporalOffsets: pairingConfiguration.temporalOffsets,
@@ -396,11 +447,14 @@ public enum RunPlanResolver {
     }
 
     private static func resolvedInputOrdering(_ requested: InputOrdering, input: InputSpec) -> InputOrdering {
+        // Datasets are canonically unordered regardless of any stale request:
+        // pairing for imported poses must never assume capture continuity.
+        if input.isDataset { return .unordered }
         guard requested == .automatic else { return requested }
         switch input {
         case .video(let files):
             return files.count == 1 ? .continuous : .unordered
-        case .photos, .mixed:
+        case .photos, .mixed, .dataset:
             return .unordered
         }
     }
@@ -691,7 +745,9 @@ public enum RunPlanResolver {
 
     private static func requiredCapabilities(route: SfmBackend, model: String) -> [String] {
         switch route {
-        case .colmap:
+        case .colmap, .importedPoses:
+            // Imported poses still use COLMAP for features, matching,
+            // triangulation, and undistortion.
             return ["geometry.colmap", "runtime.core", "training.msplat"]
         case .da3:
             let modelCapability = model == "DA3-SMALL"
