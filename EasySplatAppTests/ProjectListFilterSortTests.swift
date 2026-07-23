@@ -135,6 +135,23 @@ final class ProjectListFilterSortTests: XCTestCase {
         )
     }
 
+    func testSidebarRowIdentityMatchesSelectionTag() {
+        let directoryStyle = makeSummary(
+            url: URL(fileURLWithPath: "/tmp/Project.easysplatproj", isDirectory: true)
+        )
+        let fileStyle = makeSummary(
+            url: URL(fileURLWithPath: "/tmp/Project.easysplatproj")
+        )
+
+        // Row diffing (ForEach id) and selection matching (.tag) both read
+        // selectionID; a divergence would let a reorder strand the highlight.
+        for summary in [directoryStyle, fileStyle] {
+            XCTAssertEqual(summary.selectionID, ProjectSidebar.selectionID(for: summary))
+            XCTAssertEqual(summary.selectionID, ProjectSummary.canonicalURL(for: summary.url))
+        }
+        XCTAssertEqual(directoryStyle.selectionID, fileStyle.selectionID)
+    }
+
     func testProjectRowAccessibilityIdentifierIsStableAndDoesNotExposeThePath() {
         let directoryURL = URL(fileURLWithPath: "/Users/example/Client Work/House.easysplatproj", isDirectory: true)
         let fileURL = URL(fileURLWithPath: directoryURL.path)

@@ -62,9 +62,9 @@ struct ProjectSidebar: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(visibleProjects, id: \.url) { project in
+                        ForEach(visibleProjects, id: \.selectionID) { project in
                             projectRow(project)
-                                .tag(Self.selectionID(for: project))
+                                .tag(project.selectionID)
                                 .contextMenu { projectMenu(project) }
                         }
                     }
@@ -332,7 +332,7 @@ struct ProjectSidebar: View {
     }
 
     nonisolated static func selectionID(for project: ProjectSummary) -> URL {
-        selectionID(for: project.url)
+        project.selectionID
     }
 
     nonisolated static func selectionID(for projectURL: URL) -> URL {
