@@ -94,6 +94,13 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(visible.map(\.title), ["Kitchen"])
     }
 
+    func testRowUnavailabilityRequiresActiveRunAndOtherProject() {
+        XCTAssertTrue(ProjectSidebar.rowIsUnavailableDuringRun(isRunActive: true, isActiveProject: false))
+        XCTAssertFalse(ProjectSidebar.rowIsUnavailableDuringRun(isRunActive: true, isActiveProject: true))
+        XCTAssertFalse(ProjectSidebar.rowIsUnavailableDuringRun(isRunActive: false, isActiveProject: false))
+        XCTAssertFalse(ProjectSidebar.rowIsUnavailableDuringRun(isRunActive: false, isActiveProject: true))
+    }
+
     func testRenameDraftValidityRejectsEmptyAndUnchangedTitles() {
         XCTAssertTrue(ProjectSidebar.renameDraftIsInvalid(draft: "", currentTitle: "ProjectA"))
         XCTAssertTrue(ProjectSidebar.renameDraftIsInvalid(draft: "   ", currentTitle: "ProjectA"))

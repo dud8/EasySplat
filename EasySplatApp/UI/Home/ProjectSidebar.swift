@@ -195,15 +195,18 @@ struct ProjectSidebar: View {
             }
         }
         .padding(.vertical, 2)
+        .selectionDisabled(rowIsUnavailable(project))
     }
 
     private func projectLabel(_ project: ProjectSummary) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        let unavailable = rowIsUnavailable(project)
+        return VStack(alignment: .leading, spacing: 3) {
             Text(project.title)
                 .font(.body)
+                .foregroundStyle(unavailable ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .help(project.title)
+                .help(unavailable ? "Opens after the current run finishes." : project.title)
 
             let caption = Self.rowCaption(
                 status: project.status,
@@ -223,7 +226,7 @@ struct ProjectSidebar: View {
                 }
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(unavailable ? .tertiary : .secondary)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
@@ -291,6 +294,13 @@ struct ProjectSidebar: View {
         isRunActive && ProjectSummary.hasSameLocation(model.currentProjectURL, project.url)
     }
 
+    private func rowIsUnavailable(_ project: ProjectSummary) -> Bool {
+        Self.rowIsUnavailableDuringRun(
+            isRunActive: isRunActive,
+            isActiveProject: ProjectSummary.hasSameLocation(model.currentProjectURL, project.url)
+        )
+    }
+
     private func statusText(for project: ProjectSummary) -> String {
         Self.rowCaption(status: project.status, isInterrupted: project.isInterrupted) ?? "Ready"
     }
@@ -316,6 +326,16 @@ struct ProjectSidebar: View {
 
     nonisolated static func opensOnSelection(status: ProjectStatus) -> Bool {
         status == .ready
+    }
+
+    /// While a run is active every other project is inert; the selection
+    /// binding already refuses it, so the row must also look and act held.
+    /// The running project keeps full prominence.
+    nonisolated static func rowIsUnavailableDuringRun(
+        isRunActive: Bool,
+        isActiveProject: Bool
+    ) -> Bool {
+        isRunActive && !isActiveProject
     }
 
     nonisolated static func rowActionTitle(status: ProjectStatus) -> String? {
