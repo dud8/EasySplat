@@ -46,18 +46,6 @@ struct ProjectSidebar: View {
                 .padding(.horizontal, Theme.Spacing.medium)
                 .padding(.top, Theme.Spacing.small)
 
-            Button(action: onNewSplat) {
-                Label("New Splat", systemImage: "plus")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(isRunActive)
-            .keyboardShortcut("n", modifiers: .command)
-            .padding(Theme.Spacing.medium)
-
-            Divider()
-
             HStack(spacing: Theme.Spacing.small) {
                 statusMenu
                 sortMenu
@@ -83,6 +71,16 @@ struct ProjectSidebar: View {
                 }
             }
             .listStyle(.sidebar)
+        }
+        .toolbar {
+            ToolbarItem {
+                Button(action: onNewSplat) {
+                    Label("New Splat", systemImage: "plus")
+                }
+                .disabled(isRunActive)
+                .help("New Splat")
+                .accessibilityIdentifier("sidebar.newSplat")
+            }
         }
         .confirmationDialog(
             "Move project to Trash?",
@@ -148,6 +146,7 @@ struct ProjectSidebar: View {
             Label(filter.displayName, systemImage: "line.3.horizontal.decrease")
         }
         .menuStyle(.borderlessButton)
+        .tint(Color.primary)
         .fixedSize()
     }
 
@@ -165,6 +164,7 @@ struct ProjectSidebar: View {
             Label(sort.displayName, systemImage: "arrow.up.arrow.down")
         }
         .menuStyle(.borderlessButton)
+        .tint(Color.primary)
         .fixedSize()
     }
 
@@ -186,7 +186,8 @@ struct ProjectSidebar: View {
                 Button(actionTitle) {
                     open(project)
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.bordered)
+                .tint(Color.primary)
                 .controlSize(.small)
                 .fixedSize()
                 .accessibilityLabel("\(actionTitle) \(project.title)")

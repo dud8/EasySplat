@@ -23,6 +23,10 @@ struct DropZoneView: View {
     var body: some View {
         Button(action: onChoose) {
             VStack(spacing: Theme.Spacing.small) {
+                Image(systemName: "tray.and.arrow.down")
+                    .font(.title2)
+                    .foregroundStyle(isTargeted ? Theme.accent : Color.secondary)
+                    .accessibilityHidden(true)
                 Text(Self.displayTitle(restingTitle: title, isTargeted: isTargeted))
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(isTargeted ? Theme.accent : Color.primary)
@@ -39,7 +43,13 @@ struct DropZoneView: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
-                    .strokeBorder(isTargeted ? Theme.accent : Theme.border, lineWidth: isTargeted ? 2 : 1)
+                    .strokeBorder(
+                        isTargeted ? Theme.accent : Theme.border,
+                        style: StrokeStyle(
+                            lineWidth: isTargeted ? 2 : 1,
+                            dash: isTargeted ? [] : [5, 4]
+                        )
+                    )
             )
             .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
         }

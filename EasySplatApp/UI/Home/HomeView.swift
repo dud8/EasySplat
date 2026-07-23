@@ -8,6 +8,7 @@ struct HomeView: View {
     @State private var replaceInputOnImport = false
     @State private var showLowDiskWarning = false
     @State private var optionsExpanded = false
+    @FocusState private var isDropZoneFocused: Bool
 
     private var hasInput: Bool {
         !model.pendingVideoURLs.isEmpty || !model.pendingPhotoURLs.isEmpty
@@ -20,14 +21,9 @@ struct HomeView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.large) {
-                VStack(alignment: .leading, spacing: Theme.Spacing.small) {
-                    Text("Create a 3D splat")
-                        .font(.largeTitle.weight(.semibold))
-                        .accessibilityAddTraits(.isHeader)
-                    Text("Choose videos, photos, or a folder of them.")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
-                }
+                Text("Create a 3D splat")
+                    .font(.largeTitle.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
 
                 DropZoneView(
                     title: "Choose Input…",
@@ -36,6 +32,7 @@ struct HomeView: View {
                     onDropURLs: { model.addInputs(urls: $0) }
                 )
                 .frame(height: 180)
+                .focused($isDropZoneFocused)
                 .accessibilityIdentifier("home.chooseInput")
 
                 if hasInput {
@@ -96,6 +93,7 @@ struct HomeView: View {
             .padding(Theme.Spacing.extraLarge)
             .frame(maxWidth: .infinity, alignment: .top)
         }
+        .defaultFocus($isDropZoneFocused, true)
         .fileImporter(
             isPresented: $showInputImporter,
             allowedContentTypes: [
