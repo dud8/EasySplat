@@ -468,6 +468,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <string>EasySplatAppIcon</string>
   <key>CFBundleName</key>
   <string>EasySplat</string>
+  <key>CFBundleDisplayName</key>
+  <string>EasySplat</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -478,10 +480,14 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <string>$APP_RELEASE_CHANNEL</string>
   <key>EasySplatReleaseVersion</key>
   <string>$VERSION</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.graphics-design</string>
   <key>LSMinimumSystemVersion</key>
   <string>15.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>© 2026 EasySplat contributors. MIT License.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>

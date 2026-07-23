@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Darwin
 import EasySplatCore
 import EasySplatReleaseVerifierCore
@@ -8,6 +9,8 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     let model: AppModel
     private var mainWindow: NSWindow?
+    private var windowSubtitleCancellable: AnyCancellable?
+    private var runStatusPresenter: RunStatusPresenter?
     private let releaseVerificationConfiguration: AppConfig.ReleaseVerificationConfiguration?
 
     override init() {
@@ -72,8 +75,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         let window = makeMainWindow()
         mainWindow = window
+        runStatusPresenter = RunStatusPresenter(model: model) { [weak window] in
+            NSApp.isActive && (window?.occlusionState.contains(.visible) ?? false)
+        }
+        windowSubtitleCancellable = model.$stage
+            .combineLatest(model.$isRunActive)
+            .map(ProcessingPhase.windowSubtitle(stage:isRunActive:))
+            .removeDuplicates()
+            .sink { [weak window] subtitle in
+                window?.subtitle = subtitle
+            }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        // The sidebar search field would otherwise grab key focus at launch and
+        // show a focus ring before the user has touched anything. Tab order and
+        // click-to-focus are unaffected.
+        DispatchQueue.main.async { [weak window] in
+            guard let window, window.firstResponder is NSTextView else { return }
+            window.makeFirstResponder(nil)
+        }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -126,6 +146,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let aboutItem = NSMenuItem(title: "About EasySplat", action: #selector(showAbout(_:)), keyEquivalent: "")
         aboutItem.target = self
         applicationMenu.addItem(aboutItem)
+        let releasesItem = NSMenuItem(
+            title: "View Releases…",
+            action: #selector(viewReleases(_:)),
+            keyEquivalent: ""
+        )
+        releasesItem.target = self
+        applicationMenu.addItem(releasesItem)
         applicationMenu.addItem(.separator())
 
         let servicesMenu = NSMenu(title: "Services")
@@ -162,6 +189,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         quitItem.target = application
         applicationMenu.addItem(quitItem)
 
+        let fileMenu = NSMenu(title: "File")
+        let fileItem = NSMenuItem()
+        fileItem.submenu = fileMenu
+        mainMenu.addItem(fileItem)
+        let newSplatItem = NSMenuItem(
+            title: "New Splat",
+            action: #selector(newSplat(_:)),
+            keyEquivalent: "n"
+        )
+        newSplatItem.target = self
+        fileMenu.addItem(newSplatItem)
+        let exportItem = NSMenuItem(
+            title: "Export…",
+            action: #selector(exportSplat(_:)),
+            keyEquivalent: "e"
+        )
+        exportItem.target = self
+        fileMenu.addItem(exportItem)
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(
+            NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        )
+
         let editMenu = NSMenu(title: "Edit")
         let editItem = NSMenuItem()
         editItem.submenu = editMenu
@@ -180,6 +230,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let viewItem = NSMenuItem()
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
+        let sidebarItem = NSMenuItem(
+            title: "Show or Hide Sidebar",
+            action: #selector(NSSplitViewController.toggleSidebar(_:)),
+            keyEquivalent: "s"
+        )
+        sidebarItem.keyEquivalentModifierMask = [.command, .control]
+        viewMenu.addItem(sidebarItem)
+        viewMenu.addItem(.separator())
         let fullScreenItem = NSMenuItem(
             title: "Enter Full Screen",
             action: #selector(NSWindow.toggleFullScreen(_:)),
@@ -192,8 +250,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let windowItem = NSMenuItem()
         windowItem.submenu = windowMenu
         mainMenu.addItem(windowItem)
-        windowMenu.addItem(NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
-        windowMenu.addItem(.separator())
         windowMenu.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
         windowMenu.addItem(NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
         windowMenu.addItem(.separator())
@@ -204,6 +260,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let helpItem = NSMenuItem()
         helpItem.submenu = helpMenu
         mainMenu.addItem(helpItem)
+        application.helpMenu = helpMenu
+        let helpPageItem = NSMenuItem(
+            title: "EasySplat Help",
+            action: #selector(openHelpPage(_:)),
+            keyEquivalent: "?"
+        )
+        helpPageItem.target = self
+        helpMenu.addItem(helpPageItem)
+        helpMenu.addItem(.separator())
         let diagnosticsItem = NSMenuItem(
             title: "Copy Diagnostics for Current Project",
             action: #selector(copyDiagnostics(_:)),
@@ -219,21 +284,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if menuItem.action == #selector(copyDiagnostics(_:)) {
             return model.currentProjectURL != nil
         }
+        if menuItem.action == #selector(newSplat(_:)) {
+            return !model.isRunActive
+        }
+        if menuItem.action == #selector(exportSplat(_:)) {
+            return model.viewState == .viewer && model.outputPlyURL != nil
+        }
         return true
     }
 
+    @objc private func newSplat(_ sender: Any?) {
+        model.beginNewSplat()
+    }
+
+    @objc private func exportSplat(_ sender: Any?) {
+        model.requestExportFromMenu()
+    }
+
     @objc private func showAbout(_ sender: Any?) {
-        let panel = NSAlert()
-        panel.messageText = "EasySplat"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
-        let suffix = build.isEmpty ? "" : " (build \(build))"
-        panel.informativeText = [
-            "macOS-only Apple Silicon app for turning videos, photos, or mixed inputs into 3D Gaussian splats.",
-            "Version \(EasySplatReleaseIdentity.version())\(suffix).",
-            "Hardware: \(AppModel.hardwareSummaryLine())"
-        ].joined(separator: "\n\n")
-        panel.addButton(withTitle: "OK")
-        panel.runModal()
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        let credits = NSAttributedString(
+            string: "Turns videos and photos into 3D Gaussian splats, entirely on this Mac.",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: paragraph
+            ]
+        )
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [
+            .applicationName: "EasySplat",
+            .applicationVersion: EasySplatReleaseIdentity.version(),
+            .credits: credits
+        ]
+        if let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String, !build.isEmpty {
+            options[.version] = build
+        }
+        NSApp.orderFrontStandardAboutPanel(options: options)
+    }
+
+    @objc private func viewReleases(_ sender: Any?) {
+        let releases = AppConfig.projectHomeURL
+            .appendingPathComponent("releases", isDirectory: true)
+        NSWorkspace.shared.open(releases)
+    }
+
+    @objc private func openHelpPage(_ sender: Any?) {
+        NSWorkspace.shared.open(AppConfig.projectHomeURL)
     }
 
     @objc private func copyDiagnostics(_ sender: Any?) {
