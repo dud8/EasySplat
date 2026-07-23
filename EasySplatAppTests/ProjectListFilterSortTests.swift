@@ -230,30 +230,38 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(model.actionFailure?.title, "Couldn’t save notes")
     }
 
-    func testSortByLastActivityPrefersLastOpenedAtOverStageTimings() {
-        let openedYesterday = makeSummary(
-            title: "OpenedYesterday",
+    func testSortByLastActivityIgnoresOpens() {
+        // A very recent open must not outrank older pipeline work; otherwise
+        // opening a project reshuffles the Recent list under the user's click.
+        let openedRecently = makeSummary(
+            title: "OpenedRecently",
             stageTimings: [
-                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 100), durationSeconds: 60)
+                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 40), durationSeconds: 60)
             ],
-            lastOpenedAt: Date(timeIntervalSince1970: 200_000)
+            lastOpenedAt: Date(timeIntervalSince1970: 1_000_000)
         )
-        let openedToday = makeSummary(
-            title: "OpenedToday",
+        let ranRecently = makeSummary(
+            title: "RanRecently",
             stageTimings: [
-                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 1_000), durationSeconds: 60)
-            ],
-            lastOpenedAt: Date(timeIntervalSince1970: 300_000)
-        )
-        let stageOnly = makeSummary(
-            title: "StageOnly",
-            stageTimings: [
-                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 500_000), durationSeconds: 60)
+                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 140), durationSeconds: 60)
             ],
             lastOpenedAt: nil
         )
-        let sorted = ProjectListSort.lastActivityNewest.apply(to: [openedYesterday, openedToday, stageOnly])
-        XCTAssertEqual(sorted.map(\.title), ["StageOnly", "OpenedToday", "OpenedYesterday"])
+        let sorted = ProjectListSort.lastActivityNewest.apply(to: [openedRecently, ranRecently])
+        XCTAssertEqual(sorted.map(\.title), ["RanRecently", "OpenedRecently"])
+    }
+
+    func testLastActivityIgnoresLastOpenedAt() {
+        let project = makeSummary(
+            createdAt: Date(timeIntervalSince1970: 100),
+            stageTimings: [
+                .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 400), durationSeconds: 50)
+            ],
+            lastOpenedAt: Date(timeIntervalSince1970: 9_000_000),
+            lastRunStartedAt: Date(timeIntervalSince1970: 300)
+        )
+
+        XCTAssertEqual(project.lastActivityAt, Date(timeIntervalSince1970: 450))
     }
 
     func testLastActivityUsesWorkCompletedAfterProjectWasOpened() {

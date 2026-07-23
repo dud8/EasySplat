@@ -30,9 +30,11 @@ extension ProjectSummary {
         return canonicalURL(for: first) == canonicalURL(for: second)
     }
 
-    /// Latest durable user or pipeline activity used by the Recent sort.
+    /// Latest durable pipeline activity used by the Recent sort. Opening a
+    /// project deliberately does not count: the list must not reshuffle
+    /// underneath the row the user just clicked.
     var lastActivityAt: Date {
-        [lastOpenedAt, lastRunStartedAt, lastFailureAt, lastRunCompletedAt]
+        [lastRunStartedAt, lastFailureAt, lastRunCompletedAt]
             .compactMap { $0 }
             .max() ?? createdAt
     }
