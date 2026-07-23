@@ -51,12 +51,15 @@ struct SplatViewerView: View {
             .popover(isPresented: $showHelp) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Controls").font(.headline)
+                    Text("Fly: W A S D · E up · Q down")
+                    Text("Sprint: hold Shift")
+                    Divider()
                     Text("Orbit: Drag")
+                    Text("Look: Right-drag or Control-drag")
                     Text("Pan: Option + Drag")
                     Text("Zoom: Scroll or pinch")
                     Divider()
-                    Text("Keyboard: arrows orbit")
-                    Text("Option + arrows pan")
+                    Text("Arrows orbit · Option + arrows pan")
                     Text("+ / − zoom · F fit · R reset")
                 }
                 .padding(12)

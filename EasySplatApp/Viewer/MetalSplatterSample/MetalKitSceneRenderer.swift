@@ -6,6 +6,7 @@ import Metal
 import MetalKit
 import MetalSplatter
 import os
+import QuartzCore
 import simd
 import SwiftUI
 
@@ -190,6 +191,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private var sourceOpeningDirection = SIMD3<Float>(0, 0, -1)
     private(set) var isViewOnlyFlipActive = false
 
+    private var heldMovementKeys: Set<ViewerMovementKey> = []
+    private var isSprintKeyHeld = false
+    private var lastFlightFrameTime: TimeInterval?
+    private static let maximumFlightFrameDelta: TimeInterval = 0.1
+
     var pan: SIMD2<Float> {
         let displacement = cameraState.target - sceneCenter
         return SIMD2<Float>(
@@ -222,7 +228,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         metalKitView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         metalKitView.enableSetNeedsDisplay = true
         metalKitView.isPaused = true
-        metalKitView.preferredFramesPerSecond = 24
+        metalKitView.preferredFramesPerSecond = Constants.idleFramesPerSecond
     }
 
     func load(_ model: ModelIdentifier?, forceReload: Bool = false) async throws {
@@ -348,7 +354,67 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     private func requestDraw() {
+        // In continuous flight mode the view's own timer drives frames;
+        // explicit draws on top would double-schedule.
+        guard metalKitView.isPaused else { return }
         metalKitView.draw()
+    }
+
+    /// While any movement key is held the view runs its own frame timer;
+    /// on release it returns to on-demand drawing with one final frame so the
+    /// splat sort settles on the resting camera.
+    func setMovementInput(_ keys: Set<ViewerMovementKey>, isSprinting: Bool) {
+        let wasFlying = !heldMovementKeys.isEmpty
+        heldMovementKeys = keys
+        isSprintKeyHeld = isSprinting
+        let isFlying = !heldMovementKeys.isEmpty
+        guard isFlying != wasFlying else { return }
+        if isFlying {
+            lastFlightFrameTime = nil
+            metalKitView.enableSetNeedsDisplay = false
+            metalKitView.preferredFramesPerSecond = Constants.flightFramesPerSecond
+            metalKitView.isPaused = false
+        } else {
+            metalKitView.isPaused = true
+            metalKitView.enableSetNeedsDisplay = true
+            metalKitView.preferredFramesPerSecond = Constants.idleFramesPerSecond
+            requestDraw()
+        }
+    }
+
+    /// The first tick after activation only establishes the clock baseline, and
+    /// oversized gaps (stalls, wake from sleep) are clamped so the camera never
+    /// teleports.
+    func integrateFlight(now: TimeInterval) {
+        guard !heldMovementKeys.isEmpty else { return }
+        defer { lastFlightFrameTime = now }
+        guard let lastFlightFrameTime else { return }
+        let dt = Float(min(now - lastFlightFrameTime, Self.maximumFlightFrameDelta))
+        guard dt > 0 else { return }
+
+        let axes = heldMovementKeys.flightAxisVector
+        guard axes != .zero else { return }
+        let worldDirection = cameraState.rightDirection * axes.x
+            + SIMD3<Float>(0, 1, 0) * axes.y
+            + cameraState.forwardDirection * axes.z
+        let lengthSquared = simd_length_squared(worldDirection)
+        guard lengthSquared.isFinite, lengthSquared > 0 else { return }
+        // Cap combined input at unit speed without normalizing: near-cancelling
+        // combinations (forward plus up at a steep pitch) must stay slow.
+        let direction = lengthSquared > 1
+            ? worldDirection / sqrt(lengthSquared)
+            : worldDirection
+        let speed = cameraState.sceneRadius * Constants.flightSpeedPerSecond
+            * (isSprintKeyHeld ? Constants.flightSprintMultiplier : 1)
+        cameraState.flyTranslate(direction * speed * dt)
+    }
+
+    func freeLook(deltaX: Float, deltaY: Float) {
+        cameraState.freeLook(
+            deltaYaw: deltaX * Constants.orbitSpeed,
+            deltaPitch: deltaY * Constants.orbitSpeed
+        )
+        requestDraw()
     }
 
     var viewportCamera: ModelRenderer.CameraMatrices {
@@ -420,6 +486,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        integrateFlight(now: CACurrentMediaTime())
         guard let modelRenderer else { return }
 
         _ = inFlightSemaphore.wait(timeout: DispatchTime.distantFuture)

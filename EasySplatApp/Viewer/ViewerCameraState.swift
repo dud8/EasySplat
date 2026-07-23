@@ -113,12 +113,7 @@ struct ViewerCameraState: Equatable, Sendable {
     }
 
     var forwardDirection: SIMD3<Float> {
-        let cosinePitch = cos(pitch)
-        return SIMD3<Float>(
-            sin(yaw) * cosinePitch,
-            sin(pitch),
-            -cos(yaw) * cosinePitch
-        )
+        Self.forwardDirection(yaw: yaw, pitch: pitch)
     }
 
     var rightDirection: SIMD3<Float> {
@@ -150,6 +145,41 @@ struct ViewerCameraState: Equatable, Sendable {
         guard nextYaw != yaw || nextPitch != pitch else { return }
         yaw = nextYaw
         pitch = nextPitch
+        recordInteraction()
+    }
+
+    /// Rotates the camera about its own position, unlike `orbit`, which rotates
+    /// about the target. The target is recomputed `distance` ahead of the
+    /// unchanged camera position along the new orientation.
+    mutating func freeLook(deltaYaw: Float, deltaPitch: Float) {
+        guard deltaYaw.isFinite, deltaPitch.isFinite else { return }
+        let nextYaw = Self.sanitizedYaw(yaw + deltaYaw) ?? yaw
+        let nextPitch = Self.sanitizedPitch(pitch + deltaPitch) ?? pitch
+        guard nextYaw != yaw || nextPitch != pitch else { return }
+        let position = cameraPosition
+        let nextForward = Self.forwardDirection(yaw: nextYaw, pitch: nextPitch)
+        let nextTarget = position + nextForward * distance
+        guard Self.isRepresentablePosition(nextTarget) else { return }
+        yaw = nextYaw
+        pitch = nextPitch
+        target = nextTarget
+        recordInteraction()
+    }
+
+    /// Translates the camera through space; the orbit target travels with it,
+    /// keeping the derived camera position exactly `distance` behind the target.
+    /// Travel is bounded to the same scene-relative range as zoom so flight
+    /// cannot outrun far-plane and coordinate precision.
+    mutating func flyTranslate(_ delta: SIMD3<Float>) {
+        guard Self.isFinite(delta), delta != .zero else { return }
+        let nextTarget = target + delta
+        guard Self.isRepresentablePosition(nextTarget) else { return }
+        let range = Self.distance(from: nextTarget, offsetBy: .zero, to: sceneCenter)
+        if range > Double(sceneRadius) * 10_000 {
+            let currentRange = Self.distance(from: target, offsetBy: .zero, to: sceneCenter)
+            guard range < currentRange else { return }
+        }
+        target = nextTarget
         recordInteraction()
     }
 
@@ -452,6 +482,15 @@ struct ViewerCameraState: Equatable, Sendable {
     private static func sanitizedFOV(_ value: Float) -> Float {
         guard value.isFinite, value > 0 else { return defaultVerticalFOV }
         return max(minimumFOV, min(maximumFOV, value))
+    }
+
+    private static func forwardDirection(yaw: Float, pitch: Float) -> SIMD3<Float> {
+        let cosinePitch = cos(pitch)
+        return SIMD3<Float>(
+            sin(yaw) * cosinePitch,
+            sin(pitch),
+            -cos(yaw) * cosinePitch
+        )
     }
 
     private static func sanitizedYaw(_ value: Float) -> Float? {

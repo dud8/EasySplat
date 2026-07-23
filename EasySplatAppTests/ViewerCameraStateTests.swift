@@ -42,6 +42,111 @@ final class ViewerCameraStateTests: XCTestCase {
         XCTAssertEqual(state.interactionRevision, 1)
     }
 
+    func testFlyTranslateMovesTargetAndCameraPositionByTheSameWorldDelta() {
+        var state = makeState(target: SIMD3<Float>(1, 2, 3), radius: 4)
+        state.orbit(deltaYaw: 0.4, deltaPitch: -0.25)
+        let originalTarget = state.target
+        let originalPosition = state.cameraPosition
+        let delta = SIMD3<Float>(0.5, -1.25, 2)
+
+        state.flyTranslate(delta)
+
+        assertVector(state.target, originalTarget + delta, accuracy: 1e-5)
+        assertVector(state.cameraPosition, originalPosition + delta, accuracy: 1e-5)
+        XCTAssertEqual(state.interactionRevision, 2)
+    }
+
+    func testFlyTranslateIgnoresZeroAndNonFiniteDeltas() {
+        var state = makeState(radius: 3)
+        let original = state
+
+        state.flyTranslate(.zero)
+        state.flyTranslate(SIMD3<Float>(.nan, 0, 0))
+        state.flyTranslate(SIMD3<Float>(0, .infinity, 0))
+
+        XCTAssertEqual(state, original)
+    }
+
+    func testFlyTranslateStopsAtTheSceneRelativeTravelBound() {
+        var state = makeState(radius: 2)
+
+        state.flyTranslate(SIMD3<Float>(19_999, 0, 0))
+        XCTAssertEqual(state.target.x, 19_999)
+
+        let atBoundary = state
+        state.flyTranslate(SIMD3<Float>(2, 0, 0))
+        XCTAssertEqual(state, atBoundary)
+
+        state.flyTranslate(SIMD3<Float>(-5, 0, 0))
+        XCTAssertEqual(state.target.x, 19_994)
+    }
+
+    func testFlyTranslateBeyondTheTravelBoundOnlyAcceptsInwardMovement() {
+        var state = makeState(radius: 2)
+        let scale = state.panWorldUnitsPerPixel
+        state.pan(screenDelta: SIMD2<Float>(-25_000 / scale, 0))
+        XCTAssertGreaterThan(state.target.x, 2 * 10_000)
+
+        let outward = state.target.x
+        state.flyTranslate(SIMD3<Float>(1, 0, 0))
+        XCTAssertEqual(state.target.x, outward)
+
+        state.flyTranslate(SIMD3<Float>(-10, 0, 0))
+        XCTAssertEqual(state.target.x, outward - 10, accuracy: 1e-2)
+    }
+
+    func testFreeLookPreservesCameraPositionWhileOrbitPreservesTarget() {
+        var looking = makeState(target: SIMD3<Float>(2, -1, 5), radius: 3)
+        looking.orbit(deltaYaw: 0.3, deltaPitch: 0.1)
+        var orbiting = looking
+        let position = looking.cameraPosition
+        let target = looking.target
+
+        looking.freeLook(deltaYaw: 0.4, deltaPitch: -0.2)
+        orbiting.orbit(deltaYaw: 0.4, deltaPitch: -0.2)
+
+        assertVector(looking.cameraPosition, position, accuracy: 1e-4)
+        XCTAssertNotEqual(looking.target, target)
+        assertVector(orbiting.target, target)
+        XCTAssertEqual(looking.yaw, orbiting.yaw)
+        XCTAssertEqual(looking.pitch, orbiting.pitch)
+        XCTAssertEqual(looking.interactionRevision, 2)
+    }
+
+    func testFreeLookClampsPitchAtTheSameLimitAsOrbit() {
+        var looking = makeState(radius: 3)
+        var orbiting = makeState(radius: 3)
+
+        looking.freeLook(deltaYaw: 0, deltaPitch: 10)
+        orbiting.orbit(deltaYaw: 0, deltaPitch: 10)
+
+        XCTAssertEqual(looking.pitch, orbiting.pitch)
+        XCTAssertLessThan(looking.pitch, Float.pi / 2)
+    }
+
+    func testFreeLookIgnoresNonFiniteDeltas() {
+        var state = makeState(radius: 3)
+        let original = state
+
+        state.freeLook(deltaYaw: .nan, deltaPitch: 0)
+        state.freeLook(deltaYaw: 0, deltaPitch: .infinity)
+
+        XCTAssertEqual(state, original)
+    }
+
+    func testFlyTranslateAndFreeLookSuppressResponsiveViewportRefitting() {
+        var state = makeState(viewport: CGSize(width: 1_200, height: 800), radius: 5)
+
+        state.flyTranslate(SIMD3<Float>(1, 0, 0))
+        state.freeLook(deltaYaw: 0.1, deltaPitch: 0)
+        let distance = state.distance
+
+        state.updateViewportSize(CGSize(width: 400, height: 800))
+
+        XCTAssertEqual(state.distance, distance, accuracy: 1e-6)
+        XCTAssertNotEqual(state.distance, state.fittedDistance)
+    }
+
     func testKeyboardZoomUsesFixedMultiplicativeSteps() {
         var state = makeState(radius: 10)
         let fitted = state.distance
