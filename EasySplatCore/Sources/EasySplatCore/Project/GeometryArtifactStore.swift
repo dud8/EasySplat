@@ -432,7 +432,11 @@ enum GeometryArtifactStore {
               artifact.registeredViewCount > 0,
               artifact.registeredViewCount <= artifact.totalViewCount,
               Double(artifact.registeredViewCount) / Double(coverageDenominator)
-                  >= ReconstructionScorer.minimumRegisteredViewFraction,
+                  >= ReconstructionScorer.minimumRegisteredViewFraction
+                  || isViablePartialRegistration(
+                      artifact,
+                      coverageDenominator: coverageDenominator
+                  ),
               artifact.orderedImageNames.count == artifact.totalViewCount,
               artifact.orderedImageTimestamps.count == artifact.totalViewCount,
               artifact.medianPixelResidual.isFinite,
@@ -600,7 +604,16 @@ enum GeometryArtifactStore {
               Set(measured.measuredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
               Double(measured.measuredImageNames.count)
                   / Double(registeredCoverageDenominator(for: artifact))
-                  >= ReconstructionScorer.minimumRegisteredViewFraction,
+                  >= ReconstructionScorer.minimumRegisteredViewFraction
+                  || (isViablePartialRegistration(
+                          artifact,
+                          coverageDenominator: registeredCoverageDenominator(
+                              for: artifact
+                          )
+                      )
+                      && Double(measured.measuredImageNames.count)
+                          / Double(artifact.registeredViewCount)
+                          >= ReconstructionScorer.minimumRegisteredViewFraction),
               learnedSupportIsValid,
               measured.pointCount == artifact.pointCount,
               measured.observationCount == artifact.observationCount,
@@ -849,6 +862,32 @@ enum GeometryArtifactStore {
     /// admitted to mapping, not the full selected set: a run that continued
     /// with the dominant connected component is judged on that component.
     /// Fully connected artifacts keep the selected count as denominator.
+    /// A solve the pipeline accepted at terminal exhaustion with fewer
+    /// registered views than the strict fraction of the admitted denominator.
+    /// Coverage floors then bind to the registered count instead. Applies
+    /// only when the pair graph has an admissible dominant component — an
+    /// inadmissible graph (tied groups) never reaches the terminal
+    /// acceptance, so its coverage stays strict.
+    private static func isViablePartialRegistration(
+        _ artifact: GeometryArtifact,
+        coverageDenominator: Int
+    ) -> Bool {
+        guard artifact.pairGraph.status == .measured,
+              let measurement = artifact.pairGraph.measurement,
+              PairGraphConnectivityPolicy.admissibleDominantViewCount(
+                  totalViewCount: artifact.totalViewCount,
+                  componentViewCounts: measurement.componentViewCounts,
+                  connectedComponentCount: measurement.connectedComponentCount,
+                  isolatedViewCount: measurement.isolatedViewCount,
+                  descriptorlessViewCount: measurement.descriptorlessViewCount
+              ) != nil else {
+            return false
+        }
+        return artifact.registeredViewCount
+            >= PairGraphConnectivityPolicy.minimumViableDominantViewCount
+            && artifact.registeredViewCount <= coverageDenominator
+    }
+
     private static func registeredCoverageDenominator(
         for artifact: GeometryArtifact
     ) -> Int {

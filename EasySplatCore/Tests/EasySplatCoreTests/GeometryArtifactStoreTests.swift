@@ -1451,6 +1451,83 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testValidatesPartialRegistrationBelowTheStrictFractionOfAdmittedViews() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeDescriptorlessGeometryFixture(at: paths)
+        var artifact = makeDescriptorlessMeasuredArtifact(fixture: fixture)
+
+        // A strictly accepted graph admits 11 of 12 views, but the solve
+        // registered only 9 — below ceil(0.9 x 11). Terminal partial
+        // acceptance persists exactly this shape.
+        let imageNames = (1...12).map { String(format: "frame_%06d.jpg", $0) }
+        for (offset, imageName) in imageNames.enumerated() {
+            let frameURL = paths.framesSelectedURL.appendingPathComponent(imageName)
+            if !FileManager.default.fileExists(atPath: frameURL.path) {
+                try Data("selected frame \(offset + 1)".utf8).write(
+                    to: frameURL,
+                    options: [.atomic]
+                )
+            }
+        }
+        artifact.orderedImageNames = imageNames
+        artifact.orderedImageTimestamps = Array(repeating: nil, count: 12)
+        artifact.totalViewCount = 12
+        artifact.selectedFramesDigest = try GeometryArtifactStore.selectedFramesDigest(
+            orderedImageNames: imageNames,
+            projectPaths: paths
+        )
+        artifact.cameraGroupingReceipt = ColmapCameraGroupingReceipt(
+            mode: .allSelectedImagesShared,
+            cameraCountBefore: 12,
+            cameraCountAfter: 1,
+            groupedVideoSourceCount: 0,
+            groups: [
+                ColmapCameraGroupReceipt(
+                    sourceGroupID: "all-selected-images",
+                    memberCount: 12,
+                    canonicalCameraID: 1
+                )
+            ]
+        )
+        artifact.pairGraph.measurement?.connectedComponentCount = 2
+        artifact.pairGraph.measurement?.isolatedViewCount = 1
+        artifact.pairGraph.measurement?.componentViewCounts = [11, 1]
+        // Keep the chain-graph tallies consistent with the 11-view dominant.
+        artifact.pairGraph.measurement?.scheduledPairCount = 12
+        artifact.pairGraph.measurement?.attemptedPairCount = 12
+        artifact.pairGraph.measurement?.rawMatchedPairCount = 10
+        artifact.pairGraph.measurement?.spatiallyVerifiedPairCount = 10
+        artifact.pairGraph.measurement?.localPairCount = 12
+        artifact.pairGraph.measurement?.articulationViewCount = 9
+        artifact.pairGraph.measurement?.biconnectedBlockCount = 10
+        artifact.pairGraph.measurement?.matcherAttempts[0].scheduledPairCount = 12
+        artifact.pairGraph.measurement?.matcherAttempts[0].attemptedPairCount = 12
+        artifact.pairGraph.measurement?.matcherAttempts[0].rawMatchedPairCount = 10
+        artifact.pairGraph.measurement?.matcherAttempts[0].spatiallyVerifiedPairCount = 10
+        artifact.workerExecution.matchingInvocations[0].pairExecution =
+            defaultPairExecution(scheduledPairCount: 12)
+        _ = try GeometryWorkerExecutionArtifactStore.save(
+            artifact.workerExecution,
+            to: GeometryWorkerExecutionArtifactStore.canonicalURL(for: paths),
+            expectedBudget: artifact.workerExecution.resolvedBudget,
+            projectPaths: paths
+        )
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+
+        // Below the viable floor the relaxation does not apply.
+        var belowViableFloor = artifact
+        belowViableFloor.registeredViewCount = 7
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(belowViableFloor, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidResiduals)
+        }
+    }
+
     func testMappingArtifactAcceptsOverlappingModelsAndDetailedRecovery() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

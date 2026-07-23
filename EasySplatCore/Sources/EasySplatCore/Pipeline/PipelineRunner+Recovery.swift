@@ -436,6 +436,24 @@ extension PipelineRunner {
                 )
             case let .lowQualityReconstruction(score, _):
                 let summary = ReconstructionScorer.summary(score)
+                let onlyCoverageFailed = score.registeredImages > 0
+                    && ReconstructionScorer.isAcceptable(
+                        ReconstructionScore(
+                            registeredImages: score.registeredImages,
+                            totalImages: score.registeredImages,
+                            meanReprojectionError: score.meanReprojectionError,
+                            pointCount: score.pointCount,
+                            observationCount: score.observationCount,
+                            meanTrackLength: score.meanTrackLength
+                        ),
+                        capturePath: .automatic
+                    )
+                if onlyCoverageFailed {
+                    return (
+                        "The camera solve could only include \(score.registeredImages) of \(score.totalImages) photos, which is too few to build a reliable splat. Add photos that overlap the missing areas with clear shared detail.",
+                        "Low-quality reconstruction. \(summary)."
+                    )
+                }
                 return ("The camera solve was unstable. Try a slower capture with more light.", "Low-quality reconstruction. \(summary).")
             case let .fragmentedReconstruction(evidence):
                 return (

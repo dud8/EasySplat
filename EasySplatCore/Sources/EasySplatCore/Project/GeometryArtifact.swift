@@ -296,6 +296,31 @@ public extension PairGraphMeasurement {
     }
 }
 
+public extension GeometryArtifact {
+    /// True when the splat was built from part of the capture: matching
+    /// admitted only the dominant connected group, or the camera solve was
+    /// terminally accepted with fewer registered views than the strict
+    /// fraction of the admitted count. Strict runs stay false.
+    var usedPartialCoverageAcceptance: Bool {
+        if let measurement = pairGraph.measurement,
+           measurement.usedViableDominantAcceptance {
+            return true
+        }
+        let admittedViewCount = pairGraph.measurement.flatMap { measurement in
+            PairGraphConnectivityPolicy.admissibleDominantViewCount(
+                totalViewCount: totalViewCount,
+                componentViewCounts: measurement.componentViewCounts,
+                connectedComponentCount: measurement.connectedComponentCount,
+                isolatedViewCount: measurement.isolatedViewCount,
+                descriptorlessViewCount: measurement.descriptorlessViewCount
+            )
+        } ?? totalViewCount
+        guard admittedViewCount > 0 else { return false }
+        return Double(registeredViewCount) / Double(admittedViewCount)
+            < ReconstructionScorer.minimumRegisteredViewFraction
+    }
+}
+
 public struct PairGraphArtifact: Codable, Sendable, Equatable {
     public var status: PairGraphMeasurementStatus
     public var measurement: PairGraphMeasurement?

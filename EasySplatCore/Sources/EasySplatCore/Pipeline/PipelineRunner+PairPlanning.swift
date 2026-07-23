@@ -115,6 +115,14 @@ extension PipelineRunner {
         return line
     }
 
+    static func partialRegistrationContinuationLine(
+        registeredViewCount: Int,
+        admittedViewCount: Int
+    ) -> String {
+        let unregisteredViewCount = admittedViewCount - registeredViewCount
+        return "The camera solve could not include every connected photo. Continuing with \(registeredViewCount) of the \(admittedViewCount) connected photos. \(unregisteredViewCount) photo\(unregisteredViewCount == 1 ? " stays" : "s stay") out of the splat."
+    }
+
     static func allowsMinorVerifiedComponents(
         pairingPolicy: ResolvedPairingPolicy,
         recoveryLevel: PairRecoveryLevel

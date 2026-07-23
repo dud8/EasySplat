@@ -1220,6 +1220,10 @@ public final class PipelineRunner: @unchecked Sendable {
             )
             var acceptedMappingArtifact: MappingArtifact?
             var acceptedConditioningAnalysis: GeometryConditioningAnalysis?
+            // Registered count of a solve accepted below the strict fraction
+            // at terminal exhaustion; published coverage is judged against it
+            // instead of the admitted view count.
+            var acceptedPartialRegistrationViewCount: Int?
             var canonicalPublicationByAttemptAndPath:
                 [String: CanonicalModelPublicationArtifact] = [:]
             func prepareCanonicalTextCandidate(
@@ -3712,7 +3716,8 @@ public final class PipelineRunner: @unchecked Sendable {
                     func evaluateMappingResult(
                         mappingAttemptOrdinal: Int,
                         acceptedRefinementInvocationCount: Int,
-                        cadence: IncrementalMappingCadenceArtifact
+                        cadence: IncrementalMappingCadenceArtifact,
+                        permitViablePartialRegistration: Bool = false
                     ) async throws -> Bool {
                         let modelDirectories = try self.mappedSparseModelDirectories(
                             in: paths.colmapSparseURL
@@ -3822,11 +3827,19 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                         for selected in rankedCandidates {
                             let score = selected.score
-                            guard ReconstructionScorer.isAcceptable(
+                            let strictlyAcceptable = ReconstructionScorer.isAcceptable(
                                 score,
                                 admittedTotalImages: admittedViewCount,
                                 capturePath: resolvedRunPlan.capturePath
-                            ) else {
+                            )
+                            let viablePartialRegistration = !strictlyAcceptable
+                                && permitViablePartialRegistration
+                                && ReconstructionScorer.isViablePartialRegistration(
+                                    score,
+                                    admittedTotalImages: admittedViewCount,
+                                    capturePath: resolvedRunPlan.capturePath
+                                )
+                            guard strictlyAcceptable || viablePartialRegistration else {
                                 if preferredLowQualityScore == nil {
                                     preferredLowQualityScore = score
                                 }
@@ -3872,6 +3885,18 @@ public final class PipelineRunner: @unchecked Sendable {
                                     fraction: 0.95,
                                     message: "Validating camera solve"
                                 ))
+                                if viablePartialRegistration {
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: Self.partialRegistrationContinuationLine(
+                                            registeredViewCount: score.registeredImages,
+                                            admittedViewCount: admittedViewCount
+                                        ),
+                                        isError: true
+                                    ))
+                                    acceptedPartialRegistrationViewCount =
+                                        score.registeredImages
+                                }
                                 emit(.stageLog(
                                     stage: .sfmMapping,
                                     line: "Selected COLMAP model \(modelLabel) (\(score.registeredImages)/\(score.totalImages) registered views).",
@@ -3984,6 +4009,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         acceptedMappingArtifact = nil
                         acceptedMapper = nil
                         acceptedConditioningAnalysis = nil
+                        acceptedPartialRegistrationViewCount = nil
                         mappingSucceeded = false
                         guard let pairEvidence = acceptedPairGraphEvidence else {
                             throw PairGraphEvidenceStoreError.invalidEvidence
@@ -4050,6 +4076,58 @@ public final class PipelineRunner: @unchecked Sendable {
                                 lastMappingError = Self.normalizedUnusableSparseModelError(
                                     error
                                 )
+                            }
+                            // Terminal exhaustion: no denser refinement and no
+                            // denser pair graph remain. A solve that misses
+                            // only the coverage fraction is re-evaluated
+                            // leniently here, before the attempt's single
+                            // evaluation verdict is recorded.
+                            if !mappingSucceeded,
+                               let pipelineError = lastMappingError as? PipelineError,
+                               case .lowQualityReconstruction(let rejectedScore, _)
+                                   = pipelineError,
+                               Self.mappingCadenceFallbackTrigger(after: lastMappingError)
+                                   == nil
+                                   || IncrementalMappingCadencePolicy.fallbackCadence(
+                                       planned: plannedIncrementalCadence,
+                                       active: cadence,
+                                       existingTrigger: activeCadenceFallbackTrigger
+                                   ) == nil,
+                               Self.nextPairRecoveryLevel(
+                                   after: pairRecoveryLevel,
+                                   imageCount: selectedFrames.count,
+                                   pairingPolicy: resolvedRunPlan.pairingPolicy
+                               ) == nil
+                                   || colmapMatchOptions.descriptorMatcher != .faiss,
+                               ReconstructionScorer.isViablePartialRegistration(
+                                   rejectedScore,
+                                   admittedTotalImages: acceptedPairGraphEvidence?
+                                       .admittedViewCount ?? selectedFrames.count,
+                                   capturePath: resolvedRunPlan.capturePath
+                               ) {
+                                do {
+                                    mappingSucceeded = try await evaluateMappingResult(
+                                        mappingAttemptOrdinal: mappingAttemptOrdinal,
+                                        acceptedRefinementInvocationCount:
+                                            mappingProgress.globalRefinementInvocationCount,
+                                        cadence: cadence,
+                                        permitViablePartialRegistration: true
+                                    )
+                                } catch {
+                                    if error is CancellationError || Task.isCancelled {
+                                        try workerExecutionRecorder.recordMapperEvaluation(
+                                            mappingAttemptOrdinal: mappingAttemptOrdinal,
+                                            evaluation: ColmapMapperEvaluationEvidence(
+                                                status: .interrupted,
+                                                fallbackTrigger: nil
+                                            )
+                                        )
+                                        throw CancellationError()
+                                    }
+                                    lastMappingError = Self.normalizedUnusableSparseModelError(
+                                        error
+                                    )
+                                }
                             }
                             let evaluation: ColmapMapperEvaluationEvidence
                             if mappingSucceeded {
@@ -4329,8 +4407,9 @@ public final class PipelineRunner: @unchecked Sendable {
                 let publishedConditioningAnalysis = try validatedConditionedGeometry(
                     modelDirectory: canonicalSparseModel,
                     selectedFrames: selectedFrames,
-                    admittedViewCount: acceptedPairGraphEvidence?
-                        .admittedViewCount ?? selectedFrames.count,
+                    admittedViewCount: acceptedPartialRegistrationViewCount
+                        ?? acceptedPairGraphEvidence?.admittedViewCount
+                        ?? selectedFrames.count,
                     requireStrongObservationCoverage: acceptedDa3ModelSubdirectory != nil
                 )
                 try requirePublishedGeometry(

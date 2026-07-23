@@ -2385,6 +2385,154 @@ final class PipelineIntegrationTests: XCTestCase {
         )
     }
 
+    func testPartialCameraSolveIsAcceptedAtTerminalMappingExhaustion() async throws {
+        // The user's failure shape end to end: matching admits the dominant
+        // 10 of 12 photos, then the solve registers only 8 of those 10 —
+        // below the strict fraction. The denser-refinement retry runs first;
+        // only its exhaustion accepts the partial solve.
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "PartialSolveContinuation",
+            photoCount: 12
+        )
+        let analyzerOutput = "Registered images: 8 / 8\nPoints: 20\nObservations: 160\nMean track length: 8.0\nMean reprojection error: 0.5\n"
+        let mapperScript = { (toolchain: ToolchainPaths, projectURL: URL) in
+            MockSubprocessRunner.Script(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: ""
+                ),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in
+                    try self.writeSparseModel(
+                        at: projectURL,
+                        registeredImageCount: 8,
+                        pointCount: 20
+                    )
+                }
+            )
+        }
+        let analyzerScript = { (toolchain: ToolchainPaths) in
+            MockSubprocessRunner.Script(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: analyzerOutput,
+                    stderr: ""
+                )
+            )
+        }
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: {
+                        try self.writeGroupedVerifiedPairResults(
+                            for: $0,
+                            groupSizes: [10]
+                        )
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: {
+                        try self.writeGroupedVerifiedPairResults(
+                            for: $0,
+                            groupSizes: [10]
+                        )
+                    }
+                ),
+                mapperScript(fixture.toolchain, fixture.projectURL),
+                analyzerScript(fixture.toolchain),
+                mapperScript(fixture.toolchain, fixture.projectURL),
+                analyzerScript(fixture.toolchain),
+                analyzerScript(fixture.toolchain),
+            ]
+        )
+
+        let events = PipelineEventSink()
+        try await run.pipeline.run { events.append($0) }
+
+        let stageLogs = events.stageLogs()
+        XCTAssertTrue(stageLogs.map(\.line).contains(
+            "Matching could not connect every photo. Continuing with the largest connected group: 10 of 12 photos. 2 photos stay out of the splat."
+        ))
+        XCTAssertTrue(stageLogs.map(\.line).contains(
+            "The camera solve missed a geometry gate. Retrying the same verified image graph with denser global refinement."
+        ))
+        let solveContinuation = stageLogs.first {
+            $0.line.contains("The camera solve could not include every connected photo.")
+        }
+        XCTAssertEqual(
+            solveContinuation?.line,
+            "The camera solve could not include every connected photo. Continuing with 8 of the 10 connected photos. 2 photos stay out of the splat."
+        )
+        XCTAssertEqual(solveContinuation?.isError, true)
+        XCTAssertNotNil(events.stageLog(
+            containing: "Selected COLMAP model 0 (8/12 registered views)."
+        ))
+
+        XCTAssertEqual(
+            run.runner.calls.filter { $0.1.first == "mapper" }.count,
+            2,
+            "The strict gate must exhaust the denser-refinement retry before accepting."
+        )
+        XCTAssertEqual(
+            run.runner.calls.filter { $0.1.first == "model_analyzer" }.count,
+            3,
+            "The terminal acceptance re-evaluates the final mapper output."
+        )
+
+        let finalMetadata = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
+        XCTAssertNil(finalMetadata.state.lastError)
+        let geometry = try GeometryArtifactStore.load(
+            from: fixture.paths.geometryManifestURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(geometry.registeredViewCount, 8)
+        XCTAssertEqual(geometry.totalViewCount, 12)
+        XCTAssertEqual(geometry.mapping.attemptCount, 2)
+        XCTAssertEqual(
+            geometry.pairGraph.measurement?.componentViewCounts,
+            [10, 1, 1]
+        )
+        XCTAssertTrue(geometry.usedPartialCoverageAcceptance)
+    }
+
     func testTerminalConnectionFailureRescuesOnResumeByReinspection() async throws {
         let temp = makeTempRoot()
         let fixture = try makePhotoRecoveryProject(

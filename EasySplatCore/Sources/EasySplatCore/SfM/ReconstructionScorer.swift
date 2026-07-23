@@ -212,6 +212,31 @@ public enum ReconstructionScorer {
         return isAcceptable(admittedScore, capturePath: capturePath)
     }
 
+    /// A reconstruction that misses only the registered-view fraction while
+    /// every measured quality criterion passes. Terminal mapping exhaustion
+    /// may accept it; the strict fraction keeps driving retries before that.
+    public static func isViablePartialRegistration(
+        _ score: ReconstructionScore,
+        admittedTotalImages: Int,
+        capturePath: CapturePath
+    ) -> Bool {
+        guard score.registeredImages
+                >= PairGraphConnectivityPolicy.minimumViableDominantViewCount,
+              admittedTotalImages > 0,
+              score.registeredImages <= admittedTotalImages else {
+            return false
+        }
+        let coveredScore = ReconstructionScore(
+            registeredImages: score.registeredImages,
+            totalImages: score.registeredImages,
+            meanReprojectionError: score.meanReprojectionError,
+            pointCount: score.pointCount,
+            observationCount: score.observationCount,
+            meanTrackLength: score.meanTrackLength
+        )
+        return isAcceptable(coveredScore, capturePath: capturePath)
+    }
+
     public static func applyingExpectedTotalImages(
         _ score: ReconstructionScore,
         expectedTotalImages: Int

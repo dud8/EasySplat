@@ -16,6 +16,24 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertEqual(lowQualityMessage.userMessage, "The camera solve was unstable. Try a slower capture with more light.")
         XCTAssertTrue(lowQualityMessage.debugMessage.contains("Low-quality reconstruction"))
 
+        // When every quality criterion passed and only coverage fell short,
+        // the copy names the shortfall instead of blaming stability.
+        let coverageShortfall = ReconstructionScore(
+            registeredImages: 6,
+            totalImages: 10,
+            meanReprojectionError: 0.7,
+            pointCount: 1_500,
+            observationCount: 6_000,
+            meanTrackLength: 3.5
+        )
+        let shortfallError = runner.test_makePipelineErrorLowQuality(coverageShortfall)
+        let shortfallMessage = runner.test_failureMessages(for: shortfallError, stage: .sfmMapping)
+        XCTAssertEqual(
+            shortfallMessage.userMessage,
+            "The camera solve could only include 6 of 10 photos, which is too few to build a reliable splat. Add photos that overlap the missing areas with clear shared detail."
+        )
+        XCTAssertTrue(shortfallMessage.debugMessage.contains("Low-quality reconstruction"))
+
         let transcode = runner.test_makePipelineErrorImageTranscodeFailed("bad")
         let transcodeMessage = runner.test_failureMessages(for: transcode, stage: .selectFrames)
         XCTAssertEqual(transcodeMessage.userMessage, "Failed to convert photos for processing. Try exporting as JPEG/PNG.")

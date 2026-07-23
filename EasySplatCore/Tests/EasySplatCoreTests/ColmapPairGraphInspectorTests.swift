@@ -186,6 +186,59 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
                 recoveryLevel: .expanded
             ).usedViableDominantAcceptance
         )
+
+        // The artifact-level classifier adds the camera-solve shortfall: a
+        // registered count below the strict fraction of the admitted views
+        // warns even when the pair graph itself was strictly accepted.
+        func artifact(registered: Int, total: Int, counts: [Int]) -> GeometryArtifact {
+            var artifact = makeGeometryArtifact()
+            artifact.totalViewCount = total
+            artifact.registeredViewCount = registered
+            artifact.pairGraph = PairGraphArtifact(
+                status: .measured,
+                measurement: measurement(counts)
+            )
+            return artifact
+        }
+        // Matching-side continuation alone.
+        XCTAssertTrue(
+            artifact(registered: 18, total: 22, counts: [18, 1, 1, 1, 1])
+                .usedPartialCoverageAcceptance
+        )
+        // Solve shortfall under a viable graph (integration-test shape).
+        XCTAssertTrue(
+            artifact(registered: 8, total: 12, counts: [10, 1, 1])
+                .usedPartialCoverageAcceptance
+        )
+        // Solve shortfall under a strict graph.
+        XCTAssertTrue(
+            artifact(registered: 16, total: 22, counts: [22])
+                .usedPartialCoverageAcceptance
+        )
+        XCTAssertTrue(
+            artifact(registered: 9, total: 12, counts: [11, 1])
+                .usedPartialCoverageAcceptance
+        )
+        // Strict solves stay quiet, including at the exact boundary.
+        XCTAssertFalse(
+            artifact(registered: 22, total: 22, counts: [22])
+                .usedPartialCoverageAcceptance
+        )
+        XCTAssertFalse(
+            artifact(registered: 20, total: 22, counts: [22])
+                .usedPartialCoverageAcceptance
+        )
+        XCTAssertFalse(
+            artifact(registered: 10, total: 12, counts: [11, 1])
+                .usedPartialCoverageAcceptance
+        )
+        // No measurement (learned-provenance artifacts): the strict fraction
+        // over the selected count decides.
+        var unmeasured = makeGeometryArtifact()
+        unmeasured.pairGraph = PairGraphArtifact(status: .notEvaluated, measurement: nil)
+        unmeasured.totalViewCount = 22
+        unmeasured.registeredViewCount = 22
+        XCTAssertFalse(unmeasured.usedPartialCoverageAcceptance)
     }
 
     func testOrderedDominantComponentPolicyAcceptsMinorVerifiedComponents() {
