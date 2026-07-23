@@ -213,37 +213,46 @@
  uint64_t msplat_get_raster_fallback_count() {
 --- a/cli/msplat.cpp
 +++ b/cli/msplat.cpp
-@@ -2848,6 +2848,32 @@
-         if (!events->enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
-         return 0;
+@@ -3310,2 +3310,39 @@
      } catch (const std::exception &error) {
 +        if (msplat_metal_allocation_was_unavailable()) {
 +            const MsplatRasterStats stats = msplat_get_raster_stats();
 +            if (events) {
 +                try {
-+                    json fields = {
-+                        {"budget_bytes", stats.budget_bytes},
-+                        {"current_allocated_bytes", stats.allocation_bytes},
-+                        {"iteration", terminalIteration},
-+                        {"max_buffer_bytes", stats.max_buffer_bytes},
-+                        {"recommended_working_set_bytes",
-+                         stats.recommended_working_set_bytes},
-+                        {"requested_bytes", stats.requested_bytes},
-+                        {"required_bytes", stats.required_bytes},
-+                    };
-+                    if (stats.latest_intersection_count > 0) {
-+                        fields["intersection_count"] = stats.latest_intersection_count;
++                    if (isolate) {
++                        events->emit("isolation_memory_refused", {
++                            {"allocation_bytes", stats.allocation_bytes},
++                            {"budget_bytes", memoryBudgetBytes},
++                            {"reason", "metal_allocation"},
++                            {"requested_bytes", stats.requested_bytes},
++                            {"required_bytes", stats.required_bytes},
++                            {"status", "refused"},
++                        });
++                    } else {
++                        json fields = {
++                            {"budget_bytes", stats.budget_bytes},
++                            {"current_allocated_bytes", stats.allocation_bytes},
++                            {"iteration", terminalIteration},
++                            {"max_buffer_bytes", stats.max_buffer_bytes},
++                            {"recommended_working_set_bytes",
++                             stats.recommended_working_set_bytes},
++                            {"requested_bytes", stats.requested_bytes},
++                            {"required_bytes", stats.required_bytes},
++                        };
++                        if (stats.latest_intersection_count > 0) {
++                            fields["intersection_count"] = stats.latest_intersection_count;
++                        }
++                        events->emit("metal_allocation_unavailable", std::move(fields));
 +                    }
-+                    events->emit("metal_allocation_unavailable", std::move(fields));
 +                } catch (const std::exception &eventError) {
 +                    std::cerr << "easysplat-train: cannot report Metal allocation failure: "
 +                              << eventError.what() << '\n';
 +                }
 +            }
 +            std::cerr << "easysplat-train: " << error.what() << '\n';
-+            return 71;
++            return isolate ? 75 : 71;
 +        }
-         if (msplat_raster_resource_limit_was_exceeded()) {
+         if (isolate &&
              const MsplatRasterStats stats = msplat_get_raster_stats();
              if (events) {
 --- a/tests/msplat_raster_tests.cpp

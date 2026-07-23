@@ -771,6 +771,519 @@ Model makeModel(const InputData &inputData, int shDegreeInterval = 1000) {
     );
 }
 
+struct IsolationProjection {
+    std::vector<float> xys;
+    std::vector<float> depths;
+    std::vector<int> radii;
+    std::vector<float> conics;
+};
+
+struct IsolationLiftResources {
+    MTensor mask;
+    MTensor selected;
+    MTensor records;
+    MTensor counts;
+    MTensor alpha;
+    MTensor status;
+};
+
+struct IsolationLiftSnapshot {
+    std::vector<MsplatIsolationContributionRecord> records;
+    std::vector<std::uint32_t> counts;
+    std::vector<float> alpha;
+};
+
+void encodeIsolationPrepare(
+    Model &model,
+    Camera &camera,
+    Model::CamSetup &setup
+) {
+    msplat_prepare_isolation_view(
+        model.num_active,
+        model.means,
+        model.scales,
+        1.0f,
+        model.quats,
+        camera.cachedViewMat,
+        camera.cachedProjViewMat,
+        setup.fx,
+        setup.fy,
+        setup.cx,
+        setup.cy,
+        static_cast<unsigned>(setup.height),
+        static_cast<unsigned>(setup.width),
+        setup.tileBounds,
+        0.01f,
+        static_cast<unsigned>(setup.degree),
+        static_cast<unsigned>(setup.degreesToUse),
+        setup.cam_pos,
+        model.featuresDc,
+        model.featuresRest,
+        model.opacities,
+        model.backgroundColor
+    );
+    msplat_commit();
+}
+
+IsolationLiftResources makeIsolationLiftResources(
+    int pointCount,
+    int width,
+    int height
+) {
+    const std::int64_t pixelCount =
+        static_cast<std::int64_t>(width) * static_cast<std::int64_t>(height);
+    const std::int64_t recordCount =
+        pixelCount * MSPLAT_ISOLATION_RECORDS_PER_PIXEL;
+    IsolationLiftResources resources {
+        gpu_empty({height, width}, DType::UInt8),
+        gpu_empty({pointCount}, DType::UInt8),
+        gpu_empty(
+            {
+                recordCount *
+                    static_cast<std::int64_t>(
+                        sizeof(MsplatIsolationContributionRecord)
+                    )
+            },
+            DType::UInt8
+        ),
+        gpu_empty({pixelCount}, DType::Int32),
+        gpu_empty({pixelCount}, DType::Float32),
+        gpu_empty({1}, DType::Int32),
+    };
+    std::fill(
+        resources.selected.data<std::uint8_t>(),
+        resources.selected.data<std::uint8_t>() + pointCount,
+        std::uint8_t {1}
+    );
+    std::uint8_t *labels = resources.mask.data<std::uint8_t>();
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const std::size_t pixel =
+                static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(x);
+            labels[pixel] =
+                x < width / 3 ? std::uint8_t {0}
+                : x < 2 * width / 3 ? std::uint8_t {7}
+                                    : std::uint8_t {203};
+        }
+    }
+    return resources;
+}
+
+IsolationLiftSnapshot captureIsolationLift(
+    IsolationLiftResources &resources,
+    int width,
+    int height
+) {
+    resources.records.zero();
+    resources.counts.zero();
+    resources.alpha.zero();
+    resources.status.zero();
+    msplat_lift_isolation_stripe(
+        static_cast<unsigned>(height),
+        static_cast<unsigned>(width),
+        resources.mask,
+        resources.selected,
+        false,
+        0,
+        static_cast<unsigned>(height),
+        resources.records,
+        resources.counts,
+        resources.alpha,
+        resources.status
+    );
+    msplat_commit();
+    msplat_gpu_sync();
+    if (resources.status.data<std::uint32_t>()[0] != 0) {
+        throw std::runtime_error(
+            "isolation lift exceeded its bounded per-pixel record capacity"
+        );
+    }
+
+    const std::size_t pixelCount =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    const std::size_t recordCount =
+        pixelCount * MSPLAT_ISOLATION_RECORDS_PER_PIXEL;
+    const auto *recordValues =
+        resources.records.data<MsplatIsolationContributionRecord>();
+    const auto *countValues = resources.counts.data<std::uint32_t>();
+    const auto *alphaValues = resources.alpha.data<float>();
+    return IsolationLiftSnapshot {
+        std::vector<MsplatIsolationContributionRecord>(
+            recordValues,
+            recordValues + recordCount
+        ),
+        std::vector<std::uint32_t>(
+            countValues,
+            countValues + pixelCount
+        ),
+        std::vector<float>(alphaValues, alphaValues + pixelCount),
+    };
+}
+
+void requireIsolationLiftMatchesOracle(
+    const IsolationLiftSnapshot &actual,
+    const IsolationProjection &projection,
+    const std::vector<float> &opacityLogits,
+    const std::uint8_t *labels,
+    int width,
+    int height
+) {
+    constexpr float contributionFloor = 0.04f;
+    constexpr float weightTolerance = 2.0e-5f;
+    constexpr float alphaTolerance = 2.0e-5f;
+    const std::size_t pointCount = opacityLogits.size();
+    std::vector<std::size_t> order(pointCount);
+    std::iota(order.begin(), order.end(), std::size_t {0});
+    std::stable_sort(
+        order.begin(),
+        order.end(),
+        [&](std::size_t left, std::size_t right) {
+            if (projection.depths[left] != projection.depths[right]) {
+                return projection.depths[left] < projection.depths[right];
+            }
+            return left < right;
+        }
+    );
+
+    std::size_t comparedRecords = 0;
+    std::size_t foregroundRecords = 0;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const std::size_t pixel =
+                static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(x);
+            std::vector<MsplatIsolationContributionRecord> expected;
+            float transmittance = 1.0f;
+            const float normalizedX =
+                (static_cast<float>(x) + 0.5f - 0.5f * width) /
+                std::max(0.5f * width, 1.0f);
+            const float normalizedY =
+                (static_cast<float>(y) + 0.5f - 0.5f * height) /
+                std::max(0.5f * height, 1.0f);
+            const float centrality = std::clamp(
+                1.0f -
+                    std::sqrt(
+                        normalizedX * normalizedX +
+                        normalizedY * normalizedY
+                    ) /
+                        std::sqrt(2.0f),
+                0.0f,
+                1.0f
+            );
+            for (std::size_t gaussian : order) {
+                if (projection.radii[gaussian] <= 0) continue;
+                const float deltaX =
+                    projection.xys[gaussian * 2] - static_cast<float>(x);
+                const float deltaY =
+                    projection.xys[gaussian * 2 + 1] - static_cast<float>(y);
+                const float *conic = &projection.conics[gaussian * 3];
+                const float sigma = std::fma(
+                    0.5f,
+                    std::fma(
+                        conic[0],
+                        deltaX * deltaX,
+                        conic[2] * deltaY * deltaY
+                    ),
+                    conic[1] * deltaX * deltaY
+                );
+                if (sigma < 0.0f || sigma >= 5.55f) continue;
+                const float opacity =
+                    1.0f / (1.0f + std::exp(-opacityLogits[gaussian]));
+                const float alpha =
+                    std::min(0.999f, opacity * std::exp(-sigma));
+                if (alpha < 1.0f / 255.0f) continue;
+                const float nextTransmittance =
+                    transmittance * (1.0f - alpha);
+                if (nextTransmittance <= 1.0e-4f) break;
+                const float weight = alpha * transmittance;
+                if (weight >= contributionFloor) {
+                    expected.push_back(MsplatIsolationContributionRecord {
+                        static_cast<std::uint32_t>(gaussian),
+                        labels[pixel],
+                        0,
+                        weight,
+                        weight * centrality,
+                    });
+                }
+                transmittance = nextTransmittance;
+            }
+
+            if (actual.counts[pixel] != expected.size()) {
+                throw std::runtime_error(
+                    "isolation lift record count differs from the CPU alpha*T "
+                    "oracle at pixel " +
+                    std::to_string(pixel) + ": actual=" +
+                    std::to_string(actual.counts[pixel]) + " expected=" +
+                    std::to_string(expected.size())
+                );
+            }
+            const float expectedAlpha = 1.0f - transmittance;
+            if (!std::isfinite(actual.alpha[pixel]) ||
+                std::abs(actual.alpha[pixel] - expectedAlpha) > alphaTolerance) {
+                throw std::runtime_error(
+                    "isolation lift soft alpha differs from the CPU oracle at "
+                    "pixel " +
+                    std::to_string(pixel)
+                );
+            }
+
+            std::vector<std::uint32_t> seen;
+            for (std::size_t index = 0; index < expected.size(); ++index) {
+                const auto &candidate =
+                    actual.records[
+                        pixel * MSPLAT_ISOLATION_RECORDS_PER_PIXEL + index
+                    ];
+                const auto &reference = expected[index];
+                if (candidate.gaussian_id != reference.gaussian_id ||
+                    candidate.label != reference.label ||
+                    candidate.reserved != 0 ||
+                    std::abs(candidate.weight - reference.weight) >
+                        weightTolerance ||
+                    std::abs(
+                        candidate.centrality_weight -
+                        reference.centrality_weight
+                    ) > weightTolerance) {
+                    throw std::runtime_error(
+                        "isolation lift record differs from the CPU alpha*T "
+                        "oracle at pixel " +
+                        std::to_string(pixel) + " record " +
+                        std::to_string(index)
+                    );
+                }
+                if (std::find(
+                        seen.begin(),
+                        seen.end(),
+                        candidate.gaussian_id
+                    ) != seen.end()) {
+                    throw std::runtime_error(
+                        "isolation lift duplicated a Gaussian within one pixel"
+                    );
+                }
+                seen.push_back(candidate.gaussian_id);
+                ++comparedRecords;
+                if (candidate.label != 0) ++foregroundRecords;
+            }
+        }
+    }
+    if (comparedRecords < pointCount || foregroundRecords == 0) {
+        throw std::runtime_error(
+            "isolation oracle fixture did not expose sufficient labeled "
+            "contributions"
+        );
+    }
+}
+
+void requireIsolationSnapshotsIdentical(
+    const IsolationLiftSnapshot &reference,
+    const IsolationLiftSnapshot &candidate
+) {
+    if (reference.counts != candidate.counts ||
+        reference.alpha != candidate.alpha ||
+        reference.records.size() != candidate.records.size() ||
+        std::memcmp(
+            reference.records.data(),
+            candidate.records.data(),
+            reference.records.size() *
+                sizeof(MsplatIsolationContributionRecord)
+        ) != 0) {
+        throw std::runtime_error(
+            "isolation exact-capacity replay changed lifted evidence"
+        );
+    }
+}
+
+void verifyIsolationLiftOracle(const std::string &dataset) {
+    constexpr int pointCount = 4;
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(false);
+
+    {
+        InputData inputData = inputDataFromX(dataset);
+        if (inputData.cameras.empty() ||
+            inputData.points.count < pointCount) {
+            throw std::runtime_error(
+                "isolation oracle fixture lacks a camera or sparse points"
+            );
+        }
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        model.num_active = pointCount;
+        model.refreshViews();
+        Model::CamSetup setup = model.prepareCam(camera, 1);
+        if (setup.width != 32 || setup.height != 32) {
+            throw std::runtime_error(
+                "isolation oracle requires the 32x32 parity camera"
+            );
+        }
+
+        const float opacities[pointCount] = {0.52f, 0.46f, 0.40f, 0.34f};
+        for (int index = 0; index < pointCount; ++index) {
+            const float depth =
+                2.35f + 0.12f * static_cast<float>(index);
+            for (int axis = 0; axis < 3; ++axis) {
+                model.means.data<float>()[index * 3 + axis] =
+                    setup.cam_pos[axis] -
+                    camera.camToWorld[axis * 4 + 2] * depth;
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+                model.scales.data<float>()[index * 3 + axis] =
+                    std::log(0.065f);
+            }
+            model.quats.data<float>()[index * 4] = 0.0f;
+            model.quats.data<float>()[index * 4 + 1] = 0.0f;
+            model.quats.data<float>()[index * 4 + 2] = 0.0f;
+            model.quats.data<float>()[index * 4 + 3] = 1.0f;
+            model.opacities.data<float>()[index] =
+                std::log(opacities[index] / (1.0f - opacities[index]));
+        }
+        const std::vector<float> opacityLogits = copyTensor(model.opacities);
+        IsolationLiftResources resources = makeIsolationLiftResources(
+            pointCount,
+            setup.width,
+            setup.height
+        );
+
+        encodeIsolationPrepare(model, camera, setup);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats initialOverflow = msplat_get_raster_stats();
+        if (!initialOverflow.capacity_exceeded ||
+            initialOverflow.memory_budget_exceeded ||
+            initialOverflow.resource_limit_exceeded ||
+            initialOverflow.latest_intersection_count <= 1 ||
+            initialOverflow.dropped_intersection_count != 0) {
+            throw std::runtime_error(
+                "isolation oracle did not establish a recoverable exact "
+                "capacity probe"
+            );
+        }
+        msplat_grow_exact_raster_capacity(
+            initialOverflow.latest_intersection_count
+        );
+        msplat_clear_raster_capacity_failure();
+        encodeIsolationPrepare(model, camera, setup);
+        msplat_gpu_sync();
+
+        IsolationProjection projection {
+            std::vector<float>(pointCount * 2),
+            std::vector<float>(pointCount),
+            std::vector<int>(pointCount),
+            std::vector<float>(pointCount * 3),
+        };
+        msplat_copy_isolation_projection_for_testing(
+            projection.xys.data(),
+            projection.depths.data(),
+            projection.radii.data(),
+            projection.conics.data(),
+            pointCount
+        );
+        for (int index = 0; index < pointCount; ++index) {
+            if (!std::isfinite(projection.xys[index * 2]) ||
+                !std::isfinite(projection.xys[index * 2 + 1]) ||
+                !std::isfinite(projection.depths[index]) ||
+                projection.radii[index] < 2 ||
+                std::abs(
+                    projection.xys[index * 2] -
+                    static_cast<float>(setup.width) / 2.0f
+                ) > 1.0f ||
+                std::abs(
+                    projection.xys[index * 2 + 1] -
+                    static_cast<float>(setup.height) / 2.0f
+                ) > 1.0f) {
+                throw std::runtime_error(
+                    "isolation oracle Gaussians did not form the expected "
+                    "centered layers"
+                );
+            }
+        }
+
+        const IsolationLiftSnapshot reference = captureIsolationLift(
+            resources,
+            setup.width,
+            setup.height
+        );
+        requireIsolationLiftMatchesOracle(
+            reference,
+            projection,
+            opacityLogits,
+            resources.mask.data<std::uint8_t>(),
+            setup.width,
+            setup.height
+        );
+
+        msplat_set_exact_execution_capacity_for_testing(1);
+        encodeIsolationPrepare(model, camera, setup);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats forcedOverflow = msplat_get_raster_stats();
+        if (!forcedOverflow.capacity_exceeded ||
+            forcedOverflow.memory_budget_exceeded ||
+            forcedOverflow.resource_limit_exceeded ||
+            forcedOverflow.latest_intersection_count !=
+                initialOverflow.latest_intersection_count ||
+            forcedOverflow.dropped_intersection_count != 0) {
+            throw std::runtime_error(
+                "forced isolation exact-capacity failure lost authoritative "
+                "intersection evidence"
+            );
+        }
+
+        bool refusedBeforeReplay = false;
+        try {
+            msplat_lift_isolation_stripe(
+                static_cast<unsigned>(setup.height),
+                static_cast<unsigned>(setup.width),
+                resources.mask,
+                resources.selected,
+                false,
+                0,
+                static_cast<unsigned>(setup.height),
+                resources.records,
+                resources.counts,
+                resources.alpha,
+                resources.status
+            );
+        } catch (const std::invalid_argument &) {
+            refusedBeforeReplay = true;
+        }
+        if (!refusedBeforeReplay) {
+            throw std::runtime_error(
+                "isolation lift accepted a failed exact prepare before replay"
+            );
+        }
+
+        msplat_grow_exact_raster_capacity(
+            forcedOverflow.latest_intersection_count
+        );
+        msplat_clear_raster_capacity_failure();
+        encodeIsolationPrepare(model, camera, setup);
+        msplat_gpu_sync();
+        const IsolationLiftSnapshot replayed = captureIsolationLift(
+            resources,
+            setup.width,
+            setup.height
+        );
+        requireIsolationSnapshotsIdentical(reference, replayed);
+
+        const MsplatRasterStats completed = msplat_get_raster_stats();
+        if (completed.capacity_exceeded ||
+            completed.memory_budget_exceeded ||
+            completed.resource_limit_exceeded ||
+            completed.dropped_intersection_count != 0 ||
+            completed.fallback_count < 2 ||
+            completed.exact_buffer_growth_count == 0 ||
+            completed.exact_buffer_bytes_added == 0) {
+            throw std::runtime_error(
+                "isolation exact replay did not finish losslessly with "
+                "durable recovery metrics"
+            );
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "isolation_lift_oracle passed\n";
+}
+
 void verifyPartialThreadgroupLossAccounting(const std::string &dataset) {
     constexpr int width = 33;
     constexpr int height = 35;
@@ -2807,6 +3320,7 @@ int main(int argc, char **argv) {
         requireNear("opacity_first_moment", fast.opacityFirstMoment, exact.opacityFirstMoment);
         requireNear("opacity_second_moment", fast.opacitySecondMoment, exact.opacitySecondMoment);
 
+        verifyIsolationLiftOracle(dataset);
         verifyPartialThreadgroupLossAccounting(dataset);
 
         const RasterResult culledFast = runSingleStep(dataset, false, true);

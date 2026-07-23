@@ -37,6 +37,7 @@
 
 #include "bindings.h"
 #include "input_data.hpp"
+#include "isolation_runtime.hpp"
 #include "loaders.hpp"
 #include "model.hpp"
 #include "random_iter.hpp"
@@ -680,6 +681,121 @@ TrainingIdentity computeTrainingIdentity(
     );
 
     return TrainingIdentity {digestFiles(images, imageNames, true), geometryDigest.finish()};
+}
+
+std::pair<std::uint64_t, std::uint64_t> stableColmapRecordCount(
+    const fs::path &path,
+    std::uint64_t minimumRecordBytes
+) {
+    const struct stat pathMetadata = requireRegularFile(path, true);
+    if (pathMetadata.st_size < 8) {
+        throw std::runtime_error(
+            "COLMAP binary header is truncated: " + path.string()
+        );
+    }
+    OpenFile file(path);
+    struct stat openedMetadata {};
+    if (::fstat(file.descriptor, &openedMetadata) != 0 ||
+        !sameStableFileMetadata(pathMetadata, openedMetadata)) {
+        throw std::runtime_error(
+            "COLMAP binary changed while opening: " + path.string()
+        );
+    }
+    std::uint64_t count = 0;
+    std::size_t consumed = 0;
+    while (consumed < sizeof(count)) {
+        const ssize_t amount = ::pread(
+            file.descriptor,
+            reinterpret_cast<std::uint8_t *>(&count) + consumed,
+            sizeof(count) - consumed,
+            static_cast<off_t>(consumed)
+        );
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) {
+            throw std::runtime_error(
+                "COLMAP binary header is truncated: " + path.string()
+            );
+        }
+        consumed += static_cast<std::size_t>(amount);
+    }
+    struct stat finalOpenedMetadata {};
+    struct stat finalPathMetadata {};
+    if (::fstat(file.descriptor, &finalOpenedMetadata) != 0 ||
+        ::lstat(path.c_str(), &finalPathMetadata) != 0 ||
+        !sameStableFileMetadata(openedMetadata, finalOpenedMetadata) ||
+        !sameStableFileMetadata(openedMetadata, finalPathMetadata)) {
+        throw std::runtime_error(
+            "COLMAP binary changed while reading its header: " +
+            path.string()
+        );
+    }
+    const std::uint64_t bytes =
+        static_cast<std::uint64_t>(openedMetadata.st_size);
+    if (count > (bytes - sizeof(count)) / minimumRecordBytes) {
+        throw std::runtime_error(
+            "COLMAP binary record count exceeds its file size: " +
+            path.string()
+        );
+    }
+    return {count, bytes};
+}
+
+void enforceIsolationColmapLoadBudget(
+    const fs::path &sparse,
+    std::uint64_t memoryBudgetBytes
+) {
+    const auto [cameraCount, cameraBytes] = stableColmapRecordCount(
+        sparse / "cameras.bin",
+        48
+    );
+    const auto [imageCount, imageBytes] = stableColmapRecordCount(
+        sparse / "images.bin",
+        73
+    );
+    const auto [pointCount, pointBytes] = stableColmapRecordCount(
+        sparse / "points3D.bin",
+        51
+    );
+    (void)cameraBytes;
+    (void)pointBytes;
+    constexpr std::uint64_t conservativeCameraBytes = 256;
+    constexpr std::uint64_t conservativeImageBytes = 1024;
+    constexpr std::uint64_t conservativePointBytes = 32;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 3>
+        allocations = {{
+            {cameraCount, conservativeCameraBytes},
+            {imageCount, conservativeImageBytes},
+            {pointCount, conservativePointBytes},
+        }};
+    std::uint64_t requiredBytes = 0;
+    for (const auto &[count, bytesPerRecord] : allocations) {
+        if (count >
+            (std::numeric_limits<std::uint64_t>::max() - requiredBytes) /
+                bytesPerRecord) {
+            throw easysplat::isolation::MemoryLimitError(
+                "COLMAP loader allocation exceeds the native range"
+            );
+        }
+        requiredBytes += count * bytesPerRecord;
+    }
+    // The pinned COLMAP reader appends each image name one byte at a time.
+    // Its vector allocation is covered above, but a malformed authenticated
+    // file can otherwise hide an arbitrarily large string behind one record.
+    // Two input bytes per file byte conservatively cover libc++ string growth.
+    constexpr std::uint64_t imageParserBytesPerInputByte = 2;
+    if (imageBytes >
+        (std::numeric_limits<std::uint64_t>::max() - requiredBytes) /
+            imageParserBytesPerInputByte) {
+        throw easysplat::isolation::MemoryLimitError(
+            "COLMAP image metadata exceeds the native range"
+        );
+    }
+    requiredBytes += imageBytes * imageParserBytesPerInputByte;
+    if (requiredBytes > memoryBudgetBytes) {
+        throw easysplat::isolation::MemoryLimitError(
+            "COLMAP loader allocation exceeds the isolation memory budget"
+        );
+    }
 }
 
 fs::path trainerExecutablePath() {
@@ -2010,22 +2126,55 @@ int main(int argc, char *argv[]) {
     std::string profileName;
     std::string checkpointPath;
     std::string resumePath;
+    std::string sourcePlyPath;
+    std::string maskManifestPath;
+    std::string analysisCachePath;
+    std::string expectedSourcePlyDigest;
     std::string expectedInputDigest;
     std::string expectedGeometryDigest;
+    std::string expectedSelectedFramesDigest;
+    std::string expectedTrainingManifestDigest;
+    std::string anchorImage;
     std::uint64_t seed = 42;
     std::uint64_t memoryBudgetBytes = 0;
+    int anchorInstance = 0;
     int iterationLimitOverride = 0;
     int plateauWindowOverride = 0;
     int eventsFileDescriptor = -1;
+    bool isolate = false;
     bool selfCheck = false;
     std::string plyToValidate;
     std::string benchmarkDecodePath;
     std::string benchmarkDecodeOutputPath;
 
+    CLI::Option *isolateOption = app.add_flag(
+        "--isolate",
+        isolate,
+        "Run deterministic subject isolation without constructing training state"
+    );
     CLI::Option *datasetOption = app.add_option(
         "--dataset", datasetPath, "Canonical COLMAP dataset directory"
     );
-    CLI::Option *outputOption = app.add_option("--output", outputPath, "Final PLY output path");
+    CLI::Option *sourcePlyOption = app.add_option(
+        "--source-ply",
+        sourcePlyPath,
+        "Authenticated source binary Gaussian PLY"
+    );
+    CLI::Option *maskManifestOption = app.add_option(
+        "--mask-manifest",
+        maskManifestPath,
+        "Authenticated subject-isolation mask manifest"
+    );
+    CLI::Option *analysisCacheOption = app.add_option(
+        "--analysis-cache",
+        analysisCachePath,
+        "Bounded resumable subject-isolation analysis cache"
+    );
+    CLI::Option *outputOption = app.add_option(
+        "--output",
+        outputPath,
+        "Final trained or isolated PLY output path"
+    );
     CLI::Option *profileOption = app.add_option(
         "--profile", profileName, "Training profile: fast, balanced, or high-detail"
     );
@@ -2052,24 +2201,61 @@ int main(int argc, char *argv[]) {
     CLI::Option *checkpointOption = app.add_option(
         "--checkpoint", checkpointPath, "Atomic optimizer-checkpoint directory"
     );
-    app.add_option(
+    CLI::Option *expectedSourcePlyDigestOption = app.add_option(
+        "--expected-source-ply-digest",
+        expectedSourcePlyDigest,
+        "Expected lowercase SHA-256 digest of the source PLY"
+    );
+    CLI::Option *expectedInputDigestOption = app.add_option(
         "--expected-input-digest",
         expectedInputDigest,
         "Expected SHA-256 digest of the prepared training images"
     );
-    app.add_option(
+    CLI::Option *expectedGeometryDigestOption = app.add_option(
         "--expected-geometry-digest",
         expectedGeometryDigest,
         "Expected SHA-256 digest of the prepared sparse geometry"
     );
-    app.add_option("--resume", resumePath, "Validated optimizer-checkpoint directory");
+    CLI::Option *expectedSelectedFramesDigestOption = app.add_option(
+        "--expected-selected-frames-digest",
+        expectedSelectedFramesDigest,
+        "Expected lowercase SHA-256 digest of the selected-frame identity"
+    );
+    CLI::Option *expectedTrainingManifestDigestOption = app.add_option(
+        "--expected-training-manifest-digest",
+        expectedTrainingManifestDigest,
+        "Expected lowercase SHA-256 digest of the training manifest"
+    );
+    CLI::Option *anchorImageOption = app.add_option(
+        "--anchor-image",
+        anchorImage,
+        "Optional selected-frame identity for disambiguation"
+    );
+    CLI::Option *anchorInstanceOption = app.add_option(
+        "--anchor-instance",
+        anchorInstance,
+        "Optional nonzero 8-bit frame-local instance paired with --anchor-image"
+    );
+    CLI::Option *resumeOption = app.add_option(
+        "--resume",
+        resumePath,
+        "Validated optimizer-checkpoint directory"
+    );
     CLI::Option *eventsOption = app.add_option(
         "--events-fd", eventsFileDescriptor, "Descriptor for schema-v2 JSONL events"
     );
     eventsOption->check(CLI::Range(0, std::numeric_limits<int>::max()));
-    app.add_flag("--self-check", selfCheck, "Initialize Metal and load the adjacent metallib");
-    app.add_option("--validate-ply", plyToValidate, "Validate a binary Gaussian PLY")
-        ->check(CLI::ExistingFile);
+    CLI::Option *selfCheckOption = app.add_flag(
+        "--self-check",
+        selfCheck,
+        "Initialize Metal and load the adjacent metallib"
+    );
+    CLI::Option *validatePlyOption = app.add_option(
+        "--validate-ply",
+        plyToValidate,
+        "Validate a binary Gaussian PLY"
+    );
+    validatePlyOption->check(CLI::ExistingFile);
     CLI::Option *benchmarkDecodeOption = app.add_option(
         "--benchmark-decode",
         benchmarkDecodePath,
@@ -2081,7 +2267,12 @@ int main(int argc, char *argv[]) {
         "Write the production-decoded benchmark source as tightly packed RGB8"
     );
 
-    CLI11_PARSE(app, argc, argv);
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError &error) {
+        const int parserExit = app.exit(error);
+        return parserExit == 0 ? 0 : 1;
+    }
 
     std::optional<EventWriter> events;
     int terminalIteration = 0;
@@ -2096,8 +2287,221 @@ int main(int argc, char *argv[]) {
         events.emplace(eventsFileDescriptor);
         if (eventsFileDescriptor == STDOUT_FILENO) std::cout.rdbuf(std::cerr.rdbuf());
 
+        const bool isolationOnlyArgumentProvided =
+            sourcePlyOption->count() != 0 ||
+            maskManifestOption->count() != 0 ||
+            analysisCacheOption->count() != 0 ||
+            expectedSourcePlyDigestOption->count() != 0 ||
+            expectedSelectedFramesDigestOption->count() != 0 ||
+            expectedTrainingManifestDigestOption->count() != 0 ||
+            anchorImageOption->count() != 0 ||
+            anchorInstanceOption->count() != 0;
+        if (!isolate && isolationOnlyArgumentProvided) {
+            throw std::runtime_error(
+                "subject-isolation options require --isolate"
+            );
+        }
+
         const bool benchmarkDecodeRequested =
             benchmarkDecodeOption->count() != 0 || benchmarkDecodeOutputOption->count() != 0;
+        if (isolate) {
+            if (isolateOption->count() != 1) {
+                throw std::runtime_error("--isolate must be provided exactly once");
+            }
+            if (profileOption->count() != 0 ||
+                iterationLimitOption->count() != 0 ||
+                plateauWindowOption->count() != 0 ||
+                seedOption->count() != 0 ||
+                checkpointOption->count() != 0 ||
+                resumeOption->count() != 0) {
+                throw std::runtime_error(
+                    "--isolate cannot be combined with training-only options"
+                );
+            }
+            if (selfCheckOption->count() != 0 ||
+                validatePlyOption->count() != 0 ||
+                benchmarkDecodeRequested) {
+                throw std::runtime_error(
+                    "--isolate cannot be combined with self-check, PLY validation, or benchmark mode"
+                );
+            }
+
+            const std::array<std::pair<CLI::Option *, const char *>, 11>
+                requiredIsolationOptions = {{
+                    {datasetOption, "--dataset"},
+                    {sourcePlyOption, "--source-ply"},
+                    {maskManifestOption, "--mask-manifest"},
+                    {analysisCacheOption, "--analysis-cache"},
+                    {outputOption, "--output"},
+                    {expectedSourcePlyDigestOption, "--expected-source-ply-digest"},
+                    {expectedInputDigestOption, "--expected-input-digest"},
+                    {expectedGeometryDigestOption, "--expected-geometry-digest"},
+                    {expectedSelectedFramesDigestOption, "--expected-selected-frames-digest"},
+                    {expectedTrainingManifestDigestOption, "--expected-training-manifest-digest"},
+                    {memoryBudgetOption, "--memory-budget-bytes"},
+                }};
+            for (const auto &[option, name] : requiredIsolationOptions) {
+                if (option->count() != 1) {
+                    throw std::runtime_error(
+                        std::string(name) + " is required exactly once with --isolate"
+                    );
+                }
+            }
+            if (eventsOption->count() != 1) {
+                throw std::runtime_error(
+                    "--events-fd is required exactly once with --isolate"
+                );
+            }
+            if ((anchorImageOption->count() == 0) !=
+                (anchorInstanceOption->count() == 0) ||
+                anchorImageOption->count() > 1 ||
+                anchorInstanceOption->count() > 1) {
+                throw std::runtime_error(
+                    "--anchor-image and --anchor-instance must be provided together at most once"
+                );
+            }
+            if (anchorImageOption->count() == 1 &&
+                (anchorImage.empty() || anchorInstance < 1 || anchorInstance > 255)) {
+                throw std::runtime_error(
+                    "--anchor-instance must be a nonzero 8-bit label and --anchor-image cannot be empty"
+                );
+            }
+            const std::array<std::pair<const std::string *, const char *>, 5>
+                requiredIsolationDigests = {{
+                    {&expectedSourcePlyDigest, "--expected-source-ply-digest"},
+                    {&expectedInputDigest, "--expected-input-digest"},
+                    {&expectedGeometryDigest, "--expected-geometry-digest"},
+                    {&expectedSelectedFramesDigest, "--expected-selected-frames-digest"},
+                    {&expectedTrainingManifestDigest, "--expected-training-manifest-digest"},
+                }};
+            for (const auto &[digest, name] : requiredIsolationDigests) {
+                if (!isLowercaseHex(*digest)) {
+                    throw std::runtime_error(
+                        std::string(name) + " must be a lowercase 64-character SHA-256 digest"
+                    );
+                }
+            }
+            if (memoryBudgetBytes == 0) {
+                throw std::runtime_error(
+                    "--memory-budget-bytes must be positive with --isolate"
+                );
+            }
+            if (fs::path(outputPath).extension() != ".ply") {
+                throw std::runtime_error("--output must end in .ply");
+            }
+
+            struct sigaction action {};
+            action.sa_handler = observeCancellation;
+            sigemptyset(&action.sa_mask);
+            action.sa_flags = 0;
+            if (sigaction(SIGINT, &action, nullptr) != 0 ||
+                sigaction(SIGTERM, &action, nullptr) != 0) {
+                throw std::runtime_error("failed to install cancellation handlers");
+            }
+            auto throwIfIsolationCancelled = []() {
+                if (cancellationSignal != 0) {
+                    throw easysplat::isolation::CancellationError();
+                }
+            };
+            throwIfIsolationCancelled();
+
+            const fs::path isolationDataset(datasetPath);
+            const fs::path canonicalSparse =
+                isolationDataset / "sparse" / "0";
+            const fs::path canonicalImages =
+                isolationDataset / "images";
+            requirePlainDirectory(isolationDataset);
+            requirePlainDirectory(isolationDataset / "sparse");
+            requirePlainDirectory(canonicalSparse);
+            requirePlainDirectory(canonicalImages);
+            msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+            enforceIsolationColmapLoadBudget(
+                canonicalSparse,
+                memoryBudgetBytes
+            );
+
+            const OrientationOverlay orientation = readOrientationOverlay(datasetPath);
+            throwIfIsolationCancelled();
+            const TrainingIdentity identity = computeTrainingIdentity(
+                datasetPath,
+                orientation.contentDigest
+            );
+            throwIfIsolationCancelled();
+            if (identity.inputDigest != expectedInputDigest ||
+                identity.geometryDigest != expectedGeometryDigest) {
+                throw std::runtime_error(
+                    "prepared dataset identity does not match the expected digests"
+                );
+            }
+
+            InputData inputData = loaders::loadColmap(
+                canonicalSparse.string(),
+                canonicalImages.string()
+            );
+            applyOrientationOverlay(inputData, orientation);
+            throwIfIsolationCancelled();
+            const TrainingIdentity loadedIdentity = computeTrainingIdentity(
+                datasetPath,
+                orientation.contentDigest
+            );
+            if (loadedIdentity.inputDigest != expectedInputDigest ||
+                loadedIdentity.geometryDigest != expectedGeometryDigest) {
+                throw std::runtime_error(
+                    "prepared dataset changed while loading isolation cameras"
+                );
+            }
+            if (inputData.cameras.empty()) {
+                throw std::runtime_error("input dataset contains no isolation cameras");
+            }
+            inputData.points = Points {};
+
+            easysplat::isolation::IsolationRequest request {
+                fs::path(sourcePlyPath),
+                fs::path(maskManifestPath),
+                fs::path(analysisCachePath),
+                fs::path(outputPath),
+                expectedSourcePlyDigest,
+                expectedInputDigest,
+                expectedGeometryDigest,
+                expectedSelectedFramesDigest,
+                expectedTrainingManifestDigest,
+                static_cast<std::size_t>(memoryBudgetBytes),
+                std::nullopt,
+            };
+            if (anchorImageOption->count() == 1) {
+                request.anchor = easysplat::isolation::Anchor {
+                    anchorImage,
+                    static_cast<std::uint16_t>(anchorInstance),
+                };
+            }
+            const easysplat::isolation::IsolationRunResult result =
+                easysplat::isolation::runIsolation(
+                    request,
+                    inputData,
+                    [&](const std::string &event, json fields) {
+                        events->emit(event, std::move(fields));
+                    },
+                    []() { return cancellationSignal != 0; }
+                );
+            if (!events->enabled()) {
+                switch (result.outcome) {
+                case easysplat::isolation::IsolationRunOutcome::completed:
+                    std::cout << "EasySplat subject isolation completed: " << outputPath << '\n';
+                    break;
+                case easysplat::isolation::IsolationRunOutcome::ambiguous:
+                    std::cout << "EasySplat subject isolation requires an anchor\n";
+                    break;
+                case easysplat::isolation::IsolationRunOutcome::noSubject:
+                    std::cout << "EasySplat subject isolation found no subject\n";
+                    break;
+                case easysplat::isolation::IsolationRunOutcome::heldOutRejected:
+                    std::cout << "EasySplat subject isolation failed held-out validation\n";
+                    break;
+                }
+            }
+            return 0;
+        }
+
         if (benchmarkDecodeRequested) {
             if (benchmarkDecodeOption->count() != 1 ||
                 benchmarkDecodeOutputOption->count() != 1) {
@@ -2182,6 +2586,7 @@ int main(int argc, char *argv[]) {
             verifyOrientationOverlaySelfCheck();
             verifySceneBoundsSelfCheck();
             events->emit("self_check", {
+                {"isolation_mode_version", 1},
                 {"scene_bounds_status", "ok"},
                 {"status", "ok"},
                 {"version", APP_VERSION},
@@ -2873,7 +3278,79 @@ int main(int argc, char *argv[]) {
         events->emit("completed", completed);
         if (!events->enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
         return 0;
+    } catch (const easysplat::isolation::CancellationError &error) {
+        if (events) {
+            try {
+                events->emit("isolation_cancelled", {
+                    {"signal", cancellationSignal},
+                    {"status", "cancelled"},
+                });
+            } catch (const std::exception &eventError) {
+                std::cerr << "easysplat-train: cannot report subject-isolation cancellation: "
+                          << eventError.what() << '\n';
+            }
+        }
+        std::cerr << "easysplat-train: " << error.what() << '\n';
+        return 130;
+    } catch (const easysplat::isolation::MemoryLimitError &error) {
+        if (isolate && events) {
+            try {
+                events->emit("isolation_memory_refused", {
+                    {"budget_bytes", memoryBudgetBytes},
+                    {"reason", "working_set"},
+                    {"status", "refused"},
+                });
+            } catch (const std::exception &eventError) {
+                std::cerr << "easysplat-train: cannot report subject-isolation memory refusal: "
+                          << eventError.what() << '\n';
+            }
+        }
+        std::cerr << "easysplat-train: " << error.what() << '\n';
+        return isolate ? 75 : 1;
     } catch (const std::exception &error) {
+        if (isolate &&
+            (msplat_raster_resource_limit_was_exceeded() ||
+             msplat_raster_memory_budget_was_exceeded())) {
+            const MsplatRasterStats stats = msplat_get_raster_stats();
+            if (events) {
+                try {
+                    json fields = {
+                        {"allocation_bytes", stats.allocation_bytes},
+                        {"budget_bytes", memoryBudgetBytes},
+                        {"reason",
+                         msplat_raster_resource_limit_was_exceeded()
+                             ? "resource_limit"
+                             : "memory_budget"},
+                        {"required_bytes", stats.required_bytes},
+                        {"status", "refused"},
+                    };
+                    if (stats.latest_intersection_count > 0) {
+                        fields["intersection_count"] = stats.latest_intersection_count;
+                    }
+                    events->emit("isolation_memory_refused", std::move(fields));
+                } catch (const std::exception &eventError) {
+                    std::cerr << "easysplat-train: cannot report subject-isolation memory refusal: "
+                              << eventError.what() << '\n';
+                }
+            }
+            std::cerr << "easysplat-train: " << error.what() << '\n';
+            return 75;
+        }
+        if (isolate) {
+            if (events) {
+                try {
+                    events->emit("isolation_failed", {
+                        {"message", error.what()},
+                        {"status", "failed"},
+                    });
+                } catch (const std::exception &eventError) {
+                    std::cerr << "easysplat-train: cannot report subject-isolation failure: "
+                              << eventError.what() << '\n';
+                }
+            }
+            std::cerr << "easysplat-train: " << error.what() << '\n';
+            return 1;
+        }
         if (msplat_raster_resource_limit_was_exceeded()) {
             const MsplatRasterStats stats = msplat_get_raster_stats();
             if (events) {

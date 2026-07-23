@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 extension ToolchainManager {
@@ -439,6 +440,16 @@ extension ToolchainManager {
             "source_tree_sha256",
             "overlay_sha256",
             "raster_test_sha256",
+            "isolation_header_sha256",
+            "isolation_source_sha256",
+            "isolation_runtime_header_sha256",
+            "isolation_runtime_source_sha256",
+            "isolation_mask_header_sha256",
+            "isolation_mask_source_sha256",
+            "isolation_lift_source_sha256",
+            "isolation_test_sha256",
+            "isolation_mask_test_sha256",
+            "isolation_patch_sha256",
             "row_span_culling_patch_sha256",
             "geometry_adam_fusion_patch_sha256",
             "parallel_radix_scan_patch_sha256",
@@ -492,8 +503,18 @@ extension ToolchainManager {
             "source_url": "https://github.com/rayanht/msplat.git",
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
-            "overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23",
-            "raster_test_sha256": "3cf418fcd564240f1157f3206cb01974454f617327abc9b0c41b71ec49d46e30",
+            "overlay_sha256": "975b515aa10c8aca854e0cd3a638cb71e3b6e51aed156410242bae9af0e295e1",
+            "raster_test_sha256": "06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d",
+            "isolation_header_sha256": "267442c64a2eabe21662fd0c51dfa7bddeb2afaefdc58bc69d115699f1b6aa5f",
+            "isolation_source_sha256": "a13a277555e94861e78d04c127729a6a30b0204e4db60b3b3de743a7009de751",
+            "isolation_runtime_header_sha256": "192cbccaa5ab6b87a533ff27bca720a0512ffda5182a6e35080584d2091477b8",
+            "isolation_runtime_source_sha256": "0c77172b7ac5f0f314fc0907cc4d86bca01fd62756f52b477e435da520c984fa",
+            "isolation_mask_header_sha256": "51956923935621ef2e3681f33e11b1f63a6d1ed969234ee9e50edab927f712d7",
+            "isolation_mask_source_sha256": "ad9844c13dd427517311f0ad0725ffa348beb4c590d6febc6efe11c38d7240e8",
+            "isolation_lift_source_sha256": "c063a934eee67eb22e04483f32e798e6844ee722dde9daddeed79f5db56c13bc",
+            "isolation_test_sha256": "f2f58c26d52178ee5324e51fe3486501d7ad3e78d8e8c06ac4da1060ef937e54",
+            "isolation_mask_test_sha256": "f4900f77878a22417c1bd397ee87d2730c21344d9ba9ab7e1579bfa083e7d2bc",
+            "isolation_patch_sha256": "a8a579d9d2a5ca23ce87ae0dd2a1f79de8da56bbfa62851244cfdda51bc37f59",
             "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
             "source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb",
             "exact_raster_patch_sha256": "c34a8860ed8ae9bc92c976aaa1c3f89eec8aa9be9cab4778f074491e98860855",
@@ -503,7 +524,7 @@ extension ToolchainManager {
             "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
             "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
             "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
-            "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
+            "allocation_pressure_patch_sha256": "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8",
             "exact_prefix_hardening_patch_sha256": "510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb",
             "quaternion_stability_patch_sha256": "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786",
             "deployment_target": "macOS 15.0",
@@ -522,6 +543,16 @@ extension ToolchainManager {
             "source_tree_sha256",
             "overlay_sha256",
             "raster_test_sha256",
+            "isolation_header_sha256",
+            "isolation_source_sha256",
+            "isolation_runtime_header_sha256",
+            "isolation_runtime_source_sha256",
+            "isolation_mask_header_sha256",
+            "isolation_mask_source_sha256",
+            "isolation_lift_source_sha256",
+            "isolation_test_sha256",
+            "isolation_mask_test_sha256",
+            "isolation_patch_sha256",
             "patch_sha256",
             "checkpoint_patch_sha256",
             "numeric_stability_patch_sha256",
@@ -612,6 +643,7 @@ extension ToolchainManager {
         }
         let expectedKeys = Set([
             "event",
+            "isolation_mode_version",
             "scene_bounds_status",
             "schema_version",
             "sequence",
@@ -620,13 +652,23 @@ extension ToolchainManager {
         ])
         guard Set(event.keys) == expectedKeys,
               event["event"] as? String == "self_check",
+              exactJSONInteger(event["isolation_mode_version"], equals: 1),
               event["scene_bounds_status"] as? String == "ok",
-              event["schema_version"] as? Int == 2,
-              event["sequence"] as? Int == 1,
+              exactJSONInteger(event["schema_version"], equals: 2),
+              exactJSONInteger(event["sequence"], equals: 1),
               event["status"] as? String == "ok",
               event["version"] as? String == runtimeVersion else {
             throw ToolchainError.invalidToolchain("easysplat-train self-check event is invalid.")
         }
+    }
+
+    private func exactJSONInteger(_ value: Any?, equals expected: Int64) -> Bool {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFNumberGetTypeID(),
+              !CFNumberIsFloatType(number) else {
+            return false
+        }
+        return number.int64Value == expected
     }
 
     func rejectLegacyMsplatFootprint(root: URL) throws {

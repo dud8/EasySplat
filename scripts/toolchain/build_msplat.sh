@@ -10,16 +10,41 @@ DEPS_DIR="$BUILD_DIR/dependencies"
 INSTALL_PARENT="$BUILD_DIR/install"
 INSTALL_DIR="$INSTALL_PARENT/msplat"
 STAGE_DIR="$INSTALL_PARENT/msplat.stage.$$"
-PROMOTER="$ROOT/scripts/toolchain/atomic_swap_install.py"
+PROMOTER_SOURCE="$ROOT/scripts/toolchain/atomic_swap_install.py"
+PROMOTER_RUNTIME_DIR=""
+PROMOTER_RUNTIME=""
+PROMOTER_RUNTIME_SOURCE_SHA256=""
+PROMOTER_RUNTIME_DEVICE=""
+PROMOTER_RUNTIME_INODE=""
+PROMOTER_RUNTIME_OWNED=0
+PROMOTER_RUNTIME_READY=0
 PYTHON_BIN="/usr/bin/python3"
 INSTALL_STAGE_OWNED=0
 INSTALL_STAGE_DEVICE=""
 INSTALL_STAGE_INODE=""
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
-OVERLAY_SHA256="ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"
+OVERLAY_SHA256="975b515aa10c8aca854e0cd3a638cb71e3b6e51aed156410242bae9af0e295e1"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="3cf418fcd564240f1157f3206cb01974454f617327abc9b0c41b71ec49d46e30"
+RASTER_TEST_SHA256="06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d"
+ISOLATION_HEADER="$ROOT/Tools/MsplatNative/isolation.hpp"
+ISOLATION_HEADER_SHA256="267442c64a2eabe21662fd0c51dfa7bddeb2afaefdc58bc69d115699f1b6aa5f"
+ISOLATION_SOURCE="$ROOT/Tools/MsplatNative/isolation.cpp"
+ISOLATION_SOURCE_SHA256="a13a277555e94861e78d04c127729a6a30b0204e4db60b3b3de743a7009de751"
+ISOLATION_RUNTIME_HEADER="$ROOT/Tools/MsplatNative/isolation_runtime.hpp"
+ISOLATION_RUNTIME_HEADER_SHA256="192cbccaa5ab6b87a533ff27bca720a0512ffda5182a6e35080584d2091477b8"
+ISOLATION_RUNTIME_SOURCE="$ROOT/Tools/MsplatNative/isolation_runtime.cpp"
+ISOLATION_RUNTIME_SOURCE_SHA256="0c77172b7ac5f0f314fc0907cc4d86bca01fd62756f52b477e435da520c984fa"
+ISOLATION_MASK_HEADER="$ROOT/Tools/MsplatNative/isolation_mask.hpp"
+ISOLATION_MASK_HEADER_SHA256="51956923935621ef2e3681f33e11b1f63a6d1ed969234ee9e50edab927f712d7"
+ISOLATION_MASK_SOURCE="$ROOT/Tools/MsplatNative/isolation_mask.mm"
+ISOLATION_MASK_SOURCE_SHA256="ad9844c13dd427517311f0ad0725ffa348beb4c590d6febc6efe11c38d7240e8"
+ISOLATION_METAL_SOURCE="$ROOT/Tools/MsplatNative/isolation_lift.metal"
+ISOLATION_METAL_SOURCE_SHA256="c063a934eee67eb22e04483f32e798e6844ee722dde9daddeed79f5db56c13bc"
+ISOLATION_TEST_SOURCE="$ROOT/Tools/MsplatNative/isolation_tests.cpp"
+ISOLATION_TEST_SOURCE_SHA256="f2f58c26d52178ee5324e51fe3486501d7ad3e78d8e8c06ac4da1060ef937e54"
+ISOLATION_MASK_TEST_SOURCE="$ROOT/Tools/MsplatNative/isolation_mask_tests.mm"
+ISOLATION_MASK_TEST_SOURCE_SHA256="f4900f77878a22417c1bd397ee87d2730c21344d9ba9ab7e1579bfa083e7d2bc"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"
@@ -45,11 +70,13 @@ GEOMETRY_ADAM_FUSION_PATCH_SHA256="927ad1fdbffee7ad762396c7acc965cd4a20da781f172
 PARALLEL_RADIX_SCAN_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-parallel-radix-scan.patch"
 PARALLEL_RADIX_SCAN_PATCH_SHA256="1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"
 ALLOCATION_PRESSURE_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-allocation-pressure.patch"
-ALLOCATION_PRESSURE_PATCH_SHA256="d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"
+ALLOCATION_PRESSURE_PATCH_SHA256="34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8"
 EXACT_PREFIX_HARDENING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-prefix-hardening.patch"
 EXACT_PREFIX_HARDENING_PATCH_SHA256="510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb"
 QUATERNION_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-quaternion-stability.patch"
 QUATERNION_STABILITY_PATCH_SHA256="d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786"
+ISOLATION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-isolation.patch"
+ISOLATION_PATCH_SHA256="a8a579d9d2a5ca23ce87ae0dd2a1f79de8da56bbfa62851244cfdda51bc37f59"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
@@ -66,15 +93,26 @@ CLI11_SHA256="43e650d5e1a3acaaf419d1e61a81f77b408d0696f472be0599ddf877d40984b0"
 
 STAGE_CLEANUP_ALLOWED=1
 
+run_promoter() {
+  [ "$PROMOTER_RUNTIME_READY" = "1" ] || \
+    die "private atomic install promoter is unavailable"
+  "$PYTHON_BIN" "$PROMOTER_RUNTIME" "$@"
+}
+
+run_promoter_source_from_stdin() {
+  "$PYTHON_BIN" - "$@" < "$PROMOTER_SOURCE"
+}
+
 cleanup() {
   local status=$?
   local install_cleanup_status=0
+  local promoter_cleanup_status=0
   trap - EXIT
   trap '' INT TERM HUP
   if [ "$STAGE_CLEANUP_ALLOWED" = "1" ] && [ "$INSTALL_STAGE_OWNED" = "1" ]; then
     if [ -n "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ] && \
-      [ -f "$PROMOTER" ] && [ ! -L "$PROMOTER" ]; then
-      "$PYTHON_BIN" "$PROMOTER" \
+      [ "$PROMOTER_RUNTIME_READY" = "1" ]; then
+      run_promoter \
         --remove-owned-tree \
         "$STAGE_DIR" \
         "$INSTALL_STAGE_DEVICE" \
@@ -88,8 +126,36 @@ cleanup() {
         "native msplat cleanup preserved an unverified staged install: $STAGE_DIR" >&2
     fi
   fi
+  if [ "$PROMOTER_RUNTIME_OWNED" = "1" ]; then
+    if [ "$PROMOTER_RUNTIME_READY" = "1" ]; then
+      run_promoter \
+        --remove-owned-tree \
+        "$PROMOTER_RUNTIME_DIR" \
+        "$PROMOTER_RUNTIME_DEVICE" \
+        "$PROMOTER_RUNTIME_INODE" \
+        --allow-symlinks || promoter_cleanup_status=$?
+    elif [ -n "$PROMOTER_RUNTIME_SOURCE_SHA256" ] && \
+      [ -f "$PROMOTER_SOURCE" ] && [ ! -L "$PROMOTER_SOURCE" ] && \
+      [ "$(sha256 "$PROMOTER_SOURCE")" = "$PROMOTER_RUNTIME_SOURCE_SHA256" ]; then
+      run_promoter_source_from_stdin \
+        --remove-owned-tree \
+        "$PROMOTER_RUNTIME_DIR" \
+        "$PROMOTER_RUNTIME_DEVICE" \
+        "$PROMOTER_RUNTIME_INODE" \
+        --allow-symlinks || promoter_cleanup_status=$?
+    else
+      promoter_cleanup_status=1
+    fi
+    if [ "$promoter_cleanup_status" -ne 0 ]; then
+      printf '%s\n' \
+        "native msplat cleanup preserved an unverified private promoter: $PROMOTER_RUNTIME_DIR" >&2
+    fi
+  fi
   if [ "$status" -eq 0 ] && [ "$install_cleanup_status" -ne 0 ]; then
     status="$install_cleanup_status"
+  fi
+  if [ "$status" -eq 0 ] && [ "$promoter_cleanup_status" -ne 0 ]; then
+    status="$promoter_cleanup_status"
   fi
   exit "$status"
 }
@@ -111,10 +177,111 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+normalize_private_promoter_metadata() {
+  local entry="$1"
+  local attribute
+  while IFS= read -r attribute; do
+    [ -n "$attribute" ] || continue
+    [ "$attribute" = "com.apple.provenance" ] || \
+      die "private atomic install promoter has unexpected metadata: $attribute"
+  done < <(/usr/bin/xattr -s "$entry")
+  if /usr/bin/xattr -s "$entry" | grep -Fxq 'com.apple.provenance'; then
+    /usr/bin/xattr -s -d com.apple.provenance "$entry" || \
+      die "could not remove system provenance from private atomic install promoter"
+  fi
+  [ -z "$(/usr/bin/xattr -s "$entry")" ] || \
+    die "private atomic install promoter metadata normalization was incomplete"
+}
+
+restore_build_signal_traps() {
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+
+abandon_unbound_private_promoter() {
+  local reason="$1"
+  local path="$PROMOTER_RUNTIME_DIR"
+  if [ -n "$path" ] && [ -d "$path" ] && [ ! -L "$path" ]; then
+    /bin/rmdir "$path" || {
+      restore_build_signal_traps
+      die "$reason; preserved an unverified private promoter: $path"
+    }
+  fi
+  PROMOTER_RUNTIME_DIR=""
+  restore_build_signal_traps
+  die "$reason"
+}
+
+prepare_private_promoter() {
+  local identity runtime_hash
+  PROMOTER_RUNTIME_SOURCE_SHA256="$(sha256 "$PROMOTER_SOURCE")"
+  trap '' INT TERM HUP
+  if ! PROMOTER_RUNTIME_DIR="$(mktemp -d "$BUILD_DIR/promoter.stage.XXXXXX")"; then
+    restore_build_signal_traps
+    die "could not create private atomic install promoter directory"
+  fi
+  if ! identity="$(
+    "$PYTHON_BIN" - "$PROMOTER_RUNTIME_DIR" <<'PY'
+import os
+import stat
+import sys
+
+entry = os.lstat(sys.argv[1])
+if not stat.S_ISDIR(entry.st_mode):
+    raise SystemExit("private promoter root is not a directory")
+if entry.st_uid != os.getuid() or entry.st_gid != os.getgid():
+    raise SystemExit("private promoter root ownership is invalid")
+if stat.S_IMODE(entry.st_mode) != 0o700:
+    raise SystemExit("private promoter root permissions are invalid")
+print(f"{entry.st_dev}:{entry.st_ino}")
+PY
+  )"; then
+    abandon_unbound_private_promoter \
+      "could not bind private atomic install promoter directory"
+  fi
+  if [[ ! "$identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+    abandon_unbound_private_promoter \
+      "private atomic install promoter identity is malformed"
+  fi
+  PROMOTER_RUNTIME_DEVICE="${identity%%:*}"
+  PROMOTER_RUNTIME_INODE="${identity#*:}"
+  PROMOTER_RUNTIME_OWNED=1
+  restore_build_signal_traps
+  PROMOTER_RUNTIME="$PROMOTER_RUNTIME_DIR/atomic_swap_install.py"
+
+  install -m 0700 "$PROMOTER_SOURCE" "$PROMOTER_RUNTIME"
+  runtime_hash="$(sha256 "$PROMOTER_RUNTIME")"
+  [ "$runtime_hash" = "$PROMOTER_RUNTIME_SOURCE_SHA256" ] || \
+    die "private atomic install promoter copy changed"
+  normalize_private_promoter_metadata "$PROMOTER_RUNTIME"
+  normalize_private_promoter_metadata "$PROMOTER_RUNTIME_DIR"
+  [ "$(sha256 "$PROMOTER_SOURCE")" = "$PROMOTER_RUNTIME_SOURCE_SHA256" ] || \
+    die "atomic install promoter source changed during private copy"
+  [ "$(sha256 "$PROMOTER_RUNTIME")" = "$PROMOTER_RUNTIME_SOURCE_SHA256" ] || \
+    die "private atomic install promoter changed during metadata cleanup"
+  "$PYTHON_BIN" - "$PROMOTER_RUNTIME" <<'PY'
+import os
+import stat
+import sys
+
+entry = os.lstat(sys.argv[1])
+if not stat.S_ISREG(entry.st_mode):
+    raise SystemExit("private promoter is not a regular file")
+if entry.st_nlink != 1:
+    raise SystemExit("private promoter must have exactly one link")
+if entry.st_uid != os.getuid() or entry.st_gid != os.getgid():
+    raise SystemExit("private promoter ownership is invalid")
+if stat.S_IMODE(entry.st_mode) != 0o700:
+    raise SystemExit("private promoter permissions are invalid")
+PY
+  PROMOTER_RUNTIME_READY=1
+}
+
 create_owned_install_stage() {
   local identity
   identity="$(
-    "$PYTHON_BIN" "$PROMOTER" --create-owned-tree "$STAGE_DIR"
+    run_promoter --create-owned-tree "$STAGE_DIR"
   )" || die "could not create and bind native msplat install stage"
   [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || \
     die "native msplat install stage identity is malformed"
@@ -127,7 +294,7 @@ recover_stale_promotions() {
   local journal path
   for journal in "$INSTALL_PARENT"/msplat.stage.*.promotion-state; do
     [ -e "$journal" ] || [ -L "$journal" ] || continue
-    "$PYTHON_BIN" "$PROMOTER" --recover "$journal" || \
+    run_promoter --recover "$journal" || \
       die "could not recover interrupted msplat promotion: $journal"
   done
   for path in "$INSTALL_PARENT"/msplat.stage.* "$INSTALL_PARENT"/msplat.previous.*; do
@@ -166,7 +333,8 @@ reject_raster_test_symbols() {
     msplat_stage_profiling_status_for_testing \
     msplat_gpu_timestamp_calibration_for_testing \
     msplat_copy_last_raster_debug \
-    msplat_copy_last_raster_reference_debug; do
+    msplat_copy_last_raster_reference_debug \
+    msplat_copy_isolation_projection_for_testing; do
     if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
       die "staged CLI exports raster test hook: $symbol"
     fi
@@ -182,7 +350,8 @@ preflight() {
     require_command "$command"
   done
   [ -x "$PYTHON_BIN" ] || die "selected Python executable is unavailable"
-  [ -x "$PROMOTER" ] || die "atomic install promoter is missing or not executable"
+  [ -f "$PROMOTER_SOURCE" ] && [ ! -L "$PROMOTER_SOURCE" ] \
+    || die "atomic install promoter must be a regular file"
   if ! xcrun -f metal >/dev/null 2>&1 || ! xcrun -f metallib >/dev/null 2>&1; then
     echo "Xcode's optional Metal compiler is required." >&2
     echo "Install it with: xcodebuild -downloadComponent MetalToolchain" >&2
@@ -192,6 +361,40 @@ preflight() {
   [ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ] \
     || die "CLI overlay SHA-256 mismatch"
   [ -f "$RASTER_TEST_SOURCE" ] || die "missing raster parity test: $RASTER_TEST_SOURCE"
+  [ -f "$ISOLATION_HEADER" ] || die "missing isolation header: $ISOLATION_HEADER"
+  [ "$(sha256 "$ISOLATION_HEADER")" = "$ISOLATION_HEADER_SHA256" ] \
+    || die "isolation header SHA-256 mismatch"
+  [ -f "$ISOLATION_SOURCE" ] || die "missing isolation source: $ISOLATION_SOURCE"
+  [ "$(sha256 "$ISOLATION_SOURCE")" = "$ISOLATION_SOURCE_SHA256" ] \
+    || die "isolation source SHA-256 mismatch"
+  [ -f "$ISOLATION_RUNTIME_HEADER" ] \
+    || die "missing isolation runtime header: $ISOLATION_RUNTIME_HEADER"
+  [ "$(sha256 "$ISOLATION_RUNTIME_HEADER")" = "$ISOLATION_RUNTIME_HEADER_SHA256" ] \
+    || die "isolation runtime header SHA-256 mismatch"
+  [ -f "$ISOLATION_RUNTIME_SOURCE" ] \
+    || die "missing isolation runtime source: $ISOLATION_RUNTIME_SOURCE"
+  [ "$(sha256 "$ISOLATION_RUNTIME_SOURCE")" = "$ISOLATION_RUNTIME_SOURCE_SHA256" ] \
+    || die "isolation runtime source SHA-256 mismatch"
+  [ -f "$ISOLATION_MASK_HEADER" ] \
+    || die "missing isolation mask header: $ISOLATION_MASK_HEADER"
+  [ "$(sha256 "$ISOLATION_MASK_HEADER")" = "$ISOLATION_MASK_HEADER_SHA256" ] \
+    || die "isolation mask header SHA-256 mismatch"
+  [ -f "$ISOLATION_MASK_SOURCE" ] \
+    || die "missing isolation mask source: $ISOLATION_MASK_SOURCE"
+  [ "$(sha256 "$ISOLATION_MASK_SOURCE")" = "$ISOLATION_MASK_SOURCE_SHA256" ] \
+    || die "isolation mask source SHA-256 mismatch"
+  [ -f "$ISOLATION_METAL_SOURCE" ] \
+    || die "missing isolation Metal source: $ISOLATION_METAL_SOURCE"
+  [ "$(sha256 "$ISOLATION_METAL_SOURCE")" = "$ISOLATION_METAL_SOURCE_SHA256" ] \
+    || die "isolation Metal source SHA-256 mismatch"
+  [ -f "$ISOLATION_TEST_SOURCE" ] \
+    || die "missing isolation test source: $ISOLATION_TEST_SOURCE"
+  [ "$(sha256 "$ISOLATION_TEST_SOURCE")" = "$ISOLATION_TEST_SOURCE_SHA256" ] \
+    || die "isolation test source SHA-256 mismatch"
+  [ -f "$ISOLATION_MASK_TEST_SOURCE" ] \
+    || die "missing isolation mask test source: $ISOLATION_MASK_TEST_SOURCE"
+  [ "$(sha256 "$ISOLATION_MASK_TEST_SOURCE")" = "$ISOLATION_MASK_TEST_SOURCE_SHA256" ] \
+    || die "isolation mask test source SHA-256 mismatch"
   [ -f "$FIXTURE_GENERATOR" ] || die "missing sparse fixture generator: $FIXTURE_GENERATOR"
   [ -f "$UPSTREAM_PATCH" ] || die "missing upstream patch: $UPSTREAM_PATCH"
   [ "$(sha256 "$UPSTREAM_PATCH")" = "$UPSTREAM_PATCH_SHA256" ] \
@@ -243,6 +446,9 @@ preflight() {
     || die "missing quaternion-stability patch: $QUATERNION_STABILITY_PATCH"
   [ "$(sha256 "$QUATERNION_STABILITY_PATCH")" = "$QUATERNION_STABILITY_PATCH_SHA256" ] \
     || die "quaternion-stability patch SHA-256 mismatch"
+  [ -f "$ISOLATION_PATCH" ] || die "missing isolation patch: $ISOLATION_PATCH"
+  [ "$(sha256 "$ISOLATION_PATCH")" = "$ISOLATION_PATCH_SHA256" ] \
+    || die "isolation patch SHA-256 mismatch"
   for source in \
     "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
     "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -324,6 +530,15 @@ prepare_source() {
   cp "$OVERLAY" "$SOURCE_DIR/cli/msplat.cpp"
   mkdir -p "$SOURCE_DIR/tests"
   cp "$RASTER_TEST_SOURCE" "$SOURCE_DIR/tests/msplat_raster_tests.cpp"
+  cp "$ISOLATION_HEADER" "$SOURCE_DIR/cli/isolation.hpp"
+  cp "$ISOLATION_SOURCE" "$SOURCE_DIR/cli/isolation.cpp"
+  cp "$ISOLATION_RUNTIME_HEADER" "$SOURCE_DIR/cli/isolation_runtime.hpp"
+  cp "$ISOLATION_RUNTIME_SOURCE" "$SOURCE_DIR/cli/isolation_runtime.cpp"
+  cp "$ISOLATION_MASK_HEADER" "$SOURCE_DIR/cli/isolation_mask.hpp"
+  cp "$ISOLATION_MASK_SOURCE" "$SOURCE_DIR/cli/isolation_mask.mm"
+  cp "$ISOLATION_METAL_SOURCE" "$SOURCE_DIR/core/metal/isolation_lift.metal"
+  cp "$ISOLATION_TEST_SOURCE" "$SOURCE_DIR/tests/isolation_tests.cpp"
+  cp "$ISOLATION_MASK_TEST_SOURCE" "$SOURCE_DIR/tests/isolation_mask_tests.mm"
   git -C "$SOURCE_DIR" apply --unidiff-zero --check "$UPSTREAM_PATCH"
   git -C "$SOURCE_DIR" apply --unidiff-zero "$UPSTREAM_PATCH"
   git -C "$SOURCE_DIR" apply --check "$CHECKPOINT_PATCH"
@@ -354,6 +569,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply --unidiff-zero "$SOURCE_NOTICE_PATCH"
   git -C "$SOURCE_DIR" apply --check "$QUATERNION_STABILITY_PATCH"
   git -C "$SOURCE_DIR" apply "$QUATERNION_STABILITY_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$ISOLATION_PATCH"
+  git -C "$SOURCE_DIR" apply "$ISOLATION_PATCH"
 }
 
 configure_and_build() {
@@ -368,7 +585,9 @@ configure_and_build() {
     -DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON="$DEPS_DIR/nlohmann-json-3.11.3" \
     -DFETCHCONTENT_SOURCE_DIR_NANOFLANN="$DEPS_DIR/nanoflann-1.5.5" \
     -DFETCHCONTENT_SOURCE_DIR_CLI11="$DEPS_DIR/CLI11-2.4.2"
-  cmake --build "$NATIVE_BUILD_DIR" --target msplat metallib msplat_raster_tests
+  cmake --build "$NATIVE_BUILD_DIR" --target msplat metallib msplat_raster_tests msplat_isolation_tests msplat_isolation_mask_tests
+  "$NATIVE_BUILD_DIR/msplat_isolation_tests"
+  "$NATIVE_BUILD_DIR/msplat_isolation_mask_tests"
   xcrun clang++ -std=c++20 -O2 \
     -I"$TILE_SPAN_TEST_ROOT/include" \
     "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp" \
@@ -407,7 +626,20 @@ configure_and_build() {
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256 quaternion_stability_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp
+  local overlay_sha256 raster_test_sha256
+  local isolation_header_sha256 isolation_source_sha256
+  local isolation_runtime_header_sha256 isolation_runtime_source_sha256
+  local isolation_mask_header_sha256 isolation_mask_source_sha256
+  local isolation_lift_source_sha256 isolation_test_sha256
+  local isolation_mask_test_sha256 isolation_patch_sha256
+  local patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256
+  local numeric_stability_patch_sha256 metal_safety_patch_sha256
+  local exact_raster_patch_sha256 stage_timing_patch_sha256
+  local memory_efficiency_patch_sha256 densification_memory_patch_sha256
+  local row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256
+  local parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256
+  local exact_prefix_hardening_patch_sha256 quaternion_stability_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -415,6 +647,16 @@ write_build_info() {
   timestamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   overlay_sha256="$(sha256 "$OVERLAY")"
   raster_test_sha256="$(sha256 "$RASTER_TEST_SOURCE")"
+  isolation_header_sha256="$(sha256 "$ISOLATION_HEADER")"
+  isolation_source_sha256="$(sha256 "$ISOLATION_SOURCE")"
+  isolation_runtime_header_sha256="$(sha256 "$ISOLATION_RUNTIME_HEADER")"
+  isolation_runtime_source_sha256="$(sha256 "$ISOLATION_RUNTIME_SOURCE")"
+  isolation_mask_header_sha256="$(sha256 "$ISOLATION_MASK_HEADER")"
+  isolation_mask_source_sha256="$(sha256 "$ISOLATION_MASK_SOURCE")"
+  isolation_lift_source_sha256="$(sha256 "$ISOLATION_METAL_SOURCE")"
+  isolation_test_sha256="$(sha256 "$ISOLATION_TEST_SOURCE")"
+  isolation_mask_test_sha256="$(sha256 "$ISOLATION_MASK_TEST_SOURCE")"
+  isolation_patch_sha256="$(sha256 "$ISOLATION_PATCH")"
   patch_sha256="$(sha256 "$UPSTREAM_PATCH")"
   source_notice_patch_sha256="$(sha256 "$SOURCE_NOTICE_PATCH")"
   checkpoint_patch_sha256="$(sha256 "$CHECKPOINT_PATCH")"
@@ -433,7 +675,19 @@ write_build_info() {
 
   "$PYTHON_BIN" - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$source_notice_patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" "$parallel_radix_scan_patch_sha256" "$allocation_pressure_patch_sha256" "$exact_prefix_hardening_patch_sha256" "$quaternion_stability_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" \
+    "$isolation_header_sha256" "$isolation_source_sha256" \
+    "$isolation_runtime_header_sha256" "$isolation_runtime_source_sha256" \
+    "$isolation_mask_header_sha256" "$isolation_mask_source_sha256" \
+    "$isolation_lift_source_sha256" "$isolation_test_sha256" \
+    "$isolation_mask_test_sha256" "$isolation_patch_sha256" \
+    "$patch_sha256" "$source_notice_patch_sha256" "$checkpoint_patch_sha256" \
+    "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" \
+    "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" \
+    "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" \
+    "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" \
+    "$parallel_radix_scan_patch_sha256" "$allocation_pressure_patch_sha256" \
+    "$exact_prefix_hardening_patch_sha256" "$quaternion_stability_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -448,6 +702,16 @@ import sys
     source_tree_sha256,
     overlay_sha256,
     raster_test_sha256,
+    isolation_header_sha256,
+    isolation_source_sha256,
+    isolation_runtime_header_sha256,
+    isolation_runtime_source_sha256,
+    isolation_mask_header_sha256,
+    isolation_mask_source_sha256,
+    isolation_lift_source_sha256,
+    isolation_test_sha256,
+    isolation_mask_test_sha256,
+    isolation_patch_sha256,
     patch_sha256,
     source_notice_patch_sha256,
     checkpoint_patch_sha256,
@@ -482,6 +746,16 @@ payload = {
     "source_tree_sha256": source_tree_sha256,
     "overlay_sha256": overlay_sha256,
     "raster_test_sha256": raster_test_sha256,
+    "isolation_header_sha256": isolation_header_sha256,
+    "isolation_source_sha256": isolation_source_sha256,
+    "isolation_runtime_header_sha256": isolation_runtime_header_sha256,
+    "isolation_runtime_source_sha256": isolation_runtime_source_sha256,
+    "isolation_mask_header_sha256": isolation_mask_header_sha256,
+    "isolation_mask_source_sha256": isolation_mask_source_sha256,
+    "isolation_lift_source_sha256": isolation_lift_source_sha256,
+    "isolation_test_sha256": isolation_test_sha256,
+    "isolation_mask_test_sha256": isolation_mask_test_sha256,
+    "isolation_patch_sha256": isolation_patch_sha256,
     "patch_sha256": patch_sha256,
     "source_notice_patch_sha256": source_notice_patch_sha256,
     "checkpoint_patch_sha256": checkpoint_patch_sha256,
@@ -814,24 +1088,79 @@ PY
   grep -Fq '"event":"self_check"' <<<"$self_check" || die "self-check event missing"
   grep -Fq '"status":"ok"' <<<"$self_check" || die "self-check status missing"
   grep -Fq '"scene_bounds_status":"ok"' <<<"$self_check" || die "scene-bounds self-check status missing"
+  grep -Fq '"isolation_mode_version":1' <<<"$self_check" \
+    || die "subject-isolation self-check version missing"
+  if ! "$PYTHON_BIN" - "$self_check" "$MSPLAT_VERSION" "${MSPLAT_COMMIT:0:7}" <<'PY'
+import json
+import sys
+
+
+def reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+event = json.loads(
+    sys.argv[1],
+    object_pairs_hook=reject_duplicate_keys,
+    parse_constant=reject_constant,
+)
+expected_self_check_keys = {
+    "event",
+    "isolation_mode_version",
+    "scene_bounds_status",
+    "schema_version",
+    "sequence",
+    "status",
+    "version",
+}
+if type(event) is not dict or set(event) != expected_self_check_keys:
+    raise SystemExit("self-check event schema is not closed")
+for key in ("isolation_mode_version", "schema_version", "sequence"):
+    if type(event.get(key)) is not int:
+        raise SystemExit(f"self-check {key} must be an exact JSON integer")
+expected = {
+    "event": "self_check",
+    "isolation_mode_version": 1,
+    "scene_bounds_status": "ok",
+    "schema_version": 2,
+    "sequence": 1,
+    "status": "ok",
+    "version": f"{sys.argv[2]} (git {sys.argv[3]})",
+}
+if event != expected:
+    raise SystemExit("self-check event values mismatch")
+PY
+  then
+    die "self-check event failed strict validation"
+  fi
 }
 
 promote_install() {
   local journal="$STAGE_DIR.promotion-state" tree_receipt
   validate_stage_extended_metadata
-  tree_receipt="$("$PYTHON_BIN" "$PROMOTER" --tree-receipt \
+  tree_receipt="$(run_promoter --tree-receipt \
     "$STAGE_DIR" "$INSTALL_STAGE_DEVICE" "$INSTALL_STAGE_INODE")" || \
     die "could not bind the validated native msplat tree"
   validate_stage_extended_metadata
   STAGE_CLEANUP_ALLOWED=0
-  "$PYTHON_BIN" "$PROMOTER" "$STAGE_DIR" "$INSTALL_DIR" "$tree_receipt" || \
+  run_promoter "$STAGE_DIR" "$INSTALL_DIR" "$tree_receipt" || \
     die "could not promote staged install; recovery state preserved"
-  "$PYTHON_BIN" "$PROMOTER" --commit "$journal" || \
+  run_promoter --commit "$journal" || \
     die "could not finalize staged install; recovery state preserved"
 }
 
 preflight
 mkdir -p "$BUILD_DIR" "$INSTALL_PARENT"
+prepare_private_promoter
 recover_stale_promotions
 create_owned_install_stage
 prepare_dependencies

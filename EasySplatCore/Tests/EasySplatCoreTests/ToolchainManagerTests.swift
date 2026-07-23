@@ -440,6 +440,16 @@ final class ToolchainManagerTests: XCTestCase {
             "metal_safety_patch_sha256",
             "overlay_sha256",
             "raster_test_sha256",
+            "isolation_header_sha256",
+            "isolation_source_sha256",
+            "isolation_runtime_header_sha256",
+            "isolation_runtime_source_sha256",
+            "isolation_mask_header_sha256",
+            "isolation_mask_source_sha256",
+            "isolation_lift_source_sha256",
+            "isolation_test_sha256",
+            "isolation_mask_test_sha256",
+            "isolation_patch_sha256",
             "stage_timing_patch_sha256",
             "memory_efficiency_patch_sha256",
             "densification_memory_patch_sha256",
@@ -486,6 +496,16 @@ final class ToolchainManagerTests: XCTestCase {
             "exact_raster_patch_sha256",
             "overlay_sha256",
             "raster_test_sha256",
+            "isolation_header_sha256",
+            "isolation_source_sha256",
+            "isolation_runtime_header_sha256",
+            "isolation_runtime_source_sha256",
+            "isolation_mask_header_sha256",
+            "isolation_mask_source_sha256",
+            "isolation_lift_source_sha256",
+            "isolation_test_sha256",
+            "isolation_mask_test_sha256",
+            "isolation_patch_sha256",
             "stage_timing_patch_sha256",
             "memory_efficiency_patch_sha256",
             "densification_memory_patch_sha256",
@@ -543,16 +563,103 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
+    func testValidateToolchainAcceptsIsolationModeVersionOneInMsplatSelfCheck() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let output = """
+        {"event":"self_check","isolation_mode_version":1,"scene_bounds_status":"ok","schema_version":2,"sequence":1,"status":"ok","version":"1.1.3 (git 106499b)"}
+
+        """
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root, msplatSelfCheckStdout: output)
+        )
+
+        XCTAssertNoThrow(
+            try manager.test_validateToolchain(
+                root: root,
+                requiredCapabilities: [.da3Base, .da3Small]
+            )
+        )
+    }
+
+    func testValidateToolchainRequiresExactIntegerIsolationModeVersionOneInMsplatSelfCheck() throws {
+        let invalidValues: [(label: String, field: String)] = [
+            ("missing", ""),
+            ("zero", #","isolation_mode_version":0"#),
+            ("two", #","isolation_mode_version":2"#),
+            ("boolean", #","isolation_mode_version":true"#),
+            ("string", #","isolation_mode_version":"1""#),
+            ("null", #","isolation_mode_version":null"#),
+            ("floating one", #","isolation_mode_version":1.0"#),
+            ("fractional", #","isolation_mode_version":1.5"#),
+        ]
+
+        for invalidValue in invalidValues {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+            let output = #"{"event":"self_check","scene_bounds_status":"ok","schema_version":2,"sequence":1,"status":"ok","version":"1.1.3 (git 106499b)""#
+                + invalidValue.field
+                + "}\n"
+            let manager = ToolchainManager(
+                runner: makeValidationRunner(root: root, msplatSelfCheckStdout: output)
+            )
+
+            XCTAssertThrowsError(
+                try manager.test_validateToolchain(
+                    root: root,
+                    requiredCapabilities: [.da3Base, .da3Small]
+                ),
+                "expected rejection for \(invalidValue.label) isolation_mode_version"
+            ) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error, got \(error)")
+                }
+                XCTAssertTrue(
+                    message.contains("self-check"),
+                    "expected self-check failure for \(invalidValue.label), got \(message)"
+                )
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsUnexpectedMsplatSelfCheckKeys() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let output = """
+        {"event":"self_check","extra":true,"isolation_mode_version":1,"scene_bounds_status":"ok","schema_version":2,"sequence":1,"status":"ok","version":"1.1.3 (git 106499b)"}
+
+        """
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root, msplatSelfCheckStdout: output)
+        )
+
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(
+                root: root,
+                requiredCapabilities: [.da3Base, .da3Small]
+            )
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("self-check"), "expected self-check failure; got \(message)")
+        }
+    }
+
     func testValidateToolchainRejectsMalformedMsplatSelfCheckEvents() throws {
         let invalidOutputs = [
             "not json\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"scene_bounds_status\":\"failed\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n{\"event\":\"self_check\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":2,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"9.9.9\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"failed\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n{\"event\":\"self_check\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":2,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"9.9.9\"}\n",
         ]
         for output in invalidOutputs {
             let root = try TestFileBuilder.makeTempDir()
@@ -1075,7 +1182,7 @@ final class ToolchainManagerTests: XCTestCase {
         vocabularyTerminationReason: Process.TerminationReason = .exit,
         da3HelpExitCode: Int32 = 0,
         msplatSelfCheckExitCode: Int32 = 0,
-        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
+        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
     ) -> MockSubprocessRunner {
         MockSubprocessRunner(scripts: [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
