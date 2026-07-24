@@ -505,6 +505,30 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         XCTAssertEqual(model.outputPlyURL, fixture.originalURL)
     }
 
+    func testFailedRetrainKeepsValidSessionSubjectAvailable() throws {
+        let fixture = try makeViewerFixture()
+        defer { fixture.cleanup() }
+        let model = AppModel(
+            toolchainManager: RecordingIsolationToolchainManager(
+                paths: makeIsolationToolchainPaths()
+            ),
+            projectBaseURL: fixture.base
+        )
+        model.viewState = .viewer
+        model.currentProjectURL = fixture.projectURL
+        model.outputPlyURL = fixture.originalURL
+        model.subjectOutput = fixture.subjectOutput
+        model.selectedSplatOutputVariant = .subject
+
+        XCTAssertFalse(
+            model.retrainProject(at: fixture.projectURL, profile: .balanced)
+        )
+        XCTAssertEqual(model.subjectOutput, fixture.subjectOutput)
+        XCTAssertEqual(model.selectedSplatOutputVariant, .subject)
+        XCTAssertEqual(model.displayedOutputURL, fixture.subjectOutput.url)
+        XCTAssertFalse(model.isRunActive)
+    }
+
     private func temporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(
             "EasySplat-subject-app-tests-\(UUID().uuidString)",

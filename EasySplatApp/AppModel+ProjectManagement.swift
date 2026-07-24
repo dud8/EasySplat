@@ -178,7 +178,6 @@ extension AppModel {
     func retrainProject(at url: URL, profile: DetailProfile) -> Bool {
         guard !hasActiveWork else { return false }
         guard flushPendingNotesSave() else { return false }
-        clearSubjectIsolationSession()
         guard mutateProjectMetadata(at: url, mutation: { metadata in
             metadata.requestedRunOptions.detailProfile = profile
         }) != nil else {
@@ -187,6 +186,7 @@ extension AppModel {
             lastError = statusTitle
             return false
         }
+        clearSubjectIsolationSession()
         let token = UUID()
         currentTaskToken = token
         currentRunOrigin = .retrain
