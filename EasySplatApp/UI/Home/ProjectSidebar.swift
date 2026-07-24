@@ -288,7 +288,7 @@ struct ProjectSidebar: View {
     }
 
     private func isLocked(_ project: ProjectSummary) -> Bool {
-        isRunActive && ProjectSummary.hasSameLocation(model.currentProjectURL, project.url)
+        isRunActive
     }
 
     private func statusText(for project: ProjectSummary) -> String {

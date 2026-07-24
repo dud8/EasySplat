@@ -13,6 +13,15 @@ extension AppModel {
             self.pendingCloseWindow = window
         }
 
+        if isSubjectIsolationActive {
+            stopAction = deleteProject ? .deleteProject : .keepProject
+            subjectIsolationStatusMessage = deleteProject
+                ? "Cancelling isolation before moving to Trash…"
+                : "Cancelling subject isolation…"
+            cancelSubjectIsolation()
+            return
+        }
+
         guard currentTask != nil else {
             if deleteProject, let projectURL = currentProjectURL {
                 if moveProjectToTrash(at: projectURL) {
@@ -55,6 +64,7 @@ extension AppModel {
 
     @discardableResult
     func moveProjectToTrash(at projectURL: URL) -> Bool {
+        guard !hasActiveWork else { return false }
         actionFailure = nil
         if ProjectSummary.hasSameLocation(currentProjectURL, projectURL) {
             guard flushPendingNotesSave() else { return false }
@@ -118,6 +128,9 @@ extension AppModel {
     }
 
     func presentExitConfirmation() -> ExitDecision {
+        if let exitDecisionOverride {
+            return exitDecisionOverride()
+        }
         let presentation = exitConfirmationPresentation
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -510,6 +523,8 @@ extension AppModel {
                 boundary: timingBoundary
             )
             viewState = .viewer
+            await reloadSubjectIsolationArtifact(for: projectURL)
+            guard isCurrentTaskToken(taskToken) else { return nil }
             refreshProjectSummaries()
             refreshFreeDiskSpace()
             return toolchain
@@ -766,6 +781,8 @@ extension AppModel {
                 currentProjectNotes = metadata.notes ?? ""
                 markProjectOpened(at: url)
                 viewState = .viewer
+                await reloadSubjectIsolationArtifact(for: url)
+                guard isCurrentTaskToken(taskToken) else { return }
                 refreshProjectSummaries()
                 return
             }
@@ -874,6 +891,8 @@ extension AppModel {
             markProjectOpened(at: url)
             refreshFreeDiskSpace()
             viewState = .viewer
+            await reloadSubjectIsolationArtifact(for: url)
+            guard isCurrentTaskToken(taskToken) else { return }
             refreshProjectSummaries()
         } catch is CancellationError {
             return
@@ -1021,6 +1040,7 @@ extension AppModel {
         pendingResultViewerTiming = nil
         stopAction = nil
         cancelSharing()
+        clearSubjectIsolationSession()
         shareStatusMessage = nil
         shareStatusIsError = false
         if notesSaved {

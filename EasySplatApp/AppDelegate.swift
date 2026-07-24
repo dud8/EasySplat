@@ -107,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        model.cancelSubjectIsolation()
         model.cancelSharing()
     }
 
@@ -293,7 +294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return model.currentProjectURL != nil
         }
         if menuItem.action == #selector(newSplat(_:)) {
-            return !model.isRunActive
+            return !model.hasActiveWork
         }
         if menuItem.action == #selector(exportSplat(_:)) {
             return model.viewState == .viewer && model.outputPlyURL != nil
@@ -372,7 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return .terminateLater
         }
 
-        guard model.currentTask != nil else {
+        guard model.hasActiveWork else {
             return .terminateNow
         }
 

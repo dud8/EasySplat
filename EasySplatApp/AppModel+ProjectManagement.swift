@@ -123,7 +123,7 @@ extension AppModel {
     /// menu command and the sidebar toolbar button.
     @discardableResult
     func beginNewSplat() -> Bool {
-        guard !isRunActive else { return false }
+        guard !hasActiveWork else { return false }
         guard flushPendingNotesSave() else { return false }
         reset()
         clearPendingInputs()
@@ -140,7 +140,7 @@ extension AppModel {
 
     func startFromPendingSelection(timingBoundary: RunTimingBoundary? = nil) {
         let timingBoundary = timingBoundary ?? .capture()
-        guard !isRunActive else { return }
+        guard !hasActiveWork else { return }
         guard let inputSpec = buildInputSpec() else { return }
         let photoURLs = pendingPhotoURLs
         let title = projectTitle(for: inputSpec)
@@ -161,7 +161,7 @@ extension AppModel {
 
     @discardableResult
     func resumeProject(at url: URL) -> Bool {
-        guard !isRunActive else { return false }
+        guard !hasActiveWork else { return false }
         guard flushPendingNotesSave() else { return false }
         let token = UUID()
         currentTaskToken = token
@@ -176,8 +176,9 @@ extension AppModel {
     /// invalidates; the published output is replaced when the new export lands.
     @discardableResult
     func retrainProject(at url: URL, profile: DetailProfile) -> Bool {
-        guard !isRunActive else { return false }
+        guard !hasActiveWork else { return false }
         guard flushPendingNotesSave() else { return false }
+        clearSubjectIsolationSession()
         guard mutateProjectMetadata(at: url, mutation: { metadata in
             metadata.requestedRunOptions.detailProfile = profile
         }) != nil else {

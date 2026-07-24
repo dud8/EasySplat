@@ -5,7 +5,7 @@ struct RootView: View {
     @State private var selectedProjectURL: URL?
 
     private var isRunActive: Bool {
-        model.isRunActive
+        model.hasActiveWork
     }
 
     private var actionFailureIsPresented: Binding<Bool> {
@@ -67,6 +67,7 @@ struct RootView: View {
 
     @MainActor
     static func prepareProjectList(model: AppModel, selectedProjectURL: inout URL?) {
+        guard !model.hasActiveWork else { return }
         guard model.flushPendingNotesSave() else { return }
         model.reset()
         model.viewState = .home
