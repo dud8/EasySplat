@@ -2923,10 +2923,19 @@ from pathlib import Path
 from PIL import Image
 
 root, checkpoint, source = map(Path, sys.argv[1:])
-manifests = sorted(checkpoint.glob("generations/*/manifest.json"))
-if len(manifests) != 1:
-    raise SystemExit("isolation runtime fixture has no unique checkpoint manifest")
-training = json.loads(manifests[0].read_text(encoding="utf-8"))
+current = checkpoint / "CURRENT"
+generation = current.read_text(encoding="utf-8").strip()
+if (
+    not generation
+    or "/" in generation
+    or "\\" in generation
+    or generation in {".", ".."}
+):
+    raise SystemExit("isolation runtime fixture has no valid current checkpoint")
+manifest = checkpoint / "generations" / generation / "manifest.json"
+if not manifest.is_file():
+    raise SystemExit("isolation runtime fixture has no current checkpoint manifest")
+training = json.loads(manifest.read_text(encoding="utf-8"))
 input_digest = training["input_digest"]
 geometry_digest = training["geometry_digest"]
 source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
