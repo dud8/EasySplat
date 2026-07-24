@@ -23,7 +23,7 @@ struct PairGraphPlanBinding: Codable, Sendable, Equatable {
         let temporalPolicyIsCoherent = (temporalPairing == .none)
             == temporalOffsets.isEmpty
         let backendIsCoherent = switch geometryBackend {
-        case .colmap:
+        case .colmap, .importedPoses:
             modelIdentifier == "none"
         case .da3:
             modelIdentifier == "DA3-BASE" || modelIdentifier == "DA3-SMALL"
@@ -779,7 +779,8 @@ enum PairGraphEvidenceStore {
         }
         let acceptedAttempt = evidence.attempts.last
         guard isSHA256(evidence.selectedFramesDigest),
-              evidence.planBinding.geometryBackend == .colmap,
+              evidence.planBinding.geometryBackend == .colmap
+                || evidence.planBinding.geometryBackend == .importedPoses,
               evidence.planBinding.pairingPolicy == evidence.pairingPolicy,
               evidence.planBinding.isStructurallyValid,
               evidence.planBinding.normalDescriptorMatcher == .faiss,
@@ -1193,7 +1194,8 @@ enum PairGraphEvidenceStore {
     ) throws {
         try validate(evidence)
         guard evidence.planBinding == PairGraphPlanBinding(resolvedPlan),
-              resolvedPlan.geometryBackend == .colmap,
+              resolvedPlan.geometryBackend == .colmap
+                || resolvedPlan.geometryBackend == .importedPoses,
               resolvedPlan.normalDescriptorMatcher == .faiss else {
             throw PairGraphEvidenceStoreError.invalidEvidence
         }

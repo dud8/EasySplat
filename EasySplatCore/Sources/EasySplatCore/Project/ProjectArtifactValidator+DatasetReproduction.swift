@@ -187,10 +187,15 @@ extension ProjectArtifactValidator {
             from: sourcePaths.geometryManifestURL,
             to: scratchPaths.geometryManifestURL
         )
-        try copyStableFile(
-            from: sourcePaths.colmapDatabaseURL,
-            to: scratchPaths.colmapDatabaseURL
-        )
+        // Directly-adopted geometry has no feature database; its training
+        // dataset is reproduced from the adopted model alone. Every other route
+        // replays through the signed database.
+        if geometryArtifact.resolvedSource != .imported {
+            try copyStableFile(
+                from: sourcePaths.colmapDatabaseURL,
+                to: scratchPaths.colmapDatabaseURL
+            )
+        }
         let sourceModel = try sourcePaths.resolveProjectRelativePath(
             geometryArtifact.sourceModelPath
         )

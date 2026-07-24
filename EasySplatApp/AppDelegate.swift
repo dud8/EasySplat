@@ -107,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        model.cancelSubjectIsolation()
         model.cancelSharing()
     }
 
@@ -246,6 +247,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         inspectorItem.target = self
         viewMenu.addItem(inspectorItem)
         viewMenu.addItem(.separator())
+        let showOriginalItem = NSMenuItem(
+            title: "Show Original",
+            action: #selector(showOriginal(_:)),
+            keyEquivalent: ""
+        )
+        showOriginalItem.target = self
+        viewMenu.addItem(showOriginalItem)
+        let showSubjectItem = NSMenuItem(
+            title: "Show Subject",
+            action: #selector(showSubject(_:)),
+            keyEquivalent: ""
+        )
+        showSubjectItem.target = self
+        viewMenu.addItem(showSubjectItem)
+        viewMenu.addItem(.separator())
         let fullScreenItem = NSMenuItem(
             title: "Enter Full Screen",
             action: #selector(NSWindow.toggleFullScreen(_:)),
@@ -293,14 +309,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return model.currentProjectURL != nil
         }
         if menuItem.action == #selector(newSplat(_:)) {
-            return !model.isRunActive
+            return !model.hasActiveWork
         }
         if menuItem.action == #selector(exportSplat(_:)) {
-            return model.viewState == .viewer && model.outputPlyURL != nil
+            return model.viewState == .viewer
+                && model.displayedOutputURL != nil
         }
         if menuItem.action == #selector(toggleInspector(_:)) {
             menuItem.title = model.isResultInspectorPresented ? "Hide Inspector" : "Show Inspector"
             return model.viewState == .viewer
+        }
+        if menuItem.action == #selector(showOriginal(_:)) {
+            menuItem.state = model.selectedSplatOutputVariant == .original
+                ? .on
+                : .off
+            return model.viewState == .viewer && model.outputPlyURL != nil
+        }
+        if menuItem.action == #selector(showSubject(_:)) {
+            menuItem.state = model.selectedSplatOutputVariant == .subject
+                ? .on
+                : .off
+            return model.viewState == .viewer && model.subjectOutput != nil
         }
         return true
     }
@@ -320,6 +349,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             model.isResultInspectorPresented,
             forKey: ViewerView.inspectorPreferenceKey
         )
+    }
+
+    @objc private func showOriginal(_ sender: Any?) {
+        guard model.viewState == .viewer else { return }
+        _ = model.setSelectedSplatOutputVariant(.original)
+    }
+
+    @objc private func showSubject(_ sender: Any?) {
+        guard model.viewState == .viewer else { return }
+        _ = model.setSelectedSplatOutputVariant(.subject)
     }
 
     @objc private func showAbout(_ sender: Any?) {
@@ -372,7 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return .terminateLater
         }
 
-        guard model.currentTask != nil else {
+        guard model.hasActiveWork else {
             return .terminateNow
         }
 

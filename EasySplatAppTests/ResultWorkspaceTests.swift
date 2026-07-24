@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import MetalKit
 import MetalSplatter
+import simd
 import XCTest
 @testable import EasySplatApp
 @testable import EasySplatCore
@@ -149,6 +150,32 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertEqual(
             planner.nextDecision(now: Date()),
             .start(request: retry, forceReload: true)
+        )
+    }
+
+    func testContinuousInteractionDefersViewerLoadsUntilReleasedPlusIdleDelay() {
+        let url = URL(fileURLWithPath: "/tmp/result.ply")
+        let request = PreviewLoadRequest(url: url, reloadToken: 0)
+        var planner = PreviewReloadPlanner()
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+
+        planner.setContinuousInteraction(true, now: start)
+        planner.request(request)
+        XCTAssertEqual(
+            planner.nextDecision(now: start.addingTimeInterval(10)),
+            .deferLoad(PreviewReloadPlanner.interactionIdleDelay)
+        )
+
+        planner.setContinuousInteraction(false, now: start.addingTimeInterval(12))
+        XCTAssertEqual(
+            planner.nextDecision(now: start.addingTimeInterval(12.5)),
+            .deferLoad(PreviewReloadPlanner.interactionIdleDelay - 0.5)
+        )
+        XCTAssertEqual(
+            planner.nextDecision(
+                now: start.addingTimeInterval(12 + PreviewReloadPlanner.interactionIdleDelay + 0.1)
+            ),
+            .start(request: request, forceReload: false)
         )
     }
 
@@ -321,6 +348,47 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertNil(ViewerKeyboardCommand.resolve(keyCode: 49, characters: " ", modifiers: []))
     }
 
+    func testViewerMovementKeysMapPhysicalPositionsWithoutHijackingSystemShortcuts() {
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 13), .forward)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 1), .backward)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 0), .strafeLeft)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 2), .strafeRight)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 14), .up)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 12), .down)
+        XCTAssertNil(ViewerKeyboardCommand.resolveMovementKey(keyCode: 3))
+        XCTAssertNil(ViewerKeyboardCommand.resolveMovementKey(keyCode: 126))
+
+        XCTAssertFalse(ViewerKeyboardModifiers([]).blocksMovement)
+        XCTAssertFalse(ViewerKeyboardModifiers([.shift]).blocksMovement)
+        XCTAssertTrue(ViewerKeyboardModifiers([.command]).blocksMovement)
+        XCTAssertTrue(ViewerKeyboardModifiers([.control]).blocksMovement)
+        XCTAssertTrue(ViewerKeyboardModifiers([.option]).blocksMovement)
+    }
+
+    func testFlightAxisVectorSumsHeldKeysAndCancelsOpposedPairs() {
+        XCTAssertEqual(Set<ViewerMovementKey>().flightAxisVector, SIMD3<Float>.zero)
+        XCTAssertEqual(
+            Set<ViewerMovementKey>([.forward, .backward]).flightAxisVector,
+            SIMD3<Float>.zero
+        )
+        XCTAssertEqual(
+            Set<ViewerMovementKey>([.forward, .strafeRight, .up]).flightAxisVector,
+            SIMD3<Float>(1, 1, 1)
+        )
+    }
+
+    func testViewerPointerCommandRoutesButtonsAndModifiersToDragModes() {
+        XCTAssertEqual(ViewerPointerCommand.dragMode(forPrimaryButtonWith: []), .orbit)
+        XCTAssertEqual(ViewerPointerCommand.dragMode(forPrimaryButtonWith: [.option]), .pan)
+        XCTAssertEqual(ViewerPointerCommand.dragMode(forPrimaryButtonWith: [.control]), .freeLook)
+        XCTAssertEqual(
+            ViewerPointerCommand.dragMode(forPrimaryButtonWith: [.control, .option]),
+            .freeLook
+        )
+        XCTAssertEqual(ViewerPointerCommand.secondaryButtonDragMode, .freeLook)
+        XCTAssertEqual(ViewerPointerCommand.middleButtonDragMode, .pan)
+    }
+
     @MainActor
     func testApplyingNewBoundsClearsPriorPan() throws {
         let device = try requireMetalDevice()
@@ -454,6 +522,154 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    func testIntegrateFlightMovesAlongTheViewDirectionScaledBySceneRadiusAndTime() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        let start = renderer.cameraState
+        renderer.setMovementInput([.forward], isSprinting: false)
+
+        renderer.integrateFlight(now: 10)
+        XCTAssertEqual(renderer.cameraState.target, start.target)
+
+        renderer.integrateFlight(now: 10.08)
+        let expected = start.target
+            + start.forwardDirection * (5 * Constants.flightSpeedPerSecond * 0.08)
+        XCTAssertLessThan(simd_distance(renderer.cameraState.target, expected), 1e-3)
+        renderer.setMovementInput([], isSprinting: false)
+    }
+
+    @MainActor
+    func testIntegrateFlightAppliesTheSprintMultiplierAlongWorldUp() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        renderer.orbit(deltaX: 0, deltaY: 100)
+        let start = renderer.cameraState
+        renderer.setMovementInput([.up], isSprinting: true)
+
+        renderer.integrateFlight(now: 0)
+        renderer.integrateFlight(now: 0.1)
+
+        let climb = 5 * Constants.flightSpeedPerSecond * Constants.flightSprintMultiplier * 0.1
+        let expected = start.target + SIMD3<Float>(0, climb, 0)
+        XCTAssertLessThan(simd_distance(renderer.cameraState.target, expected), 1e-3)
+        renderer.setMovementInput([], isSprinting: false)
+    }
+
+    @MainActor
+    func testIntegrateFlightClampsLargeFrameGapsToAvoidTeleporting() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        let start = renderer.cameraState
+        renderer.setMovementInput([.forward], isSprinting: false)
+
+        renderer.integrateFlight(now: 0)
+        renderer.integrateFlight(now: 60)
+
+        let moved = simd_distance(renderer.cameraState.target, start.target)
+        XCTAssertEqual(moved, 5 * Constants.flightSpeedPerSecond * 0.1, accuracy: 1e-3)
+        renderer.setMovementInput([], isSprinting: false)
+    }
+
+    @MainActor
+    func testIntegrateFlightKeepsNearCancellingInputsSlowInsteadOfNormalizing() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        renderer.orbit(deltaX: 0, deltaY: 2_000)
+        let start = renderer.cameraState
+        XCTAssertGreaterThan(start.pitch, 1.5)
+        renderer.setMovementInput([.forward, .down], isSprinting: false)
+
+        renderer.integrateFlight(now: 0)
+        renderer.integrateFlight(now: 1)
+
+        let moved = simd_distance(renderer.cameraState.target, start.target)
+        XCTAssertGreaterThan(moved, 0)
+        XCTAssertLessThan(moved, 0.05)
+        renderer.setMovementInput([], isSprinting: false)
+    }
+
+    @MainActor
+    func testMovementInputTogglesContinuousRenderingOnlyOnActivationEdges() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+        XCTAssertEqual(view.preferredFramesPerSecond, Constants.idleFramesPerSecond)
+
+        renderer.setMovementInput([.forward], isSprinting: false)
+        XCTAssertFalse(view.isPaused)
+        XCTAssertFalse(view.enableSetNeedsDisplay)
+        XCTAssertEqual(view.preferredFramesPerSecond, Constants.flightFramesPerSecond)
+
+        renderer.setMovementInput([.forward, .strafeLeft], isSprinting: true)
+        XCTAssertFalse(view.isPaused)
+        XCTAssertFalse(view.enableSetNeedsDisplay)
+
+        renderer.setMovementInput([], isSprinting: false)
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+        XCTAssertEqual(view.preferredFramesPerSecond, Constants.idleFramesPerSecond)
+    }
+
+    @MainActor
+    func testFlightSuppressesExplicitDrawsAndSettlesWithOneFinalFrame() throws {
+        let device = try requireMetalDevice()
+        let view = DrawRecordingMTKView(frame: .zero, device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        var draws = 0
+        view.onDraw = { draws += 1 }
+
+        renderer.orbit(deltaX: 4, deltaY: 2)
+        XCTAssertEqual(draws, 1)
+
+        renderer.setMovementInput([.forward], isSprinting: false)
+        renderer.orbit(deltaX: 4, deltaY: 2)
+        XCTAssertEqual(draws, 1)
+
+        renderer.setMovementInput([], isSprinting: false)
+        XCTAssertEqual(draws, 2)
+    }
+
+    @MainActor
+    func testRendererFreeLookRotatesInPlaceWithTheSameSensitivityAsOrbit() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: SIMD3<Float>(1, 2, 3), radius: 5)
+        let start = renderer.cameraState
+
+        renderer.freeLook(deltaX: 40, deltaY: -24)
+
+        XCTAssertEqual(
+            renderer.cameraState.yaw,
+            start.yaw + 40 * Constants.orbitSpeed,
+            accuracy: 1e-5
+        )
+        XCTAssertEqual(
+            renderer.cameraState.pitch,
+            start.pitch - 24 * Constants.orbitSpeed,
+            accuracy: 1e-5
+        )
+        XCTAssertLessThan(
+            simd_distance(renderer.cameraState.cameraPosition, start.cameraPosition),
+            1e-3
+        )
+        XCTAssertGreaterThan(
+            simd_distance(renderer.cameraState.target, start.target),
+            0
+        )
+    }
+
+    @MainActor
     func testFailedReplacementPreservesRenderedSceneAndCamera() async throws {
         let device = try requireMetalDevice()
         let view = MTKView(
@@ -520,7 +736,9 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertEqual(view.accessibilityValue() as? String, "Loading")
         XCTAssertEqual(
             view.accessibilityHelp(),
-            "Drag to orbit. Option-drag pans. Scroll or pinch zooms. Press F to fit or R to reset."
+            "Drag to orbit. Right-drag or Control-drag looks around. Option-drag pans. "
+                + "Scroll or pinch zooms. Hold W, A, S, D to fly, E and Q to fly up and down, "
+                + "and Shift to sprint. Press F to fit or R to reset."
         )
         XCTAssertTrue((view.accessibilityChildren() ?? []).isEmpty)
     }
@@ -594,6 +812,145 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    func testInteractiveViewerAggregatesHeldMovementKeysAndIgnoresAutoRepeats() throws {
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        var reported: [Set<ViewerMovementKey>] = []
+        viewer.onMovementInputChanged = { keys, _ in reported.append(keys) }
+
+        viewer.keyDown(with: try keyEvent(keyCode: 13))
+        viewer.keyDown(with: try keyEvent(keyCode: 13, isARepeat: true))
+        viewer.keyDown(with: try keyEvent(keyCode: 2))
+        viewer.keyUp(with: try keyEvent(keyCode: 13, type: .keyUp))
+        viewer.keyUp(with: try keyEvent(keyCode: 2, type: .keyUp))
+
+        XCTAssertEqual(reported, [
+            [.forward],
+            [.forward, .strafeRight],
+            [.strafeRight],
+            [],
+        ])
+    }
+
+    @MainActor
+    func testInteractiveViewerBlocksModifiedMovementKeysButAlwaysHonorsReleases() throws {
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        var reported: [Set<ViewerMovementKey>] = []
+        viewer.onMovementInputChanged = { keys, _ in reported.append(keys) }
+
+        viewer.keyDown(with: try keyEvent(keyCode: 13, modifiers: [.command]))
+        viewer.keyDown(with: try keyEvent(keyCode: 13, modifiers: [.option]))
+        XCTAssertTrue(reported.isEmpty)
+
+        viewer.keyDown(with: try keyEvent(keyCode: 13))
+        viewer.keyUp(with: try keyEvent(keyCode: 13, modifiers: [.command], type: .keyUp))
+        XCTAssertEqual(reported, [[.forward], []])
+    }
+
+    @MainActor
+    func testInteractiveViewerTracksSprintThroughShiftFlagsChanges() throws {
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        var reported: [(keys: Set<ViewerMovementKey>, isSprinting: Bool)] = []
+        viewer.onMovementInputChanged = { reported.append(($0, $1)) }
+
+        viewer.keyDown(with: try keyEvent(keyCode: 13))
+        viewer.flagsChanged(
+            with: try keyEvent(keyCode: 56, modifiers: [.shift], type: .flagsChanged)
+        )
+        viewer.flagsChanged(with: try keyEvent(keyCode: 56, type: .flagsChanged))
+        viewer.keyUp(with: try keyEvent(keyCode: 13, type: .keyUp))
+
+        XCTAssertEqual(reported.map(\.isSprinting), [false, true, false, false])
+        XCTAssertEqual(reported[1].keys, [.forward])
+    }
+
+    @MainActor
+    func testInteractiveViewerClearsHeldMovementKeysWhenFocusOrKeyWindowIsLost() throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let content = try XCTUnwrap(window.contentView)
+        let other = ViewerFocusTestView(frame: .zero)
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        content.addSubview(viewer)
+        content.addSubview(other)
+        var reported: [Set<ViewerMovementKey>] = []
+        viewer.onMovementInputChanged = { keys, _ in reported.append(keys) }
+
+        XCTAssertTrue(window.makeFirstResponder(viewer))
+        viewer.keyDown(with: try keyEvent(keyCode: 13))
+        XCTAssertEqual(reported.last, [.forward])
+
+        XCTAssertTrue(window.makeFirstResponder(other))
+        XCTAssertEqual(reported.last, [])
+
+        XCTAssertTrue(window.makeFirstResponder(viewer))
+        viewer.keyDown(with: try keyEvent(keyCode: 1))
+        XCTAssertEqual(reported.last, [.backward])
+
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+        XCTAssertEqual(reported.last, [])
+    }
+
+    @MainActor
+    func testInteractiveViewerRoutesSecondaryControlAndMiddleDragsDistinctly() throws {
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        var orbits = 0
+        var looks = 0
+        var pans = 0
+        viewer.onOrbit = { _, _ in orbits += 1 }
+        viewer.onFreeLook = { _, _ in looks += 1 }
+        viewer.onPan = { _, _ in pans += 1 }
+
+        viewer.mouseDown(with: try mouseEvent(.leftMouseDown, at: NSPoint(x: 10, y: 10)))
+        viewer.mouseDragged(with: try mouseEvent(.leftMouseDragged, at: NSPoint(x: 20, y: 14)))
+        XCTAssertEqual(orbits, 1)
+
+        viewer.rightMouseDown(with: try mouseEvent(.rightMouseDown, at: NSPoint(x: 10, y: 10)))
+        viewer.rightMouseDragged(
+            with: try mouseEvent(.rightMouseDragged, at: NSPoint(x: 30, y: 24))
+        )
+        XCTAssertEqual(looks, 1)
+
+        viewer.mouseDown(
+            with: try mouseEvent(.leftMouseDown, at: .zero, modifiers: [.control])
+        )
+        viewer.mouseDragged(with: try mouseEvent(.leftMouseDragged, at: NSPoint(x: 6, y: 3)))
+        XCTAssertEqual(looks, 2)
+
+        viewer.mouseDown(
+            with: try mouseEvent(.leftMouseDown, at: .zero, modifiers: [.option])
+        )
+        viewer.mouseDragged(with: try mouseEvent(.leftMouseDragged, at: NSPoint(x: 6, y: 3)))
+        XCTAssertEqual(pans, 1)
+
+        viewer.otherMouseDown(with: try middleMouseEvent(.otherMouseDown, at: .zero))
+        viewer.otherMouseDragged(
+            with: try middleMouseEvent(.otherMouseDragged, at: CGPoint(x: 5, y: 5))
+        )
+        XCTAssertEqual(pans, 2)
+        XCTAssertEqual(orbits, 1)
+        XCTAssertEqual(looks, 2)
+    }
+
+    @MainActor
     func testDismantlingViewerClearsCallbacksAndReleasesRendererOwnership() throws {
         let device = try requireMetalDevice()
         weak var weakView: InteractiveMTKView?
@@ -626,7 +983,9 @@ final class ResultWorkspaceTests: XCTestCase {
             XCTAssertNil(view?.onScrollZoom)
             XCTAssertNil(view?.onMagnify)
             XCTAssertNil(view?.onPan)
+            XCTAssertNil(view?.onFreeLook)
             XCTAssertNil(view?.onKeyboardCommand)
+            XCTAssertNil(view?.onMovementInputChanged)
             XCTAssertNil(view?.onInteractionActivity)
             XCTAssertNil(view?.delegate)
             XCTAssertNil(coordinator.renderer)
@@ -3378,10 +3737,12 @@ final class ResultWorkspaceTests: XCTestCase {
 
     private func keyEvent(
         keyCode: UInt16,
-        modifiers: NSEvent.ModifierFlags = []
+        modifiers: NSEvent.ModifierFlags = [],
+        type: NSEvent.EventType = .keyDown,
+        isARepeat: Bool = false
     ) throws -> NSEvent {
         try XCTUnwrap(NSEvent.keyEvent(
-            with: .keyDown,
+            with: type,
             location: .zero,
             modifierFlags: modifiers,
             timestamp: 0,
@@ -3389,9 +3750,42 @@ final class ResultWorkspaceTests: XCTestCase {
             context: nil,
             characters: keyCode == 48 ? "\t" : "",
             charactersIgnoringModifiers: keyCode == 48 ? "\t" : "",
-            isARepeat: false,
+            isARepeat: isARepeat,
             keyCode: keyCode
         ))
+    }
+
+    private func mouseEvent(
+        _ type: NSEvent.EventType,
+        at location: NSPoint,
+        modifiers: NSEvent.ModifierFlags = []
+    ) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(
+            with: type,
+            location: location,
+            modifierFlags: modifiers,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ))
+    }
+
+    /// `NSEvent.mouseEvent` cannot set a button number, so middle-button events
+    /// are built from a CGEvent that carries `.center` explicitly.
+    private func middleMouseEvent(
+        _ type: CGEventType,
+        at location: CGPoint
+    ) throws -> NSEvent {
+        let cgEvent = try XCTUnwrap(CGEvent(
+            mouseEventSource: nil,
+            mouseType: type,
+            mouseCursorPosition: location,
+            mouseButton: .center
+        ))
+        return try XCTUnwrap(NSEvent(cgEvent: cgEvent))
     }
 
     @MainActor
@@ -3403,7 +3797,9 @@ final class ResultWorkspaceTests: XCTestCase {
         view.onScrollZoom = { [renderer] _, _ in _ = renderer }
         view.onMagnify = { [renderer] _, _ in _ = renderer }
         view.onPan = { [renderer] _, _ in _ = renderer }
+        view.onFreeLook = { [renderer] _, _ in _ = renderer }
         view.onKeyboardCommand = { [renderer] _ in _ = renderer }
+        view.onMovementInputChanged = { [renderer] _, _ in _ = renderer }
         view.onInteractionActivity = { [renderer] in _ = renderer }
     }
 

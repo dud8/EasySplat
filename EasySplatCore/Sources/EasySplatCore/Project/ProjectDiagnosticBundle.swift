@@ -77,6 +77,7 @@ public enum ProjectDiagnosticBundle {
             metadata: metadata,
             paths: paths
         )
+        let subjectIsolation = SubjectIsolationArtifactStore.load(paths: paths)
 
         var sections: [String] = []
         sections.append(buildHeader(metadata: metadata, now: now, hardwareLine: hardwareLine, includeNotes: includeNotes))
@@ -111,6 +112,7 @@ public enum ProjectDiagnosticBundle {
         ) {
             sections.append(stateSection)
         }
+        sections.append(subjectIsolationSection(subjectIsolation))
         if let machineSection = machineReadableSection(
             metadata: metadata,
             geometry: geometry,
@@ -126,7 +128,8 @@ public enum ProjectDiagnosticBundle {
             ("pipeline.log", paths.pipelineLogURL),
             ("colmap.log", paths.colmapLogURL),
             ("da3.log", paths.da3LogURL),
-            ("msplat.log", paths.msplatLogURL)
+            ("msplat.log", paths.msplatLogURL),
+            ("isolation.log", paths.isolationLogURL)
         ]
         for source in logSources {
             guard (try? paths.projectRelativePath(for: source.url)) != nil else { continue }
@@ -171,6 +174,8 @@ public enum ProjectDiagnosticBundle {
             lines.append("Input: photos folder")
         case .mixed(let videos, _):
             lines.append("Input: mixed (\(videos.count) videos + photos folder)")
+        case .dataset(let kind, _):
+            lines.append("Input: \(kind.rawValue) dataset")
         }
         if let hardwareLine, !hardwareLine.isEmpty {
             lines.append("Hardware: \(hardwareLine)")
@@ -267,6 +272,50 @@ public enum ProjectDiagnosticBundle {
             lines.append("Stage total: \(Int(total.rounded()))s")
         }
         return lines.joined(separator: "\n")
+    }
+
+    private static func subjectIsolationSection(
+        _ result: IsolationArtifactLoadResult
+    ) -> String {
+        var lines = ["## Subject Isolation"]
+        switch result {
+        case .noArtifact:
+            lines.append("Status: no artifact")
+        case .invalid:
+            lines.append("Status: invalid")
+        case .stale(let reason):
+            lines.append("Status: stale (\(staleReasonLabel(reason)))")
+        case .valid(let artifact, let output):
+            lines.append("Status: valid")
+            lines.append("Variant: subject")
+            lines.append(
+                "Provenance: canonical source, training receipt, and dataset identity matched"
+            )
+            lines.append("Toolchain build identity: recorded")
+            lines.append("Native executable SHA-256: \(artifact.nativeExecutableSHA256)")
+            lines.append(
+                "Mask views: \(artifact.masks.count) · selected: "
+                    + "\(artifact.selectedViewIdentities.count) · held out: "
+                    + "\(artifact.heldOutViewIdentities.count)"
+            )
+            lines.append(
+                "Vision request revision: \(artifact.visionRequestRevision) · "
+                    + "policy revision: \(artifact.policy.version)"
+            )
+            lines.append(
+                "Subject output: \(output.gaussianCount) gaussians · "
+                    + "\(output.byteCount) bytes"
+            )
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func staleReasonLabel(_ reason: IsolationArtifactStaleReason) -> String {
+        switch reason {
+        case .sourceOutput: "source output"
+        case .trainingManifest: "training receipt"
+        case .datasetIdentity: "dataset identity"
+        }
     }
 
     private static func stateSection(

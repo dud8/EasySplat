@@ -1707,54 +1707,58 @@ extension ToolchainManager {
         if shouldUseDataTaskForTests(), !forceInspection {
             return []
         }
-        let inspection = ArchiveInspectionAccumulator(
-            maximumEntryBytes: Self.maximumManifestDownloadBytes,
-            maximumEntryCount: 250_000
-        )
-        let metadata = try runner.run(
-            "/usr/bin/zipinfo",
-            ["-l", zipURL.path],
-            onStdout: inspection.inspectMetadataLine
-        )
-        guard metadata.exitCode == 0 else {
-            throw ToolchainError.unzipFailed
+        let listing: SafeArchiveExtractor.ArchiveListing
+        do {
+            listing = try SafeArchiveExtractor.listArchive(
+                zipURL: zipURL,
+                runner: runner,
+                maximumListingBytes: Self.maximumManifestDownloadBytes,
+                maximumEntryCount: 250_000
+            )
+        } catch let error as SafeArchiveExtractor.ExtractionError {
+            throw Self.toolchainError(forArchiveListing: error)
         }
-        if inspection.foundSymbolicLink() {
-            throw ToolchainError.invalidToolchain("Archive contains a symbolic link entry.")
-        }
-        if inspection.foundSpecialFile() {
-            throw ToolchainError.invalidToolchain("Archive contains a special file entry.")
-        }
-        let result = try runner.run(
-            "/usr/bin/unzip",
-            ["-Z1", zipURL.path],
-            onStdout: inspection.appendEntry
-        )
-        guard result.exitCode == 0 else {
-            throw ToolchainError.unzipFailed
-        }
-        let listing = inspection.entrySnapshot()
-        guard !listing.exceededLimit else {
+        guard listing.breach == .none else {
             throw ToolchainError.invalidToolchain("Archive entry listing exceeds the inspection limit.")
         }
-        return listing.entries
+        return listing.names
+    }
+
+    /// Maps the shared extractor's listing failures back onto the toolchain's historical
+    /// `ToolchainError` messages so the download path's observable behavior is unchanged.
+    private static func toolchainError(
+        forArchiveListing error: SafeArchiveExtractor.ExtractionError
+    ) -> ToolchainError {
+        switch error {
+        case .symbolicLinkEntry:
+            return .invalidToolchain("Archive contains a symbolic link entry.")
+        case .specialFileEntry:
+            return .invalidToolchain("Archive contains a special file entry.")
+        default:
+            return .unzipFailed
+        }
     }
 
     func validateArchiveEntries(_ entries: [String]) throws {
-        guard Set(entries).count == entries.count else {
-            throw ToolchainError.invalidToolchain("Archive contains duplicate entries.")
+        do {
+            try SafeArchiveExtractor.validateEntryPaths(entries)
+        } catch let error as SafeArchiveExtractor.ExtractionError {
+            throw Self.toolchainError(forEntryValidation: error)
         }
-        for entry in entries {
-            guard !entry.isEmpty,
-                  !entry.hasPrefix("/"),
-                  !entry.contains("\\"),
-                  !entry.unicodeScalars.contains(where: { $0.value == 0 }) else {
-                throw ToolchainError.invalidToolchain("Archive contains an unsafe entry path.")
-            }
-            let parts = entry.split(separator: "/", omittingEmptySubsequences: false)
-            guard parts.allSatisfy({ !$0.isEmpty && $0 != ".." && $0 != "." }) else {
-                throw ToolchainError.invalidToolchain("Archive contains a path traversal entry: \(entry).")
-            }
+    }
+
+    /// Maps the shared extractor's entry-path failures back onto the toolchain's historical
+    /// `ToolchainError` messages.
+    private static func toolchainError(
+        forEntryValidation error: SafeArchiveExtractor.ExtractionError
+    ) -> ToolchainError {
+        switch error {
+        case .duplicateEntry:
+            return .invalidToolchain("Archive contains duplicate entries.")
+        case .pathTraversal(let entry):
+            return .invalidToolchain("Archive contains a path traversal entry: \(entry).")
+        default:
+            return .invalidToolchain("Archive contains an unsafe entry path.")
         }
     }
 
@@ -1858,69 +1862,5 @@ extension ToolchainManager {
         throw ToolchainError.invalidToolchain(
             "Artifact '\(artifact.name)' is missing expected files: \(missingPreview)\(suffix)."
         )
-    }
-}
-
-private final class ArchiveInspectionAccumulator: @unchecked Sendable {
-    private let lock = NSLock()
-    private let maximumEntryBytes: Int
-    private let maximumEntryCount: Int
-    private var entries: [String] = []
-    private var entryBytes = 0
-    private var exceededLimit = false
-    private var containsSymbolicLink = false
-    private var containsSpecialFile = false
-
-    init(maximumEntryBytes: Int, maximumEntryCount: Int) {
-        self.maximumEntryBytes = maximumEntryBytes
-        self.maximumEntryCount = maximumEntryCount
-    }
-
-    func inspectMetadataLine(_ line: String) {
-        guard let type = line.first,
-              type == "l" || ["b", "c", "p", "s"].contains(type) else { return }
-        lock.lock()
-        if type == "l" {
-            containsSymbolicLink = true
-        } else {
-            containsSpecialFile = true
-        }
-        lock.unlock()
-    }
-
-    func appendEntry(_ entry: String) {
-        guard !entry.isEmpty else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        guard !exceededLimit else { return }
-        let addedBytes = entry.utf8.count.addingReportingOverflow(1)
-        let nextBytes = entryBytes.addingReportingOverflow(addedBytes.partialValue)
-        guard !addedBytes.overflow,
-              !nextBytes.overflow,
-              nextBytes.partialValue <= maximumEntryBytes,
-              entries.count < maximumEntryCount else {
-            exceededLimit = true
-            return
-        }
-        entries.append(entry)
-        entryBytes = nextBytes.partialValue
-    }
-
-    func foundSymbolicLink() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return containsSymbolicLink
-    }
-
-    func foundSpecialFile() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return containsSpecialFile
-    }
-
-    func entrySnapshot() -> (entries: [String], exceededLimit: Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        return (entries, exceededLimit)
     }
 }

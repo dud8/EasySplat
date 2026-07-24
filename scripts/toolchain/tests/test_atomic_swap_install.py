@@ -1624,7 +1624,13 @@ class BuilderOwnershipContractTests(unittest.TestCase):
         payload: bytes,
     ) -> Iterator[tuple[str, tuple[int, ...]]]:
         if builder == "msplat":
-            yield "", ()
+            runner = self.function(source, "run_promoter")
+            yield (
+                'PROMOTER_RUNTIME="$PROMOTER"\n'
+                "PROMOTER_RUNTIME_READY=1\n"
+                f"{runner}\n",
+                (),
+            )
             return
 
         source_path = root / "frozen-promoter-source.py"
@@ -1948,6 +1954,10 @@ class BuilderOwnershipContractTests(unittest.TestCase):
             "INSTALL_STAGE_OWNED=1\n"
             f"INSTALL_STAGE_DEVICE={metadata.st_dev}\n"
             f"INSTALL_STAGE_INODE={metadata.st_ino}\n"
+            "BUILD_INPUT_SNAPSHOT_OWNED=0\n"
+            "PROMOTER_RUNTIME_OWNED=0\n"
+            "BUILD_LOCK_OWNED=0\n"
+            "CLEANUP_DEFERRED_SIGNAL=0\n"
             "LOCK_OWNED=0\n"
             "GUARDED_RUN=0\n"
             "MODE=build\n"
@@ -2241,7 +2251,7 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 if name == "colmap":
                     self.assertIn("run_frozen_promoter --recover", recovery)
                 elif name == "msplat":
-                    self.assertIn('"$PROMOTER" --recover', recovery)
+                    self.assertIn("run_promoter --recover", recovery)
                 else:
                     self.assertIn("run_promoter --recover", recovery)
                 self.assertIn("ambiguous staged install requires recovery", recovery)
@@ -2334,6 +2344,10 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                         "INSTALL_STAGE_OWNED=0\n"
                         f"INSTALL_STAGE_DEVICE={stage.lstat().st_dev}\n"
                         f"INSTALL_STAGE_INODE={stage.lstat().st_ino}\n"
+                        "BUILD_INPUT_SNAPSHOT_OWNED=0\n"
+                        "PROMOTER_RUNTIME_OWNED=0\n"
+                        "BUILD_LOCK_OWNED=0\n"
+                        "CLEANUP_DEFERRED_SIGNAL=0\n"
                         "LOCK_OWNED=0\n"
                         "GUARDED_RUN=0\n"
                         "GUARDED_STAGE_DEVICE=\n"

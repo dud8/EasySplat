@@ -5,8 +5,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT/scripts/toolchain/build_msplat.sh"
+ATOMIC_PROMOTER="$ROOT/scripts/toolchain/atomic_swap_install.py"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
+ISOLATION_HEADER="$ROOT/Tools/MsplatNative/isolation.hpp"
+ISOLATION_SOURCE="$ROOT/Tools/MsplatNative/isolation.cpp"
+ISOLATION_RUNTIME_HEADER="$ROOT/Tools/MsplatNative/isolation_runtime.hpp"
+ISOLATION_RUNTIME_SOURCE="$ROOT/Tools/MsplatNative/isolation_runtime.cpp"
+ISOLATION_MASK_HEADER="$ROOT/Tools/MsplatNative/isolation_mask.hpp"
+ISOLATION_MASK_SOURCE="$ROOT/Tools/MsplatNative/isolation_mask.mm"
+ISOLATION_METAL_SOURCE="$ROOT/Tools/MsplatNative/isolation_lift.metal"
+ISOLATION_TEST_SOURCE="$ROOT/Tools/MsplatNative/isolation_tests.cpp"
+ISOLATION_MASK_TEST_SOURCE="$ROOT/Tools/MsplatNative/isolation_mask_tests.mm"
 APACHE_LICENSE="$ROOT/ThirdParty/LICENSES/Apache-2.0.txt"
 MSPLAT_NOTICE="$ROOT/Tools/MsplatNative/NOTICE.md"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
@@ -24,6 +34,7 @@ PARALLEL_RADIX_SCAN_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-parallel-radix-
 ALLOCATION_PRESSURE_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-allocation-pressure.patch"
 EXACT_PREFIX_HARDENING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-prefix-hardening.patch"
 QUATERNION_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-quaternion-stability.patch"
+ISOLATION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-isolation.patch"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
@@ -33,6 +44,8 @@ INSTALL_DIR="${EASYSPLAT_MSPLAT_INSTALL_DIR:-$ROOT/Toolchains/build/msplat/insta
 RASTER_TEST_BIN="${EASYSPLAT_MSPLAT_RASTER_TEST_BIN:-$ROOT/Toolchains/build/msplat/native-build/msplat_raster_tests}"
 NATIVE_BUILD_DIR="${EASYSPLAT_MSPLAT_NATIVE_BUILD_DIR:-$ROOT/Toolchains/build/msplat/native-build}"
 ALLOCATION_PRESSURE_TEST_BIN="$NATIVE_BUILD_DIR/msplat_allocation_pressure_cli"
+ISOLATION_TEST_BIN="$NATIVE_BUILD_DIR/msplat_isolation_tests"
+ISOLATION_MASK_TEST_BIN="$NATIVE_BUILD_DIR/msplat_isolation_mask_tests"
 
 fail() {
   echo "native msplat build contract failed: $*" >&2
@@ -57,9 +70,55 @@ require_file() {
   [ -f "$1" ] || fail "missing file: $1"
 }
 
+require_order() {
+  local first="$1"
+  local second="$2"
+  local file="$3"
+  local first_line second_line
+  first_line="$(grep -Fn -- "$first" "$file" | head -n 1 | cut -d: -f1)"
+  second_line="$(grep -Fn -- "$second" "$file" | head -n 1 | cut -d: -f1)"
+  [ -n "$first_line" ] || fail "$file is missing ordered contract: $first"
+  [ -n "$second_line" ] || fail "$file is missing ordered contract: $second"
+  [ "$first_line" -lt "$second_line" ] \
+    || fail "$file applies contracts out of order: $first must precede $second"
+}
+
+require_sha256_pin() {
+  local variable="$1"
+  local source="$2"
+  local expected
+  expected="$(shasum -a 256 "$source" | awk '{print $1}')"
+  require_contains "${variable}_SHA256=\"$expected\"" "$BUILD_SCRIPT"
+  require_contains \
+    '[ "$(sha256 "$'"$variable"'")" = "$'"${variable}"'_SHA256" ]' \
+    "$BUILD_SCRIPT"
+}
+
+require_json_hash() {
+  local key="$1"
+  local source="$2"
+  local file="$3"
+  local expected
+  expected="$(shasum -a 256 "$source" | awk '{print $1}')"
+  require_contains "\"$key\": \"$expected\"" "$file"
+}
+
 require_file "$BUILD_SCRIPT"
+require_file "$ATOMIC_PROMOTER"
 require_file "$OVERLAY"
 require_file "$RASTER_TEST_SOURCE"
+for source in \
+  "$ISOLATION_HEADER" \
+  "$ISOLATION_SOURCE" \
+  "$ISOLATION_RUNTIME_HEADER" \
+  "$ISOLATION_RUNTIME_SOURCE" \
+  "$ISOLATION_MASK_HEADER" \
+  "$ISOLATION_MASK_SOURCE" \
+  "$ISOLATION_METAL_SOURCE" \
+  "$ISOLATION_TEST_SOURCE" \
+  "$ISOLATION_MASK_TEST_SOURCE"; do
+  require_file "$source"
+done
 require_file "$APACHE_LICENSE"
 require_file "$MSPLAT_NOTICE"
 require_file "$UPSTREAM_PATCH"
@@ -77,6 +136,7 @@ require_file "$PARALLEL_RADIX_SCAN_PATCH"
 require_file "$ALLOCATION_PRESSURE_PATCH"
 require_file "$EXACT_PREFIX_HARDENING_PATCH"
 require_file "$QUATERNION_STABILITY_PATCH"
+require_file "$ISOLATION_PATCH"
 for source in \
   "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
   "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -103,6 +163,20 @@ require_contains 'Copyright 2025 Rayan Hatout' "$MSPLAT_NOTICE"
 require_contains '106499b0a53f82b0c92d013b0861fbebd341b17e' "$MSPLAT_NOTICE"
 require_contains 'Modified by the EasySplat project in 2026 from msplat 1.1.3.' "$OVERLAY"
 require_contains 'Modified by the EasySplat project in 2026 from msplat 1.1.3.' "$RASTER_TEST_SOURCE"
+for source in \
+  "$ISOLATION_HEADER" \
+  "$ISOLATION_SOURCE" \
+  "$ISOLATION_RUNTIME_HEADER" \
+  "$ISOLATION_RUNTIME_SOURCE" \
+  "$ISOLATION_MASK_HEADER" \
+  "$ISOLATION_MASK_SOURCE" \
+  "$ISOLATION_METAL_SOURCE" \
+  "$ISOLATION_TEST_SOURCE" \
+  "$ISOLATION_MASK_TEST_SOURCE"; do
+  require_contains \
+    'Modified by the EasySplat project in 2026 from msplat 1.1.3.' \
+    "$source"
+done
 [ "$(grep -Fc 'Modified by the EasySplat project in 2026 from msplat 1.1.3.' "$SOURCE_NOTICE_PATCH")" -eq 10 ] \
   || fail "msplat patch does not mark every modified upstream source"
 require_contains 'UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$BUILD_SCRIPT"
@@ -111,13 +185,163 @@ require_contains 'SOURCE_NOTICE_PATCH_SHA256="6deee598c9321c9b98d74b92fd5cce9808
 require_contains '[ "$(sha256 "$SOURCE_NOTICE_PATCH")" = "$SOURCE_NOTICE_PATCH_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero --check "$SOURCE_NOTICE_PATCH"' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero "$SOURCE_NOTICE_PATCH"' "$BUILD_SCRIPT"
-require_contains 'OVERLAY_SHA256="ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$BUILD_SCRIPT"
+require_sha256_pin "OVERLAY" "$OVERLAY"
 require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT"
-require_contains '"overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$VALIDATOR"
+require_json_hash "overlay_sha256" "$OVERLAY" "$VALIDATOR"
 require_contains '"patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$VALIDATOR"
 require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$VALIDATOR"
-require_contains 'RASTER_TEST_SHA256="3cf418fcd564240f1157f3206cb01974454f617327abc9b0c41b71ec49d46e30"' "$BUILD_SCRIPT"
+require_contains 'RASTER_TEST_SHA256="06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
+for source_contract in \
+  "ISOLATION_HEADER:$ISOLATION_HEADER" \
+  "ISOLATION_SOURCE:$ISOLATION_SOURCE" \
+  "ISOLATION_RUNTIME_HEADER:$ISOLATION_RUNTIME_HEADER" \
+  "ISOLATION_RUNTIME_SOURCE:$ISOLATION_RUNTIME_SOURCE" \
+  "ISOLATION_MASK_HEADER:$ISOLATION_MASK_HEADER" \
+  "ISOLATION_MASK_SOURCE:$ISOLATION_MASK_SOURCE" \
+  "ISOLATION_METAL_SOURCE:$ISOLATION_METAL_SOURCE" \
+  "ISOLATION_TEST_SOURCE:$ISOLATION_TEST_SOURCE" \
+  "ISOLATION_MASK_TEST_SOURCE:$ISOLATION_MASK_TEST_SOURCE" \
+  "ISOLATION_PATCH:$ISOLATION_PATCH"; do
+  require_sha256_pin \
+    "${source_contract%%:*}" \
+    "${source_contract#*:}"
+done
+require_json_hash "isolation_header_sha256" "$ISOLATION_HEADER" "$VALIDATOR"
+require_json_hash "isolation_source_sha256" "$ISOLATION_SOURCE" "$VALIDATOR"
+require_json_hash "isolation_runtime_header_sha256" "$ISOLATION_RUNTIME_HEADER" "$VALIDATOR"
+require_json_hash "isolation_runtime_source_sha256" "$ISOLATION_RUNTIME_SOURCE" "$VALIDATOR"
+require_json_hash "isolation_mask_header_sha256" "$ISOLATION_MASK_HEADER" "$VALIDATOR"
+require_json_hash "isolation_mask_source_sha256" "$ISOLATION_MASK_SOURCE" "$VALIDATOR"
+require_json_hash "isolation_lift_source_sha256" "$ISOLATION_METAL_SOURCE" "$VALIDATOR"
+require_json_hash "isolation_test_sha256" "$ISOLATION_TEST_SOURCE" "$VALIDATOR"
+require_json_hash "isolation_mask_test_sha256" "$ISOLATION_MASK_TEST_SOURCE" "$VALIDATOR"
+require_json_hash "isolation_patch_sha256" "$ISOLATION_PATCH" "$VALIDATOR"
+for key in \
+  isolation_header_sha256 \
+  isolation_source_sha256 \
+  isolation_runtime_header_sha256 \
+  isolation_runtime_source_sha256 \
+  isolation_mask_header_sha256 \
+  isolation_mask_source_sha256 \
+  isolation_lift_source_sha256 \
+  isolation_test_sha256 \
+  isolation_mask_test_sha256 \
+  isolation_patch_sha256; do
+  require_contains "$key" "$BUILD_SCRIPT"
+  require_contains "$key" "$VALIDATOR"
+done
+require_contains 'cp "$ISOLATION_HEADER" "$SOURCE_DIR/cli/isolation.hpp"' "$BUILD_SCRIPT"
+require_contains 'cp "$ISOLATION_SOURCE" "$SOURCE_DIR/cli/isolation.cpp"' "$BUILD_SCRIPT"
+require_contains 'cp "$ISOLATION_RUNTIME_HEADER" "$SOURCE_DIR/cli/isolation_runtime.hpp"' "$BUILD_SCRIPT"
+require_contains 'cp "$ISOLATION_RUNTIME_SOURCE" "$SOURCE_DIR/cli/isolation_runtime.cpp"' "$BUILD_SCRIPT"
+require_contains 'cp "$ISOLATION_MASK_HEADER" "$SOURCE_DIR/cli/isolation_mask.hpp"' "$BUILD_SCRIPT"
+require_contains 'cp "$ISOLATION_MASK_SOURCE" "$SOURCE_DIR/cli/isolation_mask.mm"' "$BUILD_SCRIPT"
+require_contains 'cp "$ISOLATION_METAL_SOURCE" "$SOURCE_DIR/core/metal/isolation_lift.metal"' "$BUILD_SCRIPT"
+require_contains 'cp "$ISOLATION_TEST_SOURCE" "$SOURCE_DIR/tests/isolation_tests.cpp"' "$BUILD_SCRIPT"
+require_contains 'cp "$ISOLATION_MASK_TEST_SOURCE" "$SOURCE_DIR/tests/isolation_mask_tests.mm"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$ISOLATION_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$ISOLATION_PATCH"' "$BUILD_SCRIPT"
+require_order \
+  'git -C "$SOURCE_DIR" apply "$QUATERNION_STABILITY_PATCH"' \
+  'git -C "$SOURCE_DIR" apply --check "$ISOLATION_PATCH"' \
+  "$BUILD_SCRIPT"
+require_contains 'set(ISOLATION_METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/isolation_lift.metal)' "$ISOLATION_PATCH"
+require_contains 'add_executable(msplat ${EASYSPLAT_CLI_SOURCES})' "$ISOLATION_PATCH"
+require_contains \
+  'add_executable(msplat_allocation_pressure_cli ${EASYSPLAT_CLI_SOURCES})' \
+  "$ISOLATION_PATCH"
+require_contains 'cli/isolation_runtime.cpp' "$ISOLATION_PATCH"
+require_contains 'cli/isolation_mask.mm' "$ISOLATION_PATCH"
+require_contains 'add_executable(' "$ISOLATION_PATCH"
+require_contains 'msplat_isolation_tests' "$ISOLATION_PATCH"
+require_contains 'msplat_isolation_mask_tests' "$ISOLATION_PATCH"
+require_contains 'msplat_prepare_isolation_view' "$ISOLATION_PATCH"
+require_contains 'msplat_lift_isolation_stripe' "$ISOLATION_PATCH"
+require_contains 'isolation_lift_stripe_kernel' "$ISOLATION_PATCH"
+require_absent '#include "model.hpp"' "$ISOLATION_RUNTIME_SOURCE"
+require_absent 'Model model(' "$ISOLATION_RUNTIME_SOURCE"
+require_contains \
+  'isolationDataset / "sparse" / "0"' \
+  "$OVERLAY"
+require_contains \
+  'isolationDataset / "images"' \
+  "$OVERLAY"
+require_contains 'requirePlainDirectory(isolationDataset);' "$OVERLAY"
+require_contains 'requirePlainDirectory(isolationDataset / "sparse");' "$OVERLAY"
+require_contains 'requirePlainDirectory(canonicalSparse);' "$OVERLAY"
+require_contains 'requirePlainDirectory(canonicalImages);' "$OVERLAY"
+require_contains \
+  'snapshot.sparsePath().string(),' \
+  "$OVERLAY"
+require_contains \
+  'snapshot.imagesPath().string()' \
+  "$OVERLAY"
+require_contains \
+  'InputData inputData = loaders::loadColmap(' \
+  "$OVERLAY"
+require_contains 'class IsolationDatasetSnapshot' "$OVERLAY"
+require_contains 'copyAuthenticatedFile(' "$OVERLAY"
+require_contains 'verifySnapshotIdentity(' "$OVERLAY"
+require_contains 'IsolationDatasetSnapshot snapshot(' "$OVERLAY"
+require_contains 'claimIsolationSnapshotRoot(' "$OVERLAY"
+require_contains 'removeIsolationSnapshotContentsAt(' "$OVERLAY"
+require_contains '::renameatx_np(' "$OVERLAY"
+require_contains '::fstatat(' "$OVERLAY"
+require_contains '::openat(' "$OVERLAY"
+require_contains '::unlinkat(' "$OVERLAY"
+require_absent 'fs::remove_all(root_' "$OVERLAY"
+require_absent \
+  'loaders::loadColmap(\n                canonicalSparse.string()' \
+  "$OVERLAY"
+require_contains \
+  'const TrainingIdentity loadedIdentity = computeTrainingIdentity(' \
+  "$OVERLAY"
+require_contains 'snapshot.rootPath(),' "$OVERLAY"
+require_contains 'stableColmapRecordCount(' "$OVERLAY"
+require_contains 'enforceIsolationColmapLoadBudget(' "$OVERLAY"
+require_contains 'imageParserBytesPerInputByte = 2;' "$OVERLAY"
+require_contains \
+  'requiredBytes += imageBytes * imageParserBytesPerInputByte;' \
+  "$OVERLAY"
+require_contains \
+  '"COLMAP loader allocation exceeds the isolation memory budget"' \
+  "$OVERLAY"
+require_contains 'app.parse(argc, argv);' "$OVERLAY"
+require_contains 'scanPreparseIntent(argc, argv)' "$OVERLAY"
+require_contains 'maximumPreparseArgumentCount = 4096' "$OVERLAY"
+require_contains 'maximumPreparseTokenBytes = 128' "$OVERLAY"
+require_contains 'if (*token == "--") break;' "$OVERLAY"
+require_contains 'suppressParseDiagnostics' "$OVERLAY"
+require_contains 'CLI::detail::lexical_cast(' "$OVERLAY"
+require_absent '*token == "--events-fd=1"' "$OVERLAY"
+require_contains 'const int parserExit = app.exit(' "$OVERLAY"
+require_contains 'capturedStandardOutput,' "$OVERLAY"
+require_contains 'capturedStandardError' "$OVERLAY"
+require_contains 'emitCapturedParseDiagnostics(' "$OVERLAY"
+require_absent 'EventsDescriptorIntent' "$OVERLAY"
+require_absent 'app.exit(error);' "$OVERLAY"
+require_contains 'return parserExit == 0 ? 0 : 1;' "$OVERLAY"
+require_absent 'CLI11_PARSE(app, argc, argv);' "$OVERLAY"
+require_contains 'inspectBinaryPlyHeader(' "$ISOLATION_RUNTIME_SOURCE"
+require_contains 'validateBinaryPlyRows(' "$ISOLATION_RUNTIME_SOURCE"
+require_order \
+  'enforceMemoryBudget(requiredBytes, request.memoryBudgetBytes);' \
+  'validateBinaryPlyRows(source, isCancelled);' \
+  "$ISOLATION_RUNTIME_SOURCE"
+require_contains 'eventFileIdentity' "$ISOLATION_RUNTIME_HEADER"
+require_contains 'boundEventFileIdentity' "$OVERLAY"
+require_contains 'rejectEventDescriptorAliases(' "$OVERLAY"
+require_contains 'request.eventFileIdentity' "$ISOLATION_RUNTIME_SOURCE"
+require_contains 'eventsFileDescriptor == STDERR_FILENO' "$OVERLAY"
+require_contains 'filteringUnitTotal' "$ISOLATION_RUNTIME_SOURCE"
+require_absent '{"completed_unit_count", 0}' "$ISOLATION_RUNTIME_SOURCE"
+require_absent '{"total_unit_count", 1}' "$ISOLATION_RUNTIME_SOURCE"
+require_contains \
+  'cmake --build "$NATIVE_BUILD_DIR" --target msplat metallib msplat_raster_tests msplat_isolation_tests msplat_isolation_mask_tests' \
+  "$BUILD_SCRIPT"
+require_contains '"$NATIVE_BUILD_DIR/msplat_isolation_tests"' "$BUILD_SCRIPT"
+require_contains '"$NATIVE_BUILD_DIR/msplat_isolation_mask_tests"' "$BUILD_SCRIPT"
 require_contains 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$BUILD_SCRIPT"
 require_contains 'NANOFLANN_SHA256="57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc"' "$BUILD_SCRIPT"
 require_contains 'CLI11_SHA256="43e650d5e1a3acaaf419d1e61a81f77b408d0696f472be0599ddf877d40984b0"' "$BUILD_SCRIPT"
@@ -226,15 +450,15 @@ require_contains 'verifyExactRadixOracle' "$RASTER_TEST_SOURCE"
 require_contains '--radix-oracle' "$RASTER_TEST_SOURCE"
 require_contains '"$NATIVE_BUILD_DIR/msplat_raster_tests" --radix-oracle' "$BUILD_SCRIPT"
 require_contains 'msplat-1.1.3-allocation-pressure.patch' "$BUILD_SCRIPT"
-require_contains 'ALLOCATION_PRESSURE_PATCH_SHA256="d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$BUILD_SCRIPT"
+require_contains 'ALLOCATION_PRESSURE_PATCH_SHA256="34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8"' "$BUILD_SCRIPT"
 actual_allocation_pressure_patch_sha256="$(shasum -a 256 "$ALLOCATION_PRESSURE_PATCH" | awk '{print $1}')"
-[ "$actual_allocation_pressure_patch_sha256" = "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083" ] \
+[ "$actual_allocation_pressure_patch_sha256" = "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8" ] \
   || fail "allocation-pressure patch SHA-256 mismatch"
 require_contains '[ "$(sha256 "$ALLOCATION_PRESSURE_PATCH")" = "$ALLOCATION_PRESSURE_PATCH_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply --check "$ALLOCATION_PRESSURE_PATCH"' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply "$ALLOCATION_PRESSURE_PATCH"' "$BUILD_SCRIPT"
 require_contains 'allocation_pressure_patch_sha256' "$BUILD_SCRIPT"
-require_contains '"allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$VALIDATOR"
+require_contains '"allocation_pressure_patch_sha256": "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8"' "$VALIDATOR"
 require_contains 'metal_allocation_unavailable' "$ALLOCATION_PRESSURE_PATCH"
 require_contains 'msplat_metal_allocation_was_unavailable' "$ALLOCATION_PRESSURE_PATCH"
 require_contains 'msplat_simulate_gpu_allocation_failure_for_testing' "$ALLOCATION_PRESSURE_PATCH"
@@ -245,7 +469,8 @@ require_contains 'msplat_set_raster_memory_budget_bytes=msplat_set_raster_memory
 require_contains 'MSPLAT_ENABLE_RASTER_TEST_HOOKS' "$ALLOCATION_PRESSURE_PATCH"
 require_absent 'add_option("--simulate' "$ALLOCATION_PRESSURE_PATCH"
 require_absent 'add_flag("--simulate' "$ALLOCATION_PRESSURE_PATCH"
-require_contains 'return 71;' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'events->emit("isolation_memory_refused"' "$ALLOCATION_PRESSURE_PATCH"
+require_contains 'return isolate ? 75 : 71;' "$ALLOCATION_PRESSURE_PATCH"
 require_contains 'EXACT_PREFIX_HARDENING_PATCH_SHA256="510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb"' "$BUILD_SCRIPT"
 actual_exact_prefix_hardening_patch_sha256="$(shasum -a 256 "$EXACT_PREFIX_HARDENING_PATCH" | awk '{print $1}')"
 [ "$actual_exact_prefix_hardening_patch_sha256" = "510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb" ] \
@@ -272,6 +497,10 @@ require_contains 'block_totals[group] + inclusive[lane]' "$EXACT_PREFIX_HARDENIN
 require_contains '-        for (uint prior = 0; prior < group; ++prior)' "$EXACT_PREFIX_HARDENING_PATCH"
 require_absent '+        for (uint prior = 0; prior < group; ++prior)' "$EXACT_PREFIX_HARDENING_PATCH"
 require_contains 'msplat_copy_last_raster_reference_debug' "$EXACT_PREFIX_HARDENING_PATCH"
+require_contains 'msplat_copy_isolation_projection_for_testing' "$ISOLATION_PATCH"
+require_contains 'msplat_copy_isolation_projection_for_testing' "$RASTER_TEST_SOURCE"
+require_contains 'verifyIsolationLiftOracle' "$RASTER_TEST_SOURCE"
+require_contains 'isolation_lift_oracle passed' "$RASTER_TEST_SOURCE"
 require_contains 'msplat_exact_prefix_sum_for_testing' "$EXACT_PREFIX_HARDENING_PATCH"
 require_contains 'getRootCommandBuffer' "$EXACT_PREFIX_HARDENING_PATCH"
 require_contains 'return _currentCB.rootCommandBuffer' "$EXACT_PREFIX_HARDENING_PATCH"
@@ -318,6 +547,7 @@ for symbol_contract in "$BUILD_SCRIPT" "$VALIDATOR"; do
   require_contains 'msplat_exact_radix_sort_for_testing' "$symbol_contract"
   require_contains 'msplat_set_raster_memory_budget_and_fail_for_testing' "$symbol_contract"
   require_contains 'msplat_copy_last_raster_reference_debug' "$symbol_contract"
+  require_contains 'msplat_copy_isolation_projection_for_testing' "$symbol_contract"
 done
 require_contains 'geometryAdamShDegreeInterval = 4' "$RASTER_TEST_SOURCE"
 require_contains 'makeModel(inputData, geometryAdamShDegreeInterval)' "$RASTER_TEST_SOURCE"
@@ -385,12 +615,35 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'exact_prefix_hardening_patch_sha256' "$contract_file"
   require_contains 'quaternion_stability_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
+  for key in \
+    isolation_header_sha256 \
+    isolation_source_sha256 \
+    isolation_runtime_header_sha256 \
+    isolation_runtime_source_sha256 \
+    isolation_mask_header_sha256 \
+    isolation_mask_source_sha256 \
+    isolation_lift_source_sha256 \
+    isolation_test_sha256 \
+    isolation_mask_test_sha256 \
+    isolation_patch_sha256; do
+    require_contains "$key" "$contract_file"
+  done
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
-  require_contains '"overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23"' "$contract_file"
+  require_json_hash "overlay_sha256" "$OVERLAY" "$contract_file"
+  require_json_hash "isolation_header_sha256" "$ISOLATION_HEADER" "$contract_file"
+  require_json_hash "isolation_source_sha256" "$ISOLATION_SOURCE" "$contract_file"
+  require_json_hash "isolation_runtime_header_sha256" "$ISOLATION_RUNTIME_HEADER" "$contract_file"
+  require_json_hash "isolation_runtime_source_sha256" "$ISOLATION_RUNTIME_SOURCE" "$contract_file"
+  require_json_hash "isolation_mask_header_sha256" "$ISOLATION_MASK_HEADER" "$contract_file"
+  require_json_hash "isolation_mask_source_sha256" "$ISOLATION_MASK_SOURCE" "$contract_file"
+  require_json_hash "isolation_lift_source_sha256" "$ISOLATION_METAL_SOURCE" "$contract_file"
+  require_json_hash "isolation_test_sha256" "$ISOLATION_TEST_SOURCE" "$contract_file"
+  require_json_hash "isolation_mask_test_sha256" "$ISOLATION_MASK_TEST_SOURCE" "$contract_file"
+  require_json_hash "isolation_patch_sha256" "$ISOLATION_PATCH" "$contract_file"
   require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$contract_file"
-  require_contains '"raster_test_sha256": "3cf418fcd564240f1157f3206cb01974454f617327abc9b0c41b71ec49d46e30"' "$contract_file"
+  require_contains '"raster_test_sha256": "06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
-  require_contains '"allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083"' "$contract_file"
+  require_contains '"allocation_pressure_patch_sha256": "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8"' "$contract_file"
   require_contains '"exact_prefix_hardening_patch_sha256": "510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb"' "$contract_file"
   require_contains '"quaternion_stability_patch_sha256": "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786"' "$contract_file"
 done
@@ -400,12 +653,81 @@ require_contains 'json.dump(payload, output, indent=2, sort_keys=True)' "$BUILD_
 require_contains 'json.load(source, parse_constant=reject_constant)' "$BUILD_SCRIPT"
 require_contains '/usr/bin/otool -L' "$BUILD_SCRIPT"
 require_absent 'cat >"$STAGE_DIR/build_info.json" <<JSON' "$BUILD_SCRIPT"
+require_contains 'PROMOTER_SOURCE="$ROOT/scripts/toolchain/atomic_swap_install.py"' "$BUILD_SCRIPT"
+require_contains '"$PYTHON_BIN" "$PROMOTER_RUNTIME" "$@"' "$BUILD_SCRIPT"
+require_contains 'PROMOTER_RUNTIME_SOURCE_SHA256="$(sha256 "$PROMOTER_SOURCE")"' "$BUILD_SCRIPT"
+require_contains '[ "$runtime_hash" = "$PROMOTER_RUNTIME_SOURCE_SHA256" ]' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$PROMOTER_SOURCE")" = "$PROMOTER_RUNTIME_SOURCE_SHA256" ]' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$PROMOTER_RUNTIME")" = "$PROMOTER_RUNTIME_SOURCE_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'entry.st_nlink != 1' "$BUILD_SCRIPT"
+require_contains 'PROMOTER_RUNTIME_DEVICE="${identity%%:*}"' "$BUILD_SCRIPT"
+require_contains 'PROMOTER_RUNTIME_INODE="${identity#*:}"' "$BUILD_SCRIPT"
+require_absent "trap '' INT TERM HUP" "$BUILD_SCRIPT"
+require_contains 'capture_deferred_build_signal' "$BUILD_SCRIPT"
+require_contains 'replay_deferred_build_signal' "$BUILD_SCRIPT"
+require_contains 'recover_stale_private_promoters' "$BUILD_SCRIPT"
+require_contains 'BUILD_LOCK_PATH="$ROOT/Toolchains/.msplat-build.lock"' "$BUILD_SCRIPT"
+require_contains 'acquire_build_lock' "$BUILD_SCRIPT"
+require_contains 'release_build_lock' "$BUILD_SCRIPT"
+require_contains '/usr/bin/shlock -f "$BUILD_LOCK_PATH" -p "$$"' "$BUILD_SCRIPT"
+require_contains 'EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR' "$BUILD_SCRIPT"
+require_contains 'acquisition_timeout_seconds = 60' "$0"
+require_contains '--remove-private-promoter-tree' "$BUILD_SCRIPT"
+require_contains 'def remove_private_promoter_tree(' "$ATOMIC_PROMOTER"
+require_contains 'def remove_bound_build_lock(' "$ATOMIC_PROMOTER"
+require_contains 'def _after_private_promoter_validation(' "$ATOMIC_PROMOTER"
+require_contains '--remove-private-promoter-tree' "$ATOMIC_PROMOTER"
+require_contains '--remove-bound-build-lock' "$ATOMIC_PROMOTER"
+require_contains 'abandon_unbound_private_promoter' "$BUILD_SCRIPT"
+require_contains '/bin/rmdir "$path"' "$BUILD_SCRIPT"
+require_contains 'restore_build_signal_traps' "$BUILD_SCRIPT"
+require_contains 'normalize_private_promoter_metadata "$PROMOTER_RUNTIME"' "$BUILD_SCRIPT"
+require_contains 'normalize_private_promoter_metadata "$PROMOTER_RUNTIME_DIR"' "$BUILD_SCRIPT"
+require_contains '[ "$attribute" = "com.apple.provenance" ]' "$BUILD_SCRIPT"
+require_contains '/usr/bin/xattr -s -d com.apple.provenance "$entry"' "$BUILD_SCRIPT"
+require_contains '"$PROMOTER_RUNTIME_DEVICE"' "$BUILD_SCRIPT"
+require_contains '"$PROMOTER_RUNTIME_INODE"' "$BUILD_SCRIPT"
+require_contains 'PROMOTER_RUNTIME_READY=1' "$BUILD_SCRIPT"
+require_contains 'prepare_private_promoter' "$BUILD_SCRIPT"
+require_contains 'snapshot_build_inputs' "$BUILD_SCRIPT"
+require_contains 'BUILD_INPUT_SNAPSHOT_READY=1' "$BUILD_SCRIPT"
+require_absent '"$PYTHON_BIN" "$PROMOTER_SOURCE"' "$BUILD_SCRIPT"
+require_absent '/usr/bin/xattr -c' "$BUILD_SCRIPT"
+
+python3 - "$BUILD_SCRIPT" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+boundary = source.rfind("\nsnapshot_build_inputs\n")
+if boundary < 0:
+    raise SystemExit("native build never crosses the immutable input snapshot boundary")
+calls = [
+    source.rfind("\npreflight\n"),
+    source.rfind("\nacquire_build_lock\n"),
+    boundary,
+    source.rfind("\nrevalidate_snapshotted_pins\n"),
+    source.rfind("\nrecover_stale_private_promoters\n"),
+    source.rfind("\nprepare_private_promoter\n"),
+]
+if any(call < 0 for call in calls) or calls != sorted(calls):
+    raise SystemExit("native build snapshots and revalidates inputs out of order")
+downstream = source[boundary:]
+for live_root in ('"$ROOT/Tools/', '"$ROOT/scripts/ci/'):
+    if live_root in downstream:
+        raise SystemExit(
+            f"native build reads a live checkout input after snapshot: {live_root}"
+        )
+PY
 
 for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.so' 'core_extension_path.txt' '/msplat-train'; do
   require_absent "$forbidden" "$BUILD_SCRIPT"
 done
 
 for flag in --dataset --output --profile --iteration-limit --plateau-window --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --benchmark-decode --benchmark-decode-output --version --help; do
+  require_contains "$flag" "$OVERLAY"
+done
+for flag in --isolate --source-ply --mask-manifest --analysis-cache --expected-source-ply-digest --expected-selected-frames-digest --expected-training-manifest-digest --anchor-image --anchor-instance; do
   require_contains "$flag" "$OVERLAY"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -417,6 +739,20 @@ done
 for event in started checkpoint_completed checkpoint_loaded resume_rejected progress early_stop completed cancellation_requested cancelled self_check; do
   require_contains "\"$event\"" "$OVERLAY"
 done
+for event in isolation_started isolation_progress isolation_ambiguity isolation_no_subject isolation_held_out_rejected isolation_completed; do
+  require_contains "\"$event\"" "$ISOLATION_RUNTIME_SOURCE"
+done
+for event in isolation_cancelled isolation_memory_refused isolation_failed; do
+  require_contains "\"$event\"" "$OVERLAY"
+done
+require_contains '{"isolation_mode_version", 1}' "$OVERLAY"
+require_contains 'subject-isolation self-check version missing' "$BUILD_SCRIPT"
+require_contains 'expected_self_check_keys = {' "$BUILD_SCRIPT"
+require_contains 'type(event.get(key)) is not int' "$BUILD_SCRIPT"
+require_contains 'IsolationRunOutcome::ambiguous' "$OVERLAY"
+require_contains 'IsolationRunOutcome::noSubject' "$OVERLAY"
+require_contains 'IsolationRunOutcome::heldOutRejected' "$OVERLAY"
+require_contains 'return isolate ? 75 : 1' "$OVERLAY"
 for reason in trainer_changed input_changed geometry_changed run_contract_changed; do
   require_contains "\"$reason\"" "$OVERLAY"
 done
@@ -611,6 +947,263 @@ require_contains 'msplat_fail_next_sync_for_testing' "$RASTER_TEST_SOURCE"
 require_contains 'msplat_pending_exact_raster_timing_handlers_for_testing' "$RASTER_TEST_SOURCE"
 require_contains 'invalidHistory' "$RASTER_TEST_SOURCE"
 
+python3 - "$ATOMIC_PROMOTER" <<'PY'
+import hashlib
+import importlib.util
+import os
+import shutil
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+source = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("atomic_swap_install", source)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+expected_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+
+
+def create_promoter(parent, suffix):
+    root = parent / f"promoter.stage.{suffix}"
+    root.mkdir(mode=0o700)
+    executable = root / "atomic_swap_install.py"
+    shutil.copyfile(source, executable)
+    executable.chmod(0o700)
+    metadata = root.lstat()
+    return root, metadata
+
+
+with tempfile.TemporaryDirectory(prefix="easysplat-promoter-recovery.") as temporary:
+    parent = Path(temporary)
+    valid, valid_metadata = create_promoter(parent, "ABC123")
+    module.remove_private_promoter_tree(
+        valid,
+        valid_metadata.st_dev,
+        valid_metadata.st_ino,
+        expected_digest,
+    )
+    if valid.exists():
+        raise SystemExit("strict private-promoter recovery left a valid root")
+
+    injected, injected_metadata = create_promoter(parent, "DEF456")
+
+    def inject_unverified_entry(_parent, _original, directory):
+        descriptor = os.open(
+            "injected",
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory,
+        )
+        os.write(descriptor, b"preserve me\n")
+        os.close(descriptor)
+
+    module._after_private_promoter_validation = inject_unverified_entry
+    try:
+        module.remove_private_promoter_tree(
+            injected,
+            injected_metadata.st_dev,
+            injected_metadata.st_ino,
+            expected_digest,
+        )
+    except module.PromotionRecoveryError:
+        pass
+    else:
+        raise SystemExit("injected private-promoter content was accepted")
+    if (
+        not (injected / "injected").is_file()
+        or (injected / "injected").read_bytes() != b"preserve me\n"
+        or hashlib.sha256(
+            (injected / "atomic_swap_install.py").read_bytes()
+        ).hexdigest()
+        != expected_digest
+    ):
+        raise SystemExit("private-promoter recovery deleted injected state")
+
+    swapped, swapped_metadata = create_promoter(parent, "GHI789")
+
+    def install_root_replacement(parent_descriptor, original_name, _directory):
+        os.mkdir(original_name, mode=0o700, dir_fd=parent_descriptor)
+        replacement = os.open(
+            original_name,
+            module.DIRECTORY_OPEN_FLAGS,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            sentinel = os.open(
+                "replacement",
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=replacement,
+            )
+            os.write(sentinel, b"replacement\n")
+            os.close(sentinel)
+        finally:
+            os.close(replacement)
+
+    module._after_private_promoter_validation = install_root_replacement
+    module.remove_private_promoter_tree(
+        swapped,
+        swapped_metadata.st_dev,
+        swapped_metadata.st_ino,
+        expected_digest,
+    )
+    replacement = swapped / "replacement"
+    if replacement.read_bytes() != b"replacement\n":
+        raise SystemExit("private-promoter recovery removed a root replacement")
+PY
+
+python3 - "$BUILD_SCRIPT" "$ATOMIC_PROMOTER" "$ROOT" <<'PY'
+import hashlib
+import os
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+build_script = Path(sys.argv[1])
+promoter_source = Path(sys.argv[2])
+root = Path(sys.argv[3])
+build_root = root / "Toolchains" / "build" / "msplat"
+build_root.mkdir(parents=True, exist_ok=True)
+lock_path = root / "Toolchains" / ".msplat-build.lock"
+
+with tempfile.TemporaryDirectory(prefix="easysplat-build-lock.") as temporary:
+    probe_root = Path(temporary)
+    probe_a = probe_root / "a"
+    probe_b = probe_root / "b"
+    probe_a.mkdir(mode=0o700)
+    probe_b.mkdir(mode=0o700)
+    log_a = (probe_root / "a.log").open("wb")
+    env_a = os.environ.copy()
+    env_a["EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR"] = str(probe_a)
+    first = subprocess.Popen(
+        ["/bin/bash", str(build_script)],
+        cwd=root,
+        env=env_a,
+        stdout=log_a,
+        stderr=subprocess.STDOUT,
+    )
+    live_promoter = None
+    live_identity = None
+    try:
+        acquisition_timeout_seconds = 60
+        deadline = time.monotonic() + acquisition_timeout_seconds
+        while not (probe_a / "acquired").is_file():
+            if first.poll() is not None:
+                log_a.close()
+                raise SystemExit(
+                    "first build-lock probe exited before acquiring the lock: "
+                    + (probe_root / "a.log").read_text(errors="replace")
+                )
+            if time.monotonic() >= deadline:
+                process_status = first.poll()
+                log_a.flush()
+                raise SystemExit(
+                    "first build-lock probe did not acquire the lock within "
+                    f"{acquisition_timeout_seconds} seconds "
+                    f"(alive={process_status is None}, poll={process_status!r}): "
+                    + (probe_root / "a.log").read_text(errors="replace")
+                )
+            time.sleep(0.05)
+
+        for _ in range(128):
+            candidate = build_root / (
+                "promoter.stage."
+                + "".join(
+                    secrets.choice(
+                        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+                    )
+                    for _ in range(6)
+                )
+            )
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            live_promoter = candidate
+            break
+        if live_promoter is None:
+            raise SystemExit("could not create a live private-promoter fixture")
+        live_executable = live_promoter / "atomic_swap_install.py"
+        shutil.copyfile(promoter_source, live_executable)
+        live_executable.chmod(0o700)
+        live_identity = live_promoter.lstat()
+        live_digest = hashlib.sha256(live_executable.read_bytes()).hexdigest()
+
+        env_b = os.environ.copy()
+        env_b["EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR"] = str(probe_b)
+        second = subprocess.run(
+            ["/bin/bash", str(build_script)],
+            cwd=root,
+            env=env_b,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if (
+            second.returncode != 1
+            or "another native msplat build already holds" not in second.stderr
+        ):
+            raise SystemExit(
+                "parallel native builder did not fail on the live build lock"
+            )
+        after = live_promoter.lstat()
+        if (
+            not stat.S_ISDIR(after.st_mode)
+            or (after.st_dev, after.st_ino)
+            != (live_identity.st_dev, live_identity.st_ino)
+            or hashlib.sha256(live_executable.read_bytes()).hexdigest()
+            != live_digest
+        ):
+            raise SystemExit("parallel native builder changed the live promoter")
+
+        (probe_a / "release").write_bytes(b"release\n")
+        if first.wait(timeout=30) != 0:
+            log_a.close()
+            raise SystemExit(
+                "first build-lock probe failed during release: "
+                + (probe_root / "a.log").read_text(errors="replace")
+            )
+        if lock_path.exists() or lock_path.is_symlink():
+            raise SystemExit("native build-lock probe left its owned lock behind")
+    finally:
+        if first.poll() is None:
+            (probe_a / "release").write_bytes(b"release\n")
+            try:
+                first.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                first.terminate()
+                first.wait(timeout=10)
+        log_a.close()
+        if live_promoter is not None and live_identity is not None:
+            current = live_promoter.lstat()
+            if (current.st_dev, current.st_ino) != (
+                live_identity.st_dev,
+                live_identity.st_ino,
+            ):
+                raise SystemExit(
+                    "refusing to clean a replaced live-promoter fixture"
+                )
+            executable = live_promoter / "atomic_swap_install.py"
+            executable.unlink()
+            live_promoter.rmdir()
+PY
+
 if [ "${1:-}" = "--source-only" ]; then
   echo "native msplat source contracts passed"
   exit 0
@@ -631,7 +1224,10 @@ done
   || fail "native build directory is not configured: $NATIVE_BUILD_DIR"
 production_binary_hash_before="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 production_provenance_hash_before="$(shasum -a 256 "$BUILD_INFO" | awk '{print $1}')"
-cmake --build "$NATIVE_BUILD_DIR" --target msplat_allocation_pressure_cli
+cmake --build "$NATIVE_BUILD_DIR" --target \
+  msplat_allocation_pressure_cli \
+  msplat_isolation_tests \
+  msplat_isolation_mask_tests
 require_file "$ALLOCATION_PRESSURE_TEST_BIN"
 [ -x "$ALLOCATION_PRESSURE_TEST_BIN" ] \
   || fail "allocation-pressure test CLI is not executable"
@@ -647,6 +1243,11 @@ done
   || fail "building the allocation-pressure test CLI changed the production binary"
 [ "$(shasum -a 256 "$BUILD_INFO" | awk '{print $1}')" = "$production_provenance_hash_before" ] \
   || fail "building the allocation-pressure test CLI changed production provenance"
+for test_binary in "$ISOLATION_TEST_BIN" "$ISOLATION_MASK_TEST_BIN"; do
+  require_file "$test_binary"
+  [ -x "$test_binary" ] || fail "isolation test is not executable: $test_binary"
+  "$test_binary"
+done
 
 actual_files="$(cd "$INSTALL_DIR" && find . -type f -print | LC_ALL=C sort)"
 expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./build_info.json'
@@ -674,10 +1275,15 @@ for symbol in \
   msplat_stage_profiling_status_for_testing \
   msplat_gpu_timestamp_calibration_for_testing \
   msplat_copy_last_raster_debug \
-  msplat_copy_last_raster_reference_debug; do
+  msplat_copy_last_raster_reference_debug \
+  msplat_copy_isolation_projection_for_testing; do
   if nm -gU "$BIN" | grep -Fq "$symbol"; then
     fail "production CLI exports raster test hook: $symbol"
   fi
+done
+for symbol in msplat_prepare_isolation_view msplat_lift_isolation_stripe; do
+  /usr/bin/nm -gU "$BIN" | grep -Fq "$symbol" \
+    || fail "production CLI is missing isolation binding: $symbol"
 done
 /usr/bin/otool -L "$BIN" | tail -n +2 | awk '{print $1}' | while IFS= read -r dependency; do
   case "$dependency" in
@@ -693,6 +1299,9 @@ test_help_options="$(grep -Eo -- '--[a-z][a-z0-9-]*' <<<"$test_help" | LC_ALL=C 
 [ "$test_help_options" = "$production_help_options" ] \
   || fail "allocation-pressure test CLI changed the production option surface"
 for flag in --dataset --output --profile --iteration-limit --plateau-window --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --benchmark-decode --benchmark-decode-output --version --help; do
+  grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
+done
+for flag in --isolate --source-ply --mask-manifest --analysis-cache --expected-source-ply-digest --expected-selected-frames-digest --expected-training-manifest-digest --anchor-image --anchor-instance; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -711,6 +1320,45 @@ require_contains '"sequence":1' "$self_check_stdout"
 require_contains '"event":"self_check"' "$self_check_stdout"
 require_contains '"status":"ok"' "$self_check_stdout"
 require_contains '"scene_bounds_status":"ok"' "$self_check_stdout"
+python3 - "$self_check_stdout" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+if len(lines) != 1:
+    raise SystemExit("self-check must emit exactly one JSONL record")
+event = json.loads(lines[0], parse_constant=reject_constant)
+expected_keys = {
+    "event",
+    "isolation_mode_version",
+    "scene_bounds_status",
+    "schema_version",
+    "sequence",
+    "status",
+    "version",
+}
+if type(event) is not dict or set(event) != expected_keys:
+    raise SystemExit(f"self-check event schema is not closed: {sorted(event)}")
+for key in ("isolation_mode_version", "schema_version", "sequence"):
+    if type(event[key]) is not int:
+        raise SystemExit(f"self-check {key} must be an exact JSON integer")
+if event["isolation_mode_version"] != 1:
+    raise SystemExit("self-check isolation mode version mismatch")
+if (
+    event["event"] != "self_check"
+    or event["scene_bounds_status"] != "ok"
+    or event["schema_version"] != 2
+    or event["sequence"] != 1
+    or event["status"] != "ok"
+):
+    raise SystemExit("self-check event values mismatch")
+PY
 
 decode_dir="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-msplat-decode.XXXXXX")"
 python3 - "$decode_dir/source.png" <<'PY'
@@ -847,6 +1495,514 @@ set -e
   || fail "benchmark decode published output before validating its closure"
 
 negative_dir="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-msplat-negative.XXXXXX")"
+isolation_source="$negative_dir/isolation-source.ply"
+isolation_cache="$negative_dir/isolation-analysis.cache"
+isolation_output="$negative_dir/isolation-output.ply"
+isolation_dataset="$negative_dir/isolation-dataset"
+isolation_manifest="$negative_dir/isolation-mask-manifest.json"
+valid_isolation_digest="$(printf '0%.0s' {1..64})"
+uppercase_isolation_digest="$(printf 'A%.0s' {1..64})"
+short_isolation_digest="$(printf '0%.0s' {1..63})"
+printf 'source PLY sentinel\n' >"$isolation_source"
+isolation_source_hash_before="$(shasum -a 256 "$isolation_source" | awk '{print $1}')"
+
+expect_isolation_rejection() {
+  local label="$1"
+  local diagnostic="$2"
+  shift 2
+  set +e
+  "$@" \
+    >"$negative_dir/$label.stdout" \
+    2>"$negative_dir/$label.stderr"
+  local status=$?
+  set -e
+  [ "$status" = 1 ] \
+    || fail "$label isolation rejection exited with $status instead of 1"
+  grep -Eqi -- "$diagnostic" "$negative_dir/$label.stderr" \
+    || fail "$label isolation diagnostic is not useful"
+}
+
+expect_parse_suppression() {
+  local label="$1"
+  local expected_status="$2"
+  shift 2
+  set +e
+  "$@" \
+    >"$negative_dir/$label.stdout" \
+    2>"$negative_dir/$label.stderr"
+  local status=$?
+  set -e
+  [ "$status" = "$expected_status" ] \
+    || fail "$label suppressed parse exited with $status instead of $expected_status"
+  [ ! -s "$negative_dir/$label.stdout" ] \
+    && [ ! -s "$negative_dir/$label.stderr" ] \
+    || fail "$label parser emitted suppressed diagnostics"
+}
+
+case_source_digest="$valid_isolation_digest"
+case_memory_budget=1
+case_output="$isolation_output"
+case_dataset="$isolation_dataset"
+case_include_events=1
+case_events_fd=1
+case_anchor_args=()
+case_extra_args=()
+run_complete_isolation_case() {
+  local arguments=(
+    --isolate
+    --dataset "$case_dataset"
+    --source-ply "$isolation_source"
+    --mask-manifest "$isolation_manifest"
+    --analysis-cache "$isolation_cache"
+    --output "$case_output"
+    --expected-source-ply-digest "$case_source_digest"
+    --expected-input-digest "$valid_isolation_digest"
+    --expected-geometry-digest "$valid_isolation_digest"
+    --expected-selected-frames-digest "$valid_isolation_digest"
+    --expected-training-manifest-digest "$valid_isolation_digest"
+    --memory-budget-bytes "$case_memory_budget"
+  )
+  if [ "$case_include_events" = 1 ]; then
+    arguments+=(--events-fd "$case_events_fd")
+  fi
+  if [ "${#case_anchor_args[@]}" -gt 0 ]; then
+    arguments+=("${case_anchor_args[@]}")
+  fi
+  if [ "${#case_extra_args[@]}" -gt 0 ]; then
+    arguments+=("${case_extra_args[@]}")
+  fi
+  "$BIN" "${arguments[@]}"
+}
+
+expect_isolation_rejection \
+  isolation-option-without-mode \
+  'subject-isolation options require --isolate' \
+  "$BIN" --source-ply "$isolation_source"
+expect_isolation_rejection \
+  isolation-training-conflict \
+  'training-only options' \
+  "$BIN" --isolate --profile fast
+expect_isolation_rejection \
+  isolation-mode-conflict \
+  'cannot be combined' \
+  "$BIN" --isolate --self-check
+expect_isolation_rejection \
+  isolation-missing-required \
+  '--dataset is required exactly once' \
+  "$BIN" --isolate
+
+case_include_events=0
+expect_isolation_rejection \
+  isolation-missing-events \
+  '--events-fd is required exactly once' \
+  run_complete_isolation_case
+case_include_events=1
+
+case_source_digest="$uppercase_isolation_digest"
+expect_isolation_rejection \
+  isolation-invalid-digest \
+  'lowercase 64-character' \
+  run_complete_isolation_case
+case_source_digest="$short_isolation_digest"
+expect_isolation_rejection \
+  isolation-short-digest \
+  'lowercase 64-character' \
+  run_complete_isolation_case
+case_source_digest="$valid_isolation_digest"
+
+case_memory_budget=0
+expect_isolation_rejection \
+  isolation-zero-memory \
+  'must be positive' \
+  run_complete_isolation_case
+case_memory_budget=1
+
+case_output="$negative_dir/isolation-output.obj"
+expect_isolation_rejection \
+  isolation-invalid-output-extension \
+  '--output must end in .ply' \
+  run_complete_isolation_case
+case_output="$isolation_output"
+
+case_anchor_args=(--anchor-image frame-0001)
+expect_isolation_rejection \
+  isolation-unpaired-anchor \
+  'must be provided together' \
+  run_complete_isolation_case
+case_anchor_args=(--anchor-image frame-0001 --anchor-instance 0)
+expect_isolation_rejection \
+  isolation-zero-anchor \
+  'nonzero 8-bit label' \
+  run_complete_isolation_case
+case_anchor_args=(--anchor-image frame-0001 --anchor-instance 256)
+expect_isolation_rejection \
+  isolation-large-anchor \
+  'nonzero 8-bit label' \
+  run_complete_isolation_case
+case_anchor_args=()
+
+case_extra_args=(--isolate)
+expect_isolation_rejection \
+  isolation-duplicate-mode \
+  'exactly once' \
+  run_complete_isolation_case
+case_extra_args=(--dataset "$isolation_dataset")
+expect_parse_suppression \
+  isolation-duplicate-dataset \
+  1 \
+  run_complete_isolation_case
+case_extra_args=()
+expect_parse_suppression \
+  isolation-help-before-validation \
+  0 \
+  "$BIN" --isolate --help
+expect_parse_suppression \
+  isolation-version-before-validation \
+  0 \
+  "$BIN" --isolate --version
+expect_parse_suppression \
+  alternate-event-fd-help-before-validation \
+  0 \
+  "$BIN" --events-fd=02 --help
+
+printf 'mask manifest sentinel\n' >"$isolation_manifest"
+for alias_case in source mask; do
+  if [ "$alias_case" = source ]; then
+    alias_path="$isolation_source"
+  else
+    alias_path="$isolation_manifest"
+  fi
+  for argument_order in before after equals; do
+    alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+    alias_identity_before="$(stat -f '%d:%i:%l' "$alias_path")"
+    if [ "$argument_order" = before ]; then
+      parser_arguments=(
+        --isolate
+        --unknown-isolation-option
+        --events-fd 2
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+      )
+    elif [ "$argument_order" = after ]; then
+      parser_arguments=(
+        --isolate
+        --events-fd 2
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+        --unknown-isolation-option
+      )
+    else
+      parser_arguments=(
+        --isolate
+        --events-fd=2
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+        --unknown-isolation-option
+      )
+    fi
+    set +e
+    "$BIN" "${parser_arguments[@]}" \
+      >"$negative_dir/isolation-parser-fd2-$alias_case-$argument_order.stdout" \
+      2<>"$alias_path"
+    alias_status=$?
+    set -e
+    [ "$alias_status" = 1 ] \
+      || fail "fd2 parser $alias_case alias exited with $alias_status instead of 1"
+    [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+      || fail "fd2 parser diagnostics changed the isolation $alias_case input"
+    [ "$(stat -f '%d:%i:%l' "$alias_path")" = "$alias_identity_before" ] \
+      || fail "fd2 parser diagnostics replaced the isolation $alias_case input"
+    [ ! -s "$negative_dir/isolation-parser-fd2-$alias_case-$argument_order.stdout" ] \
+      || fail "fd2 parser $alias_case diagnostic escaped isolation suppression"
+  done
+done
+
+for alias_case in source mask; do
+  if [ "$alias_case" = source ]; then
+    alias_path="$isolation_source"
+  else
+    alias_path="$isolation_manifest"
+  fi
+  for argument_order in before after; do
+    alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+    alias_identity_before="$(stat -f '%d:%i:%l' "$alias_path")"
+    if [ "$argument_order" = before ]; then
+      parser_arguments=(
+        --unknown-isolation-option
+        --isolate
+        --events-fd 2
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+      )
+    else
+      parser_arguments=(
+        --isolate
+        --events-fd 1
+        --source-ply "$isolation_source"
+        --mask-manifest "$isolation_manifest"
+        --unknown-isolation-option
+      )
+    fi
+    set +e
+    if [ "$alias_case" = source ]; then
+      "$BIN" "${parser_arguments[@]}" 1<>"$alias_path" 2>&1
+    else
+      "$BIN" "${parser_arguments[@]}" 2<>"$alias_path" 1>&2
+    fi
+    alias_status=$?
+    set -e
+    [ "$alias_status" = 1 ] \
+      || fail "dual-stdio parser $alias_case alias exited with $alias_status instead of 1"
+    [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+      || fail "dual-stdio parser diagnostics changed the isolation $alias_case input"
+    [ "$(stat -f '%d:%i:%l' "$alias_path")" = "$alias_identity_before" ] \
+      || fail "dual-stdio parser diagnostics replaced the isolation $alias_case input"
+  done
+done
+
+alternate_fd1_spellings=(
+  01 +1 0x1 0X1 0b1 0o1 1_ 0b0_1 "0x'1" true " 1"
+)
+alternate_fd2_spellings=(
+  02 +2 0x2 0X2 0b10 0o2 2_ 0b1_0 "0x'2" " 2"
+)
+for descriptor in 1 2; do
+  if [ "$descriptor" = 1 ]; then
+    alias_path="$isolation_manifest"
+    spellings=("${alternate_fd1_spellings[@]}")
+  else
+    alias_path="$isolation_source"
+    spellings=("${alternate_fd2_spellings[@]}")
+  fi
+  for spelling_index in "${!spellings[@]}"; do
+    spelling="${spellings[$spelling_index]}"
+    alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+    alias_identity_before="$(stat -f '%d:%i:%l' "$alias_path")"
+    if [ $((spelling_index % 2)) = 0 ]; then
+      parser_arguments=(
+        "--events-fd=$spelling"
+        --unknown-integral-spelling
+      )
+    else
+      parser_arguments=(
+        --events-fd "$spelling"
+        --unknown-integral-spelling
+      )
+    fi
+    set +e
+    if [ "$descriptor" = 1 ]; then
+      "$BIN" "${parser_arguments[@]}" 2<>"$alias_path" 1>&2
+    else
+      "$BIN" "${parser_arguments[@]}" 1<>"$alias_path" 2>&1
+    fi
+    alias_status=$?
+    set -e
+    [ "$alias_status" = 1 ] \
+      || fail "alternate fd$descriptor spelling exited with $alias_status instead of 1"
+    [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+      || fail "alternate fd$descriptor spelling $spelling changed its aliased artifact"
+    [ "$(stat -f '%d:%i:%l' "$alias_path")" = "$alias_identity_before" ] \
+      || fail "alternate fd$descriptor spelling $spelling replaced its aliased artifact"
+  done
+done
+
+parser_source_hash_before="$(shasum -a 256 "$isolation_source" | awk '{print $1}')"
+parser_mask_hash_before="$(shasum -a 256 "$isolation_manifest" | awk '{print $1}')"
+parser_source_identity_before="$(stat -f '%d:%i:%l' "$isolation_source")"
+parser_mask_identity_before="$(stat -f '%d:%i:%l' "$isolation_manifest")"
+set +e
+"$BIN" --isolate --events-fd 1 --events-fd 2 --unknown-isolation-option \
+  1<>"$isolation_source" 2<>"$isolation_manifest"
+parser_ambiguous_status=$?
+set -e
+[ "$parser_ambiguous_status" = 1 ] \
+  || fail "ambiguous parser event descriptors exited with $parser_ambiguous_status"
+[ "$(shasum -a 256 "$isolation_source" | awk '{print $1}')" = "$parser_source_hash_before" ] \
+  && [ "$(stat -f '%d:%i:%l' "$isolation_source")" = "$parser_source_identity_before" ] \
+  || fail "ambiguous parser diagnostics changed the fd1 isolation artifact"
+[ "$(shasum -a 256 "$isolation_manifest" | awk '{print $1}')" = "$parser_mask_hash_before" ] \
+  && [ "$(stat -f '%d:%i:%l' "$isolation_manifest")" = "$parser_mask_identity_before" ] \
+  || fail "ambiguous parser diagnostics changed the fd2 isolation artifact"
+
+set +e
+"$BIN" --isolate --events-fd 1 --unknown-isolation-option \
+  >"$negative_dir/isolation-parser-fd1.stdout" \
+  2>"$negative_dir/isolation-parser-fd1.stderr"
+parser_fd1_status=$?
+"$BIN" --unknown-isolation-option \
+  >"$negative_dir/parser-ordinary.stdout" \
+  2>"$negative_dir/parser-ordinary.stderr"
+parser_ordinary_status=$?
+set -e
+[ "$parser_fd1_status" = 1 ] && [ ! -s "$negative_dir/isolation-parser-fd1.stdout" ] \
+  && [ ! -s "$negative_dir/isolation-parser-fd1.stderr" ] \
+  || fail "fd1 parser diagnostics escaped isolation suppression"
+[ "$parser_ordinary_status" = 1 ] && [ ! -s "$negative_dir/parser-ordinary.stdout" ] \
+  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-ordinary.stderr" \
+  || fail "ordinary parser diagnostics did not preserve stderr behavior"
+
+set +e
+"$BIN" -- --isolate \
+  >"$negative_dir/parser-terminator.stdout" \
+  2>"$negative_dir/parser-terminator.stderr"
+parser_terminator_status=$?
+"$BIN" --events-fd 3 --unknown-isolation-option \
+  >"$negative_dir/parser-fd3.stdout" \
+  2>"$negative_dir/parser-fd3.stderr"
+parser_fd3_status=$?
+"$BIN" --events-fd -1 --unknown-isolation-option \
+  >"$negative_dir/parser-invalid-fd.stdout" \
+  2>"$negative_dir/parser-invalid-fd.stderr"
+parser_invalid_fd_status=$?
+"$BIN" --events-fd 999999999999999999999 \
+  >"$negative_dir/parser-overflow-fd.stdout" \
+  2>"$negative_dir/parser-overflow-fd.stderr"
+parser_overflow_fd_status=$?
+"$BIN" --events-fd=03 --unknown-isolation-option \
+  >"$negative_dir/parser-nonstandard-fd3.stdout" \
+  2>"$negative_dir/parser-nonstandard-fd3.stderr"
+parser_nonstandard_fd3_status=$?
+"$BIN" --events-fd 3 --events-fd 4 \
+  >"$negative_dir/parser-duplicate-fd3.stdout" \
+  2>"$negative_dir/parser-duplicate-fd3.stderr"
+parser_duplicate_fd3_status=$?
+set -e
+[ "$parser_terminator_status" = 1 ] && [ ! -s "$negative_dir/parser-terminator.stdout" ] \
+  && grep -Fq -- '--isolate' "$negative_dir/parser-terminator.stderr" \
+  || fail "argument terminator did not preserve ordinary parser diagnostics"
+[ "$parser_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-fd3.stdout" ] \
+  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-fd3.stderr" \
+  || fail "fd3 parser diagnostics were unnecessarily suppressed"
+[ "$parser_invalid_fd_status" = 1 ] && [ ! -s "$negative_dir/parser-invalid-fd.stdout" ] \
+  && [ -s "$negative_dir/parser-invalid-fd.stderr" ] \
+  || fail "invalid non-stdio descriptor diagnostics were unnecessarily suppressed"
+[ "$parser_overflow_fd_status" = 1 ] && [ ! -s "$negative_dir/parser-overflow-fd.stdout" ] \
+  && [ -s "$negative_dir/parser-overflow-fd.stderr" ] \
+  || fail "overflow descriptor diagnostics were unnecessarily suppressed"
+[ "$parser_nonstandard_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-nonstandard-fd3.stdout" ] \
+  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-nonstandard-fd3.stderr" \
+  || fail "nonstandard fd3 diagnostics were unnecessarily suppressed"
+[ "$parser_duplicate_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-duplicate-fd3.stdout" ] \
+  && [ -s "$negative_dir/parser-duplicate-fd3.stderr" ] \
+  || fail "duplicate fd3+ diagnostics were unnecessarily suppressed"
+
+for alias_case in source mask; do
+  if [ "$alias_case" = source ]; then
+    alias_path="$isolation_source"
+  else
+    alias_path="$isolation_manifest"
+  fi
+  alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+  case_events_fd=3
+  set +e
+  run_complete_isolation_case \
+    3<>"$alias_path" \
+    >"$negative_dir/isolation-events-alias-$alias_case.stdout" \
+    2>"$negative_dir/isolation-events-alias-$alias_case.stderr"
+  alias_status=$?
+  set -e
+  [ "$alias_status" = 1 ] \
+    || fail "event descriptor $alias_case alias exited with $alias_status instead of 1"
+  [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+    || fail "event descriptor alias changed the isolation $alias_case input"
+  grep -Eqi 'event.*descriptor|alias|distinct' \
+    "$negative_dir/isolation-events-alias-$alias_case.stderr" \
+    || fail "event descriptor $alias_case alias diagnostic is not useful"
+done
+
+for alias_case in source mask; do
+  if [ "$alias_case" = source ]; then
+    alias_path="$isolation_source"
+  else
+    alias_path="$isolation_manifest"
+  fi
+  alias_hash_before="$(shasum -a 256 "$alias_path" | awk '{print $1}')"
+  case_events_fd=2
+  set +e
+  run_complete_isolation_case \
+    >"$negative_dir/isolation-events-fd2-alias-$alias_case.stdout" \
+    2<>"$alias_path"
+  alias_status=$?
+  set -e
+  [ "$alias_status" = 1 ] \
+    || fail "fd2 event descriptor $alias_case alias exited with $alias_status instead of 1"
+  [ "$(shasum -a 256 "$alias_path" | awk '{print $1}')" = "$alias_hash_before" ] \
+    || fail "fd2 event descriptor alias changed the isolation $alias_case input"
+  grep -Eqi 'event.*descriptor|alias|distinct' \
+    "$negative_dir/isolation-events-fd2-alias-$alias_case.stdout" \
+    || fail "fd2 event descriptor $alias_case alias diagnostic is not useful"
+done
+case_events_fd=1
+
+set +e
+"$BIN" --isolate --profile fast --events-fd 2 \
+  >"$negative_dir/events-fd2.stdout" \
+  2>"$negative_dir/events-fd2.jsonl"
+events_fd2_status=$?
+set -e
+[ "$events_fd2_status" = 1 ] \
+  || fail "fd2 JSONL purity probe exited with $events_fd2_status instead of 1"
+python3 - "$negative_dir/events-fd2.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+if len(lines) != 1:
+    raise SystemExit(f"fd2 event stream contains {len(lines)} lines instead of one")
+event = json.loads(lines[0])
+if event.get("event") != "isolation_failed":
+    raise SystemExit("fd2 event stream did not contain the typed isolation failure")
+PY
+[ -s "$negative_dir/events-fd2.stdout" ] \
+  || fail "fd2 event stream did not redirect human diagnostics to stdout"
+
+isolation_dataset_target="$negative_dir/isolation-dataset-target"
+mkdir "$isolation_dataset_target"
+ln -s "$isolation_dataset_target" "$isolation_dataset"
+expect_isolation_rejection \
+  isolation-symlinked-dataset \
+  'expected an ordinary directory' \
+  run_complete_isolation_case
+
+python3 - "$negative_dir/isolation-invalid-digest.stdout" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+if len(lines) != 1:
+    raise SystemExit(
+        f"invalid isolation request emitted {len(lines)} events instead of one"
+    )
+event = json.loads(lines[0], parse_constant=reject_constant)
+expected_keys = {"event", "message", "schema_version", "sequence", "status"}
+if type(event) is not dict or set(event) != expected_keys:
+    raise SystemExit(f"isolation failure event schema is not closed: {sorted(event)}")
+if type(event["schema_version"]) is not int or type(event["sequence"]) is not int:
+    raise SystemExit("isolation failure event envelope requires exact JSON integers")
+if (
+    event["event"] != "isolation_failed"
+    or event["schema_version"] != 2
+    or event["sequence"] != 1
+    or event["status"] != "failed"
+    or "lowercase 64-character" not in event["message"]
+):
+    raise SystemExit("isolation failure event values mismatch")
+PY
+
+[ "$(shasum -a 256 "$isolation_source" | awk '{print $1}')" = "$isolation_source_hash_before" ] \
+  || fail "invalid isolation CLI probes changed the source PLY"
+[ ! -e "$isolation_cache" ] || fail "invalid isolation CLI probes published an analysis cache"
+[ ! -e "$isolation_output" ] || fail "invalid isolation CLI probes published an output PLY"
+[ ! -e "$negative_dir/isolation-output.obj" ] \
+  || fail "invalid isolation CLI probes published a non-PLY output"
+
 "$BIN" --self-check --events-fd 3 \
   3>"$negative_dir/fd3.events" \
   >"$negative_dir/fd3.stdout" \
@@ -1140,10 +2296,36 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 exact_prefix_hardening_patch_sha256 quaternion_stability_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in \
+  source_commit source_version source_url source_tree_sha256 \
+  overlay_sha256 raster_test_sha256 \
+  isolation_header_sha256 isolation_source_sha256 \
+  isolation_runtime_header_sha256 isolation_runtime_source_sha256 \
+  isolation_mask_header_sha256 isolation_mask_source_sha256 \
+  isolation_lift_source_sha256 isolation_test_sha256 \
+  isolation_mask_test_sha256 isolation_patch_sha256 \
+  patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256 \
+  numeric_stability_patch_sha256 metal_safety_patch_sha256 \
+  exact_raster_patch_sha256 stage_timing_patch_sha256 \
+  memory_efficiency_patch_sha256 densification_memory_patch_sha256 \
+  row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 \
+  parallel_radix_scan_patch_sha256 allocation_pressure_patch_sha256 \
+  exact_prefix_hardening_patch_sha256 quaternion_stability_patch_sha256 \
+  executable_sha256 metallib_sha256 compiler deployment_target \
+  cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
+isolation_header_hash="$(shasum -a 256 "$ISOLATION_HEADER" | awk '{print $1}')"
+isolation_source_hash="$(shasum -a 256 "$ISOLATION_SOURCE" | awk '{print $1}')"
+isolation_runtime_header_hash="$(shasum -a 256 "$ISOLATION_RUNTIME_HEADER" | awk '{print $1}')"
+isolation_runtime_source_hash="$(shasum -a 256 "$ISOLATION_RUNTIME_SOURCE" | awk '{print $1}')"
+isolation_mask_header_hash="$(shasum -a 256 "$ISOLATION_MASK_HEADER" | awk '{print $1}')"
+isolation_mask_source_hash="$(shasum -a 256 "$ISOLATION_MASK_SOURCE" | awk '{print $1}')"
+isolation_lift_source_hash="$(shasum -a 256 "$ISOLATION_METAL_SOURCE" | awk '{print $1}')"
+isolation_test_hash="$(shasum -a 256 "$ISOLATION_TEST_SOURCE" | awk '{print $1}')"
+isolation_mask_test_hash="$(shasum -a 256 "$ISOLATION_MASK_TEST_SOURCE" | awk '{print $1}')"
+isolation_patch_hash="$(shasum -a 256 "$ISOLATION_PATCH" | awk '{print $1}')"
 source_notice_patch_hash="$(shasum -a 256 "$SOURCE_NOTICE_PATCH" | awk '{print $1}')"
 numeric_stability_patch_hash="$(shasum -a 256 "$NUMERIC_STABILITY_PATCH" | awk '{print $1}')"
 metal_safety_patch_hash="$(shasum -a 256 "$METAL_SAFETY_PATCH" | awk '{print $1}')"
@@ -1160,7 +2342,21 @@ quaternion_stability_patch_hash="$(shasum -a 256 "$QUATERNION_STABILITY_PATCH" |
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$source_notice_patch_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" "$allocation_pressure_patch_hash" "$exact_prefix_hardening_patch_hash" "$quaternion_stability_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" \
+  "$overlay_hash" \
+  "$isolation_header_hash" "$isolation_source_hash" \
+  "$isolation_runtime_header_hash" "$isolation_runtime_source_hash" \
+  "$isolation_mask_header_hash" "$isolation_mask_source_hash" \
+  "$isolation_lift_source_hash" "$isolation_test_hash" \
+  "$isolation_mask_test_hash" "$isolation_patch_hash" \
+  "$source_notice_patch_hash" "$numeric_stability_patch_hash" \
+  "$metal_safety_patch_hash" "$exact_raster_patch_hash" \
+  "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" \
+  "$densification_memory_patch_hash" "$row_span_culling_patch_hash" \
+  "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" \
+  "$allocation_pressure_patch_hash" "$exact_prefix_hardening_patch_hash" \
+  "$quaternion_stability_patch_hash" "$raster_test_hash" \
+  "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -1175,22 +2371,32 @@ expected = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "overlay_sha256": sys.argv[2],
-    "source_notice_patch_sha256": sys.argv[3],
-    "numeric_stability_patch_sha256": sys.argv[4],
-    "metal_safety_patch_sha256": sys.argv[5],
-    "exact_raster_patch_sha256": sys.argv[6],
-    "stage_timing_patch_sha256": sys.argv[7],
-    "memory_efficiency_patch_sha256": sys.argv[8],
-    "densification_memory_patch_sha256": sys.argv[9],
-    "row_span_culling_patch_sha256": sys.argv[10],
-    "geometry_adam_fusion_patch_sha256": sys.argv[11],
-    "parallel_radix_scan_patch_sha256": sys.argv[12],
-    "allocation_pressure_patch_sha256": sys.argv[13],
-    "exact_prefix_hardening_patch_sha256": sys.argv[14],
-    "quaternion_stability_patch_sha256": sys.argv[15],
-    "raster_test_sha256": sys.argv[16],
-    "executable_sha256": sys.argv[17],
-    "metallib_sha256": sys.argv[18],
+    "isolation_header_sha256": sys.argv[3],
+    "isolation_source_sha256": sys.argv[4],
+    "isolation_runtime_header_sha256": sys.argv[5],
+    "isolation_runtime_source_sha256": sys.argv[6],
+    "isolation_mask_header_sha256": sys.argv[7],
+    "isolation_mask_source_sha256": sys.argv[8],
+    "isolation_lift_source_sha256": sys.argv[9],
+    "isolation_test_sha256": sys.argv[10],
+    "isolation_mask_test_sha256": sys.argv[11],
+    "isolation_patch_sha256": sys.argv[12],
+    "source_notice_patch_sha256": sys.argv[13],
+    "numeric_stability_patch_sha256": sys.argv[14],
+    "metal_safety_patch_sha256": sys.argv[15],
+    "exact_raster_patch_sha256": sys.argv[16],
+    "stage_timing_patch_sha256": sys.argv[17],
+    "memory_efficiency_patch_sha256": sys.argv[18],
+    "densification_memory_patch_sha256": sys.argv[19],
+    "row_span_culling_patch_sha256": sys.argv[20],
+    "geometry_adam_fusion_patch_sha256": sys.argv[21],
+    "parallel_radix_scan_patch_sha256": sys.argv[22],
+    "allocation_pressure_patch_sha256": sys.argv[23],
+    "exact_prefix_hardening_patch_sha256": sys.argv[24],
+    "quaternion_stability_patch_sha256": sys.argv[25],
+    "raster_test_sha256": sys.argv[26],
+    "executable_sha256": sys.argv[27],
+    "metallib_sha256": sys.argv[28],
 }
 for key, value in expected.items():
     if payload.get(key) != value:
@@ -1700,6 +2906,186 @@ for fixture in manifest["fixtures"]:
 PY
 )
 [ "$fixture_count" = "12" ] || fail "sparse fixture generator did not produce twelve cases"
+
+isolation_runtime_dir="$negative_dir/background-mask-runtime"
+mkdir "$isolation_runtime_dir"
+isolation_runtime_source="$negative_dir/training-01-sphere-500/splat.ply"
+[ -s "$isolation_runtime_source" ] \
+  || fail "isolation runtime fixture has no trained source PLY"
+python3 - "$isolation_runtime_dir" \
+  "$negative_dir/training-01-sphere-500/checkpoint" \
+  "$isolation_runtime_source" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+root, checkpoint, source = map(Path, sys.argv[1:])
+current = checkpoint / "CURRENT"
+generation = current.read_text(encoding="utf-8").strip()
+if (
+    not generation
+    or "/" in generation
+    or "\\" in generation
+    or generation in {".", ".."}
+):
+    raise SystemExit("isolation runtime fixture has no valid current checkpoint")
+manifest = checkpoint / "generations" / generation / "manifest.json"
+if not manifest.is_file():
+    raise SystemExit("isolation runtime fixture has no current checkpoint manifest")
+training = json.loads(manifest.read_text(encoding="utf-8"))
+input_digest = training["input_digest"]
+geometry_digest = training["geometry_digest"]
+source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+selected_frames_digest = "2" * 64
+training_manifest_digest = "3" * 64
+
+
+def write_mask(name: str, label: int) -> tuple[str, str]:
+    path = root / name
+    Image.new("L", (32, 32), label).save(path, format="PNG")
+    return name, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+blank_work = write_mask("blank-work.png", 0)
+blank_held_out = write_mask("blank-held-out.png", 0)
+foreground_work = [
+    write_mask(f"foreground-work-{index}.png", 1)
+    for index in range(3)
+]
+
+
+def write_manifest(name: str, views: list[tuple[int, str, tuple[str, str]]]) -> None:
+    payload = {
+        "schema_version": 1,
+        "isolation_mode_version": 1,
+        "source_ply_digest": source_digest,
+        "input_digest": input_digest,
+        "geometry_digest": geometry_digest,
+        "selected_frames_digest": selected_frames_digest,
+        "training_manifest_digest": training_manifest_digest,
+        "selected_image_order": [f"{index:04d}.png" for index, _, _ in views],
+        "views": [
+            {
+                "image_identity": f"{index:04d}.png",
+                "camera_index": index,
+                "role": role,
+                "relative_mask_path": mask[0],
+                "mask_sha256": mask[1],
+                "width": 32,
+                "height": 32,
+            }
+            for index, role, mask in views
+        ],
+    }
+    (root / name).write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+
+write_manifest(
+    "all-background.json",
+    [(0, "work", blank_work), (1, "held_out", blank_held_out)],
+)
+write_manifest(
+    "blank-held-out.json",
+    [(0, "work", foreground_work[0]), (1, "work", foreground_work[1]),
+     (2, "work", foreground_work[2]), (3, "held_out", blank_held_out)],
+)
+(root / "digests.json").write_text(
+    json.dumps(
+        {
+            "source": source_digest,
+            "input": input_digest,
+            "geometry": geometry_digest,
+            "selected_frames": selected_frames_digest,
+            "training_manifest": training_manifest_digest,
+        },
+        separators=(",", ":"),
+    ),
+    encoding="utf-8",
+)
+PY
+read -r isolation_source_digest isolation_input_digest isolation_geometry_digest \
+  isolation_selected_frames_digest isolation_training_manifest_digest <<EOF
+$(python3 - "$isolation_runtime_dir/digests.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+print(
+    payload["source"], payload["input"], payload["geometry"],
+    payload["selected_frames"], payload["training_manifest"]
+)
+PY
+)
+EOF
+
+run_background_mask_runtime_case() {
+  local manifest="$1"
+  local cache="$2"
+  local output="$3"
+  local events="$4"
+  "$BIN" --isolate \
+    --dataset "$fixture_root/01-sphere-500" \
+    --source-ply "$isolation_runtime_source" \
+    --mask-manifest "$manifest" \
+    --analysis-cache "$cache" \
+    --output "$output" \
+    --expected-source-ply-digest "$isolation_source_digest" \
+    --expected-input-digest "$isolation_input_digest" \
+    --expected-geometry-digest "$isolation_geometry_digest" \
+    --expected-selected-frames-digest "$isolation_selected_frames_digest" \
+    --expected-training-manifest-digest "$isolation_training_manifest_digest" \
+    --memory-budget-bytes 536870912 \
+    --events-fd 1 >"$events"
+}
+
+all_background_output="$isolation_runtime_dir/all-background-output.ply"
+run_background_mask_runtime_case \
+  "$isolation_runtime_dir/all-background.json" \
+  "$isolation_runtime_dir/all-background.cache" \
+  "$all_background_output" \
+  "$isolation_runtime_dir/all-background.events.jsonl"
+[ ! -e "$all_background_output" ] \
+  || fail "all-background work masks published a PLY"
+
+blank_held_out_output="$isolation_runtime_dir/blank-held-out-output.ply"
+run_background_mask_runtime_case \
+  "$isolation_runtime_dir/blank-held-out.json" \
+  "$isolation_runtime_dir/blank-held-out.cache" \
+  "$blank_held_out_output" \
+  "$isolation_runtime_dir/blank-held-out.events.jsonl"
+[ ! -e "$blank_held_out_output" ] \
+  || fail "background-only held-out mask published a PLY"
+python3 - "$isolation_runtime_dir/all-background.events.jsonl" \
+  "$isolation_runtime_dir/blank-held-out.events.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def events(path: str) -> list[dict]:
+    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+
+
+all_background, blank_held_out = map(events, sys.argv[1:])
+if not any(event.get("event") == "isolation_no_subject" for event in all_background):
+    raise SystemExit("all-background work masks did not reach isolation_no_subject")
+if any(event.get("event") == "isolation_completed" for event in all_background):
+    raise SystemExit("all-background work masks emitted isolation_completed")
+rejections = [
+    event for event in blank_held_out
+    if event.get("event") == "isolation_held_out_rejected"
+]
+if len(rejections) != 1:
+    raise SystemExit("background-only held-out mask did not reach held-out rejection")
+if any(event.get("event") == "isolation_completed" for event in blank_held_out):
+    raise SystemExit("background-only held-out mask emitted isolation_completed")
+evidence = rejections[0].get("held_out_evidence")
+if evidence != [{"best_instance": 0, "image_identity": "0003.png", "soft_iou": 0.0}]:
+    raise SystemExit(f"background-only held-out evidence changed: {evidence!r}")
+PY
 
 # Shader validation changes floating-point scheduling enough to make a long,
 # adversarial convergence run nondeterministic on some hosted GPUs. Keep the

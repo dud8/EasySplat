@@ -51,6 +51,10 @@ enum RunDurationPredictor {
         case videos(ClipCount)
         case photos
         case mixed(ClipCount)
+        // Per-format buckets: an adopt-direct COLMAP import and a
+        // triangulated Nerfstudio import have very different runtimes, so
+        // their histories must not pollute each other or the photo bucket.
+        case dataset(DatasetKind)
 
         init(_ input: InputSpec) {
             switch input {
@@ -60,6 +64,8 @@ enum RunDurationPredictor {
                 self = .photos
             case .mixed(let videos, _):
                 self = .mixed(ClipCount(videos.count))
+            case .dataset(let kind, _):
+                self = .dataset(kind)
             }
         }
     }

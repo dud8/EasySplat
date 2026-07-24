@@ -440,6 +440,8 @@ python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
 python3 "$ROOT/scripts/toolchain/tests/test_da3_payload.py"
 python3 "$ROOT/scripts/toolchain/tests/test_create_reproducible_zip.py"
 python3 "$ROOT/scripts/toolchain/tests/test_local_launcher.py"
+/usr/bin/python3 -I \
+  "$ROOT/scripts/benchmark/tests/test_subject_isolation_release_gate.py"
 /usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_atomic_swap_install.py"
 /usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_colmap_build_supervisor.py"
 /usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_colmap_support_builder.py" \
@@ -2764,9 +2766,9 @@ test ! -e "$atomic_outside"
 test "$(cat "$atomic_malformed_scratch")" = "sealed"
 rm -f "$atomic_malformed_scratch"
 grep -Fq 'NSIRD_EasySplatReleaseVerifier_' "$atomic_home/release-verifier.sb"
-grep -Fq 'EasySplat-selected-lineage-' "$atomic_home/release-verifier.sb"
-grep -Fq 'EasySplat-video-lineage-' "$atomic_home/release-verifier.sb"
-grep -Fq 'EasySplat-finished-dataset-replay-' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat\-selected\-lineage\-' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat\-video\-lineage\-' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat\-finished\-dataset\-replay\-' "$atomic_home/release-verifier.sb"
 
 expected_manifest_probe="$sandbox_test_root/expected-manifest-reader.py"
 cat >"$expected_manifest_probe" <<'PY'

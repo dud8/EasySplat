@@ -166,6 +166,27 @@ public final class PipelineRunner: @unchecked Sendable {
             freshPublicationAttestation: freshPublicationAttestation
         )
         try PhotoInputReceiptValidator.validateFiles(metadata: metadata, paths: paths)
+        // Dataset projects rebind the persisted pose seed the same way photo and
+        // video receipts are rebound: no run starts against drifted seed bytes.
+        try DatasetPoseSeedReceiptValidator.validateMetadata(metadata)
+        if let datasetPoseSeed = metadata.datasetPoseSeed {
+            try DatasetPoseSeedReceiptValidator.validateFiles(
+                receipt: datasetPoseSeed,
+                projectRoot: projectURL
+            )
+            // The seed files now match their receipt digests, so the parsed seed
+            // model and the admitted photo receipts are the authenticated inputs
+            // for the one-to-one entry closure: every declared image binds to
+            // exactly one seed image and one adopted photo, and none is left over.
+            let seedModel = try ColmapModelReader.readText(
+                modelDirectory: paths.importSeedURL
+            )
+            try DatasetPoseSeedReceiptValidator.validateClosure(
+                receipt: datasetPoseSeed,
+                photoReceipts: metadata.photoInputReceipts ?? [],
+                seedModel: seedModel
+            )
+        }
         // No project directory is created or repaired until the immutable video receipts
         // have been rebound to the exact controlled bytes they describe.
         try paths.ensureDirectories()
@@ -182,7 +203,13 @@ public final class PipelineRunner: @unchecked Sendable {
             input: metadata.input,
             hardware: detectedHardwareProfile,
             developmentOverrides: config.developmentOverrides,
-            trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes
+            trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes,
+            datasetImport: metadata.datasetPoseSeed.map {
+                RunPlanResolver.DatasetImportContext(
+                    route: $0.route,
+                    imageCount: $0.imageCount
+                )
+            }
         )
         let resolvedRunPlan: ResolvedRunPlan = {
             var plan = config.resolvedRunPlan ?? hardwareResolvedRunPlan
@@ -1087,6 +1114,11 @@ public final class PipelineRunner: @unchecked Sendable {
                         manifestURL: paths.framesSelectedManifestURL,
                         maxDimension: maxDim,
                         projectPaths: paths,
+                        // Dataset frames are copied verbatim: the imported camera
+                        // calibration describes the original pixel grid, so any
+                        // resize, re-encode, or orientation bake would silently
+                        // corrupt the geometry keyed to it.
+                        datasetPreservesSourceBytes: metadata.input.isDataset,
                         progress: { fraction, message in
                             emit(.stageProgress(stage: .selectFrames, fraction: fraction, message: message))
                         }
@@ -1290,7 +1322,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 && mappingAttemptCount > 0
 
             if let recovery = restoredGeometryRecovery {
-                if recovery.activeBackend == .colmap {
+                if recovery.activeBackend == .colmap
+                    || recovery.activeBackend == .importedPoses {
                     switch recovery.colmapComputeMode {
                     case .cpu:
                         colmapExtractOptions.useGPU = false
@@ -1301,7 +1334,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         throw GeometryRecoveryState.ValidationError.invalidBackendFields
                     }
                 }
-                if recovery.activeBackend == .colmap,
+                if recovery.activeBackend == .colmap
+                    || recovery.activeBackend == .importedPoses,
                    let level = recovery.pendingPairRecoveryLevel {
                     pairRecoveryLevel = PairRecoveryLevel(level)
                 }
@@ -1316,7 +1350,13 @@ public final class PipelineRunner: @unchecked Sendable {
                 pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil
             ) throws {
                 let recoveryBackend = resolvedRunPlan.geometryBackend
-                let mapperGraphContext = recoveryBackend == .colmap
+                // Imported poses run features and matching on the classical
+                // COLMAP edges, so the classical pair-graph and compute-mode
+                // recovery fields persist for both backends; only the
+                // incremental mapper cadence stays COLMAP-exclusive.
+                let usesClassicalPairGraph = recoveryBackend == .colmap
+                    || recoveryBackend == .importedPoses
+                let mapperGraphContext = usesClassicalPairGraph
                     ? activeMapperGraphContext
                     : nil
                 let state = GeometryRecoveryState(
@@ -1326,7 +1366,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     mappingAttemptCount: mappingAttemptCount,
                     mappingFallbackReasons: mappingFallbackReasons,
                     pendingPairRecoveryLevel: pendingPairRecoveryLevel,
-                    colmapComputeMode: recoveryBackend == .colmap
+                    colmapComputeMode: usesClassicalPairGraph
                         ? (colmapMatchOptions.useGPU ? .gpu : .cpu)
                         : nil,
                     plannedIncrementalCadence: recoveryBackend == .colmap
@@ -1362,7 +1402,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 guard mappingAttemptCount < GeometryRecoveryState.maximumMappingAttemptCount else {
                     throw GeometryRecoveryState.ValidationError.invalidMappingAttemptCount
                 }
-                if resolvedRunPlan.geometryBackend == .colmap,
+                if resolvedRunPlan.geometryBackend == .colmap
+                    || resolvedRunPlan.geometryBackend == .importedPoses,
                    acceptedPairGraphEvidence == nil {
                     throw PairGraphEvidenceStoreError.invalidEvidence
                 }
@@ -1482,30 +1523,6 @@ public final class PipelineRunner: @unchecked Sendable {
                             acceptedDa3ModelSubdirectory = manifest.modelSubdirectory
                             emit(.stageLog(stage: currentStage, line: "DA3 coverage: \(manifest.summary).", isError: false))
                             return manifest
-                        }
-
-                        func analyzeDa3Model(
-                            at modelURL: URL,
-                            toolLog: ToolLogWriter? = nil
-                        ) async throws -> ReconstructionScore {
-                            let report = try await self.tooling.colmap.runModelAnalyzer(
-                                colmapPath: self.config.toolchain.colmap,
-                                modelPath: modelURL,
-                                environment: [:]
-                            )
-                            for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
-                                toolLog?.append(stream: "stdout", line: String(line))
-                            }
-                            let score = ReconstructionScorer.applyingExpectedTotalImages(
-                                ReconstructionScorer.parseModelAnalyzerOutput(report),
-                                expectedTotalImages: selectedFrames.count
-                            )
-                            emit(.stageLog(
-                                stage: currentStage,
-                                line: "DA3 score: \(ReconstructionScorer.summary(score)).",
-                                isError: false
-                            ))
-                            return score
                         }
 
                         if try shouldRunStage(.sfmFeatures) {
@@ -1911,7 +1928,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                             let refinementSeed = paths.colmapRefinementSeedModelURL
                             defer { self.removeIfExists(refinementSeed.deletingLastPathComponent()) }
-                            if try self.prepareDa3RefinementSeed(
+                            if try self.prepareExternalRefinementSeed(
                                 rawModelURL: seedZero,
                                 outputModelURL: refinementSeed,
                                 databaseURL: paths.colmapDatabaseURL,
@@ -1928,109 +1945,34 @@ public final class PipelineRunner: @unchecked Sendable {
                                 progress: 0,
                                 message: "DA3 refinement started"
                             )
-                            let mappingAttemptOrdinal = try beginMappingAttempt()
-                            try self.resetDirectory(paths.colmapSparseURL)
-                            try self.resetDirectory(sparseZero)
-                            let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
-                            colmapToolLog.beginSection(
-                                title: "da3_refinement",
-                                metadata: [
-                                    "database": paths.colmapDatabaseURL.path,
-                                    "images": paths.framesSelectedURL.path,
-                                    "seed": refinementSeed.path,
-                                    "output": sparseZero.path,
-                                    "tool": self.config.toolchain.colmap.path
-                                ]
-                            )
-                            emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: point_triangulator.", isError: false))
-                            try self.tooling.checkCancellation()
-                            try await self.tooling.colmap.runPointTriangulator(
-                                colmapPath: self.config.toolchain.colmap,
-                                database: paths.colmapDatabaseURL,
-                                imagePath: paths.framesSelectedURL,
-                                inputPath: refinementSeed,
-                                outputPath: sparseZero,
-                                environment: [:],
-                                onLog: { line, isErr in
-                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                }
-                            )
-
-                            let baOutput = paths.colmapSparseURL.appendingPathComponent("0_ba", isDirectory: true)
-                            self.removeIfExists(baOutput)
-                            try fm.createDirectory(at: baOutput, withIntermediateDirectories: true)
-                            emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: bundle_adjuster.", isError: false))
-                            try await self.tooling.colmap.runBundleAdjuster(
-                                colmapPath: self.config.toolchain.colmap,
-                                inputPath: sparseZero,
-                                outputPath: baOutput,
-                                environment: [:],
+                            let acceptance = try await runSeededTriangulationMapping(
+                                seedModelURL: refinementSeed,
+                                paths: paths,
+                                selectedFrames: selectedFrames,
+                                capturePath: resolvedRunPlan.capturePath,
                                 bundleOptions: ColmapBundleAdjustmentOptions(
                                     maxNumIterations: resolvedRunPlan.refinementIterationLimit,
                                     refineExtraParams: !["PINHOLE", "SIMPLE_PINHOLE"].contains(
                                         da3Config.cameraType
                                     )
                                 ),
-                                onLog: { line, isErr in
-                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                }
+                                mapperLabel: "da3-refined",
+                                toolLogSectionTitle: "da3_refinement",
+                                refinementLogNoun: "DA3 refinement",
+                                scoreLogLabel: "DA3 score",
+                                beginMappingAttempt: { try beginMappingAttempt() },
+                                currentMappingAttemptCount: { mappingAttemptCount },
+                                prepareCanonicalTextCandidate: {
+                                    try prepareCanonicalTextCandidate(
+                                        at: $0,
+                                        mappingAttemptOrdinal: $1
+                                    )
+                                },
+                                emit: emit
                             )
-                            guard sparseModelFilesExist(at: baOutput) else {
-                                throw PipelineError.outputMissing
-                            }
-                            self.removeIfExists(sparseZero)
-                            try fm.moveItem(at: baOutput, to: sparseZero)
-                            let canonicalModelPublication = try prepareCanonicalTextCandidate(
-                                at: sparseZero,
-                                mappingAttemptOrdinal: mappingAttemptOrdinal
-                            )
-                            let conditioningAnalysis = try self.validatedConditionedGeometry(
-                                modelDirectory: sparseZero,
-                                selectedFrames: selectedFrames,
-                                requireStrongObservationCoverage: true
-                            )
-
-                            let membership = try ColmapSparseModelMembershipReader(
-                                databaseURL: paths.colmapDatabaseURL,
-                                selectedImageNames: selectedFrames.map(\.lastPathComponent)
-                            ).read(
-                                modelDirectories: [sparseZero],
-                                checkCancellation: self.tooling.checkCancellation
-                            )
-
-                            let score = try await analyzeDa3Model(
-                                at: sparseZero,
-                                toolLog: colmapToolLog
-                            )
-                            guard ReconstructionScorer.isAcceptable(
-                                score,
-                                capturePath: resolvedRunPlan.capturePath
-                            ),
-                                  score.registeredImages
-                                    == membership.largestModelRegisteredViewCount,
-                                  conditioningAnalysis.residuals.registeredViewCount
-                                    == score.registeredImages,
-                                  let residual = score.meanReprojectionError,
-                                  residual.isFinite else {
-                                throw PipelineError.lowQualityReconstruction(score, mapper: "da3-refined")
-                            }
-                            acceptedMappingArtifact = MappingArtifact(
-                                modelCount: membership.modelCount,
-                                largestModelRegisteredViewCount:
-                                    membership.largestModelRegisteredViewCount,
-                                secondLargestModelRegisteredViewCount:
-                                    membership.secondLargestModelRegisteredViewCount,
-                                unionRegisteredViewCount: membership.unionRegisteredViewCount,
-                                attemptCount: mappingAttemptCount,
-                                acceptedMappingAttemptOrdinal: mappingAttemptOrdinal,
-                                acceptedRefinementKind: .seededBundleAdjustment,
-                                acceptedRefinementInvocationCount: 1,
-                                incrementalCadence: nil,
-                                canonicalModelPublication: canonicalModelPublication,
-                                fallbackReason: nil
-                            )
+                            acceptedMappingArtifact = acceptance.artifact
                             acceptedMapper = "da3-refined"
-                            acceptedConditioningAnalysis = conditioningAnalysis
+                            acceptedConditioningAnalysis = acceptance.conditioning
                             emit(.stageLog(
                                 stage: .sfmMapping,
                                 line: "DA3 aligned seed accepted after triangulation and bounded bundle adjustment.",
@@ -2039,7 +1981,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                     } else {
             var resumingPersistedPolicyRecovery =
-                restoredGeometryRecovery?.activeBackend == .colmap
+                (restoredGeometryRecovery?.activeBackend == .colmap
+                    || restoredGeometryRecovery?.activeBackend == .importedPoses)
                 && restoredGeometryRecovery?.pendingPairRecoveryLevel != nil
 
             func restoreAcceptedPairEvidence(_ evidence: PairGraphEvidence) throws {
@@ -2060,7 +2003,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 let acceptedPlan = try evidence.restoredPairPlan()
                 let mapperGraphContext = try evidence.mapperWorkerInvocationContext()
                 if let recovery = restoredGeometryRecovery,
-                   recovery.activeBackend == .colmap,
+                   recovery.activeBackend == .colmap
+                    || recovery.activeBackend == .importedPoses,
                    metadata.checkpoint?.stage == .sfmMapping {
                     try recovery.validatePairGraphBinding(
                         acceptedPairAttemptOrdinal:
@@ -2565,6 +2509,11 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             let runFeatures: (Bool) async throws -> Void = { force in
+                // Directly-adopted dataset geometry needs no feature database:
+                // the imported model is republished verbatim. Skip the stage
+                // cleanly (no stageStarted), like a photo project skips frame
+                // extraction.
+                if resolvedRunPlan.datasetGeometryRoute == .adoptDirect { return }
                 guard try (force || shouldRunStage(.sfmFeatures)) else { return }
                 currentStage = .sfmFeatures
                 emit(.stageStarted(stage: .sfmFeatures))
@@ -2793,6 +2742,9 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             let runMatching: (Bool) async throws -> Void = { force in
+                // The adoptDirect route skips matching for the same reason it
+                // skips feature extraction: there is no pair graph to solve.
+                if resolvedRunPlan.datasetGeometryRoute == .adoptDirect { return }
                 if recoveredAcceptedExactEvidence {
                     recoveredAcceptedExactEvidence = false
                     return
@@ -3682,7 +3634,221 @@ public final class PipelineRunner: @unchecked Sendable {
                 }
 
                 try Task.checkCancellation()
-                if try shouldRunStage(.sfmMapping) {
+                let shouldRunMappingStage = try shouldRunStage(.sfmMapping)
+                if shouldRunMappingStage, backendPolicy == .importedPoses,
+                   resolvedRunPlan.datasetGeometryRoute == .adoptDirect {
+                    completedMappingThisAttempt = true
+                    currentStage = .sfmMapping
+                    emit(.stageStarted(stage: .sfmMapping))
+                    guard let datasetPoseSeed = metadata.datasetPoseSeed,
+                          datasetPoseSeed.route == .adoptDirect else {
+                        emitFailure(
+                            stage: .sfmMapping,
+                            userMessage: "The imported dataset's geometry is missing.",
+                            debugMessage: "The adoptDirect route requires metadata.datasetPoseSeed bound to adoptDirect, which was absent at the mapping stage."
+                        )
+                        throw PipelineError.invalidInput
+                    }
+                    // Republish the dataset's own model (image names finalized
+                    // against the selected frames) as the canonical sparse/0, then
+                    // measure and gate it with the same conditioning and scorer
+                    // caps a native solve passes. No subprocess runs on this route.
+                    // Direct adoption verifies the imported model's internal
+                    // consistency, its seed/source digests, and those residual
+                    // gates; it does not re-derive the model from pixel features,
+                    // so the association between the geometry and the images is
+                    // trusted from the export by the user's choice of this route.
+                    let stagedSeedModel = try finalizeImportedPoseSeed(
+                        receipt: datasetPoseSeed,
+                        paths: paths,
+                        selectedFrameManifest: selectedFrameManifest,
+                        checkCancellation: self.tooling.checkCancellation,
+                        onLog: { line in
+                            emit(.stageLog(stage: .sfmMapping, line: line, isError: true))
+                        }
+                    )
+                    let sparseZero = paths.colmapSparseURL.appendingPathComponent(
+                        "0",
+                        isDirectory: true
+                    )
+                    try self.resetDirectory(paths.colmapSparseURL)
+                    try FileManager.default.createDirectory(
+                        at: paths.colmapSparseURL,
+                        withIntermediateDirectories: true
+                    )
+                    try FileManager.default.moveItem(at: stagedSeedModel, to: sparseZero)
+                    self.removeIfExists(stagedSeedModel.deletingLastPathComponent())
+                    writeCheckpoint(
+                        stage: .sfmMapping,
+                        progress: 0.5,
+                        message: "Adopting imported geometry"
+                    )
+                    try requireTextSparseModelFiles(at: sparseZero)
+                    let adoptedImagesTxt = sparseZero.appendingPathComponent("images.txt")
+                    if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(
+                        at: adoptedImagesTxt,
+                        checkCancellation: self.tooling.checkCancellation
+                    ) {
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "Normalized the adopted camera model (added missing POINTS2D lines).",
+                            isError: false
+                        ))
+                    }
+                    let adoptedConditioning = try validatedConditionedGeometry(
+                        modelDirectory: sparseZero,
+                        selectedFrames: selectedFrames,
+                        requireStrongObservationCoverage: true
+                    )
+                    let adoptedScore = ReconstructionScorer.applyingExpectedTotalImages(
+                        ReconstructionScorer.parseSparseTextModel(
+                            at: sparseZero,
+                            expectedTotalImages: selectedFrames.count
+                        ) ?? ReconstructionScore(
+                            registeredImages: 0,
+                            totalImages: 0,
+                            meanReprojectionError: nil
+                        ),
+                        expectedTotalImages: selectedFrames.count
+                    )
+                    emit(.stageLog(
+                        stage: .sfmMapping,
+                        line: "Adopted-model score: \(ReconstructionScorer.summary(adoptedScore)).",
+                        isError: false
+                    ))
+                    guard ReconstructionScorer.isAcceptable(
+                        adoptedScore,
+                        capturePath: resolvedRunPlan.capturePath
+                    ),
+                          adoptedScore.registeredImages
+                            == adoptedConditioning.residuals.registeredViewCount,
+                          adoptedScore.registeredImages == selectedFrames.count else {
+                        throw PipelineError.lowQualityReconstruction(
+                            adoptedScore,
+                            mapper: "imported-adopted"
+                        )
+                    }
+                    guard let adoptedPeakMemoryBytes = geometryMemorySampler.sampledPeak() else {
+                        throw PipelineError.geometryResidualsUnavailable(
+                            "Geometry-stage physical memory could not be measured"
+                        )
+                    }
+                    let adoptedSelectedFrameManifest = (try? loadSelectedFrameManifest(
+                        from: paths.framesSelectedManifestURL
+                    )) ?? selectedFrameManifest
+                    try persistImportedGeometryArtifact(
+                        metadata: &metadata,
+                        paths: paths,
+                        resolvedPlan: resolvedRunPlan,
+                        receipt: datasetPoseSeed,
+                        selectedFrames: selectedFrames,
+                        selectedFrameManifest: adoptedSelectedFrameManifest,
+                        inputSnapshots: inputLease.videos + inputLease.photos,
+                        peakMemoryBytes: adoptedPeakMemoryBytes,
+                        colmapRuntimeClosure: initialColmapRuntimeClosure,
+                        acceptedAnalysis: adoptedConditioning,
+                        currentMappingDurationSeconds: {
+                            stageTiming.elapsedSeconds(.sfmMapping)
+                        }
+                    )
+                    writeCheckpoint(
+                        stage: .sfmMapping,
+                        progress: 1.0,
+                        message: "Imported geometry adopted"
+                    )
+                    emit(.stageLog(
+                        stage: .sfmMapping,
+                        line: "Imported dataset geometry adopted directly.",
+                        isError: false
+                    ))
+                    // acceptedMapper stays nil: the persisted artifact is
+                    // re-validated by the shared mapping tail's else branch.
+                } else if shouldRunMappingStage, backendPolicy == .importedPoses {
+                    completedMappingThisAttempt = true
+                    currentStage = .sfmMapping
+                    emit(.stageStarted(stage: .sfmMapping))
+                    guard resolvedRunPlan.datasetGeometryRoute == .seedTriangulate else {
+                        emitFailure(
+                            stage: .sfmMapping,
+                            userMessage: "This dataset's geometry can't be reconstructed.",
+                            debugMessage: "The importedPoses backend reached the mapping stage without a recognized dataset geometry route."
+                        )
+                        throw PipelineError.invalidInput
+                    }
+                    guard let datasetPoseSeed = metadata.datasetPoseSeed else {
+                        emitFailure(
+                            stage: .sfmMapping,
+                            userMessage: "The imported dataset's pose seed is missing.",
+                            debugMessage: "The importedPoses backend requires metadata.datasetPoseSeed, which was absent at the mapping stage."
+                        )
+                        throw PipelineError.invalidInput
+                    }
+                    let stagedSeedModel = try finalizeImportedPoseSeed(
+                        receipt: datasetPoseSeed,
+                        paths: paths,
+                        selectedFrameManifest: selectedFrameManifest,
+                        checkCancellation: self.tooling.checkCancellation,
+                        onLog: { line in
+                            emit(.stageLog(stage: .sfmMapping, line: line, isError: true))
+                        }
+                    )
+                    let refinementSeed = paths.colmapRefinementSeedModelURL
+                    defer {
+                        self.removeIfExists(refinementSeed.deletingLastPathComponent())
+                        self.removeIfExists(stagedSeedModel.deletingLastPathComponent())
+                    }
+                    if try self.prepareExternalRefinementSeed(
+                        rawModelURL: stagedSeedModel,
+                        outputModelURL: refinementSeed,
+                        databaseURL: paths.colmapDatabaseURL,
+                        checkCancellation: self.tooling.checkCancellation
+                    ) {
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "Prepared the imported pose seed for the COLMAP feature database.",
+                            isError: false
+                        ))
+                    }
+                    writeCheckpoint(
+                        stage: .sfmMapping,
+                        progress: 0,
+                        message: "Imported pose refinement started"
+                    )
+                    let acceptance = try await runSeededTriangulationMapping(
+                        seedModelURL: refinementSeed,
+                        paths: paths,
+                        selectedFrames: selectedFrames,
+                        capturePath: resolvedRunPlan.capturePath,
+                        bundleOptions: ColmapBundleAdjustmentOptions(
+                            maxNumIterations: resolvedRunPlan.refinementIterationLimit,
+                            refineFocalLength: false,
+                            refinePrincipalPoint: false,
+                            refineExtraParams: false,
+                            refineExtrinsics: false
+                        ),
+                        mapperLabel: "imported-poses",
+                        toolLogSectionTitle: "imported_pose_refinement",
+                        refinementLogNoun: "imported-pose refinement",
+                        scoreLogLabel: "Imported-pose score",
+                        beginMappingAttempt: { try beginMappingAttempt() },
+                        currentMappingAttemptCount: { mappingAttemptCount },
+                        prepareCanonicalTextCandidate: {
+                            try prepareCanonicalTextCandidate(
+                                at: $0,
+                                mappingAttemptOrdinal: $1
+                            )
+                        },
+                        emit: emit
+                    )
+                    acceptedMappingArtifact = acceptance.artifact
+                    acceptedMapper = "imported-poses"
+                    acceptedConditioningAnalysis = acceptance.conditioning
+                    emit(.stageLog(
+                        stage: .sfmMapping,
+                        line: "Imported pose seed accepted after triangulation and bounded bundle adjustment.",
+                        isError: false
+                    ))
+                } else if shouldRunMappingStage {
                     completedMappingThisAttempt = true
                     currentStage = .sfmMapping
                     emit(.stageStarted(stage: .sfmMapping))
@@ -4411,6 +4577,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         ?? acceptedPairGraphEvidence?.admittedViewCount
                         ?? selectedFrames.count,
                     requireStrongObservationCoverage: acceptedDa3ModelSubdirectory != nil
+                        || backendPolicy == .importedPoses
                 )
                 try requirePublishedGeometry(
                     publishedConditioningAnalysis,
@@ -4795,7 +4962,25 @@ public final class PipelineRunner: @unchecked Sendable {
                 try stopIfRequested(after: .exportSplat)
             }
 
-            _ = try promoteMsplatCompletionToPublicOutput(paths: paths)
+            let canonicalPublication = try Self.promoteMsplatCompletionToPublicOutput(
+                paths: paths
+            )
+            do {
+                _ = try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
+                    paths: paths,
+                    publication: canonicalPublication
+                )
+            } catch SubjectIsolationArtifactStoreError.canonicalPublicationUnchanged {
+                // A completed resume can legitimately re-promote the same canonical
+                // publication. Its matching subject artifact remains current.
+            } catch {
+                emit(.stageLog(
+                    stage: .done,
+                    line: "Could not retire the previous subject isolation: "
+                        + error.localizedDescription,
+                    isError: true
+                ))
+            }
             metadata.state = PipelineState(stage: .done, lastError: nil)
             metadata.lastRunStartedAt = nil
             try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)

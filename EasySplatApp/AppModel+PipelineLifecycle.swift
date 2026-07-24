@@ -13,6 +13,24 @@ extension AppModel {
             self.pendingCloseWindow = window
         }
 
+        if isSubjectIsolationActive {
+            stopAction = deleteProject ? .deleteProject : .keepProject
+            subjectIsolationStatusMessage = deleteProject
+                ? "Cancelling isolation before moving to Trash…"
+                : "Cancelling subject isolation…"
+            cancelSubjectIsolation()
+            return
+        }
+
+        if isSubjectVersionRemovalActive {
+            stopAction = deleteProject ? .deleteProject : .keepProject
+            subjectIsolationStatusMessage = deleteProject
+                ? "Finishing Subject removal before moving to Trash…"
+                : "Finishing Subject removal…"
+            subjectIsolationStatusIsError = false
+            return
+        }
+
         guard currentTask != nil else {
             if deleteProject, let projectURL = currentProjectURL {
                 if moveProjectToTrash(at: projectURL) {
@@ -55,6 +73,7 @@ extension AppModel {
 
     @discardableResult
     func moveProjectToTrash(at projectURL: URL) -> Bool {
+        guard !hasActiveWork else { return false }
         actionFailure = nil
         if ProjectSummary.hasSameLocation(currentProjectURL, projectURL) {
             guard flushPendingNotesSave() else { return false }
@@ -118,6 +137,9 @@ extension AppModel {
     }
 
     func presentExitConfirmation() -> ExitDecision {
+        if let exitDecisionOverride {
+            return exitDecisionOverride()
+        }
         let presentation = exitConfirmationPresentation
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -248,10 +270,12 @@ extension AppModel {
         progress = nil
         var preparedVideoInput: PreparedVideoInput?
         var preparedPhotoInput: PreparedPhotoInput?
+        var preparedDatasetInput: PreparedDatasetInput?
         var projectPublication: ProjectPublicationTransaction?
         var emptyMixedPhotoInput = false
         defer { preparedVideoInput?.discard() }
         defer { preparedPhotoInput?.discard() }
+        defer { preparedDatasetInput?.discard() }
         defer { try? projectPublication?.abort() }
 
         do {
@@ -262,7 +286,7 @@ extension AppModel {
                 hardware: hardwareProfile
             )
             let developmentOverrides = AppConfig.currentDevelopmentOverrides
-            let resolvedRunPlan = RunPlanResolver.resolve(
+            var resolvedRunPlan = RunPlanResolver.resolve(
                 requestedOptions: requestedOptions,
                 input: input,
                 hardware: hardwareProfile,
@@ -276,7 +300,73 @@ extension AppModel {
             )
             defer { idleSleepAssertion.release() }
 
-            if input.hasPhotos {
+            if input.isDataset {
+                statusTitle = "Checking dataset"
+                statusDetail = nil
+                progress = nil
+                guard let datasetKind = input.datasetKind, let sourcePath = input.photosFolder else {
+                    throw DatasetInputError.unreadableDataset
+                }
+                let source = URL(fileURLWithPath: sourcePath)
+                let isZip = source.pathExtension.lowercased() == "zip"
+                let prepared = try await DatasetInputPreflight.prepare(
+                    source: source,
+                    isZip: isZip,
+                    kind: datasetKind,
+                    stagingParent: projectBaseDirectory(),
+                    runner: SubprocessRunner()
+                )
+                preparedDatasetInput = prepared
+                // The imported poses fix the geometry route and image count, so
+                // re-resolve the plan with that context before the images ride
+                // the photo admission machinery.
+                resolvedRunPlan = RunPlanResolver.resolve(
+                    requestedOptions: requestedOptions,
+                    input: input,
+                    hardware: hardwareProfile,
+                    developmentOverrides: developmentOverrides,
+                    datasetImport: RunPlanResolver.DatasetImportContext(
+                        route: prepared.plan.route,
+                        imageCount: prepared.imageCount,
+                        maximumImagePixelDimension: prepared.maximumImagePixelDimension
+                    )
+                )
+                guard isCurrentTaskToken(taskToken) else { return nil }
+                let datasetReserveBytes = VideoInputPreflight.requiredAtomicWorkspaceReserveBytes(
+                    keyframeBudget: resolvedRunPlan.keyframeBudget,
+                    maximumImageDimension: resolvedRunPlan.maximumImageDimension,
+                    maximumFeatureCount: resolvedRunPlan.colmapMaximumFeatureCount,
+                    maximumMatchCount: resolvedRunPlan.colmapMaximumMatchCount,
+                    retrievalCandidateCount: resolvedRunPlan.retrievalCandidateCount
+                )
+                let datasetPhotoLimits = PhotoInputPreflightLimits(
+                    maximumDecodedDimension: min(4_096, resolvedRunPlan.maximumImageDimension)
+                )
+                let onDatasetProgress: @Sendable (Double, String) -> Void = { [weak self] fraction, message in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isCurrentTaskToken(taskToken) else { return }
+                        self.progress = fraction
+                        self.statusTitle = "Checking dataset"
+                        self.statusDetail = message
+                    }
+                }
+                let datasetPhotoInput = try await PhotoInputPreflight.prepare(
+                    photos: prepared.stagedImages.map(\.url),
+                    stagingParent: projectBaseDirectory(),
+                    photoSelection: resolvedRunPlan.photoSelection,
+                    inputOrdering: resolvedRunPlan.inputOrdering,
+                    keyframeBudget: resolvedRunPlan.keyframeBudget,
+                    requiredAtomicWorkspaceReserveBytes: datasetReserveBytes,
+                    limits: datasetPhotoLimits,
+                    progress: onDatasetProgress
+                )
+                preparedPhotoInput = datasetPhotoInput
+                try RunPlanResolver.validatePhotoSelection(
+                    validPhotoCount: datasetPhotoInput.summary.validPhotoCount,
+                    resolvedPlan: resolvedRunPlan,
+                    input: input
+                )
+            } else if input.hasPhotos {
                 statusTitle = "Checking photos"
                 statusDetail = nil
                 progress = nil
@@ -415,7 +505,16 @@ extension AppModel {
                 try publication.reached(.videoAdopted)
             }
             try Task.checkCancellation()
-            if let preparedPhotoInput {
+            if let preparedDatasetInput, let preparedPhotoInput {
+                // Dataset images are photo-carried; adoption admits them and
+                // binds the pose seed, so this reuses the photosAdopted gate.
+                try inputAdoption.adoptDataset(
+                    preparedDatasetInput,
+                    into: paths,
+                    photoInput: preparedPhotoInput
+                )
+                try publication.reached(.photosAdopted)
+            } else if let preparedPhotoInput {
                 try inputAdoption.adoptPhotos(preparedPhotoInput, into: paths)
                 try publication.reached(.photosAdopted)
             } else if emptyMixedPhotoInput {
@@ -431,6 +530,7 @@ extension AppModel {
                 videoInputReceipts: inputAdoption.videoInputReceipts,
                 photoInputReceipts: inputAdoption.photoInputReceipts,
                 photoSelectionReceipt: inputAdoption.photoSelectionReceipt,
+                datasetPoseSeed: inputAdoption.datasetPoseSeed,
                 requestedRunOptions: requestedOptions,
                 resolvedRunPlan: resolvedRunPlan,
                 lastRunStartedAt: Date()
@@ -509,6 +609,8 @@ extension AppModel {
                 outputURL: outputURL,
                 boundary: timingBoundary
             )
+            await reloadSubjectIsolationArtifact(for: projectURL)
+            guard isCurrentTaskToken(taskToken) else { return nil }
             viewState = .viewer
             refreshProjectSummaries()
             refreshFreeDiskSpace()
@@ -573,6 +675,15 @@ extension AppModel {
             statusTitle = presentation.title
             statusDetail = nil
             errorDetails = presentation.details
+            progress = nil
+            failureRetryAllowed = false
+            viewState = .processing
+        } catch let error as DatasetInputError {
+            guard isCurrentTaskToken(taskToken) else { return nil }
+            lastError = "Dataset couldn’t be imported"
+            statusTitle = "Dataset couldn’t be imported"
+            statusDetail = nil
+            errorDetails = error.localizedDescription
             progress = nil
             failureRetryAllowed = false
             viewState = .processing
@@ -757,6 +868,18 @@ extension AppModel {
                     )
                 }.value
             }
+            if metadata.input.isDataset, let datasetPoseSeed = metadata.datasetPoseSeed {
+                // Datasets ride the photo machinery, but their pose seed and
+                // source images have their own receipt; re-verify it on resume
+                // exactly as videos re-verify their staged copies.
+                statusDetail = "Checking saved dataset"
+                try await Task.detached(priority: .userInitiated) {
+                    try DatasetPoseSeedReceiptValidator.validateFiles(
+                        receipt: datasetPoseSeed,
+                        projectRoot: url
+                    )
+                }.value
+            }
             currentRunOptions = metadata.requestedRunOptions
             currentInput = metadata.input
             if !bypassFinishedOutput,
@@ -768,6 +891,8 @@ extension AppModel {
                 currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
                 currentProjectNotes = metadata.notes ?? ""
                 markProjectOpened(at: url)
+                await reloadSubjectIsolationArtifact(for: url)
+                guard isCurrentTaskToken(taskToken) else { return }
                 viewState = .viewer
                 refreshProjectSummaries()
                 return
@@ -782,12 +907,25 @@ extension AppModel {
                 input: metadata.input,
                 hardware: hardwareProfile
             )
+            let datasetImport = metadata.datasetPoseSeed.map { seed in
+                // Dataset images are adopted unscaled, so the photo receipts
+                // reproduce preflight's measured pixel ceiling; feeding it back
+                // keeps the resumed plan identical to the fresh run's.
+                RunPlanResolver.DatasetImportContext(
+                    route: seed.route,
+                    imageCount: seed.imageCount,
+                    maximumImagePixelDimension: metadata.photoInputReceipts?
+                        .map { max($0.pixelWidth, $0.pixelHeight) }
+                        .max()
+                )
+            }
             let resolvedRunPlan = RunPlanResolver.resolve(
                 requestedOptions: requestedOptions,
                 input: metadata.input,
                 hardware: hardwareProfile,
                 developmentOverrides: developmentOverrides,
-                trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes
+                trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes,
+                datasetImport: datasetImport
             )
             if metadata.input.photosFolder != nil {
                 let importedPhotos = paths.importedPhotosURL
@@ -876,6 +1014,8 @@ extension AppModel {
             currentProjectNotes = loadProjectNotes(projectURL: url)
             markProjectOpened(at: url)
             refreshFreeDiskSpace()
+            await reloadSubjectIsolationArtifact(for: url)
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .viewer
             refreshProjectSummaries()
         } catch is CancellationError {
@@ -1024,6 +1164,7 @@ extension AppModel {
         pendingResultViewerTiming = nil
         stopAction = nil
         cancelSharing()
+        clearSubjectIsolationSession()
         shareStatusMessage = nil
         shareStatusIsError = false
         if notesSaved {

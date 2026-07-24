@@ -155,6 +155,9 @@ Every workflow must work with keyboard only and VoiceOver.
 
 Viewer keyboard controls:
 
+- `W`/`A`/`S`/`D` held: fly forward, left, back, right
+- `E`/`Q` held: fly up and down
+- Shift held: sprint
 - arrows: orbit
 - Option-arrows: pan
 - `+` and `-`: zoom
@@ -164,7 +167,8 @@ Viewer keyboard controls:
 Pointer and trackpad controls:
 
 - drag: orbit
-- Option-drag: pan
+- right-drag or Control-drag: look around
+- Option-drag or middle-drag: pan
 - scroll or pinch: zoom
 
 ## Review matrix

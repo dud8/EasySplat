@@ -142,7 +142,7 @@ final class ProjectMetadataCurrentVersionTests: XCTestCase {
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 31)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 32)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,

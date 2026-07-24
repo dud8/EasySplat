@@ -568,7 +568,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
             rows: [(1, "café frame.jpg", 1)]
         )
 
-        let changed = try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+        let changed = try makeRunner(projectURL: root).prepareExternalRefinementSeed(
             rawModelURL: rawModel,
             outputModelURL: outputModel,
             databaseURL: databaseURL
@@ -604,7 +604,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         try writeImageMappingDatabase(at: databaseURL, rows: [(10, "frame.jpg", 20)])
 
         XCTAssertThrowsError(
-            try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+            try makeRunner(projectURL: root).prepareExternalRefinementSeed(
                 rawModelURL: rawModel,
                 outputModelURL: outputModel,
                 databaseURL: databaseURL
@@ -634,7 +634,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
             var reachedTarget = false
 
             XCTAssertThrowsError(
-                try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+                try makeRunner(projectURL: root).prepareExternalRefinementSeed(
                     rawModelURL: rawModel,
                     outputModelURL: outputModel,
                     databaseURL: databaseURL,
@@ -1079,6 +1079,157 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let outputImage = try XCTUnwrap(CGImageSourceCreateImageAtIndex(outputSource, 0, nil))
         let sideMeans = grayscaleSideMeans(outputImage)
         XCTAssertGreaterThan(sideMeans.left, sideMeans.right + 0.25)
+    }
+
+    func testDatasetCopySelectedPreservesSourceBytesAcrossExtensions() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A source set the photo path would transform in three different ways:
+        // bake the EXIF orientation, lift the exposure, and re-encode. Every one
+        // of those re-encodes the pixels, which would desync the imported
+        // calibration keyed to the original grid. The dataset copy must move no
+        // byte and must keep the retain-all count and per-file lineage intact.
+        let oriented = root.appendingPathComponent("img_000.jpg")
+        try writeOrientedJPEG(to: oriented, width: 8, height: 12, orientation: 6)
+        let underexposed = root.appendingPathComponent("img_001.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: underexposed,
+            size: 40,
+            value: 36,
+            utType: .jpeg
+        ))
+        XCTAssertGreaterThan(
+            try FrameScoring.scoreFrame(at: underexposed).lowLightExposureEV,
+            0
+        )
+        let png = root.appendingPathComponent("img_002.png")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: png,
+            size: 24,
+            value: 128,
+            utType: .png
+        ))
+
+        let sources = [oriented, underexposed, png]
+        let sourceSHA256s = try sources.map { try GeometryArtifactStore.sha256(of: $0) }
+        var bindings: [String: PipelineRunner.SelectedInputSource] = [:]
+        for (index, source) in sources.enumerated() {
+            bindings[source.lastPathComponent] = PipelineRunner.SelectedInputSource(
+                projectRelativePath: "Originals/Photos/\(source.lastPathComponent)",
+                sha256: sourceSHA256s[index],
+                photoRetainedRank: index
+            )
+        }
+
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
+        let runner = makeRunner(projectURL: root)
+        let result = try runner.test_copySelectedDataset(
+            groups: [.init(
+                id: "photos",
+                frames: sources,
+                isVideo: false,
+                sourceBindingsByFileName: bindings
+            )],
+            to: selected,
+            manifestURL: root.appendingPathComponent("selected_frames.json"),
+            projectPaths: ProjectPaths(root: root),
+            maxDimension: 128
+        )
+
+        // Retain-all: every imported image survives selection.
+        XCTAssertEqual(result.frames.count, sources.count)
+        XCTAssertEqual(result.manifest.count, sources.count)
+        XCTAssertEqual(
+            result.frames.map(\.lastPathComponent),
+            ["frame_000000.jpg", "frame_000001.jpg", "frame_000002.png"]
+        )
+
+        for (index, entry) in result.manifest.enumerated() {
+            let output = result.frames[index]
+            let outputSHA256 = try GeometryArtifactStore.sha256(of: output)
+            XCTAssertEqual(
+                outputSHA256,
+                sourceSHA256s[index],
+                "dataset frame \(index) is not byte-identical to its source"
+            )
+            XCTAssertEqual(entry.sourceSHA256, sourceSHA256s[index])
+            XCTAssertEqual(entry.selectedSHA256, sourceSHA256s[index])
+            XCTAssertEqual(entry.photoRetainedRank, index)
+            XCTAssertNil(entry.lowLightExposureEV)
+            let normalization = try XCTUnwrap(entry.normalization)
+            XCTAssertFalse(normalization.transcoded)
+            XCTAssertEqual(normalization.outputFormat, output.pathExtension.lowercased())
+            XCTAssertEqual(normalization.outputPixelWidth, normalization.sourcePixelWidth)
+            XCTAssertEqual(normalization.outputPixelHeight, normalization.sourcePixelHeight)
+        }
+
+        // The imported orientation is untouched (the photo path would bake it to 1).
+        let orientedOutput = try XCTUnwrap(
+            CGImageSourceCreateWithURL(result.frames[0] as CFURL, nil)
+        )
+        let orientedProps = try XCTUnwrap(
+            CGImageSourceCopyPropertiesAtIndex(orientedOutput, 0, nil) as? [CFString: Any]
+        )
+        XCTAssertEqual(
+            (orientedProps[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1,
+            6
+        )
+    }
+
+    func testDatasetCopySelectedBytesAreInvariantAcrossDetailProfiles() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // The resolved maximum dimension is the only frame-selection knob a
+        // DetailProfile moves. A dataset frame must hash identically no matter
+        // which profile resolved the run, so two dimensions stand in for two
+        // profiles here and both must reproduce the source bytes exactly.
+        let source = root.appendingPathComponent("img_000.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: source,
+            size: 48,
+            value: 40,
+            utType: .jpeg
+        ))
+        let sourceSHA256 = try GeometryArtifactStore.sha256(of: source)
+        let sourceData = try Data(contentsOf: source)
+        let runner = makeRunner(projectURL: root)
+
+        func datasetDigest(maxDimension: CGFloat, label: String) throws -> String {
+            let selected = root.appendingPathComponent("selected-\(label)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: selected,
+                withIntermediateDirectories: true
+            )
+            let result = try runner.test_copySelectedDataset(
+                groups: [.init(
+                    id: "photos",
+                    frames: [source],
+                    isVideo: false,
+                    sourceBindingsByFileName: [
+                        source.lastPathComponent: PipelineRunner.SelectedInputSource(
+                            projectRelativePath: "Originals/Photos/\(source.lastPathComponent)",
+                            sha256: sourceSHA256,
+                            photoRetainedRank: 0
+                        )
+                    ]
+                )],
+                to: selected,
+                manifestURL: root.appendingPathComponent("manifest-\(label).json"),
+                projectPaths: ProjectPaths(root: root),
+                maxDimension: maxDimension
+            )
+            let output = try XCTUnwrap(result.frames.first)
+            XCTAssertEqual(try Data(contentsOf: output), sourceData)
+            XCTAssertNil(result.manifest.first?.lowLightExposureEV)
+            return try GeometryArtifactStore.sha256(of: output)
+        }
+
+        let fastDigest = try datasetDigest(maxDimension: 1_024, label: "fast")
+        let highDetailDigest = try datasetDigest(maxDimension: 2_048, label: "high")
+        XCTAssertEqual(fastDigest, sourceSHA256)
+        XCTAssertEqual(highDetailDigest, sourceSHA256)
+        XCTAssertEqual(fastDigest, highDetailDigest)
     }
 
     func testSelectedFrameNormalizationRequiresSDRBridgeWithoutResizeOrRotation() {

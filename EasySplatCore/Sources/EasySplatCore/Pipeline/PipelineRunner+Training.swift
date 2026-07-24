@@ -547,7 +547,15 @@ extension PipelineRunner {
         sparseDirectory: URL,
         geometryArtifact: GeometryArtifact
     ) throws -> [String] {
-        try ColmapSparseModelMembershipReader(
+        // Imported geometry has no COLMAP feature database to attest membership
+        // against; the registered images are read directly from the adopted
+        // model (text or binary), which the caller cross-checks against the
+        // canonical analysis of the source model.
+        if geometryArtifact.resolvedSource == .imported {
+            let (model, _) = try ColmapModelReader.read(modelDirectory: sparseDirectory)
+            return model.images.map(\.name).sorted()
+        }
+        return try ColmapSparseModelMembershipReader(
             databaseURL: paths.colmapDatabaseURL,
             selectedImageNames: geometryArtifact.orderedImageNames
         ).registeredImageNames(
@@ -889,7 +897,9 @@ extension PipelineRunner {
     /// Rebinds a completed training receipt to the validated public PLY. The trainer's
     /// private output remains available until the run is durably marked done, so a
     /// crash during export can still resume without retraining.
-    func promoteMsplatCompletionToPublicOutput(paths: ProjectPaths) throws -> TrainingArtifact {
+    static func promoteMsplatCompletionToPublicOutput(
+        paths: ProjectPaths
+    ) throws -> CanonicalSplatPublication {
         guard var artifact = try? TrainingArtifactStore.load(
             from: paths.trainingManifestURL,
             projectPaths: paths
@@ -901,7 +911,9 @@ extension PipelineRunner {
                 artifact,
                 at: paths.outputURL.appendingPathComponent("splat.ply")
             )
-            return artifact
+            return try SubjectIsolationArtifactStore.captureCanonicalPublication(
+                paths: paths
+            )
         }
         guard artifact.outputPath == "Training/msplat/splat.ply" else {
             throw PipelineError.outputMissing
@@ -909,7 +921,9 @@ extension PipelineRunner {
 
         artifact.outputPath = "Output/splat.ply"
         try TrainingArtifactStore.persist(artifact, paths: paths)
-        return artifact
+        return try SubjectIsolationArtifactStore.captureCanonicalPublication(
+            paths: paths
+        )
     }
 
     /// Finished projects retain the exact dataset consumed by the trainer so release

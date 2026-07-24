@@ -31,6 +31,7 @@ enum GeometryArtifactStore {
         case invalidTimings
         case invalidWorkerExecution
         case invalidRunPlanBinding
+        case invalidImportedEvidence
 
         var errorDescription: String? {
             switch self {
@@ -76,8 +77,42 @@ enum GeometryArtifactStore {
                 return "Geometry artifact worker execution evidence is incomplete or invalid."
             case .invalidRunPlanBinding:
                 return "Geometry artifact does not match its resolved run plan."
+            case .invalidImportedEvidence:
+                return "Geometry artifact imported evidence is incomplete or does not match its dataset seed."
             }
         }
+    }
+
+    static let importedSeedClosureDomain = "easysplat-dataset-seed-closure-v1"
+    static let importedSourceClosureDomain = "easysplat-dataset-source-closure-v1"
+
+    /// Domain-separated rollup over a dataset receipt file list. Order-independent
+    /// (files are sorted by project-relative path), so a manifest and the on-disk
+    /// receipt agree regardless of enumeration order. An empty list yields the
+    /// domain-only digest, which still binds "no such files".
+    static func datasetReceiptClosureDigest(
+        _ files: [DatasetReceiptFile],
+        domain: String
+    ) -> String? {
+        guard Set(files.map(\.projectRelativePath)).count == files.count,
+              files.allSatisfy({ isSHA256($0.sha256) && $0.byteCount >= 0 }) else {
+            return nil
+        }
+        let ordered = files.sorted { $0.projectRelativePath < $1.projectRelativePath }
+        var hasher = SHA256()
+        let domainData = Data(domain.utf8)
+        update(UInt64(domainData.count), in: &hasher)
+        hasher.update(data: domainData)
+        for file in ordered {
+            let pathData = Data(file.projectRelativePath.utf8)
+            update(UInt64(pathData.count), in: &hasher)
+            hasher.update(data: pathData)
+            update(UInt64(file.byteCount), in: &hasher)
+            let digestData = Data(file.sha256.utf8)
+            update(UInt64(digestData.count), in: &hasher)
+            hasher.update(data: digestData)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     static func load(
@@ -250,9 +285,25 @@ enum GeometryArtifactStore {
             throw Error.invalidRunPlanBinding
         }
 
+        // Imported geometry binds route `.adoptDirect`; a computed artifact on the
+        // importedPoses backend was re-triangulated, so it binds `.seedTriangulate`.
+        switch artifact.resolvedSource {
+        case .imported:
+            guard plan.geometryBackend == .importedPoses,
+                  plan.datasetGeometryRoute == .adoptDirect else {
+                throw Error.invalidRunPlanBinding
+            }
+        case .computed:
+            if plan.geometryBackend == .importedPoses {
+                guard plan.datasetGeometryRoute == .seedTriangulate else {
+                    throw Error.invalidRunPlanBinding
+                }
+            }
+        }
+
         let provenanceMatchesRoute: Bool
         switch plan.geometryBackend {
-        case .colmap:
+        case .colmap, .importedPoses:
             provenanceMatchesRoute = artifact.provenance.runtime == nil
                 && artifact.provenance.model == nil
                 && artifact.modelVersion == "none"
@@ -303,6 +354,16 @@ enum GeometryArtifactStore {
     ) throws -> GeometryConditioningAnalysis {
         guard artifact.schemaVersion == GeometryArtifact.currentSchemaVersion else {
             throw Error.invalidSchema(artifact.schemaVersion)
+        }
+        if artifact.resolvedSource == .imported {
+            return try validatedImportedAnalysis(
+                artifact,
+                projectPaths: projectPaths,
+                measuredResiduals: measuredResiduals,
+                verifiedSourceSnapshot: verifiedSourceSnapshot,
+                measuredAnalysis: measuredAnalysis,
+                input: input
+            )
         }
         do {
             try artifact.workerExecution.validate(
@@ -637,6 +698,253 @@ enum GeometryArtifactStore {
             throw Error.modelHashMismatch("source snapshot")
         }
         return analysis
+    }
+
+    /// The load/persist verification path for directly-adopted dataset geometry.
+    /// It re-derives the sparse/0 model digests exactly as the computed path does,
+    /// re-runs conditioning against the imported model, and re-verifies the
+    /// authenticated seed/source receipt — but requires none of the pair-graph,
+    /// worker-execution, feature-database, or camera-grouping evidence, which do
+    /// not exist on this route. The imported evidence replaces those legs.
+    private static func validatedImportedAnalysis(
+        _ artifact: GeometryArtifact,
+        projectPaths: ProjectPaths,
+        measuredResiduals: ColmapResidualAnalyzer.Result?,
+        verifiedSourceSnapshot: GeometryModelSnapshot.Verified?,
+        measuredAnalysis: GeometryConditioningAnalysis?,
+        input: InputSpec?
+    ) throws -> GeometryConditioningAnalysis {
+        let provenance = artifact.provenance
+        guard let evidence = artifact.importedEvidence else {
+            throw Error.invalidImportedEvidence
+        }
+        // Solver provenance is the pin between the artifact and its dataset seed.
+        guard !artifact.solverVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !artifact.runtimeVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              artifact.modelVersion == "none",
+              !provenance.toolchainVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              provenance.solver.identifier == "imported",
+              provenance.runtime == nil,
+              provenance.model == nil,
+              validComponent(provenance.solver),
+              provenance.solver.version == evidence.datasetKind,
+              provenance.solver.revision == evidence.sourceClosureSHA256,
+              provenance.solver.payloadSHA256 == evidence.seedClosureSHA256 else {
+            throw Error.invalidProvenance
+        }
+        // Imported geometry carries none of the computed-evidence legs.
+        guard artifact.pairGraph.status == .notEvaluated,
+              artifact.pairGraph.measurement == nil,
+              artifact.featureDatabaseDigest == nil,
+              artifact.cameraGroupingReceipt == nil,
+              artifact.learnedPointInitializer == nil else {
+            throw Error.invalidImportedEvidence
+        }
+        // Re-verify the authenticated seed/source receipt: the closures pin into
+        // provenance, and every on-disk file must still match its recorded digest,
+        // so a swapped `Import/seed` invalidates the artifact.
+        guard evidence.route == DatasetGeometryRoute.adoptDirect.rawValue,
+              !evidence.datasetKind.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              evidence.imageCount == artifact.totalViewCount,
+              Set(evidence.seedFiles.map(\.projectRelativePath))
+                == Set(DatasetPoseSeedReceipt.seedFileRelativePaths),
+              datasetReceiptClosureDigest(
+                  evidence.seedFiles,
+                  domain: importedSeedClosureDomain
+              ) == evidence.seedClosureSHA256,
+              datasetReceiptClosureDigest(
+                  evidence.sourceFiles,
+                  domain: importedSourceClosureDomain
+              ) == evidence.sourceClosureSHA256 else {
+            throw Error.invalidImportedEvidence
+        }
+        try verifyImportedReceiptFiles(evidence.seedFiles, projectPaths: projectPaths)
+        try verifyImportedReceiptFiles(evidence.sourceFiles, projectPaths: projectPaths)
+
+        guard artifact.poseConvention == "world-to-camera",
+              artifact.quaternionOrder == "wxyz",
+              artifact.handedness == "right-handed",
+              artifact.scaleType == "arbitrary-sim3" else {
+            throw Error.invalidCanonicalOrientation
+        }
+        guard artifact.sourceModelPath == "SfM/colmap/sparse/0",
+              let sourceModel = try? projectPaths.resolveProjectRelativePath(
+                  artifact.sourceModelPath
+              ) else {
+            throw Error.invalidSourceModelPath
+        }
+        if let verifiedSourceSnapshot {
+            do {
+                try GeometryModelSnapshot.validate(verifiedSourceSnapshot, at: sourceModel)
+            } catch {
+                throw Error.modelHashMismatch("source snapshot")
+            }
+        }
+        guard isSHA256(artifact.inputDigest) else { throw Error.invalidDigest("input") }
+        guard isSHA256(artifact.selectedFramesDigest) else {
+            throw Error.invalidDigest("selected frames")
+        }
+        let coverageDenominator = registeredCoverageDenominator(for: artifact)
+        guard artifact.residualProvenance == "colmap-text-tracks-v1",
+              artifact.observationCount > 0,
+              artifact.pointCount > 0,
+              artifact.totalViewCount > 0,
+              artifact.registeredViewCount > 0,
+              artifact.registeredViewCount <= artifact.totalViewCount,
+              Double(artifact.registeredViewCount) / Double(coverageDenominator)
+                  >= ReconstructionScorer.minimumRegisteredViewFraction,
+              artifact.orderedImageNames.count == artifact.totalViewCount,
+              artifact.orderedImageTimestamps.count == artifact.totalViewCount,
+              artifact.medianPixelResidual.isFinite,
+              artifact.p90PixelResidual.isFinite,
+              artifact.medianPixelResidual >= 0,
+              artifact.p90PixelResidual >= artifact.medianPixelResidual,
+              artifact.medianPixelResidual <= maximumMedianPixelResidual,
+              artifact.p90PixelResidual <= maximumP90PixelResidual else {
+            throw Error.invalidResiduals
+        }
+        guard artifact.peakMemoryBytes > 0 else { throw Error.invalidPeakMemory }
+        guard let orientationEstimationDuration = artifact.timings[
+            "orientation_estimation_seconds"
+        ],
+              orientationEstimationDuration.isFinite,
+              orientationEstimationDuration >= 0,
+              artifact.timings["orientation_seconds"] == nil,
+              artifact.timings.allSatisfy({ key, value in
+                  !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      && value.isFinite
+                      && value >= 0
+              }) else {
+            throw Error.invalidTimings
+        }
+        try validateCanonicalOrientation(
+            artifact.canonicalOrientation,
+            registeredViewCount: artifact.registeredViewCount
+        )
+        guard Set(artifact.modelHashes.keys)
+                == ["cameras.txt", "images.txt", "points3D.txt"],
+              artifact.modelHashes.values.allSatisfy(isSHA256) else {
+            throw Error.invalidDigest("model")
+        }
+        try validateConditioning(
+            artifact.conditioning,
+            registeredViewCount: artifact.registeredViewCount,
+            pointCount: artifact.pointCount,
+            observationCount: artifact.observationCount,
+            modelHashes: artifact.modelHashes
+        )
+        if let verifiedSourceSnapshot {
+            for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+                guard verifiedSourceSnapshot.modelHashes[name]
+                        == artifact.modelHashes[name] else {
+                    throw Error.modelHashMismatch(name)
+                }
+            }
+        } else {
+            for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+                let relativePath = artifact.sourceModelPath + "/" + name
+                guard let file = try? projectPaths.resolveProjectRelativePath(relativePath),
+                      let digest = try? sha256(of: file),
+                      digest == artifact.modelHashes[name] else {
+                    throw Error.modelHashMismatch(name)
+                }
+            }
+        }
+        let currentInputDigest = try inputDigest(projectPaths: projectPaths)
+        guard currentInputDigest == artifact.inputDigest else {
+            throw Error.artifactDigestMismatch("imported input")
+        }
+        let currentSelectedFramesDigest = try selectedFramesDigest(
+            orderedImageNames: artifact.orderedImageNames,
+            projectPaths: projectPaths
+        )
+        guard currentSelectedFramesDigest == artifact.selectedFramesDigest else {
+            throw Error.artifactDigestMismatch("selected frames")
+        }
+        _ = input
+
+        let analysis: GeometryConditioningAnalysis
+        if let measuredAnalysis {
+            for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+                guard measuredAnalysis.modelSnapshot.modelHashes[name]
+                        == artifact.modelHashes[name] else {
+                    throw Error.modelHashMismatch(name)
+                }
+            }
+            do {
+                try GeometryModelSnapshot.validate(
+                    measuredAnalysis.modelSnapshot,
+                    at: sourceModel
+                )
+            } catch {
+                throw Error.modelHashMismatch("source snapshot")
+            }
+            analysis = measuredAnalysis
+        } else {
+            do {
+                analysis = try ColmapResidualAnalyzer.analyzeConditioning(
+                    modelDirectory: sourceModel,
+                    maximumRayPairEvaluations:
+                        artifact.conditioning.maximumRayPairEvaluations,
+                    checkCancellation: { try Task.checkCancellation() }
+                )
+            } catch is GeometryConditioningFailure {
+                throw Error.conditioningMismatch
+            } catch is GeometryModelSnapshot.Error {
+                throw Error.modelHashMismatch("source snapshot")
+            }
+        }
+        let measured = analysis.residuals
+        for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+            guard analysis.modelSnapshot.modelHashes[name] == artifact.modelHashes[name] else {
+                throw Error.modelHashMismatch(name)
+            }
+        }
+        if let measuredResiduals, measuredResiduals != measured {
+            throw Error.measuredResidualMismatch
+        }
+        guard measured.provenance == artifact.residualProvenance,
+              measured.cameraModel == artifact.cameraModel,
+              measured.registeredViewCount == artifact.registeredViewCount,
+              Set(measured.registeredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
+              Set(measured.measuredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
+              Double(measured.measuredImageNames.count) / Double(coverageDenominator)
+                  >= ReconstructionScorer.minimumRegisteredViewFraction,
+              measured.pointCount == artifact.pointCount,
+              measured.observationCount == artifact.observationCount,
+              approximatelyEqual(measured.medianPixelResidual, artifact.medianPixelResidual),
+              approximatelyEqual(measured.p90PixelResidual, artifact.p90PixelResidual) else {
+            throw Error.measuredResidualMismatch
+        }
+        guard analysis.measurement == artifact.conditioning.measurement else {
+            throw Error.conditioningMismatch
+        }
+        do {
+            try GeometryModelSnapshot.validate(analysis.modelSnapshot, at: sourceModel)
+        } catch {
+            throw Error.modelHashMismatch("source snapshot")
+        }
+        return analysis
+    }
+
+    private static func verifyImportedReceiptFiles(
+        _ files: [DatasetReceiptFile],
+        projectPaths: ProjectPaths
+    ) throws {
+        for file in files {
+            guard let url = try? projectPaths.resolveProjectRelativePath(
+                      file.projectRelativePath
+                  ),
+                  let attributes = try? FileManager.default.attributesOfItem(
+                      atPath: url.path
+                  ),
+                  let size = (attributes[.size] as? NSNumber)?.intValue,
+                  size == file.byteCount,
+                  let digest = try? sha256(of: url),
+                  digest == file.sha256 else {
+                throw Error.invalidImportedEvidence
+            }
+        }
     }
 
     private static func validateConditioning(
@@ -1279,8 +1587,13 @@ enum GeometryArtifactStore {
                 throw Error.invalidMapping
             }
         case .seededBundleAdjustment:
-            guard hasLearnedProvenance,
-                  pairGraphStatus == .measured,
+            // Two producers publish seeded refinements: the DA3 route (learned
+            // runtime and model provenance) and the imported-pose dataset route
+            // (classical provenance with a trusted external seed). The worker
+            // execution ledger separately pins this kind to exactly one
+            // point_triangulator and one bundle_adjuster invocation with no
+            // incremental mapper, so learned provenance is not required here.
+            guard pairGraphStatus == .measured,
                   artifact.modelCount == 1,
                   artifact.acceptedRefinementInvocationCount == 1,
                   artifact.plannedIncrementalCadence == nil,
@@ -1519,10 +1832,13 @@ enum GeometryArtifactStore {
             )
             update(UInt64(relativePath.utf8.count), in: &hasher)
             hasher.update(data: Data(relativePath.utf8))
-            try hashRegularFileContents(at: snapshot.url, into: &hasher) {
-                fileSize, hasher in
-                update(fileSize, in: &hasher)
-            }
+            try hashRegularFileContents(
+                at: snapshot.url,
+                into: &hasher,
+                beforeContents: { fileSize, hasher in
+                    update(fileSize, in: &hasher)
+                }
+            )
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
@@ -1594,9 +1910,13 @@ enum GeometryArtifactStore {
             let relativePath = String(resolved.path.dropFirst(rootPath.count + 1))
             update(UInt64(relativePath.utf8.count), in: &hasher)
             hasher.update(data: Data(relativePath.utf8))
-            try hashRegularFileContents(at: file, into: &hasher) { fileSize, hasher in
-                update(fileSize, in: &hasher)
-            }
+            try hashRegularFileContents(
+                at: file,
+                into: &hasher,
+                beforeContents: { fileSize, hasher in
+                    update(fileSize, in: &hasher)
+                }
+            )
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
@@ -1613,12 +1933,27 @@ enum GeometryArtifactStore {
     }
 
     static func sha256(of file: URL, maximumBytes: UInt64? = nil) throws -> String {
+        try sha256(
+            of: file,
+            maximumBytes: maximumBytes,
+            shouldCancel: { false }
+        )
+    }
+
+    static func sha256(
+        of file: URL,
+        maximumBytes: UInt64? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> String {
+        try throwIfCancelled(shouldCancel)
         var hasher = SHA256()
         try hashRegularFileContents(
             at: file,
             into: &hasher,
-            maximumBytes: maximumBytes
+            maximumBytes: maximumBytes,
+            shouldCancel: shouldCancel
         )
+        try throwIfCancelled(shouldCancel)
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
@@ -1626,10 +1961,12 @@ enum GeometryArtifactStore {
         at file: URL,
         into hasher: inout SHA256,
         maximumBytes: UInt64? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool = { false },
         beforeContents: (UInt64, inout SHA256) -> Void = { _, _ in }
     ) throws {
         let descriptor: Int32
         while true {
+            try throwIfCancelled(shouldCancel)
             let opened = Darwin.open(file.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
             if opened >= 0 {
                 descriptor = opened
@@ -1664,6 +2001,7 @@ enum GeometryArtifactStore {
         var totalByteCount: UInt64 = 0
         var buffer = [UInt8](repeating: 0, count: 1_048_576)
         while true {
+            try throwIfCancelled(shouldCancel)
             let count = buffer.withUnsafeMutableBytes { bytes in
                 Darwin.read(descriptor, bytes.baseAddress, bytes.count)
             }
@@ -1681,6 +2019,7 @@ enum GeometryArtifactStore {
             totalByteCount += UInt64(count)
         }
 
+        try throwIfCancelled(shouldCancel)
         let final = try descriptorStatus()
         guard (final.st_mode & S_IFMT) == S_IFREG,
               final.st_nlink == 1,
@@ -1694,6 +2033,14 @@ enum GeometryArtifactStore {
               final.st_ctimespec.tv_nsec == initial.st_ctimespec.tv_nsec,
               totalByteCount == expectedByteCount else {
             throw CocoaError(.fileReadUnknown)
+        }
+    }
+
+    private static func throwIfCancelled(
+        _ shouldCancel: @escaping @Sendable () -> Bool
+    ) throws {
+        if shouldCancel() {
+            throw CancellationError()
         }
     }
 }

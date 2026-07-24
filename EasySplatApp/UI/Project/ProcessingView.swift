@@ -18,6 +18,13 @@ enum ProcessingPhase: Int, Equatable {
         }
     }
 
+    /// Datasets bring their own camera poses, so reconstruction imports them
+    /// rather than solving structure from scratch.
+    func phrase(isDataset: Bool) -> String {
+        if isDataset, self == .reconstruct { return "Importing camera poses" }
+        return phrase
+    }
+
     var heading: String {
         "Step \(rawValue) of 4 · \(phrase)"
     }
@@ -67,11 +74,15 @@ struct ProcessingView: View {
         model.stage.map(ProcessingPhase.forStage) ?? .prepare
     }
 
+    private var isDatasetInput: Bool {
+        model.currentInput?.isDataset == true
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: Theme.Spacing.small) {
-                    Text(phase.phrase)
+                    Text(phase.phrase(isDataset: isDatasetInput))
                         .font(.title2.weight(.semibold))
                         .accessibilityAddTraits(.isHeader)
                         .accessibilityIdentifier("processing.phase")
@@ -341,7 +352,9 @@ struct ProcessingView: View {
     private var canTryAgain: Bool {
         Self.canTryAgain(
             projectExists: model.currentProjectURL != nil,
-            pendingInputExists: !model.pendingVideoURLs.isEmpty || !model.pendingPhotoURLs.isEmpty
+            pendingInputExists: !model.pendingVideoURLs.isEmpty
+                || !model.pendingPhotoURLs.isEmpty
+                || model.pendingDataset != nil
         )
     }
 

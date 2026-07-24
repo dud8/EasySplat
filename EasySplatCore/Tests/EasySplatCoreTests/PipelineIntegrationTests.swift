@@ -5672,6 +5672,82 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path }))
     }
 
+    func testCanonicalPromotionInvalidatesSubjectOnlyAfterDurableReplacement() throws {
+        let fixture = try makeSubjectIsolationFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        let oldSubject = try fixture.makeArtifact(outputIdentity: UUID())
+        _ = try SubjectIsolationArtifactStore.publish(
+            oldSubject,
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+        let oldSubjectBytes = try Data(contentsOf: fixture.paths.isolatedOutputURL)
+        let oldManifestBytes = try Data(contentsOf: fixture.paths.isolationManifestURL)
+        let oldCanonicalBytes = try Data(contentsOf: fixture.paths.outputSplatURL)
+
+        let invalidReplacement = fixture.paths.outputURL.appendingPathComponent("invalid.ply")
+        try Data("not a ply".utf8).write(to: invalidReplacement)
+        XCTAssertThrowsError(
+            try SplatExport.copyIfExists(
+                from: invalidReplacement,
+                to: fixture.paths.outputSplatURL
+            )
+        )
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.outputSplatURL), oldCanonicalBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolatedOutputURL), oldSubjectBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolationManifestURL), oldManifestBytes)
+
+        try TestFileBuilder.writeMinimalPly(at: fixture.paths.msplatOutputURL, vertexCount: 2)
+        let replacementEvidence = try ProjectArtifactValidator.validatedPlyEvidence(
+            at: fixture.paths.msplatOutputURL
+        )
+        var replacementTraining = fixture.training
+        replacementTraining.trainerVersion = "replacement-trainer"
+        replacementTraining.outputPath = "Training/msplat/splat.ply"
+        replacementTraining.outputSHA256 = replacementEvidence.sha256
+        replacementTraining.outputBytes = Int64(replacementEvidence.byteCount)
+        replacementTraining.gaussianCount = replacementEvidence.vertexCount
+        replacementTraining.sceneBounds = replacementEvidence.sceneBounds
+        try TrainingArtifactStore.persist(replacementTraining, paths: fixture.paths)
+
+        XCTAssertThrowsError(
+            try PipelineRunner.promoteMsplatCompletionToPublicOutput(
+                paths: fixture.paths
+            )
+        )
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.outputSplatURL), oldCanonicalBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolatedOutputURL), oldSubjectBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.isolationManifestURL), oldManifestBytes)
+
+        try SplatExport.copyIfExists(
+            from: fixture.paths.msplatOutputURL,
+            to: fixture.paths.outputSplatURL
+        )
+        let publication = try PipelineRunner.promoteMsplatCompletionToPublicOutput(
+            paths: fixture.paths
+        )
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: fixture.paths.isolatedOutputURL.path
+        ))
+
+        XCTAssertTrue(
+            try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
+                paths: fixture.paths,
+                publication: publication
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.isolatedOutputURL.path
+        ))
+        XCTAssertEqual(
+            try ProjectArtifactValidator.validatedPlyEvidence(
+                at: fixture.paths.outputSplatURL
+            ),
+            replacementEvidence
+        )
+    }
+
     func testPipelineCanTrainWithNativeMsplat() async throws {
         let temp = makeTempRoot()
 
@@ -6761,6 +6837,1032 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.mapping.acceptedRefinementKind, .seededBundleAdjustment)
         XCTAssertEqual(geometry.mapping.acceptedRefinementInvocationCount, 1)
         XCTAssertNil(geometry.mapping.fallbackReason)
+    }
+
+    private struct DatasetProjectFixture {
+        let projectURL: URL
+        let paths: ProjectPaths
+        let plan: ResolvedRunPlan
+        let sourceImageSHA256s: [String]
+        let sourceImagesFolder: URL
+    }
+
+    /// A signed-toolchain evidence bundle that authenticates an imported-geometry
+    /// finished project: the conversion tooling's runtime closure is pinned to the
+    /// installed COLMAP and OpenMP digests, while the imported solver provenance is
+    /// verified against its own dataset contract rather than signed COLMAP records.
+    private func makeImportedToolchainEvidence(
+        toolchainVersion: String,
+        runtimeClosure: ColmapRuntimeClosureEvidence,
+        trainerBuildDigest: String
+    ) -> ToolchainInstallationEvidence {
+        var criticalFiles: [String: String] = [
+            "bin/easysplat-train": String(repeating: "b", count: 64),
+            "bin/default.metallib": String(repeating: "c", count: 64),
+            "provenance/colmap.json": String(repeating: "d", count: 64),
+            "msplat/build_info.json": String(repeating: "e", count: 64),
+        ]
+        for component in runtimeClosure.components {
+            criticalFiles[component.toolchainRelativePath] = component.sha256
+        }
+        let declaredContents = [
+            "bin/easysplat-train",
+            "bin/default.metallib",
+            "provenance/colmap.json",
+            "msplat/build_info.json",
+        ] + runtimeClosure.components.map(\.toolchainRelativePath)
+        return ToolchainInstallationEvidence(
+            toolchainVersion: toolchainVersion,
+            keyID: String(repeating: "5", count: 64),
+            canonicalManifestSHA256: String(repeating: "6", count: 64),
+            signatureSHA256: String(repeating: "7", count: 64),
+            closureSHA256: String(repeating: "8", count: 64),
+            installationIdentitySHA256: String(repeating: "9", count: 64),
+            installedArtifacts: ["macos-arm64-core": String(repeating: "a", count: 64)],
+            installedCapabilities: [
+                ToolchainCapability.core.rawValue,
+                ToolchainCapability.colmap.rawValue,
+                ToolchainCapability.msplat.rawValue,
+            ],
+            installedCriticalFileSHA256: criticalFiles,
+            nativeTrainerBuildDigest: trainerBuildDigest,
+            signedComponents: [
+                ToolchainInstallationEvidence.SignedComponent(
+                    name: "macos-arm64-core",
+                    archiveSHA256: String(repeating: "a", count: 64),
+                    expandedClosureSHA256: String(repeating: "f", count: 64),
+                    capabilities: [
+                        ToolchainCapability.core.rawValue,
+                        ToolchainCapability.colmap.rawValue,
+                        ToolchainCapability.msplat.rawValue,
+                    ],
+                    declaredContents: declaredContents
+                ),
+            ],
+            provenanceRecords: [
+                ToolchainInstallationEvidence.ProvenanceRecord(
+                    path: "msplat/build_info.json",
+                    fileSHA256: String(repeating: "e", count: 64),
+                    canonicalJSONSHA256: String(repeating: "2", count: 64),
+                    stringFields: [
+                        "toolchain_name": "msplat",
+                        "source_version": "1.1.3",
+                        "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
+                        "executable_sha256": String(repeating: "b", count: 64),
+                        "metallib_sha256": String(repeating: "c", count: 64),
+                    ]
+                ),
+            ]
+        )
+    }
+
+    /// Builds an adopted dataset project the way import adoption leaves it:
+    /// posed images admitted through the photo machinery, the converted COLMAP
+    /// pose seed persisted under `Import/seed`, and the pose-seed receipt bound
+    /// in metadata. `unmatchableEntryCount` appends seed images whose receipt
+    /// entries can never resolve to a selected frame.
+    private func makeDatasetProjectFixture(
+        root: URL,
+        name: String,
+        imageCount: Int,
+        route: DatasetGeometryRoute = .seedTriangulate,
+        unmatchableEntryCount: Int = 0,
+        adoptDirectPointCount: Int = 24,
+        adoptDirectObservationPixelOffset: Double = 0
+    ) throws -> DatasetProjectFixture {
+        let fm = FileManager.default
+        let projectURL = root.appendingPathComponent(
+            "\(name).easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let sourceImages = root.appendingPathComponent("\(name)-images", isDirectory: true)
+        try fm.createDirectory(at: sourceImages, withIntermediateDirectories: true)
+        var sourceSHA256s: [String] = []
+        for index in 0..<imageCount {
+            let url = sourceImages.appendingPathComponent(
+                String(format: "img_%03d.jpg", index)
+            )
+            try writeRetrievalTestImage(url: url, index: index)
+            sourceSHA256s.append(try GeometryArtifactStore.sha256(of: url))
+        }
+
+        let declaredCount = imageCount + unmatchableEntryCount
+        try fm.createDirectory(at: paths.importSeedURL, withIntermediateDirectories: true)
+        let declaredPaths = (0..<declaredCount).map {
+            String(format: "images/img_%03d.jpg", $0)
+        }
+        if route == .adoptDirect {
+            // A complete model (poses + triangulated points + observations) so
+            // direct adoption republishes structure the conditioning and scorer
+            // gates can consume.
+            try writeCompleteImportSeedModel(
+                at: paths.importSeedURL,
+                declaredPaths: declaredPaths,
+                pointCount: adoptDirectPointCount,
+                observationPixelOffset: adoptDirectObservationPixelOffset
+            )
+        } else {
+            try "1 PINHOLE 640 480 500 500 320 240\n".write(
+                to: paths.importSeedURL.appendingPathComponent("cameras.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+            var imagesText = ""
+            for (index, declaredPath) in declaredPaths.enumerated() {
+                imagesText += "\(index + 1) 1 0 0 0 \(-0.25 * Double(index)) 0 0 1 \(declaredPath)\n\n"
+            }
+            try imagesText.write(
+                to: paths.importSeedURL.appendingPathComponent("images.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try "# 3D point list (pose-only import)\n".write(
+                to: paths.importSeedURL.appendingPathComponent("points3D.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        for fileName in DatasetPoseSeedReceipt.seedFileNames {
+            try fm.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: paths.importSeedURL.appendingPathComponent(fileName).path
+            )
+        }
+
+        // Each entry keeps its declared path and source digest; only the adopted
+        // file name differs between the provisional and reconciled receipts.
+        func buildEntries(
+            adoptedFileName: (_ index: Int, _ sourceSHA256: String) -> String
+        ) -> [DatasetReceiptEntry] {
+            (0..<declaredCount).map { index in
+                let declaredPath = String(format: "images/img_%03d.jpg", index)
+                let sourceSHA256 = index < imageCount
+                    ? sourceSHA256s[index]
+                    : String(format: "%064d", index + 1)
+                return DatasetReceiptEntry(
+                    entryID: declaredPath,
+                    declaredPath: declaredPath,
+                    adoptedFileName: adoptedFileName(index, sourceSHA256),
+                    sourceSHA256: sourceSHA256
+                )
+            }
+        }
+
+        // A provisional receipt keeps the metadata loadable while photo admission
+        // runs; its adopted file names are reconciled to the real controlled
+        // leaves afterward, exactly as production adoption binds them.
+        let provisionalReceipt = try DatasetPoseSeedReceipt.build(
+            kind: .nerfstudio,
+            route: route,
+            entries: buildEntries { index, _ in String(format: "img_%03d.jpg", index) },
+            sourceRelativePaths: [],
+            projectRoot: projectURL
+        )
+
+        let requestedOptions = RequestedRunOptions(
+            capturePath: .automatic,
+            detailProfile: .fast,
+            cameraGrouping: .sameCameraAndLens,
+            inputOrdering: .unordered,
+            photoSelection: .useAllValidPhotos
+        )
+        let input = InputSpec.dataset(kind: .nerfstudio, imagesFolder: sourceImages.path)
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: requestedOptions,
+            input: input,
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none,
+            datasetImport: RunPlanResolver.DatasetImportContext(
+                route: route,
+                imageCount: provisionalReceipt.imageCount
+            )
+        )
+        var metadata = ProjectMetadata(
+            title: name,
+            input: input,
+            requestedRunOptions: requestedOptions
+        )
+        metadata.datasetPoseSeed = provisionalReceipt
+        metadata.resolvedRunPlan = plan
+        let controlled = try saveFixtureMetadata(metadata, paths: paths)
+
+        // Bind each entry to the controlled photo it became, keyed by source
+        // digest — the run-start closure check pairs entries and receipts by
+        // (digest, adopted file name), just as import adoption does.
+        let leafBySourceSHA256 = Dictionary(
+            (controlled.photoInputReceipts ?? []).map {
+                ($0.source.sha256, ($0.projectRelativePath as NSString).lastPathComponent)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let reconciledReceipt = try DatasetPoseSeedReceipt.build(
+            kind: .nerfstudio,
+            route: route,
+            entries: buildEntries { index, sourceSHA256 in
+                leafBySourceSHA256[sourceSHA256] ?? String(format: "img_%03d.jpg", index)
+            },
+            sourceRelativePaths: [],
+            projectRoot: projectURL
+        )
+        var reconciledMetadata = controlled
+        reconciledMetadata.datasetPoseSeed = reconciledReceipt
+        try ProjectMetadataStore.save(reconciledMetadata, to: paths.metadataURL)
+
+        return DatasetProjectFixture(
+            projectURL: projectURL,
+            paths: paths,
+            plan: plan,
+            sourceImageSHA256s: sourceSHA256s,
+            sourceImagesFolder: sourceImages
+        )
+    }
+
+    func testImportedPoseDatasetRunsSeededTriangulationInsteadOfMapper() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetSeeded",
+            imageCount: 29
+        )
+        XCTAssertEqual(fixture.plan.geometryBackend, .importedPoses)
+        XCTAssertEqual(fixture.plan.datasetGeometryRoute, .seedTriangulate)
+        let paths = fixture.paths
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeFeatureDatabase(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let path = self.value(for: "--match_list_path", in: args),
+                      let pairs = try? String(contentsOfFile: path, encoding: .utf8) else {
+                    return XCTFail("Imported-pose pair list was not readable")
+                }
+                XCTAssertTrue(pairs.contains("frame_000000.jpg frame_000028.jpg"))
+                try? self.writeVerifiedPairResults(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let input = self.value(for: "--input_path", in: args),
+                      let output = self.value(for: "--output_path", in: args) else {
+                    return XCTFail("point_triangulator was missing model paths")
+                }
+                XCTAssertTrue(input.hasSuffix("SfM/colmap/seed/refinement/0"))
+                let seedImages = (try? String(
+                    contentsOfFile: input + "/images.txt",
+                    encoding: .utf8
+                )) ?? ""
+                XCTAssertTrue(seedImages.contains("frame_000000.jpg"))
+                XCTAssertFalse(seedImages.contains("images/img_000.jpg"))
+                try? self.writeDa3SparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
+                )
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_extrinsics", in: args), "0")
+                XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_focal_length", in: args), "0")
+                XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_principal_point", in: args), "0")
+                XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_extra_params", in: args), "0")
+                XCTAssertEqual(
+                    self.value(for: "--BundleAdjustmentCeres.max_num_iterations", in: args),
+                    "\(fixture.plan.refinementIterationLimit)"
+                )
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeDa3SparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
+                )
+            }),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 29 / 29\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
+                    stderr: ""
+                ),
+                onRun: nil
+            )
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: runner)
+        )
+        let events = PipelineEventSink()
+        try await pipeline.run { events.append($0) }
+
+        let commands = runner.calls.filter { $0.0 == toolchain.colmap.path }.compactMap { $0.1.first }
+        XCTAssertEqual(
+            commands,
+            ["feature_extractor", "matches_importer", "point_triangulator", "bundle_adjuster", "model_analyzer"]
+        )
+        XCTAssertFalse(commands.contains("mapper"))
+        XCTAssertNotNil(events.stageLog(
+            containing: "Imported pose seed accepted after triangulation and bounded bundle adjustment."
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: paths.colmapSeedURL.appendingPathComponent("import").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: paths.colmapRefinementSeedModelURL.path
+        ))
+
+        let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNil(finished.geometryRecovery)
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths,
+            expectedInput: finished.input
+        )
+        XCTAssertTrue(geometry.solverVersion.hasPrefix("imported-poses;"))
+        XCTAssertEqual(geometry.provenance.solver.identifier, "colmap")
+        XCTAssertNil(geometry.provenance.runtime)
+        XCTAssertNil(geometry.provenance.model)
+        XCTAssertEqual(geometry.modelVersion, "none")
+        XCTAssertEqual(geometry.registeredViewCount, 29)
+        XCTAssertEqual(geometry.pairGraph.status, .measured)
+        XCTAssertEqual(geometry.pairGraph.measurement?.scheduledPairCount, 406)
+        XCTAssertEqual(
+            geometry.pairGraph.measurement?.matcherAttempts.map(\.matcher),
+            [.faiss]
+        )
+        XCTAssertEqual(geometry.mapping.modelCount, 1)
+        XCTAssertEqual(geometry.mapping.largestModelRegisteredViewCount, 29)
+        XCTAssertEqual(geometry.mapping.attemptCount, 1)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementKind, .seededBundleAdjustment)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementInvocationCount, 1)
+        XCTAssertNil(geometry.mapping.incrementalCadence)
+        XCTAssertNil(geometry.mapping.fallbackReason)
+    }
+
+    func testImportedPoseSeedEntryWithoutSelectedFrameFailsClosureAtRunStart() async throws {
+        let temp = makeTempRoot()
+        // Nine declared entries, but only eight images were admitted as photos:
+        // the ninth entry consumes no receipt, so the run-start one-to-one
+        // closure rejects the project before any COLMAP compute begins.
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetSeedMiss",
+            imageCount: 8,
+            unmatchableEntryCount: 1
+        )
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [])
+
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: runner)
+        )
+        do {
+            try await pipeline.run { _ in }
+            XCTFail("Expected the unmatched seed entry to fail the run-start closure")
+        } catch let error as DatasetPoseSeedReceiptValidationError {
+            XCTAssertEqual(error, .photoReceiptClosureMismatch)
+        }
+        // The closure is proven before geometry compute, so no COLMAP runs.
+        let commands = runner.calls.filter { $0.0 == toolchain.colmap.path }
+        XCTAssertTrue(commands.isEmpty)
+    }
+
+    func testImportedPoseAdoptDirectAdoptsGeometryWithoutSubprocesses() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetAdoptDirect",
+            imageCount: 8,
+            route: .adoptDirect
+        )
+        XCTAssertEqual(fixture.plan.geometryBackend, .importedPoses)
+        XCTAssertEqual(fixture.plan.datasetGeometryRoute, .adoptDirect)
+        let paths = fixture.paths
+
+        let toolchain = try makeToolchain(root: temp)
+        // No script is provided: the adoptDirect route runs no COLMAP subprocess.
+        let runner = MockSubprocessRunner(scripts: [])
+
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: runner)
+        )
+        let events = PipelineEventSink()
+        try await pipeline.run { events.append($0) }
+
+        let colmapCalls = runner.calls.filter { $0.0 == toolchain.colmap.path }
+        XCTAssertTrue(
+            colmapCalls.isEmpty,
+            "adoptDirect must not invoke any COLMAP subprocess, saw: \(colmapCalls.map { $0.1.first ?? "" })"
+        )
+        XCTAssertNotNil(events.stageLog(containing: "Imported dataset geometry adopted directly."))
+
+        // sparse/0 holds the finalized TEXT model, not a binary one.
+        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: sparseZero.appendingPathComponent(name).path),
+                "missing \(name)"
+            )
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: sparseZero.appendingPathComponent("cameras.bin").path)
+        )
+        // The finalized model references the selected frame names, not the
+        // dataset-declared paths.
+        let imagesTxt = try String(
+            contentsOf: sparseZero.appendingPathComponent("images.txt"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(imagesTxt.contains("frame_000000.jpg"))
+        XCTAssertFalse(imagesTxt.contains("images/img_000.jpg"))
+        // The import staging directory is cleaned up.
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: paths.colmapSeedURL.appendingPathComponent("import").path
+        ))
+
+        let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNil(finished.geometryRecovery)
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths,
+            expectedInput: finished.input
+        )
+        XCTAssertEqual(geometry.resolvedSource, .imported)
+        XCTAssertEqual(geometry.provenance.solver.identifier, "imported")
+        XCTAssertEqual(geometry.provenance.solver.version, DatasetKind.nerfstudio.rawValue)
+        XCTAssertNil(geometry.provenance.runtime)
+        XCTAssertNil(geometry.provenance.model)
+        XCTAssertEqual(geometry.modelVersion, "none")
+        XCTAssertEqual(geometry.registeredViewCount, 8)
+        XCTAssertEqual(geometry.totalViewCount, 8)
+        XCTAssertEqual(geometry.pairGraph.status, .notEvaluated)
+        XCTAssertNil(geometry.featureDatabaseDigest)
+        XCTAssertNil(geometry.cameraGroupingReceipt)
+        let evidence = try XCTUnwrap(geometry.importedEvidence)
+        XCTAssertEqual(evidence.route, DatasetGeometryRoute.adoptDirect.rawValue)
+        XCTAssertEqual(evidence.imageCount, 8)
+        XCTAssertEqual(evidence.seedClosureSHA256, geometry.provenance.solver.payloadSHA256)
+        XCTAssertEqual(evidence.sourceClosureSHA256, geometry.provenance.solver.revision)
+        XCTAssertEqual(evidence.seedFiles.count, 3)
+        // The run-plan binding accepts the imported artifact against adoptDirect.
+        XCTAssertNoThrow(try GeometryArtifactStore.requireRunPlanBinding(
+            geometry,
+            plan: fixture.plan
+        ))
+    }
+
+    func testImportedPoseAdoptDirectRejectsBadObservations() async throws {
+        let temp = makeTempRoot()
+        // Every observation is offset far from its true reprojection. The adopted
+        // model then faces the same conditioning caps a native solve does and is
+        // rejected — here the corrupted rays fail the parallax conditioning gate.
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetAdoptBadObs",
+            imageCount: 8,
+            route: .adoptDirect,
+            adoptDirectObservationPixelOffset: 60
+        )
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [])
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: runner)
+        )
+        do {
+            try await pipeline.run { _ in }
+            XCTFail("Expected bad observations to fail the geometry conditioning gate")
+        } catch let error as PipelineRunner.PipelineError {
+            guard case .geometryConditioningRejected = error else {
+                return XCTFail("Unexpected pipeline error: \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.geometryManifestURL.path
+        ))
+    }
+
+    func testImportedPoseAdoptDirectSeedTamperInvalidatesArtifact() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetAdoptSeedTamper",
+            imageCount: 8,
+            route: .adoptDirect
+        )
+        let paths = fixture.paths
+        let toolchain = try makeToolchain(root: temp)
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: MockSubprocessRunner(scripts: []))
+        )
+        try await pipeline.run { _ in }
+        let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
+        // The artifact loads cleanly before any tampering.
+        XCTAssertNoThrow(try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths,
+            expectedInput: finished.input
+        ))
+        // Flip a byte in the persisted Import/seed so its digest no longer
+        // matches the artifact's authenticated seed receipt.
+        let seededImages = paths.importSeedURL.appendingPathComponent("images.txt")
+        var contents = try String(contentsOf: seededImages, encoding: .utf8)
+        contents += "\n# tampered\n"
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: seededImages.path
+        )
+        try contents.write(to: seededImages, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths,
+            expectedInput: finished.input
+        )) { error in
+            XCTAssertEqual(
+                error as? GeometryArtifactStore.Error,
+                .invalidImportedEvidence
+            )
+        }
+    }
+
+    func testImportedPoseAdoptDirectSparseModelTamperInvalidatesArtifact() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetAdoptSparseTamper",
+            imageCount: 8,
+            route: .adoptDirect
+        )
+        let paths = fixture.paths
+        let toolchain = try makeToolchain(root: temp)
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: MockSubprocessRunner(scripts: []))
+        )
+        try await pipeline.run { _ in }
+        let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let camerasTxt = paths.colmapSparseURL
+            .appendingPathComponent("0", isDirectory: true)
+            .appendingPathComponent("cameras.txt")
+        var contents = try String(contentsOf: camerasTxt, encoding: .utf8)
+        contents += "\n# tampered\n"
+        try contents.write(to: camerasTxt, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths,
+            expectedInput: finished.input
+        )) { error in
+            XCTAssertEqual(
+                error as? GeometryArtifactStore.Error,
+                .modelHashMismatch("cameras.txt")
+            )
+        }
+    }
+
+    func testImportedPoseAdoptDirectResumeSkipsMappingToTraining() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetAdoptResume",
+            imageCount: 8,
+            route: .adoptDirect
+        )
+        let paths = fixture.paths
+        let toolchain = try makeToolchain(root: temp)
+        let firstPipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: MockSubprocessRunner(scripts: []))
+        )
+        try await firstPipeline.run { _ in }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
+
+        // A resume must recover the completed geometry via validateStageOutput
+        // and never re-enter the adoption body (still no subprocess).
+        let resumeRunner = MockSubprocessRunner(scripts: [])
+        let resumePipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: resumeRunner)
+        )
+        let events = PipelineEventSink()
+        try await resumePipeline.run { events.append($0) }
+        XCTAssertTrue(
+            resumeRunner.calls.filter { $0.0 == toolchain.colmap.path }.isEmpty
+        )
+        XCTAssertNotNil(events.stageLog(
+            containing: "Recovered the completed camera reconstruction."
+        ))
+    }
+
+    func testImportedPoseAdoptDirectTrainsAndPreparesMsplatDataset() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetAdoptTrain",
+            imageCount: 8,
+            route: .adoptDirect
+        )
+        let paths = fixture.paths
+        let toolchain = try makeToolchain(root: temp, createMsplatFile: true)
+
+        let plySizeProbe = temp.appendingPathComponent("adopt-msplat-size-probe.ply")
+        try TestFileBuilder.writeMinimalPly(at: plySizeProbe, vertexCount: 1_800)
+        let msplatOutputBytes = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: plySizeProbe.path)[.size] as? NSNumber)?.int64Value
+        )
+        try FileManager.default.removeItem(at: plySizeProbe)
+        let inputDigest = String(repeating: "1", count: 64)
+        let geometryDigest = String(repeating: "2", count: 64)
+        let trainerDigest = String(repeating: "3", count: 64)
+        let payloadDigest = String(repeating: "4", count: 64)
+        let generation = "00000000-" + String(repeating: "5", count: 64)
+        let memoryBudgetBytes = automaticTrainingMemoryBudgetBytes
+        let msplatEvents = """
+        {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":268435456,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        """ + "\n"
+
+        var msplatDatasetPath: String?
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_converter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let outputPath = self.value(for: "--output_path", in: args) else { return }
+                    try? self.writeMinimalColmapBinaryModel(
+                        at: URL(fileURLWithPath: outputPath, isDirectory: true),
+                        imageNames: (0..<8).map { String(format: "frame_%06d.jpg", $0) }
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.msplat.path,
+                argsPrefix: ["--dataset"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLinesProvider: { args in
+                    guard let datasetArg = args.dropFirst().first else { return [] }
+                    let dataset = URL(fileURLWithPath: datasetArg, isDirectory: true)
+                    guard let identity = try? MsplatDatasetIdentity.compute(
+                        imageDirectory: dataset.appendingPathComponent("images", isDirectory: true),
+                        sparseDirectory: dataset.appendingPathComponent("sparse/0", isDirectory: true)
+                    ) else { return [] }
+                    return msplatEvents
+                        .replacingOccurrences(of: inputDigest, with: identity.inputDigest)
+                        .replacingOccurrences(of: geometryDigest, with: identity.geometryDigest)
+                        .split(separator: "\n")
+                        .map(String.init)
+                },
+                onRun: { args in
+                    guard let datasetArg = args.dropFirst().first,
+                          let outputArg = self.value(for: "--output", in: args),
+                          let checkpointArg = self.value(for: "--checkpoint", in: args) else { return }
+                    msplatDatasetPath = datasetArg
+                    let dataset = URL(fileURLWithPath: datasetArg, isDirectory: true)
+                    XCTAssertTrue(FileManager.default.fileExists(
+                        atPath: dataset.appendingPathComponent("sparse/0/cameras.bin").path
+                    ))
+                    try? TestFileBuilder.writeMinimalPly(
+                        at: URL(fileURLWithPath: outputArg),
+                        vertexCount: 1_800
+                    )
+                    try? FileManager.default.createDirectory(
+                        at: URL(fileURLWithPath: checkpointArg, isDirectory: true),
+                        withIntermediateDirectories: true
+                    )
+                }
+            )
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain),
+            tooling: .init(
+                runner: runner,
+                trainingResourceObserver: TestTrainingResourceObserver()
+            )
+        )
+        try await pipeline.run { _ in }
+
+        // The geometry stage ran no COLMAP subprocess; only training's dataset
+        // preparation invoked model_converter (proving the membership leg is
+        // skipped without a feature database).
+        let colmapCommands = runner.calls
+            .filter { $0.0 == toolchain.colmap.path }
+            .compactMap { $0.1.first }
+        XCTAssertEqual(colmapCommands, ["model_converter"])
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.msplat.path }))
+        XCTAssertNotNil(msplatDatasetPath)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: paths.trainingURL.appendingPathComponent("msplat_dataset").path
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.outputSplatURL.path))
+        let training = try TrainingArtifactStore.load(
+            from: paths.trainingManifestURL,
+            projectPaths: paths
+        )
+        XCTAssertEqual(training.completionStatus, .completed)
+        XCTAssertEqual(training.outputPath, "Output/splat.ply")
+        XCTAssertEqual(training.datasetDerivation.colmapProvenance.identifier, "imported")
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        XCTAssertEqual(geometry.resolvedSource, .imported)
+
+        // FIX 1: independent finished-project validation must reconstruct the
+        // dataset import context before re-resolving the plan; otherwise the
+        // plan-equality guard rejects the dataset project before any artifact
+        // check runs.
+        let validationContext = FinishedProjectValidationContext(
+            hardwareProfile: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        )
+        let finishedEvidence = try ProjectArtifactValidator.validateFinishedProject(
+            at: paths.root,
+            expectedInput: .photoFolder(fixture.sourceImagesFolder),
+            context: validationContext
+        )
+        XCTAssertEqual(finishedEvidence.resolvedRunPlan.geometryBackend, .importedPoses)
+        XCTAssertEqual(finishedEvidence.resolvedRunPlan.datasetGeometryRoute, .adoptDirect)
+        XCTAssertEqual(finishedEvidence.geometryArtifact.resolvedSource, .imported)
+
+        // FIX 2: the imported artifact authenticates against its own dataset
+        // provenance contract (identifier/kind/closures), not signed COLMAP
+        // version/revision, while the conversion tooling's runtime closure is
+        // still bound to the installed toolchain.
+        let installation = makeImportedToolchainEvidence(
+            toolchainVersion: geometry.provenance.toolchainVersion,
+            runtimeClosure: geometry.workerExecution.colmapRuntimeClosure,
+            trainerBuildDigest: training.trainerBuildDigest
+        )
+        XCTAssertNoThrow(try ProjectArtifactValidator.validateToolchainBinding(
+            finishedProject: finishedEvidence,
+            installation: installation
+        ))
+    }
+
+    func testImportedPoseSeedTriangulateFinishedProjectValidates() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetSeededTrain",
+            imageCount: 8,
+            route: .seedTriangulate
+        )
+        let paths = fixture.paths
+        let toolchain = try makeToolchain(root: temp, createMsplatFile: true)
+
+        let plySizeProbe = temp.appendingPathComponent("seeded-msplat-size-probe.ply")
+        try TestFileBuilder.writeMinimalPly(at: plySizeProbe, vertexCount: 1_800)
+        let msplatOutputBytes = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: plySizeProbe.path)[.size] as? NSNumber)?.int64Value
+        )
+        try FileManager.default.removeItem(at: plySizeProbe)
+        let inputDigest = String(repeating: "1", count: 64)
+        let geometryDigest = String(repeating: "2", count: 64)
+        let trainerDigest = String(repeating: "3", count: 64)
+        let payloadDigest = String(repeating: "4", count: 64)
+        let generation = "00000000-" + String(repeating: "5", count: 64)
+        let memoryBudgetBytes = automaticTrainingMemoryBudgetBytes
+        let msplatEvents = """
+        {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":268435456,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        """ + "\n"
+
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeFeatureDatabase(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeVerifiedPairResults(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeDa3SparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
+                )
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeDa3SparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
+                )
+            }),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 8 / 8\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
+                    stderr: ""
+                ),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_converter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let outputPath = self.value(for: "--output_path", in: args) else { return }
+                    try? self.writeMinimalColmapBinaryModel(
+                        at: URL(fileURLWithPath: outputPath, isDirectory: true),
+                        imageNames: (0..<8).map { String(format: "frame_%06d.jpg", $0) }
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.msplat.path,
+                argsPrefix: ["--dataset"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLinesProvider: { args in
+                    guard let datasetArg = args.dropFirst().first else { return [] }
+                    let dataset = URL(fileURLWithPath: datasetArg, isDirectory: true)
+                    guard let identity = try? MsplatDatasetIdentity.compute(
+                        imageDirectory: dataset.appendingPathComponent("images", isDirectory: true),
+                        sparseDirectory: dataset.appendingPathComponent("sparse/0", isDirectory: true)
+                    ) else { return [] }
+                    return msplatEvents
+                        .replacingOccurrences(of: inputDigest, with: identity.inputDigest)
+                        .replacingOccurrences(of: geometryDigest, with: identity.geometryDigest)
+                        .split(separator: "\n")
+                        .map(String.init)
+                },
+                onRun: { args in
+                    guard let outputArg = self.value(for: "--output", in: args),
+                          let checkpointArg = self.value(for: "--checkpoint", in: args) else { return }
+                    try? TestFileBuilder.writeMinimalPly(
+                        at: URL(fileURLWithPath: outputArg),
+                        vertexCount: 1_800
+                    )
+                    try? FileManager.default.createDirectory(
+                        at: URL(fileURLWithPath: checkpointArg, isDirectory: true),
+                        withIntermediateDirectories: true
+                    )
+                }
+            ),
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain),
+            tooling: .init(
+                runner: runner,
+                trainingResourceObserver: TestTrainingResourceObserver()
+            )
+        )
+        try await pipeline.run { _ in }
+
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        XCTAssertEqual(geometry.resolvedSource, .computed)
+        XCTAssertEqual(geometry.provenance.solver.identifier, "colmap")
+
+        // FIX 1: the seedTriangulate route also resolves to the importedPoses
+        // backend, so finished validation must reconstruct the dataset import
+        // context before re-resolving the plan.
+        let validationContext = FinishedProjectValidationContext(
+            hardwareProfile: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        )
+        let finishedEvidence = try ProjectArtifactValidator.validateFinishedProject(
+            at: paths.root,
+            expectedInput: .photoFolder(fixture.sourceImagesFolder),
+            context: validationContext
+        )
+        XCTAssertEqual(finishedEvidence.resolvedRunPlan.geometryBackend, .importedPoses)
+        XCTAssertEqual(finishedEvidence.resolvedRunPlan.datasetGeometryRoute, .seedTriangulate)
+        XCTAssertEqual(finishedEvidence.geometryArtifact.resolvedSource, .computed)
+    }
+
+    func testImportedPoseMappingCancellationResumesSeededTriangulation() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makeDatasetProjectFixture(
+            root: temp,
+            name: "DatasetSeededResume",
+            imageCount: 29
+        )
+        let paths = fixture.paths
+
+        let toolchain = try makeToolchain(root: temp)
+        let firstBacking = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeFeatureDatabase(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeVerifiedPairResults(for: args)
+            })
+        ])
+        let cancellingRunner = CommandCancellingSubprocessRunner(
+            backing: firstBacking,
+            launchPath: toolchain.colmap.path,
+            cancelCommand: "point_triangulator"
+        )
+        let firstPipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: cancellingRunner)
+        )
+        do {
+            try await firstPipeline.run { _ in }
+            XCTFail("Expected cancellation during seeded triangulation")
+        } catch is CancellationError {
+        }
+        let interrupted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(interrupted.checkpoint?.stage, .sfmMapping)
+        XCTAssertEqual(interrupted.geometryRecovery?.activeBackend, .importedPoses)
+        XCTAssertNil(interrupted.geometryRecovery?.plannedIncrementalCadence)
+
+        let secondRunner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeFeatureDatabase(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeVerifiedPairResults(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeDa3SparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
+                )
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_extrinsics", in: args), "0")
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeDa3SparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
+                )
+            }),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 29 / 29\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
+                    stderr: ""
+                ),
+                onRun: nil
+            )
+        ])
+        let secondPipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
+            tooling: .init(runner: secondRunner)
+        )
+        try await secondPipeline.run(resumeFrom: .sfmMatching) { _ in }
+
+        let resumedCommands = secondRunner.calls
+            .filter { $0.0 == toolchain.colmap.path }
+            .compactMap { $0.1.first }
+        XCTAssertEqual(
+            resumedCommands,
+            ["point_triangulator", "bundle_adjuster", "model_analyzer"],
+            "Resume must reuse the durable feature and matching boundaries"
+        )
+
+        let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNil(finished.geometryRecovery)
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths,
+            expectedInput: finished.input
+        )
+        XCTAssertTrue(geometry.solverVersion.hasPrefix("imported-poses;"))
+        XCTAssertEqual(geometry.mapping.acceptedRefinementKind, .seededBundleAdjustment)
+        XCTAssertEqual(geometry.mapping.attemptCount, 2)
+        XCTAssertEqual(
+            geometry.mapping.fallbackReason,
+            "interrupted mapping resumed"
+        )
     }
 
     func testDa3CancellationBeforeTriangulationDoesNotLaunchColmap() async throws {
@@ -8613,6 +9715,8 @@ final class PipelineIntegrationTests: XCTestCase {
                 videos: videos,
                 photosFolder: "Originals/Photos"
             )
+        case .dataset(let kind, _):
+            controlledMetadata.input = .dataset(kind: kind, imagesFolder: "Originals/Photos")
         case .video:
             throw NSError(domain: "PipelineIntegrationTests", code: 43)
         }
@@ -10302,6 +11406,67 @@ final class PipelineIntegrationTests: XCTestCase {
         try (points + "\n").write(to: modelURL.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
     }
 
+    /// Writes a complete COLMAP text model into `Import/seed` for the adoptDirect
+    /// route: a PINHOLE camera, poses along +x, and a grid of triangulated points
+    /// every image observes. Image NAME fields are the dataset-declared paths, so
+    /// `finalizeImportedPoseSeed` rewrites them to the selected frame names.
+    private func writeCompleteImportSeedModel(
+        at seedURL: URL,
+        declaredPaths: [String],
+        pointCount: Int,
+        observationPixelOffset: Double = 0
+    ) throws {
+        try "1 PINHOLE 640 480 500 500 320 240\n".write(
+            to: seedURL.appendingPathComponent("cameras.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let columnCount = max(2, Int(ceil(sqrt(Double(pointCount)))))
+        let rowCount = max(2, Int(ceil(Double(pointCount) / Double(columnCount))))
+        let pointPositions = (0..<pointCount).map { pointOffset in
+            (
+                x: Double(pointOffset % columnCount) - Double(columnCount - 1) / 2,
+                y: Double(pointOffset / columnCount) - Double(rowCount - 1) / 2,
+                z: 12.0
+            )
+        }
+        var tracks = Array(repeating: [String](), count: pointCount)
+        var imagesText = "# Image list with two lines per image:\n"
+        for (offset, declaredPath) in declaredPaths.enumerated() {
+            let imageID = offset + 1
+            let centerX = Double(offset) * 0.25
+            imagesText += "\(imageID) 1 0 0 0 \(-centerX) 0 0 1 \(declaredPath)\n"
+            let observations = pointPositions.enumerated()
+                .map { pointOffset, point in
+                    tracks[pointOffset].append("\(imageID) \(pointOffset)")
+                    // A non-zero offset moves every observation off its true
+                    // reprojection, driving the measured pixel residual past the
+                    // acceptance cap.
+                    let x = 500 * (point.x - centerX) / point.z + 320 + observationPixelOffset
+                    let y = 500 * point.y / point.z + 240 + observationPixelOffset
+                    return "\(x) \(y) \(pointOffset + 1)"
+                }
+                .joined(separator: " ")
+            imagesText += observations + "\n"
+        }
+        try imagesText.write(
+            to: seedURL.appendingPathComponent("images.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let points = pointPositions.enumerated()
+            .map { pointOffset, point in
+                "\(pointOffset + 1) \(point.x) \(point.y) \(point.z) 128 128 128 1.0 "
+                    + tracks[pointOffset].joined(separator: " ")
+            }
+            .joined(separator: "\n")
+        try (points + "\n").write(
+            to: seedURL.appendingPathComponent("points3D.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
     private func sparseCameraRecord(cameraID: Int, cameraModel: String) throws -> String {
         let parameters: String
         switch cameraModel {
@@ -10590,6 +11755,66 @@ private final class CancellationOnSfmRunner: @unchecked Sendable, SubprocessRunn
         }
 
         return SubprocessResult(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "")
+    }
+}
+
+/// Delegates to a scripted backing runner until the given launch path runs the
+/// given first-argument command, then throws `CancellationError` in its place.
+private final class CommandCancellingSubprocessRunner: @unchecked Sendable, SubprocessRunning {
+    private let backing: MockSubprocessRunner
+    private let launchPath: String
+    private let cancelCommand: String
+
+    init(backing: MockSubprocessRunner, launchPath: String, cancelCommand: String) {
+        self.backing = backing
+        self.launchPath = launchPath
+        self.cancelCommand = cancelCommand
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        if launchPath == self.launchPath, arguments.first == cancelCommand {
+            throw CancellationError()
+        }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        if launchPath == self.launchPath, arguments.first == cancelCommand {
+            throw CancellationError()
+        }
+        return try await backing.runAsync(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
     }
 }
 

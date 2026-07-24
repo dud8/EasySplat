@@ -709,7 +709,11 @@ extension PipelineRunner {
         return true
     }
 
-    func prepareDa3RefinementSeed(
+    /// Copies an externally produced COLMAP text seed (a DA3 aligned seed or an
+    /// imported dataset pose seed) into the refinement staging area with bounded
+    /// readers, then remaps its image and camera IDs onto the live feature
+    /// database. Returns true when normalization or remapping changed the model.
+    func prepareExternalRefinementSeed(
         rawModelURL: URL,
         outputModelURL: URL,
         databaseURL: URL,
@@ -762,6 +766,219 @@ extension PipelineRunner {
             try removeItemIfPresent(outputRootURL)
             throw error
         }
+    }
+
+    /// Rewrites the persisted dataset pose seed (`Import/seed`) so its image
+    /// NAME fields reference the selected frame files, then stages the result
+    /// under `SfM/colmap/seed/import/0` for database ID remapping. The seed's
+    /// NAMEs are dataset-declared paths; the adoption receipt binds each
+    /// declared path to the adopted photo, and the selected-frame manifest
+    /// binds that photo (by source digest) to its `Frames/selected` output.
+    /// Every seed image must resolve.
+    func finalizeImportedPoseSeed(
+        receipt: DatasetPoseSeedReceipt,
+        paths: ProjectPaths,
+        selectedFrameManifest: [SelectedFrameMapping],
+        checkCancellation: () throws -> Void = {},
+        onLog: (String) -> Void = { _ in }
+    ) throws -> URL {
+        var model = try ColmapModelReader.readText(modelDirectory: paths.importSeedURL)
+        let entriesByDeclaredPath = Dictionary(
+            receipt.entries.map { ($0.declaredPath, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var selectedNameBySourceSHA256: [String: String] = [:]
+        for mapping in selectedFrameManifest {
+            if let sourceSHA256 = mapping.sourceSHA256,
+               selectedNameBySourceSHA256[sourceSHA256] == nil {
+                selectedNameBySourceSHA256[sourceSHA256] = mapping.outputFileName
+            }
+        }
+        for index in model.images.indices {
+            try checkCancellation()
+            let declaredPath = model.images[index].name
+            guard let entry = entriesByDeclaredPath[declaredPath] else {
+                onLog("The imported pose seed lists \(declaredPath), which has no adoption receipt entry.")
+                throw PipelineError.geometryRegisteredImagesMismatch
+            }
+            guard let selectedName = selectedNameBySourceSHA256[entry.sourceSHA256] else {
+                onLog("The imported pose seed image \(declaredPath) has no selected frame.")
+                throw PipelineError.geometryRegisteredImagesMismatch
+            }
+            model.images[index].name = selectedName
+        }
+        let emitted = try ColmapTextModelEmitter.emit(model)
+        let stagingRootURL = paths.colmapSeedURL.appendingPathComponent(
+            "import",
+            isDirectory: true
+        )
+        let stagingModelURL = stagingRootURL.appendingPathComponent("0", isDirectory: true)
+        try removeItemIfPresent(stagingRootURL)
+        do {
+            try checkCancellation()
+            try FileManager.default.createDirectory(
+                at: stagingModelURL,
+                withIntermediateDirectories: true
+            )
+            let files = [
+                ("cameras.txt", emitted.camerasTxt),
+                ("images.txt", emitted.imagesTxt),
+                ("points3D.txt", emitted.points3DTxt),
+            ]
+            for (name, contents) in files {
+                try contents.write(
+                    to: stagingModelURL.appendingPathComponent(name),
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+        } catch {
+            try removeItemIfPresent(stagingRootURL)
+            throw error
+        }
+        return stagingModelURL
+    }
+
+    /// The shared seeded-triangulation mapping tail: point_triangulator against
+    /// a prepared refinement seed, one bounded bundle adjustment, then the
+    /// canonical-text, conditioning, membership, and scorer acceptance gates.
+    /// Both the DA3 aligned-seed branch and the imported-pose dataset branch
+    /// run this single implementation.
+    func runSeededTriangulationMapping(
+        seedModelURL: URL,
+        paths: ProjectPaths,
+        selectedFrames: [URL],
+        capturePath: CapturePath,
+        bundleOptions: ColmapBundleAdjustmentOptions,
+        mapperLabel: String,
+        toolLogSectionTitle: String,
+        refinementLogNoun: String,
+        scoreLogLabel: String,
+        beginMappingAttempt: () throws -> Int,
+        currentMappingAttemptCount: () -> Int,
+        prepareCanonicalTextCandidate: (URL, Int) throws -> CanonicalModelPublicationArtifact,
+        emit: (PipelineEvent) -> Void
+    ) async throws -> (artifact: MappingArtifact, conditioning: GeometryConditioningAnalysis) {
+        let fm = FileManager.default
+        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let mappingAttemptOrdinal = try beginMappingAttempt()
+        try resetDirectory(paths.colmapSparseURL)
+        try resetDirectory(sparseZero)
+        let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+        colmapToolLog.beginSection(
+            title: toolLogSectionTitle,
+            metadata: [
+                "database": paths.colmapDatabaseURL.path,
+                "images": paths.framesSelectedURL.path,
+                "seed": seedModelURL.path,
+                "output": sparseZero.path,
+                "tool": config.toolchain.colmap.path
+            ]
+        )
+        emit(.stageLog(
+            stage: .sfmMapping,
+            line: "Running \(refinementLogNoun): point_triangulator.",
+            isError: false
+        ))
+        try tooling.checkCancellation()
+        try await tooling.colmap.runPointTriangulator(
+            colmapPath: config.toolchain.colmap,
+            database: paths.colmapDatabaseURL,
+            imagePath: paths.framesSelectedURL,
+            inputPath: seedModelURL,
+            outputPath: sparseZero,
+            environment: [:],
+            onLog: { line, isErr in
+                colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+            }
+        )
+
+        let baOutput = paths.colmapSparseURL.appendingPathComponent("0_ba", isDirectory: true)
+        removeIfExists(baOutput)
+        try fm.createDirectory(at: baOutput, withIntermediateDirectories: true)
+        emit(.stageLog(
+            stage: .sfmMapping,
+            line: "Running \(refinementLogNoun): bundle_adjuster.",
+            isError: false
+        ))
+        try await tooling.colmap.runBundleAdjuster(
+            colmapPath: config.toolchain.colmap,
+            inputPath: sparseZero,
+            outputPath: baOutput,
+            environment: [:],
+            bundleOptions: bundleOptions,
+            onLog: { line, isErr in
+                colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+            }
+        )
+        guard sparseModelFilesExist(at: baOutput) else {
+            throw PipelineError.outputMissing
+        }
+        removeIfExists(sparseZero)
+        try fm.moveItem(at: baOutput, to: sparseZero)
+        let canonicalModelPublication = try prepareCanonicalTextCandidate(
+            sparseZero,
+            mappingAttemptOrdinal
+        )
+        let conditioningAnalysis = try validatedConditionedGeometry(
+            modelDirectory: sparseZero,
+            selectedFrames: selectedFrames,
+            requireStrongObservationCoverage: true
+        )
+
+        let membership = try ColmapSparseModelMembershipReader(
+            databaseURL: paths.colmapDatabaseURL,
+            selectedImageNames: selectedFrames.map(\.lastPathComponent)
+        ).read(
+            modelDirectories: [sparseZero],
+            checkCancellation: tooling.checkCancellation
+        )
+
+        let report = try await tooling.colmap.runModelAnalyzer(
+            colmapPath: config.toolchain.colmap,
+            modelPath: sparseZero,
+            environment: [:]
+        )
+        for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+            colmapToolLog.append(stream: "stdout", line: String(line))
+        }
+        let score = ReconstructionScorer.applyingExpectedTotalImages(
+            ReconstructionScorer.parseModelAnalyzerOutput(report),
+            expectedTotalImages: selectedFrames.count
+        )
+        emit(.stageLog(
+            stage: .sfmMapping,
+            line: "\(scoreLogLabel): \(ReconstructionScorer.summary(score)).",
+            isError: false
+        ))
+        guard ReconstructionScorer.isAcceptable(
+            score,
+            capturePath: capturePath
+        ),
+              score.registeredImages
+                == membership.largestModelRegisteredViewCount,
+              conditioningAnalysis.residuals.registeredViewCount
+                == score.registeredImages,
+              let residual = score.meanReprojectionError,
+              residual.isFinite else {
+            throw PipelineError.lowQualityReconstruction(score, mapper: mapperLabel)
+        }
+        let artifact = MappingArtifact(
+            modelCount: membership.modelCount,
+            largestModelRegisteredViewCount:
+                membership.largestModelRegisteredViewCount,
+            secondLargestModelRegisteredViewCount:
+                membership.secondLargestModelRegisteredViewCount,
+            unionRegisteredViewCount: membership.unionRegisteredViewCount,
+            attemptCount: currentMappingAttemptCount(),
+            acceptedMappingAttemptOrdinal: mappingAttemptOrdinal,
+            acceptedRefinementKind: .seededBundleAdjustment,
+            acceptedRefinementInvocationCount: 1,
+            incrementalCadence: nil,
+            canonicalModelPublication: canonicalModelPublication,
+            fallbackReason: nil
+        )
+        return (artifact, conditioningAnalysis)
     }
 
     func colmapOptionsForExtraction(workerCount: Int) -> ColmapOptions {

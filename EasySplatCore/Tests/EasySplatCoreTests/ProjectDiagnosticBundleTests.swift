@@ -75,6 +75,126 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertTrue(bundle.contains("third line"))
     }
 
+    func testDiagnosticsReportNoSubjectArtifactAndTailIsolationLog() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                title: "NoSubjectArtifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            to: paths.metadataURL
+        )
+        try "isolation completed without a subject\n".write(
+            to: paths.isolationLogURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertTrue(bundle.contains("## Subject Isolation\nStatus: no artifact"))
+        XCTAssertTrue(bundle.contains("## isolation.log (tail)"))
+        XCTAssertTrue(bundle.contains("isolation completed without a subject"))
+    }
+
+    func testDiagnosticsReportValidSubjectArtifactWithoutMaskIdentityOrAnchor() throws {
+        let fixture = try makeSubjectIsolationFixture()
+        defer { fixture.cleanup() }
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                title: "ValidSubjectArtifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            to: fixture.paths.metadataURL
+        )
+        let artifact = try fixture.makeArtifact()
+        _ = try SubjectIsolationArtifactStore.publish(
+            artifact,
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: fixture.root))
+
+        XCTAssertTrue(bundle.contains("## Subject Isolation\nStatus: valid"))
+        XCTAssertTrue(bundle.contains("Variant: subject"))
+        XCTAssertTrue(bundle.contains("Mask views: 3 · selected: 2 · held out: 1"))
+        XCTAssertTrue(bundle.contains("Vision request revision: 1 · policy revision: 1"))
+        XCTAssertFalse(bundle.contains("frame-0.png"))
+        XCTAssertFalse(bundle.contains("frame-1.png"))
+        XCTAssertFalse(bundle.contains("normalizedX"))
+        XCTAssertFalse(bundle.contains("normalizedY"))
+        XCTAssertFalse(bundle.contains("Output/isolated.ply"))
+        XCTAssertFalse(bundle.contains("Isolation/masks"))
+    }
+
+    func testDiagnosticsReportStaleAndInvalidSubjectArtifacts() throws {
+        let staleFixture = try makeSubjectIsolationFixture()
+        defer { staleFixture.cleanup() }
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                title: "StaleSubjectArtifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            to: staleFixture.paths.metadataURL
+        )
+        _ = try SubjectIsolationArtifactStore.publish(
+            staleFixture.makeArtifact(),
+            stagedOutputURL: staleFixture.stagedOutputURL,
+            stagedMasksURL: staleFixture.stagedMasksURL,
+            paths: staleFixture.paths
+        )
+        try TestFileBuilder.writeMinimalPly(
+            at: staleFixture.paths.outputSplatURL,
+            vertexCount: 2
+        )
+
+        let staleBundle = try XCTUnwrap(
+            ProjectDiagnosticBundle.build(projectURL: staleFixture.root)
+        )
+        XCTAssertTrue(
+            staleBundle.contains("## Subject Isolation\nStatus: stale (source output)")
+        )
+
+        let invalidRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: invalidRoot) }
+        let invalidPaths = ProjectPaths(root: invalidRoot)
+        try invalidPaths.ensureDirectories()
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                title: "InvalidSubjectArtifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            to: invalidPaths.metadataURL
+        )
+        try TestFileBuilder.writeMinimalPly(at: invalidPaths.isolatedOutputURL)
+
+        let invalidBundle = try XCTUnwrap(
+            ProjectDiagnosticBundle.build(projectURL: invalidRoot)
+        )
+        XCTAssertTrue(invalidBundle.contains("## Subject Isolation\nStatus: invalid"))
+    }
+
     func testSkipsSymlinkedLogTailWithoutReadingExternalContents() throws {
         let parent = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: parent) }
