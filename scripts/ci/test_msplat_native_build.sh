@@ -2907,6 +2907,177 @@ PY
 )
 [ "$fixture_count" = "12" ] || fail "sparse fixture generator did not produce twelve cases"
 
+isolation_runtime_dir="$negative_dir/background-mask-runtime"
+mkdir "$isolation_runtime_dir"
+isolation_runtime_source="$negative_dir/training-01-sphere-500/splat.ply"
+[ -s "$isolation_runtime_source" ] \
+  || fail "isolation runtime fixture has no trained source PLY"
+python3 - "$isolation_runtime_dir" \
+  "$negative_dir/training-01-sphere-500/checkpoint" \
+  "$isolation_runtime_source" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+root, checkpoint, source = map(Path, sys.argv[1:])
+manifests = sorted(checkpoint.glob("generations/*/manifest.json"))
+if len(manifests) != 1:
+    raise SystemExit("isolation runtime fixture has no unique checkpoint manifest")
+training = json.loads(manifests[0].read_text(encoding="utf-8"))
+input_digest = training["input_digest"]
+geometry_digest = training["geometry_digest"]
+source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+selected_frames_digest = "2" * 64
+training_manifest_digest = "3" * 64
+
+
+def write_mask(name: str, label: int) -> tuple[str, str]:
+    path = root / name
+    Image.new("L", (32, 32), label).save(path, format="PNG")
+    return name, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+blank_work = write_mask("blank-work.png", 0)
+blank_held_out = write_mask("blank-held-out.png", 0)
+foreground_work = [
+    write_mask(f"foreground-work-{index}.png", 1)
+    for index in range(3)
+]
+
+
+def write_manifest(name: str, views: list[tuple[int, str, tuple[str, str]]]) -> None:
+    payload = {
+        "schema_version": 1,
+        "isolation_mode_version": 1,
+        "source_ply_digest": source_digest,
+        "input_digest": input_digest,
+        "geometry_digest": geometry_digest,
+        "selected_frames_digest": selected_frames_digest,
+        "training_manifest_digest": training_manifest_digest,
+        "selected_image_order": [f"{index:04d}.png" for index, _, _ in views],
+        "views": [
+            {
+                "image_identity": f"{index:04d}.png",
+                "camera_index": index,
+                "role": role,
+                "relative_mask_path": mask[0],
+                "mask_sha256": mask[1],
+                "width": 32,
+                "height": 32,
+            }
+            for index, role, mask in views
+        ],
+    }
+    (root / name).write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+
+write_manifest(
+    "all-background.json",
+    [(0, "work", blank_work), (1, "held_out", blank_held_out)],
+)
+write_manifest(
+    "blank-held-out.json",
+    [(0, "work", foreground_work[0]), (1, "work", foreground_work[1]),
+     (2, "work", foreground_work[2]), (3, "held_out", blank_held_out)],
+)
+(root / "digests.json").write_text(
+    json.dumps(
+        {
+            "source": source_digest,
+            "input": input_digest,
+            "geometry": geometry_digest,
+            "selected_frames": selected_frames_digest,
+            "training_manifest": training_manifest_digest,
+        },
+        separators=(",", ":"),
+    ),
+    encoding="utf-8",
+)
+PY
+read -r isolation_source_digest isolation_input_digest isolation_geometry_digest \
+  isolation_selected_frames_digest isolation_training_manifest_digest <<EOF
+$(python3 - "$isolation_runtime_dir/digests.json" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+print(
+    payload["source"], payload["input"], payload["geometry"],
+    payload["selected_frames"], payload["training_manifest"]
+)
+PY
+)
+EOF
+
+run_background_mask_runtime_case() {
+  local manifest="$1"
+  local cache="$2"
+  local output="$3"
+  local events="$4"
+  "$BIN" --isolate \
+    --dataset "$fixture_root/01-sphere-500" \
+    --source-ply "$isolation_runtime_source" \
+    --mask-manifest "$manifest" \
+    --analysis-cache "$cache" \
+    --output "$output" \
+    --expected-source-ply-digest "$isolation_source_digest" \
+    --expected-input-digest "$isolation_input_digest" \
+    --expected-geometry-digest "$isolation_geometry_digest" \
+    --expected-selected-frames-digest "$isolation_selected_frames_digest" \
+    --expected-training-manifest-digest "$isolation_training_manifest_digest" \
+    --memory-budget-bytes 536870912 \
+    --events-fd 1 >"$events"
+}
+
+all_background_output="$isolation_runtime_dir/all-background-output.ply"
+run_background_mask_runtime_case \
+  "$isolation_runtime_dir/all-background.json" \
+  "$isolation_runtime_dir/all-background.cache" \
+  "$all_background_output" \
+  "$isolation_runtime_dir/all-background.events.jsonl"
+[ ! -e "$all_background_output" ] \
+  || fail "all-background work masks published a PLY"
+
+blank_held_out_output="$isolation_runtime_dir/blank-held-out-output.ply"
+run_background_mask_runtime_case \
+  "$isolation_runtime_dir/blank-held-out.json" \
+  "$isolation_runtime_dir/blank-held-out.cache" \
+  "$blank_held_out_output" \
+  "$isolation_runtime_dir/blank-held-out.events.jsonl"
+[ ! -e "$blank_held_out_output" ] \
+  || fail "background-only held-out mask published a PLY"
+python3 - "$isolation_runtime_dir/all-background.events.jsonl" \
+  "$isolation_runtime_dir/blank-held-out.events.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def events(path: str) -> list[dict]:
+    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+
+
+all_background, blank_held_out = map(events, sys.argv[1:])
+if not any(event.get("event") == "isolation_no_subject" for event in all_background):
+    raise SystemExit("all-background work masks did not reach isolation_no_subject")
+if any(event.get("event") == "isolation_completed" for event in all_background):
+    raise SystemExit("all-background work masks emitted isolation_completed")
+rejections = [
+    event for event in blank_held_out
+    if event.get("event") == "isolation_held_out_rejected"
+]
+if len(rejections) != 1:
+    raise SystemExit("background-only held-out mask did not reach held-out rejection")
+if any(event.get("event") == "isolation_completed" for event in blank_held_out):
+    raise SystemExit("background-only held-out mask emitted isolation_completed")
+evidence = rejections[0].get("held_out_evidence")
+if evidence != [{"best_instance": 0, "image_identity": "0003.png", "soft_iou": 0.0}]:
+    raise SystemExit(f"background-only held-out evidence changed: {evidence!r}")
+PY
+
 # Shader validation changes floating-point scheduling enough to make a long,
 # adversarial convergence run nondeterministic on some hosted GPUs. Keep the
 # full 3,000-iteration production runs above, then exercise the instrumented
