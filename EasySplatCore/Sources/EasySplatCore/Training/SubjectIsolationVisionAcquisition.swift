@@ -285,9 +285,14 @@ struct SubjectIsolationVisionMaskAcquirer: Sendable {
     func acquire(
         views: [SubjectIsolationAnalysisView],
         stagingDirectory: URL,
+        startingOrdinal: Int = 0,
         shouldCancel: @escaping @Sendable () -> Bool = { Task.isCancelled }
     ) async throws -> [SubjectIsolationAcquiredMask] {
         try checkCancellation(shouldCancel)
+        guard startingOrdinal >= 0,
+              startingOrdinal <= Int.max - views.count else {
+            throw SubjectIsolationAcquisitionError.incompleteResult(startingOrdinal)
+        }
         try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
         let prepared = try views.map { view in
             try checkCancellation(shouldCancel)
@@ -312,7 +317,7 @@ struct SubjectIsolationVisionMaskAcquirer: Sendable {
                         let result = try Self.writeMask(
                             masks: masks,
                             prepared: value,
-                            ordinal: index,
+                            ordinal: startingOrdinal + index,
                             stagingDirectory: stagingDirectory,
                             shouldCancel: shouldCancel
                         )
