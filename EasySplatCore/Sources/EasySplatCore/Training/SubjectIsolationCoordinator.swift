@@ -422,12 +422,11 @@ public struct SubjectIsolationCoordinator: SubjectIsolationCoordinating, Sendabl
               }) else {
             throw SubjectIsolationCoordinatorError.invalidProject
         }
-        let candidates = try orderedComponents.map { component in
+        let candidates: [SubjectChoiceRequest.Candidate] = orderedComponents.compactMap { component in
             guard let contribution = component.keyframes
                 .filter({ $0.imageIdentity == keyframe.imageIdentity })
-                .max(by: keyframeLessThan)
-                ?? bestKeyframe(in: component) else {
-                throw SubjectIsolationCoordinatorError.invalidProject
+                .max(by: keyframeLessThan) else {
+                return nil
             }
             return SubjectChoiceRequest.Candidate(
                 componentIdentity: component.identity,
@@ -435,6 +434,9 @@ public struct SubjectIsolationCoordinator: SubjectIsolationCoordinating, Sendabl
                 confidence: min(1, max(0, component.score)),
                 previewMaskURL: mask.fileURL
             )
+        }
+        guard !candidates.isEmpty else {
+            throw SubjectIsolationCoordinatorError.invalidProject
         }
         return SubjectChoiceRequest(
             keyframeImageURL: imagesDirectory.appendingPathComponent(

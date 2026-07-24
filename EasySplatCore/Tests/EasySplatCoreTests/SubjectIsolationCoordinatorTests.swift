@@ -107,6 +107,33 @@ final class SubjectIsolationCoordinatorTests: XCTestCase {
         }
     }
 
+    func testFinalAmbiguityOnlyOffersCandidatesFromDisplayedKeyframe() async throws {
+        let fixture = try CoordinatorFixture()
+        defer { fixture.cleanup() }
+        let native = CoordinatorNativeHarness(
+            plans: [.noSubject, .ambiguity, .splitKeyframeAmbiguity]
+        )
+
+        let outcome = try await SubjectIsolationCoordinator(
+            nativeOperation: native.run,
+            maskAcquisition: CoordinatorMaskHarness().acquire
+        ).isolate(
+            request: fixture.request(),
+            onProgress: { _ in },
+            onLog: { _, _ in }
+        )
+
+        guard case .ambiguity(let request) = outcome else {
+            return XCTFail("Expected ambiguity.")
+        }
+        XCTAssertEqual(request.keyframeImageURL.lastPathComponent, "frame-0.png")
+        XCTAssertEqual(
+            request.candidates.map(\.componentIdentity),
+            ["component-main"]
+        )
+        XCTAssertEqual(request.candidates.map(\.instanceLabel), [1])
+    }
+
     func testFinalNoSubjectAndHeldOutRejectionPublishNothing() async throws {
         for finalPlan in [CoordinatorNativeHarness.Plan.noSubject, .heldOutRejected] {
             let fixture = try CoordinatorFixture()
@@ -306,6 +333,7 @@ private final class CoordinatorNativeHarness: @unchecked Sendable {
     enum Plan: Equatable {
         case noSubject
         case ambiguity
+        case splitKeyframeAmbiguity
         case heldOutRejected
         case complete
         case cancel
@@ -380,6 +408,21 @@ private final class CoordinatorNativeHarness: @unchecked Sendable {
             return .noSubject([component])
         case .ambiguity:
             return .ambiguity([component])
+        case .splitKeyframeAmbiguity:
+            let otherKeyframe = try XCTUnwrap(work.last)
+            let otherComponent = SubjectIsolationNativeComponent(
+                identity: "component-other",
+                score: 0.8,
+                keyframes: [
+                    SubjectIsolationNativeKeyframeContribution(
+                        imageIdentity: otherKeyframe,
+                        instanceLabel: 7,
+                        weight: 9,
+                        fraction: 0.8
+                    ),
+                ]
+            )
+            return .ambiguity([component, otherComponent])
         case .heldOutRejected:
             return .heldOutRejected
         case .cancel:
