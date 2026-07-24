@@ -61,8 +61,10 @@ final class ProjectMetadataValidationTests: XCTestCase {
     }
 
     func testLoadRejectsPreviousFormatBeforeDecodingCanonicalGeometryState() throws {
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 31)
-        let retiredFormatVersion = ProjectMetadataStore.supportedFormatVersion - 1
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 32)
+        // Format 31 is still readable (dataset-input migration); the retired
+        // generation starts below the accepted floor.
+        let retiredFormatVersion = (ProjectMetadataStore.acceptedFormatVersions.min() ?? 31) - 1
 
         let metadata = makeMetadata()
         let encoder = JSONEncoder()

@@ -44,6 +44,51 @@ extension AppModel {
     /// capture folder with both kinds of media brings all of it in. Photos and
     /// videos coming from different folders are merged into one selection.
     func addInputs(urls: [URL]) {
+        // A dataset is exclusive with photos and videos. Classify the drop for
+        // datasets first (deterministically by path so the winner is stable),
+        // then let the exclusivity rules short-circuit before the media loop.
+        let sortedURLs = urls.sorted { $0.path < $1.path }
+        let detectedDatasets = sortedURLs.compactMap(detectDataset(at:))
+
+        if let existing = pendingDataset {
+            // A dataset is already selected; nothing else can join it.
+            var warnings: [String] = []
+            if !detectedDatasets.isEmpty {
+                warnings.append(
+                    "Selected more than one dataset. EasySplat uses one at a time — kept \(existing.kind.displayName)."
+                )
+            }
+            let hasNonDatasetURLs = sortedURLs.contains { url in
+                !detectedDatasets.contains { $0.sourceURL == url }
+            }
+            if hasNonDatasetURLs {
+                warnings.append("A dataset is selected. Remove it to add photos or videos.")
+            }
+            selectionWarning = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+            return
+        }
+
+        if let winner = detectedDatasets.first {
+            // A dataset consumes the whole drop and evicts any pending media.
+            let clearedMedia = !pendingVideoURLs.isEmpty || !pendingPhotoURLs.isEmpty
+            pendingVideoURLs = []
+            pendingPhotoURLs = []
+            pendingDataset = winner
+            var warnings: [String] = []
+            if clearedMedia {
+                warnings.append(
+                    "Added the \(winner.kind.displayName). The photos and videos you selected were removed."
+                )
+            }
+            if detectedDatasets.count > 1 {
+                warnings.append(
+                    "Selected more than one dataset. EasySplat uses one at a time — kept \(winner.kind.displayName)."
+                )
+            }
+            selectionWarning = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+            return
+        }
+
         var videoIdentities = Set(pendingVideoURLs.compactMap { Self.classifyInput($0).identity })
         var photoIdentities = Set(pendingPhotoURLs.compactMap { Self.classifyInput($0).identity })
 
@@ -89,7 +134,7 @@ extension AppModel {
         if ignoredFileCount > 0 {
             let noun = ignoredFileCount == 1 ? "file" : "files"
             warnings.append(
-                "Ignored \(ignoredFileCount) \(noun). Supported: photos, videos, or folders of them."
+                "Ignored \(ignoredFileCount) \(noun). Supported: photos, videos, folders, or COLMAP, Nerfstudio, or Polycam datasets."
             )
         }
         if requestedRunOptions.inputOrdering == .continuous,
@@ -115,6 +160,26 @@ extension AppModel {
             return "Selected \(countText). Add at least \(RunPlanResolver.minimumReconstructionImageCount) from different viewpoints."
         }
         return "Selected \(countText). \(Self.minimumRecommendedPhotos) or more is recommended for reliable coverage."
+    }
+
+    /// Classifies a single selected URL as a dataset, or nil. Directories are
+    /// probed on disk; regular files qualify only when they carry a `.zip`
+    /// extension, whose entry names are peeked without extraction.
+    private func detectDataset(at url: URL) -> PendingDataset? {
+        if Self.classifyInput(url).kind == .directory {
+            guard let detection = DatasetSniffer.detect(at: url) else { return nil }
+            return PendingDataset(
+                kind: detection.kind,
+                sourceURL: url,
+                isZip: false,
+                imageCount: nil
+            )
+        }
+        guard url.pathExtension.lowercased() == "zip",
+              let detection = DatasetSniffer.detectInZip(at: url) else {
+            return nil
+        }
+        return PendingDataset(kind: detection.kind, sourceURL: url, isZip: true, imageCount: nil)
     }
 
     private static func classifyInput(_ url: URL) -> ClassifiedInput {
@@ -317,6 +382,7 @@ extension AppModel {
     func clearPendingInputs() {
         pendingVideoURLs = []
         pendingPhotoURLs = []
+        pendingDataset = nil
         selectionWarning = nil
     }
 
@@ -326,6 +392,11 @@ extension AppModel {
     }
 
     func buildInputSpec() -> InputSpec? {
+        if let pendingDataset {
+            // Adoption rewrites `imagesFolder` to a project-relative path later;
+            // this pre-adoption spec names the source the user picked.
+            return .dataset(kind: pendingDataset.kind, imagesFolder: pendingDataset.sourceURL.path)
+        }
         let videos = pendingVideoURLs
         let photosFolder = nominalPhotosFolderPath(for: pendingPhotoURLs)
         if !videos.isEmpty, let photosFolder {
@@ -368,6 +439,9 @@ extension AppModel {
     }
 
     func projectTitle(for input: InputSpec) -> String {
+        if input.isDataset, let source = input.photosFolder {
+            return URL(fileURLWithPath: source).deletingPathExtension().lastPathComponent
+        }
         if let firstVideo = input.videoFiles.first {
             return URL(fileURLWithPath: firstVideo).deletingPathExtension().lastPathComponent
         }

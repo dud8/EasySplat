@@ -36,6 +36,16 @@ public struct ProjectPaths: Sendable {
     }
     public var framesSelectedURL: URL { root.appendingPathComponent("Frames/selected", isDirectory: true) }
     public var framesSelectedManifestURL: URL { root.appendingPathComponent("Frames/selected_manifest.json") }
+    /// Root of a pre-processed dataset import. Deliberately outside `Originals`
+    /// so the geometry artifact store, which hashes `Originals` recursively, never
+    /// sweeps in the persisted seed or source metadata. Created lazily at adoption.
+    public var importURL: URL { root.appendingPathComponent("Import", isDirectory: true) }
+    /// Original small geometry metadata copied verbatim from the imported dataset
+    /// (e.g. COLMAP `cameras/images/points3D.*`, `transforms.json`, Polycam JSONs).
+    public var importSourceURL: URL { importURL.appendingPathComponent("source", isDirectory: true) }
+    /// COLMAP text seed converted from the import, adopted or re-triangulated by
+    /// the toolchain (`cameras.txt`, `images.txt`, `points3D.txt`).
+    public var importSeedURL: URL { importURL.appendingPathComponent("seed", isDirectory: true) }
     public var colmapDatabaseURL: URL { root.appendingPathComponent("SfM/colmap/database.db") }
     public var colmapFeatureEvidenceURL: URL {
         root.appendingPathComponent("SfM/colmap/feature_evidence.json")

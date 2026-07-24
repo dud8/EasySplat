@@ -705,6 +705,46 @@ public enum ProjectArtifactValidator {
         paths: ProjectPaths
     ) throws -> PairGraphArtifact {
         switch plan.geometryBackend {
+        case .importedPoses:
+            switch plan.datasetGeometryRoute {
+            case .adoptDirect:
+                // Directly-adopted geometry has no solved pair graph. Its
+                // authenticated seed/source receipt and sparse/0 digests were
+                // already re-verified when the geometry artifact loaded; the
+                // artifact's own pair graph is the not-evaluated sentinel, so
+                // that is what the caller must match.
+                guard geometry.resolvedSource == .imported,
+                      geometry.pairGraph.status == .notEvaluated else {
+                    throw finishedProjectError(
+                        "an adopted-geometry project has inconsistent pair-graph evidence"
+                    )
+                }
+                return .notEvaluated()
+            case .seedTriangulate, nil:
+                // Re-triangulated dataset poses run the classical matching path,
+                // so their pair-graph evidence exists and is reproduced exactly
+                // as a COLMAP project's is.
+                let pairEvidence = try PairGraphEvidenceStore.loadVerified(
+                    from: paths.pairGraphEvidenceURL,
+                    expectedImageNames: geometry.orderedImageNames,
+                    databaseURL: paths.colmapDatabaseURL,
+                    projectPaths: paths
+                )
+                let groups = try PipelineRunner.colmapPairGroups(
+                    imageNames: geometry.orderedImageNames,
+                    manifest: selectedFrameManifest
+                )
+                try PairGraphEvidenceStore.validateSchedule(
+                    pairEvidence,
+                    resolvedPlan: plan,
+                    groups: groups
+                )
+                try PairGraphEvidenceStore.validateWorkerExecution(
+                    pairEvidence,
+                    workerExecution: geometry.workerExecution
+                )
+                return try pairEvidence.pairGraphArtifact()
+            }
         case .colmap:
             let pairEvidence = try PairGraphEvidenceStore.loadVerified(
                 from: paths.pairGraphEvidenceURL,
@@ -824,6 +864,17 @@ public enum ProjectArtifactValidator {
         if metadata.photoInputReceipts?.isEmpty == false {
             protectedFiles.append(paths.photoSelectionArtifactURL)
         }
+        if metadata.resolvedRunPlan?.datasetGeometryRoute == .adoptDirect {
+            // Directly-adopted dataset geometry runs no COLMAP solve, so the
+            // feature database and the feature and pair-graph evidence never
+            // exist. Do not guard files the route does not produce.
+            let absentForDirectAdoption: Set<String> = [
+                paths.colmapFeatureEvidenceURL.path,
+                paths.pairGraphEvidenceURL.path,
+                paths.colmapDatabaseURL.path,
+            ]
+            protectedFiles.removeAll { absentForDirectAdoption.contains($0.path) }
+        }
         let protectedFileMutationGuard: FinishedProjectProtectedPathMutationGuard
         do {
             protectedFileMutationGuard = try FinishedProjectProtectedPathMutationGuard(
@@ -860,7 +911,11 @@ public enum ProjectArtifactValidator {
                 "video projects require independent asynchronous frame rederivation"
             )
         }
-        try validateCompletedStageTimings(metadata.stageTimings, input: metadata.input)
+        try validateCompletedStageTimings(
+            metadata.stageTimings,
+            input: metadata.input,
+            datasetGeometryRoute: metadata.resolvedRunPlan?.datasetGeometryRoute
+        )
         try requireExpectedInput(metadata.input, canonicalInput: expectedInput)
         guard let plan = metadata.resolvedRunPlan else {
             throw finishedProjectError("the project has no resolved run plan")
@@ -889,7 +944,8 @@ public enum ProjectArtifactValidator {
             input: metadata.input,
             hardware: context.hardwareProfile,
             developmentOverrides: DevelopmentOverrides(benchmarkSeed: 42),
-            trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes
+            trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes,
+            datasetImport: datasetImportContext(for: metadata)
         )
         guard plan == independentlyResolvedPlan else {
             throw finishedProjectError(
@@ -942,61 +998,68 @@ public enum ProjectArtifactValidator {
             geometry: sidecarGeometry,
             allowPendingVideoLineage: allowPendingVideoLineage
         )
-        let cameraEvidence: [ColmapSelectedImageCameraEvidence]
-        let featureEvidence: ColmapFeatureEvidence
-        do {
-            cameraEvidence = try PipelineRunner.colmapCameraGroupingEvidence(
-                imageNames: sidecarGeometry.orderedImageNames,
-                manifest: initialSelectedLineage.manifest
-            )
-            let selectedImages = sidecarGeometry.orderedImageNames.map {
-                paths.framesSelectedURL.appendingPathComponent($0)
-            }
-            let expectedCameraInitialization = try ColmapCameraInitializationReceipt.resolve(
-                plan: plan,
-                detailProfile: metadata.requestedRunOptions.detailProfile,
-                selectedImages: selectedImages
-            )
-            featureEvidence = try ColmapFeatureEvidenceStore.loadVerified(
-                from: paths.colmapFeatureEvidenceURL,
-                expectedImageNames: sidecarGeometry.orderedImageNames,
-                expectedCameraEvidence: cameraEvidence,
-                expectedCameraGroupingMode: PipelineRunner.colmapCameraGroupingMode(
-                    cameraGrouping: plan.cameraGrouping,
-                    evidence: cameraEvidence
-                ),
-                expectedCameraInitializationReceipt: expectedCameraInitialization,
-                databaseURL: paths.colmapDatabaseURL,
-                projectPaths: paths
-            )
-            guard featureEvidence.cameraGroupingReceipt
-                    == sidecarGeometry.cameraGroupingReceipt,
-                  featureEvidence.cameraInitializationReceipt
-                    == sidecarGeometry.cameraInitializationReceipt,
-                  sidecarGeometry.cameraInitializationReceipt.recipe
-                    == plan.cameraInitializationRecipe,
-                  featureEvidence.featureDatabaseDigest
-                    == sidecarGeometry.featureDatabaseDigest else {
+        // Directly-adopted geometry has no feature database or camera-grouping
+        // evidence to reproduce; its cameras come from the imported model, and
+        // its authenticated seed/source receipt was already re-verified when the
+        // geometry sidecar loaded. The run-plan binding check above pins the
+        // camera grouping and initialization recipe.
+        if sidecarGeometry.resolvedSource != .imported {
+            let cameraEvidence: [ColmapSelectedImageCameraEvidence]
+            let featureEvidence: ColmapFeatureEvidence
+            do {
+                cameraEvidence = try PipelineRunner.colmapCameraGroupingEvidence(
+                    imageNames: sidecarGeometry.orderedImageNames,
+                    manifest: initialSelectedLineage.manifest
+                )
+                let selectedImages = sidecarGeometry.orderedImageNames.map {
+                    paths.framesSelectedURL.appendingPathComponent($0)
+                }
+                let expectedCameraInitialization = try ColmapCameraInitializationReceipt.resolve(
+                    plan: plan,
+                    detailProfile: metadata.requestedRunOptions.detailProfile,
+                    selectedImages: selectedImages
+                )
+                featureEvidence = try ColmapFeatureEvidenceStore.loadVerified(
+                    from: paths.colmapFeatureEvidenceURL,
+                    expectedImageNames: sidecarGeometry.orderedImageNames,
+                    expectedCameraEvidence: cameraEvidence,
+                    expectedCameraGroupingMode: PipelineRunner.colmapCameraGroupingMode(
+                        cameraGrouping: plan.cameraGrouping,
+                        evidence: cameraEvidence
+                    ),
+                    expectedCameraInitializationReceipt: expectedCameraInitialization,
+                    databaseURL: paths.colmapDatabaseURL,
+                    projectPaths: paths
+                )
+                guard featureEvidence.cameraGroupingReceipt
+                        == sidecarGeometry.cameraGroupingReceipt,
+                      featureEvidence.cameraInitializationReceipt
+                        == sidecarGeometry.cameraInitializationReceipt,
+                      sidecarGeometry.cameraInitializationReceipt.recipe
+                        == plan.cameraInitializationRecipe,
+                      featureEvidence.featureDatabaseDigest
+                        == sidecarGeometry.featureDatabaseDigest else {
+                    throw finishedProjectError(
+                        "the camera grouping evidence does not match the geometry artifact"
+                    )
+                }
+                try requireCanonicalCameraBinding(
+                    geometry: sidecarGeometry,
+                    measured: canonicalMeasurement,
+                    plan: plan,
+                    detailProfile: metadata.requestedRunOptions.detailProfile,
+                    selectedImages: sidecarGeometry.orderedImageNames.map {
+                        paths.framesSelectedURL.appendingPathComponent($0)
+                    },
+                    selectedFrameManifest: initialSelectedLineage.manifest
+                )
+            } catch let error as FinishedProjectArtifactValidationError {
+                throw error
+            } catch {
                 throw finishedProjectError(
-                    "the camera grouping evidence does not match the geometry artifact"
+                    "the canonical camera grouping cannot be independently reproduced"
                 )
             }
-            try requireCanonicalCameraBinding(
-                geometry: sidecarGeometry,
-                measured: canonicalMeasurement,
-                plan: plan,
-                detailProfile: metadata.requestedRunOptions.detailProfile,
-                selectedImages: sidecarGeometry.orderedImageNames.map {
-                    paths.framesSelectedURL.appendingPathComponent($0)
-                },
-                selectedFrameManifest: initialSelectedLineage.manifest
-            )
-        } catch let error as FinishedProjectArtifactValidationError {
-            throw error
-        } catch {
-            throw finishedProjectError(
-                "the canonical camera grouping cannot be independently reproduced"
-            )
         }
         do {
             let reproducedPairGraph = try reproducePairGraph(
@@ -1205,9 +1268,21 @@ public enum ProjectArtifactValidator {
         }
 
         let runtimeClosure = geometry.workerExecution.colmapRuntimeClosure
-        guard geometry.provenance.solver.identifier == "colmap",
+        let solverBindingIsValid: Bool
+        switch geometry.resolvedSource {
+        case .computed:
+            // A COLMAP solve pins its solver provenance to the runtime closure.
+            solverBindingIsValid = geometry.provenance.solver.identifier == "colmap"
+                && geometry.provenance.solver.payloadSHA256 == runtimeClosure.closureSHA256
+        case .imported:
+            // Imported geometry ran no COLMAP solve; its solver provenance pins the
+            // dataset seed, not the runtime closure. The dataset's training model was
+            // still converted by the signed COLMAP, so the runtime closure is
+            // verified against the installed toolchain just the same.
+            solverBindingIsValid = geometry.provenance.solver.identifier == "imported"
+        }
+        guard solverBindingIsValid,
               runtimeClosure.isValid,
-              geometry.provenance.solver.payloadSHA256 == runtimeClosure.closureSHA256,
               runtimeClosure.components.allSatisfy({ component in
                   installation.installedCriticalFileSHA256[
                     component.toolchainRelativePath
@@ -1235,26 +1310,51 @@ public enum ProjectArtifactValidator {
                 "the authenticated toolchain has duplicate or missing signed components"
             )
         }
-        let colmapRecord = try uniqueProvenanceRecord(
-            path: "provenance/colmap.json",
-            installation: installation
-        )
-        guard colmapRecord.fileSHA256
-                == installation.installedCriticalFileSHA256["provenance/colmap.json"],
-              colmapRecord.stringFields["toolchain_name"] == "colmap",
-              colmapRecord.stringFields["source_version"]
-                == geometry.provenance.solver.version,
-              colmapRecord.stringFields["source_commit"]
-                == geometry.provenance.solver.revision,
-              colmapRecord.stringFields["executable_sha256"]
-                == runtimeClosure.sha256(for: "bin/colmap"),
-              geometry.solverVersion.hasSuffix(
-                "COLMAP \(geometry.provenance.solver.version) "
-                    + "(git \(geometry.provenance.solver.revision.prefix(7)))"
-              ) else {
-            throw finishedProjectError(
-                "the persisted COLMAP version and revision are not signed provenance"
+        switch geometry.resolvedSource {
+        case .computed:
+            // A COLMAP solve (classical or imported-pose re-triangulation) pins
+            // its persisted version and revision to signed COLMAP provenance.
+            let colmapRecord = try uniqueProvenanceRecord(
+                path: "provenance/colmap.json",
+                installation: installation
             )
+            guard colmapRecord.fileSHA256
+                    == installation.installedCriticalFileSHA256["provenance/colmap.json"],
+                  colmapRecord.stringFields["toolchain_name"] == "colmap",
+                  colmapRecord.stringFields["source_version"]
+                    == geometry.provenance.solver.version,
+                  colmapRecord.stringFields["source_commit"]
+                    == geometry.provenance.solver.revision,
+                  colmapRecord.stringFields["executable_sha256"]
+                    == runtimeClosure.sha256(for: "bin/colmap"),
+                  geometry.solverVersion.hasSuffix(
+                    "COLMAP \(geometry.provenance.solver.version) "
+                        + "(git \(geometry.provenance.solver.revision.prefix(7)))"
+                  ) else {
+                throw finishedProjectError(
+                    "the persisted COLMAP version and revision are not signed provenance"
+                )
+            }
+        case .imported:
+            // Directly-adopted geometry ran no COLMAP solve; its solver
+            // provenance pins the dataset seed, not signed COLMAP provenance. Its
+            // conversion-tooling runtime closure was already authenticated above;
+            // here the artifact must instead satisfy its own imported contract,
+            // whose closures the geometry store re-derives from Import/ on load.
+            guard let importedEvidence = geometry.importedEvidence,
+                  geometry.provenance.solver.identifier == "imported",
+                  DatasetKind(rawValue: geometry.provenance.solver.version) != nil,
+                  geometry.provenance.solver.revision
+                    == importedEvidence.sourceClosureSHA256,
+                  geometry.provenance.solver.payloadSHA256
+                    == importedEvidence.seedClosureSHA256,
+                  geometry.solverVersion
+                    == "imported \(geometry.provenance.solver.version); "
+                        + importedEvidence.route else {
+                throw finishedProjectError(
+                    "the imported dataset provenance is not internally consistent"
+                )
+            }
         }
         let msplatRecord = try uniqueProvenanceRecord(
             path: "msplat/build_info.json",
@@ -1282,10 +1382,14 @@ public enum ProjectArtifactValidator {
 
         switch (geometry.provenance.runtime, geometry.provenance.model) {
         case (nil, nil):
+            // Imported-pose runs re-solve through the same COLMAP binary, so
+            // their provenance is classical too.
             guard geometry.modelVersion == "none",
                   geometry.runtimeVersion
                     == "toolchain \(geometry.provenance.toolchainVersion)",
-                  finishedProject.resolvedRunPlan.geometryBackend == .colmap else {
+                  [.colmap, .importedPoses].contains(
+                    finishedProject.resolvedRunPlan.geometryBackend
+                  ) else {
                 throw finishedProjectError(
                     "classical geometry provenance does not match the resolved route"
                 )
@@ -1755,35 +1859,48 @@ public enum ProjectArtifactValidator {
                         "selected photo frame \(index) has invalid source evidence"
                     )
                 }
-                let recomputedExposure = try FrameScoring.scoreFrame(at: source).lowLightExposureEV
-                let expectedExposure = recomputedExposure > 0 ? recomputedExposure : nil
-                guard equalOptionalFiniteDouble(
-                    entry.lowLightExposureEV,
-                    expectedExposure,
-                    tolerance: 1e-12
-                ) else {
-                    throw finishedProjectError(
-                        "selected photo frame \(index) has untrusted exposure evidence"
+                if case .dataset = input {
+                    // Dataset frames are copied pixel-for-pixel from the adopted
+                    // originals — no resize, no re-encode, no exposure lift — so
+                    // the retained file must be byte-identical to its source
+                    // rather than a reproducible photo-normalized transcode.
+                    guard entry.lowLightExposureEV == nil,
+                          sourceSHA256 == selectedSHA256 else {
+                        throw finishedProjectError(
+                            "selected dataset frame \(index) is not a byte-identical copy of its source"
+                        )
+                    }
+                } else {
+                    let recomputedExposure = try FrameScoring.scoreFrame(at: source).lowLightExposureEV
+                    let expectedExposure = recomputedExposure > 0 ? recomputedExposure : nil
+                    guard equalOptionalFiniteDouble(
+                        entry.lowLightExposureEV,
+                        expectedExposure,
+                        tolerance: 1e-12
+                    ) else {
+                        throw finishedProjectError(
+                            "selected photo frame \(index) has untrusted exposure evidence"
+                        )
+                    }
+                    let reproduced = reproductionRoot.appendingPathComponent(
+                        entry.outputFileName
                     )
-                }
-                let reproduced = reproductionRoot.appendingPathComponent(
-                    entry.outputFileName
-                )
-                try PipelineRunner.reproduceSelectedFrame(
-                    source: source,
-                    destination: reproduced,
-                    normalization: normalization,
-                    exposureEV: entry.lowLightExposureEV
-                )
-                let reproducedIdentity = try PipelineRunner.selectedFrameContentIdentity(
-                    at: reproduced,
-                    maximumPixelDimension: normalization.maximumPixelDimension
-                )
-                guard reproducedIdentity.sha256 == selectedSHA256,
-                      reproducedIdentity.pixelSHA256 == selectedPixelSHA256 else {
-                    throw finishedProjectError(
-                        "selected photo frame \(index) cannot be independently reproduced"
+                    try PipelineRunner.reproduceSelectedFrame(
+                        source: source,
+                        destination: reproduced,
+                        normalization: normalization,
+                        exposureEV: entry.lowLightExposureEV
                     )
+                    let reproducedIdentity = try PipelineRunner.selectedFrameContentIdentity(
+                        at: reproduced,
+                        maximumPixelDimension: normalization.maximumPixelDimension
+                    )
+                    guard reproducedIdentity.sha256 == selectedSHA256,
+                          reproducedIdentity.pixelSHA256 == selectedPixelSHA256 else {
+                        throw finishedProjectError(
+                            "selected photo frame \(index) cannot be independently reproduced"
+                        )
+                    }
                 }
                 selectedPhotoLineage.append((
                     sourceRelativePath,
@@ -1794,7 +1911,7 @@ public enum ProjectArtifactValidator {
         }
 
         switch input {
-        case .photos:
+        case .photos, .dataset:
             guard let photoSelectionProjection else {
                 throw finishedProjectError("the photo selection evidence is missing")
             }
@@ -3409,6 +3526,17 @@ public enum ProjectArtifactValidator {
                 )
             }
             return
+        case (.photos, .dataset(_, let folder)):
+            // A dataset's images ride the photo machinery: they are admitted into
+            // Originals/Photos and bound to a photo folder just as ordinary photos
+            // are, so the caller supplies the dataset image folder as the expected
+            // photo folder.
+            guard folder == "Originals/Photos", canonicalInput.photoFolder != nil else {
+                throw finishedProjectError(
+                    "project.json does not record the controlled photo directory"
+                )
+            }
+            return
         case (.videos, .video(let files)):
             guard files.count == canonicalInput.videoFiles.count,
                   files.allSatisfy({ !($0 as NSString).isAbsolutePath }) else {
@@ -3591,7 +3719,7 @@ public enum ProjectArtifactValidator {
         switch input {
         case .video(let files):
             mappings = try videoMappings(files: files, receipts: videoInputReceipts)
-        case .photos:
+        case .photos, .dataset:
             mappings = try photoMappings(receipts: photoInputReceipts, requireNonempty: true)
         case .mixed(let files, _):
             mappings = try videoMappings(files: files, receipts: videoInputReceipts)
@@ -4043,6 +4171,27 @@ public enum ProjectArtifactValidator {
         _ reason: String
     ) -> FinishedProjectArtifactValidationError {
         .invalidProject(reason)
+    }
+
+    /// Rebuilds the dataset import context a finished dataset project resolved
+    /// its plan against, mirroring the pipeline's resume path: the route and
+    /// image count come from the persisted pose seed, and the pixel ceiling is
+    /// the largest dimension across the photo receipts (dataset images are
+    /// adopted unscaled, so the receipts reproduce preflight's measured
+    /// ceiling). Non-dataset projects have no import context.
+    private static func datasetImportContext(
+        for metadata: ProjectMetadata
+    ) -> RunPlanResolver.DatasetImportContext? {
+        guard metadata.input.isDataset, let seed = metadata.datasetPoseSeed else {
+            return nil
+        }
+        return RunPlanResolver.DatasetImportContext(
+            route: seed.route,
+            imageCount: seed.imageCount,
+            maximumImagePixelDimension: metadata.photoInputReceipts?
+                .map { max($0.pixelWidth, $0.pixelHeight) }
+                .max()
+        )
     }
 
     /// Copies a validated PLY through descriptor-stable reads and publishes it

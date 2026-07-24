@@ -999,8 +999,12 @@ extension PipelineRunner {
             }
             return .valid
         case .sfmFeatures:
+            // Only the DA3 route publishes its raw aligned seed as the feature
+            // boundary; a leftover seed must not mask missing classical
+            // feature evidence on the COLMAP or imported-pose routes.
             let seedZero = paths.colmapSeedModelURL
-            if sparseModelFilesExist(at: seedZero) {
+            if metadata.resolvedRunPlan?.geometryBackend == .da3,
+               sparseModelFilesExist(at: seedZero) {
                 return .valid
             }
             let databaseStatus = validateColmapDatabaseOutput(

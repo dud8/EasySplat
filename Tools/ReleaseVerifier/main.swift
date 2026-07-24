@@ -724,7 +724,7 @@ private enum ReleaseVerifier {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let decoded = try? decoder.decode(ProjectMetadata.self, from: read.data),
-              decoded.formatVersion == ProjectMetadataStore.supportedFormatVersion else {
+              ProjectMetadataStore.acceptedFormatVersions.contains(decoded.formatVersion) else {
             throw VerificationError.invalidEvidence(
                 "project.json could not be decoded from the descriptor-bound bytes."
             )

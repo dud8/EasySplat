@@ -11,11 +11,28 @@ struct HomeView: View {
     @FocusState private var isDropZoneFocused: Bool
 
     private var hasInput: Bool {
-        !model.pendingVideoURLs.isEmpty || !model.pendingPhotoURLs.isEmpty
+        Self.hasSelectableInput(
+            hasMedia: !model.pendingVideoURLs.isEmpty || !model.pendingPhotoURLs.isEmpty,
+            hasDataset: model.pendingDataset != nil
+        )
+    }
+
+    /// Gates the Create Splat button: media and datasets are both valid
+    /// starting points.
+    nonisolated static func hasSelectableInput(hasMedia: Bool, hasDataset: Bool) -> Bool {
+        hasMedia || hasDataset
     }
 
     private var hasPhotos: Bool {
         !model.pendingPhotoURLs.isEmpty
+    }
+
+    private var isDataset: Bool {
+        model.pendingDataset != nil
+    }
+
+    private var visibleOptionSections: VisibleOptionSections {
+        Self.visibleOptionSections(forDataset: isDataset)
     }
 
     var body: some View {
@@ -27,7 +44,7 @@ struct HomeView: View {
 
                 DropZoneView(
                     title: "Choose Input…",
-                    subtitle: "or drop videos, photos, or a folder here",
+                    subtitle: "or drop videos, photos, folders, or a dataset here",
                     onChoose: { presentInputImporter(replacing: false) },
                     onDropURLs: { model.addInputs(urls: $0) }
                 )
@@ -65,7 +82,8 @@ struct HomeView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                if let input = model.buildInputSpec(),
+                if !isDataset,
+                   let input = model.buildInputSpec(),
                    let prediction = RunDurationPredictor.predict(
                        options: model.requestedRunOptions,
                        input: input,
@@ -102,7 +120,8 @@ struct HomeView: View {
                 .movie,
                 .video,
                 .mpeg4Movie,
-                .quickTimeMovie
+                .quickTimeMovie,
+                .zip
             ],
             allowsMultipleSelection: true
         ) { result in
@@ -135,19 +154,33 @@ struct HomeView: View {
                 .buttonStyle(.borderless)
             }
 
-            if !model.pendingPhotoURLs.isEmpty {
-                let count = model.pendingPhotoURLs.count
-                inputRow(name: "\(count) \(count == 1 ? "photo" : "photos")", systemImage: "photo") {
-                    model.removeAllPhotos()
+            if let dataset = model.pendingDataset {
+                inputRow(name: datasetRowName(dataset), systemImage: "cube.transparent") {
+                    model.pendingDataset = nil
+                    model.selectionWarning = nil
                 }
-            }
+            } else {
+                if !model.pendingPhotoURLs.isEmpty {
+                    let count = model.pendingPhotoURLs.count
+                    inputRow(name: "\(count) \(count == 1 ? "photo" : "photos")", systemImage: "photo") {
+                        model.removeAllPhotos()
+                    }
+                }
 
-            ForEach(Array(model.pendingVideoURLs.enumerated()), id: \.element) { index, url in
-                inputRow(name: url.lastPathComponent, systemImage: "film") {
-                    model.pendingVideoURLs.remove(at: index)
+                ForEach(Array(model.pendingVideoURLs.enumerated()), id: \.element) { index, url in
+                    inputRow(name: url.lastPathComponent, systemImage: "film") {
+                        model.pendingVideoURLs.remove(at: index)
+                    }
                 }
             }
         }
+    }
+
+    private func datasetRowName(_ dataset: PendingDataset) -> String {
+        guard let imageCount = dataset.imageCount else {
+            return dataset.kind.displayName
+        }
+        return "\(dataset.kind.displayName) · \(imageCount) images"
     }
 
     private func inputRow(name: String, systemImage: String, remove: @escaping () -> Void) -> some View {
@@ -170,15 +203,18 @@ struct HomeView: View {
     }
 
     private var optionControls: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
-            optionRow("Capture Path") {
-                Picker("Capture Path", selection: $model.requestedRunOptions.capturePath) {
-                    Text("Automatic").tag(CapturePath.automatic)
-                    Text("Around a subject").tag(CapturePath.orbit)
-                    Text("Through a space").tag(CapturePath.walkthrough)
-                    Text("Across a large area").tag(CapturePath.largeArea)
+        let sections = visibleOptionSections
+        return VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
+            if sections.capturePath {
+                optionRow("Capture Path") {
+                    Picker("Capture Path", selection: $model.requestedRunOptions.capturePath) {
+                        Text("Automatic").tag(CapturePath.automatic)
+                        Text("Around a subject").tag(CapturePath.orbit)
+                        Text("Through a space").tag(CapturePath.walkthrough)
+                        Text("Across a large area").tag(CapturePath.largeArea)
+                    }
+                    .accessibilityIdentifier("home.capturePath")
                 }
-                .accessibilityIdentifier("home.capturePath")
             }
 
             optionRow("Detail") {
@@ -203,34 +239,40 @@ struct HomeView: View {
                 }
             }
 
-            optionRow("Camera Source") {
-                Picker("Camera Source", selection: $model.requestedRunOptions.cameraGrouping) {
-                    Text("Automatic").tag(CameraGrouping.automatic)
-                    Text("Same camera and lens").tag(CameraGrouping.sameCameraAndLens)
-                    Text("Mixed cameras or lenses").tag(CameraGrouping.mixedCamerasOrLenses)
+            if sections.cameraGrouping {
+                optionRow("Camera Source") {
+                    Picker("Camera Source", selection: $model.requestedRunOptions.cameraGrouping) {
+                        Text("Automatic").tag(CameraGrouping.automatic)
+                        Text("Same camera and lens").tag(CameraGrouping.sameCameraAndLens)
+                        Text("Mixed cameras or lenses").tag(CameraGrouping.mixedCamerasOrLenses)
+                    }
+                    .accessibilityIdentifier("home.cameraSource")
                 }
-                .accessibilityIdentifier("home.cameraSource")
             }
 
-            optionRow("Lens") {
-                Picker("Lens", selection: $model.requestedRunOptions.lensProjection) {
-                    Text("Automatic").tag(LensProjection.automatic)
-                    Text("Perspective").tag(LensProjection.perspective)
-                    Text("Fisheye").tag(LensProjection.fisheye)
+            if sections.lensProjection {
+                optionRow("Lens") {
+                    Picker("Lens", selection: $model.requestedRunOptions.lensProjection) {
+                        Text("Automatic").tag(LensProjection.automatic)
+                        Text("Perspective").tag(LensProjection.perspective)
+                        Text("Fisheye").tag(LensProjection.fisheye)
+                    }
+                    .accessibilityIdentifier("home.lens")
                 }
-                .accessibilityIdentifier("home.lens")
             }
 
-            optionRow("Input Order") {
-                Picker("Input Order", selection: $model.requestedRunOptions.inputOrdering) {
-                    Text("Automatic").tag(InputOrdering.automatic)
-                    Text("Continuous sequence")
-                        .tag(InputOrdering.continuous)
-                        .disabled(!continuousOrderingIsAvailable)
-                        .help(continuousOrderingHelp)
-                    Text("Unordered").tag(InputOrdering.unordered)
+            if sections.inputOrdering {
+                optionRow("Input Order") {
+                    Picker("Input Order", selection: $model.requestedRunOptions.inputOrdering) {
+                        Text("Automatic").tag(InputOrdering.automatic)
+                        Text("Continuous sequence")
+                            .tag(InputOrdering.continuous)
+                            .disabled(!continuousOrderingIsAvailable)
+                            .help(continuousOrderingHelp)
+                        Text("Unordered").tag(InputOrdering.unordered)
+                    }
+                    .accessibilityIdentifier("home.inputOrder")
                 }
-                .accessibilityIdentifier("home.inputOrder")
             }
 
             optionRow("Resource Use") {
@@ -266,7 +308,9 @@ struct HomeView: View {
     }
 
     private var continuousOrderingIsAvailable: Bool {
-        guard let input = model.buildInputSpec() else { return true }
+        // Ordering is inert for datasets, and their input spec should never be
+        // read as media here; the row itself is hidden in that case.
+        guard !isDataset, let input = model.buildInputSpec() else { return true }
         return RunPlanResolver.supports(inputOrdering: .continuous, input: input)
     }
 
@@ -310,29 +354,53 @@ struct HomeView: View {
 
     private var optionsSummary: String {
         let options = model.requestedRunOptions
+        let sections = visibleOptionSections
         var parts = [Self.detailLabel(options.detailProfile)]
-        if options.capturePath != .automatic {
+        if sections.capturePath, options.capturePath != .automatic {
             parts.append(Self.captureLabel(options.capturePath))
         }
-        if options.cameraGrouping != .automatic {
+        if sections.cameraGrouping, options.cameraGrouping != .automatic {
             parts.append(Self.cameraLabel(options.cameraGrouping))
         }
-        if options.lensProjection != .automatic {
+        if sections.lensProjection, options.lensProjection != .automatic {
             parts.append(Self.lensLabel(options.lensProjection))
         }
-        if options.inputOrdering != .automatic {
+        if sections.inputOrdering, options.inputOrdering != .automatic {
             parts.append(Self.orderLabel(options.inputOrdering))
         }
         if options.resourcePolicy != .automatic {
             parts.append(Self.resourceLabel(options.resourcePolicy))
         }
-        if hasPhotos, options.photoSelection == .useAllValidPhotos {
+        if !isDataset, hasPhotos, options.photoSelection == .useAllValidPhotos {
             parts.append("All valid photos")
         }
         if parts.count == 1 {
             parts.append("Automatic")
         }
         return parts.joined(separator: " · ")
+    }
+
+    /// Which option sections a given input surfaces. Datasets fixed their
+    /// capture, ordering, and camera decisions upstream, so only Detail and
+    /// Resource Use remain meaningful; media inputs show the full set.
+    struct VisibleOptionSections: Equatable {
+        var capturePath: Bool
+        var detail: Bool
+        var cameraGrouping: Bool
+        var lensProjection: Bool
+        var inputOrdering: Bool
+        var resourceUse: Bool
+    }
+
+    nonisolated static func visibleOptionSections(forDataset: Bool) -> VisibleOptionSections {
+        VisibleOptionSections(
+            capturePath: !forDataset,
+            detail: true,
+            cameraGrouping: !forDataset,
+            lensProjection: !forDataset,
+            inputOrdering: !forDataset,
+            resourceUse: true
+        )
     }
 
     nonisolated static func detailLabel(_ value: DetailProfile) -> String {

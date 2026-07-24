@@ -142,7 +142,9 @@ public enum TrainingArtifactStore {
               isSHA256(derivation.sourceSelectedFramesDigest),
               derivation.maximumImageDimension > 0,
               !derivation.toolchainVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              derivation.colmapProvenance.identifier == "colmap",
+              // The dataset was prepared from either a COLMAP solve or a directly
+              // adopted external model; both pin a solver provenance here.
+              ["colmap", "imported"].contains(derivation.colmapProvenance.identifier),
               !derivation.colmapProvenance.version
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !derivation.colmapProvenance.revision

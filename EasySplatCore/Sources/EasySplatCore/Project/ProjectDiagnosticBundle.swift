@@ -171,6 +171,8 @@ public enum ProjectDiagnosticBundle {
             lines.append("Input: photos folder")
         case .mixed(let videos, _):
             lines.append("Input: mixed (\(videos.count) videos + photos folder)")
+        case .dataset(let kind, _):
+            lines.append("Input: \(kind.rawValue) dataset")
         }
         if let hardwareLine, !hardwareLine.isEmpty {
             lines.append("Hardware: \(hardwareLine)")

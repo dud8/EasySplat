@@ -770,17 +770,23 @@ public struct ColmapBundleAdjustmentOptions: Sendable {
     public var refineFocalLength: Bool
     public var refinePrincipalPoint: Bool
     public var refineExtraParams: Bool
+    /// When false, camera poses are held constant and only structure (and
+    /// any enabled intrinsics) are refined. Imported-pose datasets rely on
+    /// this: their extrinsics are the trusted input, not a free variable.
+    public var refineExtrinsics: Bool
 
     public init(
         maxNumIterations: Int = 50,
         refineFocalLength: Bool = true,
         refinePrincipalPoint: Bool = false,
-        refineExtraParams: Bool = false
+        refineExtraParams: Bool = false,
+        refineExtrinsics: Bool = true
     ) {
         self.maxNumIterations = max(1, maxNumIterations)
         self.refineFocalLength = refineFocalLength
         self.refinePrincipalPoint = refinePrincipalPoint
         self.refineExtraParams = refineExtraParams
+        self.refineExtrinsics = refineExtrinsics
     }
 }
 
@@ -1626,6 +1632,7 @@ public final class ColmapRunner: @unchecked Sendable {
             "--BundleAdjustment.refine_focal_length", bundleOptions.refineFocalLength ? "1" : "0",
             "--BundleAdjustment.refine_principal_point", bundleOptions.refinePrincipalPoint ? "1" : "0",
             "--BundleAdjustment.refine_extra_params", bundleOptions.refineExtraParams ? "1" : "0",
+            "--BundleAdjustment.refine_extrinsics", bundleOptions.refineExtrinsics ? "1" : "0",
             "--BundleAdjustmentCeres.max_num_iterations", "\(max(1, bundleOptions.maxNumIterations))"
         ]
 

@@ -783,10 +783,67 @@ public struct GeometryConditioningArtifact: Codable, Sendable, Equatable {
     }
 }
 
+/// Discriminates how the accepted geometry was produced. `computed` geometry is
+/// solved by the toolchain and carries the full pair-graph, worker-execution, and
+/// mapping evidence. `imported` geometry is adopted directly from an external
+/// dataset model; it carries its own authenticated evidence contract in
+/// `importedEvidence` instead. Absent from manifests written before the imported
+/// route existed, which decode as `computed`.
+public enum GeometryArtifactSource: String, Codable, Sendable, Equatable {
+    case computed
+    case imported
+}
+
+/// The evidence contract that stands in for pair-graph, worker-execution, and
+/// feature-database evidence when geometry is adopted directly from a dataset.
+/// Re-verified on every load: the seed and source file digests are recomputed
+/// against the persisted `Import/seed` and `Import/source` files so a swapped
+/// seed invalidates the artifact, and the rollups are pinned into the artifact's
+/// solver provenance (`revision` == `sourceClosureSHA256`, `payloadSHA256` ==
+/// `seedClosureSHA256`).
+public struct ImportedGeometryEvidence: Codable, Sendable, Equatable {
+    /// `DatasetKind.rawValue` of the imported dataset.
+    public var datasetKind: String
+    /// `DatasetGeometryRoute.rawValue`; always `adoptDirect` for imported geometry.
+    public var route: String
+    /// The three converted seed files under `Import/seed`, with digests.
+    public var seedFiles: [DatasetReceiptFile]
+    /// The verbatim original geometry metadata under `Import/source`, with digests.
+    public var sourceFiles: [DatasetReceiptFile]
+    /// Rollup digest over `seedFiles`; binds the persisted `Import/seed`.
+    public var seedClosureSHA256: String
+    /// Rollup digest over `sourceFiles`; binds the persisted `Import/source`.
+    public var sourceClosureSHA256: String
+    public var imageCount: Int
+
+    public init(
+        datasetKind: String,
+        route: String,
+        seedFiles: [DatasetReceiptFile],
+        sourceFiles: [DatasetReceiptFile],
+        seedClosureSHA256: String,
+        sourceClosureSHA256: String,
+        imageCount: Int
+    ) {
+        self.datasetKind = datasetKind
+        self.route = route
+        self.seedFiles = seedFiles
+        self.sourceFiles = sourceFiles
+        self.seedClosureSHA256 = seedClosureSHA256
+        self.sourceClosureSHA256 = sourceClosureSHA256
+        self.imageCount = imageCount
+    }
+}
+
 public struct GeometryArtifact: Codable, Sendable, Equatable {
     public static let currentSchemaVersion = 35
 
     public var schemaVersion: Int
+    /// How this geometry was produced. `nil` decodes as `.computed` so manifests
+    /// written before the imported route existed keep loading unchanged.
+    public var source: GeometryArtifactSource?
+    /// Present only for `.imported` geometry; `nil` for computed geometry.
+    public var importedEvidence: ImportedGeometryEvidence?
     public var solverVersion: String
     public var runtimeVersion: String
     public var modelVersion: String
@@ -826,6 +883,9 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var mapping: MappingArtifact
     public var canonicalOrientation: CanonicalOrientationArtifact
 
+    /// Resolves the discriminator, defaulting pre-import manifests to `.computed`.
+    public var resolvedSource: GeometryArtifactSource { source ?? .computed }
+
     public var allowsViewOnlyUprightFlip: Bool {
         switch canonicalOrientation.status {
         case .axisAlignedSignUnverified, .unresolved:
@@ -842,6 +902,8 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
 
     public init(
         schemaVersion: Int,
+        source: GeometryArtifactSource? = nil,
+        importedEvidence: ImportedGeometryEvidence? = nil,
         solverVersion: String,
         runtimeVersion: String,
         modelVersion: String,
@@ -878,6 +940,8 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         canonicalOrientation: CanonicalOrientationArtifact
     ) {
         self.schemaVersion = schemaVersion
+        self.source = source
+        self.importedEvidence = importedEvidence
         self.solverVersion = solverVersion
         self.runtimeVersion = runtimeVersion
         self.modelVersion = modelVersion
