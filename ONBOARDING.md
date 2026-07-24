@@ -217,6 +217,7 @@ Release verification adds:
 
 ```bash
 ./scripts/benchmark/run_suite.sh --profile release
+./scripts/benchmark/validate_subject_isolation_results.py /path/to/subject-isolation-results.json
 ./scripts/ci/test_msplat_native_build.sh
 shellcheck $(git ls-files 'scripts/*.sh' 'scripts/**/*.sh')
 actionlint
@@ -224,6 +225,8 @@ gitleaks git --redact
 ```
 
 The full benchmark requires external media matching `scripts/benchmark/corpus.json`. Never fabricate evidence or mark an unavailable scene as passed. The Release App workflow runs the packaged verifier with the built app, DMG, signed component closure, generated fixture, and online/offline runners. Geometry conditioning is part of the production pipeline and is recomputed when a geometry artifact is loaded. The packaged fixture must reconstruct at least 11 of 12 views before native training. Release verification also checks the signed and notarized app, stapled DMG, Gatekeeper assessment, quarantined installation, SBOM, licenses, provenance, checksums, and cached offline reuse.
+
+The subject-isolation validator consumes a schema-version 1 JSON object bound to an Apple M4 Max with 48 GiB of memory and confirms that timing excludes the first toolchain installation. Its `captures` array records each outcome (`automatic_correct`, `user_selected`, `asked`, `refused`, or `wrong_automatic`), source Gaussian count, isolation time, incremental unified-memory bytes, canonical PLY SHA-256 and byte count before and after isolation, plus held-out IoU and boundary F1 for accepted outputs.
 
 ## Releases
 
