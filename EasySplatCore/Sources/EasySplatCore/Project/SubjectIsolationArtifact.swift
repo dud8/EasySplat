@@ -56,11 +56,18 @@ public struct CanonicalSplatPublication: Sendable, Equatable {
 
 public struct SubjectAnchor: Codable, Sendable, Equatable {
     public var imageIdentity: String
+    public var instanceLabel: UInt8
     public var normalizedX: Double
     public var normalizedY: Double
 
-    public init(imageIdentity: String, normalizedX: Double, normalizedY: Double) {
+    public init(
+        imageIdentity: String,
+        instanceLabel: UInt8,
+        normalizedX: Double,
+        normalizedY: Double
+    ) {
         self.imageIdentity = imageIdentity
+        self.instanceLabel = instanceLabel
         self.normalizedX = normalizedX
         self.normalizedY = normalizedY
     }
@@ -68,22 +75,41 @@ public struct SubjectAnchor: Codable, Sendable, Equatable {
 
 public struct SubjectChoiceRequest: Sendable, Equatable {
     public struct Candidate: Sendable, Equatable {
-        public let identity: String
+        public let componentIdentity: String
+        public let instanceLabel: UInt8
         public let confidence: Double
         public let previewMaskURL: URL?
 
-        public init(identity: String, confidence: Double, previewMaskURL: URL? = nil) {
-            self.identity = identity
+        public init(
+            componentIdentity: String,
+            instanceLabel: UInt8,
+            confidence: Double,
+            previewMaskURL: URL? = nil
+        ) {
+            self.componentIdentity = componentIdentity
+            self.instanceLabel = instanceLabel
             self.confidence = confidence
             self.previewMaskURL = previewMaskURL
         }
     }
 
-    public let imageIdentity: String
+    public let keyframeImageURL: URL
+    public let combinedInstanceLabelMaskURL: URL
+    public let pixelWidth: Int
+    public let pixelHeight: Int
     public let candidates: [Candidate]
 
-    public init(imageIdentity: String, candidates: [Candidate]) {
-        self.imageIdentity = imageIdentity
+    public init(
+        keyframeImageURL: URL,
+        combinedInstanceLabelMaskURL: URL,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        candidates: [Candidate]
+    ) {
+        self.keyframeImageURL = keyframeImageURL
+        self.combinedInstanceLabelMaskURL = combinedInstanceLabelMaskURL
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
         self.candidates = candidates
     }
 }
@@ -152,8 +178,7 @@ public struct IsolationArtifact: Codable, Sendable, Equatable {
         public var maskSHA256: String
         public var pixelWidth: Int
         public var pixelHeight: Int
-        public var backgroundLabel: UInt8
-        public var subjectLabel: UInt8
+        public var instanceLabels: [UInt8]
 
         public init(
             relativePath: String,
@@ -162,8 +187,7 @@ public struct IsolationArtifact: Codable, Sendable, Equatable {
             maskSHA256: String,
             pixelWidth: Int,
             pixelHeight: Int,
-            backgroundLabel: UInt8,
-            subjectLabel: UInt8
+            instanceLabels: [UInt8]
         ) {
             self.relativePath = relativePath
             self.imageIdentity = imageIdentity
@@ -171,28 +195,30 @@ public struct IsolationArtifact: Codable, Sendable, Equatable {
             self.maskSHA256 = maskSHA256
             self.pixelWidth = pixelWidth
             self.pixelHeight = pixelHeight
-            self.backgroundLabel = backgroundLabel
-            self.subjectLabel = subjectLabel
+            self.instanceLabels = instanceLabels
         }
     }
 
     public struct Policy: Codable, Sendable, Equatable {
         public var version: Int
         public var minimumMaskConfidence: Double
-        public var minimumHeldOutIoU: Double
+        public var minimumHeldOutMedianIoU: Double
+        public var minimumHeldOutFirstQuartileIoU: Double
         public var minimumRetainedGaussianFraction: Double
         public var maximumRetainedGaussianFraction: Double
 
         public init(
             version: Int,
             minimumMaskConfidence: Double,
-            minimumHeldOutIoU: Double,
+            minimumHeldOutMedianIoU: Double,
+            minimumHeldOutFirstQuartileIoU: Double,
             minimumRetainedGaussianFraction: Double,
             maximumRetainedGaussianFraction: Double
         ) {
             self.version = version
             self.minimumMaskConfidence = minimumMaskConfidence
-            self.minimumHeldOutIoU = minimumHeldOutIoU
+            self.minimumHeldOutMedianIoU = minimumHeldOutMedianIoU
+            self.minimumHeldOutFirstQuartileIoU = minimumHeldOutFirstQuartileIoU
             self.minimumRetainedGaussianFraction = minimumRetainedGaussianFraction
             self.maximumRetainedGaussianFraction = maximumRetainedGaussianFraction
         }
@@ -201,15 +227,21 @@ public struct IsolationArtifact: Codable, Sendable, Equatable {
     public struct ValidationMetrics: Codable, Sendable, Equatable {
         public var meanMaskConfidence: Double
         public var heldOutMeanIoU: Double?
+        public var heldOutMedianIoU: Double?
+        public var heldOutFirstQuartileIoU: Double?
         public var retainedGaussianFraction: Double
 
         public init(
             meanMaskConfidence: Double,
             heldOutMeanIoU: Double?,
+            heldOutMedianIoU: Double?,
+            heldOutFirstQuartileIoU: Double?,
             retainedGaussianFraction: Double
         ) {
             self.meanMaskConfidence = meanMaskConfidence
             self.heldOutMeanIoU = heldOutMeanIoU
+            self.heldOutMedianIoU = heldOutMedianIoU
+            self.heldOutFirstQuartileIoU = heldOutFirstQuartileIoU
             self.retainedGaussianFraction = retainedGaussianFraction
         }
     }

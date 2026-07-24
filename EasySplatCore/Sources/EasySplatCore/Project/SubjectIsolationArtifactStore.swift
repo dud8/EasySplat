@@ -371,6 +371,7 @@ public enum SubjectIsolationArtifactStore {
 
         if let anchor = artifact.subjectAnchor {
             guard knownViews.contains(anchor.imageIdentity),
+                  anchor.instanceLabel > 0,
                   anchor.normalizedX.isFinite,
                   anchor.normalizedY.isFinite,
                   (0...1).contains(anchor.normalizedX),
@@ -396,8 +397,9 @@ public enum SubjectIsolationArtifactStore {
                   ).overflow == false,
                   mask.pixelWidth * mask.pixelHeight
                     <= IsolationArtifact.maximumDecodedMaskPixelCount,
-                  mask.backgroundLabel == 0,
-                  mask.subjectLabel > 0 else {
+                  mask.instanceLabels.allSatisfy({ $0 > 0 }),
+                  mask.instanceLabels == mask.instanceLabels.sorted(),
+                  Set(mask.instanceLabels).count == mask.instanceLabels.count else {
                 throw SubjectIsolationArtifactStoreError.invalidArtifact
             }
             let resolved = try paths.resolveProjectRelativePath(mask.relativePath)
@@ -527,20 +529,18 @@ public enum SubjectIsolationArtifactStore {
               image.height == mask.pixelHeight,
               image.bitsPerComponent == 8,
               image.colorSpace?.model == .monochrome,
-              try containsOnlyExpectedLabels(
+              try hasExactlyDeclaredInstanceLabels(
                 image,
-                background: mask.backgroundLabel,
-                subject: mask.subjectLabel,
+                declared: mask.instanceLabels,
                 shouldCancel: shouldCancel
               ) else {
             throw SubjectIsolationArtifactStoreError.invalidArtifact
         }
     }
 
-    private static func containsOnlyExpectedLabels(
+    private static func hasExactlyDeclaredInstanceLabels(
         _ image: CGImage,
-        background: UInt8,
-        subject: UInt8,
+        declared: [UInt8],
         shouldCancel: @escaping @Sendable () -> Bool
     ) throws -> Bool {
         guard image.bitsPerPixel == 8,
@@ -550,19 +550,18 @@ public enum SubjectIsolationArtifactStore {
         }
         let bytes = CFDataGetBytePtr(data)
         guard let bytes else { return false }
-        var foundSubject = false
+        var observed = Set<UInt8>()
         for row in 0..<image.height {
             try throwIfCancelled(shouldCancel)
             let rowStart = row * image.bytesPerRow
             for column in 0..<image.width {
                 let value = bytes[rowStart + column]
-                guard value == background || value == subject else {
-                    return false
+                if value != 0 {
+                    observed.insert(value)
                 }
-                foundSubject = foundSubject || value == subject
             }
         }
-        return foundSubject
+        return observed == Set(declared)
     }
 
 #if DEBUG
@@ -702,21 +701,24 @@ public enum SubjectIsolationArtifactStore {
                 mask,
                 required: [
                     "relativePath", "imageIdentity", "imageSHA256", "maskSHA256",
-                    "pixelWidth", "pixelHeight", "backgroundLabel", "subjectLabel",
+                    "pixelWidth", "pixelHeight", "instanceLabels",
                 ]
             )
         }
         try requireObject(
             root["policy"],
             keys: [
-                "version", "minimumMaskConfidence", "minimumHeldOutIoU",
+                "version", "minimumMaskConfidence", "minimumHeldOutMedianIoU",
+                "minimumHeldOutFirstQuartileIoU",
                 "minimumRetainedGaussianFraction", "maximumRetainedGaussianFraction",
             ]
         )
         try requireObject(
             root["metrics"],
             required: ["meanMaskConfidence", "retainedGaussianFraction"],
-            optional: ["heldOutMeanIoU"]
+            optional: [
+                "heldOutMeanIoU", "heldOutMedianIoU", "heldOutFirstQuartileIoU",
+            ]
         )
         try requireObject(
             root["output"],
@@ -735,7 +737,7 @@ public enum SubjectIsolationArtifactStore {
             if !(anchor is NSNull) {
                 try requireObject(
                     anchor,
-                    keys: ["imageIdentity", "normalizedX", "normalizedY"]
+                    keys: ["imageIdentity", "instanceLabel", "normalizedX", "normalizedY"]
                 )
             }
         }
@@ -771,7 +773,8 @@ public enum SubjectIsolationArtifactStore {
     private static func validPolicy(_ policy: IsolationArtifact.Policy) -> Bool {
         policy.version > 0
             && validUnitInterval(policy.minimumMaskConfidence)
-            && validUnitInterval(policy.minimumHeldOutIoU)
+            && validUnitInterval(policy.minimumHeldOutMedianIoU)
+            && validUnitInterval(policy.minimumHeldOutFirstQuartileIoU)
             && policy.minimumRetainedGaussianFraction.isFinite
             && policy.maximumRetainedGaussianFraction.isFinite
             && policy.minimumRetainedGaussianFraction > 0
@@ -784,12 +787,23 @@ public enum SubjectIsolationArtifactStore {
         _ metrics: IsolationArtifact.ValidationMetrics,
         policy: IsolationArtifact.Policy
     ) -> Bool {
-        validUnitInterval(metrics.meanMaskConfidence)
-            && metrics.heldOutMeanIoU.map(validUnitInterval) ?? true
+        let heldOutMetrics = [
+            metrics.heldOutMeanIoU,
+            metrics.heldOutMedianIoU,
+            metrics.heldOutFirstQuartileIoU,
+        ]
+        let hasNoHeldOutMetrics = heldOutMetrics.allSatisfy { $0 == nil }
+        let hasAllHeldOutMetrics = heldOutMetrics.allSatisfy { $0 != nil }
+        return validUnitInterval(metrics.meanMaskConfidence)
+            && (hasNoHeldOutMetrics || hasAllHeldOutMetrics)
+            && heldOutMetrics.allSatisfy { $0.map(validUnitInterval) ?? true }
             && validUnitInterval(metrics.retainedGaussianFraction)
             && metrics.meanMaskConfidence >= policy.minimumMaskConfidence
-            && (metrics.heldOutMeanIoU.map {
-                $0 >= policy.minimumHeldOutIoU
+            && (metrics.heldOutMedianIoU.map {
+                $0 >= policy.minimumHeldOutMedianIoU
+            } ?? true)
+            && (metrics.heldOutFirstQuartileIoU.map {
+                $0 >= policy.minimumHeldOutFirstQuartileIoU
             } ?? true)
             && metrics.retainedGaussianFraction
                 >= policy.minimumRetainedGaussianFraction

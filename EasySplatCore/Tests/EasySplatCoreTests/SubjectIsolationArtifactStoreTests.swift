@@ -520,6 +520,184 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
             return XCTFail("Pre-retrain proof must not remove the current subject.")
         }
     }
+
+    func testBackgroundOnlyMaskPublishesAndReloads() throws {
+        let fixture = try makeFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        try fixture.rebuildStaging(vertexCount: 1, maskPixels: Array(repeating: 0, count: 16))
+        var artifact = try fixture.makeArtifact()
+        artifact.masks[0].instanceLabels = []
+        artifact.subjectAnchor = nil
+        artifact.masks[0].maskSHA256 = try GeometryArtifactStore.sha256(
+            of: fixture.stagedMasksURL.appendingPathComponent("mask-0.png")
+        )
+
+        _ = try SubjectIsolationArtifactStore.publish(
+            artifact,
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+
+        guard case .valid(let loaded, _) = SubjectIsolationArtifactStore.load(paths: fixture.paths) else {
+            return XCTFail("A background-only mask must publish and reload.")
+        }
+        XCTAssertEqual(loaded.masks[0].instanceLabels, [UInt8]())
+    }
+
+    func testMultiLabelMaskPublishesAndReloads() throws {
+        let fixture = try makeFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        try fixture.rebuildStaging(
+            vertexCount: 1,
+            maskPixels: [0, 2, 9, 0, 2, 9, 0, 0, 2, 9, 0, 0, 0, 0, 0, 0]
+        )
+        var artifact = try fixture.makeArtifact()
+        artifact.masks[0].instanceLabels = [2, 9]
+        artifact.masks[0].maskSHA256 = try GeometryArtifactStore.sha256(
+            of: fixture.stagedMasksURL.appendingPathComponent("mask-0.png")
+        )
+
+        _ = try SubjectIsolationArtifactStore.publish(
+            artifact,
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+
+        guard case .valid(let loaded, _) = SubjectIsolationArtifactStore.load(paths: fixture.paths) else {
+            return XCTFail("A multi-label mask must publish and reload.")
+        }
+        XCTAssertEqual(loaded.masks[0].instanceLabels, [2, 9])
+    }
+
+    func testMaskLabelDeclarationsRejectZeroDuplicatesUnsortedAndPixelSetMismatch() throws {
+        let fixture = try makeFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        try fixture.rebuildStaging(
+            vertexCount: 1,
+            maskPixels: [0, 2, 9, 0, 2, 9, 0, 0, 2, 9, 0, 0, 0, 0, 0, 0]
+        )
+        let expectedDigest = try GeometryArtifactStore.sha256(
+            of: fixture.stagedMasksURL.appendingPathComponent("mask-0.png")
+        )
+
+        for labels in [[UInt8](arrayLiteral: 0), [2, 2], [9, 2], [2], [2, 9, 10]] {
+            var artifact = try fixture.makeArtifact()
+            artifact.masks[0].instanceLabels = labels
+            artifact.masks[0].maskSHA256 = expectedDigest
+            XCTAssertThrowsError(
+                try SubjectIsolationArtifactStore.publish(
+                    artifact,
+                    stagedOutputURL: fixture.stagedOutputURL,
+                    stagedMasksURL: fixture.stagedMasksURL,
+                    paths: fixture.paths
+                ),
+                "Labels \(labels) must be rejected."
+            )
+        }
+    }
+
+    func testStrictManifestRejectsSupersededMaskKeysAndUnknownFields() throws {
+        let fixture = try makeFixture(maskCount: 1)
+        defer { fixture.cleanup() }
+        let artifact = try fixture.makeArtifact()
+        let encoded = try JSONEncoder().encode(artifact)
+        var manifest = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var mask = try XCTUnwrap(manifest["masks"] as? [[String: Any]]).first!
+        mask.removeValue(forKey: "instanceLabels")
+        mask["backgroundLabel"] = 0
+        mask["subjectLabel"] = 1
+        manifest["masks"] = [mask]
+        try fixture.writeManifest(manifest)
+
+        guard case .invalid = SubjectIsolationArtifactStore.load(paths: fixture.paths) else {
+            return XCTFail("The superseded mask shape must be rejected.")
+        }
+
+        var unknownManifest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        unknownManifest["unknown"] = true
+        try fixture.writeManifest(unknownManifest)
+        guard case .invalid = SubjectIsolationArtifactStore.load(paths: fixture.paths) else {
+            return XCTFail("Unknown manifest fields must be rejected.")
+        }
+    }
+
+    func testHeldOutMetricsAreAllOrNoneAndMeetMedianAndFirstQuartilePolicy() throws {
+        let fixture = try makeFixture(maskCount: 3)
+        defer { fixture.cleanup() }
+
+        var missingMetric = try fixture.makeArtifact()
+        missingMetric.metrics.heldOutMedianIoU = nil
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.publish(
+                missingMetric,
+                stagedOutputURL: fixture.stagedOutputURL,
+                stagedMasksURL: fixture.stagedMasksURL,
+                paths: fixture.paths
+            )
+        )
+
+        var belowMedian = try fixture.makeArtifact()
+        belowMedian.metrics.heldOutMedianIoU = 0.64
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.publish(
+                belowMedian,
+                stagedOutputURL: fixture.stagedOutputURL,
+                stagedMasksURL: fixture.stagedMasksURL,
+                paths: fixture.paths
+            )
+        )
+
+        var belowFirstQuartile = try fixture.makeArtifact()
+        belowFirstQuartile.metrics.heldOutFirstQuartileIoU = 0.54
+        XCTAssertThrowsError(
+            try SubjectIsolationArtifactStore.publish(
+                belowFirstQuartile,
+                stagedOutputURL: fixture.stagedOutputURL,
+                stagedMasksURL: fixture.stagedMasksURL,
+                paths: fixture.paths
+            )
+        )
+    }
+
+    func testAmbiguityAndAnchorValuesRetainVisionInstanceDetails() throws {
+        let imageURL = URL(fileURLWithPath: "/tmp/keyframe.png")
+        let maskURL = URL(fileURLWithPath: "/tmp/instances.png")
+        let previewURL = URL(fileURLWithPath: "/tmp/preview.png")
+        let candidate = SubjectChoiceRequest.Candidate(
+            componentIdentity: "component-7",
+            instanceLabel: 9,
+            confidence: 0.92,
+            previewMaskURL: previewURL
+        )
+        let request = SubjectChoiceRequest(
+            keyframeImageURL: imageURL,
+            combinedInstanceLabelMaskURL: maskURL,
+            pixelWidth: 1920,
+            pixelHeight: 1080,
+            candidates: [candidate]
+        )
+        let anchor = SubjectAnchor(
+            imageIdentity: "frame-7.png",
+            instanceLabel: 9,
+            normalizedX: 0.25,
+            normalizedY: 0.75
+        )
+
+        XCTAssertEqual(request.keyframeImageURL, imageURL)
+        XCTAssertEqual(request.combinedInstanceLabelMaskURL, maskURL)
+        XCTAssertEqual(request.pixelWidth, 1920)
+        XCTAssertEqual(request.pixelHeight, 1080)
+        XCTAssertEqual(request.candidates[0].componentIdentity, "component-7")
+        XCTAssertEqual(request.candidates[0].instanceLabel, 9)
+        XCTAssertEqual(request.candidates[0].previewMaskURL, previewURL)
+        XCTAssertEqual(anchor.instanceLabel, 9)
+        XCTAssertEqual(anchor.normalizedX, 0.25)
+        XCTAssertEqual(anchor.normalizedY, 0.75)
+    }
 }
 
 private enum IdentityMutation: CaseIterable {
@@ -542,17 +720,24 @@ struct SubjectIsolationFixture {
     }
 
     func rebuildStaging(vertexCount: Int, maskValue: UInt8) throws {
+        try rebuildStaging(
+            vertexCount: vertexCount,
+            maskPixels: Array(repeating: maskValue, count: 16)
+        )
+    }
+
+    func rebuildStaging(vertexCount: Int, maskPixels: [UInt8]) throws {
         let staging = paths.isolationStagingURL(for: runID)
         try? FileManager.default.removeItem(at: staging)
         try FileManager.default.createDirectory(at: stagedMasksURL, withIntermediateDirectories: true)
         try TestFileBuilder.writeMinimalPly(at: stagedOutputURL, vertexCount: vertexCount)
         for index in 0..<maskCount {
             XCTAssertTrue(
-                try TestFileBuilder.writeGrayscaleImage(
-                    url: stagedMasksURL.appendingPathComponent("mask-\(index).png"),
-                    size: 4,
-                    value: maskValue,
-                    utType: .png
+                try writeGrayscalePNG(
+                    at: stagedMasksURL.appendingPathComponent("mask-\(index).png"),
+                    width: 4,
+                    height: 4,
+                    pixels: maskPixels
                 )
             )
         }
@@ -581,8 +766,7 @@ struct SubjectIsolationFixture {
                 maskSHA256: try GeometryArtifactStore.sha256(of: maskURL),
                 pixelWidth: 4,
                 pixelHeight: 4,
-                backgroundLabel: 0,
-                subjectLabel: maskValue
+                instanceLabels: maskValue == 0 ? [] : [maskValue]
             )
         }
         return IsolationArtifact(
@@ -603,18 +787,22 @@ struct SubjectIsolationFixture {
             policy: .init(
                 version: 1,
                 minimumMaskConfidence: 0.8,
-                minimumHeldOutIoU: 0.65,
+                minimumHeldOutMedianIoU: 0.65,
+                minimumHeldOutFirstQuartileIoU: 0.55,
                 minimumRetainedGaussianFraction: 0.01,
                 maximumRetainedGaussianFraction: 0.95
             ),
             subjectAnchor: SubjectAnchor(
                 imageIdentity: imageNames[0],
+                instanceLabel: maskValue,
                 normalizedX: 0.5,
                 normalizedY: 0.5
             ),
             metrics: .init(
                 meanMaskConfidence: 0.9,
                 heldOutMeanIoU: imageNames.count > 2 ? 0.8 : nil,
+                heldOutMedianIoU: imageNames.count > 2 ? 0.8 : nil,
+                heldOutFirstQuartileIoU: imageNames.count > 2 ? 0.8 : nil,
                 retainedGaussianFraction: 0.5
             ),
             output: .init(
@@ -755,8 +943,24 @@ private func writeGrayscalePNG(
             ? nil
             : width * height
     )
-    var pixels = [UInt8](repeating: value, count: pixelCount)
-    let data = Data(bytes: &pixels, count: pixels.count)
+    return try writeGrayscalePNG(
+        at: url,
+        width: width,
+        height: height,
+        pixels: [UInt8](repeating: value, count: pixelCount)
+    )
+}
+
+private func writeGrayscalePNG(
+    at url: URL,
+    width: Int,
+    height: Int,
+    pixels: [UInt8]
+) throws -> Bool {
+    guard pixels.count == width * height else {
+        return false
+    }
+    let data = Data(pixels)
     guard let provider = CGDataProvider(data: data as CFData),
           let image = CGImage(
             width: width,
