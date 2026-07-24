@@ -126,11 +126,14 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
         let paths = ProjectPaths(root: root)
         let video = try TestFileBuilder.writeControlledVideoReceipt(paths: paths)
         let metadata = ProjectMetadata(
+            formatVersion: 31,
             title: "Format 31",
             input: .video(files: [video.receipt.projectRelativePath]),
             videoInputReceipts: [video.receipt]
         )
-        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(metadata).write(to: paths.metadataURL, options: .atomic)
         try FileManager.default.createDirectory(
             at: paths.isolationURL,
             withIntermediateDirectories: true
@@ -138,7 +141,7 @@ final class SubjectIsolationArtifactStoreTests: XCTestCase {
         try Data(#"{"schemaVersion":1,"unexpected":true}"#.utf8)
             .write(to: paths.isolationManifestURL)
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 31)
+        XCTAssertTrue(ProjectMetadataStore.acceptedFormatVersions.contains(31))
         XCTAssertEqual(
             try ProjectArtifactSnapshotStore.load(projectURL: root).metadata.formatVersion,
             31
