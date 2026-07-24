@@ -1710,8 +1710,19 @@ AnalysisCache readAnalysisCache(
                 "stored analysis view mask digest"
             );
         }
-        if (cache.expectedViewIdentities != expectedViewIdentities ||
-            cache.expectedViewMaskDigests != expectedViewMaskDigests) {
+        const std::size_t storedExpectedViewCount =
+            cache.expectedViewIdentities.size();
+        if (storedExpectedViewCount > expectedViewIdentities.size() ||
+            !std::equal(
+                cache.expectedViewIdentities.begin(),
+                cache.expectedViewIdentities.end(),
+                expectedViewIdentities.begin()
+            ) ||
+            !std::equal(
+                cache.expectedViewMaskDigests.begin(),
+                cache.expectedViewMaskDigests.end(),
+                expectedViewMaskDigests.begin()
+            )) {
             throw CacheValidationError(
                 "analysis cache view or mask binding is stale"
             );
@@ -1724,7 +1735,7 @@ AnalysisCache readAnalysisCache(
         }
         cache.gaussianCount = expectedGaussianCount;
         const std::uint32_t viewCount = reader.scalar<std::uint32_t>();
-        if (viewCount > cache.expectedViewIdentities.size()) {
+        if (viewCount > storedExpectedViewCount) {
             throw CacheValidationError("analysis cache has too many views");
         }
         for (std::uint32_t viewIndex = 0; viewIndex < viewCount; ++viewIndex) {
@@ -1759,6 +1770,8 @@ AnalysisCache readAnalysisCache(
             cache.views.push_back(std::move(view));
         }
         reader.exactEnd();
+        cache.expectedViewIdentities = expectedViewIdentities;
+        cache.expectedViewMaskDigests = expectedViewMaskDigests;
         return cache;
     } catch (...) {
         closeDescriptor(descriptor);

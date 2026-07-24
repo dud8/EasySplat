@@ -853,11 +853,6 @@ ReducedView reduceWorkView(
     }
     std::sort(labels.begin() + 1, labels.end());
     labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
-    if (labels.size() < 2) {
-        throw MaskValidationError(
-            "work-view mask must contain background and a nonzero instance"
-        );
-    }
     for (std::size_t index = 0; index < labels.size(); ++index) {
         labelIndex[labels[index]] = static_cast<int>(index);
     }
@@ -1287,15 +1282,6 @@ HeldOutResult validateHeldOutView(
     std::size_t memoryBudgetBytes,
     const std::function<bool()> &isCancelled
 ) {
-    if (std::none_of(
-            decoded.labels.begin(),
-            decoded.labels.end(),
-            [](std::uint8_t label) { return label != 0; }
-        )) {
-        throw MaskValidationError(
-            "held-out mask must contain a nonzero instance"
-        );
-    }
     PreparedCamera camera = prepareCamera(sourceCamera);
     prepareExactView(
         gaussians,
@@ -1369,11 +1355,6 @@ HeldOutResult validateHeldOutView(
             result.bestLabel = static_cast<std::uint16_t>(label);
             result.softIoU = softIoU;
         }
-    }
-    if (result.bestLabel == 0) {
-        throw MaskValidationError(
-            "held-out mask contains no matchable nonzero instance"
-        );
     }
     return result;
 }
@@ -1642,15 +1623,6 @@ IsolationRunResult runIsolation(
                 "decoded mask dimensions do not match the authenticated view"
             );
         }
-        if (std::none_of(
-                decoded.labels.begin(),
-                decoded.labels.end(),
-                [](std::uint8_t label) { return label != 0; }
-            )) {
-            throw MaskValidationError(
-                "every isolation mask must contain a nonzero instance"
-            );
-        }
         maximumWidth = std::max<std::size_t>(maximumWidth, decoded.width);
         maximumHeight = std::max<std::size_t>(maximumHeight, decoded.height);
         maximumLabelCount = std::max(
@@ -1664,9 +1636,9 @@ IsolationRunResult runIsolation(
         }
     }
     if (workViewCount == 0 || heldOutViewCount == 0 ||
-        maximumLabelCount < 2) {
+        maximumLabelCount == 0) {
         throw MaskValidationError(
-            "isolation requires work and held-out masks with instances"
+            "isolation requires work and held-out masks"
         );
     }
     const std::size_t gaussianCount =

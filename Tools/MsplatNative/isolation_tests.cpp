@@ -1321,6 +1321,145 @@ void testAnalysisCacheReuseAndCorruptionRejection() {
     fs::remove(cachePath);
 }
 
+void testAnalysisCacheProgressivelyExtendsAnExactPrefix() {
+    const fs::path cachePath = temporaryPath("progressive-analysis.cache");
+    fs::remove(cachePath);
+    AnalysisCache cache;
+    cache.sourceDigest = std::string(64, 'a');
+    cache.inputDigest = std::string(64, 'b');
+    cache.geometryDigest = std::string(64, 'c');
+    cache.selectedFramesDigest = std::string(64, 'd');
+    cache.trainingDigest = std::string(64, 'e');
+    cache.gaussianCount = 2;
+    for (std::size_t index = 0; index < 8; ++index) {
+        cache.expectedViewIdentities.push_back(
+            "cached-" + std::to_string(index) + ".png"
+        );
+        cache.expectedViewMaskDigests.push_back(
+            std::string(63, 'f') + std::to_string(index % 10)
+        );
+    }
+    cache.views.push_back(reduceLiftedView(liftContributions(
+        cache.expectedViewIdentities[0],
+        cache.gaussianCount,
+        {{0, 1, 0.5, 0.5, 1.0}}
+    )));
+    writeAnalysisCacheAtomically(cachePath, cache);
+
+    std::vector<std::string> extendedIdentities = cache.expectedViewIdentities;
+    std::vector<std::string> extendedMaskDigests = cache.expectedViewMaskDigests;
+    for (std::size_t index = 8; index < 14; ++index) {
+        extendedIdentities.push_back("cached-" + std::to_string(index) + ".png");
+        extendedMaskDigests.push_back(std::string(63, 'f') + std::to_string(index % 10));
+    }
+    AnalysisCache extended = readAnalysisCache(
+        cachePath,
+        cache.sourceDigest,
+        cache.inputDigest,
+        cache.geometryDigest,
+        cache.selectedFramesDigest,
+        cache.trainingDigest,
+        extendedIdentities,
+        extendedMaskDigests,
+        cache.gaussianCount,
+        1 << 20
+    );
+    require(extended.views.size() == 1,
+            "progressive cache did not preserve completed view prefix");
+    require(extended.expectedViewIdentities == extendedIdentities,
+            "progressive cache did not bind the expanded expected views");
+    require(extended.expectedViewMaskDigests == extendedMaskDigests,
+            "progressive cache did not bind the expanded mask digests");
+    writeAnalysisCacheAtomically(cachePath, extended);
+    require(
+        readAnalysisCache(
+            cachePath,
+            cache.sourceDigest,
+            cache.inputDigest,
+            cache.geometryDigest,
+            cache.selectedFramesDigest,
+            cache.trainingDigest,
+            extendedIdentities,
+            extendedMaskDigests,
+            cache.gaussianCount,
+            1 << 20
+        ).expectedViewIdentities == extendedIdentities,
+        "rewritten progressive cache did not retain the expanded expected views"
+    );
+
+    requireThrows<CacheValidationError>(
+        [&] {
+            (void)readAnalysisCache(
+                cachePath, cache.sourceDigest, cache.inputDigest,
+                cache.geometryDigest, cache.selectedFramesDigest,
+                cache.trainingDigest, cache.expectedViewIdentities,
+                cache.expectedViewMaskDigests, cache.gaussianCount, 1 << 20
+            );
+        },
+        "progressive cache accepted a contraction"
+    );
+    std::vector<std::string> reordered = extendedIdentities;
+    std::swap(reordered[0], reordered[1]);
+    requireThrows<CacheValidationError>(
+        [&] {
+            (void)readAnalysisCache(
+                cachePath, cache.sourceDigest, cache.inputDigest,
+                cache.geometryDigest, cache.selectedFramesDigest,
+                cache.trainingDigest, reordered, extendedMaskDigests,
+                cache.gaussianCount, 1 << 20
+            );
+        },
+        "progressive cache accepted a reordered prefix"
+    );
+    std::vector<std::string> changedDigests = extendedMaskDigests;
+    changedDigests[0][0] = '0';
+    requireThrows<CacheValidationError>(
+        [&] {
+            (void)readAnalysisCache(
+                cachePath, cache.sourceDigest, cache.inputDigest,
+                cache.geometryDigest, cache.selectedFramesDigest,
+                cache.trainingDigest, extendedIdentities, changedDigests,
+                cache.gaussianCount, 1 << 20
+            );
+        },
+        "progressive cache accepted a changed prefix digest"
+    );
+    std::vector<std::string> duplicateExtension = extendedIdentities;
+    duplicateExtension.back() = duplicateExtension.front();
+    requireThrows<CacheValidationError>(
+        [&] {
+            (void)readAnalysisCache(
+                cachePath, cache.sourceDigest, cache.inputDigest,
+                cache.geometryDigest, cache.selectedFramesDigest,
+                cache.trainingDigest, duplicateExtension, extendedMaskDigests,
+                cache.gaussianCount, 1 << 20
+            );
+        },
+        "progressive cache accepted a duplicate extension"
+    );
+    fs::remove(cachePath);
+}
+
+void testBackgroundOnlyWorkEvidenceClassifiesAsNoSubject() {
+    const LiftedView backgroundOnly = liftContributions(
+        "blank-work-view.png",
+        2,
+        {{0, 0, 0.8, 1.0, 1.0}, {1, 0, 0.9, 1.0, 1.0}}
+    );
+    require(backgroundOnly.labels == std::vector<std::uint16_t>({0}),
+            "background-only work evidence invented a foreground label");
+    const ReducedView reduced = reduceLiftedView(backgroundOnly);
+    const std::vector<ReducedView> views = {reduced};
+    const SelectionResult result = selectSubject(
+        {{0.0, 0.0, 0.0}, {0.1, 0.0, 0.0}},
+        classifyGaussians(views),
+        views,
+        std::nullopt
+    );
+    require(result.outcome == SelectionOutcome::noSubject,
+            "background-only work evidence did not classify to no subject");
+}
+
 void testHeldOutQuartileGate() {
     require(heldOutValidationPasses({0.50, 0.70, 0.70, 0.95}),
             "inclusive held-out thresholds were rejected");
@@ -1354,6 +1493,8 @@ int main() {
         testBinaryPlyRejectsMalformedUnsafeAndCollidingInputs();
         testMemoryAdmissionAndCancellationPreserveSource();
         testAnalysisCacheReuseAndCorruptionRejection();
+        testAnalysisCacheProgressivelyExtendsAnExactPrefix();
+        testBackgroundOnlyWorkEvidenceClassifiesAsNoSubject();
         testHeldOutQuartileGate();
         std::cout << "native subject isolation fixtures passed\n";
         return 0;
