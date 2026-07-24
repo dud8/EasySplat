@@ -8,6 +8,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import stat
@@ -1535,6 +1536,357 @@ def _remove_expected_tree(
         os.close(parent)
 
 
+def _descriptor_xattr_names(descriptor: int) -> set[bytes]:
+    libc = ctypes.CDLL(None, use_errno=True)
+    flistxattr = libc.flistxattr
+    flistxattr.argtypes = (
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+    )
+    flistxattr.restype = ctypes.c_ssize_t
+    ctypes.set_errno(0)
+    size = flistxattr(descriptor, None, 0, XATTR_SHOWCOMPRESSION)
+    if size < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if size == 0:
+        return set()
+    buffer = ctypes.create_string_buffer(size)
+    ctypes.set_errno(0)
+    actual = flistxattr(
+        descriptor,
+        buffer,
+        size,
+        XATTR_SHOWCOMPRESSION,
+    )
+    if actual < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if actual != size:
+        raise PromotionRecoveryError(
+            "extended attribute names changed while binding private state"
+        )
+    return {
+        name
+        for name in bytes(buffer.raw[:actual]).split(b"\0")
+        if name
+    }
+
+
+def _private_metadata_is_allowed(descriptor: int) -> bool:
+    return _descriptor_xattr_names(descriptor).issubset(
+        {b"com.apple.provenance"}
+    )
+
+
+def _after_private_promoter_validation(
+    parent: int,
+    original_name: str,
+    directory: int,
+) -> None:
+    """Test seam after a claimed private promoter has been fully validated."""
+
+
+def remove_private_promoter_tree(
+    path: Path,
+    device: int,
+    inode: int,
+    expected_digest: str,
+) -> None:
+    """Claim and remove only one exact, strictly validated private promoter."""
+
+    if not re.fullmatch(r"promoter[.]stage[.][A-Za-z0-9]{6}", path.name):
+        raise PromotionRecoveryError(
+            f"private promoter cleanup name is ambiguous: {path}"
+        )
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise ValueError("private promoter digest is malformed")
+
+    expected = {"device": device, "inode": inode}
+    parent = os.open(path.parent, DIRECTORY_OPEN_FLAGS)
+    claimed_root = ""
+    root_removed = False
+    try:
+        before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or before.st_dev != expected["device"]
+            or before.st_ino != expected["inode"]
+            or before.st_uid != os.getuid()
+            or before.st_gid != os.getgid()
+            or stat.S_IMODE(before.st_mode) != 0o700
+            or before.st_flags != 0
+        ):
+            raise PromotionRecoveryError(
+                f"private promoter root identity is invalid: {path}"
+            )
+        claimed_root, claimed_metadata = _claim_entry(
+            parent,
+            path.name,
+            before,
+        )
+        directory = os.open(
+            claimed_root,
+            DIRECTORY_OPEN_FLAGS,
+            dir_fd=parent,
+        )
+        try:
+            opened = os.fstat(directory)
+            named = os.stat(
+                claimed_root,
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not _same_metadata(claimed_metadata, opened, named)
+                or not _private_metadata_is_allowed(directory)
+            ):
+                raise PromotionRecoveryError(
+                    f"claimed private promoter root is invalid: {path}"
+                )
+
+            names = sorted(os.listdir(directory), key=os.fsencode)
+            if names not in ([], ["atomic_swap_install.py"]):
+                raise PromotionRecoveryError(
+                    f"private promoter tree has unexpected entries: {path}"
+                )
+
+            if names:
+                child_before = os.stat(
+                    names[0],
+                    dir_fd=directory,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(child_before.st_mode)
+                    or child_before.st_nlink != 1
+                    or child_before.st_uid != os.getuid()
+                    or child_before.st_gid != os.getgid()
+                    or stat.S_IMODE(child_before.st_mode) != 0o700
+                    or child_before.st_flags != 0
+                ):
+                    raise PromotionRecoveryError(
+                        f"private promoter executable is invalid: {path}"
+                    )
+                claimed_child, child_metadata = _claim_entry(
+                    directory,
+                    names[0],
+                    child_before,
+                )
+                child_removed = False
+                try:
+                    child = os.open(
+                        claimed_child,
+                        FILE_OPEN_FLAGS,
+                        dir_fd=directory,
+                    )
+                    try:
+                        child_opened = os.fstat(child)
+                        child_named = os.stat(
+                            claimed_child,
+                            dir_fd=directory,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            not stat.S_ISREG(child_opened.st_mode)
+                            or not _same_metadata(
+                                child_metadata,
+                                child_opened,
+                                child_named,
+                            )
+                            or not _private_metadata_is_allowed(child)
+                        ):
+                            raise PromotionRecoveryError(
+                                f"claimed private promoter executable is invalid: {path}"
+                            )
+                        digest = hashlib.sha256()
+                        offset = 0
+                        while offset < child_opened.st_size:
+                            block = os.pread(
+                                child,
+                                min(
+                                    TREE_READ_BLOCK_SIZE,
+                                    child_opened.st_size - offset,
+                                ),
+                                offset,
+                            )
+                            if not block:
+                                raise PromotionRecoveryError(
+                                    "private promoter executable was truncated"
+                                )
+                            digest.update(block)
+                            offset += len(block)
+                        if (
+                            os.pread(child, 1, child_opened.st_size)
+                            or digest.hexdigest() != expected_digest
+                        ):
+                            raise PromotionRecoveryError(
+                                f"private promoter executable digest changed: {path}"
+                            )
+                        _after_private_promoter_validation(
+                            parent,
+                            path.name,
+                            directory,
+                        )
+                        child_after = os.fstat(child)
+                        child_named_after = os.stat(
+                            claimed_child,
+                            dir_fd=directory,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            not _same_metadata(
+                                child_metadata,
+                                child_opened,
+                                child_after,
+                                child_named_after,
+                            )
+                            or sorted(
+                                os.listdir(directory),
+                                key=os.fsencode,
+                            )
+                            != [claimed_child]
+                        ):
+                            raise PromotionRecoveryError(
+                                f"private promoter changed after validation: {path}"
+                            )
+                    finally:
+                        os.close(child)
+                    os.unlink(claimed_child, dir_fd=directory)
+                    child_removed = True
+                    os.fsync(directory)
+                finally:
+                    if not child_removed:
+                        try:
+                            os.stat(
+                                claimed_child,
+                                dir_fd=directory,
+                                follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            _restore_claimed_entry(
+                                directory,
+                                claimed_child,
+                                names[0],
+                            )
+            else:
+                _after_private_promoter_validation(
+                    parent,
+                    path.name,
+                    directory,
+                )
+
+            opened_after = os.fstat(directory)
+            named_after = os.stat(
+                claimed_root,
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+            if (
+                os.listdir(directory)
+                or not _same_stat_identity(opened, opened_after)
+                or not _same_stat_identity(opened, named_after)
+            ):
+                raise PromotionRecoveryError(
+                    f"private promoter changed during cleanup: {path}"
+                )
+        finally:
+            os.close(directory)
+        os.rmdir(claimed_root, dir_fd=parent)
+        root_removed = True
+        os.fsync(parent)
+    finally:
+        if claimed_root and not root_removed:
+            try:
+                os.stat(
+                    claimed_root,
+                    dir_fd=parent,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                _restore_claimed_entry(parent, claimed_root, path.name)
+                os.fsync(parent)
+        os.close(parent)
+
+
+def remove_bound_build_lock(
+    path: Path,
+    device: int,
+    inode: int,
+    owner_pid: int,
+) -> None:
+    """Remove only the exact shlock file owned by this live builder."""
+
+    if path.name != ".msplat-build.lock" or owner_pid <= 0:
+        raise ValueError("native build lock cleanup request is invalid")
+    parent = os.open(path.parent, DIRECTORY_OPEN_FLAGS)
+    claimed = ""
+    removed = False
+    try:
+        before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_dev != device
+            or before.st_ino != inode
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or before.st_gid != os.getgid()
+            or stat.S_IMODE(before.st_mode) != 0o644
+            or before.st_flags != 0
+        ):
+            raise PromotionRecoveryError(
+                f"native build lock identity is invalid: {path}"
+            )
+        claimed, claimed_metadata = _claim_entry(parent, path.name, before)
+        descriptor = os.open(claimed, FILE_OPEN_FLAGS, dir_fd=parent)
+        try:
+            opened = os.fstat(descriptor)
+            named = os.stat(claimed, dir_fd=parent, follow_symlinks=False)
+            content = os.pread(descriptor, 64, 0)
+            after = os.fstat(descriptor)
+            named_after = os.stat(
+                claimed,
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+            if (
+                not _same_metadata(
+                    claimed_metadata,
+                    opened,
+                    named,
+                    after,
+                    named_after,
+                )
+                or content != f"{owner_pid}\n".encode("ascii")
+                or not _private_metadata_is_allowed(descriptor)
+            ):
+                raise PromotionRecoveryError(
+                    f"native build lock changed before release: {path}"
+                )
+        finally:
+            os.close(descriptor)
+        os.unlink(claimed, dir_fd=parent)
+        removed = True
+        os.fsync(parent)
+    finally:
+        if claimed and not removed:
+            try:
+                os.stat(claimed, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                _restore_claimed_entry(parent, claimed, path.name)
+                os.fsync(parent)
+        os.close(parent)
+
+
 def _remove_retirement_tree(
     path: Path,
     expected: dict[str, int],
@@ -2503,6 +2855,26 @@ def main() -> int:
         elif len(sys.argv) == 3 and sys.argv[1] == "--create-owned-tree":
             identity = create_owned_tree(Path(sys.argv[2]))
             print(f"{identity['device']}:{identity['inode']}")
+        elif (
+            len(sys.argv) == 6
+            and sys.argv[1] == "--remove-private-promoter-tree"
+        ):
+            remove_private_promoter_tree(
+                Path(sys.argv[2]),
+                int(sys.argv[3]),
+                int(sys.argv[4]),
+                sys.argv[5],
+            )
+        elif (
+            len(sys.argv) == 6
+            and sys.argv[1] == "--remove-bound-build-lock"
+        ):
+            remove_bound_build_lock(
+                Path(sys.argv[2]),
+                int(sys.argv[3]),
+                int(sys.argv[4]),
+                int(sys.argv[5]),
+            )
         elif len(sys.argv) == 6 and sys.argv[1] == "--remove-owned-tree":
             if sys.argv[5] != "--allow-symlinks":
                 raise ValueError("owned-tree cleanup mode is invalid")
@@ -2529,7 +2901,10 @@ def main() -> int:
                 "--create-owned-tree <path> | "
                 "<stage> <install> <tree-receipt> | --commit <transaction> | "
                 "--recover <transaction> | --remove-owned-tree <path> "
-                "<device> <inode> --allow-symlinks",
+                "<device> <inode> --allow-symlinks | "
+                "--remove-private-promoter-tree <path> <device> <inode> "
+                "<sha256> | --remove-bound-build-lock <path> <device> "
+                "<inode> <pid>",
                 file=sys.stderr,
             )
             return 2

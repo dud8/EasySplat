@@ -71,6 +71,20 @@ public struct ProjectPaths: Sendable {
     public var msplatOutputURL: URL { trainingURL.appendingPathComponent("msplat/splat.ply") }
     public var outputURL: URL { root.appendingPathComponent("Output", isDirectory: true) }
     public var outputSplatURL: URL { outputURL.appendingPathComponent("splat.ply") }
+    public var isolatedOutputURL: URL { outputURL.appendingPathComponent("isolated.ply") }
+    public var isolationURL: URL { root.appendingPathComponent("Isolation", isDirectory: true) }
+    public var isolationManifestURL: URL {
+        isolationURL.appendingPathComponent("isolation_manifest.json")
+    }
+    public var isolationMasksURL: URL {
+        isolationURL.appendingPathComponent("masks", isDirectory: true)
+    }
+    public var isolationStagingURL: URL {
+        isolationURL.appendingPathComponent("staging", isDirectory: true)
+    }
+    public func isolationStagingURL(for runID: UUID) -> URL {
+        isolationStagingURL.appendingPathComponent(runID.uuidString, isDirectory: true)
+    }
     public var logsURL: URL { root.appendingPathComponent("Logs", isDirectory: true) }
     public var pipelineLogURL: URL { logsURL.appendingPathComponent("pipeline.log") }
     public var eventsLogURL: URL { logsURL.appendingPathComponent("events.jsonl") }
@@ -78,6 +92,7 @@ public struct ProjectPaths: Sendable {
     public var da3LogURL: URL { logsURL.appendingPathComponent("da3.log") }
     public var da3CoverageManifestURL: URL { logsURL.appendingPathComponent("da3_coverage_manifest.json") }
     public var msplatLogURL: URL { logsURL.appendingPathComponent("msplat.log") }
+    public var isolationLogURL: URL { logsURL.appendingPathComponent("isolation.log") }
 
     public func ensureDirectories() throws {
         let fileManager = FileManager.default
@@ -118,6 +133,18 @@ public struct ProjectPaths: Sendable {
             "Training/msplat_dataset/images",
             "Training/msplat_dataset/sparse",
             "Training/msplat_dataset/sparse/0",
+        ] {
+            try ensurePlainDirectory(relativePath)
+        }
+    }
+
+    public func ensureIsolationDirectories() throws {
+        try validateRootDirectory()
+        for relativePath in [
+            "Output",
+            "Isolation",
+            "Isolation/masks",
+            "Isolation/staging",
         ] {
             try ensurePlainDirectory(relativePath)
         }

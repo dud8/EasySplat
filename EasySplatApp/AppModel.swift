@@ -48,6 +48,12 @@ struct ProjectPublicationCheckpointHook: Sendable {
 @MainActor
 final class AppModel: ObservableObject {
     typealias FinishedOutputValidator = @Sendable (URL) -> URL?
+    typealias SubjectIsolationCoordinatorFactory =
+        @Sendable () -> any SubjectIsolationCoordinating
+    typealias SubjectIsolationArtifactLoader =
+        @Sendable (ProjectPaths) -> IsolationArtifactLoadResult
+    typealias SubjectIsolationArtifactRemover =
+        @Sendable (ProjectPaths) throws -> Bool
 
     enum ViewState: Equatable {
         case home
@@ -71,6 +77,14 @@ final class AppModel: ObservableObject {
     @Published var validationRecovery: RunValidationRecovery? = nil
     @Published var failureRetryAllowed = true
     @Published var outputPlyURL: URL? = nil
+    @Published var isSubjectIsolationActive = false
+    @Published var subjectIsolationProgress: SubjectIsolationProgress?
+    @Published var subjectChoiceRequest: SubjectChoiceRequest?
+    @Published var subjectOutput: ValidatedSplatOutput?
+    @Published var selectedSplatOutputVariant: SplatOutputVariant = .original
+    @Published var subjectIsolationStatusMessage: String?
+    @Published var subjectIsolationStatusIsError = false
+    @Published var isSubjectVersionRemovalActive = false
     @Published var currentStageTimings: [StageTimingRecord] = []
     @Published var currentCreateToViewerReadySeconds: TimeInterval? = nil
     @Published var currentOutputPlyInfo: OutputPlyInfo? = nil
@@ -128,10 +142,16 @@ final class AppModel: ObservableObject {
     let finishedOutputValidator: FinishedOutputValidator
     let videoInputPreflight: VideoInputPreflight
     let projectPublicationCheckpointHook: ProjectPublicationCheckpointHook
+    let subjectIsolationCoordinatorFactory: SubjectIsolationCoordinatorFactory
+    let subjectIsolationArtifactLoader: SubjectIsolationArtifactLoader
+    let subjectIsolationArtifactRemover: SubjectIsolationArtifactRemover
     let projectBaseURL: URL?
     let projectTrashHandler: (URL) throws -> Void
     var currentTask: Task<Void, Never>?
     var currentTaskToken: UUID?
+    var subjectIsolationTask: Task<Void, Never>?
+    var subjectIsolationTaskToken: UUID?
+    var subjectIsolationCancellationRequested = false
     var pendingResultViewerTiming: PendingResultViewerTiming?
     var lastProgressLogAt: Date = .distantPast
     var lastProgressLogMessage: String = ""
@@ -152,6 +172,7 @@ final class AppModel: ObservableObject {
     var exitIntent: ExitIntent = .none
     weak var pendingCloseWindow: NSWindow?
     var allowNextWindowClose = false
+    var exitDecisionOverride: (() -> ExitDecision)?
     var replyToTerminationRequest: (Bool) -> Void = { shouldTerminate in
         NSApp.reply(toApplicationShouldTerminate: shouldTerminate)
     }
@@ -207,6 +228,38 @@ final class AppModel: ObservableObject {
 
     var isStopping: Bool {
         stopAction != nil
+    }
+
+    var hasActiveWork: Bool {
+        isRunActive || isSubjectIsolationActive || isSubjectVersionRemovalActive
+    }
+
+    var displayedOutputURL: URL? {
+        switch selectedSplatOutputVariant {
+        case .original:
+            outputPlyURL
+        case .subject:
+            subjectOutput?.url
+        }
+    }
+
+    var displayedOutputPlyInfo: OutputPlyInfo? {
+        switch selectedSplatOutputVariant {
+        case .original:
+            currentOutputPlyInfo
+        case .subject:
+            subjectOutput.map {
+                OutputPlyInfo(
+                    vertexCount: $0.gaussianCount,
+                    sizeBytes: Int64(clamping: $0.byteCount),
+                    format: ""
+                )
+            }
+        }
+    }
+
+    var displayedOutputSceneBounds: SplatSceneBounds? {
+        selectedSplatOutputVariant == .subject ? subjectOutput?.sceneBounds : nil
     }
 
     var isTrainingStageActive: Bool {
@@ -294,6 +347,15 @@ final class AppModel: ObservableObject {
         },
         projectPublicationCheckpointHook: ProjectPublicationCheckpointHook = .none,
         powerAssertion: PowerAssertionManaging = SystemPowerAssertion(),
+        subjectIsolationCoordinatorFactory: @escaping SubjectIsolationCoordinatorFactory = {
+            SubjectIsolationCoordinator()
+        },
+        subjectIsolationArtifactLoader: @escaping SubjectIsolationArtifactLoader = {
+            SubjectIsolationArtifactStore.load(paths: $0)
+        },
+        subjectIsolationArtifactRemover: @escaping SubjectIsolationArtifactRemover = {
+            try SubjectIsolationArtifactStore.removeValidatedSubject(paths: $0)
+        },
         projectTrashHandler: @escaping (URL) throws -> Void = { url in
             var resultingURL: NSURL?
             try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
@@ -311,6 +373,9 @@ final class AppModel: ObservableObject {
         self.finishedOutputValidator = finishedOutputValidator
         self.videoInputPreflight = videoInputPreflight
         self.projectPublicationCheckpointHook = projectPublicationCheckpointHook
+        self.subjectIsolationCoordinatorFactory = subjectIsolationCoordinatorFactory
+        self.subjectIsolationArtifactLoader = subjectIsolationArtifactLoader
+        self.subjectIsolationArtifactRemover = subjectIsolationArtifactRemover
         self.projectTrashHandler = projectTrashHandler
         self.pipelineRunnerFactory = pipelineRunnerFactory
         self.powerAssertion = powerAssertion

@@ -1832,10 +1832,13 @@ enum GeometryArtifactStore {
             )
             update(UInt64(relativePath.utf8.count), in: &hasher)
             hasher.update(data: Data(relativePath.utf8))
-            try hashRegularFileContents(at: snapshot.url, into: &hasher) {
-                fileSize, hasher in
-                update(fileSize, in: &hasher)
-            }
+            try hashRegularFileContents(
+                at: snapshot.url,
+                into: &hasher,
+                beforeContents: { fileSize, hasher in
+                    update(fileSize, in: &hasher)
+                }
+            )
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
@@ -1907,9 +1910,13 @@ enum GeometryArtifactStore {
             let relativePath = String(resolved.path.dropFirst(rootPath.count + 1))
             update(UInt64(relativePath.utf8.count), in: &hasher)
             hasher.update(data: Data(relativePath.utf8))
-            try hashRegularFileContents(at: file, into: &hasher) { fileSize, hasher in
-                update(fileSize, in: &hasher)
-            }
+            try hashRegularFileContents(
+                at: file,
+                into: &hasher,
+                beforeContents: { fileSize, hasher in
+                    update(fileSize, in: &hasher)
+                }
+            )
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
@@ -1926,12 +1933,27 @@ enum GeometryArtifactStore {
     }
 
     static func sha256(of file: URL, maximumBytes: UInt64? = nil) throws -> String {
+        try sha256(
+            of: file,
+            maximumBytes: maximumBytes,
+            shouldCancel: { false }
+        )
+    }
+
+    static func sha256(
+        of file: URL,
+        maximumBytes: UInt64? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> String {
+        try throwIfCancelled(shouldCancel)
         var hasher = SHA256()
         try hashRegularFileContents(
             at: file,
             into: &hasher,
-            maximumBytes: maximumBytes
+            maximumBytes: maximumBytes,
+            shouldCancel: shouldCancel
         )
+        try throwIfCancelled(shouldCancel)
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
@@ -1939,10 +1961,12 @@ enum GeometryArtifactStore {
         at file: URL,
         into hasher: inout SHA256,
         maximumBytes: UInt64? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool = { false },
         beforeContents: (UInt64, inout SHA256) -> Void = { _, _ in }
     ) throws {
         let descriptor: Int32
         while true {
+            try throwIfCancelled(shouldCancel)
             let opened = Darwin.open(file.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
             if opened >= 0 {
                 descriptor = opened
@@ -1977,6 +2001,7 @@ enum GeometryArtifactStore {
         var totalByteCount: UInt64 = 0
         var buffer = [UInt8](repeating: 0, count: 1_048_576)
         while true {
+            try throwIfCancelled(shouldCancel)
             let count = buffer.withUnsafeMutableBytes { bytes in
                 Darwin.read(descriptor, bytes.baseAddress, bytes.count)
             }
@@ -1994,6 +2019,7 @@ enum GeometryArtifactStore {
             totalByteCount += UInt64(count)
         }
 
+        try throwIfCancelled(shouldCancel)
         let final = try descriptorStatus()
         guard (final.st_mode & S_IFMT) == S_IFREG,
               final.st_nlink == 1,
@@ -2007,6 +2033,14 @@ enum GeometryArtifactStore {
               final.st_ctimespec.tv_nsec == initial.st_ctimespec.tv_nsec,
               totalByteCount == expectedByteCount else {
             throw CocoaError(.fileReadUnknown)
+        }
+    }
+
+    private static func throwIfCancelled(
+        _ shouldCancel: @escaping @Sendable () -> Bool
+    ) throws {
+        if shouldCancel() {
+            throw CancellationError()
         }
     }
 }

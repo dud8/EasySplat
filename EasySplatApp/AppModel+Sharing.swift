@@ -1066,15 +1066,16 @@ enum ShareSnapshotStorage {
 }
 
 struct PreparedShareItem: Equatable, Sendable {
-    let projectURL: URL
-    let outputURL: URL
+    let source: AppModel.CurrentSplatPublicationSource
     let shareURL: URL
     let shareDirectory: ShareSnapshotDirectory
-    let validatedSHA256: String?
     let byteCount: Int64
     let outputSnapshot: ShareFileSnapshot
     let shareSnapshot: ShareFileSnapshot
 
+    var projectURL: URL { source.projectURL }
+    var outputURL: URL { source.outputURL }
+    var validatedSHA256: String? { source.expectedIdentity.sha256 }
     var shareDirectoryURL: URL { shareDirectory.url }
 }
 
@@ -1113,6 +1114,7 @@ extension AppModel {
         publisher: @escaping ShareSnapshotPublisher
     ) async {
         guard activeShareSession == nil else { return }
+        let requestedVariant = selectedSplatOutputVariant
         let token = UUID()
         latestShareOperationID = nil
         sharePreparationToken = token
@@ -1120,26 +1122,41 @@ extension AppModel {
         isShareReady = false
         isPreparingShare = true
 
-        guard let projectURL = currentProjectURL,
-              let displayedOutputURL = outputPlyURL,
-              ProjectSummary.hasSameLocation(
-                  displayedOutputURL,
-                  ProjectPaths(root: projectURL).outputSplatURL
-              ) else {
+        let source: CurrentSplatPublicationSource
+        do {
+            source = try await validatedCurrentSplatForPublication()
+        } catch is CancellationError {
+            clearSharePreparation(token: token)
+            return
+        } catch {
+            let message: String
+            if requestedVariant == .subject {
+                message = "Subject isn’t available to share."
+            } else if let projectURL = currentProjectURL {
+                message = unavailableOutputMessage(
+                    for: ProjectPaths(root: projectURL).outputSplatURL
+                )
+            } else {
+                message = "Finish a project before sharing."
+            }
             finishSharePreparationFailure(
                 token: token,
-                message: "Finish a project before sharing."
+                message: message
             )
             return
         }
-        let expectedOutputURL = ProjectPaths(root: projectURL).outputSplatURL
-        let validator = finishedOutputValidator
+        guard sharePreparationToken == token,
+              selectedSplatOutputVariant == source.variant,
+              ProjectSummary.hasSameLocation(
+                  currentProjectURL,
+                  source.projectURL
+              ) else {
+            clearSharePreparation(token: token)
+            return
+        }
         let worker = Task.detached(priority: .userInitiated) {
             try Self.makePreparedShareItem(
-                projectURL: projectURL,
-                displayedOutputURL: displayedOutputURL,
-                expectedOutputURL: expectedOutputURL,
-                validator: validator,
+                source: source,
                 publisher: publisher
             )
         }
@@ -1158,8 +1175,15 @@ extension AppModel {
                 return
             }
             guard sharePreparationToken == token,
-                  ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
-                  ProjectSummary.hasSameLocation(outputPlyURL, displayedOutputURL) else {
+                  selectedSplatOutputVariant == source.variant,
+                  ProjectSummary.hasSameLocation(
+                      currentProjectURL,
+                      source.projectURL
+                  ),
+                  ProjectSummary.hasSameLocation(
+                      displayedOutputURL,
+                      source.outputURL
+                  ) else {
                 ShareSnapshotStorage.remove(
                     item.shareDirectory,
                     expectedFileLeaf: item.shareURL.lastPathComponent
@@ -1250,10 +1274,16 @@ extension AppModel {
               !isShareSheetActive,
               let preparedShareItem,
               let projectURL = currentProjectURL,
+              selectedSplatOutputVariant == preparedShareItem.source.variant,
               ProjectSummary.hasSameLocation(projectURL, preparedShareItem.projectURL),
-              ProjectSummary.hasSameLocation(outputPlyURL, preparedShareItem.outputURL) else {
+              ProjectSummary.hasSameLocation(
+                  displayedOutputURL,
+                  preparedShareItem.outputURL
+              ) else {
             invalidatePreparedShareItem(
-                message: "Could not open the validated splat. Reopen the project and try again."
+                message: sharePresentationFailureMessage(
+                    for: preparedShareItem?.source.variant
+                )
             )
             return
         }
@@ -1294,11 +1324,14 @@ extension AppModel {
               permitsRequestedPreparation || !isPreparingShare,
               let preparedItem = preparedShareItem,
               let projectURL = currentProjectURL,
-              let displayedOutputURL = outputPlyURL,
+              let displayedOutputURL,
+              selectedSplatOutputVariant == preparedItem.source.variant,
               ProjectSummary.hasSameLocation(projectURL, preparedItem.projectURL),
               ProjectSummary.hasSameLocation(displayedOutputURL, preparedItem.outputURL) else {
             invalidatePreparedShareItem(
-                message: "Could not open the validated splat. Reopen the project and try again."
+                message: sharePresentationFailureMessage(
+                    for: preparedShareItem?.source.variant
+                )
             )
             return
         }
@@ -1306,11 +1339,13 @@ extension AppModel {
         sharePreparationToken = token
         isPreparingShare = true
         let validator = finishedOutputValidator
+        let subjectLoader = subjectIsolationArtifactLoader
         let validation = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try Self.isPreparedShareItemCurrent(
                 preparedItem,
-                validator: validator
+                validator: validator,
+                subjectLoader: subjectLoader
             )
         }
         let isCurrent: Bool
@@ -1330,11 +1365,17 @@ extension AppModel {
         }
         guard sharePreparationToken == token else { return }
         guard ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
-              ProjectSummary.hasSameLocation(outputPlyURL, displayedOutputURL),
+              selectedSplatOutputVariant == preparedItem.source.variant,
+              ProjectSummary.hasSameLocation(
+                  self.displayedOutputURL,
+                  displayedOutputURL
+              ),
               preparedShareItem == preparedItem,
               isCurrent else {
             invalidatePreparedShareItem(
-                message: "Could not open the validated splat. Reopen the project and try again."
+                message: sharePresentationFailureMessage(
+                    for: preparedItem.source.variant
+                )
             )
             return
         }
@@ -1456,32 +1497,64 @@ extension AppModel {
         _ preparedItem: PreparedShareItem,
         projectURL: URL
     ) -> Bool {
+        guard preparedItem.source.variant == .original else {
+            return false
+        }
         guard let snapshot = try? ProjectArtifactSnapshotStore.load(projectURL: projectURL) else {
             return false
         }
-        guard let trainingArtifact = snapshot.trainingArtifact else { return false }
-        return trainingArtifact.outputSHA256 == preparedItem.validatedSHA256
-            && trainingArtifact.outputBytes == preparedItem.byteCount
+        guard let trainingArtifact = snapshot.trainingArtifact,
+              let identity = expectedPlyIdentity(from: trainingArtifact) else {
+            return false
+        }
+        return identity == preparedItem.source.expectedIdentity
     }
 
     private nonisolated static func isPreparedShareItemCurrent(
         _ preparedItem: PreparedShareItem,
-        validator: FinishedOutputValidator
+        validator: FinishedOutputValidator,
+        subjectLoader: SubjectIsolationArtifactLoader
     ) throws -> Bool {
-        guard let currentOutputURL = validator(preparedItem.projectURL),
-              ProjectSummary.hasSameLocation(currentOutputURL, preparedItem.outputURL),
-              try ShareFileSnapshot.capture(
-                  at: currentOutputURL,
-                  shouldCancel: { Task.isCancelled }
-              ) == preparedItem.outputSnapshot,
-              currentShareArtifactStillMatches(
-                  preparedItem,
-                  projectURL: preparedItem.projectURL
-              ),
-              try ShareFileSnapshot.capture(
-                  at: preparedItem.shareURL,
-                  shouldCancel: { Task.isCancelled }
-              ) == preparedItem.shareSnapshot else {
+        let currentOutputURL: URL
+        switch preparedItem.source.variant {
+        case .original:
+            guard let validatedOutputURL = validator(preparedItem.projectURL),
+                  ProjectSummary.hasSameLocation(
+                      validatedOutputURL,
+                      preparedItem.outputURL
+                  ),
+                  currentShareArtifactStillMatches(
+                      preparedItem,
+                      projectURL: preparedItem.projectURL
+                  ) else {
+                return false
+            }
+            currentOutputURL = validatedOutputURL
+
+        case .subject:
+            guard case .valid(_, let output) = subjectLoader(
+                ProjectPaths(root: preparedItem.projectURL)
+            ),
+            output.variant == .subject,
+            ProjectSummary.hasSameLocation(
+                output.url,
+                preparedItem.outputURL
+            ),
+            expectedPlyIdentity(from: output)
+                == preparedItem.source.expectedIdentity else {
+                return false
+            }
+            currentOutputURL = output.url
+        }
+
+        guard try ShareFileSnapshot.capture(
+            at: currentOutputURL,
+            shouldCancel: { Task.isCancelled }
+        ) == preparedItem.outputSnapshot,
+        try ShareFileSnapshot.capture(
+            at: preparedItem.shareURL,
+            shouldCancel: { Task.isCancelled }
+        ) == preparedItem.shareSnapshot else {
             return false
         }
         return true
@@ -1529,44 +1602,17 @@ extension AppModel {
     }
 
     private nonisolated static func makePreparedShareItem(
-        projectURL: URL,
-        displayedOutputURL: URL,
-        expectedOutputURL: URL,
-        validator: FinishedOutputValidator,
+        source: CurrentSplatPublicationSource,
         publisher: ShareSnapshotPublisher
     ) throws -> PreparedShareItem {
         try Task.checkCancellation()
-        guard let validatedOutputURL = validator(projectURL),
-              ProjectSummary.hasSameLocation(validatedOutputURL, expectedOutputURL) else {
-            throw SharePreparationFailure(
-                message: shareUnavailableOutputMessage(for: expectedOutputURL)
-            )
-        }
-        try Task.checkCancellation()
-
-        let snapshot: ProjectArtifactSnapshot
-        do {
-            snapshot = try ProjectArtifactSnapshotStore.load(projectURL: projectURL)
-        } catch {
-            throw SharePreparationFailure(
-                message: shareUnavailableOutputMessage(for: expectedOutputURL)
-            )
-        }
-        guard let trainingArtifact = snapshot.trainingArtifact,
-              let expectedIdentity = expectedPlyIdentity(from: trainingArtifact) else {
-            throw SharePreparationFailure(
-                message: shareUnavailableOutputMessage(for: expectedOutputURL)
-            )
-        }
-        let validatedSHA256 = expectedIdentity.sha256
-
         var createdShareDirectory: ShareSnapshotDirectory?
         var expectedShareLeaf: String?
         do {
             let shareDirectory = try ShareSnapshotStorage.create()
             createdShareDirectory = shareDirectory
             let shareURL = shareDirectory.url.appendingPathComponent(
-                validatedOutputURL.lastPathComponent,
+                source.defaultFilename,
                 isDirectory: false
             )
             expectedShareLeaf = shareURL.lastPathComponent
@@ -1575,13 +1621,13 @@ extension AppModel {
                 expectedFileLeaf: shareURL.lastPathComponent
             )
             let evidence = try publisher(
-                validatedOutputURL,
+                source.outputURL,
                 shareURL,
-                expectedIdentity
+                source.expectedIdentity
             )
             guard evidence.byteCount <= UInt64(Int64.max),
                   let outputSnapshot = ShareFileSnapshot.captureIdentity(
-                      at: validatedOutputURL,
+                      at: source.outputURL,
                       verifiedSHA256: evidence.sha256
                   ),
                   let capturedShareSnapshot = ShareFileSnapshot.captureIdentity(
@@ -1598,11 +1644,9 @@ extension AppModel {
             )
             try Task.checkCancellation()
             return PreparedShareItem(
-                projectURL: projectURL.standardizedFileURL,
-                outputURL: displayedOutputURL.standardizedFileURL,
+                source: source,
                 shareURL: shareURL.standardizedFileURL,
                 shareDirectory: shareDirectory,
-                validatedSHA256: validatedSHA256,
                 byteCount: Int64(evidence.byteCount),
                 outputSnapshot: outputSnapshot,
                 shareSnapshot: capturedShareSnapshot
@@ -1638,6 +1682,15 @@ extension AppModel {
             return "Could not open \(expectedURL.lastPathComponent). Rebuild or reopen the project."
         }
         return "Could not find \(expectedURL.lastPathComponent). Rebuild or reopen the project."
+    }
+
+    private func sharePresentationFailureMessage(
+        for variant: SplatOutputVariant?
+    ) -> String {
+        if variant == .subject {
+            return "Could not open the validated Subject splat. Try again."
+        }
+        return "Could not open the validated splat. Reopen the project and try again."
     }
 
 }
