@@ -522,9 +522,9 @@ extension AppModel {
                 outputURL: outputURL,
                 boundary: timingBoundary
             )
-            viewState = .viewer
             await reloadSubjectIsolationArtifact(for: projectURL)
             guard isCurrentTaskToken(taskToken) else { return nil }
+            viewState = .viewer
             refreshProjectSummaries()
             refreshFreeDiskSpace()
             return toolchain
@@ -780,9 +780,9 @@ extension AppModel {
                 currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
                 currentProjectNotes = metadata.notes ?? ""
                 markProjectOpened(at: url)
-                viewState = .viewer
                 await reloadSubjectIsolationArtifact(for: url)
                 guard isCurrentTaskToken(taskToken) else { return }
+                viewState = .viewer
                 refreshProjectSummaries()
                 return
             }
@@ -890,9 +890,9 @@ extension AppModel {
             currentProjectNotes = loadProjectNotes(projectURL: url)
             markProjectOpened(at: url)
             refreshFreeDiskSpace()
-            viewState = .viewer
             await reloadSubjectIsolationArtifact(for: url)
             guard isCurrentTaskToken(taskToken) else { return }
+            viewState = .viewer
             refreshProjectSummaries()
         } catch is CancellationError {
             return
