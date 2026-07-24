@@ -90,6 +90,10 @@ Output/splat.ply
 
 `ProjectPaths` is the layout authority. Stored paths are relative to the project root and must pass the safe resolver before use. Never accept an absolute path, traversal, or escaping symlink from metadata.
 
+Subject isolation is optional and never replaces the canonical result. `Output/splat.ply` remains the only canonical splat. A completed optional result adds `Output/isolated.ply`, `Isolation/isolation_manifest.json`, the validated `Isolation/masks/` files, and private `Isolation/staging/` work.
+
+The viewer's chosen variant is session-local and starts on the original. Isolation reuses the bundled native filtering binary; a missing, stale, invalid, or failed optional artifact never blocks opening, viewing, sharing, or recovering the canonical project.
+
 The new-project order is deliberate:
 
 1. validate the request;

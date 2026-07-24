@@ -82,6 +82,7 @@ public struct ProjectPaths: Sendable {
     public var da3LogURL: URL { logsURL.appendingPathComponent("da3.log") }
     public var da3CoverageManifestURL: URL { logsURL.appendingPathComponent("da3_coverage_manifest.json") }
     public var msplatLogURL: URL { logsURL.appendingPathComponent("msplat.log") }
+    public var isolationLogURL: URL { logsURL.appendingPathComponent("isolation.log") }
 
     public func ensureDirectories() throws {
         let fileManager = FileManager.default
