@@ -2752,6 +2752,50 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.outputPlyURL, output)
     }
 
+    func testResumeProjectKeepsOpenedProjectCurrentForTheWholeOpen() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: tempBase, name: "Finished", lastError: nil, withOutput: true)
+        let output = ProjectPaths(root: projectURL).outputURL.appendingPathComponent("splat.ply")
+
+        let validationStarted = DispatchSemaphore(value: 0)
+        let allowValidationToFinish = DispatchSemaphore(value: 0)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { url, config in
+                MockPipelineRunner(projectURL: url, config: config)
+            },
+            finishedOutputValidator: { _ in
+                validationStarted.signal()
+                _ = allowValidationToFinish.wait(timeout: .now() + 2)
+                return output
+            }
+        )
+
+        model.resumeProject(at: projectURL)
+
+        // The sidebar's lock and trash-cancel branch key on currentProjectURL,
+        // so a run must never be active without it — not even for the slice
+        // between the click and the task's first turn.
+        XCTAssertTrue(model.isRunActive)
+        XCTAssertTrue(ProjectSummary.hasSameLocation(model.currentProjectURL, projectURL))
+
+        let validationStartResult = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: validationStarted.wait(timeout: .now() + 1))
+            }
+        }
+        XCTAssertEqual(validationStartResult, .success)
+        XCTAssertTrue(ProjectSummary.hasSameLocation(model.currentProjectURL, projectURL))
+
+        allowValidationToFinish.signal()
+        try await waitForViewState(model: model, state: .viewer)
+        XCTAssertTrue(ProjectSummary.hasSameLocation(model.currentProjectURL, projectURL))
+    }
+
     func testResumeProjectFallsThroughToProcessingWhenOutputValidationFails() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }

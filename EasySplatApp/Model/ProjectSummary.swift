@@ -30,9 +30,17 @@ extension ProjectSummary {
         return canonicalURL(for: first) == canonicalURL(for: second)
     }
 
-    /// Latest durable user or pipeline activity used by the Recent sort.
+    /// Single identity for sidebar row diffing and List selection tags; the
+    /// two must never diverge or a reorder can strand the highlight.
+    var selectionID: URL {
+        Self.canonicalURL(for: url)
+    }
+
+    /// Latest durable pipeline activity used by the Recent sort. Opening a
+    /// project deliberately does not count: the list must not reshuffle
+    /// underneath the row the user just clicked.
     var lastActivityAt: Date {
-        [lastOpenedAt, lastRunStartedAt, lastFailureAt, lastRunCompletedAt]
+        [lastRunStartedAt, lastFailureAt, lastRunCompletedAt]
             .compactMap { $0 }
             .max() ?? createdAt
     }

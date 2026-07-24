@@ -845,6 +845,10 @@ extension AppModel {
         guard isCurrentTaskToken(taskToken) else { return }
         defer { finishRun(taskToken: taskToken) }
         reset()
+        // Immediately after reset, before any suspension: the opened project
+        // must stay current across the whole task so selection and the
+        // sidebar's lock never see a run with no project.
+        currentProjectURL = url
         viewState = .opening
         phaseStartedAt = Date()
         statusTitle = "Preparing project"
@@ -876,7 +880,6 @@ extension AppModel {
                     )
                 }.value
             }
-            currentProjectURL = url
             currentRunOptions = metadata.requestedRunOptions
             currentInput = metadata.input
             if !bypassFinishedOutput,

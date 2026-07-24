@@ -62,9 +62,9 @@ struct ProjectSidebar: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(visibleProjects, id: \.url) { project in
+                        ForEach(visibleProjects, id: \.selectionID) { project in
                             projectRow(project)
-                                .tag(Self.selectionID(for: project))
+                                .tag(project.selectionID)
                                 .contextMenu { projectMenu(project) }
                         }
                     }
@@ -195,15 +195,18 @@ struct ProjectSidebar: View {
             }
         }
         .padding(.vertical, 2)
+        .selectionDisabled(rowIsUnavailable(project))
     }
 
     private func projectLabel(_ project: ProjectSummary) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        let unavailable = rowIsUnavailable(project)
+        return VStack(alignment: .leading, spacing: 3) {
             Text(project.title)
                 .font(.body)
+                .foregroundStyle(unavailable ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .help(project.title)
+                .help(unavailable ? "Opens after the current run finishes." : project.title)
 
             let caption = Self.rowCaption(
                 status: project.status,
@@ -223,7 +226,7 @@ struct ProjectSidebar: View {
                 }
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(unavailable ? .tertiary : .secondary)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
@@ -291,6 +294,13 @@ struct ProjectSidebar: View {
         isRunActive
     }
 
+    private func rowIsUnavailable(_ project: ProjectSummary) -> Bool {
+        Self.rowIsUnavailableDuringRun(
+            isRunActive: isRunActive,
+            isActiveProject: ProjectSummary.hasSameLocation(model.currentProjectURL, project.url)
+        )
+    }
+
     private func statusText(for project: ProjectSummary) -> String {
         Self.rowCaption(status: project.status, isInterrupted: project.isInterrupted) ?? "Ready"
     }
@@ -318,6 +328,16 @@ struct ProjectSidebar: View {
         status == .ready
     }
 
+    /// While a run is active every other project is inert; the selection
+    /// binding already refuses it, so the row must also look and act held.
+    /// The running project keeps full prominence.
+    nonisolated static func rowIsUnavailableDuringRun(
+        isRunActive: Bool,
+        isActiveProject: Bool
+    ) -> Bool {
+        isRunActive && !isActiveProject
+    }
+
     nonisolated static func rowActionTitle(status: ProjectStatus) -> String? {
         switch status {
         case .inProgress: return "Resume"
@@ -332,7 +352,7 @@ struct ProjectSidebar: View {
     }
 
     nonisolated static func selectionID(for project: ProjectSummary) -> URL {
-        selectionID(for: project.url)
+        project.selectionID
     }
 
     nonisolated static func selectionID(for projectURL: URL) -> URL {

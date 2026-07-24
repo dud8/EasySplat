@@ -167,6 +167,10 @@ extension AppModel {
         currentTaskToken = token
         currentRunOrigin = .resume
         isRunActive = true
+        // Record the target before the task's first suspension so the project
+        // is locked (rename/trash) for the entire open, not just after its
+        // metadata loads.
+        currentProjectURL = url
         currentTask = Task { await resumeProjectTask(at: url, taskToken: token) }
         return true
     }
@@ -191,6 +195,7 @@ extension AppModel {
         currentTaskToken = token
         currentRunOrigin = .retrain
         isRunActive = true
+        currentProjectURL = url
         currentTask = Task {
             await resumeProjectTask(at: url, taskToken: token, bypassFinishedOutput: true)
         }
@@ -752,8 +757,9 @@ extension AppModel {
         }
     }
 
-    /// Stamp the project as opened-by-the-user at this moment so the home
-    /// list can sort by real interaction instead of pipeline-derived signals.
+    /// Stamp the project as opened-by-the-user at this moment. Kept as
+    /// diagnostic metadata only; it deliberately does not feed the Recent
+    /// sort, so opening a project never reorders the sidebar.
     /// Writes to a sidecar file so it cannot clobber concurrent pipeline
     /// writes to project.json. Silent no-op on file errors.
     func markProjectOpened(at url: URL, at moment: Date = Date()) {
