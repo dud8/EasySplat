@@ -97,30 +97,46 @@ extension AppModel {
     }
 
     @discardableResult
-    func removeSubjectVersion() -> Bool {
+    func removeSubjectVersion() async -> Bool {
         guard !hasActiveWork,
               let projectURL = currentProjectURL,
-              subjectOutput != nil else {
+              let expectedSubjectOutput = subjectOutput else {
             return false
         }
+
+        isSubjectVersionRemovalActive = true
+        let paths = ProjectPaths(root: projectURL)
+        let remover = subjectIsolationArtifactRemover
+        let removed: Bool?
         do {
-            guard try subjectIsolationArtifactRemover(
-                ProjectPaths(root: projectURL)
-            ) else {
+            removed = try await Task.detached(priority: .userInitiated) {
+                try remover(paths)
+            }.value
+        } catch {
+            removed = nil
+        }
+
+        let isCurrentSubject = ProjectSummary.hasSameLocation(
+            currentProjectURL,
+            projectURL
+        ) && subjectOutput == expectedSubjectOutput
+        isSubjectVersionRemovalActive = false
+
+        if isCurrentSubject {
+            if removed == true {
+                clearSubjectIsolationSession()
+                subjectIsolationStatusMessage = "Subject version removed."
+            } else {
                 subjectIsolationStatusMessage =
                     "Couldn’t remove the Subject version. Try again."
                 subjectIsolationStatusIsError = true
-                return false
             }
-            clearSubjectIsolationSession()
-            subjectIsolationStatusMessage = "Subject version removed."
-            return true
-        } catch {
-            subjectIsolationStatusMessage =
-                "Couldn’t remove the Subject version. Try again."
-            subjectIsolationStatusIsError = true
-            return false
         }
+
+        if stopAction != nil {
+            completeStop()
+        }
+        return removed == true
     }
 
     func clearSubjectIsolationSession() {

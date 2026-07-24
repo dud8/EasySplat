@@ -272,8 +272,8 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         }
     }
 
-    func testSubjectRemovalClearsSessionOnlyAfterStoreSuccess() {
-        let fixture = try! makeViewerFixture()
+    func testSubjectRemovalClearsSessionOnlyAfterStoreSuccess() async throws {
+        let fixture = try makeViewerFixture()
         defer { fixture.cleanup() }
         let removal = RemovalHarness()
         let model = makeViewerModel(
@@ -284,16 +284,92 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         model.selectedSplatOutputVariant = .subject
         removal.result = false
 
-        XCTAssertFalse(model.removeSubjectVersion())
+        let firstRemovalSucceeded = await model.removeSubjectVersion()
+        XCTAssertFalse(firstRemovalSucceeded)
         XCTAssertEqual(model.subjectOutput, fixture.subjectOutput)
         XCTAssertEqual(model.selectedSplatOutputVariant, .subject)
         XCTAssertTrue(model.subjectIsolationStatusIsError)
 
         removal.result = true
-        XCTAssertTrue(model.removeSubjectVersion())
+        let secondRemovalSucceeded = await model.removeSubjectVersion()
+        XCTAssertTrue(secondRemovalSucceeded)
         XCTAssertNil(model.subjectOutput)
         XCTAssertEqual(model.selectedSplatOutputVariant, .original)
         XCTAssertEqual(removal.paths.last?.root, fixture.projectURL)
+    }
+
+    func testSubjectRemovalRunsStoreOffMainActor() async throws {
+        let fixture = try makeViewerFixture()
+        defer { fixture.cleanup() }
+        let removal = RemovalHarness()
+        removal.result = true
+        let model = makeViewerModel(
+            fixture: fixture,
+            artifactRemover: removal.remove
+        )
+        model.subjectOutput = fixture.subjectOutput
+        model.selectedSplatOutputVariant = .subject
+
+        let removalSucceeded = await model.removeSubjectVersion()
+        XCTAssertTrue(removalSucceeded)
+        try await waitUntil { removal.paths.count == 1 }
+
+        XCTAssertEqual(removal.calledOnMainThread, false)
+        try await waitUntil { model.subjectOutput == nil }
+    }
+
+    func testSubjectRemovalDoesNotClearStateAfterProjectChanges() async throws {
+        let fixture = try makeViewerFixture()
+        defer { fixture.cleanup() }
+        let removal = RemovalHarness()
+        removal.result = true
+        removal.delay = 0.2
+        let model = makeViewerModel(
+            fixture: fixture,
+            artifactRemover: removal.remove
+        )
+        model.subjectOutput = fixture.subjectOutput
+        model.selectedSplatOutputVariant = .subject
+        let otherProject = fixture.base.appendingPathComponent(
+            "Other.easysplatproj",
+            isDirectory: true
+        )
+
+        let task = Task { await model.removeSubjectVersion() }
+        try await waitUntil { removal.hasStarted }
+
+        XCTAssertFalse(removal.hasFinished)
+        model.currentProjectURL = otherProject
+        let removalSucceeded = await task.value
+        XCTAssertTrue(removalSucceeded)
+        XCTAssertEqual(model.subjectOutput, fixture.subjectOutput)
+        XCTAssertEqual(model.selectedSplatOutputVariant, .subject)
+    }
+
+    func testSubjectRemovalParticipatesInTheActiveWorkGuard() async throws {
+        let fixture = try makeViewerFixture()
+        defer { fixture.cleanup() }
+        let removal = RemovalHarness()
+        removal.result = true
+        removal.delay = 0.2
+        let model = makeViewerModel(
+            fixture: fixture,
+            artifactRemover: removal.remove
+        )
+        model.subjectOutput = fixture.subjectOutput
+        model.selectedSplatOutputVariant = .subject
+
+        let task = Task { await model.removeSubjectVersion() }
+        try await waitUntil { removal.hasStarted }
+
+        XCTAssertTrue(model.isSubjectVersionRemovalActive)
+        XCTAssertTrue(model.hasActiveWork)
+        XCTAssertFalse(model.startSubjectIsolation())
+
+        let removalSucceeded = await task.value
+        XCTAssertTrue(removalSucceeded)
+        XCTAssertFalse(model.isSubjectVersionRemovalActive)
+        XCTAssertFalse(model.hasActiveWork)
     }
 
     func testVariantSelectionRequiresSubjectAndInvalidatesPreparedShareState() {
@@ -876,6 +952,10 @@ private final class RemovalHarness: @unchecked Sendable {
     private let lock = NSLock()
     private var storedResult = false
     private var recordedPaths: [ProjectPaths] = []
+    private var removalCalledOnMainThread: Bool?
+    private var storedDelay: TimeInterval = 0
+    private var started = false
+    private var finished = false
 
     var result: Bool {
         get { lock.withLock { storedResult } }
@@ -886,11 +966,37 @@ private final class RemovalHarness: @unchecked Sendable {
         lock.withLock { recordedPaths }
     }
 
+    var delay: TimeInterval {
+        get { lock.withLock { storedDelay } }
+        set { lock.withLock { storedDelay = newValue } }
+    }
+
+    var calledOnMainThread: Bool? {
+        lock.withLock { removalCalledOnMainThread }
+    }
+
+    var hasStarted: Bool {
+        lock.withLock { started }
+    }
+
+    var hasFinished: Bool {
+        lock.withLock { finished }
+    }
+
     func remove(paths: ProjectPaths) throws -> Bool {
-        lock.withLock {
+        let (result, delay) = lock.withLock {
+            removalCalledOnMainThread = Thread.isMainThread
             recordedPaths.append(paths)
-            return storedResult
+            started = true
+            return (storedResult, storedDelay)
         }
+        if delay > 0 {
+            Thread.sleep(forTimeInterval: delay)
+        }
+        lock.withLock {
+            finished = true
+        }
+        return result
     }
 }
 

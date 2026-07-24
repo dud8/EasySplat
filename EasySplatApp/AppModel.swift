@@ -84,6 +84,7 @@ final class AppModel: ObservableObject {
     @Published var selectedSplatOutputVariant: SplatOutputVariant = .original
     @Published var subjectIsolationStatusMessage: String?
     @Published var subjectIsolationStatusIsError = false
+    @Published var isSubjectVersionRemovalActive = false
     @Published var currentStageTimings: [StageTimingRecord] = []
     @Published var currentCreateToViewerReadySeconds: TimeInterval? = nil
     @Published var currentOutputPlyInfo: OutputPlyInfo? = nil
@@ -226,7 +227,7 @@ final class AppModel: ObservableObject {
     }
 
     var hasActiveWork: Bool {
-        isRunActive || isSubjectIsolationActive
+        isRunActive || isSubjectIsolationActive || isSubjectVersionRemovalActive
     }
 
     var displayedOutputURL: URL? {

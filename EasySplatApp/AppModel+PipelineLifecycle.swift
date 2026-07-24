@@ -22,6 +22,15 @@ extension AppModel {
             return
         }
 
+        if isSubjectVersionRemovalActive {
+            stopAction = deleteProject ? .deleteProject : .keepProject
+            subjectIsolationStatusMessage = deleteProject
+                ? "Finishing Subject removal before moving to Trash…"
+                : "Finishing Subject removal…"
+            subjectIsolationStatusIsError = false
+            return
+        }
+
         guard currentTask != nil else {
             if deleteProject, let projectURL = currentProjectURL {
                 if moveProjectToTrash(at: projectURL) {

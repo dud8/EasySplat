@@ -103,7 +103,9 @@ struct ViewerView: View {
             titleVisibility: .visible
         ) {
             Button("Remove Subject Version", role: .destructive) {
-                _ = model.removeSubjectVersion()
+                Task {
+                    _ = await model.removeSubjectVersion()
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
