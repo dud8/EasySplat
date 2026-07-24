@@ -2766,9 +2766,9 @@ test ! -e "$atomic_outside"
 test "$(cat "$atomic_malformed_scratch")" = "sealed"
 rm -f "$atomic_malformed_scratch"
 grep -Fq 'NSIRD_EasySplatReleaseVerifier_' "$atomic_home/release-verifier.sb"
-grep -Fq 'EasySplat-selected-lineage-' "$atomic_home/release-verifier.sb"
-grep -Fq 'EasySplat-video-lineage-' "$atomic_home/release-verifier.sb"
-grep -Fq 'EasySplat-finished-dataset-replay-' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat\-selected\-lineage\-' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat\-video\-lineage\-' "$atomic_home/release-verifier.sb"
+grep -Fq 'EasySplat\-finished\-dataset\-replay\-' "$atomic_home/release-verifier.sb"
 
 expected_manifest_probe="$sandbox_test_root/expected-manifest-reader.py"
 cat >"$expected_manifest_probe" <<'PY'
