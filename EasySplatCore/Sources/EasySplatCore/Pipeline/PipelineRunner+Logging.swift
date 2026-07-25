@@ -307,6 +307,8 @@ final class StageTimingTracker: @unchecked Sendable {
 }
 
 final class PipelineLogger: @unchecked Sendable {
+    private static let failureDetailLineLimit = 12
+
     private let eventsURL: URL
     private let logURL: URL
     private let emit: @Sendable (PipelineEvent) -> Void
@@ -353,8 +355,26 @@ final class PipelineLogger: @unchecked Sendable {
             appendLogLine(stage: stage, line: line, isError: isError)
         case let .stageFinished(stage):
             appendLogLine(stage: stage, line: "Stage finished", isError: false)
-        case let .pipelineFailed(stage, userMessage, _):
+        case let .pipelineFailed(stage, userMessage, debugMessage):
             appendLogLine(stage: stage, line: userMessage, isError: true)
+            // Diagnostic bundles carry this log but not events.jsonl, so a
+            // generic user message would otherwise leave the real cause with
+            // nowhere to be read. Bounded, because a subprocess failure brings
+            // its output tails along and the bundle only ships the log's tail.
+            let detail = debugMessage
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty && $0 != userMessage }
+            for line in detail.prefix(Self.failureDetailLineLimit) {
+                appendLogLine(stage: stage, line: "Failure detail: \(line)", isError: true)
+            }
+            if detail.count > Self.failureDetailLineLimit {
+                appendLogLine(
+                    stage: stage,
+                    line: "Failure detail: (\(detail.count - Self.failureDetailLineLimit) more lines in events.jsonl)",
+                    isError: true
+                )
+            }
         }
         lock.unlock()
     }

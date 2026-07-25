@@ -241,6 +241,62 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertTrue(message.debugMessage.contains("Tool: geometry-helper"))
     }
 
+    func testPipelineLogNamesTheFailingErrorAlongsideTheUserMessage() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logURL = root.appendingPathComponent("pipeline.log")
+        let logger = PipelineLogger(
+            eventsURL: root.appendingPathComponent("events.jsonl"),
+            logURL: logURL,
+            emit: { _ in }
+        )
+
+        logger.emit(.pipelineFailed(
+            stage: .sfmMapping,
+            userMessage: "Processing failed. Check details for more info.",
+            debugMessage: "EasySplatCore.PairGraphEvidenceStoreError.invalidEvidence"
+        ))
+
+        // The diagnostic bundle ships pipeline.log but not events.jsonl, so the
+        // error identity has to land here to be diagnosable after the fact.
+        let log = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(log.contains("Processing failed. Check details for more info."))
+        XCTAssertTrue(
+            log.contains("EasySplatCore.PairGraphEvidenceStoreError.invalidEvidence"),
+            "pipeline.log did not carry the failure's debug identity:\n\(log)"
+        )
+        XCTAssertTrue(log.split(whereSeparator: \.isNewline).allSatisfy {
+            $0.hasPrefix("[err] [")
+        }, "every failure line stays prefixed:\n\(log)")
+    }
+
+    func testPipelineLogBoundsAVerboseFailureDetail() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logURL = root.appendingPathComponent("pipeline.log")
+        let logger = PipelineLogger(
+            eventsURL: root.appendingPathComponent("events.jsonl"),
+            logURL: logURL,
+            emit: { _ in }
+        )
+
+        logger.emit(.pipelineFailed(
+            stage: .sfmMapping,
+            userMessage: "Processing failed. Check details for more info.",
+            debugMessage: (0..<40).map { "stderr line \($0)" }.joined(separator: "\n")
+        ))
+
+        // A subprocess failure carries its output tails; the log tail the bundle
+        // ships has to keep room for the surrounding context.
+        let log = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(log.contains("stderr line 0"))
+        XCTAssertFalse(log.contains("stderr line 39"))
+        XCTAssertTrue(
+            log.contains("28 more lines in events.jsonl"),
+            "truncation was not disclosed:\n\(log)"
+        )
+    }
+
     private func conditioningMeasurementFixture() -> GeometryConditioningMeasurement {
         GeometryConditioningMeasurement(
             pointCount: 25,
