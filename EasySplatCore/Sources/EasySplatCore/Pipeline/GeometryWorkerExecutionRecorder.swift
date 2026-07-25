@@ -358,6 +358,23 @@ final class GeometryWorkerExecutionRecorder: @unchecked Sendable {
             }
             let ordinal = allocatedMaximum + 1
             activeMappingAttemptOrdinal = ordinal
+            // Acceptance is recorded before the publication tail runs, so an
+            // accepted evaluation still in the ledger belongs to a run that
+            // died after selecting its solve — a new attempt could not be
+            // starting otherwise. Nothing recorded so far backs a published
+            // geometry, and publication reads two accepted solves as
+            // contradictory evidence, so open the attempt on a clean mapping
+            // slate instead of carrying the superseded acceptance forward.
+            // The ordinal is allocated above, off the pre-clear maximum, so
+            // attempts stay monotonic across runs.
+            if artifact.mappingAndRefinementInvocations.contains(where: {
+                $0.command == .mapper
+                    && $0.succeeded
+                    && $0.mapperExecution?.evaluation?.status == .accepted
+            }) {
+                artifact.mappingAndRefinementInvocations.removeAll()
+                try persistLocked()
+            }
             return ordinal
         }
     }

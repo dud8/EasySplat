@@ -142,6 +142,60 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
         XCTAssertTrue(artifact.rejectedVocabularyRetrievalInvocations.isEmpty)
     }
 
+    func testNewMappingAttemptClearsASupersededAcceptedSolve() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var stale = emptyArtifact(budget: budget)
+        // What a run that died in the publication tail leaves behind.
+        stale.mappingAndRefinementInvocations = [
+            acceptedMapperInvocation(mappingAttemptOrdinal: 1),
+            nativeAutoInvocation(.modelAnalyzer, mappingAttemptOrdinal: 1),
+        ]
+        try save(stale, paths: fixture.paths, budget: budget)
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: .sfmMatching,
+            inputHasVideos: false
+        )
+
+        let ordinal = try recorder.beginMappingAttempt()
+
+        // The ordinal still advances past the dead run's attempt, but its
+        // acceptance does not survive to contradict the new one.
+        XCTAssertEqual(ordinal, 2)
+        XCTAssertTrue(
+            try loadArtifact(fixture.paths, budget: budget)
+                .mappingAndRefinementInvocations.isEmpty
+        )
+    }
+
+    func testNewMappingAttemptKeepsARejectedLadderHistory() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var laddered = emptyArtifact(budget: budget)
+        // A cadence-fallback rung inside one run: rejected, never published,
+        // and publication needs the history to prove the ladder.
+        let rejected = rejectedMapperInvocation(mappingAttemptOrdinal: 1)
+        laddered.mappingAndRefinementInvocations = [rejected]
+        try save(laddered, paths: fixture.paths, budget: budget)
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: .sfmMatching,
+            inputHasVideos: false
+        )
+
+        let ordinal = try recorder.beginMappingAttempt()
+
+        XCTAssertEqual(ordinal, 2)
+        XCTAssertEqual(
+            try loadArtifact(fixture.paths, budget: budget)
+                .mappingAndRefinementInvocations,
+            [rejected]
+        )
+    }
+
     func testResealedRetrievalRetryReplacesTheReceiptItFailedOn() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -957,6 +1011,42 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
                 retrievalOutputDigest: retrieval.outputDigest
             )
         )
+    }
+
+    private func acceptedMapperInvocation(
+        mappingAttemptOrdinal: Int
+    ) -> ColmapWorkerInvocationEvidence {
+        mapperInvocation(
+            mappingAttemptOrdinal: mappingAttemptOrdinal,
+            evaluation: ColmapMapperEvaluationEvidence(
+                status: .accepted,
+                fallbackTrigger: nil
+            )
+        )
+    }
+
+    private func rejectedMapperInvocation(
+        mappingAttemptOrdinal: Int
+    ) -> ColmapWorkerInvocationEvidence {
+        mapperInvocation(
+            mappingAttemptOrdinal: mappingAttemptOrdinal,
+            evaluation: ColmapMapperEvaluationEvidence(
+                status: .rejected,
+                fallbackTrigger: nil
+            )
+        )
+    }
+
+    private func mapperInvocation(
+        mappingAttemptOrdinal: Int,
+        evaluation: ColmapMapperEvaluationEvidence
+    ) -> ColmapWorkerInvocationEvidence {
+        var invocation = nativeAutoInvocation(
+            .mapper,
+            mappingAttemptOrdinal: mappingAttemptOrdinal
+        )
+        invocation.mapperExecution?.evaluation = evaluation
+        return invocation
     }
 
     private func nativeAutoInvocation(
