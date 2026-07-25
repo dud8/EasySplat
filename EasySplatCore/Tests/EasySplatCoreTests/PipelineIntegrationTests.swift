@@ -4592,6 +4592,243 @@ final class PipelineIntegrationTests: XCTestCase {
         )
     }
 
+    func testPendingWriteAheadLogFromRejectedMatcherDoesNotBlockTheNextRetrieval() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "PendingWalRecovery",
+            photoCount: 251,
+            detailProfile: .highDetail
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["local_vocab_retriever"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { arguments in
+                        self.assertNoDatabaseSidecars(for: arguments)
+                        try self.writeVocabularyOutput(for: arguments, connectQueries: true)
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { arguments in
+                        try self.writeVerifiedPairResults(for: arguments, verifiedRows: 0)
+                        guard let databasePath = self.value(
+                            for: "--database_path",
+                            in: arguments
+                        ) else {
+                            return XCTFail("Matching is missing its database path")
+                        }
+                        try self.leavePendingWriteAheadLog(atDatabasePath: databasePath)
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["local_vocab_retriever"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { arguments in
+                        // The rejected attempt above left committed WAL frames
+                        // behind. Without a seal on the rejected path the real
+                        // retriever would refuse to open the database here.
+                        self.assertNoDatabaseSidecars(for: arguments)
+                        guard let queryPath = self.value(
+                            for: "--query_image_list_path",
+                            in: arguments
+                        ) else {
+                            return XCTFail("Expanded retrieval is missing its query list")
+                        }
+                        let queryNames = try String(contentsOfFile: queryPath, encoding: .utf8)
+                            .split(whereSeparator: \.isWhitespace)
+                            .map(String.init)
+                        // A denser graph than the first rung: the ring plus
+                        // stride-two chords, so the schedule is genuinely new.
+                        var pairs = zip(queryNames, queryNames.dropFirst()).map {
+                            "\($0.0) \($0.1)"
+                        }
+                        pairs += zip(queryNames, queryNames.dropFirst(2)).map {
+                            "\($0.0) \($0.1)"
+                        }
+                        if let first = queryNames.first, let last = queryNames.last {
+                            pairs.append("\(last) \(first)")
+                        }
+                        try self.writeVocabularyOutput(for: arguments, pairLines: pairs)
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { try self.writeVerifiedPairResults(for: $0) }
+                ),
+            ],
+            stopAfterStage: .sfmMatching
+        )
+
+        try await run.pipeline.run { _ in }
+
+        let commands = run.runner.calls.compactMap { $0.1.first }
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 2)
+        XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 2)
+
+        let pairEvidence = try PairGraphEvidenceStore.loadVerified(
+            from: fixture.paths.pairGraphEvidenceURL,
+            expectedImageNames: selectedImageNames(in: fixture.paths),
+            databaseURL: fixture.paths.colmapDatabaseURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(
+            pairEvidence.attempts.map(\.artifact.recoveryLevel),
+            [.normal, .expanded]
+        )
+        XCTAssertEqual(
+            pairEvidence.attempts.map(\.artifact.outcome),
+            [.rejected, .completed]
+        )
+        for suffix in ["-wal", "-journal", "-shm"] {
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: fixture.paths.colmapDatabaseURL.path + suffix
+            ))
+        }
+    }
+
+    func testRetrievalExecutionFailureIsResealedAndRetriedWithoutSpendingARecoveryRung() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "RetrievalSelfHeal",
+            photoCount: 251,
+            detailProfile: .highDetail
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["local_vocab_retriever"],
+                    result: .init(
+                        exitCode: 1,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: "Local vocabulary retrieval failed: retrieval database has a pending SQLite wal sidecar"
+                    )
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["local_vocab_retriever"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { arguments in
+                        XCTAssertEqual(self.value(for: "--num_images", in: arguments), "20")
+                        try self.writeVocabularyOutput(for: arguments, connectQueries: true)
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { try self.writeVerifiedPairResults(for: $0) }
+                ),
+            ],
+            stopAfterStage: .sfmMatching
+        )
+
+        let events = PipelineEventSink()
+        try await run.pipeline.run { events.append($0) }
+
+        let commands = run.runner.calls.compactMap { $0.1.first }
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 2)
+        XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 1)
+
+        // The real cause reaches the stage log instead of only the tool log.
+        let diagnostic = try XCTUnwrap(events.stageLogs().first {
+            $0.line.contains("pending SQLite wal sidecar")
+        })
+        XCTAssertTrue(diagnostic.line.contains("local_vocab_retriever"))
+        XCTAssertEqual(diagnostic.isError, true)
+        XCTAssertNil(events.stageLog(containing: "Retrying with a denser pair graph"))
+
+        let pairEvidence = try PairGraphEvidenceStore.loadVerified(
+            from: fixture.paths.pairGraphEvidenceURL,
+            expectedImageNames: selectedImageNames(in: fixture.paths),
+            databaseURL: fixture.paths.colmapDatabaseURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(pairEvidence.attempts.map(\.artifact.recoveryLevel), [.normal])
+        XCTAssertEqual(pairEvidence.attempts.map(\.artifact.outcome), [.completed])
+    }
+
+    func testRepeatedRetrievalExecutionFailureWalksTheLadderThenSurfacesTheToolError() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "RetrievalExhaustion",
+            photoCount: 251,
+            detailProfile: .highDetail
+        )
+        let failingRetrieval = MockSubprocessRunner.Script(
+            path: fixture.toolchain.colmap.path,
+            argsPrefix: ["local_vocab_retriever"],
+            result: .init(
+                exitCode: 1,
+                terminationReason: .exit,
+                stdout: "",
+                stderr: "Local vocabulary retrieval failed: retrieval database has a pending SQLite wal sidecar"
+            )
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+            ] + Array(repeating: failingRetrieval, count: 6)
+        )
+
+        let events = PipelineEventSink()
+        await XCTAssertThrowsErrorAsync({
+            try await run.pipeline.run { events.append($0) }
+        }, errorHandler: { error in
+            guard case let ColmapRunnerError.failed(command, _, _, _, stderrTail) = error else {
+                return XCTFail("Expected the retriever's own typed failure, got \(error)")
+            }
+            XCTAssertEqual(command, "local_vocab_retriever")
+            XCTAssertTrue(stderrTail.contains("pending SQLite wal sidecar"))
+        })
+
+        let commands = run.runner.calls.compactMap { $0.1.first }
+        // Two invocations per rung: the first attempt and the resealed retry.
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 6)
+        XCTAssertFalse(commands.contains("matches_importer"))
+        XCTAssertEqual(
+            events.stageLogs().filter {
+                $0.line == "Image retrieval could not run. Retrying with a denser pair graph."
+            }.count,
+            2
+        )
+    }
+
     func testRejectedExactMatchingDoesNotContinueDensityLadder() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("ExactFallback.easysplatproj", isDirectory: true)
@@ -10770,6 +11007,86 @@ final class PipelineIntegrationTests: XCTestCase {
                 throw NSError(domain: "PipelineIntegrationTests", code: 25)
             }
             return Int(sqlite3_column_int64(statement, 0))
+        }
+    }
+
+    /// Reproduces the database state a COLMAP matcher leaves behind when the
+    /// progress poller is still holding a connection at exit: WAL mode with
+    /// committed frames that were never checkpointed, and a `-wal` sidecar that
+    /// outlived every connection. `local_vocab_retriever` reads the database
+    /// `immutable=1`, which ignores the WAL, so it refuses to run against this.
+    private func leavePendingWriteAheadLog(atDatabasePath path: String) throws {
+        var writer: OpaquePointer?
+        guard sqlite3_open(path, &writer) == SQLITE_OK, let writer else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 40)
+        }
+        do {
+            try executeSQL("PRAGMA journal_mode = WAL;", in: writer)
+            try executeSQL("PRAGMA wal_autocheckpoint = 0;", in: writer)
+            // Round-trip the names so real frames land in the WAL while the
+            // committed content stays byte-identical. SQLite skips the write
+            // entirely for a `SET name = name` no-op.
+            try executeSQL("UPDATE images SET name = name || 'x';", in: writer)
+            try executeSQL(
+                "UPDATE images SET name = substr(name, 1, length(name) - 1);",
+                in: writer
+            )
+        } catch {
+            sqlite3_close(writer)
+            throw error
+        }
+
+        // The progress poller's connection is read-only, so when it outlives the
+        // writer it becomes the last connection and can neither checkpoint the
+        // WAL nor unlink the sidecar. That is how the frames are orphaned.
+        var poller: OpaquePointer?
+        guard sqlite3_open_v2(path, &poller, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let poller else {
+            sqlite3_close(writer)
+            throw NSError(domain: "PipelineIntegrationTests", code: 41)
+        }
+        do {
+            // SQLite opens the file lazily, so the poller only counts as an
+            // attached connection once it has actually read something.
+            try executeSQL("SELECT COUNT(*) FROM images;", in: poller)
+        } catch {
+            sqlite3_close(writer)
+            sqlite3_close(poller)
+            throw error
+        }
+        guard sqlite3_close(writer) == SQLITE_OK else {
+            sqlite3_close(poller)
+            throw NSError(domain: "PipelineIntegrationTests", code: 42)
+        }
+        guard sqlite3_close(poller) == SQLITE_OK else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 44)
+        }
+        let sidecar = URL(fileURLWithPath: path + "-wal")
+        let size = try FileManager.default
+            .attributesOfItem(atPath: sidecar.path)[.size] as? Int ?? 0
+        guard size > 0 else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 43)
+        }
+    }
+
+    /// The precondition `local_vocab_retriever` enforces before it will read the
+    /// database. Asserted from inside a retriever script so a regression shows up
+    /// as the retriever seeing what the real tool would reject.
+    private func assertNoDatabaseSidecars(
+        for arguments: [String],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard let databasePath = value(for: "--database_path", in: arguments) else {
+            return XCTFail("Retrieval is missing its database path", file: file, line: line)
+        }
+        for suffix in ["-wal", "-journal", "-shm"] {
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: databasePath + suffix),
+                "Retrieval started with a \(suffix) sidecar still on disk",
+                file: file,
+                line: line
+            )
         }
     }
 

@@ -2656,6 +2656,23 @@ public final class PipelineRunner: @unchecked Sendable {
                 try restoreAcceptedPairEvidence(evidence)
             }
 
+            // Every matcher exit is a stage boundary, not just an accepted one.
+            // COLMAP writes in WAL mode and the progress poller can be the last
+            // connection to close, so a rejected attempt can leave committed WAL
+            // frames behind. `local_vocab_retriever` opens the database
+            // `immutable=1` and refuses to read past a pending WAL, so the next
+            // recovery rung would die before it ever ran. Sealing here keeps the
+            // database quiesced no matter how the attempt ended.
+            func sealedInspection(
+                schedule: ColmapPairSchedule,
+                completion: ColmapPairAttemptCompletion
+            ) throws -> ColmapPairGraphInspection {
+                try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
+                return try ColmapPairGraphInspector(
+                    databaseURL: paths.colmapDatabaseURL
+                ).inspect(schedule: schedule, completion: completion)
+            }
+
             // Shared tail for every accepted pair graph: advisory logs,
             // evidence persistence, checkpoint, and stage completion. Called
             // from the in-attempt acceptance and from the terminal
@@ -2819,9 +2836,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                     let restoredInspection: ColmapPairGraphInspection
                     do {
-                        restoredInspection = try ColmapPairGraphInspector(
-                            databaseURL: paths.colmapDatabaseURL
-                        ).inspect(
+                        restoredInspection = try sealedInspection(
                             schedule: ColmapPairSchedule(
                                 imageNames: selectedFrames.map(\.lastPathComponent),
                                 pairs: restoredPlan.pairs
@@ -2953,39 +2968,97 @@ public final class PipelineRunner: @unchecked Sendable {
                             candidatePolicy: request.imageGroupContract?.policy,
                             imageGroupListDigest: request.imageGroupContract?.digest
                         )
-                    try await self.tooling.colmap.runLocalVocabularyRetriever(
-                        colmapPath: self.config.toolchain.colmap,
-                        database: paths.colmapDatabaseURL,
-                        outputPairListPath: outputURL,
-                        queryImageListPath: queryListURL,
-                        excludedPairListPath: excludedPairListURL,
-                        imageGroupListPath: imageGroupListURL,
-                        imageGroupListDigest: request.imageGroupContract?.digest,
-                        options: try ColmapVocabularyRetrievalOptions(
-                            candidateCount: request.candidateCount,
-                            returnedNeighborCount: request.returnedNeighborCount,
-                            minimumFrameSeparation: request.minimumFrameSeparation,
-                            queryStride: resolvedRunPlan.retrievalQueryStride,
-                            threadCount: vocabularyRetrievalWorkers,
-                            memoryBudgetBytes: resolvedRunPlan.geometryWorkerBudget
-                                .retrievalMemoryBudgetBytes
-                        ),
-                        pairContext: ColmapPairWorkerInvocationContext(
-                            attemptOrdinal: attemptNumber,
-                            descriptorMatcher: colmapMatchOptions.descriptorMatcher,
-                            retrievalRequestDigest: retrievalRequestDigest,
-                            retrievalOutputURL: outputURL
-                        ),
-                        environment: self.colmapWorkerEnvironment(
-                            workerCount: vocabularyRetrievalWorkers
-                        ),
-                        onLog: { line, isErr in
-                            colmapToolLog.append(
-                                stream: isErr ? "stderr" : "stdout",
-                                line: line
+                    func invokeVocabularyRetriever() async throws {
+                        try await self.tooling.colmap.runLocalVocabularyRetriever(
+                            colmapPath: self.config.toolchain.colmap,
+                            database: paths.colmapDatabaseURL,
+                            outputPairListPath: outputURL,
+                            queryImageListPath: queryListURL,
+                            excludedPairListPath: excludedPairListURL,
+                            imageGroupListPath: imageGroupListURL,
+                            imageGroupListDigest: request.imageGroupContract?.digest,
+                            options: try ColmapVocabularyRetrievalOptions(
+                                candidateCount: request.candidateCount,
+                                returnedNeighborCount: request.returnedNeighborCount,
+                                minimumFrameSeparation: request.minimumFrameSeparation,
+                                queryStride: resolvedRunPlan.retrievalQueryStride,
+                                threadCount: vocabularyRetrievalWorkers,
+                                memoryBudgetBytes: resolvedRunPlan.geometryWorkerBudget
+                                    .retrievalMemoryBudgetBytes
+                            ),
+                            pairContext: ColmapPairWorkerInvocationContext(
+                                attemptOrdinal: attemptNumber,
+                                descriptorMatcher: colmapMatchOptions.descriptorMatcher,
+                                retrievalRequestDigest: retrievalRequestDigest,
+                                retrievalOutputURL: outputURL
+                            ),
+                            environment: self.colmapWorkerEnvironment(
+                                workerCount: vocabularyRetrievalWorkers
+                            ),
+                            onLog: { line, isErr in
+                                colmapToolLog.append(
+                                    stream: isErr ? "stderr" : "stdout",
+                                    line: line
+                                )
+                            }
+                        )
+                    }
+
+                    // The retriever reads the database `immutable=1`, which
+                    // ignores the WAL, so it refuses to run while WAL frames are
+                    // pending. Seal first: a no-op on a database the matcher
+                    // already sealed, and it heals a resumed run whose previous
+                    // process died before it could seal.
+                    try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
+                    do {
+                        try await invokeVocabularyRetriever()
+                    } catch let firstError {
+                        // A killed subprocess surfaces as a signal exit, not a
+                        // CancellationError, so check the task as well: a
+                        // cancelled run must not launch the retry.
+                        if firstError is CancellationError || Task.isCancelled {
+                            throw CancellationError()
+                        }
+                        guard let runnerError = firstError as? ColmapRunnerError,
+                              case .failed = runnerError else {
+                            throw firstError
+                        }
+                        // Retrieval is a read-only step, so re-running it is
+                        // safe. Reseal and try once more: that clears a stale
+                        // sidecar left behind by an outside writer, and any
+                        // other transient tool failure, without spending a whole
+                        // recovery rung on it.
+                        self.emitColmapRetryDiagnostics(
+                            firstError,
+                            stage: .sfmMatching,
+                            emit: emit
+                        )
+                        try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
+                        do {
+                            try await invokeVocabularyRetriever()
+                        } catch let secondError {
+                            if secondError is CancellationError || Task.isCancelled {
+                                throw CancellationError()
+                            }
+                            guard let secondRunnerError = secondError as? ColmapRunnerError,
+                                  case .failed = secondRunnerError else {
+                                throw secondError
+                            }
+                            // Hand the failure to the recovery ladder instead of
+                            // ending the run. The next rung requests a different
+                            // pair graph through a fresh invocation; if no rung
+                            // is left the underlying tool error is rethrown, so
+                            // the terminal message still names the real cause.
+                            latestPreparedPairPlan = pairPlan
+                            try workerExecutionRecorder
+                                .discardPairPreparationWithoutMatcher(
+                                    attemptOrdinal: attemptNumber
+                                )
+                            throw VocabularyRetrievalExecutionFailure(
+                                underlying: secondRunnerError
                             )
                         }
-                    )
+                    }
                     retrievalWasExecuted = true
                     let validatedRetrieval: PairGraphRetrievalAttemptEvidence
                     do {
@@ -3117,9 +3190,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         if existing.succeeded {
                             reuseCompletedExactMatcher = true
                         } else {
-                            let partialInspection = try? ColmapPairGraphInspector(
-                                databaseURL: paths.colmapDatabaseURL
-                            ).inspect(
+                            let partialInspection = try? sealedInspection(
                                 schedule: ColmapPairSchedule(
                                     imageNames: imageNames,
                                     pairs: pairPlan.pairs
@@ -3232,9 +3303,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             emit: emit
                         )
                     }
-                    inspection = try ColmapPairGraphInspector(
-                        databaseURL: paths.colmapDatabaseURL
-                    ).inspect(
+                    inspection = try sealedInspection(
                         schedule: ColmapPairSchedule(
                             imageNames: imageNames,
                             pairs: pairPlan.pairs
@@ -3257,9 +3326,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         throw CancellationError()
                     }
                     let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
-                    let partialInspection = try? ColmapPairGraphInspector(
-                        databaseURL: paths.colmapDatabaseURL
-                    ).inspect(
+                    let partialInspection = try? sealedInspection(
                         schedule: ColmapPairSchedule(
                             imageNames: imageNames,
                             pairs: pairPlan.pairs
@@ -3508,6 +3575,25 @@ public final class PipelineRunner: @unchecked Sendable {
                             forceSfMRun = false
                             forceMatchingRun = true
                             continue
+                        }
+                        // A retriever that could not execute has already been
+                        // resealed and retried once. Spend a recovery rung on it
+                        // rather than ending the run; when none is left, rethrow
+                        // the tool's own error so the terminal message names the
+                        // real cause instead of the generic stage failure.
+                        if let retrievalFailure = error
+                            as? VocabularyRetrievalExecutionFailure {
+                            if try advancePairRecovery("Image retrieval could not run") {
+                                self.emitColmapRetryDiagnostics(
+                                    retrievalFailure.underlying,
+                                    stage: .sfmMatching,
+                                    emit: emit
+                                )
+                                forceSfMRun = false
+                                forceMatchingRun = true
+                                continue
+                            }
+                            throw retrievalFailure.underlying
                         }
                         let disconnectedRetrieval = error
                             as? DisconnectedVocabularyRetrievalEvidence
