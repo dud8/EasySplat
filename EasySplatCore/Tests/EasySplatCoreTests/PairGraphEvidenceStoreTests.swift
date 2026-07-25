@@ -324,6 +324,56 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         ))
     }
 
+    func testWorkerExecutionBindingRejectsDuplicatedAndUnsuccessfulRetrievalReceipts() throws {
+        var evidence = makeEvidence()
+        evidence.attempts[0].retrieval = PairGraphRetrievalAttemptEvidence(
+            engine: .localSiftVocabularyV2,
+            queryImageNames: ["a.jpg"],
+            queryStride: 1,
+            candidateCount: 20,
+            returnedNeighborCount: 8,
+            minimumFrameSeparation: 0,
+            queryOutcomes: [PairGraphRetrievalQueryOutcome(
+                queryImageName: "a.jpg",
+                status: .ranked,
+                rankedNeighborImageNames: ["d.jpg"]
+            )],
+            directedPairLines: ["a.jpg d.jpg"]
+        )
+        evidence.attempts[0].retrievalWasExecuted = true
+        var execution = makeWorkerExecution(for: evidence)
+
+        XCTAssertNoThrow(try PairGraphEvidenceStore.validateWorkerExecution(
+            evidence,
+            workerExecution: execution
+        ))
+
+        // A replayed attempt that appended a second receipt.
+        execution.vocabularyRetrievalInvocations.append(
+            execution.vocabularyRetrievalInvocations[0]
+        )
+        XCTAssertThrowsError(try PairGraphEvidenceStore.validateWorkerExecution(
+            evidence,
+            workerExecution: execution
+        )) { error in
+            XCTAssertEqual(error as? PairGraphEvidenceStoreError, .invalidEvidence)
+        }
+
+        // A failed retriever receipt left in front of its successful retry.
+        execution = makeWorkerExecution(for: evidence)
+        var failed = execution.vocabularyRetrievalInvocations[0]
+        failed.exitStatus = 1
+        failed.succeeded = false
+        failed.pairExecution?.retrievalOutputDigest = nil
+        execution.vocabularyRetrievalInvocations.insert(failed, at: 0)
+        XCTAssertThrowsError(try PairGraphEvidenceStore.validateWorkerExecution(
+            evidence,
+            workerExecution: execution
+        )) { error in
+            XCTAssertEqual(error as? PairGraphEvidenceStoreError, .invalidEvidence)
+        }
+    }
+
     func testRetrievalContractAcceptsAuthenticatedNoNeighborOutcome() throws {
         let imageNames = ["a.jpg", "b.jpg", "c.jpg"]
         let retrieval = PairGraphRetrievalAttemptEvidence(

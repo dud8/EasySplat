@@ -4746,8 +4746,13 @@ final class PipelineIntegrationTests: XCTestCase {
                     result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                     onRun: { try self.writeVerifiedPairResults(for: $0) }
                 ),
-            ],
-            stopAfterStage: .sfmMatching
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 251,
+                totalViews: 251,
+                pointCount: 20
+            )
         )
 
         let events = PipelineEventSink()
@@ -4773,6 +4778,25 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(pairEvidence.attempts.map(\.artifact.recoveryLevel), [.normal])
         XCTAssertEqual(pairEvidence.attempts.map(\.artifact.outcome), [.completed])
+
+        // The retry left one receipt per attempt, so the mapped model survives
+        // publication instead of being discarded by the attestation contract.
+        let workerExecution = try GeometryWorkerExecutionArtifactStore.load(
+            from: fixture.paths.workerExecutionURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(workerExecution.vocabularyRetrievalInvocations.count, 1)
+        XCTAssertNoThrow(try PairGraphEvidenceStore.validateWorkerExecution(
+            pairEvidence,
+            workerExecution: workerExecution
+        ))
+        XCTAssertEqual(
+            try GeometryArtifactStore.load(
+                from: fixture.paths.geometryManifestURL,
+                projectPaths: fixture.paths
+            ).registeredViewCount,
+            251
+        )
     }
 
     func testRepeatedRetrievalExecutionFailureWalksTheLadderThenSurfacesTheToolError() async throws {

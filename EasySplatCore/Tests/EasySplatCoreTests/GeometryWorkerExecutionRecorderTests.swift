@@ -142,6 +142,113 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
         XCTAssertTrue(artifact.rejectedVocabularyRetrievalInvocations.isEmpty)
     }
 
+    func testResealedRetrievalRetryReplacesTheReceiptItFailedOn() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: nil,
+            inputHasVideos: false
+        )
+        let first = retrievalInvocation(attemptOrdinal: 1, seed: "1")
+        let second = retrievalInvocation(attemptOrdinal: 2, seed: "2")
+        let failed = retrievalInvocation(attemptOrdinal: 3, seed: "3", exitStatus: 1)
+        let resealed = retrievalInvocation(attemptOrdinal: 3, seed: "3")
+
+        try recorder.record(first)
+        try recorder.record(second)
+        try recorder.record(failed)
+        try recorder.record(resealed)
+
+        // One receipt per attempt ordinal, in attempt order: the publication
+        // contract zips these against the pair-graph attempts.
+        XCTAssertEqual(
+            try loadArtifact(fixture.paths, budget: budget)
+                .vocabularyRetrievalInvocations,
+            [first, second, resealed]
+        )
+    }
+
+    func testReplayedRetrievalDoesNotAccumulateReceipts() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: nil,
+            inputHasVideos: false
+        )
+        let first = retrievalInvocation(attemptOrdinal: 1, seed: "1")
+        let second = retrievalInvocation(attemptOrdinal: 2, seed: "2")
+
+        try recorder.record(first)
+        try recorder.record(second)
+        try recorder.record(first)
+        try recorder.record(second)
+
+        XCTAssertEqual(
+            try loadArtifact(fixture.paths, budget: budget)
+                .vocabularyRetrievalInvocations,
+            [first, second]
+        )
+    }
+
+    func testResumeRepairsRetrievalReceiptsLeftBehindByAnInterruptedRun() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let first = retrievalInvocation(attemptOrdinal: 1, seed: "1")
+        let second = retrievalInvocation(attemptOrdinal: 2, seed: "2")
+        let failed = retrievalInvocation(attemptOrdinal: 3, seed: "3", exitStatus: 1)
+        let third = retrievalInvocation(attemptOrdinal: 3, seed: "3")
+        var stale = emptyArtifact(budget: budget)
+        // The shape a resumed run leaves behind: every attempt replayed, plus
+        // the dead process's failed receipt.
+        stale.vocabularyRetrievalInvocations = [
+            first, second, failed, first, second, third,
+        ]
+        try save(stale, paths: fixture.paths, budget: budget)
+
+        _ = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: .sfmFeatures,
+            inputHasVideos: false
+        )
+
+        XCTAssertEqual(
+            try loadArtifact(fixture.paths, budget: budget)
+                .vocabularyRetrievalInvocations,
+            [first, second, third]
+        )
+    }
+
+    func testResumeKeepsRetrievalReceiptsThatAreNotProvablyRedundant() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let first = retrievalInvocation(attemptOrdinal: 1, seed: "1")
+        let divergent = retrievalInvocation(attemptOrdinal: 1, seed: "2")
+        let unresolved = retrievalInvocation(attemptOrdinal: 2, seed: "3", exitStatus: 1)
+        var ambiguous = emptyArtifact(budget: budget)
+        ambiguous.vocabularyRetrievalInvocations = [first, divergent, unresolved]
+        try save(ambiguous, paths: fixture.paths, budget: budget)
+
+        _ = try GeometryWorkerExecutionRecorder(
+            paths: fixture.paths,
+            budget: budget,
+            resumeAfter: .sfmFeatures,
+            inputHasVideos: false
+        )
+
+        // Two different retrievals for one ordinal, and a failure with no
+        // successor, are real inconsistencies: leave them for validation.
+        XCTAssertEqual(
+            try loadArtifact(fixture.paths, budget: budget)
+                .vocabularyRetrievalInvocations,
+            [first, divergent, unresolved]
+        )
+    }
+
     func testDiscardUnacceptedMatcherInvocationRollsBackOnlyTheActiveAttempt() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -791,6 +898,27 @@ final class GeometryWorkerExecutionRecorderTests: XCTestCase {
             pairListDigest: pairListDigest,
             retrievalRequestDigest: retrievalRequestDigest,
             retrievalOutputDigest: retrievalOutputDigest
+        )
+    }
+
+    private func retrievalInvocation(
+        attemptOrdinal: Int,
+        seed: String,
+        exitStatus: Int32 = 0
+    ) -> ColmapWorkerInvocationEvidence {
+        boundedInvocation(
+            .localVocabularyRetriever,
+            workers: budget.vocabularyRetrievalWorkers,
+            exitStatus: exitStatus,
+            pairExecution: pairExecution(
+                attemptOrdinal: attemptOrdinal,
+                pairListDigest: nil,
+                retrievalRequestDigest: String(repeating: seed, count: 64),
+                // A failed retriever writes no output, so it has no digest.
+                retrievalOutputDigest: exitStatus == 0
+                    ? String(repeating: "a", count: 63) + seed
+                    : nil
+            )
         )
     }
 
