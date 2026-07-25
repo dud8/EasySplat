@@ -236,8 +236,11 @@ normalize_private_promoter_metadata() {
     /usr/bin/xattr -s -d com.apple.provenance "$entry" || \
       die "could not remove system provenance from private atomic install promoter"
   fi
-  [ -z "$(/usr/bin/xattr -s "$entry")" ] || \
-    die "private atomic install promoter metadata normalization was incomplete"
+  while IFS= read -r attribute; do
+    [ -n "$attribute" ] || continue
+    [ "$attribute" = "com.apple.provenance" ] || \
+      die "private atomic install promoter metadata normalization was incomplete"
+  done < <(/usr/bin/xattr -s "$entry")
 }
 
 restore_build_signal_traps() {
@@ -1507,7 +1510,7 @@ try:
                 "native msplat install has an unexpected extended attribute: "
                 f"{unexpected[0]} on {path}"
             )
-        if mode == "validate" and names:
+        if mode == "validate" and any(name != SYSTEM_PROVENANCE for name in names):
             raise SystemExit(f"native msplat install has extended attributes: {path}")
         bound_attributes.append((path, descriptor, names))
 
@@ -1576,7 +1579,9 @@ if mode == "normalize":
                 raise SystemExit(
                     f"native msplat metadata entry changed after cleanup: {path}"
                 )
-            remaining = attribute_names(descriptor)
+            remaining = tuple(
+                name for name in attribute_names(descriptor) if name != SYSTEM_PROVENANCE
+            )
             if remaining:
                 raise SystemExit(
                     "native msplat metadata normalization was incomplete: "

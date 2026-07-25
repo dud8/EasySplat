@@ -1046,6 +1046,7 @@ validate_receipt() {
     "$LIPO_BIN" "$LOCKF_BIN" "$NINJA_BIN" "$NM_BIN" "$OTOOL_BIN" "$PYTHON_BIN" \
     "$RANLIB_BIN" "$RG_BIN" "$SHASUM_BIN" "$STRINGS_BIN" "$VTOOL_BIN" "$XATTR_BIN" \
     "$XCODEBUILD_BIN" "$XCRUN_BIN" <<'PY'
+import ctypes
 import hashlib
 import json
 import os
@@ -1053,6 +1054,35 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_listxattr = _libc.listxattr
+_listxattr.argtypes = (ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_listxattr.restype = ctypes.c_ssize_t
+_XATTR_NOFOLLOW = 0x0001
+
+
+def xattr_names(path: Path) -> set[str]:
+    encoded = os.fsencode(path)
+    ctypes.set_errno(0)
+    size = _listxattr(encoded, None, 0, _XATTR_NOFOLLOW)
+    if size < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    if size == 0:
+        return set()
+    buffer = ctypes.create_string_buffer(size)
+    ctypes.set_errno(0)
+    actual = _listxattr(encoded, buffer, size, _XATTR_NOFOLLOW)
+    if actual < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    return {
+        os.fsdecode(name)
+        for name in bytes(buffer.raw[:actual]).split(b"\0")
+        if name
+    }
+
 
 root, support, lock = map(Path, sys.argv[1:4])
 freezer_sha256, wrapper_sha256, implementation_sha256 = sys.argv[4:7]
@@ -1177,7 +1207,8 @@ for path in [root, *root.rglob("*")]:
     expected_mode = 0o755 if stat.S_ISDIR(metadata.st_mode) else 0o644
     if stat.S_IMODE(metadata.st_mode) != expected_mode or metadata.st_uid != os.getuid() or metadata.st_gid != os.getgid() or metadata.st_mtime_ns != epoch * 1_000_000_000:
         raise SystemExit(f"Ceres install metadata is not canonical: {path}")
-    if hasattr(os, "listxattr") and os.listxattr(path, follow_symlinks=False):
+    unexpected = xattr_names(path) - {"com.apple.provenance"}
+    if unexpected:
         raise SystemExit(f"Ceres install has extended attributes: {path}")
 PY
 }

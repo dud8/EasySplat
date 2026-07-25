@@ -32,6 +32,39 @@ TREE_READ_BLOCK_SIZE = 1024 * 1024
 ACL_TYPE_EXTENDED = 0x00000100
 EMPTY_EXTENDED_METADATA = (0).to_bytes(8, "big") + b"\0"
 XATTR_SHOWCOMPRESSION = 0x0020
+SYSTEM_PROVENANCE_ATTRIBUTE = b"com.apple.provenance"
+
+
+def _is_permitted_clean_metadata(blob: bytes) -> bool:
+    """True for empty extended metadata, or exactly one unremovable
+    com.apple.provenance attribute and no extended ACL."""
+
+    if blob == EMPTY_EXTENDED_METADATA:
+        return True
+    if len(blob) < 8:
+        return False
+    count = int.from_bytes(blob[:8], "big")
+    if count != 1:
+        return False
+    offset = 8
+    if len(blob) < offset + 8:
+        return False
+    name_length = int.from_bytes(blob[offset : offset + 8], "big")
+    offset += 8
+    if len(blob) < offset + name_length:
+        return False
+    name = blob[offset : offset + name_length]
+    offset += name_length
+    if name != SYSTEM_PROVENANCE_ATTRIBUTE:
+        return False
+    if len(blob) < offset + 8:
+        return False
+    value_length = int.from_bytes(blob[offset : offset + 8], "big")
+    offset += 8
+    if len(blob) < offset + value_length:
+        return False
+    offset += value_length
+    return blob[offset:] == b"\0"
 
 DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY
@@ -291,7 +324,9 @@ def _read_stable_file(
         extended_metadata = (
             _descriptor_extended_metadata(descriptor) if bind_extended_metadata else b""
         )
-        if require_clean_metadata and extended_metadata != EMPTY_EXTENDED_METADATA:
+        if require_clean_metadata and not _is_permitted_clean_metadata(
+            extended_metadata
+        ):
             raise ValueError(
                 f"tree receipt rejects extended metadata: {os.fsdecode(relative)}"
             )
@@ -374,9 +409,8 @@ def _hash_directory_tree(
                     if bind_extended_metadata
                     else b""
                 )
-                if (
-                    require_clean_metadata
-                    and extended_metadata != EMPTY_EXTENDED_METADATA
+                if require_clean_metadata and not _is_permitted_clean_metadata(
+                    extended_metadata
                 ):
                     raise ValueError(
                         "tree receipt rejects extended metadata: "
@@ -499,8 +533,8 @@ def tree_receipt(
                 if bind_extended_metadata
                 else b""
             )
-            if require_clean_metadata and (
-                extended_metadata != EMPTY_EXTENDED_METADATA
+            if require_clean_metadata and not _is_permitted_clean_metadata(
+                extended_metadata
             ):
                 raise ValueError(f"tree receipt rejects extended metadata: {root}")
             digest = hashlib.sha256()

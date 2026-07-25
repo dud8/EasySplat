@@ -1194,6 +1194,7 @@ validate_receipt() {
     "$FROZEN_IMPLEMENTATION_SHA256" \
     "$LOCK" "$EXTRACTOR" "$FROZEN_PROMOTER_SHA256" \
     "$NORMALIZED_MTIME_EPOCH" <<'PY'
+import ctypes
 import hashlib
 import json
 import os
@@ -1210,6 +1211,34 @@ extractor = Path(sys.argv[6])
 promoter_sha256 = sys.argv[7]
 normalized_mtime_epoch = int(sys.argv[8])
 receipt = json.loads((root / "build_info.json").read_text(encoding="utf-8"))
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_listxattr = _libc.listxattr
+_listxattr.argtypes = (ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_listxattr.restype = ctypes.c_ssize_t
+_XATTR_NOFOLLOW = 0x0001
+
+
+def xattr_names(path: Path) -> set[str]:
+    encoded = os.fsencode(path)
+    ctypes.set_errno(0)
+    size = _listxattr(encoded, None, 0, _XATTR_NOFOLLOW)
+    if size < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    if size == 0:
+        return set()
+    buffer = ctypes.create_string_buffer(size)
+    ctypes.set_errno(0)
+    actual = _listxattr(encoded, buffer, size, _XATTR_NOFOLLOW)
+    if actual < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    return {
+        os.fsdecode(name)
+        for name in bytes(buffer.raw[:actual]).split(b"\0")
+        if name
+    }
 
 
 def file_sha256(path: Path) -> str:
@@ -1289,10 +1318,13 @@ for path in paths:
     tree.update(b"\0")
 if tree.hexdigest() != receipt["install_tree_sha256"]:
     raise SystemExit("install_tree_sha256 does not match final bytes")
+
+ALLOWED_XATTRS = {"com.apple.provenance"}
+for path in paths:
+    unexpected = xattr_names(path) - ALLOWED_XATTRS
+    if unexpected:
+        raise SystemExit("extended attributes survived COLMAP support normalization")
 PY
-  if "$XATTR_BIN" -l -r "$STAGE" | /usr/bin/grep -q .; then
-    die "extended attributes survived COLMAP support normalization"
-  fi
 }
 
 verify_artifacts() {

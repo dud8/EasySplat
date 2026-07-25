@@ -100,7 +100,7 @@ def clean_system_temporary_directory():
     )
     try:
         attributes = extended_attribute_names(path)
-        if attributes:
+        if any(name != "com.apple.provenance" for name in attributes):
             raise RuntimeError(
                 "system temporary directory inherited extended attributes; "
                 "run this host-metadata suite with /usr/bin/python3 -I"
@@ -1811,7 +1811,7 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 0,
                 normalized.stdout + normalized.stderr,
             )
-            self.assertEqual(extended_attribute_names(payload), ())
+            self.assertEqual(extended_attribute_names(payload), ("com.apple.provenance",))
 
             subprocess.run(
                 [
@@ -2144,8 +2144,8 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 0,
                 accepted.stdout + accepted.stderr,
             )
-            self.assertEqual(extended_attribute_names(stage), ())
-            self.assertEqual(extended_attribute_names(payload), ())
+            self.assertEqual(extended_attribute_names(stage), ("com.apple.provenance",))
+            self.assertEqual(extended_attribute_names(payload), ("com.apple.provenance",))
 
             for path in (stage, payload):
                 subprocess.run(
