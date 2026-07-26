@@ -56,7 +56,7 @@ struct HomeView: View {
                     selectedInputs
                 }
 
-                DisclosureGroup(isExpanded: $optionsExpanded) {
+                DisclosureSection(isExpanded: $optionsExpanded) {
                     optionControls
                         .padding(.top, Theme.Spacing.medium)
                 } label: {
@@ -111,6 +111,7 @@ struct HomeView: View {
             .padding(Theme.Spacing.extraLarge)
             .frame(maxWidth: .infinity, alignment: .top)
         }
+        .pageScrollEdgeEffect()
         .defaultFocus($isDropZoneFocused, true)
         .fileImporter(
             isPresented: $showInputImporter,

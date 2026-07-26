@@ -112,6 +112,7 @@ struct ProcessingView: View {
             .padding(32)
             .frame(maxWidth: .infinity, alignment: .top)
         }
+        .pageScrollEdgeEffect()
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 if model.isRunActive {
@@ -319,7 +320,7 @@ struct ProcessingView: View {
     }
 
     private var technicalDetails: some View {
-        DisclosureGroup(isExpanded: $isTechnicalDetailsExpanded) {
+        DisclosureSection(isExpanded: $isTechnicalDetailsExpanded) {
             VStack(alignment: .leading, spacing: 8) {
                 LabeledContent("Stage", value: model.stage?.displayName ?? "Preparing")
                     .font(.caption)

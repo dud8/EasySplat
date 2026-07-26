@@ -447,6 +447,7 @@ struct ViewerView: View {
             }
             .padding(Theme.Spacing.large)
         }
+        .pageScrollEdgeEffect()
         .accessibilityIdentifier("result.inspectorContent")
     }
 
@@ -641,7 +642,7 @@ struct ViewerView: View {
     }
 
     private var technicalSection: some View {
-        DisclosureGroup(isExpanded: $isTechnicalExpanded) {
+        DisclosureSection(isExpanded: $isTechnicalExpanded) {
             VStack(alignment: .leading, spacing: Theme.Spacing.small) {
                 if let geometry = artifactSnapshot?.geometryArtifact {
                     LabeledContent("Solver", value: geometry.solverVersion)
