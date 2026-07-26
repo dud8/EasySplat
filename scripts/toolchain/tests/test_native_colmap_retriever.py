@@ -2165,7 +2165,12 @@ class NativeRetrieverTests(unittest.TestCase):
             capture_output=True,
             text=True,
             env=environment,
-            timeout=60,
+            # Detects a hang, not slowness. The lexical-image-id fixture extracts
+            # 26,032 SIFT features from one 2048x2048 image while the other eight
+            # yield none, so a single mostly serial extraction sets the wall clock:
+            # measured 68s on an M4 Max, unchanged between load averages of 3.2 and
+            # 8.3. At 60s it failed on hardware faster than any CI runner.
+            timeout=180,
         )
 
     @classmethod
