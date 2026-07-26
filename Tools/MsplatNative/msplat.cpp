@@ -12,6 +12,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <dirent.h>
 #include <filesystem>
@@ -2909,6 +2910,7 @@ int main(int argc, char *argv[]) {
     int anchorInstance = 0;
     int iterationLimitOverride = 0;
     int plateauWindowOverride = 0;
+    int holdoutEvery = 0;
     int eventsFileDescriptor = -1;
     bool isolate = false;
     bool selfCheck = false;
@@ -2959,6 +2961,29 @@ int main(int argc, char *argv[]) {
         "Positive early-stop plateau window"
     );
     plateauWindowOption->check(CLI::Range(1, 1000000));
+    CLI::Option *holdoutEveryOption = app.add_option(
+        "--holdout-every",
+        holdoutEvery,
+        "Hold out every Nth camera for validation PSNR; 0 disables"
+    );
+    // 1 would hold out every camera, leaving nothing to train on, and it also slipped
+    // past the resume conflict below because only values above 1 create a split.
+    holdoutEveryOption->check(CLI::Validator(
+        [](std::string &value) -> std::string {
+            const char *begin = value.c_str();
+            char *end = nullptr;
+            errno = 0;
+            const long parsed = std::strtol(begin, &end, 10);
+            // strtol rather than stoi: a throwing validator escapes CLI11's error
+            // reporting and surfaces as a crash instead of a usage message.
+            if (errno != 0 || end == begin || *end != '\0') {
+                return "--holdout-every must be an integer";
+            }
+            if (parsed == 0 || (parsed >= 2 && parsed <= 1000)) return {};
+            return "--holdout-every must be 0 or between 2 and 1000";
+        },
+        "0 or 2..1000"
+    ));
     CLI::Option *seedOption = app.add_option(
         "--seed", seed, "UInt64 seed for reproducible camera ordering"
     );
@@ -3458,6 +3483,15 @@ int main(int argc, char *argv[]) {
             throw std::runtime_error("failed to install cancellation handlers");
         }
 
+        // Reject the unsupported combination before touching the dataset or allocating
+        // Metal state, so an unrelated input error cannot mask the contract violation.
+        if (holdoutEvery > 1 && !resumePath.empty()) {
+            throw std::runtime_error(
+                "--resume cannot be combined with --holdout-every; the checkpoint "
+                "contract does not yet identify the held-out camera split"
+            );
+        }
+
         const OrientationOverlay orientation = readOrientationOverlay(datasetPath);
         const TrainingIdentity identity = computeTrainingIdentity(
             datasetPath,
@@ -3475,6 +3509,16 @@ int main(int argc, char *argv[]) {
         InputData inputData = inputDataFromX(datasetPath);
         applyOrientationOverlay(inputData, orientation);
 
+        // Hold out every Nth camera so novel-view quality can be measured. Training
+        // loss cannot detect a model that fits its own views while degrading between
+        // them, which is precisely the failure this trainer had no signal for.
+        std::vector<Camera> heldOutCameras;
+        if (holdoutEvery > 1) {
+            auto split = inputData.splitTrainTest(holdoutEvery);
+            heldOutCameras = std::move(std::get<1>(split));
+            inputData.cameras = std::move(std::get<0>(split));
+        }
+
         std::vector<Camera> &cameras = inputData.cameras;
         if (cameras.empty()) throw std::runtime_error("input dataset contains no training cameras");
 
@@ -3487,7 +3531,13 @@ int main(int argc, char *argv[]) {
         constexpr int resetAlphaEvery = 30;
         constexpr float densifyGradThreshold = 0.0002f;
         constexpr float densifySizeThreshold = 0.01f;
-        constexpr int stopScreenSizeAt = 4000;
+        // Screen-size splitting is an early-densification heuristic. The shipped literal
+        // 4000 was tuned against the built-in profiles (3000/7000/15000 iterations), so
+        // raising the budget silently shrank its share of the run: at 40000 it covered
+        // 10% instead of the ~27% it had at 15000. Express it as that same fraction of
+        // the growth window so every budget gets equivalent treatment.
+        const int stopScreenSizeAt =
+            (std::max)(refineEvery * 2, (profile.iterationLimit * 4000) / 15000);
         constexpr float splitScreenSize = 0.05f;
         constexpr float ssimWeight = 0.2f;
         constexpr float background[3] = {0.0f, 0.0f, 0.0f};
@@ -3498,6 +3548,79 @@ int main(int argc, char *argv[]) {
                     warmupLength, resetAlphaEvery, densifyGradThreshold,
                     densifySizeThreshold, stopScreenSizeAt, splitScreenSize,
                     profile.iterationLimit, true, background);
+
+        // Bound the gaussian population to what the admitted memory can hold. The
+        // binding constraint is not parameter storage but a single exact-raster
+        // allocation, which scales with tile intersections and so with scene density:
+        // mip-NeRF 360 treehill demanded 38.2 GB at 4.52M gaussians while flowers ran
+        // to 2.7M inside 14.8 GB. 10 KB per gaussian is the conservative empirical
+        // envelope across both, tuned in both directions - 8000 aborted treehill, and
+        // 6000 aborted it again while making flowers 30% slower for no quality gain.
+        // It is calibrated, not derived: driving it from live raster pressure would be
+        // the principled version. Without any bound the run aborts mid-training
+        // instead of simply ceasing to grow.
+        constexpr std::uint64_t kEstimatedBytesPerGaussian = 10000;
+        // Never bind below this. The per-gaussian estimate is calibrated against
+        // multi-gigabyte training budgets; applied to a small one it yields an absurd
+        // ceiling - a 96 MB budget admits about 10k gaussians - and throttles work that
+        // memory was never going to constrain. Below this floor the ceiling is inert.
+        constexpr std::uint64_t kMinimumPopulationCeiling = 500000;
+        if (memoryBudgetBytes > 0) {
+            // Part of the budget is spent before a single gaussian exists. The raster
+            // keeps six full-resolution image buffers (31 floats per pixel: colour,
+            // transmittance, final index, loss intermediates, the SSIM row buffer and
+            // the rendered-image gradient) plus one tile-local intersection arena of
+            // MAX_TILE_ELEMS 64-bit keys per 16x16 tile. Both scale with resolution and
+            // not at all with population, so charging them to the per-gaussian estimate
+            // overstated the headroom - at 2304x1296 by roughly 560 MB.
+            constexpr std::uint64_t kBytesPerPixel = 31 * sizeof(float);
+            constexpr std::uint64_t kTileSide = 16;
+            // Queried rather than duplicated: a literal here would drift silently the
+            // first time MAX_TILE_ELEMS changes in the kernels.
+            const std::uint64_t bytesPerTile =
+                msplat_max_tile_elements() * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
+            std::uint64_t largestFixed = 0;
+            bool mixedResolutions = false;
+            int firstWidth = 0;
+            int firstHeight = 0;
+            for (const Camera &camera : cameras) {
+                if (camera.width <= 0 || camera.height <= 0) continue;
+                if (firstWidth == 0) {
+                    firstWidth = camera.width;
+                    firstHeight = camera.height;
+                } else if (camera.width != firstWidth || camera.height != firstHeight) {
+                    mixedResolutions = true;
+                }
+                const std::uint64_t w = static_cast<std::uint64_t>(camera.width);
+                const std::uint64_t h = static_cast<std::uint64_t>(camera.height);
+                const std::uint64_t tiles =
+                    ((w + kTileSide - 1) / kTileSide) * ((h + kTileSide - 1) / kTileSide);
+                largestFixed = (std::max<std::uint64_t>)(
+                    largestFixed, w * h * kBytesPerPixel + tiles * bytesPerTile);
+            }
+            // The raster reserves the new resolution's image and tile buffers while the
+            // previous ones are still resident, so a capture that alternates between
+            // resolutions - portrait stills among landscape video, say - transiently
+            // needs two of these. Charge for both rather than let the ceiling promise
+            // headroom that a resolution switch immediately spends.
+            const std::uint64_t fixedBytes =
+                mixedResolutions ? 2 * largestFixed : largestFixed;
+            const std::uint64_t gaussianBudget =
+                memoryBudgetBytes > fixedBytes ? memoryBudgetBytes - fixedBytes : 0;
+            const std::uint64_t population = (std::max<std::uint64_t>)(
+                kMinimumPopulationCeiling,
+                gaussianBudget / kEstimatedBytesPerGaussian
+            );
+            // The model bounds allocated slots, not the population, because a densify
+            // pass can triple its input and the buffers never shrink. Three slots per
+            // admitted gaussian preserves the calibrated ceiling above while making the
+            // worst case bounded rather than open-ended.
+            const std::uint64_t slots = (std::min<std::uint64_t>)(
+                3 * population,
+                static_cast<std::uint64_t>(std::numeric_limits<int>::max() / 4)
+            );
+            model.maxCapacity = static_cast<int>(slots);
+        }
 
         std::vector<size_t> camIndices(cameras.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
@@ -3513,6 +3636,17 @@ int main(int argc, char *argv[]) {
             requirePlainDirectory(resumePath);
             if (fs::canonical(resumePath) != fs::canonical(checkpointRoot)) {
                 throw std::runtime_error("--resume must identify the --checkpoint directory");
+            }
+            // The checkpoint contract records the training-camera count but not which
+            // cameras were held out, and two different strides can leave the same count
+            // while selecting different subsets. Until the split is versioned into the
+            // manifest, refuse the combination rather than silently resume against a
+            // different set of views.
+            if (holdoutEvery > 1) {
+                throw std::runtime_error(
+                    "--resume cannot be combined with --holdout-every; the checkpoint "
+                    "contract does not yet identify the held-out camera split"
+                );
             }
         }
         const CheckpointContext checkpointContext {
@@ -3534,6 +3668,8 @@ int main(int argc, char *argv[]) {
         );
         int lastImprovementIteration = warmupLength;
         double latestWindowLoss = std::numeric_limits<double>::quiet_NaN();
+        double latestHeldOutPsnr = std::numeric_limits<double>::quiet_NaN();
+        int latestHeldOutIteration = 0;
         int latestLossIteration = 0;
         int completedIteration = 0;
         double priorElapsedSeconds = 0;
@@ -3862,6 +3998,57 @@ int main(int argc, char *argv[]) {
             msplat_commit();
         };
 
+        // Held-out evaluation. Runs only at a drained pipeline boundary, and resolves
+        // any raster capacity failure inline so no evidence from a non-training camera
+        // index reaches synchronizeWindow's rewind logic.
+        auto evaluateHeldOut = [&](int step,
+                                   std::size_t *evaluatedOut,
+                                   std::string *failureOut) -> double {
+            if (heldOutCameras.empty()) return std::numeric_limits<double>::quiet_NaN();
+            const std::size_t count = heldOutCameras.size();
+            double total = 0;
+            int counted = 0;
+            for (std::size_t index = 0; index < count; ++index) {
+                Camera &camera = heldOutCameras[index];
+                // Contained per camera: one view that cannot be rendered costs its own
+                // measurement, not every measurement gathered before it. Only a pending
+                // capacity failure is cleared, so an unrelated GPU or synchronization
+                // fault is still visible to whatever runs next.
+                try {
+                    if (camera.image.empty()) {
+                        camera.loadImage(1.0f);
+                        if (camera.image.empty()) continue;
+                    }
+                    MTensor target = camera.getGPUImage(model.getDownscaleFactor(step));
+                    bool measured = false;
+                    for (int attempt = 0; attempt < 2 && !measured; ++attempt) {
+                        MTensor rendered = model.render(camera, step);
+                        msplat_commit();
+                        msplat_gpu_sync_for_raster_replay();
+                        const MsplatRasterStats stats = msplat_get_raster_stats();
+                        if (stats.capacity_exceeded) {
+                            msplat_grow_exact_raster_capacity(stats.latest_intersection_count);
+                            msplat_clear_raster_capacity_failure();
+                            continue;
+                        }
+                        total += psnr(rendered, target);
+                        ++counted;
+                        measured = true;
+                    }
+                } catch (const std::exception &error) {
+                    if (failureOut && failureOut->empty()) *failureOut = error.what();
+                    if (msplat_raster_memory_budget_was_exceeded()) {
+                        msplat_clear_raster_capacity_failure();
+                    }
+                }
+                releaseCameraResources(camera);
+            }
+            if (evaluatedOut) *evaluatedOut = static_cast<std::size_t>(counted);
+            return counted > 0
+                ? total / static_cast<double>(counted)
+                : std::numeric_limits<double>::quiet_NaN();
+        };
+
         auto synchronizeWindow = [&](int windowEnd) {
             int attemptEnd = windowEnd;
             bool cancellationObserved = false;
@@ -4061,8 +4248,53 @@ int main(int argc, char *argv[]) {
             if (handleCancellation()) return 130;
             throw std::runtime_error("final output was not published");
         }
+        // Snapshot training raster telemetry before any validation render, so held-out
+        // work cannot inflate the fallback counts the completed event reports. Those
+        // counts must never regress below the last checkpoint's, and a validation
+        // render after the snapshot would attribute non-training work to training.
         const MsplatRasterStats finalRasterStats =
             emitRasterFallbackIfNeeded(completedIteration);
+
+        // Validation is a measurement and must never fail the thing it measures. A
+        // held-out view can demand exact-raster growth that throws on the memory
+        // budget; the model is already published, so swallow it and report what was
+        // actually evaluated rather than losing a finished run.
+        if (!heldOutCameras.empty()) {
+            std::size_t evaluated = 0;
+            std::string failure;
+            double heldOutPsnr = std::numeric_limits<double>::quiet_NaN();
+            try {
+                heldOutPsnr = evaluateHeldOut(completedIteration, &evaluated, &failure);
+            } catch (const std::exception &error) {
+                if (failure.empty()) failure = error.what();
+                if (msplat_raster_memory_budget_was_exceeded()) {
+                    msplat_clear_raster_capacity_failure();
+                }
+            }
+            const bool usable = std::isfinite(heldOutPsnr) && evaluated > 0;
+            if (usable) {
+                latestHeldOutPsnr = heldOutPsnr;
+                latestHeldOutIteration = completedIteration;
+            }
+            if (!failure.empty()) {
+                fprintf(stderr, "held-out evaluation incomplete (%zu of %zu views): %s\n",
+                        evaluated, heldOutCameras.size(), failure.c_str());
+            }
+            // Emitted unconditionally. A missing event would be indistinguishable from
+            // validation never having been requested, which is the one thing a quality
+            // signal must not be ambiguous about.
+            json holdout = {
+                {"iteration", completedIteration},
+                {"holdout_camera_count", static_cast<int>(heldOutCameras.size())},
+                {"holdout_evaluated", static_cast<int>(evaluated)},
+                {"full_set", evaluated == heldOutCameras.size()},
+                {"status", failure.empty() ? (usable ? "ok" : "empty") : "partial"}
+            };
+            if (usable) holdout["holdout_psnr"] = heldOutPsnr;
+            if (!failure.empty()) holdout["failure"] = failure;
+            events->emit("holdout_eval", holdout);
+        }
+
         const std::uintmax_t outputBytes = fs::file_size(outputPath);
         const double elapsed = cumulativeElapsed();
 
@@ -4095,6 +4327,11 @@ int main(int argc, char *argv[]) {
                           {"stop_reason", stopReason},
                           {"trainer_build_digest", trainerBuildDigest},
                           {"version", APP_VERSION}};
+        if (std::isfinite(latestHeldOutPsnr)) {
+            completed["holdout_psnr"] = latestHeldOutPsnr;
+            completed["holdout_psnr_iteration"] = latestHeldOutIteration;
+            completed["holdout_camera_count"] = static_cast<int>(heldOutCameras.size());
+        }
         events->emit("completed", completed);
         if (!events->enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
         return 0;

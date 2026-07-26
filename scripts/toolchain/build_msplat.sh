@@ -37,9 +37,9 @@ INSTALL_STAGE_DEVICE=""
 INSTALL_STAGE_INODE=""
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
-OVERLAY_SHA256="bac2fd94499dda7a9216efe6b6161efea0f16776946952acae05a5b10d0ab10e"
+OVERLAY_SHA256="97cff0165819019c146c377cd0df3e21b0fb916d7f10257109ef5228d438192c"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="06eec969719a4b44102280eed79d817c8774dafbd3050b90324d9898bc57e43d"
+RASTER_TEST_SHA256="60f4eea65d5be2ad8684292e8234fbce97ab330d5c1e0946d6b2e00a91957dcf"
 ISOLATION_HEADER="$ROOT/Tools/MsplatNative/isolation.hpp"
 ISOLATION_HEADER_SHA256="ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8"
 ISOLATION_SOURCE="$ROOT/Tools/MsplatNative/isolation.cpp"
@@ -90,6 +90,8 @@ QUATERNION_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-quaternion-sta
 QUATERNION_STABILITY_PATCH_SHA256="d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786"
 ISOLATION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-isolation.patch"
 ISOLATION_PATCH_SHA256="a8a579d9d2a5ca23ce87ae0dd2a1f79de8da56bbfa62851244cfdda51bc37f59"
+DENSITY_CONTROL_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-density-control.patch"
+DENSITY_CONTROL_PATCH_SHA256="b3b7bde76ff10174972e6a9f1d8b7db7e365477d3daff911110ab6d3b598a7b0"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
@@ -687,6 +689,9 @@ preflight() {
     || die "missing quaternion-stability patch: $QUATERNION_STABILITY_PATCH"
   [ "$(sha256 "$QUATERNION_STABILITY_PATCH")" = "$QUATERNION_STABILITY_PATCH_SHA256" ] \
     || die "quaternion-stability patch SHA-256 mismatch"
+  [ -f "$DENSITY_CONTROL_PATCH" ] || die "missing density-control patch: $DENSITY_CONTROL_PATCH"
+  [ "$(sha256 "$DENSITY_CONTROL_PATCH")" = "$DENSITY_CONTROL_PATCH_SHA256" ] \
+    || die "density-control patch SHA-256 mismatch"
   [ -f "$ISOLATION_PATCH" ] || die "missing isolation patch: $ISOLATION_PATCH"
   [ "$(sha256 "$ISOLATION_PATCH")" = "$ISOLATION_PATCH_SHA256" ] \
     || die "isolation patch SHA-256 mismatch"
@@ -817,6 +822,7 @@ snapshot_build_inputs() {
       "$EXACT_PREFIX_HARDENING_PATCH" "patches/msplat-1.1.3-exact-prefix-hardening.patch" "$EXACT_PREFIX_HARDENING_PATCH_SHA256" \
       "$QUATERNION_STABILITY_PATCH" "patches/msplat-1.1.3-quaternion-stability.patch" "$QUATERNION_STABILITY_PATCH_SHA256" \
       "$ISOLATION_PATCH" "patches/msplat-1.1.3-isolation.patch" "$ISOLATION_PATCH_SHA256" \
+      "$DENSITY_CONTROL_PATCH" "patches/msplat-1.1.3-density-control.patch" "$DENSITY_CONTROL_PATCH_SHA256" \
       "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" "tile/include/tile_culling.hpp" "" \
       "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" "tile/include/gpu_tile_culling.hpp" "" \
       "$TILE_SPAN_TEST_ROOT/src/tile_culling.metal" "tile/src/tile_culling.metal" "" \
@@ -986,6 +992,7 @@ PY
   EXACT_PREFIX_HARDENING_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-exact-prefix-hardening.patch"
   QUATERNION_STABILITY_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-quaternion-stability.patch"
   ISOLATION_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-isolation.patch"
+  DENSITY_CONTROL_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-density-control.patch"
   TILE_SPAN_TEST_ROOT="$BUILD_INPUT_SNAPSHOT_DIR/tile"
   BUILD_INPUT_SNAPSHOT_READY=1
 }
@@ -1022,6 +1029,7 @@ $ALLOCATION_PRESSURE_PATCH|$ALLOCATION_PRESSURE_PATCH_SHA256|allocation-pressure
 $EXACT_PREFIX_HARDENING_PATCH|$EXACT_PREFIX_HARDENING_PATCH_SHA256|exact-prefix patch
 $QUATERNION_STABILITY_PATCH|$QUATERNION_STABILITY_PATCH_SHA256|quaternion patch
 $ISOLATION_PATCH|$ISOLATION_PATCH_SHA256|isolation patch
+$DENSITY_CONTROL_PATCH|$DENSITY_CONTROL_PATCH_SHA256|density-control patch
 EOF
 }
 
@@ -1136,6 +1144,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply "$QUATERNION_STABILITY_PATCH"
   git -C "$SOURCE_DIR" apply --check "$ISOLATION_PATCH"
   git -C "$SOURCE_DIR" apply "$ISOLATION_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$DENSITY_CONTROL_PATCH"
+  git -C "$SOURCE_DIR" apply "$DENSITY_CONTROL_PATCH"
 }
 
 configure_and_build() {
@@ -1197,7 +1207,7 @@ write_build_info() {
   local isolation_runtime_header_sha256 isolation_runtime_source_sha256
   local isolation_mask_header_sha256 isolation_mask_source_sha256
   local isolation_lift_source_sha256 isolation_test_sha256
-  local isolation_mask_test_sha256 isolation_patch_sha256
+  local isolation_mask_test_sha256 isolation_patch_sha256 density_control_patch_sha256
   local patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256
   local numeric_stability_patch_sha256 metal_safety_patch_sha256
   local exact_raster_patch_sha256 stage_timing_patch_sha256
@@ -1222,6 +1232,7 @@ write_build_info() {
   isolation_test_sha256="$(sha256 "$ISOLATION_TEST_SOURCE")"
   isolation_mask_test_sha256="$(sha256 "$ISOLATION_MASK_TEST_SOURCE")"
   isolation_patch_sha256="$(sha256 "$ISOLATION_PATCH")"
+  density_control_patch_sha256="$(sha256 "$DENSITY_CONTROL_PATCH")"
   patch_sha256="$(sha256 "$UPSTREAM_PATCH")"
   source_notice_patch_sha256="$(sha256 "$SOURCE_NOTICE_PATCH")"
   checkpoint_patch_sha256="$(sha256 "$CHECKPOINT_PATCH")"
@@ -1246,6 +1257,7 @@ write_build_info() {
     "$isolation_mask_header_sha256" "$isolation_mask_source_sha256" \
     "$isolation_lift_source_sha256" "$isolation_test_sha256" \
     "$isolation_mask_test_sha256" "$isolation_patch_sha256" \
+    "$density_control_patch_sha256" \
     "$patch_sha256" "$source_notice_patch_sha256" "$checkpoint_patch_sha256" \
     "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" \
     "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" \
@@ -1277,6 +1289,7 @@ import sys
     isolation_test_sha256,
     isolation_mask_test_sha256,
     isolation_patch_sha256,
+    density_control_patch_sha256,
     patch_sha256,
     source_notice_patch_sha256,
     checkpoint_patch_sha256,
@@ -1321,6 +1334,7 @@ payload = {
     "isolation_test_sha256": isolation_test_sha256,
     "isolation_mask_test_sha256": isolation_mask_test_sha256,
     "isolation_patch_sha256": isolation_patch_sha256,
+    "density_control_patch_sha256": density_control_patch_sha256,
     "patch_sha256": patch_sha256,
     "source_notice_patch_sha256": source_notice_patch_sha256,
     "checkpoint_patch_sha256": checkpoint_patch_sha256,

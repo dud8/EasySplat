@@ -1461,11 +1461,19 @@ void verifyDensificationScratchLifecycle(const std::string &dataset) {
             throw std::runtime_error("sufficient densification scratch memory was reallocated");
         }
 
+        // Culling continues past stopSplitAt, so the compaction scratch must survive the
+        // growth boundary rather than being released there. Zeroed visibility counts
+        // make the classify kernel early-return, so this exercises the cull path
+        // deterministically without needing a full training iteration.
         model.radii = gpu_zeros({pointCount}, DType::Float32);
+        model.xysGradNorm = gpu_zeros({pointCount}, DType::Float32);
+        model.visCounts = gpu_zeros({pointCount}, DType::Float32);
+        model.max2DSize = gpu_zeros({pointCount}, DType::Float32);
         model.afterTrain(model.stopSplitAt);
-        if (model.densify_compact_scratch.defined()) {
-            throw std::runtime_error("densification scratch memory survived the final boundary");
+        if (!model.densify_compact_scratch.defined()) {
+            throw std::runtime_error("densification scratch memory was released at the growth boundary");
         }
+        const void *survivingStorage = model.densify_compact_scratch.data_ptr();
         try {
             model.ensureDensificationCompactScratch(0);
             throw std::runtime_error("invalid densification point count was accepted");
@@ -1475,12 +1483,131 @@ void verifyDensificationScratchLifecycle(const std::string &dataset) {
                 throw;
             }
         }
-        if (model.densify_compact_scratch.defined()) {
-            throw std::runtime_error("invalid densification request retained scratch memory");
+        if (!model.densify_compact_scratch.defined() ||
+            model.densify_compact_scratch.data_ptr() != survivingStorage) {
+            throw std::runtime_error("a rejected densification request disturbed scratch memory");
         }
     }
     cleanup_msplat_metal();
     std::cout << "densification scratch lifecycle passed\n";
+}
+
+// Drive a model to the point where a densify pass would fire, so a caller can observe
+// whether the capacity ceiling refuses it. Zeroed visibility counts make the classify
+// kernel early-return, so the gradients have to be primed explicitly.
+void primeForDensification(Model &model) {
+    const int pointCount = model.num_active;
+    model.lastWidth = 1024;
+    model.lastHeight = 1024;
+    model.radii = gpu_zeros({pointCount}, DType::Float32);
+    model.xysGradNorm = gpu_zeros({pointCount}, DType::Float32);
+    model.visCounts = gpu_zeros({pointCount}, DType::Float32);
+    model.max2DSize = gpu_zeros({pointCount}, DType::Float32);
+    float *grad = model.xysGradNorm.data<float>();
+    float *vis = model.visCounts.data<float>();
+    for (int i = 0; i < pointCount; i++) {
+        grad[i] = 1.0f;
+        vis[i] = 1.0f;
+    }
+}
+
+void verifyCapacityCeilingBoundsGrowth(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        // Inside the growth window: past warmupLength, before stopSplitAt (maxSteps/2),
+        // on a refineEvery boundary, and clear of the post-reset blackout.
+        const int growthStep = 600;
+
+        // Baseline with the ceiling disabled, to prove the fixture actually grows here.
+        // Without it a ceiling that silently did nothing would still pass.
+        {
+            Model model = makeModel(inputData);
+            model.maxCapacity = 0;
+            primeForDensification(model);
+            const int before = model.num_active;
+            model.afterTrain(growthStep);
+            if (model.num_active <= before) {
+                throw std::runtime_error(
+                    "capacity ceiling fixture does not densify without a ceiling");
+            }
+        }
+
+        Model model = makeModel(inputData);
+        const int pointCount = model.num_active;
+        // One slot below the worst case the pass could allocate. The population is far
+        // under this, so a ceiling that gates on population instead of capacity would
+        // admit the pass and let buf_capacity settle above the bound for good.
+        model.maxCapacity = 3 * pointCount - 1;
+        const int capacityBefore = model.buf_capacity;
+        primeForDensification(model);
+        model.afterTrain(growthStep);
+
+        if (model.num_active > pointCount) {
+            throw std::runtime_error(
+                "capacity ceiling admitted a densify pass that grew the population");
+        }
+        // The bound governs growth, not the seed allocation: setupOptimizers already
+        // reserved 4x the point count before the ceiling could have any say.
+        if (model.buf_capacity != capacityBefore) {
+            throw std::runtime_error(
+                "capacity ceiling did not prevent buffer growth");
+        }
+        if (!model.densify_compact_scratch.defined()) {
+            throw std::runtime_error(
+                "capacity ceiling suppressed the cull pass along with densification");
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "capacity ceiling bounds growth passed\n";
+}
+
+void verifyTailCullRemovesOversizedOnShortRuns(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Model model = makeModel(inputData);
+        const int pointCount = model.num_active;
+
+        // Scale culling used to be gated on step > refineEvery * resetAlphaEvery, which
+        // is 3000 - exactly where the fast profile ends. Its entire tail therefore ran
+        // opacity culling only. Plant an oversized round gaussian well inside that
+        // window and require the tail pass to remove it.
+        float *scales = model.scales.data<float>();
+        scales[0] = scales[1] = scales[2] = 0.0f;  // exp(0) = 1.0, far above kCullScale
+
+        model.radii = gpu_zeros({pointCount}, DType::Float32);
+        model.xysGradNorm = gpu_zeros({pointCount}, DType::Float32);
+        model.visCounts = gpu_zeros({pointCount}, DType::Float32);
+        model.max2DSize = gpu_zeros({pointCount}, DType::Float32);
+        model.lastWidth = 1024;
+        model.lastHeight = 1024;
+
+        // stopSplitAt is maxSteps / 2 = 1500 for this model, and the tail culls every
+        // 500 steps, so this is the first tail pass - and it is below 3000.
+        const int tailStep = model.stopSplitAt;
+        if (tailStep >= 3000) {
+            throw std::runtime_error("tail-cull fixture no longer exercises a short run");
+        }
+        model.afterTrain(tailStep);
+
+        const float *survivors = model.scales.data<float>();
+        float largest = 0.0f;
+        for (int i = 0; i < model.num_active; i++) {
+            for (int axis = 0; axis < 3; axis++) {
+                largest = (std::max)(largest, std::exp(survivors[i * 3 + axis]));
+            }
+        }
+        if (largest >= 1.0f) {
+            throw std::runtime_error(
+                "tail cull left an oversized gaussian on a run shorter than the "
+                "opacity-reset interval");
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "tail cull removes oversized on short runs passed\n";
 }
 
 void enqueueStep(Model &model, Camera &camera, int step, std::size_t cameraIndex) {
@@ -2584,15 +2711,21 @@ void verifyWindowReplayNumericalParity(const std::string &dataset) {
 void verifyRepeatedExactFallbackMetrics(const std::string &dataset) {
     cleanup_msplat_metal();
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    // A fallback means some tile exceeded MAX_TILE_ELEMS intersections, so a restored
+    // history claiming a fallback must also report a global capacity above that budget.
+    // These values track MAX_TILE_ELEMS and must move with it.
+    constexpr std::uint64_t kTileElementBudget = 2048;
+    constexpr std::uint64_t kCapacityAtBudget = kTileElementBudget;
+    constexpr std::uint64_t kCapacityAboveBudget = kTileElementBudget + 512;
     const std::vector<std::tuple<std::uint64_t, double, std::uint64_t,
                                  std::uint64_t, std::uint64_t>> invalidHistory {
         {0, 0.1, 0, 0, 0},
         {1, 0.0, 0, 0, 0},
         {1, 0.1, 0, 0, 0},
-        {1, 0.1, 1, 0, 2304},
-        {1, 0.1, 1, 4096, 2048},
-        {1, 0.1, 2, 4096, 2304},
-        {1, 0.1, 1, memoryBudgetBytes + 1, 2304},
+        {1, 0.1, 1, 0, kCapacityAboveBudget},
+        {1, 0.1, 1, 4096, kCapacityAtBudget},
+        {1, 0.1, 2, 4096, kCapacityAboveBudget},
+        {1, 0.1, 1, memoryBudgetBytes + 1, kCapacityAboveBudget},
         {1, 0.1, 1, 4096, std::uint64_t {1} << 32},
     };
     for (const auto &[fallbacks, elapsed, growths, bytes, peak] : invalidHistory) {
@@ -2606,12 +2739,12 @@ void verifyRepeatedExactFallbackMetrics(const std::string &dataset) {
             throw std::runtime_error("native raster restore accepted inconsistent history");
         }
     }
-    msplat_restore_raster_metrics(3, 0.1, 2, memoryBudgetBytes + 1, 2304);
+    msplat_restore_raster_metrics(3, 0.1, 2, memoryBudgetBytes + 1, kCapacityAboveBudget);
     const MsplatRasterStats restored = msplat_get_raster_stats();
     if (restored.fallback_count != 3 || restored.exact_fallback_elapsed_seconds != 0.1 ||
         restored.exact_buffer_growth_count != 2 ||
         restored.exact_buffer_bytes_added != memoryBudgetBytes + 1 ||
-        restored.peak_exact_intersection_capacity != 2304) {
+        restored.peak_exact_intersection_capacity != kCapacityAboveBudget) {
         throw std::runtime_error("native raster restore rejected consistent history");
     }
     cleanup_msplat_metal();
@@ -3390,6 +3523,8 @@ int main(int argc, char **argv) {
         }
         verifyGeometryAdamFusionParity(argv[2]);
         verifyDensificationScratchLifecycle(dataset);
+        verifyCapacityCeilingBoundsGrowth(dataset);
+        verifyTailCullRemovesOversizedOnShortRuns(dataset);
         verifyMixedResolutionGrowth(argv[2]);
         verifyExactOnlyBudgetEvidence(argv[6]);
         verifySharedAllocationBudget(argv[3]);

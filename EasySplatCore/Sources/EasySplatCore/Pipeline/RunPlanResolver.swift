@@ -643,7 +643,10 @@ public enum RunPlanResolver {
 
     // Iteration limits are ceilings, not targets: the trainer's plateau detector is
     // the intended stop, and densification runs until iterationLimit / 2, so the
-    // ceiling also bounds how far the gaussian count can grow.
+    // ceiling also bounds how far the gaussian count can grow. It is no longer the
+    // only bound - the trainer derives a capacity ceiling from its memory budget and
+    // culls past the growth window - so raising a budget no longer trades directly
+    // against how much geometry survives.
     private static func trainerBudget(
         for detail: DetailProfile,
         memoryTier: MemoryTier
