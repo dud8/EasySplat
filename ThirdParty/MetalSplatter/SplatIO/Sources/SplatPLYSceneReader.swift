@@ -94,6 +94,8 @@ private class SplatPLYSceneReaderStream {
     private weak var delegate: SplatSceneReaderDelegate? = nil
     private var active = false
     private var pointElementMapping: PointElementMapping?
+    private var compressedMapping: CompressedPLYMapping?
+    private var chunks: [CompressedPLYMapping.Chunk] = []
     private var expectedPointCount: UInt32 = 0
     private var pointCount: UInt32 = 0
     private var reusablePoint = SplatScenePoint(position: .zero, normal: .zero, color: .none, opacity: .zero, scale: .zero, rotation: .init(vector: .zero))
@@ -110,6 +112,8 @@ private class SplatPLYSceneReaderStream {
         self.delegate = delegate
         active = true
         pointElementMapping = nil
+        compressedMapping = nil
+        chunks = []
         expectedPointCount = 0
         pointCount = 0
 
@@ -129,6 +133,18 @@ extension SplatPLYSceneReaderStream: PLYReaderDelegate {
         }
 
         do {
+            // A chunked file has no float positions to map, so this has to come first.
+            if let compressedMapping = try CompressedPLYMapping.mapping(for: header) {
+                self.compressedMapping = compressedMapping
+                // The declared count comes from an untrusted header, so reserve against
+                // a bound rather than whatever the file claims; the array still grows if
+                // the file really is that large.
+                let declaredChunks = header.elements[compressedMapping.chunkElementTypeIndex].count
+                chunks.reserveCapacity(Int(min(declaredChunks, 1 << 20)))
+                expectedPointCount = header.elements[compressedMapping.vertexElementTypeIndex].count
+                delegate?.didStartReading(withPointCount: expectedPointCount)
+                return
+            }
             let pointElementMapping = try PointElementMapping.pointElementMapping(for: header)
             self.pointElementMapping = pointElementMapping
             expectedPointCount = header.elements[pointElementMapping.elementTypeIndex].count
@@ -142,6 +158,10 @@ extension SplatPLYSceneReaderStream: PLYReaderDelegate {
 
     func didRead(element: PLYElement, typeIndex: Int, withHeader elementHeader: PLYHeader.Element) {
         guard active else { return }
+        if let compressedMapping {
+            didReadCompressed(element: element, typeIndex: typeIndex, mapping: compressedMapping)
+            return
+        }
         guard let pointElementMapping else {
             delegate?.didFailReading(withError: SplatPLYSceneReader.Error.internalConsistency("didRead(element:typeIndex:withHeader:) called but pointElementMapping is nil"))
             active = false
@@ -160,6 +180,37 @@ extension SplatPLYSceneReaderStream: PLYReaderDelegate {
             delegate?.didFailReading(withError: error)
             active = false
             return
+        }
+    }
+
+    private func didReadCompressed(
+        element: PLYElement,
+        typeIndex: Int,
+        mapping: CompressedPLYMapping
+    ) {
+        do {
+            switch typeIndex {
+            case mapping.chunkElementTypeIndex:
+                chunks.append(try mapping.chunk(from: element))
+            case mapping.vertexElementTypeIndex:
+                let chunkIndex = Int(pointCount) / CompressedPLYMapping.verticesPerChunk
+                guard chunkIndex < chunks.count else {
+                    throw SplatPLYSceneReader.Error.unsupportedFileContents(
+                        "Vertex \(pointCount) has no chunk to dequantize against"
+                    )
+                }
+                try mapping.apply(from: element, in: chunks[chunkIndex], to: &reusablePoint)
+                if validatesRenderEncoding {
+                    try SplatRenderEncodingValidator.validate(reusablePoint)
+                }
+                pointCount += 1
+                delegate?.didRead(points: [ reusablePoint ])
+            default:
+                return
+            }
+        } catch {
+            delegate?.didFailReading(withError: error)
+            active = false
         }
     }
 
@@ -368,7 +419,7 @@ private struct PointElementMapping {
     }
 }
 
-private extension PLYHeader.Element {
+extension PLYHeader.Element {
     func sphericalHarmonicPropertyIndices(prefix: String, expectedCount: Int) throws -> [Int] {
         let names = properties.lazy.map(\.name).filter { $0.hasPrefix(prefix) }
         guard !names.isEmpty else { return [] }
@@ -431,7 +482,7 @@ private extension PLYHeader.Element {
     }
 }
 
-private extension PLYElement {
+extension PLYElement {
     func float32Value(forPropertyIndex propertyIndex: Int) throws -> Float {
         guard case .float32(let typedValue) = properties[propertyIndex] else { throw SplatPLYSceneReader.Error.internalConsistency("Unexpected type for property at index \(propertyIndex)") }
         return typedValue
@@ -439,6 +490,11 @@ private extension PLYElement {
 
     func uint8Value(forPropertyIndex propertyIndex: Int) throws -> UInt8 {
         guard case .uint8(let typedValue) = properties[propertyIndex] else { throw SplatPLYSceneReader.Error.internalConsistency("Unexpected type for property at index \(propertyIndex)") }
+        return typedValue
+    }
+
+    func uint32Value(forPropertyIndex propertyIndex: Int) throws -> UInt32 {
+        guard case .uint32(let typedValue) = properties[propertyIndex] else { throw SplatPLYSceneReader.Error.internalConsistency("Unexpected type for property at index \(propertyIndex)") }
         return typedValue
     }
 }
