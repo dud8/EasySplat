@@ -35,6 +35,11 @@ struct RootView: View {
         .onChange(of: model.currentProjectURL) { _, projectURL in
             selectedProjectURL = projectURL.map(ProjectSidebar.selectionID(for:))
         }
+        .onChange(of: model.splatOpenRequests) { _, requests in
+            guard !requests.isEmpty else { return }
+            model.splatOpenRequests.removeAll()
+            requests.forEach(StandaloneSplatWindowPresenter.shared.present)
+        }
         .alert(
             model.actionFailure?.title ?? "Action failed",
             isPresented: actionFailureIsPresented
