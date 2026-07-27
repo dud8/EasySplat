@@ -37,7 +37,7 @@
  #include <filesystem>
  #include <fstream>
  #include <iostream>
-@@ -16,6 +17,26 @@
+@@ -16,6 +17,41 @@
  
  static const double C0 = 0.28209479177387814;
  
@@ -53,6 +53,21 @@
 +// mass-extinction risk. This is what removes the residual haze.
 +static constexpr float kTailCullAlpha = 0.05f;
 +static constexpr float kCullScale = 0.1f;
++// The tail reuses this cull for a different job and kCullScale is far too sharp for it.
++// Tail culling exists to remove fog, which runs an order of magnitude oversized; at
++// kCullScale it also removes ordinary background and ground-plane geometry that
++// densification is no longer running to replace. On mip-NeRF 360 flowers that cost
++// 2.77 dB held-out and blacked out the near foreground of 7 of 22 held-out views;
++// 99.8% of what it removed was under 1.0 in normalised units. Five times kCullScale
++// spares those and still catches anything pathological - the capture that motivated
++// tail culling carried gaussians past 12 units.
++static constexpr float kTailCullScale = 5.0f * kCullScale;
++// The thin-disc exemption must not ride on the phase threshold. Deriving its ceiling
++// from cull_scale_thresh silently widened it from 0.35 to 1.75 during tail passes,
++// admitting sheets that owned 5.4% of projected area on flowers and 8.2% on the
++// Apartment capture - a second behaviour change that the >1.85 oversize metric could
++// not see. Pin it to the shipped value and let only the scale cull move.
++static constexpr float kThinDiscCap = 3.5f * kCullScale;
 +// Left at the shipped value. A tighter screen-size cull reads as reference-like, but
 +// reference tunes it for object-centric captures; indoor walkthroughs put cameras a
 +// metre from surfaces, so legitimate wall patches routinely exceed a tight screen
@@ -64,7 +79,7 @@
  int numShBases(int degree){
      switch(degree){
          case 0: return 1;
-@@ -214,7 +235,13 @@
+@@ -214,7 +250,13 @@
  
  void Model::ensureCapacity(int needed){
      if (needed <= buf_capacity) return;
@@ -79,7 +94,7 @@
  
      auto grow = [&](MTensor &buf) {
          auto shape = buf.shape();
-@@ -257,15 +284,47 @@
+@@ -257,15 +299,47 @@
          // Surface a persistent GPU budget failure before changing topology.
          msplat_gpu_sync();
          int resetInterval = resetAlphaEvery * refineEvery;
@@ -132,7 +147,7 @@
                  std::mt19937 rng(step);
                  std::normal_distribution<float> dist(0.0f, 1.0f);
                  float *p = densify_random_samples.data<float>();
-@@ -273,14 +332,36 @@
+@@ -273,14 +347,43 @@
              }
  
              float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
@@ -149,6 +164,12 @@
 +            // so its whole tail phase saw opacity culling only. The tail exists to remove
 +            // oversized geometry, so enable it there regardless of the reset schedule.
 +            bool checkHuge = doTailCull || step > refineEvery * resetAlphaEvery;
++            // doTailCull covers both ways growth can be over: past stopSplitAt, and the
++            // capacity ceiling inside the growth window. Both mean densification is no
++            // longer running to replace what a cull removes, which is what the relaxed
++            // scale threshold below is keyed on. On mip-NeRF 360 flowers the ceiling
++            // binds at step 6000 of a 15000-step window, so that branch is the common
++            // one, not an edge case.
              int fr_stride = (int)featuresRest_buf.stride0();
 +            // An infinite gradient threshold leaves nothing flagged for split or
 +            // duplication, which turns the fused densify pass into a cull-only pass.
@@ -169,11 +190,12 @@
 -                densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
 -                0.1f, 0.5f, 0.15f, checkHuge ? 1 : 0,
 +                gradThresh, densifySizeThresh, splitScreenSize, check_screen_split,
-+                cullAlpha, kCullScale, kCullScreenSize, checkHuge ? 1 : 0, check_screen_cull,
++                cullAlpha, doTailCull ? kTailCullScale : kCullScale, kThinDiscCap,
++                kCullScreenSize, checkHuge ? 1 : 0, check_screen_cull,
                  xysGradNorm, visCounts, max2DSize, half_max_dim,
                  means_buf, scales_buf, quats_buf,
                  featuresDc_buf, featuresRest_buf, opacities_buf, fr_stride,
-@@ -294,14 +375,16 @@
+@@ -294,14 +397,16 @@
  
              num_active = new_count;
              refreshViews();
@@ -226,7 +248,15 @@
  
      split_flag[idx] = do_split ? 1 : 0;
      dup_flag[idx]   = do_dup   ? 1 : 0;
-@@ -4579,9 +4593,18 @@
+@@ -4562,6 +4576,7 @@
+     constant int& check_huge         [[buffer(10)]],
+     constant int& check_screen       [[buffer(11)]],
+     device int* keep_flag            [[buffer(12)]],
++    constant float& cull_disc_scale  [[buffer(13)]],
+     uint idx [[thread_position_in_grid]]
+ ) {
+     int nSplits = (N_old > 0) ? split_prefix[N_old - 1] : 0;
+@@ -4579,9 +4594,18 @@
  
      // Huge gaussians
      if (check_huge) {
@@ -243,7 +273,7 @@
 +        // threshold a "disc" is a sheet draped across the whole scene, not a surface
 +        // patch, and it is the single worst artifact class.
 +        bool thin_disc = (hi < 3.0f * mid) && (mid > 8.0f * lo) &&
-+                         (hi < 3.5f * cull_scale_thresh);
++                         (hi < cull_disc_scale);
 +        if (hi > cull_scale_thresh && !thin_disc) cull = true;
          if (check_screen && idx < (uint)N_old && max_2d_size[idx] > cull_screen_size) cull = true;
      }
@@ -259,26 +289,29 @@
  static constexpr uint32_t kRasterStatFallbackCount = 0;
  static constexpr uint32_t kRasterStatDroppedCount = 1;
  static constexpr uint32_t kRasterStatLatestIntersectionCount = 2;
-@@ -1589,6 +1589,10 @@
-         context->device
-     );
+@@ -1591,6 +1591,10 @@
      g_tcache.ensure_backward(point_count, context->device);
-+}
-+
-+uint64_t msplat_max_tile_elements(void) {
-+    return static_cast<uint64_t>(kMaxTileElements);
  }
  
++uint64_t msplat_max_tile_elements(void) {
++    return static_cast<uint64_t>(kMaxTileElements);
++}
++
  void msplat_set_raster_memory_budget_bytes(uint64_t budget_bytes) {
-@@ -3524,6 +3528,7 @@
+     if (budget_bytes == 0) {
+         throw std::invalid_argument("msplat: raster memory budget must be positive");
+@@ -3523,7 +3527,9 @@
+ int msplat_densify(
      int N, int buf_capacity,
      float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
-     float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
+-    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
++    float cull_alpha_thresh, float cull_scale_thresh, float cull_disc_scale,
++    float cull_screen_size, int check_huge,
 +    int check_screen_cull,
      MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
      float half_max_dim,
      MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
-@@ -3567,6 +3572,7 @@
+@@ -3567,6 +3573,7 @@
      uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
      int check_screen_int = check_screen;
      int check_huge_int = check_huge;
@@ -286,9 +319,11 @@
  
      id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
      assert(command_buffer && "Failed to retrieve command buffer reference");
-@@ -3709,7 +3715,7 @@
+@@ -3708,8 +3715,9 @@
+             ENC_SCALAR(enc, cull_alpha_thresh, 7);
              ENC_SCALAR(enc, cull_scale_thresh, 8);
              ENC_SCALAR(enc, cull_screen_size, 9);
++            ENC_SCALAR(enc, cull_disc_scale, 13);
              ENC_SCALAR(enc, check_huge_int, 10);
 -            ENC_SCALAR(enc, check_screen_int, 11);
 +            ENC_SCALAR(enc, check_screen_cull_int, 11);
@@ -308,10 +343,13 @@
  void msplat_preflight_raster_memory(
      int point_count,
      int image_height,
-@@ -255,6 +259,7 @@
+@@ -254,7 +258,9 @@
+ int msplat_densify(
      int N, int buf_capacity,
      float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
-     float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
+-    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
++    float cull_alpha_thresh, float cull_scale_thresh, float cull_disc_scale,
++    float cull_screen_size, int check_huge,
 +    int check_screen_cull,
      MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
      float half_max_dim,
