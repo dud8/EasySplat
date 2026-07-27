@@ -79,41 +79,32 @@ struct ProcessingView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                VStack(alignment: .leading, spacing: Theme.Spacing.small) {
-                    Text(phase.phrase(isDataset: isDatasetInput))
-                        .font(.title2.weight(.semibold))
-                        .accessibilityAddTraits(.isHeader)
-                        .accessibilityIdentifier("processing.phase")
-
-                    if let context = contextLine {
-                        Text(context)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .help(context)
-                            .accessibilityIdentifier("processing.context")
-                    }
-                }
-
-                phaseRail
-
-                if model.lastError != nil {
-                    failureContent
-                } else {
-                    progressContent
-                }
-
-                technicalDetails
+        Group {
+            if model.isTrainingPreviewVisible {
+                previewWorkspace
+            } else {
+                documentWorkspace
             }
-            .frame(maxWidth: 720, alignment: .leading)
-            .padding(32)
-            .frame(maxWidth: .infinity, alignment: .top)
         }
-        .pageScrollEdgeEffect()
         .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                if model.isTrainingStageActive {
+                    Button {
+                        model.setTrainingPreviewShown(!model.isTrainingPreviewShown)
+                    } label: {
+                        Label(
+                            Self.previewToggleTitle(
+                                isShown: model.isTrainingPreviewShown,
+                                isAvailable: model.isTrainingPreviewAvailable
+                            ),
+                            systemImage: "cube.transparent"
+                        )
+                    }
+                    .disabled(!model.isTrainingPreviewAvailable)
+                    .help(Self.previewToggleHelp(isAvailable: model.isTrainingPreviewAvailable))
+                    .accessibilityIdentifier("processing.previewToggle")
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 if model.isRunActive {
                     Button(Self.stopToolbarTitle(projectExists: model.currentProjectURL != nil)) {
@@ -141,6 +132,132 @@ struct ProcessingView: View {
             Text(stopDialogMessage)
         }
     }
+
+    /// The ordinary waiting screen: a reading column of status.
+    private var documentWorkspace: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                heading
+                phaseRail
+
+                if model.lastError != nil {
+                    failureContent
+                } else {
+                    progressContent
+                }
+
+                technicalDetails
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+            .padding(32)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .pageScrollEdgeEffect()
+    }
+
+    /// Once there is something to see, the splat takes the workspace and the status
+    /// moves onto it. Same information, same order — it stops being a page and
+    /// becomes a caption.
+    private var previewWorkspace: some View {
+        ZStack(alignment: .bottomLeading) {
+            if let previewURL = model.trainingPreviewURL,
+               let bounds = Self.viewerBounds(model.trainingPreviewSceneBounds) {
+                SplatViewerView(
+                    splatURL: previewURL,
+                    reloadToken: model.trainingPreviewPublication,
+                    sceneConfiguration: SplatViewerSceneConfiguration(bounds: bounds),
+                    showsLoadErrors: false,
+                    onLoadStateChanged: { state in
+                        // The canvas has already taken the workspace by the time a
+                        // decode can fail. Falling back is the difference between a
+                        // brief empty frame and a run that looks broken for an hour.
+                        if case .failed(let reason) = state {
+                            model.releaseTrainingPreview(reason: reason)
+                        }
+                    },
+                    presentation: .subordinate
+                )
+                .ignoresSafeArea()
+                .accessibilityHidden(true)
+            }
+
+            VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
+                heading
+                phaseRail
+                progressContent
+                Text(Self.previewCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("processing.previewCaption")
+            }
+            .padding(Theme.Spacing.large)
+            .frame(maxWidth: 480, alignment: .leading)
+            .background(
+                .ultraThinMaterial,
+                in: RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
+            )
+            .padding(Theme.Spacing.large)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+            Text(phase.phrase(isDataset: isDatasetInput))
+                .font(.title2.weight(.semibold))
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier("processing.phase")
+
+            if let context = contextLine {
+                Text(context)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(context)
+                    .accessibilityIdentifier("processing.context")
+            }
+        }
+    }
+
+    /// Names what the action does next. A run with no preview can only ever offer
+    /// to show one, never to hide something that is not there.
+    nonisolated static func previewToggleTitle(isShown: Bool, isAvailable: Bool) -> String {
+        isShown && isAvailable ? "Hide Preview" : "Show Preview"
+    }
+
+    nonisolated static func previewToggleHelp(isAvailable: Bool) -> String {
+        isAvailable
+            ? "Show or hide the splat while it trains"
+            : "No preview for this run — training is unaffected"
+    }
+
+    /// The viewer refuses a scene it cannot bound, so a preview without usable
+    /// bounds is not mounted at all rather than mounted blank.
+    nonisolated static func viewerBounds(_ bounds: SplatSceneBounds?) -> ViewerSceneBounds? {
+        guard let bounds,
+              bounds.radius.isFinite,
+              bounds.radius > 0,
+              bounds.center.x.isFinite,
+              bounds.center.y.isFinite,
+              bounds.center.z.isFinite else {
+            return nil
+        }
+        return ViewerSceneBounds(
+            center: SIMD3<Float>(
+                Float(bounds.center.x),
+                Float(bounds.center.y),
+                Float(bounds.center.z)
+            ),
+            radius: Float(bounds.radius)
+        )
+    }
+
+    /// The preview trails the model by design — republished every several seconds,
+    /// thinned to stay cheap. Saying so is cheaper than being asked why it and the
+    /// finished splat differ. Names no iteration: the guide keeps trainer counters
+    /// out of product UI, and the number would only invite the wrong comparison.
+    nonisolated static let previewCaption = "Preview · approximate, still training"
 
     enum PhaseRailState: Equatable {
         case completed

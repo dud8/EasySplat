@@ -3935,7 +3935,10 @@ struct PipelineMeasurementAdapter {
               benchmarkSeed: benchmarkSeed
             ),
             hardwareProfile: .detect(),
-            resolvedRunPlan: plan
+            resolvedRunPlan: plan,
+            // Measurements describe training cost, so they must never carry the
+            // preview's overhead. Stated rather than inherited from the default.
+            trainingPreviewPolicy: .disabled
           )
         #else
           let started = candidateStartedMonotonicSeconds
@@ -3950,7 +3953,10 @@ struct PipelineMeasurementAdapter {
             resolvedRunPlan: plan,
             prePipelineDurationSeconds: ProcessInfo.processInfo.systemUptime
               - candidateStartedMonotonicSeconds,
-            prePipelineStartedAt: candidatePreparationStartedAt
+            prePipelineStartedAt: candidatePreparationStartedAt,
+            // Measurements describe training cost, so they must never carry the
+            // preview's overhead. Stated rather than inherited from the default.
+            trainingPreviewPolicy: .disabled
           )
         #endif
         #if BASELINE_ADAPTER

@@ -69,6 +69,9 @@ public struct ProjectPaths: Sendable {
         trainingURL.appendingPathComponent("checkpoints/msplat", isDirectory: true)
     }
     public var msplatOutputURL: URL { trainingURL.appendingPathComponent("msplat/splat.ply") }
+    /// Live training preview. Deliberately outside the checkpoint tree: this is a
+    /// display cache with no bearing on resume, and its presence grants no authority.
+    public var msplatPreviewURL: URL { trainingURL.appendingPathComponent("msplat/preview.ply") }
     public var outputURL: URL { root.appendingPathComponent("Output", isDirectory: true) }
     public var outputSplatURL: URL { outputURL.appendingPathComponent("splat.ply") }
     public var isolatedOutputURL: URL { outputURL.appendingPathComponent("isolated.ply") }

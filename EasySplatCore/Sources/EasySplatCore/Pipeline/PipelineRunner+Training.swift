@@ -939,5 +939,52 @@ extension PipelineRunner {
             || (try? fileManager.destinationOfSymbolicLink(atPath: disposableOutput.path)) != nil {
             try fileManager.removeItem(at: disposableOutput)
         }
+        try removeTrainingPreviewPayload(paths: paths)
+    }
+
+    /// Removes the preview and any temporary a crashed publication left behind.
+    /// The preview is a display cache tied to a live run: keeping ~26 MB per
+    /// finished project to describe a model that has since been superseded is pure
+    /// accumulation. Safe to call when nothing is present.
+    func removeTrainingPreviewPayload(paths: ProjectPaths) throws {
+        let fileManager = FileManager.default
+        let preview = try paths.resolveProjectRelativePath("Training/msplat/preview.ply")
+        try removeRegularFileIfPresent(preview)
+
+        // Publication temporaries are ".preview.ply.preview.tmp.<pid>.ply" beside the
+        // preview. A crash between create and rename strands one, and the next run
+        // only replaces the canonical name.
+        let directory = preview.deletingLastPathComponent()
+        let prefix = ".\(preview.lastPathComponent).preview.tmp."
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+        for entry in entries {
+            let name = entry.lastPathComponent
+            guard name.hasPrefix(prefix), name.hasSuffix(".ply") else { continue }
+            // The producer writes exactly one decimal pid between the fixed affixes.
+            // Anything else in that slot is not ours to delete.
+            let pid = name.dropFirst(prefix.count).dropLast(".ply".count)
+            guard !pid.isEmpty, pid.allSatisfy({ $0.isASCII && $0.isNumber }) else { continue }
+            // Resolve through the project's own containment check so a symlinked
+            // entry cannot walk the delete outside the bundle.
+            guard let relative = try? paths.projectRelativePath(for: entry),
+                  let resolved = try? paths.resolveProjectRelativePath(relative) else {
+                continue
+            }
+            try? removeRegularFileIfPresent(resolved)
+        }
+    }
+
+    /// Deletes only an ordinary file. `removeItem` is recursive, so a directory or
+    /// symlink wearing a preview's name would otherwise take its contents with it.
+    private func removeRegularFileIfPresent(_ url: URL) throws {
+        var status = stat()
+        guard lstat(url.path, &status) == 0 else { return }
+        guard status.st_mode & S_IFMT == S_IFREG else { return }
+        try FileManager.default.removeItem(at: url)
     }
 }

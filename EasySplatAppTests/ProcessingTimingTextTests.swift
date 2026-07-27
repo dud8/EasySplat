@@ -139,11 +139,49 @@ final class ProcessingTimingTextTests: XCTestCase {
         XCTAssertEqual(model.logLines.filter { $0.contains("Exact raster fallback") }.count, 1)
 
         // Bucketed training milestones ignore the interval: an advance always
-        // logs, a repeat never does.
-        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training model · 120/40,000")
-        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training model · 121/40,000")
-        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training model · 240/40,000")
-        XCTAssertEqual(model.logLines.filter { $0.contains("Training model") }.count, 2)
+        // logs, a repeat never does. The message must match what PipelineRunner
+        // actually emits — pinning a format the pipeline stopped producing is how
+        // this gate silently stopped applying.
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training splat · 120 of 40,000")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training splat · 121 of 40,000")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training splat · 240 of 40,000")
+        XCTAssertEqual(model.logLines.filter { $0.contains("Training splat") }.count, 2)
+    }
+
+    func testProgressRatioReadsBothSpellingsThePipelineEmits() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(projectBaseURL: base)
+
+        // Dataset preparation counts with a slash, the trainer counts with "of".
+        let slash = model.parseProgressRatio("Preparing msplat dataset (images) 12/40")
+        XCTAssertEqual(slash?.current, 12)
+        XCTAssertEqual(slash?.total, 40)
+
+        let spelled = model.parseProgressRatio("Training splat · 1,200 of 40,000")
+        XCTAssertEqual(spelled?.current, 1200)
+        XCTAssertEqual(spelled?.total, 40000)
+
+        // A bare count is not a ratio.
+        XCTAssertNil(model.parseProgressRatio("Training model with msplat"))
+    }
+
+    func testTrainingProgressGatesMatchThePipelinesOwnMessages() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(projectBaseURL: base)
+
+        // Bucketed by percent: 10% advances past 0%, the repeat does not.
+        model.maybeAppendProgressLog(
+            stage: .trainSplat, message: "Preparing msplat dataset (images) 1/40")
+        model.maybeAppendProgressLog(
+            stage: .trainSplat, message: "Preparing msplat dataset (images) 4/40")
+        model.maybeAppendProgressLog(
+            stage: .trainSplat, message: "Preparing msplat dataset (images) 5/40")
+        XCTAssertEqual(
+            model.logLines.filter { $0.contains("(images)") }.count,
+            2
+        )
     }
 
     func testTechnicalLogStaysPinnedOnlyNearTheBottom() {

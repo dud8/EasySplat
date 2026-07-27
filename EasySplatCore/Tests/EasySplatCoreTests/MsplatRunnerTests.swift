@@ -117,6 +117,251 @@ final class MsplatRunnerTests: XCTestCase {
         }
     }
 
+    func testPreviewPathIsOnlyPassedWhenRequested() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let preview = context.root.appendingPathComponent("preview.ply")
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(previewCount: 2),
+                    stderr: ""
+                ),
+                onRun: { arguments in
+                    XCTAssertEqual(argumentValue("--preview-output", in: arguments), preview.path)
+                    XCTAssertEqual(argumentValue("--preview-interval-seconds", in: arguments), "15")
+                    try? writeFixtureOutput(arguments: arguments)
+                }
+            ),
+        ])
+
+        let receipts = LockedBox<[MsplatPreviewReceipt]>([])
+        _ = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            profile: .balanced,
+            seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            previewPath: preview,
+            previewIntervalSeconds: 15,
+            onPreview: { receipt in receipts.withValue { $0.append(receipt) } },
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(receipts.value.map(\.publication), [1, 2])
+        XCTAssertEqual(receipts.value.first?.previewGaussianCount, 400)
+        XCTAssertEqual(receipts.value.first?.sourceGaussianCount, 1_000)
+        // Without authenticated bounds the viewer refuses the scene, so the receipt
+        // must carry them rather than leaving the app to invent them.
+        XCTAssertEqual(
+            receipts.value.first?.sceneBounds,
+            SplatSceneBounds(center: .init(x: 1.25, y: -2.5, z: 3.75), radius: 8.5)
+        )
+    }
+
+    /// A preview that cannot describe its own extent is unrenderable, so the
+    /// protocol rejects it rather than letting the app mount a blank canvas.
+    func testPreviewWithoutSceneBoundsIsRejected() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let preview = context.root.appendingPathComponent("preview.ply")
+        let boundless = validEvents(previewCount: 1)
+            .replacingOccurrences(of: #","scene_center":[1.25,-2.5,3.75],"scene_radius":8.5"#, with: "")
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: boundless, stderr: ""),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                previewPath: preview,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected a protocol failure for a preview with no scene bounds")
+        } catch {
+            XCTAssertTrue("\(error)".contains("preview_published"))
+        }
+    }
+
+    /// A publisher that fails after succeeding once must say so, or the app keeps
+    /// presenting a frozen frame as the live model.
+    func testPreviewDisabledAfterAPublicationIsReported() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let preview = context.root.appendingPathComponent("preview.ply")
+        // Splice a preview_disabled in after the publication, renumbering the
+        // completion so the sequence stays strictly increasing.
+        let base = validEvents(previewCount: 1)
+        var lines = base.split(separator: "\n").map(String.init)
+        let completion = lines.removeLast()
+        let disabledSequence = lines.count + 1
+        lines.append(
+            #"{"event":"preview_disabled","iteration":3500,"reason":"disk full","schema_version":2,"sequence":\#(disabledSequence)}"#
+        )
+        lines.append(
+            completion.replacingOccurrences(
+                of: #""sequence":\#(disabledSequence)"#,
+                with: #""sequence":\#(disabledSequence + 1)"#
+            )
+        )
+        let stdout = lines.joined(separator: "\n") + "\n"
+
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        let previews = LockedBox<[MsplatPreviewReceipt]>([])
+        let disabled = LockedBox<[String]>([])
+        _ = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            profile: .balanced,
+            seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            previewPath: preview,
+            onPreview: { receipt in previews.withValue { $0.append(receipt) } },
+            onPreviewDisabled: { reason in disabled.withValue { $0.append(reason) } },
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(previews.value.count, 1)
+        XCTAssertEqual(disabled.value, ["disk full"])
+    }
+
+    func testPreviewPathCollidingWithTheFinalOutputIsRejected() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let mock = MockSubprocessRunner(scripts: [])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                previewPath: context.output,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected a rejection for a preview aliasing the final output")
+        } catch {
+            XCTAssertTrue("\(error)".contains("collides"))
+        }
+    }
+
+    func testTrainingRunsWithoutAPreviewPathPassNoPreviewFlags() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(),
+                    stderr: ""
+                ),
+                onRun: { arguments in
+                    XCTAssertNil(argumentValue("--preview-output", in: arguments))
+                    XCTAssertNil(argumentValue("--preview-interval-seconds", in: arguments))
+                    try? writeFixtureOutput(arguments: arguments)
+                }
+            ),
+        ])
+
+        _ = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            profile: .balanced,
+            seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            onLog: { _, _ in }
+        )
+    }
+
+    /// A replayed or reordered publication counter would let a stale preview
+    /// overwrite a newer one on screen.
+    func testNonAdvancingPreviewPublicationIsRejected() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let preview = context.root.appendingPathComponent("preview.ply")
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(previewPublicationOverrides: [2, 2]),
+                    stderr: ""
+                ),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                previewPath: preview,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected a protocol failure for a repeated preview publication")
+        } catch {
+            XCTAssertTrue("\(error)".contains("preview_published"))
+        }
+    }
+
+    func testPreviewIntervalWithoutAPreviewPathIsRejected() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let mock = MockSubprocessRunner(scripts: [])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                previewIntervalSeconds: 15,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected a rejection for an interval with no preview path")
+        } catch {
+            XCTAssertTrue("\(error)".contains("preview"))
+        }
+    }
+
     func testRunTrainForwardsExplicitReferenceBudget() async throws {
         let context = try makeContext()
         defer { context.cleanup() }
@@ -1895,9 +2140,13 @@ private extension MsplatRunner {
         iterationLimit: Int? = nil,
         plateauWindow: Int? = nil,
         memoryBudgetBytes: Int64,
+        previewPath: URL? = nil,
+        previewIntervalSeconds: Int? = nil,
         onProgress: @escaping @Sendable (MsplatTrainingProgress) -> Void = { _ in },
         onCheckpoint: @escaping @Sendable (MsplatCheckpointReceipt) -> Void = { _ in },
         onRasterFallback: @escaping @Sendable (MsplatRasterFallback) -> Void = { _ in },
+        onPreview: @escaping @Sendable (MsplatPreviewReceipt) -> Void = { _ in },
+        onPreviewDisabled: @escaping @Sendable (String) -> Void = { _ in },
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws -> MsplatTrainingResult {
         try await runTrain(
@@ -1912,9 +2161,13 @@ private extension MsplatRunner {
             iterationLimit: iterationLimit,
             plateauWindow: plateauWindow,
             memoryBudgetBytes: memoryBudgetBytes,
+            previewPath: previewPath,
+            previewIntervalSeconds: previewIntervalSeconds,
             onProgress: onProgress,
             onCheckpoint: onCheckpoint,
             onRasterFallback: onRasterFallback,
+            onPreview: onPreview,
+            onPreviewDisabled: onPreviewDisabled,
             onLog: onLog
         )
     }
@@ -2002,7 +2255,9 @@ private func validEvents(
     rasterFallbackCount: Int = 0,
     includeRasterReplay: Bool = false,
     droppedIntersectionCount: Int = 0,
-    memoryBudgetBytes: Int64 = testMemoryBudgetBytes
+    memoryBudgetBytes: Int64 = testMemoryBudgetBytes,
+    previewCount: Int = 0,
+    previewPublicationOverrides: [Int]? = nil
 ) -> String {
     let checkpoint = checkpoint ?? MsplatCheckpointReceipt(
         iteration: 0,
@@ -2083,11 +2338,25 @@ private func validEvents(
     let progressRecord = """
     {"elapsed_seconds":2.5,"eta_seconds":2.5,"event":"progress","gaussian_count":1000,"iteration":\(progressIteration),"iteration_limit":\(limit),"iterations_per_second":1400\(lossFields),"schema_version":2,"sequence":\(progressSequence)}
     """
+    // Previews sit between the last progress record and completion, which is where
+    // the trainer emits them: after a synchronized window, before the run ends.
+    let publications = previewPublicationOverrides ?? Array(1...max(previewCount, 1))
+    let effectivePreviewCount = previewPublicationOverrides?.count ?? previewCount
+    let previewRecords = (0..<effectivePreviewCount).map { index -> String in
+        let sequence = progressSequence + 1 + index
+        let publication = publications[index]
+        return """
+        {"event":"preview_published","iteration":\(progressIteration),"preview_bytes":4096,"preview_gaussian_count":400,"preview_publication":\(publication),"preview_schema":1,"preview_sha256":"\(testPayloadDigest)","scene_center":[1.25,-2.5,3.75],"scene_radius":8.5,"schema_version":2,"sequence":\(sequence),"source_gaussian_count":1000}
+        """ + "\n"
+    }.joined()
+    let effectiveCompletionSequence = effectivePreviewCount > 0
+        ? progressSequence + effectivePreviewCount + 1
+        : completionSequence
     let completedRecord = """
-    {"dropped_intersection_count":\(droppedIntersectionCount),"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(fixtureOutputData.count)\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","raster_exact_buffer_bytes_added":\(completedBytesAdded),"raster_exact_buffer_growth_count":\(completedGrowthCount),"raster_exact_fallback_elapsed_seconds":\(completedExactFallbackElapsed),"raster_fallback_count":\(completedRasterFallbackCount),"raster_peak_exact_intersection_capacity":\(completedPeakCapacity),"raster_replay_elapsed_seconds":\(completedReplayElapsed),"scene_center":[1.25,-2.5,3.75],"scene_radius":8.5,"schema_version":2,"seed":\(seed),"sequence":\(completionSequence),"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"dropped_intersection_count":\(droppedIntersectionCount),"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(fixtureOutputData.count)\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","raster_exact_buffer_bytes_added":\(completedBytesAdded),"raster_exact_buffer_growth_count":\(completedGrowthCount),"raster_exact_fallback_elapsed_seconds":\(completedExactFallbackElapsed),"raster_fallback_count":\(completedRasterFallbackCount),"raster_peak_exact_intersection_capacity":\(completedPeakCapacity),"raster_replay_elapsed_seconds":\(completedReplayElapsed),"scene_center":[1.25,-2.5,3.75],"scene_radius":8.5,"schema_version":2,"seed":\(seed),"sequence":\(effectiveCompletionSequence),"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     """
     return startedEvent + "\n" + checkpointRecord + "\n" + replayEvent + fallbackEvent
-        + progressRecord + "\n" + completedRecord + "\n"
+        + progressRecord + "\n" + previewRecords + completedRecord + "\n"
 }
 
 private let fixtureOutputData: Data = {

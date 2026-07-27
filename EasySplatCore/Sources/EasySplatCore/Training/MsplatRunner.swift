@@ -35,6 +35,39 @@ public struct MsplatTrainingProgress: Sendable, Equatable {
     public let lossIteration: Int?
 }
 
+/// A published training preview. The preview is a display cache, never an artifact:
+/// nothing durable is derived from it, and losing one costs a redraw.
+public struct MsplatPreviewReceipt: Sendable, Equatable {
+    public let iteration: Int
+    public let publication: Int
+    public let previewGaussianCount: Int
+    public let sourceGaussianCount: Int
+    public let bytes: Int64
+    public let sha256: String
+    /// Extent of the published gaussians, in published coordinates. The viewer
+    /// rejects a scene that cannot name its own bounds, so this travels with the
+    /// preview rather than being recomputed from the file.
+    public let sceneBounds: SplatSceneBounds
+
+    public init(
+        iteration: Int,
+        publication: Int,
+        previewGaussianCount: Int,
+        sourceGaussianCount: Int,
+        bytes: Int64,
+        sha256: String,
+        sceneBounds: SplatSceneBounds
+    ) {
+        self.iteration = iteration
+        self.publication = publication
+        self.previewGaussianCount = previewGaussianCount
+        self.sourceGaussianCount = sourceGaussianCount
+        self.bytes = bytes
+        self.sha256 = sha256
+        self.sceneBounds = sceneBounds
+    }
+}
+
 public struct MsplatRasterFallback: Sendable, Equatable {
     public let iteration: Int
     public let fallbackCount: Int
@@ -179,9 +212,13 @@ public final class MsplatRunner: Sendable {
         iterationLimit: Int? = nil,
         plateauWindow: Int? = nil,
         memoryBudgetBytes: Int64,
+        previewPath: URL? = nil,
+        previewIntervalSeconds: Int? = nil,
         onProgress: @escaping @Sendable (MsplatTrainingProgress) -> Void = { _ in },
         onCheckpoint: @escaping @Sendable (MsplatCheckpointReceipt) -> Void = { _ in },
         onRasterFallback: @escaping @Sendable (MsplatRasterFallback) -> Void = { _ in },
+        onPreview: @escaping @Sendable (MsplatPreviewReceipt) -> Void = { _ in },
+        onPreviewDisabled: @escaping @Sendable (String) -> Void = { _ in },
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws -> MsplatTrainingResult {
         let fileManager = FileManager.default
@@ -262,6 +299,40 @@ public final class MsplatRunner: Sendable {
         if let resumeFrom {
             arguments.append(contentsOf: ["--resume", resumeFrom.path])
         }
+        if let previewPath {
+            // The trainer only ever sees the staging output, so its own collision
+            // check cannot see the durable one. Catch the alias here or a preview
+            // publication could replace a finished splat from an earlier run.
+            let previewStandard = previewPath.standardizedFileURL.resolvingSymlinksInPath()
+            if previewStandard
+                == outputPath.standardizedFileURL.resolvingSymlinksInPath() {
+                throw MsplatEventProtocolError("preview path collides with the final output")
+            }
+            // Containment, not equality: a preview written to dataset/sparse/0/x.ply
+            // would be renamed over retained input the run is required to preserve.
+            for (tree, name) in [
+                (checkpointPath, "the checkpoint directory"),
+                (datasetPath, "the dataset"),
+            ] {
+                let root = tree.standardizedFileURL.resolvingSymlinksInPath()
+                if previewStandard == root
+                    || previewStandard.pathComponents.starts(with: root.pathComponents) {
+                    throw MsplatEventProtocolError("preview path collides with \(name)")
+                }
+            }
+            try fileManager.createDirectory(
+                at: previewPath.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            arguments.append(contentsOf: ["--preview-output", previewPath.path])
+            if let previewIntervalSeconds {
+                arguments.append(contentsOf: [
+                    "--preview-interval-seconds", String(previewIntervalSeconds),
+                ])
+            }
+        } else if previewIntervalSeconds != nil {
+            throw MsplatEventProtocolError("preview interval requires a preview path")
+        }
         let events = MsplatEventStream(
             contract: contract,
             seed: seed,
@@ -271,7 +342,9 @@ public final class MsplatRunner: Sendable {
             resumeRequested: resumeFrom != nil,
             onProgress: onProgress,
             onCheckpoint: onCheckpoint,
-            onRasterFallback: onRasterFallback
+            onRasterFallback: onRasterFallback,
+            onPreview: onPreview,
+            onPreviewDisabled: onPreviewDisabled
         )
 
         onLog("EasySplat: running native splat training", false)
@@ -506,6 +579,12 @@ private struct MsplatNativeEvent: Decodable {
     let recommendedWorkingSetBytes: Int64?
     let sceneCenter: [Double]?
     let sceneRadius: Double?
+    let previewSchema: Int?
+    let previewPublication: Int?
+    let previewGaussianCount: Int?
+    let sourceGaussianCount: Int?
+    let previewBytes: Int64?
+    let previewSHA256: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -562,6 +641,12 @@ private struct MsplatNativeEvent: Decodable {
         case recommendedWorkingSetBytes = "recommended_working_set_bytes"
         case sceneCenter = "scene_center"
         case sceneRadius = "scene_radius"
+        case previewSchema = "preview_schema"
+        case previewPublication = "preview_publication"
+        case previewGaussianCount = "preview_gaussian_count"
+        case sourceGaussianCount = "source_gaussian_count"
+        case previewBytes = "preview_bytes"
+        case previewSHA256 = "preview_sha256"
     }
 
     private enum Field: String, Hashable {
@@ -619,6 +704,12 @@ private struct MsplatNativeEvent: Decodable {
         case sceneCenter = "scene_center"
         case sceneRadius = "scene_radius"
         case lastImprovementIteration = "last_improvement_iteration"
+        case previewSchema = "preview_schema"
+        case previewPublication = "preview_publication"
+        case previewGaussianCount = "preview_gaussian_count"
+        case sourceGaussianCount = "source_gaussian_count"
+        case previewBytes = "preview_bytes"
+        case previewSHA256 = "preview_sha256"
     }
 
     private static let envelopeFields: Set<Field> = [
@@ -648,6 +739,14 @@ private struct MsplatNativeEvent: Decodable {
     private static let progressFields: Set<Field> = [
         .elapsedSeconds, .etaSeconds, .gaussianCount, .iteration, .iterationLimit,
         .iterationsPerSecond, .loss, .lossIteration,
+    ]
+    private static let previewPublishedFields: Set<Field> = [
+        .iteration, .previewBytes, .previewGaussianCount, .previewPublication,
+        .previewSchema, .previewSHA256, .sceneCenter, .sceneRadius,
+        .sourceGaussianCount,
+    ]
+    private static let previewDisabledFields: Set<Field> = [
+        .iteration, .reason,
     ]
     private static let earlyStopFields: Set<Field> = [
         .iteration, .lastImprovementIteration, .loss, .lossIteration, .plateauWindow,
@@ -717,6 +816,10 @@ private struct MsplatNativeEvent: Decodable {
             eventFields = checkpointFields
         case "progress":
             eventFields = progressFields
+        case "preview_published":
+            eventFields = previewPublishedFields
+        case "preview_disabled":
+            eventFields = previewDisabledFields
         case "early_stop":
             eventFields = earlyStopFields
         case "raster_replay":
@@ -765,6 +868,8 @@ private final class MsplatEventStream: @unchecked Sendable {
     private let onProgress: @Sendable (MsplatTrainingProgress) -> Void
     private let onCheckpoint: @Sendable (MsplatCheckpointReceipt) -> Void
     private let onRasterFallback: @Sendable (MsplatRasterFallback) -> Void
+    private let onPreview: @Sendable (MsplatPreviewReceipt) -> Void
+    private let onPreviewDisabled: @Sendable (String) -> Void
     private var nextSequence: UInt64 = 1
     private var started = false
     private var completed = false
@@ -792,6 +897,7 @@ private final class MsplatEventStream: @unchecked Sendable {
     private var rasterExactBufferBytesAdded: Int64 = 0
     private var rasterReplayElapsedSeconds = 0.0
     private var rasterPeakExactIntersectionCapacity: Int64 = 0
+    private var lastPreviewPublication = 0
 
     init(
         contract: MsplatProfileContract,
@@ -802,7 +908,9 @@ private final class MsplatEventStream: @unchecked Sendable {
         resumeRequested: Bool,
         onProgress: @escaping @Sendable (MsplatTrainingProgress) -> Void,
         onCheckpoint: @escaping @Sendable (MsplatCheckpointReceipt) -> Void,
-        onRasterFallback: @escaping @Sendable (MsplatRasterFallback) -> Void
+        onRasterFallback: @escaping @Sendable (MsplatRasterFallback) -> Void,
+        onPreview: @escaping @Sendable (MsplatPreviewReceipt) -> Void,
+        onPreviewDisabled: @escaping @Sendable (String) -> Void
     ) {
         self.contract = contract
         self.seed = seed
@@ -813,6 +921,8 @@ private final class MsplatEventStream: @unchecked Sendable {
         self.onProgress = onProgress
         self.onCheckpoint = onCheckpoint
         self.onRasterFallback = onRasterFallback
+        self.onPreview = onPreview
+        self.onPreviewDisabled = onPreviewDisabled
     }
 
     var consumedLineCount: Int {
@@ -838,6 +948,12 @@ private final class MsplatEventStream: @unchecked Sendable {
                 }
                 if let rasterFallback = effect?.rasterFallback {
                     onRasterFallback(rasterFallback)
+                }
+                if let preview = effect?.preview {
+                    onPreview(preview)
+                }
+                if let previewDisabled = effect?.previewDisabled {
+                    onPreviewDisabled(previewDisabled)
                 }
             } catch {
                 failure = error is MsplatEventProtocolError
@@ -1223,6 +1339,65 @@ private final class MsplatEventStream: @unchecked Sendable {
                     lossIteration: event.lossIteration
                 )
             )
+        case "preview_published":
+            // Deliberately does not advance lastIteration: previews are published
+            // between progress records and must not perturb the training sequence.
+            guard started,
+                  event.previewSchema == 1,
+                  let iteration = event.iteration,
+                  let publication = event.previewPublication,
+                  let previewGaussianCount = event.previewGaussianCount,
+                  let sourceGaussianCount = event.sourceGaussianCount,
+                  let bytes = event.previewBytes,
+                  let sha256 = event.previewSHA256,
+                  iteration > 0,
+                  iteration <= contract.iterationLimit,
+                  publication > lastPreviewPublication,
+                  previewGaussianCount > 0,
+                  sourceGaussianCount > 0,
+                  previewGaussianCount <= sourceGaussianCount,
+                  bytes > 0,
+                  isSHA256(sha256),
+                  // The viewer refuses a scene without authenticated bounds, so a
+                  // preview that cannot describe its own extent is not renderable.
+                  let sceneCenter = event.sceneCenter,
+                  sceneCenter.count == 3,
+                  sceneCenter.allSatisfy(\.isFinite),
+                  let sceneRadius = event.sceneRadius,
+                  sceneRadius.isFinite,
+                  sceneRadius > 0 else {
+                throw MsplatEventProtocolError("event preview_published record is invalid")
+            }
+            lastPreviewPublication = publication
+            return AcceptedEffect(
+                preview: MsplatPreviewReceipt(
+                    iteration: iteration,
+                    publication: publication,
+                    previewGaussianCount: previewGaussianCount,
+                    sourceGaussianCount: sourceGaussianCount,
+                    bytes: bytes,
+                    sha256: sha256,
+                    sceneBounds: SplatSceneBounds(
+                        center: .init(x: sceneCenter[0], y: sceneCenter[1], z: sceneCenter[2]),
+                        radius: sceneRadius
+                    )
+                )
+            )
+        case "preview_disabled":
+            // The trainer gave up on previews for the rest of this run. Training is
+            // unaffected, so this carries no effect beyond validation.
+            guard started,
+                  let iteration = event.iteration,
+                  iteration > 0,
+                  iteration <= contract.iterationLimit,
+                  let reason = event.reason,
+                  !reason.isEmpty else {
+                throw MsplatEventProtocolError("event preview_disabled record is invalid")
+            }
+            // Training is unaffected, but any preview already on screen is now
+            // frozen. Propagated so the app can stop presenting a stale model as
+            // the live one.
+            return AcceptedEffect(previewDisabled: reason)
         case "early_stop":
             guard started,
                   earlyStopIteration == nil,
@@ -1558,15 +1733,21 @@ private final class MsplatEventStream: @unchecked Sendable {
         let progress: MsplatTrainingProgress?
         let checkpoint: MsplatCheckpointReceipt?
         let rasterFallback: MsplatRasterFallback?
+        let preview: MsplatPreviewReceipt?
+        let previewDisabled: String?
 
         init(
             progress: MsplatTrainingProgress? = nil,
             checkpoint: MsplatCheckpointReceipt? = nil,
-            rasterFallback: MsplatRasterFallback? = nil
+            rasterFallback: MsplatRasterFallback? = nil,
+            preview: MsplatPreviewReceipt? = nil,
+            previewDisabled: String? = nil
         ) {
             self.progress = progress
             self.checkpoint = checkpoint
             self.rasterFallback = rasterFallback
+            self.preview = preview
+            self.previewDisabled = previewDisabled
         }
     }
 }

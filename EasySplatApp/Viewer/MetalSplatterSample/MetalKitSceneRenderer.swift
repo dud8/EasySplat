@@ -207,6 +207,10 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var interactionRevision: UInt64 { cameraState.interactionRevision }
 
     private(set) var drawableSize: CGSize = .zero
+    /// Subordinate mode: the scene is a live training preview sharing the GPU with
+    /// the trainer that produced it, so this view yields rather than competes.
+    var isTrainingPreview = false
+    private var lastPreviewDrawTime: CFTimeInterval?
     private static let modelLoadExecutor = SerialModelLoadExecutor(
         queue: DispatchQueue(label: "com.easysplat.model-load", qos: .userInitiated)
     )
@@ -281,12 +285,19 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let hostObservation = try? LiveTrainingResourceObserver().observe()
         let installedMemoryBytes = hostObservation?.installedMemoryBytes
             ?? ProcessInfo.processInfo.physicalMemory
+        // A training preview shares the machine with the trainer that produced it,
+        // so a failed observation must not be read as calm here: assuming normal
+        // would let the preview allocate into headroom training is about to need.
+        // The result viewer keeps its existing optimistic default — nothing is
+        // competing with it.
+        let observedPressure = hostObservation?.memoryPressure
+            ?? (isTrainingPreview ? .unknown : .normal)
         let maximumWorkingSetBytes = ViewerMemoryAdmissionPolicy.resolveBudgetBytes(
             physicalMemoryBytes: installedMemoryBytes,
             recommendedMaxWorkingSetBytes: device.value.recommendedMaxWorkingSetSize,
             currentAllocatedBytes: UInt64(max(0, device.value.currentAllocatedSize)),
             availableHostMemoryBytes: hostObservation?.availableHostMemoryBytes,
-            memoryPressure: hostObservation?.memoryPressure ?? .normal
+            memoryPressure: observedPressure
         )
         let maximumRecoverableWorkingSetBytes =
             ViewerMemoryAdmissionPolicy.resolveMaximumRecoverableBytes(
@@ -357,6 +368,17 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         // In continuous flight mode the view's own timer drives frames;
         // explicit draws on top would double-schedule.
         guard metalKitView.isPaused else { return }
+        if isTrainingPreview {
+            // Every draw resorts the scene on the CPU and submits Metal work. While
+            // training holds the GPU, a dropped intermediate frame costs the user
+            // nothing; stealing the cycle from the trainer costs them the run.
+            let now = CACurrentMediaTime()
+            let minimumInterval = 1.0 / Double(Constants.trainingPreviewFramesPerSecond)
+            if let lastPreviewDrawTime, now - lastPreviewDrawTime < minimumInterval {
+                return
+            }
+            lastPreviewDrawTime = now
+        }
         metalKitView.draw()
     }
 
@@ -364,6 +386,9 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     /// on release it returns to on-demand drawing with one final frame so the
     /// splat sort settles on the resting camera.
     func setMovementInput(_ keys: Set<ViewerMovementKey>, isSprinting: Bool) {
+        // Sustained 60 fps flight is the single most expensive thing this view can
+        // do. A preview is for looking, not travelling, so it never enters flight.
+        guard !isTrainingPreview else { return }
         let wasFlying = !heldMovementKeys.isEmpty
         heldMovementKeys = keys
         isSprintKeyHeld = isSprinting

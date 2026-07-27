@@ -76,6 +76,14 @@ public final class PipelineRunner: @unchecked Sendable {
         }
     }
 
+    /// Whether a run may publish live training previews. Defaults to `.disabled`, so
+    /// only a caller that deliberately asks for previews pays for them — measurement
+    /// and benchmark paths cannot enable one by omission.
+    public enum TrainingPreviewPolicy: String, Sendable, Equatable {
+        case disabled
+        case enabled
+    }
+
     public struct PipelineConfig: Sendable {
         public var toolchain: ToolchainPaths
         public var developmentOverrides: DevelopmentOverrides
@@ -83,6 +91,7 @@ public final class PipelineRunner: @unchecked Sendable {
         public var resolvedRunPlan: ResolvedRunPlan?
         public var prePipelineDurationSeconds: TimeInterval
         public var prePipelineStartedAt: Date?
+        public var trainingPreviewPolicy: TrainingPreviewPolicy
 
         public init(
             toolchain: ToolchainPaths,
@@ -90,7 +99,8 @@ public final class PipelineRunner: @unchecked Sendable {
             hardwareProfile: HardwareProfile? = nil,
             resolvedRunPlan: ResolvedRunPlan? = nil,
             prePipelineDurationSeconds: TimeInterval = 0,
-            prePipelineStartedAt: Date? = nil
+            prePipelineStartedAt: Date? = nil,
+            trainingPreviewPolicy: TrainingPreviewPolicy = .disabled
         ) {
             self.toolchain = toolchain
             self.developmentOverrides = developmentOverrides
@@ -98,6 +108,7 @@ public final class PipelineRunner: @unchecked Sendable {
             self.resolvedRunPlan = resolvedRunPlan
             self.prePipelineDurationSeconds = prePipelineDurationSeconds
             self.prePipelineStartedAt = prePipelineStartedAt
+            self.trainingPreviewPolicy = trainingPreviewPolicy
         }
     }
 
@@ -4843,6 +4854,36 @@ public final class PipelineRunner: @unchecked Sendable {
                             line: "Training admitted \(ByteCountFormatter.string(fromByteCount: admittedBudget, countStyle: .memory)) from current unified-memory capacity.",
                             isError: false
                         ))
+
+                        // Spend only headroom the trainer was not given. The permit is
+                        // resolved here, after the trainer's budget is settled, so a
+                        // preview can never bid against reconstruction quality.
+                        let previewPermit: TrainingPreviewPermit
+                        switch self.config.trainingPreviewPolicy {
+                        case .disabled:
+                            previewPermit = .refused(.insufficientSurplus)
+                        case .enabled:
+                            previewPermit = TrainingPreviewAdmissionPolicy.evaluate(
+                                admission: resourceAdmission,
+                                admittedTrainerBytes: admittedBudget,
+                                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                                memoryPressure: resourceAdmission.observation.memoryPressure
+                            )
+                        }
+                        let previewURL = previewPermit.isGranted ? paths.msplatPreviewURL : nil
+                        if self.config.trainingPreviewPolicy == .enabled,
+                           let refusal = previewPermit.refusal {
+                            emit(.stageLog(
+                                stage: .trainSplat,
+                                line: "Live preview withheld this run (\(refusal.rawValue)); training is unaffected.",
+                                isError: false
+                            ))
+                        }
+                        // A preview left over from an earlier attempt describes a model
+                        // that no longer exists. Existence on disk grants no authority,
+                        // and a crashed publication can have stranded a temporary too.
+                        try? self.removeTrainingPreviewPayload(paths: paths)
+
                         do {
                             let result = try await self.tooling.msplat.runTrain(
                                 msplatPath: msplatPath,
@@ -4856,6 +4897,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 iterationLimit: resolvedRunPlan.trainerIterationLimit,
                                 plateauWindow: resolvedRunPlan.plateauWindow,
                                 memoryBudgetBytes: admittedBudget,
+                                previewPath: previewURL,
                                 onProgress: { progress in
                                     let fraction = Double(progress.iteration) / Double(progress.iterationLimit)
                                     emit(.stageProgress(
@@ -4890,6 +4932,19 @@ public final class PipelineRunner: @unchecked Sendable {
                                         line: "Exact raster fallback \(fallback.fallbackCount): \(fallback.intersectionCount.formatted()) intersections, \(ByteCountFormatter.string(fromByteCount: fallback.allocationBytes, countStyle: .memory)).",
                                         isError: false
                                     ))
+                                },
+                                onPreview: { receipt in
+                                    guard let previewURL else { return }
+                                    emit(.trainingPreviewPublished(
+                                        url: previewURL,
+                                        iteration: receipt.iteration,
+                                        publication: receipt.publication,
+                                        sceneBounds: receipt.sceneBounds
+                                    ))
+                                },
+                                onPreviewDisabled: { reason in
+                                    guard previewURL != nil else { return }
+                                    emit(.trainingPreviewDisabled(reason: reason))
                                 },
                                 onLog: { line, isErr in
                                     msplatToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)

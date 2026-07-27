@@ -17,7 +17,7 @@ The app uses one `NavigationSplitView`:
 - workspace: new project, processing, recovery, or result;
 - inspector: selected project and measured result facts.
 
-Only one reconstruction may run. Disable New Splat while it is active. Do not imply concurrent GPU work.
+Only one reconstruction may run. Disable New Splat while it is active. Do not imply concurrent GPU work — with one exception: the Train phase may preview the run in flight. The preview is subordinate to the run that produced it, never a second job, and it yields the GPU rather than competing for it.
 
 Accent color belongs to selection, active progress, and the primary action — nowhere else. Sidebar filter, sort, and row actions render in label colors, not accent.
 
@@ -70,6 +70,8 @@ Show:
 While a run is active the window subtitle mirrors the step, so Mission Control and the Dock name the phase without raising the window.
 
 Stage-local progress must not masquerade as overall completion. Backend names and raw logs stay in Technical Details.
+
+While training, the workspace may show a live preview of the splat. It is off with one command and remembered. When it is on, the canvas takes the workspace and the phase heading, rail, progress, and timing move onto it in one system-material panel — one panel, not several. The preview is thinned and trails the model, so it says so; it never names an iteration and never reads as the finished result. A run that cannot spare the memory withholds it and says why in Technical Details, and training is unaffected either way.
 
 Outside the window, the Dock icon carries a progress bar only for stages with real fractional progress, and a notification fires when a run finishes or fails while the app is in the background. A user-initiated stop never notifies.
 

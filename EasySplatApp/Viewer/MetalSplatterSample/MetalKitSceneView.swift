@@ -314,6 +314,7 @@ struct MetalKitSceneView: NSViewRepresentable {
     var loadAttemptRevision: Int = 0
     var controller: SplatViewerController
     var sceneConfiguration = SplatViewerSceneConfiguration()
+    var isTrainingPreview: Bool = false
     var onLoadStateChanged: ((SplatViewerLoadState) -> Void)?
 
     @MainActor
@@ -617,6 +618,7 @@ struct MetalKitSceneView: NSViewRepresentable {
             return metalKitView
         }
         context.coordinator.renderer = renderer
+        renderer.isTrainingPreview = isTrainingPreview
         controller.renderer = renderer
         renderer.onSortFailure = { [weak controller] message in
             controller?.recordSortFailure(message)
@@ -683,6 +685,7 @@ struct MetalKitSceneView: NSViewRepresentable {
     func updateNSView(_ view: MTKView, context: NSViewRepresentableContext<MetalKitSceneView>) {
         context.coordinator.controller = controller
         context.coordinator.onLoadStateChanged = onLoadStateChanged
+        context.coordinator.renderer?.isTrainingPreview = isTrainingPreview
         loadIfNeeded(context: context)
     }
 

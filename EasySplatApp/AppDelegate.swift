@@ -246,6 +246,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         inspectorItem.keyEquivalentModifierMask = [.command, .control]
         inspectorItem.target = self
         viewMenu.addItem(inspectorItem)
+        let trainingPreviewItem = NSMenuItem(
+            title: "Show Preview",
+            action: #selector(toggleTrainingPreview(_:)),
+            keyEquivalent: "p"
+        )
+        trainingPreviewItem.keyEquivalentModifierMask = [.command, .control]
+        trainingPreviewItem.target = self
+        viewMenu.addItem(trainingPreviewItem)
         viewMenu.addItem(.separator())
         let showOriginalItem = NSMenuItem(
             title: "Show Original",
@@ -319,6 +327,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             menuItem.title = model.isResultInspectorPresented ? "Hide Inspector" : "Show Inspector"
             return model.viewState == .viewer
         }
+        if menuItem.action == #selector(toggleTrainingPreview(_:)) {
+            menuItem.title = ProcessingView.previewToggleTitle(
+                isShown: model.isTrainingPreviewShown,
+                isAvailable: model.isTrainingPreviewAvailable
+            )
+            return model.isTrainingPreviewAvailable
+        }
         if menuItem.action == #selector(showOriginal(_:)) {
             menuItem.state = model.selectedSplatOutputVariant == .original
                 ? .on
@@ -349,6 +364,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             model.isResultInspectorPresented,
             forKey: ViewerView.inspectorPreferenceKey
         )
+    }
+
+    @objc private func toggleTrainingPreview(_ sender: Any?) {
+        guard model.isTrainingPreviewAvailable else { return }
+        model.setTrainingPreviewShown(!model.isTrainingPreviewShown)
     }
 
     @objc private func showOriginal(_ sender: Any?) {

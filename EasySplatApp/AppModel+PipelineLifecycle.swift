@@ -1154,6 +1154,7 @@ extension AppModel {
         // when reset() runs as part of app teardown).
         let notesSaved = flushPendingNotesSave()
         outputPlyURL = nil
+        clearTrainingPreview()
         currentStageTimings = []
         currentCreateToViewerReadySeconds = nil
         currentOutputPlyInfo = nil
@@ -1271,7 +1272,13 @@ extension AppModel {
             hardwareProfile: hardwareProfile,
             resolvedRunPlan: resolvedRunPlan,
             prePipelineDurationSeconds: prePipelineDurationSeconds,
-            prePipelineStartedAt: prePipelineStartedAt
+            prePipelineStartedAt: prePipelineStartedAt,
+            // Deliberately not tied to the display preference. Publication is what
+            // the run can afford; showing is what the user wants to look at. Binding
+            // them made Show Preview inert for any run started while hidden, and the
+            // publication itself is the cheap half. Admission still decides whether
+            // any preview is produced at all.
+            trainingPreviewPolicy: .enabled
         )
     }
 

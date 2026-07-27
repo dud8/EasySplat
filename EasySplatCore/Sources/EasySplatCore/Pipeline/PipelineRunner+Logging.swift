@@ -344,6 +344,10 @@ final class PipelineLogger: @unchecked Sendable {
 
     func emit(_ event: PipelineEvent) {
         emit(event)
+        // Training previews are a display cache republished every few seconds. They
+        // describe no durable state, so recording them would only dilute the run's
+        // forensic record and grow events.jsonl for nothing.
+        if case .trainingPreviewPublished = event { return }
         lock.lock()
         appendEvent(event)
         switch event {
@@ -355,6 +359,16 @@ final class PipelineLogger: @unchecked Sendable {
             appendLogLine(stage: stage, line: line, isError: isError)
         case let .stageFinished(stage):
             appendLogLine(stage: stage, line: "Stage finished", isError: false)
+        case .trainingPreviewPublished:
+            break   // returned above; kept here so the switch stays exhaustive
+        case .trainingPreviewDisabled(let reason):
+            // Unlike a publication this is worth recording once: it explains why
+            // the preview stopped updating for the rest of the run.
+            appendLogLine(
+                stage: .trainSplat,
+                line: "Live preview stopped: \(reason). Training is unaffected.",
+                isError: false
+            )
         case let .pipelineFailed(stage, userMessage, debugMessage):
             appendLogLine(stage: stage, line: userMessage, isError: true)
             // Diagnostic bundles carry this log but not events.jsonl, so a

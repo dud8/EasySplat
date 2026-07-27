@@ -97,6 +97,24 @@ final class AppModel: ObservableObject {
     @Published var isRunActive = false
     @Published var actionFailure: ActionFailurePresentation?
 
+    /// Live training preview. `trainingPreviewPublication` is the reload token: the
+    /// URL is republished in place, so identity has to come from the counter rather
+    /// than the path.
+    @Published var trainingPreviewURL: URL? = nil
+    @Published var trainingPreviewIteration: Int = 0
+    @Published var trainingPreviewPublication: Int = 0
+    @Published var trainingPreviewSceneBounds: SplatSceneBounds? = nil
+    /// Latched once memory pressure has been seen to leave normal during a run.
+    /// The permit granted before launch describes one instant; the preview is the
+    /// expendable party, so it stays down for the rest of the run rather than
+    /// flapping back in and bidding against the trainer again.
+    @Published private(set) var isTrainingPreviewMemoryRefused = false
+    let memoryPressureProbe: @Sendable () -> MemoryPressureState
+    var trainingPreviewMemoryWatch: (any DispatchSourceMemoryPressure)?
+    /// User's display preference. Independent of whether a preview exists: the run
+    /// may have been refused a preview, and the user may hide one that does.
+    @Published var isTrainingPreviewShown = AppModel.storedTrainingPreviewPreference()
+
     /// How the active run was started. Fresh runs are the only ones the
     /// historical duration estimate describes; resumes and retrains skip
     /// stages and would make it misleading.
@@ -266,6 +284,94 @@ final class AppModel: ObservableObject {
         stage == .trainSplat
     }
 
+    /// A preview is only worth showing while the model it depicts is still being
+    /// trained; once the run leaves training the real result takes over.
+    var isTrainingPreviewVisible: Bool {
+        isTrainingPreviewAvailable && isTrainingPreviewShown
+    }
+
+    /// Whether this run has a preview to show at all. A run can be refused one for
+    /// memory, or release it after a failed load, and the control must not offer to
+    /// show something that does not exist.
+    var isTrainingPreviewAvailable: Bool {
+        isTrainingStageActive && trainingPreviewURL != nil
+            && trainingPreviewSceneBounds != nil && lastError == nil
+    }
+
+    nonisolated static let trainingPreviewPreferenceKey = "EasySplatTrainingPreviewShown"
+
+    /// Defaults to on: a user who has never chosen benefits most from seeing the
+    /// splat form, and the run withholds the preview on its own when it cannot
+    /// afford one.
+    nonisolated static func storedTrainingPreviewPreference() -> Bool {
+        UserDefaults.standard.object(forKey: trainingPreviewPreferenceKey) as? Bool ?? true
+    }
+
+    func setTrainingPreviewShown(_ shown: Bool) {
+        isTrainingPreviewShown = shown
+        UserDefaults.standard.set(shown, forKey: Self.trainingPreviewPreferenceKey)
+    }
+
+    /// Drops the preview identity so a stale file from a previous run can never be
+    /// mounted against the next one. The display preference deliberately survives.
+    func clearTrainingPreview() {
+        stopTrainingPreviewMemoryWatch()
+        trainingPreviewURL = nil
+        trainingPreviewIteration = 0
+        trainingPreviewPublication = 0
+        trainingPreviewSceneBounds = nil
+        isTrainingPreviewMemoryRefused = false
+    }
+
+    /// Re-tests memory pressure before a new preview generation is mounted, and
+    /// unmounts the resident one the first time pressure leaves normal. Returns
+    /// whether the publication may be shown.
+    @discardableResult
+    func acceptTrainingPreviewUnderCurrentMemoryPressure() -> Bool {
+        guard !isTrainingPreviewMemoryRefused else { return false }
+        guard memoryPressureProbe() == .normal else {
+            releaseTrainingPreview(reason: "memory pressure")
+            return false
+        }
+        return true
+    }
+
+    /// Takes the preview down for the rest of the run and returns the workspace to
+    /// the ordinary processing screen. Latched rather than retried: a preview that
+    /// failed to load or cost memory under pressure has already shown it is the
+    /// expendable party, and retrying it competes with training again.
+    func releaseTrainingPreview(reason: String) {
+        guard trainingPreviewURL != nil || !isTrainingPreviewMemoryRefused else { return }
+        isTrainingPreviewMemoryRefused = true
+        trainingPreviewURL = nil
+        trainingPreviewSceneBounds = nil
+        appendLogLine("[Training] Live preview released (\(reason)); training is unaffected.")
+    }
+
+    /// Installs a run-scoped memory-pressure watch so the preview is released the
+    /// moment the system reports strain, not at the next publication — which may
+    /// never arrive if the trainer has stalled or stopped publishing.
+    func startTrainingPreviewMemoryWatch() {
+        stopTrainingPreviewMemoryWatch()
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.releaseTrainingPreview(reason: "memory pressure")
+            }
+        }
+        source.resume()
+        trainingPreviewMemoryWatch = source
+    }
+
+    func stopTrainingPreviewMemoryWatch() {
+        trainingPreviewMemoryWatch?.cancel()
+        trainingPreviewMemoryWatch = nil
+    }
+
     func stopFailurePresentation(for action: StopAction) -> StopFailurePresentation {
         if currentProjectURL == nil {
             return StopFailurePresentation(
@@ -365,8 +471,13 @@ final class AppModel: ObservableObject {
                 projectURL: projectURL,
                 validationDepth: .full
             )
+        },
+        memoryPressureProbe: @escaping @Sendable () -> MemoryPressureState = {
+            // A failed observation is not evidence of calm.
+            (try? LiveTrainingResourceObserver().observe())?.memoryPressure ?? .unknown
         }
     ) {
+        self.memoryPressureProbe = memoryPressureProbe
         self.toolchainManager = toolchainManager
         self.projectBaseURL = projectBaseURL
         self.hardwareProfile = hardwareProfile ?? .detect()

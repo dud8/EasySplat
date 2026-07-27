@@ -11,6 +11,17 @@ enum SplatViewerOverlayDensity {
     case compact
 }
 
+/// How much of its own chrome the viewer draws.
+///
+/// `.standard` owns the canvas and shows its own controls. `.subordinate` draws the
+/// splat and nothing else: the training preview sits under a panel that already
+/// carries the run's state, and two floating material layers on one canvas read as
+/// clutter rather than as one surface.
+enum SplatViewerPresentation {
+    case standard
+    case subordinate
+}
+
 struct SplatViewerView: View {
     let splatURL: URL
     var reloadToken: Int = 0
@@ -19,10 +30,37 @@ struct SplatViewerView: View {
     var showsLoadErrors: Bool = true
     var onLoadStateChanged: ((SplatViewerLoadState) -> Void)? = nil
     var overlayDensity: SplatViewerOverlayDensity = .regular
+    var presentation: SplatViewerPresentation = .standard
     @StateObject private var controller = SplatViewerController()
     @State private var showHelp = false
 
     var body: some View {
+        if presentation == .subordinate {
+            subordinateBody
+        } else {
+            standardBody
+        }
+    }
+
+    /// Canvas only. The host supplies status, controls, and error reporting, so
+    /// nothing here competes with it.
+    private var subordinateBody: some View {
+        MetalKitSceneView(
+            splatURL: splatURL,
+            reloadToken: reloadToken,
+            loadAttemptRevision: controller.loadAttemptRevision,
+            controller: controller,
+            sceneConfiguration: sceneConfiguration,
+            isTrainingPreview: true,
+            onLoadStateChanged: onLoadStateChanged
+        )
+        .onChange(of: resetCameraToken) { _, _ in
+            controller.resetCamera()
+        }
+    }
+
+    @ViewBuilder
+    private var standardBody: some View {
         let isCompactOverlay = overlayDensity == .compact
         let toolbarSpacing: CGFloat = isCompactOverlay ? 6 : 8
         let toolbarPadding: CGFloat = 12

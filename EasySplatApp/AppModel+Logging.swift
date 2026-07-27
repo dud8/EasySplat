@@ -7,6 +7,12 @@ extension AppModel {
         switch event {
         case .stageStarted(let stage):
             updatePhaseStart(for: stage, at: now)
+            // The watch only needs to exist while a preview can be resident.
+            if stage == .trainSplat {
+                startTrainingPreviewMemoryWatch()
+            } else if self.stage == .trainSplat {
+                stopTrainingPreviewMemoryWatch()
+            }
             self.stage = stage
             progress = nil
             statusTitle = stage.displayName
@@ -58,6 +64,23 @@ extension AppModel {
             progress = 1.0
             lastPipelineEventAt = now
             appendLogLine("[\(stage.displayName)] finished")
+        case .trainingPreviewPublished(let url, let iteration, let publication, let sceneBounds):
+            // Deliberately does not touch lastPipelineEventAt: a preview is not
+            // evidence that the run advanced, and letting it reset the silence
+            // timer would mask a stalled trainer.
+            guard isTrainingStageActive else { return }
+            // Mounting a publication is the one moment the app commits new renderer
+            // memory, so the launch-time permit is re-tested here. Training must
+            // never lose unified memory to a preview it was not admitted alongside.
+            guard acceptTrainingPreviewUnderCurrentMemoryPressure() else { return }
+            trainingPreviewURL = url
+            trainingPreviewIteration = iteration
+            trainingPreviewPublication = publication
+            trainingPreviewSceneBounds = sceneBounds
+        case .trainingPreviewDisabled(let reason):
+            // The last published frame would otherwise sit there indefinitely,
+            // reading as the current state of a model that has moved on.
+            releaseTrainingPreview(reason: reason)
         case .pipelineFailed(_, let userMessage, let debugMessage):
             if stopAction != nil {
                 return
@@ -100,7 +123,7 @@ extension AppModel {
         if stage == .trainSplat {
             // Bucketed training milestones gate on the bucket alone: an
             // advance always logs, a repeat never does.
-            if trimmed.hasPrefix("Preparing training dataset (images)"),
+            if trimmed.hasPrefix("Preparing msplat dataset (images)"),
                let ratio = parseProgressRatio(trimmed) {
                 let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
                 guard bucket != lastTrainingImagesBucket else { return }
@@ -108,7 +131,7 @@ extension AppModel {
                 appendProgressLogLine(stage: stage, message: trimmed, at: now)
                 return
             }
-            if trimmed.hasPrefix("Preparing training dataset (sparse)"),
+            if trimmed.hasPrefix("Preparing msplat dataset (sparse)"),
                let ratio = parseProgressRatio(trimmed) {
                 let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
                 guard bucket != lastTrainingSparseBucket else { return }
@@ -116,7 +139,7 @@ extension AppModel {
                 appendProgressLogLine(stage: stage, message: trimmed, at: now)
                 return
             }
-            if trimmed.hasPrefix("Training model") {
+            if trimmed.hasPrefix("Training splat") {
                 guard let ratio = parseProgressRatio(trimmed) else { return }
                 let bucket = bucketedSteps(current: ratio.current, bucketSize: trainingStepLogInterval)
                 guard bucket != lastTrainingStepsBucket else { return }
@@ -142,8 +165,12 @@ extension AppModel {
         appendLogLine("[\(stage.displayName)] \(message)")
     }
 
+    /// Reads the first `N/M` or `N of M` pair in a progress message. Both spellings
+    /// are live: dataset preparation counts with a slash, the trainer counts with
+    /// "of".
     func parseProgressRatio(_ message: String) -> (current: Int, total: Int)? {
         let chars = Array(message)
+        let separator = Array(" of ")
         var index = 0
         while index < chars.count {
             if chars[index].isNumber {
@@ -152,8 +179,14 @@ extension AppModel {
                 while end < chars.count, chars[end].isNumber || chars[end] == "," {
                     end += 1
                 }
+                var secondStart: Int?
                 if end < chars.count, chars[end] == "/" {
-                    let secondStart = end + 1
+                    secondStart = end + 1
+                } else if end + separator.count <= chars.count,
+                          Array(chars[end..<(end + separator.count)]) == separator {
+                    secondStart = end + separator.count
+                }
+                if let secondStart {
                     var secondEnd = secondStart
                     while secondEnd < chars.count, chars[secondEnd].isNumber || chars[secondEnd] == "," {
                         secondEnd += 1
