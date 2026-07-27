@@ -141,7 +141,7 @@ final class SplatRenderEncodingValidatorTests: XCTestCase {
         let encoding = try SplatRenderEncodingValidator.encode(point)
 
         XCTAssertTrue(encoding.position.allFinite)
-        XCTAssertTrue(encoding.linearColorOpacity.allFinite)
+        XCTAssertTrue(encoding.colorOpacity.allFinite)
         XCTAssertTrue(encoding.covarianceA.allFinite)
         XCTAssertTrue(encoding.covarianceB.allFinite)
         let sphericalHarmonics = try XCTUnwrap(encoding.sphericalHarmonics)

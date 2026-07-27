@@ -1204,7 +1204,7 @@ extension SplatRenderer: SplatSceneReaderDelegate {
 
 extension SplatRenderer.Splat {
     init(_ encoding: SplatRenderEncoding) {
-        let color = encoding.linearColorOpacity
+        let color = encoding.colorOpacity
         let covA = encoding.covarianceA
         let covB = encoding.covarianceB
         self.init(

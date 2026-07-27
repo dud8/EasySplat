@@ -53,20 +53,20 @@ public enum SplatRenderEncodingValidationError: LocalizedError, Sendable, Equata
 /// and every half-precision field is representable before a GPU buffer is allocated.
 public struct SplatRenderEncoding: Sendable, Equatable {
     public let position: SIMD3<Float>
-    public let linearColorOpacity: SIMD4<Float>
+    public let colorOpacity: SIMD4<Float>
     public let covarianceA: SIMD3<Float>
     public let covarianceB: SIMD3<Float>
     public let sphericalHarmonics: SplatRenderSphericalHarmonics?
 
     fileprivate init(
         position: SIMD3<Float>,
-        linearColorOpacity: SIMD4<Float>,
+        colorOpacity: SIMD4<Float>,
         covarianceA: SIMD3<Float>,
         covarianceB: SIMD3<Float>,
         sphericalHarmonics: SplatRenderSphericalHarmonics?
     ) {
         self.position = position
-        self.linearColorOpacity = linearColorOpacity
+        self.colorOpacity = colorOpacity
         self.covarianceA = covarianceA
         self.covarianceB = covarianceB
         self.sphericalHarmonics = sphericalHarmonics
@@ -154,15 +154,15 @@ public enum SplatRenderEncodingValidator {
 
         let color = try encodedColor(point.color)
         let opacity = stableSigmoid(point.opacity)
-        let linearColorOpacity = SIMD4<Float>(color.sRGBToLinear, opacity)
-        guard linearColorOpacity.allFinite,
-              linearColorOpacity.allHalfRepresentable else {
+        let colorOpacity = SIMD4<Float>(color, opacity)
+        guard colorOpacity.allFinite,
+              colorOpacity.allHalfRepresentable else {
             throw SplatRenderEncodingValidationError.unrepresentableColor
         }
 
         return SplatRenderEncoding(
             position: point.position,
-            linearColorOpacity: linearColorOpacity,
+            colorOpacity: colorOpacity,
             covarianceA: quantizedCovariance.a,
             covarianceB: quantizedCovariance.b,
             sphericalHarmonics: sphericalHarmonics(point.color)
@@ -301,15 +301,18 @@ public enum SplatRenderEncodingValidator {
         }
     }
 
+    /// Clamped below only. The trainer bounds a gaussian's colour at zero and lets the
+    /// composite saturate, so pre-clamping to 1 here would drop the contribution of a
+    /// bright gaussian at partial alpha relative to what the model was fitted against.
     private static func sphericalHarmonicColor(
         r: Float,
         g: Float,
         b: Float
     ) -> SIMD3<Float> {
         SIMD3<Float>(
-            max(0, min(1, 0.5 + sphericalHarmonicC0 * r)),
-            max(0, min(1, 0.5 + sphericalHarmonicC0 * g)),
-            max(0, min(1, 0.5 + sphericalHarmonicC0 * b))
+            max(0, 0.5 + sphericalHarmonicC0 * r),
+            max(0, 0.5 + sphericalHarmonicC0 * g),
+            max(0, 0.5 + sphericalHarmonicC0 * b)
         )
     }
 
@@ -359,14 +362,6 @@ private extension SIMD3<Float> {
 
     var allHalfRepresentable: Bool {
         Float16(x).isFinite && Float16(y).isFinite && Float16(z).isFinite
-    }
-
-    var sRGBToLinear: SIMD3<Float> {
-        SIMD3<Float>(
-            Foundation.pow(x, 2.2),
-            Foundation.pow(y, 2.2),
-            Foundation.pow(z, 2.2)
-        )
     }
 }
 

@@ -222,7 +222,12 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             viewportSize: metalKitView.bounds.size,
             verticalFOV: Float(Constants.fovy.radians)
         )
-        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
+        // Splat colours are sRGB code values and the trainer composites them in that
+        // space, so the attachment must not linearise for blending. Colour management
+        // moves to the layer instead: without an explicit colour space no matching
+        // happens at all and the bytes land unconverted on a wide-gamut display.
+        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm
+        metalKitView.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
         metalKitView.sampleCount = 1
         metalKitView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
