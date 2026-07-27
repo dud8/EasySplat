@@ -737,13 +737,25 @@ done
 for flag in --isolate --source-ply --mask-manifest --analysis-cache --expected-source-ply-digest --expected-selected-frames-digest --expected-training-manifest-digest --anchor-image --anchor-instance; do
   require_contains "$flag" "$OVERLAY"
 done
+for flag in --preview-output --preview-interval-seconds; do
+  require_contains "$flag" "$OVERLAY"
+done
+# The preview must stay degree 0 and capped: MetalSplatter rejects a partial
+# higher-order set, and an uncapped preview would bid against training for memory.
+require_contains 'previewGaussianCap = 400000' "$OVERLAY"
+require_contains 'previewPropertyCount = 17' "$OVERLAY"
+require_contains 'preview PLY does not use the degree 0 layout' "$OVERLAY"
+require_contains 'preview PLY properties are out of contract order' "$OVERLAY"
+# Bounds travel with the publication: the viewer refuses a scene it cannot bound,
+# so a preview that omits them renders blank.
+require_contains '"scene_center", publication.bounds.center' "$OVERLAY"
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
   require_absent "$flag" "$OVERLAY"
 done
 for budget in 'fast", 3000, 400' 'balanced", 7000, 800' 'high-detail", 15000, 1500'; do
   require_contains "$budget" "$OVERLAY"
 done
-for event in started checkpoint_completed checkpoint_loaded resume_rejected progress early_stop completed cancellation_requested cancelled self_check; do
+for event in started checkpoint_completed checkpoint_loaded resume_rejected progress early_stop completed cancellation_requested cancelled self_check preview_published preview_disabled; do
   require_contains "\"$event\"" "$OVERLAY"
 done
 for event in isolation_started isolation_progress isolation_ambiguity isolation_no_subject isolation_held_out_rejected isolation_completed; do
@@ -1309,6 +1321,9 @@ for flag in --dataset --output --profile --iteration-limit --plateau-window --ch
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 for flag in --isolate --source-ply --mask-manifest --analysis-cache --expected-source-ply-digest --expected-selected-frames-digest --expected-training-manifest-digest --anchor-image --anchor-instance; do
+  grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
+done
+for flag in --preview-output --preview-interval-seconds; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -3873,5 +3888,158 @@ set -e
 [ ! -e "$resume_dir/tampered.ply" ] || fail "tampered resume published output"
 grep -Eqi 'hash|size|payload' "$resume_dir/tampered.stderr" \
   || fail "tampered checkpoint diagnostic is not useful"
+
+# Real preview-enabled training. Source-level greps prove the code is present;
+# only running it proves the publisher accepts its CLI, emits loadable degree 0
+# PLYs, and reports evidence that matches the bytes on disk.
+preview_dir="$negative_dir/preview"
+mkdir -p "$preview_dir"
+"$BIN" \
+  --dataset "$fixture_root/12-clusters-1500" \
+  --output "$preview_dir/splat.ply" \
+  --preview-output "$preview_dir/preview.ply" \
+  --preview-interval-seconds 1 \
+  --profile fast \
+  --iteration-limit 20000 \
+  --plateau-window 20000 \
+  --checkpoint "$preview_dir/checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes 4000000000 \
+  --events-fd 1 \
+  >"$preview_dir/events.jsonl" 2>"$preview_dir/stderr.txt" \
+  || fail "preview-enabled training run failed"
+
+[ -f "$preview_dir/preview.ply" ] || fail "preview-enabled training published no preview"
+grep -q '"event":"preview_published"' "$preview_dir/events.jsonl" \
+  || fail "preview-enabled training emitted no preview_published event"
+# No temporary may survive a clean run.
+if find "$preview_dir" -maxdepth 1 -name '.preview.ply.preview.tmp.*' -print -quit | grep -q .; then
+  fail "preview publication left a temporary behind"
+fi
+
+python3 - "$preview_dir" <<'PY'
+import hashlib, json, pathlib, struct, sys
+
+root = pathlib.Path(sys.argv[1])
+events = [
+    json.loads(line)
+    for line in (root / "events.jsonl").read_text().splitlines()
+    if line.strip()
+]
+published = [event for event in events if event.get("event") == "preview_published"]
+if not published:
+    raise SystemExit("no preview_published events")
+
+expected_properties = [
+    "x", "y", "z",
+    "nx", "ny", "nz",
+    "f_dc_0", "f_dc_1", "f_dc_2",
+    "opacity",
+    "scale_0", "scale_1", "scale_2",
+    "rot_0", "rot_1", "rot_2", "rot_3",
+]
+
+publications = [event["preview_publication"] for event in published]
+if publications != sorted(set(publications)):
+    raise SystemExit("preview publications are not strictly increasing")
+
+for event in published:
+    if event.get("preview_schema") != 1:
+        raise SystemExit("unexpected preview schema")
+    count = event["preview_gaussian_count"]
+    source = event["source_gaussian_count"]
+    if not 0 < count <= source:
+        raise SystemExit("preview count is not a subset of the model")
+    if count > 400000:
+        raise SystemExit("preview exceeded its 400k cap")
+    radius = event["scene_radius"]
+    center = event["scene_center"]
+    if not (radius > 0) or len(center) != 3:
+        raise SystemExit("preview carries unusable scene bounds")
+
+# The final publication must still describe the file left on disk.
+final = published[-1]
+payload = (root / "preview.ply").read_bytes()
+if len(payload) != final["preview_bytes"]:
+    raise SystemExit("preview byte count does not match its receipt")
+if hashlib.sha256(payload).hexdigest() != final["preview_sha256"]:
+    raise SystemExit("preview digest does not match its receipt")
+
+header, _, body = payload.partition(b"end_header\n")
+lines = header.decode("ascii").splitlines()
+properties = [
+    line.split(" ", 2)[2] for line in lines if line.startswith("property float ")
+]
+if properties != expected_properties:
+    raise SystemExit(f"preview layout is not degree 0 in contract order: {properties}")
+if any(line.startswith("property float f_rest_") for line in lines):
+    raise SystemExit("preview emitted higher-order coefficients")
+
+vertex_lines = [line for line in lines if line.startswith("element vertex ")]
+vertices = int(vertex_lines[0].split()[-1])
+if vertices != final["preview_gaussian_count"]:
+    raise SystemExit("preview header count disagrees with its receipt")
+if len(body) != vertices * len(expected_properties) * 4:
+    raise SystemExit("preview payload length does not match its header")
+
+# Every value must be finite; the publisher rejects non-finite rows on write.
+for value in struct.iter_unpack("<f", body):
+    if value[0] != value[0] or value[0] in (float("inf"), float("-inf")):
+        raise SystemExit("preview contains a non-finite value")
+
+print(f"preview contract verified across {len(published)} publications")
+PY
+
+# A preview that cannot be written must not take training down with it: point the
+# publication at an unwritable directory and require the run to finish anyway.
+readonly_dir="$negative_dir/preview-readonly"
+mkdir -p "$readonly_dir/locked"
+chmod 500 "$readonly_dir/locked"
+"$BIN" \
+  --dataset "$fixture_root/01-sphere-500" \
+  --output "$readonly_dir/splat.ply" \
+  --preview-output "$readonly_dir/locked/preview.ply" \
+  --preview-interval-seconds 1 \
+  --profile fast \
+  --iteration-limit 6000 \
+  --plateau-window 6000 \
+  --checkpoint "$readonly_dir/checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes 2000000000 \
+  --events-fd 1 \
+  >"$readonly_dir/events.jsonl" 2>"$readonly_dir/stderr.txt" \
+  || fail "an unwritable preview destination took the training run down"
+chmod 700 "$readonly_dir/locked"
+[ -f "$readonly_dir/splat.ply" ] || fail "training did not publish its output despite a preview failure"
+grep -q '"event":"preview_disabled"' "$readonly_dir/events.jsonl" \
+  || fail "a failed preview publication did not report preview_disabled"
+
+expect_preview_rejection() {
+  local label="$1" expected="$2"
+  shift 2
+  set +e
+  "$@" >"$negative_dir/$label.stdout" 2>"$negative_dir/$label.stderr"
+  local status=$?
+  set -e
+  [ "$status" -ne 0 ] || fail "$label was accepted"
+  grep -Fq "$expected" "$negative_dir/$label.stderr" \
+    || fail "$label did not explain itself: $(cat "$negative_dir/$label.stderr")"
+}
+
+expect_preview_rejection \
+  preview-aliases-output \
+  'cannot collide with --output' \
+  "$BIN" --dataset "$fixture_root/01-sphere-500" \
+  --output "$negative_dir/alias.ply" --preview-output "$negative_dir/alias.ply" \
+  --profile fast --checkpoint "$negative_dir/alias-ckpt" --seed 42 \
+  --memory-budget-bytes 536870912 --events-fd 1
+
+expect_preview_rejection \
+  preview-interval-without-path \
+  'requires --preview-output' \
+  "$BIN" --dataset "$fixture_root/01-sphere-500" \
+  --output "$negative_dir/interval.ply" --preview-interval-seconds 5 \
+  --profile fast --checkpoint "$negative_dir/interval-ckpt" --seed 42 \
+  --memory-budget-bytes 536870912 --events-fd 1
 
 echo "native msplat build and CLI contracts passed"

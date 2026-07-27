@@ -372,6 +372,48 @@ SceneBounds robustSceneBounds(const std::vector<GaussianBoundsSample> &finiteSam
     return bounds;
 }
 
+void requireFiniteOutputTransform(const Model &model) {
+    if (model.keepCrs && (!std::isfinite(model.scale) || model.scale <= 0 ||
+        !std::isfinite(model.translation[0]) || !std::isfinite(model.translation[1]) ||
+        !std::isfinite(model.translation[2]))) {
+        throw std::runtime_error("final Gaussian coordinate transform is invalid");
+    }
+}
+
+/// One bounds sample in published coordinates. Shared by the final scene bounds and
+/// the training preview so the two can never describe different frames.
+std::optional<GaussianBoundsSample> makeOutputBoundsSample(
+    const Model &model,
+    const float *means,
+    const float *scales,
+    const float *opacities,
+    int index
+) {
+    auto sample = makeBoundsSample(
+        means + index * 3,
+        scales + index * 3,
+        opacities[index]
+    );
+    if (!sample) return std::nullopt;
+    if (!model.keepCrs) return sample;
+
+    bool outputTransformIsFinite = true;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        sample->position[axis] =
+            sample->position[axis] / model.scale + model.translation[axis];
+        outputTransformIsFinite = outputTransformIsFinite &&
+            std::isfinite(sample->position[axis]) &&
+            std::abs(sample->position[axis]) <= std::numeric_limits<float>::max();
+    }
+    sample->largestPhysicalScale /= model.scale;
+    outputTransformIsFinite = outputTransformIsFinite &&
+        std::isfinite(sample->largestPhysicalScale) &&
+        sample->largestPhysicalScale > 0 &&
+        sample->largestPhysicalScale <= std::numeric_limits<float>::max();
+    if (!outputTransformIsFinite) return std::nullopt;
+    return sample;
+}
+
 SceneBounds robustSceneBounds(const Model &model) {
     if (model.num_active <= 0 || model.means.numel() < model.num_active * 3LL ||
         model.scales.numel() < model.num_active * 3LL ||
@@ -382,36 +424,11 @@ SceneBounds robustSceneBounds(const Model &model) {
     const float *means = model.means.data<float>();
     const float *scales = model.scales.data<float>();
     const float *opacities = model.opacities.data<float>();
-    if (model.keepCrs && (!std::isfinite(model.scale) || model.scale <= 0 ||
-        !std::isfinite(model.translation[0]) || !std::isfinite(model.translation[1]) ||
-        !std::isfinite(model.translation[2]))) {
-        throw std::runtime_error("final Gaussian coordinate transform is invalid");
-    }
+    requireFiniteOutputTransform(model);
     std::vector<GaussianBoundsSample> samples;
     samples.reserve(static_cast<std::size_t>(model.num_active));
     for (int index = 0; index < model.num_active; ++index) {
-        auto sample = makeBoundsSample(
-            means + index * 3,
-            scales + index * 3,
-            opacities[index]
-        );
-        if (sample) {
-            if (model.keepCrs) {
-                bool outputTransformIsFinite = true;
-                for (std::size_t axis = 0; axis < 3; ++axis) {
-                    sample->position[axis] =
-                        sample->position[axis] / model.scale + model.translation[axis];
-                    outputTransformIsFinite = outputTransformIsFinite &&
-                        std::isfinite(sample->position[axis]) &&
-                        std::abs(sample->position[axis]) <= std::numeric_limits<float>::max();
-                }
-                sample->largestPhysicalScale /= model.scale;
-                outputTransformIsFinite = outputTransformIsFinite &&
-                    std::isfinite(sample->largestPhysicalScale) &&
-                    sample->largestPhysicalScale > 0 &&
-                    sample->largestPhysicalScale <= std::numeric_limits<float>::max();
-                if (!outputTransformIsFinite) continue;
-            }
+        if (auto sample = makeOutputBoundsSample(model, means, scales, opacities, index)) {
             samples.push_back(*sample);
         }
     }
@@ -2850,6 +2867,190 @@ PlyValidation validateBinaryPly(const fs::path &path) {
     return {vertices, properties, actualBytes};
 }
 
+// The preview is a display cache, not an artifact: a decimated, spherical-harmonic
+// degree 0 copy of the live model that the app renders while training continues.
+// It carries the same CRS transform the final PLY applies, so the preview and the
+// finished splat share one coordinate frame and the viewer camera survives the
+// handover.
+constexpr int previewPropertyCount = 17;
+constexpr std::int64_t previewGaussianCap = 400000;
+
+struct PreviewPublication {
+    std::int64_t sourceGaussianCount;
+    std::int64_t previewGaussianCount;
+    std::uintmax_t bytes;
+    std::string sha256;
+    SceneBounds bounds;
+};
+
+// Exact-count midpoint sampling. Striding by ceil(N/cap) collapses 400001 points to
+// 200001; this always emits exactly min(N, cap) and degrades smoothly. Storage order
+// is structured by densification, so this is bounded and deterministic rather than
+// statistically uniform - the UI says the preview is approximate.
+std::int64_t previewSampleIndex(std::int64_t emitted, std::int64_t total, std::int64_t count) {
+    const std::int64_t index = static_cast<std::int64_t>(
+        (static_cast<double>(emitted) + 0.5) * static_cast<double>(total) /
+        static_cast<double>(count)
+    );
+    if (index < 0) return 0;
+    if (index >= total) return total - 1;
+    return index;
+}
+
+// Stricter than validateBinaryPly, which only enforces a property floor: a preview
+// must carry exactly the degree 0 layout, because MetalSplatter rejects any partial
+// f_rest_* set and would otherwise fail the load with a shape error.
+void validatePreviewPly(const fs::path &path, std::int64_t expectedVertices) {
+    static const std::array<std::string, previewPropertyCount> expectedProperties = {
+        "x", "y", "z",
+        "nx", "ny", "nz",
+        "f_dc_0", "f_dc_1", "f_dc_2",
+        "opacity",
+        "scale_0", "scale_1", "scale_2",
+        "rot_0", "rot_1", "rot_2", "rot_3",
+    };
+
+    const PlyValidation validation = validateBinaryPly(path);
+    if (validation.properties != previewPropertyCount) {
+        throw std::runtime_error("preview PLY does not use the degree 0 layout");
+    }
+    if (validation.vertices != static_cast<std::uint64_t>(expectedVertices)) {
+        throw std::runtime_error("preview PLY vertex count does not match the sampled count");
+    }
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) throw std::runtime_error("cannot open preview PLY for validation");
+    std::string line;
+    std::size_t matched = 0;
+    for (int headerLine = 0; headerLine < 512 && std::getline(input, line); ++headerLine) {
+        if (line == "end_header") break;
+        constexpr std::string_view propertyPrefix = "property float ";
+        if (line.rfind(propertyPrefix, 0) != 0) continue;
+        if (matched >= expectedProperties.size() ||
+            line.substr(propertyPrefix.size()) != expectedProperties[matched]) {
+            throw std::runtime_error("preview PLY properties are out of contract order");
+        }
+        ++matched;
+    }
+    if (matched != expectedProperties.size()) {
+        throw std::runtime_error("preview PLY is missing contract properties");
+    }
+}
+
+PreviewPublication publishPreviewAtomically(
+    Model &model,
+    const fs::path &output,
+    int step
+) {
+    fs::path parent = output.parent_path();
+    if (parent.empty()) parent = fs::current_path();
+    fs::create_directories(parent);
+
+    const std::int64_t total = model.num_active;
+    if (total <= 0) throw std::runtime_error("preview requested with no active gaussians");
+    const std::int64_t count = std::min(total, previewGaussianCap);
+
+    const fs::path temporary = parent / ("." + output.filename().string() + ".preview.tmp." +
+                                        std::to_string(static_cast<long long>(::getpid())) + ".ply");
+    std::error_code ignored;
+    fs::remove(temporary, ignored);
+
+    try {
+        msplat_gpu_sync();
+        requireFiniteOutputTransform(model);
+
+        std::ostringstream header;
+        header << "ply\nformat binary_little_endian 1.0\n";
+        header << "comment easysplat preview iteration " << step << "\n";
+        header << "element vertex " << count << "\n";
+        header << "property float x\nproperty float y\nproperty float z\n";
+        header << "property float nx\nproperty float ny\nproperty float nz\n";
+        header << "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n";
+        header << "property float opacity\n";
+        header << "property float scale_0\nproperty float scale_1\nproperty float scale_2\n";
+        header << "property float rot_0\nproperty float rot_1\n";
+        header << "property float rot_2\nproperty float rot_3\n";
+        header << "end_header\n";
+        const std::string headerText = header.str();
+
+        Sha256Accumulator digest;
+        std::ofstream out;
+        out.exceptions(std::ios::failbit | std::ios::badbit);
+        out.open(temporary, std::ios::binary | std::ios::trunc);
+        out.write(headerText.data(), static_cast<std::streamsize>(headerText.size()));
+        digest.update(headerText);
+
+        const float *means = model.means.data<float>();
+        const float *scales = model.scales.data<float>();
+        const float *quats = model.quats.data<float>();
+        const float *featuresDc = model.featuresDc.data<float>();
+        const float *opacities = model.opacities.data<float>();
+
+        // Bounds are computed over exactly the gaussians published, in published
+        // coordinates. The viewer refuses a scene without authenticated bounds, so
+        // this travels with the preview rather than being derived downstream.
+        std::vector<GaussianBoundsSample> boundsSamples;
+        boundsSamples.reserve(static_cast<std::size_t>(count));
+
+        std::array<float, previewPropertyCount> row {};
+        for (std::int64_t emitted = 0; emitted < count; ++emitted) {
+            const std::int64_t i = previewSampleIndex(emitted, total, count);
+            if (auto sample = makeOutputBoundsSample(
+                    model, means, scales, opacities, static_cast<int>(i))) {
+                boundsSamples.push_back(*sample);
+            }
+            int cursor = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                row[cursor++] = model.keepCrs
+                    ? (means[i * 3 + axis] / model.scale + model.translation[axis])
+                    : means[i * 3 + axis];
+            }
+            row[cursor++] = 0;
+            row[cursor++] = 0;
+            row[cursor++] = 0;
+            for (int channel = 0; channel < 3; ++channel) {
+                row[cursor++] = featuresDc[i * 3 + channel];
+            }
+            row[cursor++] = opacities[i];
+            for (int axis = 0; axis < 3; ++axis) {
+                row[cursor++] = model.keepCrs
+                    ? std::log(std::exp(scales[i * 3 + axis]) / model.scale)
+                    : scales[i * 3 + axis];
+            }
+            for (int component = 0; component < 4; ++component) {
+                row[cursor++] = quats[i * 4 + component];
+            }
+            for (float value : row) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("preview contains a non-finite value");
+                }
+            }
+            out.write(reinterpret_cast<const char *>(row.data()), sizeof(row));
+            digest.update(row.data(), sizeof(row));
+        }
+
+        out.flush();
+        out.close();
+
+        const SceneBounds bounds = robustSceneBounds(boundsSamples);
+        if (!std::isfinite(bounds.radius) || bounds.radius <= 0) {
+            throw std::runtime_error("preview produced no representable scene bounds");
+        }
+
+        validatePreviewPly(temporary, count);
+        const std::uintmax_t bytes = fs::file_size(temporary);
+        syncFile(temporary);
+        if (::rename(temporary.c_str(), output.c_str()) != 0) {
+            throwSystemError("cannot atomically replace preview", output);
+        }
+        syncDirectory(parent);
+        return PreviewPublication {total, count, bytes, digest.finish(), bounds};
+    } catch (...) {
+        fs::remove(temporary, ignored);
+        throw;
+    }
+}
+
 bool savePlyAtomically(Model &model, const fs::path &output, int step) {
     fs::path parent = output.parent_path();
     if (parent.empty()) parent = fs::current_path();
@@ -2893,6 +3094,8 @@ int main(int argc, char *argv[]) {
 
     std::string datasetPath;
     std::string outputPath;
+    std::string previewOutputPath;
+    int previewIntervalSeconds = 20;
     std::string profileName;
     std::string checkpointPath;
     std::string resumePath;
@@ -2946,6 +3149,17 @@ int main(int argc, char *argv[]) {
         outputPath,
         "Final trained or isolated PLY output path"
     );
+    CLI::Option *previewOutputOption = app.add_option(
+        "--preview-output",
+        previewOutputPath,
+        "Optional decimated preview PLY republished during training"
+    );
+    CLI::Option *previewIntervalOption = app.add_option(
+        "--preview-interval-seconds",
+        previewIntervalSeconds,
+        "Minimum wall-clock seconds between preview publications"
+    );
+    previewIntervalOption->check(CLI::Range(1, 3600));
     CLI::Option *profileOption = app.add_option(
         "--profile", profileName, "Training profile: fast, balanced, or high-detail"
     );
@@ -3138,7 +3352,9 @@ int main(int argc, char *argv[]) {
                 plateauWindowOption->count() != 0 ||
                 seedOption->count() != 0 ||
                 checkpointOption->count() != 0 ||
-                resumeOption->count() != 0) {
+                resumeOption->count() != 0 ||
+                previewOutputOption->count() != 0 ||
+                previewIntervalOption->count() != 0) {
                 throw std::runtime_error(
                     "--isolate cannot be combined with training-only options"
                 );
@@ -3473,6 +3689,37 @@ int main(int argc, char *argv[]) {
         }
         if (!fs::is_directory(datasetPath)) throw std::runtime_error("dataset directory does not exist");
         if (fs::path(outputPath).extension() != ".ply") throw std::runtime_error("--output must end in .ply");
+        if (previewIntervalOption->count() != 0 && previewOutputOption->count() == 0) {
+            throw std::runtime_error(
+                "--preview-interval-seconds requires --preview-output"
+            );
+        }
+        if (previewOutputOption->count() != 0) {
+            if (fs::path(previewOutputPath).extension() != ".ply") {
+                throw std::runtime_error("--preview-output must end in .ply");
+            }
+            // Compared after normalization, not as raw strings: a preview that
+            // aliases the durable output would replace a finished splat with a
+            // decimated one on the first publication.
+            std::error_code aliasError;
+            const fs::path previewPath = fs::weakly_canonical(previewOutputPath, aliasError);
+            const fs::path finalPath = fs::weakly_canonical(outputPath, aliasError);
+            if (previewPath == finalPath ||
+                fs::path(previewOutputPath).lexically_normal()
+                    == fs::path(outputPath).lexically_normal()) {
+                throw std::runtime_error("--preview-output cannot collide with --output");
+            }
+            if (!checkpointPath.empty()) {
+                const fs::path checkpointRoot =
+                    fs::weakly_canonical(checkpointPath, aliasError);
+                if (!checkpointRoot.empty() &&
+                    previewPath.string().rfind(checkpointRoot.string() + "/", 0) == 0) {
+                    throw std::runtime_error(
+                        "--preview-output cannot live inside the checkpoint directory"
+                    );
+                }
+            }
+        }
         msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
 
         struct sigaction action {};
@@ -3901,6 +4148,11 @@ int main(int argc, char *argv[]) {
         emitCheckpoint(resumed ? "checkpoint_loaded" : "checkpoint_completed", *lastCheckpoint);
 
         auto lastProgressAt = startedAt;
+        auto lastPreviewAt = startedAt;
+        std::uint64_t previewPublicationID = 0;
+        // One write failure disables the preview for the rest of the run. A preview is
+        // a convenience; it must never take the training run down with it.
+        bool previewEnabled = previewOutputOption->count() != 0;
         auto cumulativeElapsed = [&]() {
             return priorElapsedSeconds + std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - startedAt
@@ -4187,6 +4439,40 @@ int main(int argc, char *argv[]) {
                 }
                 events->emit("progress", std::move(progress));
                 lastProgressAt = now;
+            }
+
+            // Published here because the window has already synchronized and afterTrain
+            // has settled densification: the tensors are quiescent and readable without
+            // a second GPU sync. Serialization is synchronous on the training thread -
+            // a background reader would race the next window's densify and prune.
+            if (previewEnabled && step < profile.iterationLimit &&
+                now - lastPreviewAt >= std::chrono::seconds(previewIntervalSeconds)) {
+                try {
+                    const PreviewPublication publication = publishPreviewAtomically(
+                        model,
+                        fs::path(previewOutputPath),
+                        step
+                    );
+                    ++previewPublicationID;
+                    events->emit("preview_published", {
+                        {"iteration", step},
+                        {"preview_bytes", static_cast<std::uint64_t>(publication.bytes)},
+                        {"preview_gaussian_count", publication.previewGaussianCount},
+                        {"preview_publication", previewPublicationID},
+                        {"preview_schema", 1},
+                        {"preview_sha256", publication.sha256},
+                        {"scene_center", publication.bounds.center},
+                        {"scene_radius", publication.bounds.radius},
+                        {"source_gaussian_count", publication.sourceGaussianCount},
+                    });
+                } catch (const std::exception &error) {
+                    previewEnabled = false;
+                    events->emit("preview_disabled", {
+                        {"iteration", step},
+                        {"reason", std::string(error.what())},
+                    });
+                }
+                lastPreviewAt = std::chrono::steady_clock::now();
             }
 
             if (plateauReached && step < profile.iterationLimit) {

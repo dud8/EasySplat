@@ -106,7 +106,7 @@ enum ToolchainFixtureBuilder {
                 "source_version": "1.1.3",
                 "source_tree_sha256": String(repeating: "a", count: 64),
                 "density_control_patch_sha256": "e91085cb20f573f515c939ba040d3661909744bd596b75af7d9bfb2ddd74e188",
-                "overlay_sha256": "97cff0165819019c146c377cd0df3e21b0fb916d7f10257109ef5228d438192c",
+                "overlay_sha256": "9d5f0e509f556061bff4ab16357e1d3fc5e2b54b638628529cb2fbfe54009869",
                 "raster_test_sha256": "60f4eea65d5be2ad8684292e8234fbce97ab330d5c1e0946d6b2e00a91957dcf",
                 "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
                 "isolation_source_sha256": "65504b0448c61b4f2602d86150ff6ce83be61bfc48cc9f632fa72d95b4992e61",
