@@ -212,6 +212,10 @@ fileprivate class PLYReaderStream {
                             let header = try parseHeader(headerData)
                             self.header = header
                             phase = .body
+                            // Groups declaring zero elements are only skipped after an
+                            // element is read, so a leading empty group would leave the
+                            // body loop waiting forever for an element that cannot come.
+                            advancePastEmptyElementGroups()
                             delegate.didStartReading(withHeader: header)
                         } catch {
                             delegate.didFailReading(withError: error)
@@ -248,6 +252,17 @@ fileprivate class PLYReaderStream {
     private var isComplete: Bool {
         guard let header else { return false }
         return currentElementGroup == header.elements.count
+    }
+
+    /// Steps over element groups that declare no elements, so an empty group never
+    /// leaves the body loop waiting on an element the file does not contain.
+    private func advancePastEmptyElementGroups() {
+        guard let header else { return }
+        while currentElementGroup < header.elements.count,
+              currentElementCountInGroup == header.elements[currentElementGroup].count {
+            currentElementGroup += 1
+            currentElementCountInGroup = 0
+        }
     }
 
     // Maybe remove already-processed bytes from body, to reclaim memory
@@ -403,10 +418,7 @@ fileprivate class PLYReaderStream {
 
                     delegate.didRead(element: reusableElement, typeIndex: self.currentElementGroup, withHeader: elementHeader)
                     currentElementCountInGroup += 1
-                    while !isComplete && currentElementCountInGroup == header.elements[currentElementGroup].count {
-                        currentElementGroup += 1
-                        currentElementCountInGroup = 0
-                    }
+                    advancePastEmptyElementGroups()
                 }
             }
         case .binaryBigEndian, .binaryLittleEndian:
@@ -430,10 +442,7 @@ fileprivate class PLYReaderStream {
 
                     delegate.didRead(element: reusableElement, typeIndex: currentElementGroup, withHeader: elementHeader)
                     currentElementCountInGroup += 1
-                    while !isComplete && currentElementCountInGroup == header.elements[currentElementGroup].count {
-                        currentElementGroup += 1
-                        currentElementCountInGroup = 0
-                    }
+                    advancePastEmptyElementGroups()
                 }
             }
         }
