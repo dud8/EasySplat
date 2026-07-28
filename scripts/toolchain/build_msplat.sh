@@ -39,7 +39,7 @@ INSTALL_STAGE_INODE=""
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 OVERLAY_SHA256="9d5f0e509f556061bff4ab16357e1d3fc5e2b54b638628529cb2fbfe54009869"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="2117e15eda637952a3481fb01da8c8f0cdb5629830344e84486fa5f094a09dc7"
+RASTER_TEST_SHA256="2f9b7c7241accbae20dd3c93ff2a5c13934a391b75438328e5fa9725ea2bdb5a"
 ISOLATION_HEADER="$ROOT/Tools/MsplatNative/isolation.hpp"
 ISOLATION_HEADER_SHA256="ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8"
 ISOLATION_SOURCE="$ROOT/Tools/MsplatNative/isolation.cpp"
@@ -1226,6 +1226,7 @@ configure_and_build() {
   "$NATIVE_BUILD_DIR/msplat_raster_tests" --prefix-oracle
   "$NATIVE_BUILD_DIR/msplat_raster_tests" --radix-oracle
   "$NATIVE_BUILD_DIR/msplat_raster_tests" --quaternion-vjp
+  "$NATIVE_BUILD_DIR/msplat_raster_tests" --projection-vjp
 }
 
 write_build_info() {

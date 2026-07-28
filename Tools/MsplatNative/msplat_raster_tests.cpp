@@ -151,6 +151,12 @@ void verifyProjectionVJP() {
     };
 
     double worst = 0;
+    double worstExact = 0;
+    double worstAbsolute = 0;
+    // Gradients here run to order 1e3 (focal length over depth), so a bare 1e-5
+    // absolute bound would be stricter than single precision can represent. Scale it
+    // by the largest gradient the sweep produces.
+    double gradientScale = 0;
     for (const auto &point : points) {
         for (const auto &cotangent : cotangents) {
             float pixel[2];
@@ -162,6 +168,7 @@ void verifyProjectionVJP() {
                 if (!std::isfinite(gradient[axis])) {
                     throw std::runtime_error("projection VJP contains a non-finite value");
                 }
+                gradientScale = std::max(gradientScale, std::abs(static_cast<double>(gradient[axis])));
             }
 
             // Central differences of the same forward, stepped in world space.
@@ -191,6 +198,49 @@ void verifyProjectionVJP() {
                     (2.0 * step);
             }
 
+            // Closed-form reference in double. This is the helper-level check the
+            // contract asks for; the finite differences below are the independent
+            // end-to-end one, and they are what would catch a sign or index slip that
+            // an algebra transcription could reproduce faithfully in both places.
+            double homogeneous[4] = {0, 0, 0, 0};
+            for (int row = 0; row < 4; ++row) {
+                homogeneous[row] =
+                    static_cast<double>(projection[row * 4 + 0]) * point[0] +
+                    static_cast<double>(projection[row * 4 + 1]) * point[1] +
+                    static_cast<double>(projection[row * 4 + 2]) * point[2] +
+                    static_cast<double>(projection[row * 4 + 3]);
+            }
+            const double reciprocalW = 1.0 / (homogeneous[3] + 1.0e-6);
+            const double ndcX = 0.5 * width * static_cast<double>(cotangent[0]);
+            const double ndcY = 0.5 * height * static_cast<double>(cotangent[1]);
+            const double projected[4] = {
+                ndcX * reciprocalW,
+                ndcY * reciprocalW,
+                0.0,
+                -(ndcX * homogeneous[0] + ndcY * homogeneous[1]) *
+                    reciprocalW * reciprocalW,
+            };
+            double exact[3];
+            for (int axis = 0; axis < 3; ++axis) {
+                exact[axis] =
+                    static_cast<double>(projection[axis]) * projected[0] +
+                    static_cast<double>(projection[4 + axis]) * projected[1] +
+                    static_cast<double>(projection[8 + axis]) * projected[2] +
+                    static_cast<double>(projection[12 + axis]) * projected[3];
+            }
+
+            double exactNumerator = 0;
+            double exactDenominator = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double difference = static_cast<double>(gradient[axis]) - exact[axis];
+                exactNumerator += difference * difference;
+                exactDenominator += exact[axis] * exact[axis];
+                worstAbsolute = std::max(worstAbsolute, std::abs(difference));
+            }
+            if (exactDenominator > 0) {
+                worstExact = std::max(worstExact, std::sqrt(exactNumerator / exactDenominator));
+            }
+
             double numerator = 0;
             double denominator = 0;
             for (int axis = 0; axis < 3; ++axis) {
@@ -206,15 +256,30 @@ void verifyProjectionVJP() {
         }
     }
 
-    // research-quality-v1 sets 1e-3 for end-to-end finite differences. Single precision
-    // in the kernel and a 1e-3 world step put the achievable floor near 1e-4.
+    // research-quality-v1: helpers are 1e-5 absolute and 1e-4 relative against CPU
+    // double; end-to-end finite differences are 1e-3. The finite-difference figure is
+    // looser because a 1e-3 world step in single precision cannot do better.
+    if (worstExact > 1.0e-4) {
+        throw std::runtime_error(
+            "projection VJP disagrees with the double-precision closed form: relative L2 " +
+            std::to_string(worstExact)
+        );
+    }
+    if (worstAbsolute > 1.0e-5 * std::max(1.0, gradientScale)) {
+        throw std::runtime_error(
+            "projection VJP absolute error exceeds tolerance: " +
+            std::to_string(worstAbsolute)
+        );
+    }
     if (worst > 1.0e-3) {
         throw std::runtime_error(
             "projection VJP disagrees with central differences: relative L2 " +
             std::to_string(worst)
         );
     }
-    std::cout << "projection_vjp passed (worst relative L2 " << worst << ")\n";
+    std::cout << "projection_vjp passed (exact relative L2 " << worstExact
+              << ", absolute " << worstAbsolute
+              << ", central-difference relative L2 " << worst << ")\n";
 }
 
 void verifyQuaternionVJP() {
