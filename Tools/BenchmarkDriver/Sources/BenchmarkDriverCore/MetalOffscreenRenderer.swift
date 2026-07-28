@@ -49,10 +49,10 @@ public final class MetalOffscreenRenderer {
                 sampleCount: 1,
                 maxViewCount: 1,
                 maxSimultaneousRenders: 1,
-                // This renderer blocks on every sort before it draws, so the stale-order
-                // and camera-turn artifacts that keep the interactive viewer on Euclidean
-                // ordering cannot occur here, and depth ordering is what the trainer's
-                // own rasterizer keys on.
+                // What the trainer's rasterizer keys on. Stated rather than defaulted:
+                // this renderer blocks on every sort before it draws, so it would be
+                // unaffected by a change of interactive policy, and a measurement should
+                // not move because a viewer default did.
                 sortOrdering: .cameraForwardDepth
             )
             try renderer.readPLY(from: plyURL)

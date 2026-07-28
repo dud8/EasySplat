@@ -94,11 +94,14 @@ public class SplatRenderer {
     /// Neither is exact for extended overlapping splats, which have no single correct
     /// order; forward depth matches how the trainer's rasterizer keys its intersections,
     /// so it is the trainer-aligned choice rather than a physically exact one, and it
-    /// measures better on static images. It also exposes two artifacts during camera
-    /// rotation that Euclidean ordering masks: a sort in flight is dropped rather than
-    /// coalesced, and two overlapping splats swap discontinuously when their centre
-    /// depths cross. Interactive callers should keep Euclidean until those are handled.
-    /// Measurements live in the engineering log, not here.
+    /// measures better on static images.
+    ///
+    /// Euclidean is chosen by interactive callers because its rotation invariance hides a
+    /// sort that has fallen behind the camera. The invariance is real but narrow: it holds
+    /// for a rotation about the eye and for nothing else, so it does not survive an orbit,
+    /// which moves the camera position. Callers whose dominant motion is a look-around
+    /// rather than an orbit have the stronger reason to prefer it. Measurements live in the
+    /// engineering log, not here.
     public enum SortOrdering: Sendable {
         /// Euclidean distance from the camera position. Rotation-invariant.
         case euclideanCameraDistance
@@ -985,8 +988,6 @@ public class SplatRenderer {
                         }
                     }
                 )
-                sortKeysTempSort = packedKeys
-                sortScratchTempSort = packedScratch
                 finishSort(context, publishedOrder: sortedOrder, failure: nil)
             } catch {
                 finishSort(
@@ -995,6 +996,11 @@ public class SplatRenderer {
                     failure: .orderBufferAllocationFailed(error.localizedDescription)
                 )
             }
+            // Returned on both paths. Losing them to a failed allocation would make the
+            // next sort reallocate 26 MB on a 1.6M-splat scene, which is the worst moment
+            // to do it: the failure that got here was itself an allocation failure.
+            sortKeysTempSort = packedKeys
+            sortScratchTempSort = packedScratch
         }
     }
 

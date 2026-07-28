@@ -41,8 +41,9 @@ final class SplatDepthRadixSortTests: XCTestCase {
     }
 
     /// The case a comparison sort gets wrong. A trained scene holds more splats than the key
-    /// has distinguishable values nearby, so keys collide in the thousands; `Array.sort` is
-    /// not stable, so the same camera could publish a different order each time it was asked.
+    /// has distinguishable values nearby, so keys collide in the thousands, and `Array.sort`
+    /// is not stable -- the same camera could publish a different order each time it was
+    /// asked, because the array being sorted was the previous frame's output.
     func testEqualKeysKeepIndexOrder() {
         let depths = [Float](repeating: 3.25, count: 5_000)
         XCTAssertEqual(sortedIndices(depths), (0..<5_000).map(UInt32.init))

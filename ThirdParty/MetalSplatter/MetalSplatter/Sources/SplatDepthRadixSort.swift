@@ -23,9 +23,14 @@ enum SplatDepthRadixSort {
 
     /// Maps a Float32 onto a `UInt32` whose unsigned ordering matches the float's ordering.
     /// Positives get their sign bit set; negatives are inverted whole, which reverses the
-    /// descending order that sign-magnitude gives them. Undefined for NaN, which cannot
-    /// reach here: positions are validated finite at load and the keys are a dot product and
-    /// a squared length of finite values.
+    /// descending order that sign-magnitude gives them.
+    ///
+    /// Total on every bit pattern, so a NaN key sorts somewhere rather than corrupting the
+    /// pass -- the result is a valid permutation of the input either way. Where in the order
+    /// it lands is unspecified. Splat positions are validated finite at load, but the camera
+    /// reaches this through a public `CameraDescriptor` that accepts any matrix, and a
+    /// singular one can produce a non-finite forward vector; the sort stays well defined and
+    /// the picture is the caller's problem.
     @inline(__always)
     static func orderPreservingBits(_ value: Float) -> UInt32 {
         let bits = value.bitPattern

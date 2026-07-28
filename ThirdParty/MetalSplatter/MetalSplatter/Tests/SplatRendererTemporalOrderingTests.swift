@@ -7,12 +7,19 @@ import XCTest
 /// The temporal gate for `SortOrdering.cameraForwardDepth`.
 ///
 /// Depth ordering is what the trainer's own rasterizer keys on, and rendering a fixed PLY
-/// with it recovers most of the viewer-to-trainer gap. The interactive viewer still selects
-/// Euclidean because rotation exposes something a still frame cannot show: the sort runs
-/// asynchronously and a request arriving while one is in flight is dropped, so the order a
-/// frame composites can belong to an older camera. Euclidean distance does not change under
-/// rotation about the camera centre, so with that key a stale order is still the right
-/// order. Depth does change, and the same lag becomes visible popping.
+/// with it recovers most of the viewer-to-trainer gap. The interactive viewer selected
+/// Euclidean anyway, because rotation exposes something a still frame cannot show: the sort
+/// runs asynchronously and a request arriving while one is in flight is dropped, so the order
+/// a frame composites can belong to an older camera. Euclidean distance does not change under
+/// rotation about the camera centre, so with that key a stale order is still the right order.
+///
+/// These tests are what withdrew that argument. The invariance is real but narrow: it holds
+/// for a rotation about the eye and for nothing else. Both motions are measured here because
+/// the viewer performs both -- its primary drag and its arrow keys `orbit`, which moves the
+/// camera and leaves neither key invariant, while a secondary or Control drag is the
+/// `freeLook` the invariance covers. Under an orbit the two orderings cost the same to within
+/// noise; under a free look Euclidean is cheaper and depth still renders better, which is the
+/// trade the numbers below price.
 ///
 /// The first version of this gate measured *permutations* -- the share of splat pairs the
 /// displayed order got wrong. That statistic cannot decide the question. Two splats whose
@@ -102,7 +109,10 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
                 Harness.yawed(Float($0) * Turn.radiansPerFrame)
             }
 
-            for measurement in try await staleOrderCost(harness, renderer, cameras: cameras) {
+            for measurement in try await staleOrderCost(
+                harness, renderer, cameras: cameras,
+                cadences: Turn.lags.map { .constantLag($0) } + Turn.lags.map { .sampleAndHold($0) }
+            ) {
                 report.append("  " + String(describing: ordering) + " " + measurement.summary)
                 if ordering == .euclideanCameraDistance {
                     XCTAssertEqual(
@@ -138,6 +148,8 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
         let harness = try Harness()
         let size = SIMD2(960, 720)
         var report: [String] = []
+        var orbitCost: [String: StaleOrderCost] = [:]
+        var freeLookCost: [String: StaleOrderCost] = [:]
 
         for ordering in [SplatRenderer.SortOrdering.euclideanCameraDistance, .cameraForwardDepth] {
             let renderer = try harness.makeRenderer(ordering: ordering)
@@ -154,6 +166,17 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
                     far: bounds.radius * 8
                 )
             }
+            // The motion the invariance argument does not cover. Same angular rate, but the
+            // camera position moves, so neither key is invariant.
+            let orbit = (0..<Turn.realFrames).map {
+                Harness.orbited(
+                    Float($0) * Turn.radiansPerFrame,
+                    centre: bounds.centre,
+                    radius: bounds.radius * 1.1,
+                    size: size,
+                    far: bounds.radius * 8
+                )
+            }
 
             let sortSeconds = try await sortDuration(renderer, cameras: cameras)
             report.append(String(
@@ -162,17 +185,39 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
                 Int(ceil(sortSeconds * 60)), Int(ceil(sortSeconds * 120))
             ))
             for measurement in try await staleOrderCost(
-                harness, renderer, cameras: cameras, lags: Turn.realLags
+                harness, renderer, cameras: orbit,
+                cadences: [.constantLag(1), .sampleAndHold(1), .sampleAndHold(4), .sampleAndHold(16)]
+            ) {
+                report.append("  " + String(describing: ordering) + " ORBIT " + measurement.summary)
+                if measurement.isHold, measurement.lag == 1 {
+                    orbitCost[String(describing: ordering)] = measurement
+                }
+            }
+            let intrinsic = try await intrinsicPop(harness, renderer, cameras: orbit)
+            report.append(String(
+                format: "  %@ ORBIT intrinsic pop, fresh sort every frame: p99.9 %.4f worst %.4f",
+                String(describing: ordering), intrinsic.p999, intrinsic.worst
+            ))
+            for measurement in try await staleOrderCost(
+                harness, renderer, cameras: cameras,
+                cadences: Turn.realLags.map { .constantLag($0) }
+                    + Turn.realLags.map { .sampleAndHold($0) }
             ) {
                 report.append("  " + String(describing: ordering) + " " + measurement.summary)
+                if measurement.isHold, measurement.lag == 1 {
+                    freeLookCost[String(describing: ordering)] = measurement
+                }
                 if ordering == .euclideanCameraDistance {
-                    // Not exactly zero here, unlike the synthetic fixture. A real scene has
-                    // more splats than the sort key has distinguishable Float32 values, so
-                    // keys tie; `Array.sort` is not stable, and the array it sorts is the
-                    // previous frame's output, so tied splats come back in a different order
-                    // each time. That churn is not staleness -- it does not grow with lag --
-                    // and it is small, but it is the reason this is a bound rather than an
-                    // equality.
+                    // Not exactly zero here, unlike the synthetic fixture, and not for the
+                    // reason first recorded. The sorter is a total order now, so ties are
+                    // not the cause. The camera position is recovered by inverting the view
+                    // matrix, and that inverse is not bit-stable as the matrix rotates -- a
+                    // 40-frame yaw about the eye produces 16 distinct positions. The
+                    // Euclidean key moves in its last bits, which reorders near-ties. The
+                    // churn is not staleness -- it does not grow with lag -- and at 0.001%
+                    // of channels it is not worth trading a general matrix inverse for an
+                    // assumption of rigidity, but it is the reason this is a bound and not
+                    // an equality.
                     XCTAssertLessThan(
                         measurement.visibleShare, 0.0005,
                         "Euclidean ordering does not change under rotation about the camera "
@@ -187,6 +232,42 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
         print("stale-order cost on \((path as NSString).lastPathComponent) "
               + "(\(size.x)x\(size.y), bgra8Unorm):")
         report.forEach { print($0) }
+
+        // Regression bounds, not perceptual thresholds. They were set from the 2026-07-28
+        // measurement and cannot have justified the decision that measurement informed; their
+        // job is to fail if a later change makes depth ordering materially worse than it was.
+        // Stated as a ratio against Euclidean rather than an absolute, because Euclidean is
+        // the alternative actually on offer -- the question a viewer default has to answer is
+        // not "is this invisible" but "is this worse than what it replaces".
+        let euclidean = String(describing: SplatRenderer.SortOrdering.euclideanCameraDistance)
+        let depth = String(describing: SplatRenderer.SortOrdering.cameraForwardDepth)
+        if let reference = orbitCost[euclidean], let candidate = orbitCost[depth] {
+            XCTAssertLessThanOrEqual(
+                candidate.visibleShare, reference.visibleShare * 1.5 + 0.0025,
+                "under an orbit -- the viewer's primary drag -- depth ordering must not move "
+                + "materially more of the frame than Euclidean does; measured 0.691% against "
+                + "0.708% on bonsai, and this bound allows half again plus a quarter point"
+            )
+            XCTAssertLessThanOrEqual(
+                candidate.worstTileShare, reference.worstTileShare * 1.5 + 0.02,
+                "the same, within the worst 64x64 tile, so a small badly-wrong region cannot "
+                + "hide inside a pooled share"
+            )
+        } else {
+            XCTFail("the orbit sweep did not produce a hold-1 row for both orderings")
+        }
+        if let candidate = freeLookCost[depth] {
+            // Free look is the one gesture Euclidean's invariance covers, so a ratio against
+            // it is meaningless here -- Euclidean is near zero by construction. This is the
+            // absolute bound on what the trade costs: measured 0.854% pooled on bonsai.
+            XCTAssertLessThanOrEqual(
+                candidate.visibleShare, 0.02,
+                "a free look is where depth ordering pays for itself; measured 0.854% of RGB "
+                + "channels moving at least 2/255, and this bound fails if that doubles"
+            )
+        } else {
+            XCTFail("the free-look sweep did not produce a hold-1 row for depth ordering")
+        }
     }
 
     // MARK: the measurement
@@ -198,18 +279,84 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
         /// stable statistic of the three: a worst pixel is one sample of a long tail, and
         /// PSNR buries a local artifact in a mostly-correct frame.
         let visibleShare: Double
+        /// The same share within the worst 64x64 tile of any frame. Catches a small region
+        /// that is badly wrong, which the pooled share cannot.
+        let worstTileShare: Double
+        /// True when the displayed order was held for the whole period and then jumped, which
+        /// is what the scheduler does. False for the smooth constant-lag transfer function.
+        let isHold: Bool
         let summary: String
     }
 
+    /// How the displayed order falls behind.
+    ///
+    /// `constantLag` advances the displayed order every frame, always `k` behind. It is the
+    /// clean transfer function and the wrong cadence: `beginSort` refuses a request while one
+    /// is in flight, so production holds one order for the whole duration of a sort and then
+    /// jumps. `sampleAndHold` reproduces that -- the order changes once every `k` frames and
+    /// its age sawtooths between `k` and `2k - 1`. The distinction matters for the pop
+    /// statistic specifically: the same total error arrives as one step rather than spread
+    /// across `k` frames, and a step is what is visible.
+    private enum Cadence {
+        case constantLag(Int)
+        case sampleAndHold(Int)
+
+        var period: Int {
+            switch self {
+            case .constantLag(let k), .sampleAndHold(let k): return k
+            }
+        }
+
+        /// Index of the order displayed at `frame`, or nil before the first publication.
+        func orderIndex(forFrame frame: Int) -> Int? {
+            switch self {
+            case .constantLag(let k):
+                return frame >= k ? frame - k : nil
+            case .sampleAndHold(let k):
+                // Sorts complete at frames k, 2k, 3k...; the one completing at j*k was
+                // started at (j-1)*k and so carries that camera.
+                let completed = frame / k
+                return completed >= 2 ? (completed - 2) * k + k : nil
+            }
+        }
+
+        var label: String {
+            switch self {
+            case .constantLag(let k): return String(format: "lag %2d      ", k)
+            case .sampleAndHold(let k): return String(format: "hold %2d     ", k)
+            }
+        }
+
+        var isHold: Bool {
+            if case .sampleAndHold = self { return true }
+            return false
+        }
+
+        /// Frames the turn must contain before this cadence displays anything at all.
+        var framesNeeded: Int {
+            switch self {
+            case .constantLag(let k): return k + 1
+            case .sampleAndHold(let k): return 2 * k + 1
+            }
+        }
+    }
+
     /// Renders each camera on the turn twice -- once with the order that camera would have
-    /// produced, once with the order from `lag` frames earlier -- and reports the difference.
-    /// Every sort runs to completion first, so nothing here races the scheduler; the lag is
-    /// imposed, which is what makes the numbers reproducible on a loaded machine.
+    /// produced, once with the order the scheduler would actually be displaying -- and
+    /// reports the difference. Every sort runs to completion first, so nothing here races the
+    /// scheduler; the lag is imposed, which is what makes the numbers reproducible on a
+    /// loaded machine.
+    ///
+    /// Alpha is excluded and the frame is tiled. Alpha is a quarter of the channels and the
+    /// background is transparent, so pooling over all four dilutes a colour error by whatever
+    /// share of the frame is empty; and a pooled percentile over 2.7M samples can hide a
+    /// small region that is badly wrong, which is exactly the artifact worth catching. The
+    /// worst 64x64 tile is reported alongside the pooled figures.
     private func staleOrderCost(
         _ harness: Harness,
         _ renderer: SplatRenderer,
         cameras: [SplatRenderer.CameraDescriptor],
-        lags: [Int] = Turn.lags
+        cadences: [Cadence]
     ) async throws -> [StaleOrderCost] {
         var orders: [[SplatRenderer.IndexType]] = []
         var fresh: [[UInt8]] = []
@@ -218,55 +365,131 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
             fresh.append(try harness.render(renderer, camera: camera))
         }
 
-        let channels = cameras[0].screenSize.x * cameras[0].screenSize.y * 4
+        let width = cameras[0].screenSize.x
+        let height = cameras[0].screenSize.y
+        let channels = width * height * 4
+        let tileSize = 64
+        let tilesAcross = (width + tileSize - 1) / tileSize
+        let tileCount = tilesAcross * ((height + tileSize - 1) / tileSize)
         var difference = [Int](repeating: 0, count: channels)
         var previous = [Int](repeating: 0, count: channels)
         var results: [StaleOrderCost] = []
 
-        for lag in lags where lag < cameras.count {
+        // A hold needs two full periods before it publishes anything, so a period that does
+        // not fit the turn produces no frames at all -- and an empty measurement formats as a
+        // flawless one, which is worse than no row at all.
+        for cadence in cadences where cadence.framesNeeded <= cameras.count {
             var squaredError = 0.0
             var samples = 0
             let staleness = Histogram()
             let pop = Histogram()
+            var worstTileShare = 0.0
             var havePrevious = false
 
-            for frame in lag..<cameras.count {
-                try renderer.publishOrderForTesting(orders[frame - lag])
+            for frame in 0..<cameras.count {
+                guard let source = cadence.orderIndex(forFrame: frame) else { continue }
+                try renderer.publishOrderForTesting(orders[source])
                 let displayed = try harness.render(renderer, camera: cameras[frame])
                 let reference = fresh[frame]
 
-                for channel in 0..<channels {
-                    let value = Int(displayed[channel]) - Int(reference[channel])
-                    difference[channel] = value
-                    staleness.add(abs(value))
-                    squaredError += Double(value * value)
-                    // A constant offset from the fresh image is not what the eye catches --
-                    // nothing on screen offers the comparison. Popping is the offset
-                    // *changing* between frames, which is this residual.
-                    if havePrevious { pop.add(abs(value - previous[channel])) }
+                var tileVisible = [Int](repeating: 0, count: tileCount)
+                var tileTotal = [Int](repeating: 0, count: tileCount)
+                for pixel in 0..<(width * height) {
+                    let tile = (pixel / width) / tileSize * tilesAcross
+                        + (pixel % width) / tileSize
+                    tileTotal[tile] += 3
+                    // Skip index 3 of each BGRA quad: alpha is not a colour a viewer reads,
+                    // and the transparent background would otherwise dominate the pool.
+                    for component in 0..<3 {
+                        let channel = pixel * 4 + component
+                        let value = Int(displayed[channel]) - Int(reference[channel])
+                        difference[channel] = value
+                        staleness.add(abs(value))
+                        squaredError += Double(value * value)
+                        if abs(value) >= 2 { tileVisible[tile] += 1 }
+                        // A constant offset from the fresh image is not what the eye catches
+                        // -- nothing on screen offers the comparison. Popping is the offset
+                        // *changing* between frames, which is this residual.
+                        if havePrevious { pop.add(abs(value - previous[channel])) }
+                    }
+                    samples += 3
                 }
-                samples += channels
+                for tile in 0..<tileCount where tileTotal[tile] > 0 {
+                    worstTileShare = max(
+                        worstTileShare,
+                        Double(tileVisible[tile]) / Double(tileTotal[tile])
+                    )
+                }
                 swap(&difference, &previous)
                 havePrevious = true
             }
 
-            let mse = samples > 0 ? squaredError / Double(samples) / (255 * 255) : 0
+            guard samples > 0 else { continue }
+            let mse = squaredError / Double(samples) / (255 * 255)
             let psnr = mse > 0 ? 10 * log10(1 / mse) : Double.infinity
             results.append(StaleOrderCost(
-                lag: lag,
+                lag: cadence.period,
                 worstStaleness: staleness.maximum,
                 visibleShare: staleness.fractionAtLeast(codes: 2),
+                worstTileShare: worstTileShare,
+                isHold: cadence.isHold,
                 summary: String(
-                    format: "lag %2d: PSNR %7.2f dB   stale p99.9 %.4f worst %.4f   "
-                        + "pop p99.9 %.4f worst %.4f   %.3f%% of channels past 2/255",
-                    lag, psnr,
+                    format: "%@: PSNR %7.2f dB   stale p99.9 %.4f worst %.4f   "
+                        + "pop p99.9 %.4f worst %.4f   RGB past 2/255: %.3f%% pooled, "
+                        + "%.2f%% worst tile",
+                    cadence.label, psnr,
                     staleness.quantile(0.999), staleness.maximum,
                     pop.quantile(0.999), pop.maximum,
-                    100 * staleness.fractionAtLeast(codes: 2)
+                    100 * staleness.fractionAtLeast(codes: 2),
+                    100 * worstTileShare
                 )
             ))
         }
         return results
+    }
+
+    /// The popping that sort freshness cannot remove.
+    ///
+    /// Every frame here is freshly sorted, so any remaining discontinuity is intrinsic: two
+    /// overlapping splats whose centre keys cross swap in one frame however current the sort
+    /// is. Comparing against a freshly sorted reference cannot see it, because the reference
+    /// contains the same swap.
+    ///
+    /// Camera motion has to be cancelled first or it swamps everything -- texture sweeping
+    /// across pixels dominates any difference statistic taken on the frames themselves. So
+    /// each frame is rendered twice, once freshly sorted and once with the order frozen at
+    /// the first camera, and the measurement runs on the residual between them. The frozen
+    /// arm carries the camera motion and no reordering at all; the residual is reordering
+    /// alone. Its frame-to-frame change is popping: growing staleness moves the residual
+    /// smoothly, a crossing steps it.
+    private func intrinsicPop(
+        _ harness: Harness,
+        _ renderer: SplatRenderer,
+        cameras: [SplatRenderer.CameraDescriptor]
+    ) async throws -> (p999: Double, worst: Double) {
+        guard let first = cameras.first else { return (0, 0) }
+        let frozen = try await sortedOrder(renderer, camera: first)
+
+        let histogram = Histogram()
+        var previousResidual: [Int]?
+        for camera in cameras {
+            let fresh = try await sortedOrder(renderer, camera: camera)
+            let freshFrame = try harness.render(renderer, camera: camera)
+            try renderer.publishOrderForTesting(frozen)
+            let frozenFrame = try harness.render(renderer, camera: camera)
+            try renderer.publishOrderForTesting(fresh)
+
+            let residual = (0..<freshFrame.count).map {
+                Int(freshFrame[$0]) - Int(frozenFrame[$0])
+            }
+            if let previous = previousResidual {
+                for channel in 0..<residual.count {
+                    histogram.add(abs(residual[channel] - previous[channel]))
+                }
+            }
+            previousResidual = residual
+        }
+        return (histogram.quantile(0.999), histogram.maximum)
     }
 
     /// Median wall-clock time of a forced sort across the turn. This is the load-dependent
@@ -309,9 +532,10 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
     /// second claim while silently assuming the first.
     func testFreshDepthOrderChangesPixelsWhenCentreDepthsCross() async throws {
         let harness = try Harness()
-        // Not equidistant: nearly so, which is what makes Euclidean hold them still, but
-        // exactly equidistant would tie the sort key and leave the comparison at the mercy
-        // of an unstable sort.
+        // Not equidistant: nearly so, which is what makes Euclidean hold them still. Exactly
+        // equidistant would tie the sort key, and while the sorter now breaks ties by index
+        // rather than leaving them to chance, a fixture should not rest on which of two
+        // tied splats the implementation happens to put first.
         let crossing = [
             Harness.point(
                 at: SIMD3<Float>(-0.3, 0, -2.00),
@@ -416,12 +640,11 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
         timing: DurationBox? = nil
     ) async throws -> [SplatRenderer.IndexType] {
         let started = Flag()
-        let finished = expectation(description: "sort")
-        finished.assertForOverFulfill = false
+        let finished = Signal()
         renderer.onSortStart = { started.raise() }
         renderer.onSortComplete = { seconds in
             timing?.record(seconds)
-            finished.fulfill()
+            finished.signal()
         }
         defer {
             renderer.onSortStart = nil
@@ -433,7 +656,12 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
             renderer.resortIndices()
         }
         if started.isRaised {
-            await fulfillment(of: [finished], timeout: 30)
+            // Bounded: a sort that fails without calling back would otherwise hang the
+            // suite rather than fail it.
+            guard await finished.wait(timeoutSeconds: 60) else {
+                XCTFail("a scheduled sort did not complete within 60 s")
+                return renderer.orderSnapshotForTesting()
+            }
         }
         return renderer.orderSnapshotForTesting()
     }
@@ -447,6 +675,66 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
         var isRaised: Bool {
             lock.lock(); defer { lock.unlock() }
             return raised
+        }
+    }
+
+    /// A one-shot await. Deliberately not an `XCTestExpectation`: this helper has to install
+    /// its completion handler before it knows whether a sort will start at all, and an
+    /// expectation created and then not waited on fails the test on its own.
+    private final class Signal: @unchecked Sendable {
+        private let lock = NSLock()
+        private var signalled = false
+        private var waiter: CheckedContinuation<Void, Never>?
+
+        func signal() {
+            lock.lock()
+            guard !signalled else { return lock.unlock() }
+            signalled = true
+            let waiter = self.waiter
+            self.waiter = nil
+            lock.unlock()
+            waiter?.resume()
+        }
+
+        /// Returns false if the deadline passed first.
+        func wait(timeoutSeconds: Double) async -> Bool {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [self] in
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                        lock.lock()
+                        if signalled {
+                            lock.unlock()
+                            continuation.resume()
+                        } else {
+                            waiter = continuation
+                            lock.unlock()
+                        }
+                    }
+                }
+                group.addTask { [self] in
+                    try? await Task.sleep(until: deadline, clock: .continuous)
+                    // Unblocks the waiter so the group can finish; `signalled` is what the
+                    // caller reads, and this does not set it.
+                    expire()
+                }
+                await group.next()
+                group.cancelAll()
+            }
+            return isSignalled
+        }
+
+        private var isSignalled: Bool {
+            lock.withLock { signalled }
+        }
+
+        private func expire() {
+            let waiter: CheckedContinuation<Void, Never>? = lock.withLock {
+                let pending = self.waiter
+                self.waiter = nil
+                return pending
+            }
+            waiter?.resume()
         }
     }
 
@@ -572,8 +860,9 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
         ///
         /// Radii are stratified rather than drawn freely. Every splat sits exactly `radius`
         /// from the camera, so a free draw would collide within the generator's resolution
-        /// long before 2000 samples, tie the Euclidean sort key, and leave the order at the
-        /// mercy of an unstable sort.
+        /// long before 2000 samples and tie the Euclidean sort key wholesale. Ties resolve
+        /// by index now, but a fixture asserting bit-identical frames should not depend on
+        /// that; distinct keys make the assertion about ordering rather than tie policy.
         static func overlappingCloud(count: Int) -> [SplatScenePoint] {
             var state: UInt64 = 0x9E37_79B9_7F4A_7C15
             func uniform() -> Float {
@@ -627,6 +916,52 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
         /// A yaw about the camera's own centre, under a real perspective projection. The
         /// rotation is the motion Euclidean ordering is invariant to and depth ordering is
         /// not; the perspective is what separates forward depth from radial distance at all.
+        /// A camera on a circle around `centre`, looking inward. This is how a viewer is
+        /// actually driven -- the user orbits the subject -- and unlike a yaw about the eye
+        /// it moves the camera position, so Euclidean distance is no longer invariant. The
+        /// whole argument for keeping Euclidean interactive rests on an invariance that only
+        /// one motion has; this is the other one.
+        static func orbited(
+            _ radians: Float,
+            centre: SIMD3<Float>,
+            radius: Float,
+            size: SIMD2<Int>,
+            far: Float
+        ) -> SplatRenderer.CameraDescriptor {
+            let eye = centre + SIMD3<Float>(radius * sin(radians), 0, radius * cos(radians))
+            let forward = simd_normalize(centre - eye)
+            // right = forward x up, not up x forward, which is left and gives a basis of
+            // determinant -1 -- a mirrored camera. Pooled error magnitudes survive a mirror,
+            // so this was invisible in the numbers and wrong anyway.
+            let right = simd_normalize(simd_cross(forward, SIMD3<Float>(0, 1, 0)))
+            let up = simd_cross(right, forward)
+            // World-to-camera: the basis as rows, then the translation into that basis.
+            let view = simd_float4x4(columns: (
+                SIMD4<Float>(right.x, up.x, -forward.x, 0),
+                SIMD4<Float>(right.y, up.y, -forward.y, 0),
+                SIMD4<Float>(right.z, up.z, -forward.z, 0),
+                SIMD4<Float>(-simd_dot(right, eye), -simd_dot(up, eye), simd_dot(forward, eye), 1)
+            ))
+            return SplatRenderer.CameraDescriptor(
+                projectionMatrix: perspective(size: size, far: far),
+                viewMatrix: view,
+                screenSize: size
+            )
+        }
+
+        static func perspective(size: SIMD2<Int>, far: Float) -> simd_float4x4 {
+            let fieldOfView: Float = 60 * .pi / 180
+            let aspect = Float(size.x) / Float(size.y)
+            let scaleY = 1 / tan(fieldOfView / 2)
+            let near: Float = 0.1
+            return simd_float4x4(columns: (
+                SIMD4<Float>(scaleY / aspect, 0, 0, 0),
+                SIMD4<Float>(0, scaleY, 0, 0),
+                SIMD4<Float>(0, 0, far / (near - far), -1),
+                SIMD4<Float>(0, 0, far * near / (near - far), 0)
+            ))
+        }
+
         static func yawed(
             _ radians: Float,
             at position: SIMD3<Float> = .zero,
@@ -649,18 +984,8 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
                 SIMD4<Float>(0, 0, 1, 0),
                 SIMD4<Float>(-position.x, -position.y, -position.z, 1)
             ))
-            let fieldOfView: Float = 60 * .pi / 180
-            let aspect = Float(size.x) / Float(size.y)
-            let scaleY = 1 / tan(fieldOfView / 2)
-            let near: Float = 0.1
-            let projection = simd_float4x4(columns: (
-                SIMD4<Float>(scaleY / aspect, 0, 0, 0),
-                SIMD4<Float>(0, scaleY, 0, 0),
-                SIMD4<Float>(0, 0, far / (near - far), -1),
-                SIMD4<Float>(0, 0, far * near / (near - far), 0)
-            ))
             return SplatRenderer.CameraDescriptor(
-                projectionMatrix: projection,
+                projectionMatrix: perspective(size: size, far: far),
                 viewMatrix: rotation * recentre,
                 screenSize: size
             )
