@@ -68,6 +68,7 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
             try load(renderer, points: spread(count: 4_000))
 
             var mismatchedFrames = 0
+            var disagreement = 0.0
             let frames = 24
             for frame in 0..<frames {
                 let angle = Float(frame) * 0.05
@@ -78,8 +79,13 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
                 let reference = try makeRenderer(ordering: ordering)
                 try load(reference, points: spread(count: 4_000))
                 try await sortFully(reference, camera: yawed(angle))
-                if displayed != reference.orderSnapshotForTesting() {
+                let fresh = reference.orderSnapshotForTesting()
+                if displayed != fresh {
                     mismatchedFrames += 1
+                    // Frequency alone conflates a single adjacent swap with a wholesale
+                    // reorder, and those are not perceptually alike. Normalised Kendall
+                    // distance: the fraction of splat pairs whose relative order differs.
+                    disagreement += normalisedInversionDistance(displayed, fresh)
                 }
             }
             // Not an assertion on a threshold: Euclidean is invariant under this rotation
@@ -93,7 +99,12 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
                     + "it should rarely disagree with a freshly sorted reference during a turn"
                 )
             }
-            print("rotation lag [\(ordering)]: \(mismatchedFrames)/\(frames) frames differ from fresh")
+            let meanDisagreement = disagreement / Double(frames)
+            print(String(
+                format: "rotation lag [%@]: %d/%d frames differ from fresh, "
+                    + "mean normalised inversion distance %.5f",
+                String(describing: ordering), mismatchedFrames, frames, meanDisagreement
+            ))
         }
     }
 
@@ -142,6 +153,42 @@ final class SplatRendererTemporalOrderingTests: XCTestCase {
     }
 
     // MARK: helpers
+
+    /// Fraction of splat pairs whose relative order differs between two permutations, via
+    /// rank correlation. 0 means identical ordering, 1 means fully reversed. Counting
+    /// frames that differ says how often the viewer is wrong; this says how wrong.
+    private func normalisedInversionDistance(
+        _ a: [SplatRenderer.IndexType],
+        _ b: [SplatRenderer.IndexType]
+    ) -> Double {
+        guard a.count == b.count, a.count > 1 else { return 0 }
+        var rank = [Int](repeating: 0, count: a.count)
+        for (position, index) in b.enumerated() { rank[Int(index)] = position }
+        let projected = a.map { rank[Int($0)] }
+        // Count inversions in `projected` by merge sort; O(n log n).
+        var work = projected
+        var scratch = work
+        var inversions = 0
+        func sortRange(_ lo: Int, _ hi: Int) {
+            guard hi - lo > 1 else { return }
+            let mid = (lo + hi) / 2
+            sortRange(lo, mid); sortRange(mid, hi)
+            var i = lo, j = mid, k = lo
+            while i < mid || j < hi {
+                if j >= hi || (i < mid && work[i] <= work[j]) {
+                    scratch[k] = work[i]; i += 1
+                } else {
+                    inversions += mid - i
+                    scratch[k] = work[j]; j += 1
+                }
+                k += 1
+            }
+            for index in lo..<hi { work[index] = scratch[index] }
+        }
+        sortRange(0, work.count)
+        let pairs = Double(a.count) * Double(a.count - 1) / 2
+        return pairs > 0 ? Double(inversions) / pairs : 0
+    }
 
     private func makeRenderer(ordering: SplatRenderer.SortOrdering) throws -> SplatRenderer {
         guard let device = MTLCreateSystemDefaultDevice() else {

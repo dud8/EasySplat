@@ -123,12 +123,14 @@
     },
     "mathematical_correctness": {
       "applies_to": "backward-pass VJP corrections (A2)",
-      "helper_max_abs_error": 1e-05,
+      "helper_max_abs_error": "1e-5 scaled by the largest gradient magnitude in the sweep",
       "helper_max_rel_error": 0.0001,
       "end_to_end_finite_difference_rel_l2_max": 0.001,
       "excludes": "declared nonsmooth boundaries",
       "outcome": "passing permits a correctness claim only; it does not establish a quality gain, and a correct gradient that scores neutral is still correct",
-      "coupling_rule": "density-control thresholds stay frozen during each correction's A/B. A matched-checkpoint population shift of at least 10 percent, or a cull-reason shift beyond 4 baseline SD, triggers a separate density re-fit; it never changes thresholds in the same patch."
+      "coupling_rule": "density-control thresholds stay frozen during each correction's A/B. A matched-checkpoint population shift of at least 10 percent, or a cull-reason shift beyond 4 baseline SD, triggers a separate density re-fit; it never changes thresholds in the same patch.",
+      "helper_max_abs_error_rationale": "A bare 1e-5 absolute bound is below what Float32 can represent for these quantities: projected position gradients run to order 1e3 (focal length over depth), where one ULP is already ~6e-5. An unscaled bound would be unsatisfiable by correct code, so it is expressed relative to the largest gradient the sweep produces. The relative bound (1e-4) is unchanged and is the binding check.",
+      "amended": "2026-07-28. Amended before any experiment receipt cited this contract's digest, so the immutability rule had not yet engaged. Recorded rather than applied silently: the original wording would have been reported as passed when the test actually applied a scaled bound."
     }
   }
 }
