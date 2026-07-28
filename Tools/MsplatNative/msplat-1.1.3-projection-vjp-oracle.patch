@@ -1,0 +1,125 @@
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -1892,6 +1892,30 @@
+     // The matrix is a function of q / ||q||. Project the normalized-coordinate
+     // cotangent onto the quaternion tangent plane, then apply d(q/||q||)/dq.
+     return inverse_norm * (v_quat - normalized * dot(normalized, v_quat));
++}
++
++// Exposes project_pix and project_pix_vjp to the oracle suite so the backward can be
++// checked against central differences of the forward it claims to differentiate.
++kernel void projection_vjp_for_testing_kernel(
++    constant float* mat [[buffer(0)]],
++    constant float* point [[buffer(1)]],
++    constant uint2& img_size [[buffer(2)]],
++    constant float* principal_point [[buffer(3)]],
++    constant float* v_xy [[buffer(4)]],
++    device float* out_pix [[buffer(5)]],
++    device float* out_grad [[buffer(6)]],
++    uint index [[thread_position_in_grid]]
++) {
++    if (index != 0) return;
++    const float3 p = float3(point[0], point[1], point[2]);
++    const float2 pp = float2(principal_point[0], principal_point[1]);
++    const float2 pix = project_pix(mat, p, img_size, pp);
++    out_pix[0] = pix.x;
++    out_pix[1] = pix.y;
++    const float3 grad = project_pix_vjp(mat, p, img_size, float2(v_xy[0], v_xy[1]));
++    out_grad[0] = grad.x;
++    out_grad[1] = grad.y;
++    out_grad[2] = grad.z;
+ }
+ 
+ kernel void quaternion_vjp_for_testing_kernel(
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -330,6 +330,7 @@
+     id<MTLComputePipelineState> exact_block_scan_propagate_u64_kernel_cpso;
+ #ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
+     id<MTLComputePipelineState> quaternion_vjp_for_testing_kernel_cpso;
++    id<MTLComputePipelineState> projection_vjp_for_testing_kernel_cpso;
+ #endif
+     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
+     id<MTLComputePipelineState> radix_sort_histogram_kernel_cpso;
+@@ -477,6 +478,8 @@
+ #ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
+     ctx->quaternion_vjp_for_testing_kernel_cpso =
+         load(@"quaternion_vjp_for_testing_kernel");
++    ctx->projection_vjp_for_testing_kernel_cpso =
++        load(@"projection_vjp_for_testing_kernel");
+ #endif
+     ctx->map_gaussian_to_intersects_kernel_cpso   = load(@"map_gaussian_to_intersects_kernel");
+     ctx->radix_sort_histogram_kernel_cpso         = load(@"radix_sort_histogram_kernel");
+@@ -1405,6 +1408,53 @@
+         device_output.data<uint64_t>(),
+         static_cast<size_t>(count) * sizeof(*output)
+     );
++}
++
++void msplat_projection_vjp_for_testing(
++    const float* mat,
++    const float* point,
++    unsigned int width,
++    unsigned int height,
++    const float* principal_point,
++    const float* v_xy,
++    float* out_pix,
++    float* out_grad
++) {
++    if (!mat || !point || !principal_point || !v_xy || !out_pix || !out_grad) {
++        throw std::invalid_argument("msplat: projection VJP oracle received a null buffer");
++    }
++    MetalContext* context = get_global_context();
++    MTensor d_mat = mtensor_empty(context->device, {16}, DType::Float32);
++    MTensor d_point = mtensor_empty(context->device, {3}, DType::Float32);
++    MTensor d_size = mtensor_empty(context->device, {2}, DType::Int32);
++    MTensor d_pp = mtensor_empty(context->device, {2}, DType::Float32);
++    MTensor d_vxy = mtensor_empty(context->device, {2}, DType::Float32);
++    MTensor d_pix = mtensor_empty(context->device, {2}, DType::Float32);
++    MTensor d_grad = mtensor_empty(context->device, {3}, DType::Float32);
++    std::memcpy(d_mat.data<float>(), mat, 16 * sizeof(float));
++    std::memcpy(d_point.data<float>(), point, 3 * sizeof(float));
++    std::memcpy(d_pp.data<float>(), principal_point, 2 * sizeof(float));
++    std::memcpy(d_vxy.data<float>(), v_xy, 2 * sizeof(float));
++    std::int32_t* size_ptr = d_size.data<std::int32_t>();
++    size_ptr[0] = static_cast<std::int32_t>(width);
++    size_ptr[1] = static_cast<std::int32_t>(height);
++
++    id<MTLCommandBuffer> command_buffer = context->getCommandBuffer();
++    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
++    [encoder setComputePipelineState:context->projection_vjp_for_testing_kernel_cpso];
++    ENC_BUF(encoder, d_mat, 0);
++    ENC_BUF(encoder, d_point, 1);
++    ENC_BUF(encoder, d_size, 2);
++    ENC_BUF(encoder, d_pp, 3);
++    ENC_BUF(encoder, d_vxy, 4);
++    ENC_BUF(encoder, d_pix, 5);
++    ENC_BUF(encoder, d_grad, 6);
++    [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
++       threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
++    [encoder endEncoding];
++    context->syncCB();
++    std::memcpy(out_pix, d_pix.data<float>(), 2 * sizeof(float));
++    std::memcpy(out_grad, d_grad.data<float>(), 3 * sizeof(float));
+ }
+ 
+ void msplat_quaternion_vjp_for_testing(
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -125,6 +125,16 @@
+     uint32_t tile_count,
+     uint64_t* sorted_keys,
+     uint32_t* sorted_values
++);
++void msplat_projection_vjp_for_testing(
++    const float* mat,
++    const float* point,
++    unsigned int width,
++    unsigned int height,
++    const float* principal_point,
++    const float* v_xy,
++    float* out_pix,
++    float* out_grad
+ );
+ void msplat_quaternion_vjp_for_testing(
+     const float* quaternion,

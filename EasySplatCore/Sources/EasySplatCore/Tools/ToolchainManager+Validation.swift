@@ -506,7 +506,7 @@ extension ToolchainManager {
             "source_version": "1.1.3",
             "density_control_patch_sha256": "895df7c0562f885b6389897a990683419cdcb319faf2b24e4d1c44d0950432b9",
             "overlay_sha256": "9d5f0e509f556061bff4ab16357e1d3fc5e2b54b638628529cb2fbfe54009869",
-            "raster_test_sha256": "664faa8c21af6ae1ee7e0d090068044dab44d68ba8610bb2e44b695ad76888ba",
+            "raster_test_sha256": "2117e15eda637952a3481fb01da8c8f0cdb5629830344e84486fa5f094a09dc7",
             "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
             "isolation_source_sha256": "65504b0448c61b4f2602d86150ff6ce83be61bfc48cc9f632fa72d95b4992e61",
             "isolation_runtime_header_sha256": "f3fae8409eeb24446bd9b5f4970b64522f01b1048c25827b712f4bef087b7d82",

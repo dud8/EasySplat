@@ -47,6 +47,16 @@ void msplat_quaternion_vjp_for_testing(
     const float *rotationGradient,
     float *quaternionGradient
 );
+void msplat_projection_vjp_for_testing(
+    const float *mat,
+    const float *point,
+    unsigned int width,
+    unsigned int height,
+    const float *principalPoint,
+    const float *viewGradient,
+    float *outPixel,
+    float *outGradient
+);
 
 namespace {
 
@@ -102,6 +112,109 @@ double quaternionRotationObjective(
         result += rotation[index] * static_cast<double>(rotationGradient[index]);
     }
     return result;
+}
+
+// project_pix divides by the homogeneous w, so its VJP has to carry the quotient-rule
+// term for w and the projection matrix's denominator row. Both were absent, which left
+// the world-space position gradient pointing in the wrong direction for every visible
+// gaussian rather than merely being mis-scaled. Central differences of the forward are
+// the only check that catches that: the shipped form stayed finite, stayed smooth, and
+// stayed wrong.
+void verifyProjectionVJP() {
+    // A perspective matrix with a non-trivial denominator row, row major, at bonsai's
+    // images_2 intrinsics.
+    const unsigned int width = 1559;
+    const unsigned int height = 1039;
+    const float focal = 1611.35f;
+    const float znear = 0.01f;
+    const float zfar = 100.0f;
+    const float principalPoint[2] = {0.5f * width, 0.5f * height};
+
+    const float projection[16] = {
+        2.0f * focal / width, 0.0f, 0.0f, 0.0f,
+        0.0f, 2.0f * focal / height, 0.0f, 0.0f,
+        0.0f, 0.0f, (zfar + znear) / (zfar - znear), -2.0f * zfar * znear / (zfar - znear),
+        0.0f, 0.0f, 1.0f, 0.0f,
+    };
+
+    const float points[5][3] = {
+        {0.10f, -0.05f, 2.00f},
+        {-0.60f, 0.40f, 1.20f},
+        {0.85f, 0.70f, 3.50f},
+        {-0.30f, -0.90f, 0.80f},
+        {0.02f, 0.01f, 6.00f},
+    };
+    const float cotangents[3][2] = {
+        {1.0f, 0.0f},
+        {0.0f, 1.0f},
+        {0.7f, -1.3f},
+    };
+
+    double worst = 0;
+    for (const auto &point : points) {
+        for (const auto &cotangent : cotangents) {
+            float pixel[2];
+            float gradient[3];
+            msplat_projection_vjp_for_testing(
+                projection, point, width, height, principalPoint, cotangent, pixel, gradient
+            );
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!std::isfinite(gradient[axis])) {
+                    throw std::runtime_error("projection VJP contains a non-finite value");
+                }
+            }
+
+            // Central differences of the same forward, stepped in world space.
+            double reference[3];
+            for (int axis = 0; axis < 3; ++axis) {
+                const float step = 1.0e-3f;
+                float forward[3] = {point[0], point[1], point[2]};
+                float backward[3] = {point[0], point[1], point[2]};
+                forward[axis] += step;
+                backward[axis] -= step;
+                float forwardPixel[2];
+                float backwardPixel[2];
+                float ignored[3];
+                msplat_projection_vjp_for_testing(
+                    projection, forward, width, height, principalPoint, cotangent,
+                    forwardPixel, ignored
+                );
+                msplat_projection_vjp_for_testing(
+                    projection, backward, width, height, principalPoint, cotangent,
+                    backwardPixel, ignored
+                );
+                reference[axis] =
+                    (static_cast<double>(cotangent[0]) *
+                         (forwardPixel[0] - backwardPixel[0]) +
+                     static_cast<double>(cotangent[1]) *
+                         (forwardPixel[1] - backwardPixel[1])) /
+                    (2.0 * step);
+            }
+
+            double numerator = 0;
+            double denominator = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double difference =
+                    static_cast<double>(gradient[axis]) - reference[axis];
+                numerator += difference * difference;
+                denominator += reference[axis] * reference[axis];
+            }
+            if (denominator <= 0) {
+                continue;
+            }
+            worst = std::max(worst, std::sqrt(numerator / denominator));
+        }
+    }
+
+    // research-quality-v1 sets 1e-3 for end-to-end finite differences. Single precision
+    // in the kernel and a 1e-3 world step put the achievable floor near 1e-4.
+    if (worst > 1.0e-3) {
+        throw std::runtime_error(
+            "projection VJP disagrees with central differences: relative L2 " +
+            std::to_string(worst)
+        );
+    }
+    std::cout << "projection_vjp passed (worst relative L2 " << worst << ")\n";
 }
 
 void verifyQuaternionVJP() {
@@ -3473,6 +3586,10 @@ int main(int argc, char **argv) {
             verifyQuaternionVJP();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--projection-vjp") {
+            verifyProjectionVJP();
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--geometry-adam-benchmark") {
             benchmarkGeometryAdamFusion(argv[2]);
             return 0;
@@ -3493,6 +3610,7 @@ int main(int argc, char **argv) {
                 "       msplat-raster-tests --prefix-oracle\n"
                 "       msplat-raster-tests --radix-oracle\n"
                 "       msplat-raster-tests --quaternion-vjp\n"
+                "       msplat-raster-tests --projection-vjp\n"
                 "       msplat-raster-tests --overflow-cpu-reference <overflow dataset>\n"
                 "       msplat-raster-tests --stage-timing <profile dataset>\n"
                 "       msplat-raster-tests --geometry-adam-benchmark <dataset>"
