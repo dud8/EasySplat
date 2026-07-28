@@ -57,7 +57,7 @@ final class SplatRendererLoadTests: XCTestCase {
         let geometryBytes = MemoryLayout<SplatRenderer.Splat>.stride
         let sphericalHarmonicBytes = 16 * MemoryLayout<SplatRenderer.PackedHalf3>.stride
         let orderBytes = 2 * MemoryLayout<SplatRenderer.IndexType>.stride
-        let cpuSortBytes = 2 * MemoryLayout<SplatRenderer.SplatIndexAndDepth>.stride
+        let cpuSortBytes = 2 * MemoryLayout<SplatRenderer.SplatPackedSortKey>.stride
         let bytesPerSplat = geometryBytes + sphericalHarmonicBytes + orderBytes + cpuSortBytes
         XCTAssertEqual(
             SplatRenderer.ViewerMemoryModel.bytesPerFullSphericalHarmonicSplat,

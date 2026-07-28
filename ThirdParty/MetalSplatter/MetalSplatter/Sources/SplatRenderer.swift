@@ -112,16 +112,14 @@ public class SplatRenderer {
         public static let fixedReserveBytes = 64 * 1_024 * 1_024
 
         /// During a full-SH camera sort, all of these allocations coexist: encoded geometry,
-        /// 16 packed SH RGB triplets, the published and replacement index buffers, and two CPU
-        /// index/depth arrays. The async scalar sort captures the reusable array, then mutates a
-        /// local copy, so Swift copy-on-write keeps both backing stores live while sorting. The
-        /// production reader admits against this worst-case representation before it knows whether
-        /// a PLY uses SH0 or SH3.
+        /// 16 packed SH RGB triplets, the published and replacement index buffers, and the
+        /// radix sorter's two packed-key arrays. The production reader admits against this
+        /// worst-case representation before it knows whether a PLY uses SH0 or SH3.
         public static let bytesPerFullSphericalHarmonicSplat =
             MemoryLayout<Splat>.stride
             + SHDegree.payloadCount * MemoryLayout<PackedHalf3>.stride
             + 2 * MemoryLayout<IndexType>.stride
-            + 2 * MemoryLayout<SplatIndexAndDepth>.stride
+            + 2 * MemoryLayout<SplatPackedSortKey>.stride
 
         public static func requiredBytes(forPointCount pointCount: Int) throws -> Int {
             guard pointCount >= 0 else {
@@ -338,10 +336,10 @@ public class SplatRenderer {
         var covB: PackedHalf3
     }
 
-    struct SplatIndexAndDepth {
-        var index: UInt32
-        var depth: Float
-    }
+    /// One entry of the sorter's working array: an order-preserving image of the depth key
+    /// in the high half, the splat index in the low half. Named so the viewer's memory
+    /// admission can size the two scratch arrays without reaching into the sorter.
+    typealias SplatPackedSortKey = UInt64
 
     struct RenderSceneSnapshot {
         let splatBuffer: MTLBuffer
@@ -372,6 +370,25 @@ public class SplatRenderer {
             return Array(UnsafeBufferPointer(start: orderBuffer.values, count: count))
         }
     }
+
+    /// Installs a draw order directly, bypassing the sorter. The counterpart to
+    /// `orderSnapshotForTesting`, and only useful with it: the image-space temporal gate
+    /// records what each frame published while the camera moves, then renders those
+    /// recordings afterwards. Doing the rendering inside the moving loop is what made the
+    /// first version of that gate measure its own scheduling latency rather than the
+    /// picture, so replaying has to be possible after the fact.
+    func publishOrderForTesting(_ order: [IndexType]) throws {
+        let published = try makeOrderBuffer(
+            device: splatBuffer.device,
+            count: order.count,
+            maximumCapacity: sortedOrderBufferCapacityLimit,
+            fill: { destination in
+                for index in 0..<order.count { destination[index] = order[index] }
+            }
+        )
+        withSortStateLock { orderBuffer = published }
+    }
+
     var onSortWorkerBufferBoundForTesting: ((MTLBuffer) -> Void)?
 
     // dynamicUniformBuffers contains maxSimultaneousRenders uniforms buffers,
@@ -411,9 +428,12 @@ public class SplatRenderer {
     var depthBufferTempSort: MetalBuffer<Float>
 
     // Sorting on CPU
-    // While not sorting, we guarantee that orderAndDepthTempSort remains valid: the count may not match splatCount, but the array should contain all indices.
-    // So for every i in 0..<orderAndDepthTempSort.count, orderAndDepthTempSort should contain exactly one element with .index = i
-    var orderAndDepthTempSort: [SplatIndexAndDepth] = []
+    // Scratch for the radix sort, kept between frames so a turn does not reallocate 26 MB
+    // per frame. Both are handed to the worker for the duration of a sort and handed back
+    // when it publishes; neither carries meaning across sorts, since the keys are rebuilt in
+    // index order every time.
+    var sortKeysTempSort: [UInt64] = []
+    var sortScratchTempSort: [UInt64] = []
 
     private let maximumSplatCount: Int?
     private let maximumWorkingSetBytes: Int?
@@ -530,7 +550,7 @@ public class SplatRenderer {
                 device: splatBuffer.device,
                 count: 0,
                 maximumCapacity: nil,
-                indexAt: { _ in 0 }
+                fill: { _ in }
             )
             withSortStateLock {
                 splatBuffer = emptySplats
@@ -613,7 +633,9 @@ public class SplatRenderer {
             device: pendingSplatBuffer.device,
             count: pendingSplatBuffer.count,
             maximumCapacity: nil,
-            indexAt: { UInt32($0) }
+            fill: { destination in
+                for index in 0..<pendingSplatBuffer.count { destination[index] = UInt32(index) }
+            }
         )
         publishScene(
             splats: pendingSplatBuffer,
@@ -726,7 +748,9 @@ public class SplatRenderer {
                 device: splatBuffer.device,
                 count: newCount,
                 maximumCapacity: nil,
-                indexAt: { UInt32($0) }
+                fill: { destination in
+                    for index in 0..<newCount { destination[index] = UInt32(index) }
+                }
             )
             var coefficients = sphericalHarmonicCoefficientBuffer
             var degree = sphericalHarmonicDegree
@@ -892,47 +916,77 @@ public class SplatRenderer {
         onSortSnapshotCapturedForTesting?(context.splatBuffer)
         onSortStart?()
 
-        var workingOrder = orderAndDepthTempSort
-        orderAndDepthTempSort = []
-        if workingOrder.count != context.splatCount {
-            workingOrder = Array(
-                repeating: SplatIndexAndDepth(index: .max, depth: 0),
-                count: context.splatCount
-            )
-            for index in workingOrder.indices {
-                workingOrder[index].index = UInt32(index)
-            }
+        // Both scratch arrays are handed to the worker and handed back when it finishes, so
+        // the allocation survives between frames without being shared with a live sort.
+        var packedKeys = sortKeysTempSort
+        var packedScratch = sortScratchTempSort
+        sortKeysTempSort = []
+        sortScratchTempSort = []
+        if packedKeys.count != context.splatCount {
+            packedKeys = [UInt64](repeating: 0, count: context.splatCount)
+        }
+        if packedScratch.count != context.splatCount {
+            packedScratch = [UInt64](repeating: 0, count: context.splatCount)
         }
 
-        Task(priority: .high) { [self, context, workingOrder] in
-            var workingOrder = workingOrder
+        Task(priority: .high) { [self, context] in
+            var packedKeys = packedKeys
+            var packedScratch = packedScratch
             let splatValues = sortSplatValues(for: context)
-            for index in workingOrder.indices {
-                let splatIndex = workingOrder[index].index
-                let splatPosition = splatValues[Int(splatIndex)].position
+            // Always built in index order rather than reusing the previous frame's
+            // permutation: the radix pass never inspects the index half of a key, so equal
+            // depths keep the order they were built in, and a canonical starting order is
+            // what makes the published sequence reproducible.
+            for index in 0..<context.splatCount {
+                let splatPosition = splatValues[index].position
                 let splatPositionUnpacked = SIMD3<Float>(splatPosition.x, splatPosition.y, splatPosition.z)
+                let depth: Float
                 switch context.ordering {
                 case .euclideanCameraDistance:
-                    workingOrder[index].depth = (splatPositionUnpacked - context.camera.position).lengthSquared
+                    depth = (splatPositionUnpacked - context.camera.position).lengthSquared
                 case .cameraForwardDepth:
-                    workingOrder[index].depth = dot(splatPositionUnpacked, context.camera.forward)
+                    depth = dot(splatPositionUnpacked, context.camera.forward)
+                }
+                packedKeys[index] = SplatDepthRadixSort.pack(key: depth, index: UInt32(index))
+            }
+
+            packedKeys.withUnsafeMutableBufferPointer { keys in
+                packedScratch.withUnsafeMutableBufferPointer { scratch in
+                    guard let keysBase = keys.baseAddress, let scratchBase = scratch.baseAddress
+                    else { return }
+                    SplatDepthRadixSort.sort(
+                        keysBase,
+                        scratch: scratchBase,
+                        count: context.splatCount
+                    )
                 }
             }
 
-            if Constants.renderFrontToBack {
-                workingOrder.sort { $0.depth < $1.depth }
-            } else {
-                workingOrder.sort { $0.depth > $1.depth }
-            }
-
-            orderAndDepthTempSort = workingOrder
             do {
                 let sortedOrder = try makeOrderBuffer(
                     device: context.splatBuffer.device,
                     count: context.splatCount,
                     maximumCapacity: context.orderBufferCapacityLimit,
-                    indexAt: { workingOrder[$0].index }
+                    fill: { destination in
+                        // The radix sorts front to back; a back-to-front renderer reads the
+                        // same array from the other end.
+                        let count = context.splatCount
+                        packedKeys.withUnsafeBufferPointer { sorted in
+                            if Constants.renderFrontToBack {
+                                for position in 0..<count {
+                                    destination[position] = SplatDepthRadixSort.index(of: sorted[position])
+                                }
+                            } else {
+                                for position in 0..<count {
+                                    destination[position] =
+                                        SplatDepthRadixSort.index(of: sorted[count - 1 - position])
+                                }
+                            }
+                        }
+                    }
                 )
+                sortKeysTempSort = packedKeys
+                sortScratchTempSort = packedScratch
                 finishSort(context, publishedOrder: sortedOrder, failure: nil)
             } catch {
                 finishSort(
@@ -996,7 +1050,12 @@ public class SplatRenderer {
                     device: context.splatBuffer.device,
                     count: context.splatCount,
                     maximumCapacity: context.orderBufferCapacityLimit,
-                    indexAt: { UInt32(orderScratch.values[$0]) }
+                    fill: { destination in
+                        let source = orderScratch.values
+                        for position in 0..<context.splatCount {
+                            destination[position] = UInt32(source[position])
+                        }
+                    }
                 )
                 finishSort(context, publishedOrder: sortedOrder, failure: nil)
             } catch {
@@ -1058,11 +1117,18 @@ public class SplatRenderer {
             .bindMemory(to: Splat.self, capacity: context.splatCount)
     }
 
+    /// `fill` receives the buffer's base pointer and must write exactly `count` indices.
+    ///
+    /// It takes the whole range rather than one index at a time because appending element by
+    /// element reloads the buffer's `values` and `count` through a class reference on every
+    /// iteration, and the optimizer cannot hoist either. On a 1.64M-splat scene that loop
+    /// cost 27 ms of a 35 ms sort -- more than the sort itself -- against about one for the
+    /// same bytes written through a local pointer.
     private func makeOrderBuffer(
         device: MTLDevice,
         count: Int,
         maximumCapacity: Int?,
-        indexAt: (Int) -> IndexType
+        fill: (UnsafeMutablePointer<IndexType>) -> Void
     ) throws -> MetalBuffer<IndexType> {
         guard count <= Int(UInt32.max) else {
             throw SortFailure.orderBufferAllocationFailed("The scene contains too many splats to index.")
@@ -1072,9 +1138,8 @@ public class SplatRenderer {
             capacity: max(1, count),
             maximumCapacity: maximumCapacity
         )
-        for index in 0..<count {
-            buffer.append(indexAt(index))
-        }
+        fill(buffer.values)
+        buffer.count = count
         return buffer
     }
 
