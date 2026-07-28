@@ -43,7 +43,7 @@ public final class MetalOffscreenRenderer {
         do {
             renderer = try SplatRenderer(
                 device: device,
-                colorFormat: .rgba8Unorm_srgb,
+                colorFormat: .rgba8Unorm,
                 depthFormat: .invalid,
                 stencilFormat: .invalid,
                 sampleCount: 1,
@@ -162,7 +162,7 @@ private final class MetalLoadedScene: LoadedSceneRendering {
         }
 
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba8Unorm_srgb,
+            pixelFormat: .rgba8Unorm,
             width: camera.width,
             height: camera.height,
             mipmapped: false

@@ -27,7 +27,10 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         guard let queue = self.device.makeCommandQueue() else { return nil }
         self.commandQueue = queue
         self.metalKitView = metalKitView
-        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
+        // Splat colours are sRGB code values, so the attachment must not linearise them
+        // for blending; the layer's colour space handles display matching instead.
+        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm
+        metalKitView.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
         metalKitView.sampleCount = 1
         // This is required because we render front-to-back (see SplatRenderer.Constants.renderFrontToBack).

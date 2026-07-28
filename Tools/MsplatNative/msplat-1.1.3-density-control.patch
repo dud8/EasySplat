@@ -164,12 +164,12 @@
 +            // so its whole tail phase saw opacity culling only. The tail exists to remove
 +            // oversized geometry, so enable it there regardless of the reset schedule.
 +            bool checkHuge = doTailCull || step > refineEvery * resetAlphaEvery;
-+            // doTailCull covers both ways growth can be over: past stopSplitAt, and the
-+            // capacity ceiling inside the growth window. Both mean densification is no
-+            // longer running to replace what a cull removes, which is what the relaxed
-+            // scale threshold below is keyed on. On mip-NeRF 360 flowers the ceiling
-+            // binds at step 6000 of a 15000-step window, so that branch is the common
-+            // one, not an edge case.
++            // doTailCull covers two cases: past stopSplitAt, where growth is over for
++            // good, and the capacity ceiling, where it is refused for this pass only and
++            // resumes once a cull frees headroom. What both share is that this pass will
++            // not replace what it removes, which is what the relaxed scale threshold
++            // below is keyed on. On flowers the ceiling binds at step 6000 of a 15000
++            // step window, so that branch is the common one, not an edge case.
              int fr_stride = (int)featuresRest_buf.stride0();
 +            // An infinite gradient threshold leaves nothing flagged for split or
 +            // duplication, which turns the fused densify pass into a cull-only pass.

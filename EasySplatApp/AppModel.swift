@@ -147,6 +147,10 @@ final class AppModel: ObservableObject {
     @Published var pendingDataset: PendingDataset? = nil
     @Published var projectSummaries: [ProjectSummary] = []
     @Published var selectionWarning: String? = nil
+    /// Splats dropped where capture input was expected. Opening one is what the user
+    /// meant, so the drop is routed to the viewer rather than refused. Drained by the
+    /// view that presents the window.
+    @Published var splatOpenRequests: [URL] = []
     @Published var shareStatusMessage: String? = nil
     @Published var shareStatusIsError: Bool = false
     @Published var isShareSheetActive: Bool = false

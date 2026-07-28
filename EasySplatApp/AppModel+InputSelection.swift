@@ -44,6 +44,15 @@ extension AppModel {
     /// capture folder with both kinds of media brings all of it in. Photos and
     /// videos coming from different folders are merged into one selection.
     func addInputs(urls: [URL]) {
+        // A splat is a result rather than capture input, but dropping one here is a
+        // reasonable thing to expect to work, so it opens in the viewer instead of
+        // being refused. Anything else in the same drop still goes through selection.
+        let openable = urls.filter { SplatFileType.isViewable($0) }
+        if !openable.isEmpty {
+            splatOpenRequests.append(contentsOf: openable)
+        }
+        let urls = urls.filter { !SplatFileType.isViewable($0) }
+
         // A dataset is exclusive with photos and videos. Classify the drop for
         // datasets first (deterministically by path so the winner is stable),
         // then let the exclusivity rules short-circuit before the media loop.
@@ -107,6 +116,12 @@ extension AppModel {
             newPhotos.append(url)
         }
 
+        var ignoredSplatCount = 0
+        func ignore(_ url: URL) {
+            ignoredFileCount += 1
+            if SplatFileType.isSplat(url) { ignoredSplatCount += 1 }
+        }
+
         for url in urls {
             let input = Self.classifyInput(url)
             switch input.kind {
@@ -120,10 +135,10 @@ extension AppModel {
                 } else if Self.isSupportedImage(url) {
                     admitPhoto(url)
                 } else {
-                    ignoredFileCount += 1
+                    ignore(url)
                 }
             case .unsupported:
-                ignoredFileCount += 1
+                ignore(url)
             }
         }
 
@@ -133,9 +148,19 @@ extension AppModel {
         var warnings: [String] = []
         if ignoredFileCount > 0 {
             let noun = ignoredFileCount == 1 ? "file" : "files"
-            warnings.append(
-                "Ignored \(ignoredFileCount) \(noun). Supported: photos, videos, folders, or COLMAP, Nerfstudio, or Polycam datasets."
-            )
+            // A viewable splat never reaches here — it opens instead. What is left is a
+            // splat in a container the reader does not understand, and saying "add
+            // photos" to that reads as a non-sequitur.
+            if ignoredSplatCount == ignoredFileCount {
+                let splatNoun = ignoredFileCount == 1 ? "splat" : "splats"
+                warnings.append(
+                    "Ignored \(ignoredFileCount) \(splatNoun). EasySplat opens .ply splats."
+                )
+            } else {
+                warnings.append(
+                    "Ignored \(ignoredFileCount) \(noun). Add photos, a video, or a folder of them."
+                )
+            }
         }
         if requestedRunOptions.inputOrdering == .continuous,
            let input = buildInputSpec(),

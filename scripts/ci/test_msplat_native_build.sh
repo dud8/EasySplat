@@ -192,7 +192,7 @@ require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT
 require_json_hash "overlay_sha256" "$OVERLAY" "$VALIDATOR"
 require_contains '"patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$VALIDATOR"
 require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$VALIDATOR"
-require_contains 'RASTER_TEST_SHA256="60f4eea65d5be2ad8684292e8234fbce97ab330d5c1e0946d6b2e00a91957dcf"' "$BUILD_SCRIPT"
+require_contains 'RASTER_TEST_SHA256="664faa8c21af6ae1ee7e0d090068044dab44d68ba8610bb2e44b695ad76888ba"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 for source_contract in \
   "ISOLATION_HEADER:$ISOLATION_HEADER" \
@@ -648,7 +648,7 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_json_hash "isolation_mask_test_sha256" "$ISOLATION_MASK_TEST_SOURCE" "$contract_file"
   require_json_hash "isolation_patch_sha256" "$ISOLATION_PATCH" "$contract_file"
   require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$contract_file"
-  require_contains '"raster_test_sha256": "60f4eea65d5be2ad8684292e8234fbce97ab330d5c1e0946d6b2e00a91957dcf"' "$contract_file"
+  require_contains '"raster_test_sha256": "664faa8c21af6ae1ee7e0d090068044dab44d68ba8610bb2e44b695ad76888ba"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
   require_contains '"allocation_pressure_patch_sha256": "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8"' "$contract_file"
   require_contains '"exact_prefix_hardening_patch_sha256": "510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb"' "$contract_file"

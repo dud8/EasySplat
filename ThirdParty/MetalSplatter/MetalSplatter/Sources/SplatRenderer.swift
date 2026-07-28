@@ -512,11 +512,18 @@ public class SplatRenderer {
         from url: URL,
         shouldCancel: @escaping @Sendable () -> Bool
     ) throws {
+        try readSplatScene(from: url, shouldCancel: shouldCancel)
+    }
+
+    /// Reads any container ``SplatSceneReaderFactory`` recognises, choosing the reader
+    /// from the file rather than assuming PLY.
+    public func readSplatScene(
+        from url: URL,
+        shouldCancel: @escaping @Sendable () -> Bool = { false }
+    ) throws {
+        let reader = try SplatSceneReaderFactory.reader(for: url, validatesRenderEncoding: false)
         try readScene(shouldCancel: shouldCancel) { delegate, shouldStop in
-            SplatPLYSceneReader(
-                url,
-                validatesRenderEncoding: false
-            ).read(to: delegate, shouldCancel: shouldStop)
+            reader.read(to: delegate, shouldCancel: shouldStop)
         }
     }
 
@@ -1204,7 +1211,7 @@ extension SplatRenderer: SplatSceneReaderDelegate {
 
 extension SplatRenderer.Splat {
     init(_ encoding: SplatRenderEncoding) {
-        let color = encoding.linearColorOpacity
+        let color = encoding.colorOpacity
         let covA = encoding.covarianceA
         let covB = encoding.covarianceB
         self.init(

@@ -2583,7 +2583,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.pendingVideoURLs.isEmpty)
         XCTAssertEqual(
             model.selectionWarning,
-            "Ignored 1 file. Supported: photos, videos, folders, or COLMAP, Nerfstudio, or Polycam datasets."
+            "Ignored 1 file. Add photos, a video, or a folder of them."
         )
     }
 

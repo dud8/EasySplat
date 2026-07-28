@@ -1610,6 +1610,75 @@ void verifyTailCullRemovesOversizedOnShortRuns(const std::string &dataset) {
     std::cout << "tail cull removes oversized on short runs passed\n";
 }
 
+// The capacity ceiling takes the same relaxed scale threshold as the post-stopSplitAt
+// tail, and it fires inside the growth window rather than after it. That is the common
+// production path, not an edge case: training always carries a memory budget, so the
+// ceiling is always live, and on mip-NeRF 360 flowers it binds at step 6000 of 15000.
+// verifyCapacityCeilingBoundsGrowth proves growth is refused and a cull still runs, but
+// it never touches scales, so nothing observed which threshold that cull used.
+void verifyCeilingCullKeepsOrdinaryGeometry(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Model model = makeModel(inputData);
+        const int pointCount = model.num_active;
+
+        // One slot below the worst case, so the pass is refused and takes the tail
+        // branch. Step 600 is past warmupLength, before stopSplitAt, on a refine
+        // boundary, and clear of the post-reset blackout.
+        model.maxCapacity = 3 * pointCount - 1;
+        const int growthStep = 600;
+
+        // Well clear of the 0.005 opacity cull that still applies inside the window,
+        // so opacity cannot explain either outcome below.
+        setUniformOpacity(model, 0.5f);
+
+        // Round, so the thin-disc exemption cannot explain a survival, and uniformly
+        // below kCullScale so the two planted scales identify themselves afterwards.
+        float *scales = model.scales.data<float>();
+        std::fill(scales, scales + 3 * pointCount, std::log(0.05f));
+        for (int axis = 0; axis < 3; axis++) {
+            scales[0 * 3 + axis] = std::log(0.2f);  // over kCullScale, under kTailCullScale
+            scales[1 * 3 + axis] = std::log(1.0f);  // over both
+        }
+
+        primeForDensification(model);
+        model.afterTrain(growthStep);
+
+        int ordinary = 0;
+        int oversized = 0;
+        const float *survivors = model.scales.data<float>();
+        for (int i = 0; i < model.num_active; i++) {
+            float largest = 0.0f;
+            for (int axis = 0; axis < 3; axis++) {
+                largest = (std::max)(largest, std::exp(survivors[i * 3 + axis]));
+            }
+            if (largest > 0.15f && largest < 0.5f) {
+                ordinary++;
+            } else if (largest >= 0.5f) {
+                oversized++;
+            }
+        }
+        if (ordinary != 1) {
+            throw std::runtime_error(
+                "the capacity-ceiling cull removed ordinary geometry that densification "
+                "is no longer running to replace");
+        }
+        if (oversized != 0) {
+            throw std::runtime_error(
+                "the capacity-ceiling cull kept an oversized gaussian");
+        }
+        if (model.num_active != pointCount - 1) {
+            throw std::runtime_error(
+                "the capacity-ceiling cull removed something other than the oversized "
+                "gaussian");
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "ceiling cull keeps ordinary geometry passed\n";
+}
+
 void enqueueStep(Model &model, Camera &camera, int step, std::size_t cameraIndex) {
     if (camera.image.empty()) {
         camera.loadImage(1.0f);
@@ -3524,6 +3593,7 @@ int main(int argc, char **argv) {
         verifyGeometryAdamFusionParity(argv[2]);
         verifyDensificationScratchLifecycle(dataset);
         verifyCapacityCeilingBoundsGrowth(dataset);
+        verifyCeilingCullKeepsOrdinaryGeometry(dataset);
         verifyTailCullRemovesOversizedOnShortRuns(dataset);
         verifyMixedResolutionGrowth(argv[2]);
         verifyExactOnlyBudgetEvidence(argv[6]);

@@ -232,14 +232,58 @@ final class AppModelDatasetSelectionTests: XCTestCase {
         XCTAssertTrue(HomeView.hasSelectableInput(hasMedia: false, hasDataset: true))
     }
 
-    func testIgnoredFilesWarningMentionsDatasets() throws {
+    func testIgnoredFilesWarningNamesNoParticularDatasetFormat() throws {
         let model = makeModel()
         let unsupported = base.appendingPathComponent("notes.txt")
         try Data("t".utf8).write(to: unsupported)
         model.addInputs(urls: [unsupported])
         XCTAssertEqual(
             model.selectionWarning,
-            "Ignored 1 file. Supported: photos, videos, folders, or COLMAP, Nerfstudio, or Polycam datasets."
+            "Ignored 1 file. Add photos, a video, or a folder of them."
+        )
+    }
+
+    // Dropping a finished splat on the input zone is a reasonable thing to expect to
+    // work, so it opens rather than being refused.
+    func testDroppedSplatIsRoutedToTheViewerInsteadOfBeingIgnored() throws {
+        let model = makeModel()
+        let splat = base.appendingPathComponent("scene.ply")
+        try Data("ply".utf8).write(to: splat)
+
+        model.addInputs(urls: [splat])
+
+        XCTAssertEqual(model.splatOpenRequests, [splat])
+        XCTAssertNil(model.selectionWarning)
+        XCTAssertTrue(model.pendingPhotoURLs.isEmpty)
+        XCTAssertTrue(model.pendingVideoURLs.isEmpty)
+    }
+
+    // A splat alongside capture input should not cost the capture input.
+    func testDroppedSplatOpensWithoutDiscardingPhotosInTheSameDrop() throws {
+        let model = makeModel()
+        let splat = base.appendingPathComponent("scene.ply")
+        let photo = base.appendingPathComponent("frame.jpg")
+        try Data("ply".utf8).write(to: splat)
+        try Data("jpg".utf8).write(to: photo)
+
+        model.addInputs(urls: [splat, photo])
+
+        XCTAssertEqual(model.splatOpenRequests, [splat])
+        XCTAssertEqual(model.pendingPhotoURLs, [photo])
+    }
+
+    // A container the reader cannot open still has to say so specifically.
+    func testUnreadableSplatContainerSaysWhichFormatOpens() throws {
+        let model = makeModel()
+        let splat = base.appendingPathComponent("scene.spz")
+        try Data("spz".utf8).write(to: splat)
+
+        model.addInputs(urls: [splat])
+
+        XCTAssertTrue(model.splatOpenRequests.isEmpty)
+        XCTAssertEqual(
+            model.selectionWarning,
+            "Ignored 1 splat. EasySplat opens .ply splats."
         )
     }
 

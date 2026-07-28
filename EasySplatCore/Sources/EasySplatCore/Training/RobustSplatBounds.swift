@@ -202,13 +202,19 @@ public enum SplatSceneBoundsCalculator {
             && approximatelyEqual(lhs.radius, rhs.radius)
     }
 
+    /// - Parameter format: the container to parse as. Defaults to PLY because artifact
+    ///   validation measures the app's own output through a `/dev/fd` descriptor URL,
+    ///   which carries no extension to dispatch on. Callers opening a user-chosen file
+    ///   should pass the format detected from that file instead.
     public static func compute(
         at url: URL,
+        format: SplatSceneFormat = .ply,
         maximumSampleCount: Int? = nil,
         shouldCancel: @escaping @Sendable () -> Bool = { false }
     ) throws -> SplatSceneBounds? {
         let collector = BoundsCollector(maximumSampleCount: maximumSampleCount)
-        SplatPLYSceneReader(url).read(to: collector, shouldCancel: shouldCancel)
+        SplatSceneReaderFactory.reader(for: url, format: format)
+            .read(to: collector, shouldCancel: shouldCancel)
         if let error = collector.error { throw error }
         return RobustSplatBounds.computeTrainingBounds(preparedSamples: collector.samples)
     }

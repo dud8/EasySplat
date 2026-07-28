@@ -4,6 +4,7 @@ import Darwin
 import EasySplatCore
 import EasySplatReleaseVerifierCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
@@ -32,6 +33,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         NSWindow.allowsAutomaticWindowTabbing = false
         guard let application = notification.object as? NSApplication else { return }
         application.mainMenu = makeMainMenu(for: application)
+    }
+
+    /// Finder "Open With", a drop on the Dock tile, and `open -a` all arrive here.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let splats = urls.filter { SplatFileType.isViewable($0) }
+        splats.forEach(StandaloneSplatWindowPresenter.shared.present)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -201,6 +208,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         )
         newSplatItem.target = self
         fileMenu.addItem(newSplatItem)
+        let openSplatItem = NSMenuItem(
+            title: "Open Splat…",
+            action: #selector(openSplat(_:)),
+            keyEquivalent: "o"
+        )
+        openSplatItem.target = self
+        fileMenu.addItem(openSplatItem)
         let exportItem = NSMenuItem(
             title: "Export…",
             action: #selector(exportSplat(_:)),
@@ -351,6 +365,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     @objc private func newSplat(_ sender: Any?) {
         model.beginNewSplat()
+    }
+
+    @objc private func openSplat(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.message = "Choose a splat to view."
+        panel.prompt = "Open"
+        // Driven by what the reader supports so a newly supported container does not
+        // need a second edit here to become selectable.
+        let types = SplatFileType.viewableExtensions
+            .sorted()
+            .compactMap { UTType(filenameExtension: $0) }
+        if !types.isEmpty {
+            panel.allowedContentTypes = types
+        }
+        guard panel.runModal() == .OK else { return }
+        panel.urls.forEach(StandaloneSplatWindowPresenter.shared.present)
     }
 
     @objc private func exportSplat(_ sender: Any?) {
