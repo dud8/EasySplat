@@ -51,8 +51,8 @@ public final class MetalOffscreenRenderer {
                 maxSimultaneousRenders: 1,
                 // This renderer blocks on every sort before it draws, so the stale-order
                 // and camera-turn artifacts that keep the interactive viewer on Euclidean
-                // ordering cannot occur here. Depth ordering is the correct compositing
-                // order and scores 1.142 dB better against the trainer's own rasterizer.
+                // ordering cannot occur here, and depth ordering is what the trainer's
+                // own rasterizer keys on.
                 sortOrdering: .cameraForwardDepth
             )
             try renderer.readPLY(from: plyURL)

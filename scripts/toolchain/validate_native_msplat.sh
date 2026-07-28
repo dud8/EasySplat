@@ -165,6 +165,9 @@ exact_values = {
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
     "density_control_patch_sha256": "895df7c0562f885b6389897a990683419cdcb319faf2b24e4d1c44d0950432b9",
+    "projection_vjp_patch_sha256": "e283e1c608f2ea940c46cdcc08252ba0381fa7c33f9490c2812e2f1a83157667",
+    "alpha_cap_patch_sha256": "ee5b7f1563248d279f0b1a9d5fe9637feeb171cfa42546004772e7424b7bd7a6",
+    "projection_oracle_patch_sha256": "cfcf5a0c70bb6cbd05c25c1263d19ff87792abfc326fb43df4e1d17baf77c0a3",
     "overlay_sha256": "9d5f0e509f556061bff4ab16357e1d3fc5e2b54b638628529cb2fbfe54009869",
     "raster_test_sha256": "2f9b7c7241accbae20dd3c93ff2a5c13934a391b75438328e5fa9725ea2bdb5a",
     "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
@@ -228,6 +231,9 @@ if payload.get("cmake_arguments") != expected_cmake_arguments:
 hash_pattern = re.compile(r"[0-9a-f]{64}\Z")
 for key in (
     "source_tree_sha256",
+    "projection_vjp_patch_sha256",
+    "alpha_cap_patch_sha256",
+    "projection_oracle_patch_sha256",
     "overlay_sha256",
     "isolation_header_sha256",
     "isolation_source_sha256",

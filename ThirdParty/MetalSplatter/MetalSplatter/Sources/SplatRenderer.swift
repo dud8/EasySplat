@@ -91,12 +91,14 @@ public class SplatRenderer {
     /// invariant under rotation about the camera centre, while forward depth is planar
     /// and is what correct compositing requires.
     ///
-    /// Depth ordering measures better on a static image - on bonsai at 40,000
-    /// iterations it recovers 1.142 dB against the trainer's own rasterizer, with none
-    /// of 37 held-out views regressing - but it exposes two artifacts during camera
+    /// Neither is exact for extended overlapping splats, which have no single correct
+    /// order; forward depth matches how the trainer's rasterizer keys its intersections,
+    /// so it is the trainer-aligned choice rather than a physically exact one, and it
+    /// measures better on static images. It also exposes two artifacts during camera
     /// rotation that Euclidean ordering masks: a sort in flight is dropped rather than
     /// coalesced, and two overlapping splats swap discontinuously when their centre
     /// depths cross. Interactive callers should keep Euclidean until those are handled.
+    /// Measurements live in the engineering log, not here.
     public enum SortOrdering: Sendable {
         /// Euclidean distance from the camera position. Rotation-invariant.
         case euclideanCameraDistance
@@ -359,6 +361,17 @@ public class SplatRenderer {
     public var onSortFailure: ((SortFailure) -> Void)?
     public var onSortSuccess: (() -> Void)?
     var onSortSnapshotCapturedForTesting: ((MTLBuffer) -> Void)?
+
+    /// The currently published draw order, copied out under the sort lock. Used by the
+    /// temporal-ordering tests to compare a displayed frame against a freshly sorted
+    /// reference; there is no other way to observe what a frame would actually composite.
+    func orderSnapshotForTesting() -> [IndexType] {
+        withSortStateLock {
+            let count = orderBuffer.count
+            guard count > 0 else { return [] }
+            return Array(UnsafeBufferPointer(start: orderBuffer.values, count: count))
+        }
+    }
     var onSortWorkerBufferBoundForTesting: ((MTLBuffer) -> Void)?
 
     // dynamicUniformBuffers contains maxSimultaneousRenders uniforms buffers,
