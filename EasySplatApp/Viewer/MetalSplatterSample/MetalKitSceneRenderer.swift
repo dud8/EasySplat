@@ -319,6 +319,12 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                 sampleCount: sampleCount,
                 maxViewCount: 1,
                 maxSimultaneousRenders: Constants.maxSimultaneousRenders,
+                // Interactive. Euclidean distance is invariant under rotation about the
+                // camera centre, which masks both a sort dropped while another is in
+                // flight and the discontinuous swap when two overlapping splats cross in
+                // depth. Depth ordering renders better statically but exposes both as
+                // popping during a turn; it moves here once that has a regression gate.
+                sortOrdering: .euclideanCameraDistance,
                 maximumWorkingSetBytes: maximumWorkingSetBytes,
                 maximumRecoverableWorkingSetBytes: maximumRecoverableWorkingSetBytes
             )
