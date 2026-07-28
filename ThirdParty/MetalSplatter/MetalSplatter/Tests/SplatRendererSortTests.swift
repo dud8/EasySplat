@@ -131,39 +131,6 @@ final class SplatRendererSortTests: XCTestCase {
         XCTAssertEqual(successes, 1)
     }
 
-    func testAccelerateScratchFailureBalancesCallbacksAndPreservesLastOrdering() async throws {
-        let renderer = try makeRenderer()
-        try renderer.add(makePoint(x: -1))
-        try renderer.add(makePoint(x: 1))
-        let originalGeneration = bufferIdentity(renderer.orderBuffer.buffer)
-        let device = renderer.orderBuffer.device
-        renderer.orderBufferTempSort = try MetalBuffer(device: device, capacity: 2, maximumCapacity: 2)
-        renderer.depthBufferTempSort = try MetalBuffer(device: device, capacity: 1, maximumCapacity: 1)
-        let completed = expectation(description: "failed Accelerate sort completed")
-        var starts = 0
-        var completions = 0
-        var failure: SplatRenderer.SortFailure?
-        renderer.onSortStart = { starts += 1 }
-        renderer.onSortFailure = { failure = $0 }
-        renderer.onSortComplete = { _ in
-            completions += 1
-            completed.fulfill()
-        }
-
-        renderer.resortIndicesViaAccelerate()
-        await fulfillment(of: [completed], timeout: 2)
-
-        XCTAssertEqual(starts, 1)
-        XCTAssertEqual(completions, 1)
-        guard case .temporaryBufferAllocationFailed = failure else {
-            return XCTFail("Expected a typed temporary-buffer allocation failure")
-        }
-        XCTAssertFalse(renderer.sorting)
-        XCTAssertEqual(bufferIdentity(renderer.orderBuffer.buffer), originalGeneration)
-        XCTAssertEqual(renderer.orderBufferTempSort.count, 0)
-        XCTAssertEqual(renderer.depthBufferTempSort.count, 0)
-    }
-
     func testUnchangedCameraDoesNotStartAnotherSortAfterCompletion() async throws {
         let renderer = try makeRenderer()
         try renderer.add(makePoint(x: -1))
@@ -228,12 +195,6 @@ final class SplatRendererSortTests: XCTestCase {
     func testCPUSortWorkerUsesCapturedMetalBufferAcrossCapacityGrowth() async throws {
         try await assertSortWorkerUsesCapturedMetalBuffer { renderer in
             renderer.resortIndicesOnCPU()
-        }
-    }
-
-    func testAccelerateSortWorkerUsesCapturedMetalBufferAcrossCapacityGrowth() async throws {
-        try await assertSortWorkerUsesCapturedMetalBuffer { renderer in
-            renderer.resortIndicesViaAccelerate()
         }
     }
 

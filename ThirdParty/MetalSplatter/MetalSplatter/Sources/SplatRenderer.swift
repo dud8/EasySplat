@@ -1,7 +1,7 @@
-import Accelerate
 import Foundation
 import Metal
 import MetalKit
+import os
 import SplatIO
 
 public class SplatRenderer {
@@ -217,7 +217,6 @@ public class SplatRenderer {
     public enum SortFailure: LocalizedError, Sendable, Equatable {
         case orderBufferAllocationFailed(String)
         case sceneResetAllocationFailed(String)
-        case temporaryBufferAllocationFailed(String)
 
         public var errorDescription: String? {
             switch self {
@@ -225,8 +224,6 @@ public class SplatRenderer {
                 "Could not allocate a sorted splat-order buffer: \(detail)"
             case .sceneResetAllocationFailed(let detail):
                 "Could not allocate empty splat scene storage: \(detail)"
-            case .temporaryBufferAllocationFailed(let detail):
-                "Could not allocate temporary splat-sort storage: \(detail)"
             }
         }
     }
@@ -249,8 +246,6 @@ public class SplatRenderer {
     enum Constants {
         // Keep in sync with Shaders.metal : maxViewCount
         static let maxViewCount = 2
-        // Keep the scalar CPU sorter as the single production path.
-        static let useAccelerateForSort = false
         static let renderFrontToBack = true
     }
 
@@ -425,10 +420,6 @@ public class SplatRenderer {
     var sortedOrderBufferCapacityLimit: Int?
 
     // Sorting via Accelerate
-    // While not sorting, we guarantee that orderBufferTempSort remains valid: the count may not match splatCount, but for every i in 0..<orderBufferTempSort.count, orderBufferTempSort should contain exactly one element equal to i
-    var orderBufferTempSort: MetalBuffer<UInt>
-    // depthBufferTempSort is ordered by vertex index; so depthBufferTempSort[0] -> splatBuffer[0], *not* orderBufferTempSort[0]
-    var depthBufferTempSort: MetalBuffer<Float>
 
     // Sorting on CPU
     // Scratch for the radix sort, kept between frames so a turn does not reallocate 26 MB
@@ -526,8 +517,6 @@ public class SplatRenderer {
         self.sphericalHarmonicCoefficientBuffer = nil
         self.emptySphericalHarmonicCoefficientBuffer = try MetalBuffer(device: device)
         self.orderBuffer = try MetalBuffer(device: device)
-        self.orderBufferTempSort = try MetalBuffer(device: device)
-        self.depthBufferTempSort = try MetalBuffer(device: device)
         self.sortedOrderBufferCapacityLimit = nil
 
         pipelineState = try Self.buildRenderPipelineWithDevice(device: device,
@@ -886,20 +875,15 @@ public class SplatRenderer {
         renderEncoder.popDebugGroup()
     }
 
+    /// Re-sorts against the last camera shown, whether or not it changed.
     public func resortIndices() {
-        if Constants.useAccelerateForSort {
-            resortIndicesViaAccelerate()
-        } else {
-            resortIndicesOnCPU()
-        }
-    }
-
-    public func resortIndicesOnCPU() {
         resortIndicesOnCPU(camera: currentSortCamera, force: true)
     }
 
-    public func resortIndicesViaAccelerate() {
-        resortIndicesViaAccelerate(camera: currentSortCamera, force: true)
+    /// Retained spelling from when the renderer offered a second, vDSP-backed sort. There
+    /// is one sorter now, so this and `resortIndices` are the same call.
+    public func resortIndicesOnCPU() {
+        resortIndices()
     }
 
     private var currentSortCamera: SortCamera {
@@ -907,11 +891,7 @@ public class SplatRenderer {
     }
 
     private func resortIndicesIfCameraChanged(_ camera: SortCamera) {
-        if Constants.useAccelerateForSort {
-            resortIndicesViaAccelerate(camera: camera, force: false)
-        } else {
-            resortIndicesOnCPU(camera: camera, force: false)
-        }
+        resortIndicesOnCPU(camera: camera, force: false)
     }
 
     private func resortIndicesOnCPU(camera: SortCamera, force: Bool) {
@@ -1001,76 +981,6 @@ public class SplatRenderer {
             // to do it: the failure that got here was itself an allocation failure.
             sortKeysTempSort = packedKeys
             sortScratchTempSort = packedScratch
-        }
-    }
-
-    private func resortIndicesViaAccelerate(camera: SortCamera, force: Bool) {
-        guard let context = beginSort(camera: camera, force: force) else { return }
-        onSortSnapshotCapturedForTesting?(context.splatBuffer)
-        onSortStart?()
-        let orderScratch = orderBufferTempSort
-        let depthScratch = depthBufferTempSort
-
-        if orderScratch.count != context.splatCount || depthScratch.count != context.splatCount {
-            do {
-                try orderScratch.ensureCapacity(context.splatCount)
-                try depthScratch.ensureCapacity(context.splatCount)
-                orderScratch.count = context.splatCount
-                depthScratch.count = context.splatCount
-
-                for index in 0..<context.splatCount {
-                    orderScratch.values[index] = UInt(index)
-                }
-            } catch {
-                finishSort(
-                    context,
-                    publishedOrder: nil,
-                    failure: .temporaryBufferAllocationFailed(error.localizedDescription)
-                )
-                return
-            }
-        }
-
-        Task(priority: .high) { [self, context, orderScratch, depthScratch] in
-            let splatValues = sortSplatValues(for: context)
-            // Depth remains scalar in this opt-in path; vDSP performs the indexed sort below.
-            for index in 0..<context.splatCount {
-                let splatPosition = splatValues[index].position
-                let splatPositionUnpacked = SIMD3<Float>(splatPosition.x, splatPosition.y, splatPosition.z)
-                switch context.ordering {
-                case .euclideanCameraDistance:
-                    depthScratch.values[index] = (splatPositionUnpacked - context.camera.position).lengthSquared
-                case .cameraForwardDepth:
-                    depthScratch.values[index] = dot(splatPositionUnpacked, context.camera.forward)
-                }
-            }
-
-            vDSP_vsorti(depthScratch.values,
-                        orderScratch.values,
-                        nil,
-                        vDSP_Length(context.splatCount),
-                        Constants.renderFrontToBack ? 1 : -1)
-
-            do {
-                let sortedOrder = try makeOrderBuffer(
-                    device: context.splatBuffer.device,
-                    count: context.splatCount,
-                    maximumCapacity: context.orderBufferCapacityLimit,
-                    fill: { destination in
-                        let source = orderScratch.values
-                        for position in 0..<context.splatCount {
-                            destination[position] = UInt32(source[position])
-                        }
-                    }
-                )
-                finishSort(context, publishedOrder: sortedOrder, failure: nil)
-            } catch {
-                finishSort(
-                    context,
-                    publishedOrder: nil,
-                    failure: .orderBufferAllocationFailed(error.localizedDescription)
-                )
-            }
         }
     }
 
