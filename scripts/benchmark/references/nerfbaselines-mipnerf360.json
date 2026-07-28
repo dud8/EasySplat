@@ -1,0 +1,120 @@
+{
+  "reference": "nerfbaselines-mipnerf360",
+  "schema_version": 1,
+  "purpose": "Published per-scene results for the Mip-NeRF 360 benchmark, so EasySplat's quality can be compared to a maintained leaderboard rather than to a figure with no source.",
+  "why_this_exists": "The deficit that motivated the 2026-07 quality work was recorded as '26.99 on five scenes against reference 3DGS-30k's 28.40 on the same scenes'. Neither the five scenes nor the origin of 28.40 was written down anywhere in the repository or the engineering log, so the number could not be reconstructed. This file pins a reference that can be cited and rechecked.",
+  "source": {
+    "site": "https://nerfbaselines.github.io/",
+    "dataset_page": "https://nerfbaselines.github.io/mipnerf360",
+    "paper": "https://arxiv.org/abs/2406.17345",
+    "retrieved": "2026-07-28",
+    "retrieved_by": "manual transcription from the published per-method pages"
+  },
+  "protocol": {
+    "scenes": 9,
+    "downscale": {
+      "outdoor": 4,
+      "indoor": 2,
+      "note": "The leaderboard default is the dataset's own pre-downscaled JPEGs (protocol P1 in the paper), not a fresh downscale of the originals (P2). Some methods' authors report P2 and the paper measures roughly 0.3 dB between them, so the distinction matters."
+    },
+    "holdout": "every 8th frame of the trajectory",
+    "psnr": "float32 in [0,1]",
+    "ssim": "gaussian window, kernel 11, sigma 1.5, k1 0.01, k2 0.03",
+    "lpips": "VGG backbone, lpips package checkpoint 0.1"
+  },
+  "easysplat_protocol_match": {
+    "downscale": "match - the harness symlinks images_4 outdoor and images_2 indoor, which is P1",
+    "holdout": "match - every 8th filename-sorted camera, matching InputData::splitTrainTest",
+    "psnr": "match",
+    "ssim": "match - harness/bench.py uses the same window and constants",
+    "lpips": "match - lpips.LPIPS(net=\"vgg\") defaults to checkpoint 0.1",
+    "poses": "match - the dataset's own COLMAP reconstruction",
+    "sort_key": "was NOT a match until 2026-07-28. The harness never passed sortOrdering and so rendered with radial ordering while the reference sorts by view depth; worth 0.28 to 1.33 dB depending on scene. sortOrdering now has no default so this cannot recur."
+  },
+  "scene_availability": {
+    "public": ["bicycle", "garden", "stump", "kitchen", "bonsai", "counter", "room"],
+    "restricted": ["flowers", "treehill"],
+    "restriction_note": "flowers and treehill ship as a placeholder text file: 'We are not permitted to share this scene publicly.' They are obtainable only by emailing the dataset authors, so EasySplat can produce a 7-scene mean and never the 9-scene mean the leaderboard reports.",
+    "warning": "The two restricted scenes are the two hardest. Every method's 7-scene mean is far above its 9-scene mean - for 3D Gaussian Splatting the gap is 1.55 dB. Comparing a 7-scene EasySplat mean against a 9-scene leaderboard average would overstate EasySplat by that much. Always compare against the derived 7-scene subset below."
+  },
+  "methods": {
+    "gaussian-splatting": {
+      "page": "https://nerfbaselines.github.io/m-gaussian-splatting",
+      "published_average_9": {"psnr": 27.43, "ssim": 0.814, "lpips_vgg": 0.257},
+      "training_time": "23m 25s",
+      "gpu_memory_gb": 11.14,
+      "per_scene": {
+        "garden":   {"psnr": 27.34, "ssim": 0.866, "lpips_vgg": 0.124},
+        "bicycle":  {"psnr": 25.21, "ssim": 0.764, "lpips_vgg": 0.240},
+        "flowers":  {"psnr": 21.60, "ssim": 0.604, "lpips_vgg": 0.367},
+        "treehill": {"psnr": 22.44, "ssim": 0.631, "lpips_vgg": 0.377},
+        "stump":    {"psnr": 26.58, "ssim": 0.771, "lpips_vgg": 0.250},
+        "kitchen":  {"psnr": 31.14, "ssim": 0.926, "lpips_vgg": 0.155},
+        "bonsai":   {"psnr": 32.20, "ssim": 0.941, "lpips_vgg": 0.254},
+        "counter":  {"psnr": 28.96, "ssim": 0.907, "lpips_vgg": 0.258},
+        "room":     {"psnr": 31.43, "ssim": 0.917, "lpips_vgg": 0.287}
+      }
+    },
+    "taming-3dgs": {
+      "page": "https://nerfbaselines.github.io/m-taming-3dgs",
+      "note": "The closest published analogue to EasySplat's position: a fast Gaussian trainer. Six minutes per scene.",
+      "published_average_9": {"psnr": 27.22, "ssim": 0.793, "lpips_vgg": 0.305},
+      "training_time": "5m 59s",
+      "gpu_memory_gb": 8.69,
+      "per_scene": {
+        "garden":   {"psnr": 27.42, "ssim": 0.858, "lpips_vgg": 0.145},
+        "bicycle":  {"psnr": 24.75, "ssim": 0.712, "lpips_vgg": 0.336},
+        "flowers":  {"psnr": 21.10, "ssim": 0.551, "lpips_vgg": 0.438},
+        "treehill": {"psnr": 23.02, "ssim": 0.623, "lpips_vgg": 0.443},
+        "stump":    {"psnr": 25.95, "ssim": 0.734, "lpips_vgg": 0.336},
+        "kitchen":  {"psnr": 30.92, "ssim": 0.921, "lpips_vgg": 0.172},
+        "bonsai":   {"psnr": 31.86, "ssim": 0.935, "lpips_vgg": 0.271},
+        "counter":  {"psnr": 28.53, "ssim": 0.897, "lpips_vgg": 0.283},
+        "room":     {"psnr": 31.41, "ssim": 0.906, "lpips_vgg": 0.321}
+      }
+    },
+    "zipnerf": {
+      "page": "https://nerfbaselines.github.io/m-zipnerf",
+      "note": "Leaderboard ceiling, and not a Gaussian method. Five and a half hours per scene on a datacentre GPU.",
+      "published_average_9": {"psnr": 28.55, "ssim": 0.829, "lpips_vgg": 0.218},
+      "training_time": "5h 30m 20s",
+      "gpu_memory_gb": 26.82,
+      "per_scene": {
+        "garden":   {"psnr": 28.19, "ssim": 0.864, "lpips_vgg": 0.127},
+        "bicycle":  {"psnr": 25.89, "ssim": 0.775, "lpips_vgg": 0.226},
+        "flowers":  {"psnr": 22.33, "ssim": 0.637, "lpips_vgg": 0.310},
+        "treehill": {"psnr": 24.01, "ssim": 0.677, "lpips_vgg": 0.279},
+        "stump":    {"psnr": 27.41, "ssim": 0.792, "lpips_vgg": 0.233},
+        "kitchen":  {"psnr": 32.35, "ssim": 0.929, "lpips_vgg": 0.134},
+        "bonsai":   {"psnr": 34.68, "ssim": 0.951, "lpips_vgg": 0.195},
+        "counter":  {"psnr": 29.13, "ssim": 0.905, "lpips_vgg": 0.223},
+        "room":     {"psnr": 32.99, "ssim": 0.928, "lpips_vgg": 0.237}
+      }
+    }
+  },
+  "leaderboard_averages_9_scene_only": {
+    "note": "Averages over all nine scenes, transcribed from the dataset page. Recorded for context; a 7-scene subset cannot be derived from these, so they must never be compared against an EasySplat mean.",
+    "colmap": 16.67,
+    "instant-ngp": 25.51,
+    "nerfstudio": 26.39,
+    "2d-gaussian-splatting": 26.81,
+    "h3dgs": 26.93,
+    "3dgut": 27.04,
+    "pgsr": 27.20,
+    "taming-3dgs": 27.22,
+    "octree-gs": 27.40,
+    "gsplat": 27.41,
+    "gaussian-opacity-fields": 27.42,
+    "gaussian-splatting": 27.43,
+    "mip-splatting": 27.49,
+    "mipnerf360": 27.68,
+    "scaffold-gs": 27.71,
+    "3dgs-mcmc": 27.98,
+    "zipnerf": 28.55
+  },
+  "observations": {
+    "3dgut": "3DGUT sits at 27.04, below vanilla 3DGS at 27.43, on the dataset EasySplat benchmarks. Independent support for the A3 probe that killed 3DGUT here on a 0.0331 dB distortion headroom measurement.",
+    "mcmc": "3DGS-MCMC is the strongest Gaussian method on the board at 27.98. EasySplat built MCMC clean-room and rejected it on a predeclared per-view veto (four held-out views losing 1.06-1.82 dB). The rejection stands unless re-run, but the leaderboard says the mechanism is worth revisiting rather than closed.",
+    "spread": "The Gaussian family is packed between 26.8 and 28.0 on the 9-scene mean. Roughly a decibel separates a 6-minute trainer from a 40-minute one, so speed and quality are not far apart on this benchmark and EasySplat's fast profile is a defensible place to sit."
+  }
+}
