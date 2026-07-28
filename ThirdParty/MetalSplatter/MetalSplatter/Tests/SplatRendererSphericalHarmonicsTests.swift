@@ -448,7 +448,8 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
             stencilFormat: .invalid,
             sampleCount: 1,
             maxViewCount: maxViewCount,
-            maxSimultaneousRenders: 1
+            maxSimultaneousRenders: 1,
+            sortOrdering: .cameraForwardDepth
         )
     }
 

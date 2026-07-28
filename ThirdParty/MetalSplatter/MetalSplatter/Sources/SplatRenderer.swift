@@ -102,6 +102,11 @@ public class SplatRenderer {
     /// which moves the camera position. Callers whose dominant motion is a look-around
     /// rather than an orbit have the stronger reason to prefer it. Measurements live in the
     /// engineering log, not here.
+    /// Deliberately without a default. A caller that did not think about ordering used to
+    /// get Euclidean silently, and the mip-NeRF 360 benchmark harness was such a caller for
+    /// its entire history -- every figure it produced was scored against a reference that
+    /// sorts by view depth, using radial order, which is worth 0.28 to 1.33 dB depending on
+    /// the scene. Requiring the argument is what turns that into a build error.
     public enum SortOrdering: Sendable {
         /// Euclidean distance from the camera position. Rotation-invariant.
         case euclideanCameraDistance
@@ -446,7 +451,7 @@ public class SplatRenderer {
                             sampleCount: Int,
                             maxViewCount: Int,
                             maxSimultaneousRenders: Int,
-                            sortOrdering: SortOrdering = .euclideanCameraDistance,
+                            sortOrdering: SortOrdering,
                             maximumWorkingSetBytes: Int? = nil,
                             maximumRecoverableWorkingSetBytes: Int? = nil) throws {
         try self.init(
@@ -472,7 +477,7 @@ public class SplatRenderer {
          maxViewCount: Int,
          maxSimultaneousRenders: Int,
          maximumSplatCount: Int?,
-         sortOrdering: SortOrdering = .euclideanCameraDistance,
+         sortOrdering: SortOrdering,
          maximumWorkingSetBytes: Int? = nil,
          maximumRecoverableWorkingSetBytes: Int? = nil) throws {
         self.sortOrdering = sortOrdering

@@ -261,7 +261,10 @@ final class SplatRendererSortTests: XCTestCase {
             sampleCount: 1,
             maxViewCount: 1,
             maxSimultaneousRenders: 3,
-            maximumSplatCount: nil
+            maximumSplatCount: nil,
+            // These fixtures assert scheduling and failure handling, which both orderings
+            // share; the ordering-specific behaviour has its own suite.
+            sortOrdering: .cameraForwardDepth
         )
     }
 

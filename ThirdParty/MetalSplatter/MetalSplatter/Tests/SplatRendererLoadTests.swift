@@ -343,7 +343,10 @@ final class SplatRendererLoadTests: XCTestCase {
             sampleCount: 1,
             maxViewCount: 1,
             maxSimultaneousRenders: 1,
-            maximumSplatCount: maximumSplatCount
+            maximumSplatCount: maximumSplatCount,
+            // Irrelevant to loading and admission, but the argument is required so that no
+            // caller can pick an ordering by accident.
+            sortOrdering: .cameraForwardDepth
         )
     }
 
