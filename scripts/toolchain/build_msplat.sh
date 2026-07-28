@@ -92,6 +92,8 @@ ISOLATION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-isolation.patch"
 ISOLATION_PATCH_SHA256="a8a579d9d2a5ca23ce87ae0dd2a1f79de8da56bbfa62851244cfdda51bc37f59"
 DENSITY_CONTROL_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-density-control.patch"
 DENSITY_CONTROL_PATCH_SHA256="895df7c0562f885b6389897a990683419cdcb319faf2b24e4d1c44d0950432b9"
+PROJECTION_VJP_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-projection-vjp.patch"
+PROJECTION_VJP_PATCH_SHA256="e283e1c608f2ea940c46cdcc08252ba0381fa7c33f9490c2812e2f1a83157667"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
@@ -692,6 +694,9 @@ preflight() {
   [ -f "$DENSITY_CONTROL_PATCH" ] || die "missing density-control patch: $DENSITY_CONTROL_PATCH"
   [ "$(sha256 "$DENSITY_CONTROL_PATCH")" = "$DENSITY_CONTROL_PATCH_SHA256" ] \
     || die "density-control patch SHA-256 mismatch"
+  [ -f "$PROJECTION_VJP_PATCH" ] || die "missing projection-vjp patch: $PROJECTION_VJP_PATCH"
+  [ "$(sha256 "$PROJECTION_VJP_PATCH")" = "$PROJECTION_VJP_PATCH_SHA256" ] \
+    || die "projection-vjp patch SHA-256 mismatch"
   [ -f "$ISOLATION_PATCH" ] || die "missing isolation patch: $ISOLATION_PATCH"
   [ "$(sha256 "$ISOLATION_PATCH")" = "$ISOLATION_PATCH_SHA256" ] \
     || die "isolation patch SHA-256 mismatch"
@@ -823,6 +828,7 @@ snapshot_build_inputs() {
       "$QUATERNION_STABILITY_PATCH" "patches/msplat-1.1.3-quaternion-stability.patch" "$QUATERNION_STABILITY_PATCH_SHA256" \
       "$ISOLATION_PATCH" "patches/msplat-1.1.3-isolation.patch" "$ISOLATION_PATCH_SHA256" \
       "$DENSITY_CONTROL_PATCH" "patches/msplat-1.1.3-density-control.patch" "$DENSITY_CONTROL_PATCH_SHA256" \
+      "$PROJECTION_VJP_PATCH" "patches/msplat-1.1.3-projection-vjp.patch" "$PROJECTION_VJP_PATCH_SHA256" \
       "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" "tile/include/tile_culling.hpp" "" \
       "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" "tile/include/gpu_tile_culling.hpp" "" \
       "$TILE_SPAN_TEST_ROOT/src/tile_culling.metal" "tile/src/tile_culling.metal" "" \
@@ -993,6 +999,7 @@ PY
   QUATERNION_STABILITY_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-quaternion-stability.patch"
   ISOLATION_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-isolation.patch"
   DENSITY_CONTROL_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-density-control.patch"
+  PROJECTION_VJP_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-projection-vjp.patch"
   TILE_SPAN_TEST_ROOT="$BUILD_INPUT_SNAPSHOT_DIR/tile"
   BUILD_INPUT_SNAPSHOT_READY=1
 }
@@ -1030,6 +1037,7 @@ $EXACT_PREFIX_HARDENING_PATCH|$EXACT_PREFIX_HARDENING_PATCH_SHA256|exact-prefix 
 $QUATERNION_STABILITY_PATCH|$QUATERNION_STABILITY_PATCH_SHA256|quaternion patch
 $ISOLATION_PATCH|$ISOLATION_PATCH_SHA256|isolation patch
 $DENSITY_CONTROL_PATCH|$DENSITY_CONTROL_PATCH_SHA256|density-control patch
+$PROJECTION_VJP_PATCH|$PROJECTION_VJP_PATCH_SHA256|projection-vjp patch
 EOF
 }
 
@@ -1146,6 +1154,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply "$ISOLATION_PATCH"
   git -C "$SOURCE_DIR" apply --check "$DENSITY_CONTROL_PATCH"
   git -C "$SOURCE_DIR" apply "$DENSITY_CONTROL_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$PROJECTION_VJP_PATCH"
+  git -C "$SOURCE_DIR" apply "$PROJECTION_VJP_PATCH"
 }
 
 configure_and_build() {
@@ -1208,6 +1218,7 @@ write_build_info() {
   local isolation_mask_header_sha256 isolation_mask_source_sha256
   local isolation_lift_source_sha256 isolation_test_sha256
   local isolation_mask_test_sha256 isolation_patch_sha256 density_control_patch_sha256
+  local projection_vjp_patch_sha256
   local patch_sha256 source_notice_patch_sha256 checkpoint_patch_sha256
   local numeric_stability_patch_sha256 metal_safety_patch_sha256
   local exact_raster_patch_sha256 stage_timing_patch_sha256
@@ -1233,6 +1244,7 @@ write_build_info() {
   isolation_mask_test_sha256="$(sha256 "$ISOLATION_MASK_TEST_SOURCE")"
   isolation_patch_sha256="$(sha256 "$ISOLATION_PATCH")"
   density_control_patch_sha256="$(sha256 "$DENSITY_CONTROL_PATCH")"
+  projection_vjp_patch_sha256="$(sha256 "$PROJECTION_VJP_PATCH")"
   patch_sha256="$(sha256 "$UPSTREAM_PATCH")"
   source_notice_patch_sha256="$(sha256 "$SOURCE_NOTICE_PATCH")"
   checkpoint_patch_sha256="$(sha256 "$CHECKPOINT_PATCH")"
@@ -1257,7 +1269,7 @@ write_build_info() {
     "$isolation_mask_header_sha256" "$isolation_mask_source_sha256" \
     "$isolation_lift_source_sha256" "$isolation_test_sha256" \
     "$isolation_mask_test_sha256" "$isolation_patch_sha256" \
-    "$density_control_patch_sha256" \
+    "$density_control_patch_sha256" "$projection_vjp_patch_sha256" \
     "$patch_sha256" "$source_notice_patch_sha256" "$checkpoint_patch_sha256" \
     "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" \
     "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" \
@@ -1290,6 +1302,7 @@ import sys
     isolation_mask_test_sha256,
     isolation_patch_sha256,
     density_control_patch_sha256,
+    projection_vjp_patch_sha256,
     patch_sha256,
     source_notice_patch_sha256,
     checkpoint_patch_sha256,
@@ -1335,6 +1348,7 @@ payload = {
     "isolation_mask_test_sha256": isolation_mask_test_sha256,
     "isolation_patch_sha256": isolation_patch_sha256,
     "density_control_patch_sha256": density_control_patch_sha256,
+    "projection_vjp_patch_sha256": projection_vjp_patch_sha256,
     "patch_sha256": patch_sha256,
     "source_notice_patch_sha256": source_notice_patch_sha256,
     "checkpoint_patch_sha256": checkpoint_patch_sha256,
