@@ -290,6 +290,13 @@ def main() -> int:
         "holdout_every": arguments.holdout_every,
         "memory_budget_bytes": arguments.budget,
         "trainer_argv": command,
+        # The trainer reads experiment toggles from the environment (EASYSPLAT_TAIL_RAMP
+        # and friends), so two arms can differ by nothing the argv records. Captured here
+        # or the receipts would be indistinguishable.
+        "trainer_environment": {
+            key: value for key, value in sorted(os.environ.items())
+            if key.startswith("EASYSPLAT_")
+        },
         "trainer_sha256": sha256(arguments.trainer),
         "metrics_sha256": sha256(metrics_path),
         "image_source": os.path.basename(os.path.realpath(dataset / "images")),

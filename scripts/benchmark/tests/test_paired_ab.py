@@ -65,6 +65,7 @@ class Workspace:
         names: list[str] | None = None,
         digest: str | bool | None = None,
         trainer: str = "sha256:" + "c" * 64,
+        environment: dict | None = None,
     ) -> pathlib.Path:
         # A small per-replicate offset, so the pooled repeat SD is not zero. Without it
         # every SD multiple is undefined and the advance gate can never be cleared, which
@@ -103,6 +104,8 @@ class Workspace:
             "metrics_sha256": ("sha256:" + hashlib.sha256(raw).hexdigest())
             if digest is None else digest,
             "trainer_sha256": trainer,
+            "trainer_environment": environment or {},
+            "memory_budget_bytes": 36_000_000_000,
             # Not `provenance or PROVENANCE`: an explicitly empty block is the case under
             # test, and a falsy default would quietly restore it.
             "rendering": {"provenance": PROVENANCE if provenance is None else provenance},
@@ -482,6 +485,34 @@ class TrainerProvenanceTests(PairedABTestCase):
         report = self.compare(baseline, candidate)
         self.assertEqual(report["research_verdict"], "missing_provenance")
         self.assertIn("trainer_sha256", report["refusal"])
+
+
+class ArmDifferenceTests(PairedABTestCase):
+    def test_an_environment_only_experiment_is_reported_as_such(self):
+        """The trainer takes experiment toggles from the environment, so the argv and the
+        binary can be identical across arms and the run still be a real experiment."""
+        baseline = self.arm("baseline", {"bicycle": 25.0})
+        candidate = self.advancing({"bicycle": 25.0},
+                                   environment={"EASYSPLAT_SPLIT_FRACTION": "65"})
+        report = self.compare(baseline, candidate)
+        self.assertEqual(report["arms_differ_by"], ["environment: EASYSPLAT_SPLIT_FRACTION"])
+
+    def test_identically_configured_arms_say_so(self):
+        """An unexported variable produces two identical arms and a delta of nothing. That
+        has to read as "the experiment did not run", not as "the change had no effect"."""
+        baseline = self.arm("baseline", {"bicycle": 25.0})
+        candidate = self.arm("candidate", {"bicycle": 25.0})
+        report = self.compare(baseline, candidate)
+        self.assertIn("null", report["arms_differ_by"])
+
+    def test_a_budget_difference_is_named(self):
+        baseline = self.arm("baseline", {"bicycle": 25.0})
+        candidate = self.advancing({"bicycle": 25.0})
+        for path in candidate:
+            body = json.loads(path.read_text())
+            body["memory_budget_bytes"] = 46_000_000_000
+            path.write_text(json.dumps(body, indent=2), encoding="utf-8")
+        self.assertEqual(self.compare(baseline, candidate)["arms_differ_by"], ["memory budget"])
 
 
 class ViewSetTests(PairedABTestCase):

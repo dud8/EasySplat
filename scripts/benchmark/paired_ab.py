@@ -142,6 +142,8 @@ def load_run(path: pathlib.Path) -> dict:
         "holdout_every": record.get("holdout_every"),
         "provenance": record.get("rendering", {}).get("provenance", {}),
         "trainer_sha256": record.get("trainer_sha256"),
+        "trainer_environment": record.get("trainer_environment", {}),
+        "memory_budget_bytes": record.get("memory_budget_bytes"),
         "rows": rows,
         # Recomputed from the rows rather than trusted: a mismatch means the summary and
         # the rows describe different renders.
@@ -389,6 +391,38 @@ def check_scope(contract: dict, runs: list[dict]) -> list[str]:
     return problems
 
 
+def arms_differ_by(baseline: list[dict], candidate: list[dict]) -> list[str] | str:
+    """What actually distinguishes the two arms.
+
+    The trainer reads experiment toggles from the environment, so an arm can be
+    misconfigured -- an unexported variable, a typo -- and still produce a complete,
+    well-formed receipt. The comparison then reads as "no effect" when what happened is
+    "the experiment did not run". Stating the difference makes the two distinguishable,
+    and a genuinely null comparison says so rather than looking like a failed one.
+    """
+    differences = []
+    for label, key in (("trainer binary", "trainer_sha256"),
+                       ("memory budget", "memory_budget_bytes")):
+        if {run[key] for run in baseline} != {run[key] for run in candidate}:
+            differences.append(label)
+    environments = [
+        {frozenset(run["trainer_environment"].items()) for run in arm}
+        for arm in (baseline, candidate)
+    ]
+    if environments[0] != environments[1]:
+        keys = set()
+        for arm in (baseline, candidate):
+            for run in arm:
+                keys |= set(run["trainer_environment"])
+        differing = sorted(
+            key for key in keys
+            if {run["trainer_environment"].get(key) for run in baseline}
+            != {run["trainer_environment"].get(key) for run in candidate}
+        )
+        differences.append("environment: " + ", ".join(differing))
+    return differences or "nothing -- the arms are identically configured, so this is a null"
+
+
 def refuse(runs: list[dict], minimum: int, renderer_mismatch_is_fatal: bool) -> str | None:
     """The refusals, in precedence order. Returns a reason, or None to proceed."""
     paths = [run["path"] for run in runs]
@@ -472,6 +506,7 @@ def main() -> int:
 
     report: dict = {
         "contract": CONTRACT_NAME,
+        "arms_differ_by": arms_differ_by(baseline, candidate),
         "research_contract_sha256": digest,
         "research_contract_path": str(arguments.contract),
         "arms": {
@@ -544,8 +579,10 @@ def tail(per_view: dict) -> dict:
 
 
 def summarize(report: dict) -> str:
+    differ = report["arms_differ_by"]
     lines = [f"contract {report['research_contract_sha256'][:19]}",
-             f"scope    {report['scope_check']}"]
+             f"scope    {report['scope_check']}",
+             f"arms     {differ if isinstance(differ, str) else ', '.join(differ)}"]
     if "statistics" in report:
         lines.append("")
         lines.append(f"{'scene':<10s} {'base':>9s} {'cand':>9s} {'delta':>8s} "
