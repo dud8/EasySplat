@@ -86,6 +86,22 @@ class NerfBaselinesReferenceTests(unittest.TestCase):
         gap = mean(per_scene, public, "psnr") - mean(per_scene, per_scene.keys(), "psnr")
         self.assertAlmostEqual(gap, 1.55, delta=0.01)
 
+    def test_the_target_is_a_same_format_method_and_not_the_leaderboard_ceiling(self):
+        """The quality work aims at 3DGS-MCMC rather than Zip-NeRF, and the reason is
+        this comparison: on the seven scenes EasySplat can actually run, the best
+        Gaussian method gives up half a decibel and takes back SSIM and LPIPS. If that
+        stops being true the target is wrong, so it is asserted rather than narrated."""
+        public = self.reference["scene_availability"]["public"]
+        mcmc = self.methods["3dgs-mcmc"]["per_scene"]
+        zipnerf = self.methods["zipnerf"]["per_scene"]
+
+        self.assertAlmostEqual(mean(mcmc, public, "psnr"), 29.55, delta=0.01)
+        self.assertLess(mean(mcmc, public, "psnr"), mean(zipnerf, public, "psnr"))
+        self.assertGreater(mean(mcmc, public, "ssim"), mean(zipnerf, public, "ssim"))
+        self.assertAlmostEqual(
+            mean(mcmc, public, "lpips_vgg"), mean(zipnerf, public, "lpips_vgg"), delta=0.005
+        )
+
     def test_easysplat_protocol_differences_are_enumerated(self):
         """Every protocol axis the comparison depends on gets an explicit verdict,
         so a silent mismatch cannot hide in an unlisted field."""

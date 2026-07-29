@@ -14,10 +14,10 @@ on the same held-out views.
 EasySplat's trainer derives its split from the COLMAP model it is given, so a sparse
 run needs a model containing only the chosen training images -- filtering the image
 directory alone would leave the trainer with camera records whose files are missing.
-This writes a new dataset directory with a filtered `images.bin`, the original
-`cameras.bin` and `points3D.bin`, and symlinks for the images it kept.
+This writes a new dataset directory with a filtered `images.bin`, the rest of the
+original model beside it, and copies of the images it kept.
 
-The trainer must then be run with holdout disabled (`--holdout-every 1`), because the
+The trainer must then be run with holdout disabled (`--holdout-every 0`), because the
 held-out views are deliberately absent from the staged model. Render and score the
 standard test cameras from the *original* dataset: the exported PLY is written back
 through the scene normalisation into original world coordinates, so it lines up with
@@ -175,7 +175,9 @@ def main() -> int:
 
     print(f"staged {len(train)} train views ({arguments.views} requested) at {target}")
     print(f"test set is unchanged at {len(test)} views; render those from {source}")
-    print("train with --holdout-every 1: the held-out views are not in this model")
+    # 0 is the trainer's spelling of "no holdout"; it rejects 1, which would ask it to
+    # hold out every camera.
+    print("train with --holdout-every 0: the held-out views are not in this model")
     return 0
 
 

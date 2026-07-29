@@ -164,6 +164,64 @@
         }
       }
     },
+    "3dgs-mcmc": {
+      "page": "https://nerfbaselines.github.io/m-3dgs-mcmc",
+      "note": "The strongest Gaussian method on the board, and the one that sets the target: its seven-scene subset beats Zip-NeRF on SSIM and ties it on LPIPS while giving up half a decibel of PSNR. Same ordinary-Gaussian asset EasySplat exports, so the format is not what separates the leaderboard from a splat viewer.",
+      "published_average_9": {
+        "psnr": 27.98,
+        "ssim": 0.835,
+        "lpips_vgg": 0.224
+      },
+      "training_time": "41m 11s",
+      "gpu_memory_gb": 28.86,
+      "per_scene": {
+        "garden": {
+          "psnr": 27.81,
+          "ssim": 0.877,
+          "lpips_vgg": 0.109
+        },
+        "bicycle": {
+          "psnr": 25.69,
+          "ssim": 0.799,
+          "lpips_vgg": 0.194
+        },
+        "flowers": {
+          "psnr": 22.05,
+          "ssim": 0.644,
+          "lpips_vgg": 0.316
+        },
+        "treehill": {
+          "psnr": 22.97,
+          "ssim": 0.658,
+          "lpips_vgg": 0.315
+        },
+        "stump": {
+          "psnr": 27.38,
+          "ssim": 0.811,
+          "lpips_vgg": 0.2
+        },
+        "kitchen": {
+          "psnr": 31.91,
+          "ssim": 0.933,
+          "lpips_vgg": 0.148
+        },
+        "bonsai": {
+          "psnr": 32.66,
+          "ssim": 0.947,
+          "lpips_vgg": 0.236
+        },
+        "counter": {
+          "psnr": 29.32,
+          "ssim": 0.916,
+          "lpips_vgg": 0.238
+        },
+        "room": {
+          "psnr": 32.05,
+          "ssim": 0.927,
+          "lpips_vgg": 0.262
+        }
+      }
+    },
     "zipnerf": {
       "page": "https://nerfbaselines.github.io/m-zipnerf",
       "note": "Leaderboard ceiling, and not a Gaussian method. Five and a half hours per scene on a datacentre GPU.",
@@ -245,7 +303,7 @@
   },
   "observations": {
     "3dgut": "3DGUT sits at 27.04, below vanilla 3DGS at 27.43, on the dataset EasySplat benchmarks. Independent support for the A3 probe that killed 3DGUT here on a 0.0331 dB distortion headroom measurement.",
-    "mcmc": "3DGS-MCMC is the strongest Gaussian method on the board at 27.98. EasySplat built MCMC clean-room and rejected it on a predeclared per-view veto (four held-out views losing 1.06-1.82 dB). The rejection stands unless re-run, but the leaderboard says the mechanism is worth revisiting rather than closed.",
+    "mcmc": "3DGS-MCMC is the strongest Gaussian method on the board at 27.98, and on the seven public scenes it reaches 29.55 / 0.8871 / 0.1981 against Zip-NeRF's 30.09 / 0.8777 / 0.1964 - behind on PSNR, ahead on SSIM, level on LPIPS. That is the number to chase, because it is reachable inside the ordinary-Gaussian export EasySplat already ships. EasySplat built MCMC clean-room and rejected it on a predeclared per-view veto (four held-out views losing 1.06-1.82 dB), attributing the failure to tile intersection pressure rather than primitive count. The rejection stands unless re-run, but a method this far ahead failing here is a statement about our rasterizer's constraints, not about the mechanism.",
     "spread": "The Gaussian family is packed between 26.8 and 28.0 on the 9-scene mean. Roughly a decibel separates a 6-minute trainer from a 40-minute one, so speed and quality are not far apart on this benchmark and EasySplat's fast profile is a defensible place to sit."
   },
   "sparse": {
