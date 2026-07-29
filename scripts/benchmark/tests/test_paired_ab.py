@@ -487,6 +487,30 @@ class TrainerProvenanceTests(PairedABTestCase):
         self.assertIn("trainer_sha256", report["refusal"])
 
 
+class SuiteScopeTests(PairedABTestCase):
+    def test_a_single_scene_screen_cannot_be_reported_as_an_acceptance(self):
+        """The contract's suite is seven scenes. One scene is a screen -- often the right
+        thing to run -- but reporting it as `accept` claims a contract verdict it does not
+        have, and that is exactly what this tool existed to stop."""
+        baseline = self.arm("baseline", {"bicycle": 25.0})
+        candidate = self.advancing({"bicycle": 25.1})
+        report = self.compare(baseline, candidate)
+        self.assertEqual(report["research_verdict"], "out_of_scope")
+        self.assertIn("1 of 7 suite scenes", str(report["scope_check"]))
+        self.assertIn("statistics", report, "the screen's numbers are still reported")
+
+    def test_the_full_suite_can_accept(self):
+        scenes = {name: 30.0 for name in VIEW_COUNTS}
+        baseline = self.arm("baseline", scenes)
+        candidate = self.advancing({k: v - 0.1 for k, v in scenes.items()})
+        report = self.compare(baseline, candidate)
+        self.assertEqual(report["scope_check"], "in scope")
+        self.assertEqual(report["research_verdict"], "accept")
+
+    def test_the_scene_count_comes_from_the_contract(self):
+        self.assertEqual(paired.scenes_required(json.loads(CONTRACT.read_text())), 7)
+
+
 class ArmDifferenceTests(PairedABTestCase):
     def test_an_environment_only_experiment_is_reported_as_such(self):
         """The trainer takes experiment toggles from the environment, so the argv and the

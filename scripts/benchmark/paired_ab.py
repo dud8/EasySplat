@@ -59,6 +59,7 @@ REQUIRED_CONTRACT_PATHS = (
     ("gates", "per_view_veto_stochastic", "paired_per_view_median_ssim_loss_max"),
     ("gates", "per_view_veto_stochastic", "require_beyond_pooled_per_view_sd"),
     ("relationship_to_release_gate", "dual_verdict_required"),
+    ("scope", "suite"),
     ("scope", "profile"),
     ("scope", "seed"),
     ("scope", "holdout"),
@@ -368,9 +369,28 @@ def declares(text: str, value) -> bool:
     return re.search(pattern, text) is not None
 
 
+def scenes_required(contract: dict) -> int | None:
+    """How many scenes the contract's suite is, read from its own prose.
+
+    `scope.suite` reads "mip-NeRF 360, 7 public scenes". The count is the only part this
+    tool needs and hardcoding it here would put a threshold back in the Python.
+    """
+    match = re.search(r"(\d+)\s+\w*\s*scenes", str(at(contract, "scope", "suite")))
+    return int(match.group(1)) if match else None
+
+
 def check_scope(contract: dict, runs: list[dict]) -> list[str]:
     scope = at(contract, "scope")
     problems = []
+    # The suite is the seven scenes, not whichever subset was run. A single-scene
+    # comparison is a screen and can be a perfectly good one, but it is not the
+    # contract's acceptance and must not be reported as it.
+    required = scenes_required(contract)
+    present = {run["scene"] for run in runs}
+    if required is not None and len(present) < required:
+        problems.append(
+            f"{len(present)} of {required} suite scenes: {sorted(present)}"
+        )
     for run in runs:
         # Absent is out of scope, not exempt. A receipt that does not say what it ran is
         # exactly the receipt that must not reach an acceptance.
