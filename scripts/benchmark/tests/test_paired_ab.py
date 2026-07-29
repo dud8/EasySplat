@@ -64,6 +64,7 @@ class Workspace:
         holdout_every: int | None = 8,
         names: list[str] | None = None,
         digest: str | bool | None = None,
+        trainer: str = "sha256:" + "c" * 64,
     ) -> pathlib.Path:
         # A small per-replicate offset, so the pooled repeat SD is not zero. Without it
         # every SD multiple is undefined and the advance gate can never be cleared, which
@@ -101,6 +102,7 @@ class Workspace:
             # Not `digest or ...`: a falsy value has to mean absent, not "use the default".
             "metrics_sha256": ("sha256:" + hashlib.sha256(raw).hexdigest())
             if digest is None else digest,
+            "trainer_sha256": trainer,
             # Not `provenance or PROVENANCE`: an explicitly empty block is the case under
             # test, and a falsy default would quietly restore it.
             "rendering": {"provenance": PROVENANCE if provenance is None else provenance},
@@ -462,6 +464,24 @@ class ReceiptIntegrityTests(PairedABTestCase):
         candidate = self.arm("candidate", {"bicycle": 25.0})
         report = self.compare([first, copied, first.with_name(first.name)], candidate)
         self.assertIn(report["research_verdict"], {"duplicate_receipt", "duplicate_replicate"})
+
+
+class TrainerProvenanceTests(PairedABTestCase):
+    def test_arms_built_from_different_trainers_are_refused(self):
+        """The shipped toolchain and the tree under test are different binaries, and
+        benchmarking the wrong one costs about 0.3 dB on stump. Two arms that do not share
+        a trainer are two experiments, not an A/B."""
+        baseline = self.arm("baseline", {"bicycle": 25.0})
+        candidate = self.advancing({"bicycle": 25.0}, trainer="sha256:" + "d" * 64)
+        report = self.compare(baseline, candidate)
+        self.assertEqual(report["research_verdict"], "trainer_mismatch")
+
+    def test_a_run_that_does_not_name_its_trainer_is_refused(self):
+        baseline = self.arm("baseline", {"bicycle": 25.0})
+        candidate = self.advancing({"bicycle": 25.0}, trainer=None)
+        report = self.compare(baseline, candidate)
+        self.assertEqual(report["research_verdict"], "missing_provenance")
+        self.assertIn("trainer_sha256", report["refusal"])
 
 
 class ViewSetTests(PairedABTestCase):

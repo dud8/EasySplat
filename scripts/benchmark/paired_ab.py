@@ -141,6 +141,7 @@ def load_run(path: pathlib.Path) -> dict:
         "seed": record.get("seed"),
         "holdout_every": record.get("holdout_every"),
         "provenance": record.get("rendering", {}).get("provenance", {}),
+        "trainer_sha256": record.get("trainer_sha256"),
         "rows": rows,
         # Recomputed from the rows rather than trusted: a mismatch means the summary and
         # the rows describe different renders.
@@ -412,6 +413,14 @@ def refuse(runs: list[dict], minimum: int, renderer_mismatch_is_fatal: bool) -> 
         if renderer_mismatch_is_fatal:
             return (f"renderer_mismatch: sort orderings {sorted(orderings)}, "
                     f"{len(sources)} distinct MetalSplatter trees")
+    if any(run["trainer_sha256"] is None for run in runs):
+        return "missing_provenance: a run does not record trainer_sha256"
+    trainers = {run["trainer_sha256"] for run in runs}
+    if len(trainers) > 1:
+        # Two arms built from different trainers is not a trainer A/B, it is two
+        # experiments. The shipped toolchain and the tree under test are different
+        # binaries, and defaulting to the wrong one costs about 0.3 dB on stump.
+        return f"trainer_mismatch: {len(trainers)} distinct trainer binaries"
     by_arm: dict[str, set[str]] = {}
     for run in runs:
         by_arm.setdefault(run["arm"] or "?", set()).add(run["scene"])

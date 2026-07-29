@@ -192,8 +192,12 @@ def main() -> int:
     parser.add_argument("--holdout-every", type=int, default=8,
                         help="0 disables holdout; the trainer rejects 1")
     parser.add_argument("--budget", type=int, default=36_000_000_000)
-    parser.add_argument("--trainer", type=Path, default=Path.home() / (
-        "Library/Application Support/EasySplat/Toolchains/3.0.0/bin/easysplat-train"))
+    # The trainer under test, not the one the app ships with. Those are different
+    # binaries and they score differently: the installed toolchain predates the backward
+    # pass corrections, and benchmarking it measures a build nobody is working on. The
+    # recorded trainer_sha256 is what makes a mistake here visible afterwards.
+    parser.add_argument("--trainer", type=Path, default=Path(
+        "/Users/user/Downloads/EasySplat/Toolchains/build/msplat/native-build/msplat"))
     parser.add_argument("--checkout", type=Path,
                         default=Path(__file__).resolve().parents[3])
     parser.add_argument("--renderer", type=Path,
