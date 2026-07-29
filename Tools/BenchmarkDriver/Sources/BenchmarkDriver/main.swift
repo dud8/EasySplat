@@ -30,6 +30,33 @@ do {
             manifestURL: outputURL,
             rendererExecutableURL: executableURL
         )
+    } else if arguments.count == 8,
+              arguments[1] == "render-views",
+              arguments[2] == "--request",
+              arguments[4] == "--checkout",
+              arguments[6] == "--manifest" {
+        let requestURL = URL(fileURLWithPath: arguments[3])
+        let checkoutRoot = URL(fileURLWithPath: arguments[5], isDirectory: true)
+        let manifestURL = URL(fileURLWithPath: arguments[7])
+        let data = try Data(contentsOf: requestURL, options: [.mappedIfSafe])
+        let request = try JSONDecoder().decode(HeldOutViewRendering.Request.self, from: data)
+        guard let executableURL = Bundle.main.executableURL else {
+            throw BenchmarkDriverError.invalidJob("The renderer executable path is unavailable.")
+        }
+        let driver = HeldOutViewRenderer(
+            renderer: try MetalOffscreenRenderer(),
+            checkoutRoot: checkoutRoot
+        )
+        let manifest = try driver.execute(
+            request: request,
+            rendererExecutableURL: executableURL
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .prettyPrinted, .withoutEscapingSlashes]
+        try (try encoder.encode(manifest) + Data("\n".utf8)).write(
+            to: manifestURL,
+            options: [.atomic]
+        )
     } else if arguments.count == 20,
               arguments[1] == "extract-orientation",
               arguments[2] == "--geometry-manifest",
@@ -86,6 +113,8 @@ do {
         fail(
             "usage: EasySplatBenchmarkDriver render --job <job.json> "
                 + "--artifact-root <directory> --output <rendering-manifest.json>\n"
+                + "   or: EasySplatBenchmarkDriver render-views --request <request.json> "
+                + "--checkout <repository-root> --manifest <manifest.json>\n"
                 + "   or: EasySplatBenchmarkDriver extract-orientation "
                 + "--geometry-manifest <geometry_manifest.json> "
                 + "--geometry-manifest-sha256 <sha256:...> "

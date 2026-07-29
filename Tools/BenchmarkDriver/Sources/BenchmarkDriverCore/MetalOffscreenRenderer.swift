@@ -10,12 +10,23 @@ import UniformTypeIdentifiers
 
 public protocol LoadedSceneRendering: AnyObject {
     func render(camera: RenderCamera, outputURL: URL) throws -> String
+    var splatCount: Int { get }
 }
 
 public final class MetalOffscreenRenderer {
+    /// What the trainer's rasterizer keys its tile intersections on. Held here rather than
+    /// written at the call site so the manifest reports the ordering that was actually used:
+    /// a second literal is a second thing to keep in step, and this is the field a reader
+    /// would check first when two runs disagree.
+    public static let sortOrdering: SplatRenderer.SortOrdering = .cameraForwardDepth
+
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let sortTimeout: DispatchTimeInterval
+
+    /// Metal's running allocation total. Sampled after each view rather than integrated,
+    /// so it is a floor on the true peak.
+    public var currentAllocatedBytes: UInt64 { UInt64(device.currentAllocatedSize) }
 
     public init(
         device: MTLDevice? = MTLCreateSystemDefaultDevice(),
@@ -49,11 +60,10 @@ public final class MetalOffscreenRenderer {
                 sampleCount: 1,
                 maxViewCount: 1,
                 maxSimultaneousRenders: 1,
-                // What the trainer's rasterizer keys on. Stated rather than defaulted:
-                // this renderer blocks on every sort before it draws, so it would be
-                // unaffected by a change of interactive policy, and a measurement should
-                // not move because a viewer default did.
-                sortOrdering: .cameraForwardDepth
+                // Stated rather than defaulted: this renderer blocks on every sort before it
+                // draws, so it would be unaffected by a change of interactive policy, and a
+                // measurement should not move because a viewer default did.
+                sortOrdering: Self.sortOrdering
             )
             try renderer.readPLY(from: plyURL)
         } catch {
@@ -151,6 +161,8 @@ private final class MetalLoadedScene: LoadedSceneRendering {
         self.commandQueue = commandQueue
         self.sortTimeout = sortTimeout
     }
+
+    var splatCount: Int { renderer.splatCount }
 
     func render(camera: RenderCamera, outputURL: URL) throws -> String {
         let descriptor = SplatRenderer.CameraDescriptor(
