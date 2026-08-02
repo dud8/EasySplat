@@ -273,7 +273,7 @@ def evaluate(contract: dict, scenes: dict, per_view: dict) -> dict:
     gating = {"lpips_squeezenet": "lpips_squeeze"}.get(gating, gating)
     lpips = headline(gating)
 
-    veto = []
+    veto, candidates = [], []
     veto_limits = at(contract, "gates", "per_view_veto_stochastic")
     multiple_min = veto_limits["require_beyond_pooled_per_view_sd"]
     for name, entry in per_view["views"].items():
@@ -285,12 +285,26 @@ def evaluate(contract: dict, scenes: dict, per_view: dict) -> dict:
             sd = entry[metric]["veto_sd"]
             if delta is None or delta > -veto_limits[key]:
                 continue
-            if sd and abs(delta) <= multiple_min * sd:
+            if not sd:
+                # No replicates, so no per-view SD, so the contract's "beyond 4 pooled
+                # per-view SD" cannot be evaluated -- and firing without it contradicts the
+                # clause's own note not to veto from a single noisy run. Recorded as a
+                # candidate rather than resolved in either direction.
+                candidates.append({"view": name, "metric": metric,
+                                   "paired_median_delta": delta,
+                                   "limit": -veto_limits[key]})
+                continue
+            if abs(delta) <= multiple_min * sd:
                 continue
             veto.append({"view": name, "metric": metric, "paired_median_delta": delta,
                          "veto_sd": sd, "limit": -veto_limits[key]})
 
     not_evaluable = {}
+    if candidates:
+        not_evaluable["per_view_veto_stochastic"] = (
+            f"{len(candidates)} view(s) past the loss threshold, but with no replicates "
+            "there is no per-view SD to test them against"
+        )
     if lpips is None:
         not_evaluable["advance_to_consideration"] = (
             f"no {gating} in the per-view rows; the contract gates on "
@@ -346,6 +360,7 @@ def evaluate(contract: dict, scenes: dict, per_view: dict) -> dict:
             "median over scenes of |per-scene delta| / pooled per-scene repeat SD",
         "advance_to_consideration": advance,
         "veto": veto,
+        "veto_candidates": candidates,
         "not_evaluable": not_evaluable,
         "research_verdict": verdict,
         "current_release_gate_verdict": "not_evaluated",
@@ -443,6 +458,22 @@ def arms_differ_by(baseline: list[dict], candidate: list[dict]) -> list[str] | s
     return differences or "nothing -- the arms are identically configured, so this is a null"
 
 
+def under_replicated(runs: list[dict], minimum: int) -> dict[str, int]:
+    """Arm/scene pairs short of the contract's replication minimum.
+
+    Separate from `refuse` because it is a different kind of problem. A renderer mismatch
+    or a missing digest makes a comparison *invalid* and its numbers meaningless. Too few
+    replicates makes it *underpowered*, and the numbers are still the best estimate
+    available -- often the whole point of a screen. So this reports statistics and withholds
+    the verdict rather than refusing outright.
+    """
+    counts: dict[tuple[str, str], int] = {}
+    for run in runs:
+        key = (run["arm"] or "?", run["scene"])
+        counts[key] = counts.get(key, 0) + 1
+    return {f"{arm}/{scene}": n for (arm, scene), n in counts.items() if n < minimum}
+
+
 def refuse(runs: list[dict], minimum: int, renderer_mismatch_is_fatal: bool) -> str | None:
     """The refusals, in precedence order. Returns a reason, or None to proceed."""
     paths = [run["path"] for run in runs]
@@ -480,14 +511,6 @@ def refuse(runs: list[dict], minimum: int, renderer_mismatch_is_fatal: bool) -> 
         by_arm.setdefault(run["arm"] or "?", set()).add(run["scene"])
     if len(set(map(frozenset, by_arm.values()))) > 1:
         return f"scene_set_mismatch: {({k: sorted(v) for k, v in by_arm.items()})}"
-    counts: dict[tuple[str, str], int] = {}
-    for run in runs:
-        counts[(run["arm"] or "?", run["scene"])] = counts.get(
-            (run["arm"] or "?", run["scene"]), 0
-        ) + 1
-    short = {f"{arm}/{scene}": n for (arm, scene), n in counts.items() if n < minimum}
-    if short:
-        return f"insufficient_replication: {short} against minimum {minimum}"
     by_scene: dict[str, set[frozenset]] = {}
     for run in runs:
         by_scene.setdefault(run["scene"], set()).add(frozenset(run["rows"]))
@@ -556,6 +579,10 @@ def main() -> int:
                                 "paired_per_view": per_view["paired"]}
         report.update(evaluate(contract, scenes, per_view))
         report["per_view_tail"] = tail(per_view)
+        short = under_replicated(runs, minimum)
+        if short:
+            report["under_replicated"] = short
+            report["research_verdict"] = "insufficient_replication"
         if scope_problems and report["research_verdict"] == "accept":
             report["research_verdict"] = "out_of_scope"
         if arguments.renderer_mismatch == "report-only":
@@ -620,6 +647,11 @@ def summarize(report: dict) -> str:
         lines.append(f"{'median':<10s} {'':>9s} {'':>9s} {medians['psnr']:+8.4f}")
         if report["veto"]:
             lines.append(f"VETO on {len(report['veto'])} view(s)")
+        elif report.get("veto_candidates"):
+            lines.append(
+                f"{len(report['veto_candidates'])} view(s) past the veto threshold, "
+                "not evaluable without replicates"
+            )
     lines.append("")
     lines.append(f"research verdict:     {report['research_verdict']}")
     if "refusal" in report:

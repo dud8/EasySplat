@@ -302,6 +302,39 @@ class VetoTests(PairedABTestCase):
         self.assertEqual(report["veto"], [], "a 1.1 dB delta inside 4 scene-pool SD")
 
 
+class VetoWithoutReplicatesTests(PairedABTestCase):
+    def test_a_single_run_loss_is_a_candidate_not_a_veto(self):
+        """At n=1 there is no per-view SD, so the contract's 4-SD requirement cannot be
+        evaluated. Firing anyway contradicts its own note not to veto from a single noisy
+        run -- and the worst such view on room turned out to be that scene's noisiest, at
+        6x the median view's spread."""
+        loud = flat(30.0, VIEW_COUNTS["bicycle"])
+        quiet = list(loud)
+        quiet[0] = 26.0
+        baseline = [self.workspace.write("bicycle", "baseline", 1, loud)]
+        candidate = [self.workspace.write("bicycle", "candidate", 1, quiet,
+                                          lpips_squeeze=flat(0.13, VIEW_COUNTS["bicycle"]))]
+        report = self.compare(baseline, candidate)
+        self.assertEqual(report["veto"], [], "no SD means no veto verdict")
+        self.assertEqual(len(report["veto_candidates"]), 1)
+        self.assertIn("per_view_veto_stochastic", report["not_evaluable"])
+
+    def test_with_replicates_the_same_loss_does_veto(self):
+        """The guard is about missing evidence, not about tolerating regressions."""
+        baseline, candidate = [], []
+        for replicate in range(1, 4):
+            loud = flat(30.0, VIEW_COUNTS["bicycle"])
+            quiet = list(loud)
+            quiet[0] = 26.0
+            baseline.append(self.workspace.write("bicycle", "baseline", replicate, loud))
+            candidate.append(self.workspace.write(
+                "bicycle", "candidate", replicate, quiet,
+                lpips_squeeze=flat(0.13, VIEW_COUNTS["bicycle"])))
+        report = self.compare(baseline, candidate)
+        self.assertEqual(report["research_verdict"], "veto")
+        self.assertEqual(len(report["veto"]), 1)
+
+
 class NullComparisonTests(PairedABTestCase):
     def test_identical_arms_do_not_advance_rather_than_being_accepted(self):
         """A change that improves nothing has not earned consideration. This is how the
@@ -331,11 +364,28 @@ class NullComparisonTests(PairedABTestCase):
 
 
 class RefusalTests(PairedABTestCase):
-    def test_two_replicates_are_insufficient(self):
+    def test_two_replicates_are_insufficient_but_still_reported(self):
+        """Underpowered is not invalid. A screen's numbers are the best estimate available
+        and are often the whole point of running it; what it cannot have is a verdict."""
         baseline = self.arm("baseline", {"bicycle": 25.0}, replicates=2)
-        candidate = self.arm("candidate", {"bicycle": 25.0}, replicates=2)
+        candidate = self.advancing({"bicycle": 25.0}, replicates=2)
         report = self.compare(baseline, candidate)
         self.assertEqual(report["research_verdict"], "insufficient_replication")
+        self.assertIn("statistics", report, "the screen's numbers are still reported")
+        self.assertEqual(report["under_replicated"], {"baseline/bicycle": 2,
+                                                      "candidate/bicycle": 2})
+
+    def test_an_invalid_comparison_still_refuses_outright(self):
+        """The distinction being drawn: a renderer mismatch makes the numbers meaningless,
+        so unlike under-replication it reports none."""
+        baseline = self.arm("baseline", {"bicycle": 25.0})
+        candidate = self.advancing(
+            {"bicycle": 25.0},
+            provenance={**PROVENANCE, "sort_ordering": "euclidean_camera_distance"},
+        )
+        report = self.compare(baseline, candidate)
+        self.assertEqual(report["research_verdict"], "renderer_mismatch")
+        self.assertNotIn("statistics", report)
 
     def test_a_missing_scene_is_refused_rather_than_averaged_over_what_is_present(self):
         baseline = self.arm("baseline", {"bicycle": 25.0, "room": 30.0})
