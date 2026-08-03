@@ -51,7 +51,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                           stencilFormat: metalKitView.depthStencilPixelFormat,
                                           sampleCount: metalKitView.sampleCount,
                                           maxViewCount: 1,
-                                          maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+                                          maxSimultaneousRenders: Constants.maxSimultaneousRenders,
+                                          // Interactive, and stated rather than defaulted: the
+                                          // argument has no default, so no renderer can composite
+                                          // under an ordering nobody chose.
+                                          sortOrdering: .cameraForwardDepth)
             try splat.readPLY(from: url)
             modelRenderer = splat
         case .sampleBox:

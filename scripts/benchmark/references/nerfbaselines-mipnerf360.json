@@ -1,0 +1,541 @@
+{
+  "reference": "nerfbaselines-mipnerf360",
+  "schema_version": 1,
+  "purpose": "Published per-scene results for the Mip-NeRF 360 benchmark, so EasySplat's quality can be compared to a maintained leaderboard rather than to a figure with no source.",
+  "why_this_exists": "The deficit that motivated the 2026-07 quality work was recorded as '26.99 on five scenes against reference 3DGS-30k's 28.40 on the same scenes'. Neither the five scenes nor the origin of 28.40 was written down anywhere in the repository or the engineering log, so the number could not be reconstructed. This file pins a reference that can be cited and rechecked.",
+  "source": {
+    "site": "https://nerfbaselines.github.io/",
+    "dataset_page": "https://nerfbaselines.github.io/mipnerf360",
+    "paper": "https://arxiv.org/abs/2406.17345",
+    "retrieved": "2026-07-28",
+    "retrieved_by": "manual transcription from the published per-method pages"
+  },
+  "protocol": {
+    "scenes": 9,
+    "downscale": {
+      "outdoor": 4,
+      "indoor": 2,
+      "note": "The leaderboard default is the dataset's own pre-downscaled JPEGs (protocol P1 in the paper), not a fresh downscale of the originals (P2). Some methods' authors report P2 and the paper measures roughly 0.3 dB between them, so the distinction matters."
+    },
+    "holdout": "every 8th frame of the trajectory",
+    "psnr": "float32 in [0,1]",
+    "ssim": "gaussian window, kernel 11, sigma 1.5, k1 0.01, k2 0.03",
+    "lpips": "VGG backbone, lpips package checkpoint 0.1"
+  },
+  "easysplat_protocol_match": {
+    "downscale": "match - the harness symlinks images_4 outdoor and images_2 indoor, which is P1",
+    "holdout": "match - every 8th filename-sorted camera, matching InputData::splitTrainTest",
+    "psnr": "match",
+    "ssim": "match - harness/bench.py uses the same window and constants",
+    "lpips": "match - lpips.LPIPS(net=\"vgg\") defaults to checkpoint 0.1",
+    "poses": "match - the dataset's own COLMAP reconstruction",
+    "sort_key": "was NOT a match until 2026-07-28. The harness never passed sortOrdering and so rendered with radial ordering while the reference sorts by view depth; worth 0.28 to 1.33 dB depending on scene. sortOrdering now has no default so this cannot recur."
+  },
+  "scene_availability": {
+    "public": [
+      "bicycle",
+      "garden",
+      "stump",
+      "kitchen",
+      "bonsai",
+      "counter",
+      "room"
+    ],
+    "restricted": [
+      "flowers",
+      "treehill"
+    ],
+    "restriction_note": "flowers and treehill ship as a placeholder text file: 'We are not permitted to share this scene publicly.' They are obtainable only by emailing the dataset authors, so EasySplat can produce a 7-scene mean and never the 9-scene mean the leaderboard reports.",
+    "warning": "The two restricted scenes are the two hardest. Every method's 7-scene mean is far above its 9-scene mean - for 3D Gaussian Splatting the gap is 1.55 dB. Comparing a 7-scene EasySplat mean against a 9-scene leaderboard average would overstate EasySplat by that much. Always compare against the derived 7-scene subset below."
+  },
+  "methods": {
+    "gaussian-splatting": {
+      "page": "https://nerfbaselines.github.io/m-gaussian-splatting",
+      "published_average_9": {
+        "psnr": 27.43,
+        "ssim": 0.814,
+        "lpips_vgg": 0.257
+      },
+      "training_time": "23m 25s",
+      "gpu_memory_gb": 11.14,
+      "per_scene": {
+        "garden": {
+          "psnr": 27.34,
+          "ssim": 0.866,
+          "lpips_vgg": 0.124
+        },
+        "bicycle": {
+          "psnr": 25.21,
+          "ssim": 0.764,
+          "lpips_vgg": 0.24
+        },
+        "flowers": {
+          "psnr": 21.6,
+          "ssim": 0.604,
+          "lpips_vgg": 0.367
+        },
+        "treehill": {
+          "psnr": 22.44,
+          "ssim": 0.631,
+          "lpips_vgg": 0.377
+        },
+        "stump": {
+          "psnr": 26.58,
+          "ssim": 0.771,
+          "lpips_vgg": 0.25
+        },
+        "kitchen": {
+          "psnr": 31.14,
+          "ssim": 0.926,
+          "lpips_vgg": 0.155
+        },
+        "bonsai": {
+          "psnr": 32.2,
+          "ssim": 0.941,
+          "lpips_vgg": 0.254
+        },
+        "counter": {
+          "psnr": 28.96,
+          "ssim": 0.907,
+          "lpips_vgg": 0.258
+        },
+        "room": {
+          "psnr": 31.43,
+          "ssim": 0.917,
+          "lpips_vgg": 0.287
+        }
+      }
+    },
+    "taming-3dgs": {
+      "page": "https://nerfbaselines.github.io/m-taming-3dgs",
+      "note": "The closest published analogue to EasySplat's position: a fast Gaussian trainer. Six minutes per scene.",
+      "published_average_9": {
+        "psnr": 27.22,
+        "ssim": 0.793,
+        "lpips_vgg": 0.305
+      },
+      "training_time": "5m 59s",
+      "gpu_memory_gb": 8.69,
+      "per_scene": {
+        "garden": {
+          "psnr": 27.42,
+          "ssim": 0.858,
+          "lpips_vgg": 0.145
+        },
+        "bicycle": {
+          "psnr": 24.75,
+          "ssim": 0.712,
+          "lpips_vgg": 0.336
+        },
+        "flowers": {
+          "psnr": 21.1,
+          "ssim": 0.551,
+          "lpips_vgg": 0.438
+        },
+        "treehill": {
+          "psnr": 23.02,
+          "ssim": 0.623,
+          "lpips_vgg": 0.443
+        },
+        "stump": {
+          "psnr": 25.95,
+          "ssim": 0.734,
+          "lpips_vgg": 0.336
+        },
+        "kitchen": {
+          "psnr": 30.92,
+          "ssim": 0.921,
+          "lpips_vgg": 0.172
+        },
+        "bonsai": {
+          "psnr": 31.86,
+          "ssim": 0.935,
+          "lpips_vgg": 0.271
+        },
+        "counter": {
+          "psnr": 28.53,
+          "ssim": 0.897,
+          "lpips_vgg": 0.283
+        },
+        "room": {
+          "psnr": 31.41,
+          "ssim": 0.906,
+          "lpips_vgg": 0.321
+        }
+      }
+    },
+    "3dgs-mcmc": {
+      "page": "https://nerfbaselines.github.io/m-3dgs-mcmc",
+      "note": "The strongest Gaussian method on the board, and the one that sets the target: its seven-scene subset beats Zip-NeRF on SSIM and ties it on LPIPS while giving up half a decibel of PSNR. Same ordinary-Gaussian asset EasySplat exports, so the format is not what separates the leaderboard from a splat viewer.",
+      "published_average_9": {
+        "psnr": 27.98,
+        "ssim": 0.835,
+        "lpips_vgg": 0.224
+      },
+      "training_time": "41m 11s",
+      "gpu_memory_gb": 28.86,
+      "per_scene": {
+        "garden": {
+          "psnr": 27.81,
+          "ssim": 0.877,
+          "lpips_vgg": 0.109
+        },
+        "bicycle": {
+          "psnr": 25.69,
+          "ssim": 0.799,
+          "lpips_vgg": 0.194
+        },
+        "flowers": {
+          "psnr": 22.05,
+          "ssim": 0.644,
+          "lpips_vgg": 0.316
+        },
+        "treehill": {
+          "psnr": 22.97,
+          "ssim": 0.658,
+          "lpips_vgg": 0.315
+        },
+        "stump": {
+          "psnr": 27.38,
+          "ssim": 0.811,
+          "lpips_vgg": 0.2
+        },
+        "kitchen": {
+          "psnr": 31.91,
+          "ssim": 0.933,
+          "lpips_vgg": 0.148
+        },
+        "bonsai": {
+          "psnr": 32.66,
+          "ssim": 0.947,
+          "lpips_vgg": 0.236
+        },
+        "counter": {
+          "psnr": 29.32,
+          "ssim": 0.916,
+          "lpips_vgg": 0.238
+        },
+        "room": {
+          "psnr": 32.05,
+          "ssim": 0.927,
+          "lpips_vgg": 0.262
+        }
+      }
+    },
+    "zipnerf": {
+      "page": "https://nerfbaselines.github.io/m-zipnerf",
+      "note": "Leaderboard ceiling, and not a Gaussian method. Five and a half hours per scene on a datacentre GPU.",
+      "published_average_9": {
+        "psnr": 28.55,
+        "ssim": 0.829,
+        "lpips_vgg": 0.218
+      },
+      "training_time": "5h 30m 20s",
+      "gpu_memory_gb": 26.82,
+      "per_scene": {
+        "garden": {
+          "psnr": 28.19,
+          "ssim": 0.864,
+          "lpips_vgg": 0.127
+        },
+        "bicycle": {
+          "psnr": 25.89,
+          "ssim": 0.775,
+          "lpips_vgg": 0.226
+        },
+        "flowers": {
+          "psnr": 22.33,
+          "ssim": 0.637,
+          "lpips_vgg": 0.31
+        },
+        "treehill": {
+          "psnr": 24.01,
+          "ssim": 0.677,
+          "lpips_vgg": 0.279
+        },
+        "stump": {
+          "psnr": 27.41,
+          "ssim": 0.792,
+          "lpips_vgg": 0.233
+        },
+        "kitchen": {
+          "psnr": 32.35,
+          "ssim": 0.929,
+          "lpips_vgg": 0.134
+        },
+        "bonsai": {
+          "psnr": 34.68,
+          "ssim": 0.951,
+          "lpips_vgg": 0.195
+        },
+        "counter": {
+          "psnr": 29.13,
+          "ssim": 0.905,
+          "lpips_vgg": 0.223
+        },
+        "room": {
+          "psnr": 32.99,
+          "ssim": 0.928,
+          "lpips_vgg": 0.237
+        }
+      }
+    }
+  },
+  "leaderboard_averages_9_scene_only": {
+    "note": "Averages over all nine scenes, transcribed from the dataset page. Recorded for context; a 7-scene subset cannot be derived from these, so they must never be compared against an EasySplat mean.",
+    "colmap": 16.67,
+    "instant-ngp": 25.51,
+    "nerfstudio": 26.39,
+    "2d-gaussian-splatting": 26.81,
+    "h3dgs": 26.93,
+    "3dgut": 27.04,
+    "pgsr": 27.2,
+    "taming-3dgs": 27.22,
+    "octree-gs": 27.4,
+    "gsplat": 27.41,
+    "gaussian-opacity-fields": 27.42,
+    "gaussian-splatting": 27.43,
+    "mip-splatting": 27.49,
+    "mipnerf360": 27.68,
+    "scaffold-gs": 27.71,
+    "3dgs-mcmc": 27.98,
+    "zipnerf": 28.55
+  },
+  "observations": {
+    "3dgut": "3DGUT sits at 27.04, below vanilla 3DGS at 27.43, on the dataset EasySplat benchmarks. Independent support for the A3 probe that killed 3DGUT here on a 0.0331 dB distortion headroom measurement.",
+    "mcmc": "3DGS-MCMC is the strongest Gaussian method on the board at 27.98, and on the seven public scenes it reaches 29.55 / 0.8871 / 0.1981 against Zip-NeRF's 30.09 / 0.8777 / 0.1964 - behind on PSNR, ahead on SSIM, level on LPIPS. That is the number to chase, because it is reachable inside the ordinary-Gaussian export EasySplat already ships. EasySplat built MCMC clean-room and rejected it on a predeclared per-view veto (four held-out views losing 1.06-1.82 dB), attributing the failure to tile intersection pressure rather than primitive count. The rejection stands unless re-run, but a method this far ahead failing here is a statement about our rasterizer's constraints, not about the mechanism.",
+    "spread": "The Gaussian family is packed between 26.8 and 28.0 on the 9-scene mean. Roughly a decibel separates a 6-minute trainer from a 40-minute one, so speed and quality are not far apart on this benchmark and EasySplat's fast profile is a defensible place to sit."
+  },
+  "sparse": {
+    "dataset_page": "https://nerfbaselines.github.io/mipnerf360-sparse",
+    "protocol": {
+      "selection": "hold out every 8th filename-sorted image for test, then take linspace(0, len(train)-1, num_views, dtype=int) over the remaining train list",
+      "source": "nerfbaselines/datasets/mipnerf360_sparse.py",
+      "view_counts": [
+        12,
+        24
+      ],
+      "test_set": "unchanged from the dense benchmark, so a sparse result is directly comparable to a dense one on the same views",
+      "average_convention": "the published leaderboard average is over all 18 rows - nine scenes at both view counts - not over one view count"
+    },
+    "leaderboard_averages_18_row": {
+      "dropgaussian": 21.45,
+      "scaffold-gs": 20.28,
+      "3dgs-mcmc": 20.07,
+      "gaussian-splatting": 19.76,
+      "mip-splatting": 19.75,
+      "sparsegs": 19.65,
+      "pgsr": 17.2,
+      "zipnerf": 16.47
+    },
+    "methods": {
+      "gaussian-splatting": {
+        "n12": {
+          "garden": {
+            "psnr": 19.51,
+            "ssim": 0.541,
+            "lpips_vgg": 0.335
+          },
+          "bicycle": {
+            "psnr": 17.21,
+            "ssim": 0.334,
+            "lpips_vgg": 0.484
+          },
+          "flowers": {
+            "psnr": 14.08,
+            "ssim": 0.231,
+            "lpips_vgg": 0.552
+          },
+          "treehill": {
+            "psnr": 15.08,
+            "ssim": 0.327,
+            "lpips_vgg": 0.557
+          },
+          "stump": {
+            "psnr": 18.36,
+            "ssim": 0.324,
+            "lpips_vgg": 0.535
+          },
+          "kitchen": {
+            "psnr": 21.38,
+            "ssim": 0.738,
+            "lpips_vgg": 0.324
+          },
+          "bonsai": {
+            "psnr": 18.97,
+            "ssim": 0.71,
+            "lpips_vgg": 0.423
+          },
+          "counter": {
+            "psnr": 18.43,
+            "ssim": 0.647,
+            "lpips_vgg": 0.445
+          },
+          "room": {
+            "psnr": 20.6,
+            "ssim": 0.724,
+            "lpips_vgg": 0.425
+          }
+        },
+        "n24": {
+          "garden": {
+            "psnr": 23.73,
+            "ssim": 0.743,
+            "lpips_vgg": 0.2
+          },
+          "bicycle": {
+            "psnr": 19.77,
+            "ssim": 0.468,
+            "lpips_vgg": 0.396
+          },
+          "flowers": {
+            "psnr": 16.49,
+            "ssim": 0.345,
+            "lpips_vgg": 0.489
+          },
+          "treehill": {
+            "psnr": 17.99,
+            "ssim": 0.425,
+            "lpips_vgg": 0.475
+          },
+          "stump": {
+            "psnr": 19.78,
+            "ssim": 0.407,
+            "lpips_vgg": 0.478
+          },
+          "kitchen": {
+            "psnr": 24.33,
+            "ssim": 0.838,
+            "lpips_vgg": 0.232
+          },
+          "bonsai": {
+            "psnr": 22.91,
+            "ssim": 0.835,
+            "lpips_vgg": 0.34
+          },
+          "counter": {
+            "psnr": 23.0,
+            "ssim": 0.785,
+            "lpips_vgg": 0.346
+          },
+          "room": {
+            "psnr": 24.02,
+            "ssim": 0.803,
+            "lpips_vgg": 0.37
+          }
+        },
+        "published_average_18": {
+          "psnr": 19.76,
+          "ssim": 0.568,
+          "lpips_vgg": 0.412
+        }
+      },
+      "dropgaussian": {
+        "n12": {
+          "garden": {
+            "psnr": 20.74,
+            "ssim": 0.579,
+            "lpips_vgg": 0.421
+          },
+          "bicycle": {
+            "psnr": 19.46,
+            "ssim": 0.425,
+            "lpips_vgg": 0.523
+          },
+          "flowers": {
+            "psnr": 16.39,
+            "ssim": 0.296,
+            "lpips_vgg": 0.615
+          },
+          "treehill": {
+            "psnr": 17.39,
+            "ssim": 0.413,
+            "lpips_vgg": 0.61
+          },
+          "stump": {
+            "psnr": 19.84,
+            "ssim": 0.406,
+            "lpips_vgg": 0.571
+          },
+          "kitchen": {
+            "psnr": 22.83,
+            "ssim": 0.792,
+            "lpips_vgg": 0.306
+          },
+          "bonsai": {
+            "psnr": 21.23,
+            "ssim": 0.786,
+            "lpips_vgg": 0.404
+          },
+          "counter": {
+            "psnr": 20.07,
+            "ssim": 0.725,
+            "lpips_vgg": 0.425
+          },
+          "room": {
+            "psnr": 22.78,
+            "ssim": 0.797,
+            "lpips_vgg": 0.422
+          }
+        },
+        "n24": {
+          "garden": {
+            "psnr": 24.26,
+            "ssim": 0.694,
+            "lpips_vgg": 0.369
+          },
+          "bicycle": {
+            "psnr": 21.27,
+            "ssim": 0.496,
+            "lpips_vgg": 0.496
+          },
+          "flowers": {
+            "psnr": 17.99,
+            "ssim": 0.355,
+            "lpips_vgg": 0.588
+          },
+          "treehill": {
+            "psnr": 20.31,
+            "ssim": 0.487,
+            "lpips_vgg": 0.576
+          },
+          "stump": {
+            "psnr": 21.09,
+            "ssim": 0.466,
+            "lpips_vgg": 0.556
+          },
+          "kitchen": {
+            "psnr": 25.85,
+            "ssim": 0.863,
+            "lpips_vgg": 0.248
+          },
+          "bonsai": {
+            "psnr": 25.12,
+            "ssim": 0.863,
+            "lpips_vgg": 0.351
+          },
+          "counter": {
+            "psnr": 24.27,
+            "ssim": 0.817,
+            "lpips_vgg": 0.36
+          },
+          "room": {
+            "psnr": 25.25,
+            "ssim": 0.832,
+            "lpips_vgg": 0.399
+          }
+        },
+        "note": "leaderboard leader on this benchmark",
+        "published_average_18": {
+          "psnr": 21.45,
+          "ssim": 0.616,
+          "lpips_vgg": 0.458
+        }
+      }
+    },
+    "observations": {
+      "zipnerf": "Zip-NeRF leads the dense benchmark at 28.55 and comes last here at 16.47. Sparse view synthesis is a different problem and dense ranking does not carry over.",
+      "gaussian_robustness": "Every Gaussian method beats every NeRF method on this benchmark, which is the opposite of the dense ordering at the top."
+    }
+  }
+}

@@ -1253,8 +1253,10 @@ private struct RenderCameraDigestFixture: Decodable {
 
 private final class StubLoadedScene: LoadedSceneRendering {
     private let body: (RenderCamera, URL) throws -> String
+    let splatCount: Int
 
-    init(body: @escaping (RenderCamera, URL) throws -> String) {
+    init(splatCount: Int = 0, body: @escaping (RenderCamera, URL) throws -> String) {
+        self.splatCount = splatCount
         self.body = body
     }
 

@@ -58,7 +58,11 @@ class VisionSceneRenderer {
                                           stencilFormat: .invalid,
                                           sampleCount: 1,
                                           maxViewCount: layerRenderer.properties.viewCount,
-                                          maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+                                          maxSimultaneousRenders: Constants.maxSimultaneousRenders,
+                                          // Interactive, and stated rather than defaulted: the
+                                          // argument has no default, so no renderer can composite
+                                          // under an ordering nobody chose.
+                                          sortOrdering: .cameraForwardDepth)
             try splat.readPLY(from: url)
             modelRenderer = splat
         case .sampleBox:

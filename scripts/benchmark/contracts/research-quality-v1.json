@@ -1,0 +1,136 @@
+{
+  "contract": "research-quality-v1",
+  "schema_version": 1,
+  "purpose": "Acceptance policy for research A/B experiments on trainer and renderer quality. Governs what makes a change believable, not what makes a build shippable.",
+  "relationship_to_release_gate": {
+    "release_contract": "scripts/benchmark/reference-config.json",
+    "rule": "This contract never substitutes for the release contract and is never accepted where a reference-config is expected. reference-config.json and easysplat_benchmark.py APPROVED_THRESHOLDS remain frozen; nothing in this file authorizes editing them.",
+    "dual_verdict_required": true,
+    "verdicts": [
+      "research_verdict",
+      "current_release_gate_verdict"
+    ],
+    "conflict_outcome": "release_policy_review_required",
+    "conflict_rule": "A candidate that satisfies research_verdict but fails current_release_gate_verdict is recorded as release_policy_review_required. It is not promoted to a release, and the release gate is not amended to accommodate it. The conflict is surfaced, not resolved here."
+  },
+  "immutability": {
+    "rule": "Immutable once any experiment receipt cites this contract's digest. Policy changes create research-quality-v2.json; they never rewrite v1.",
+    "binding": "Every experiment receipt records this file's SHA-256 as research_contract_sha256, alongside the existing experiment_contract_sha256 / quality_thresholds_sha256 envelope fields.",
+    "rationale": "Declared before any candidate result exists. A threshold chosen after seeing a number is not a gate."
+  },
+  "scope": {
+    "suite": "mip-NeRF 360, 7 public scenes",
+    "data_root": "/Users/user/Downloads/360_v2",
+    "resolutions": {
+      "outdoor": "images_4",
+      "indoor": "images_2"
+    },
+    "holdout": "every 8th filename-sorted camera, matching InputData::splitTrainTest",
+    "poses": "the dataset's own COLMAP reconstruction",
+    "profile": "high-detail, 40000 iterations",
+    "seed": 42
+  },
+  "perceptual_metric": {
+    "gating_backbone": "squeezenet",
+    "gating_source": "scripts/benchmark/evidence_protocol.py render-scoring closure: torchvision_squeezenet1_1_imagenet1k_v1 backbone and lpips_v0.1_squeeze calibration, both SHA-256 pinned, network_access disabled",
+    "rule": "LPIPS gates are evaluated with the repository's hash-locked SqueezeNet closure. It is provenance-bound and mechanically enforceable today.",
+    "vgg_status": "reported, not gating",
+    "vgg_rationale": "The existing 26-run benchmark reports LPIPS(VGG), and published baselines use VGG, so it is recorded alongside for continuity and comparability. It does not gate until its weight lineage is closed under the project's clean-weight rule; hash-locking is not lineage.",
+    "independence_note": "Gating on SqueezeNet while a candidate objective optimizes VGG features (as WD-R does) is a deliberate property, not an oversight: it prevents a change from being accepted by the same features it optimizes."
+  },
+  "statistics": {
+    "median_definition": "Median over the 7 equally weighted per-scene deltas. Never a median over pooled per-view deltas, which would weight scenes by view count.",
+    "stochastic_replication": {
+      "minimum_runs_per_arm": 3,
+      "runs_per_arm_near_a_gate": 5,
+      "pairing": "alternating fresh-process runs on a quiet host",
+      "replicate_unit": "a whole training run; held-out views from one model are not independent samples"
+    },
+    "sd_definition": "pooled repeat standard deviation across same-arm replicates"
+  },
+  "gates": {
+    "advance_to_consideration": {
+      "applies_to": "stochastic trainer work",
+      "median_lpips_improvement_min": 0.01,
+      "lpips_backbone": "squeezenet",
+      "sd_multiple_min": 4,
+      "note": "A candidate that does not clear this is not evaluated further. LPIPS improvement alone never authorizes a metric trade; it only earns consideration. LPIPS(VGG) is recorded in the same receipt but does not gate."
+    },
+    "metric_preserving_acceptance": {
+      "applies_to": "stochastic trainer work",
+      "median_psnr_loss_db_max": 0.2,
+      "median_ssim_loss_max": 0.005,
+      "outcome": "accept"
+    },
+    "perceptual_trade_acceptance": {
+      "applies_to": "stochastic trainer work",
+      "median_psnr_loss_db_max": 0.4,
+      "median_ssim_loss_max": 0.01,
+      "blinded_human_preference_min": 0.6,
+      "blinded_human_preference_ci95_lower_bound_above": 0.5,
+      "outcome": "accept",
+      "note": "0.4 dB is approximately a 9.6% MSE allowance. The human-preference requirement is what makes the trade substantive; without it this tier is unavailable."
+    },
+    "reject": {
+      "applies_to": "stochastic trainer work",
+      "median_psnr_loss_db_above": 0.4,
+      "median_ssim_loss_above": 0.01,
+      "outcome": "reject under v1"
+    },
+    "per_view_veto_stochastic": {
+      "applies_to": "stochastic trainer work",
+      "paired_per_view_median_psnr_loss_db_max": 1.0,
+      "paired_per_view_median_ssim_loss_max": 0.02,
+      "require_beyond_pooled_per_view_sd": 4,
+      "outcome": "hard veto, overrides any acceptance tier",
+      "note": "Do not veto from a single noisy run. This is the criterion that correctly rejected clean-room fixed-cap MCMC, where four held-out views lost 1.06-1.82 dB outside baseline-repeat noise."
+    },
+    "deterministic_rendering": {
+      "applies_to": "fixed-PLY renderer parity work (A1); no training, no run-to-run variance",
+      "promote_if_median_psnr_gain_db_min": 0.2,
+      "promote_if_any_scene_psnr_gain_db_min": 0.5,
+      "no_regression_median": {
+        "psnr_loss_db_max": 0.2,
+        "ssim_loss_max": 0.005,
+        "lpips_increase_max": 0.01
+      },
+      "no_regression_scene": {
+        "psnr_loss_db_max": 0.5,
+        "ssim_loss_max": 0.01,
+        "lpips_increase_max": 0.02
+      },
+      "per_view_veto": {
+        "psnr_loss_db_max": 1.0,
+        "ssim_loss_max": 0.02,
+        "sd_clause": "not applicable; deterministic"
+      },
+      "additional": "no camera-turn regression against a freshly sorted reference"
+    },
+    "deterministic_probe": {
+      "applies_to": "distortion transfer-function probe (A3)",
+      "per_view_veto": "not applicable",
+      "worst_cell_gate": "worst radius / orientation / subpixel-phase cell, reported separately from the median",
+      "admit_3dgut_ab_if": {
+        "median_headroom_db_bootstrap_lower_95_min": 0.2,
+        "independent_device_classes_min": 2,
+        "or_both_classes_exceed_db": 0.5,
+        "or_solid_angle_gain_min": 0.05
+      },
+      "kill_if": {
+        "median_headroom_db_bootstrap_upper_95_below": 0.2,
+        "and_every_class_solid_angle_gain_below": 0.05
+      }
+    },
+    "mathematical_correctness": {
+      "applies_to": "backward-pass VJP corrections (A2)",
+      "helper_max_abs_error": "1e-5 scaled by the largest gradient magnitude in the sweep",
+      "helper_max_rel_error": 0.0001,
+      "end_to_end_finite_difference_rel_l2_max": 0.001,
+      "excludes": "declared nonsmooth boundaries",
+      "outcome": "passing permits a correctness claim only; it does not establish a quality gain, and a correct gradient that scores neutral is still correct",
+      "coupling_rule": "density-control thresholds stay frozen during each correction's A/B. A matched-checkpoint population shift of at least 10 percent, or a cull-reason shift beyond 4 baseline SD, triggers a separate density re-fit; it never changes thresholds in the same patch.",
+      "helper_max_abs_error_rationale": "A bare 1e-5 absolute bound is below what Float32 can represent for these quantities: projected position gradients run to order 1e3 (focal length over depth), where one ULP is already ~6e-5. An unscaled bound would be unsatisfiable by correct code, so it is expressed relative to the largest gradient the sweep produces. The relative bound (1e-4) is unchanged and is the binding check.",
+      "amended": "2026-07-28. Amended before any experiment receipt cited this contract's digest, so the immutability rule had not yet engaged. Recorded rather than applied silently: the original wording would have been reported as passed when the test actually applied a scaled bound."
+    }
+  }
+}

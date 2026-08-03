@@ -319,6 +319,15 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                 sampleCount: sampleCount,
                 maxViewCount: 1,
                 maxSimultaneousRenders: Constants.maxSimultaneousRenders,
+                // What the trainer's rasterizer keys on, so the viewer shows what was
+                // fitted. Euclidean distance was here because it is invariant under
+                // rotation about the camera centre and so hides a sort that has fallen
+                // behind. That invariance covers `ViewerCameraState.freeLook` and nothing
+                // else: the primary drag and the arrow keys `orbit`, which moves the
+                // camera, and under an orbit neither key is invariant and the two cost
+                // the same. Depth costs a little more during a free look and renders
+                // better in every mode; the trade is measured in the temporal gate.
+                sortOrdering: .cameraForwardDepth,
                 maximumWorkingSetBytes: maximumWorkingSetBytes,
                 maximumRecoverableWorkingSetBytes: maximumRecoverableWorkingSetBytes
             )
