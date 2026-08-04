@@ -10,12 +10,6 @@ private func hasNoASCIIControlCharacters(_ value: String) -> Bool {
     }
 }
 
-private enum InstallationPolicy: String {
-    case remoteOnly = "remote-only"
-    case bundledBootstrapOnly = "bundled-bootstrap-only"
-    case cachedOnly = "cached-only"
-}
-
 private struct PackagedMarkerFileIdentity: Equatable {
     let device: dev_t
     let inode: ino_t
@@ -63,42 +57,19 @@ private struct PackagedProjectMetadataSnapshot: Equatable {
 private struct Arguments {
     var inputManifest: URL
     var inputRoot: URL
-    var manifestURL: URL
-    var publicKeyFile: URL
-    var expectedManifest: URL
-    var expectedManifestFileSHA256: String
-    var bootstrapManifest: URL?
-    var bootstrapCoreArchive: URL?
-    var cacheRoot: URL
+    var toolchainRoot: URL
     var output: URL
     var evidence: URL
     var appVersion: String
-    var installationPolicy: InstallationPolicy
-    var offline: Bool
-    var allowInsecureLoopbackHTTP: Bool
 
     static func parse(_ raw: [String]) throws -> Arguments {
         var values: [String: String] = [:]
-        var offline = false
-        var allowInsecureLoopbackHTTP = false
         var index = 0
         while index < raw.count {
             let option = raw[index]
-            if option == "--offline" {
-                offline = true
-                index += 1
-                continue
-            }
-            if option == "--allow-insecure-loopback-http" {
-                allowInsecureLoopbackHTTP = true
-                index += 1
-                continue
-            }
             guard [
-                "--input-manifest", "--input-root", "--manifest-url", "--public-key-file", "--cache-root", "--output",
-                "--app-version", "--bootstrap-manifest", "--bootstrap-core-archive",
-                "--installation-policy", "--evidence", "--expected-manifest",
-                "--expected-manifest-file-sha256",
+                "--input-manifest", "--input-root", "--toolchain-root", "--output",
+                "--app-version", "--evidence",
             ].contains(option), index + 1 < raw.count else {
                 throw VerificationError.usage("Unknown or incomplete option: \(option)")
             }
@@ -108,73 +79,29 @@ private struct Arguments {
 
         guard let inputManifest = values["--input-manifest"],
               let inputRoot = values["--input-root"],
-              let manifest = values["--manifest-url"],
-              let manifestURL = URL(string: manifest),
-              let publicKeyFile = values["--public-key-file"],
-              let expectedManifest = values["--expected-manifest"],
-              let expectedManifestFileSHA256 = values["--expected-manifest-file-sha256"],
-              expectedManifestFileSHA256.range(
-                of: "^[0-9a-fA-F]{64}$",
-                options: .regularExpression
-              ) != nil,
-              let cacheRoot = values["--cache-root"],
+              let toolchainRoot = values["--toolchain-root"],
               let output = values["--output"],
               let evidence = values["--evidence"],
-              let appVersion = values["--app-version"],
-              let policyValue = values["--installation-policy"],
-              let installationPolicy = InstallationPolicy(rawValue: policyValue) else {
+              let appVersion = values["--app-version"] else {
             throw VerificationError.usage(
-                "Usage: EasySplatReleaseVerifier --input-manifest <schema1.json> --input-root <directory> --manifest-url <https-url> "
-                    + "--public-key-file <file> --cache-root <dir> --output <splat.ply> "
-                    + "--expected-manifest <manifest.json> --expected-manifest-file-sha256 <sha256> "
-                    + "--app-version <semver> --installation-policy <remote-only|bundled-bootstrap-only|cached-only> "
-                    + "--evidence <diagnostic.md> "
-                    + "[--bootstrap-manifest <manifest.json> --bootstrap-core-archive <core.zip> --offline] "
-                    + "[--allow-insecure-loopback-http]"
+                "Usage: EasySplatReleaseVerifier --input-manifest <schema1.json> --input-root <directory> "
+                    + "--toolchain-root <dir> --output <splat.ply> "
+                    + "--app-version <semver> --evidence <diagnostic.md>"
             )
-        }
-        switch installationPolicy {
-        case .remoteOnly where offline:
-            throw VerificationError.usage("The remote-only installation policy cannot be combined with --offline.")
-        case .remoteOnly where values["--bootstrap-manifest"] != nil || values["--bootstrap-core-archive"] != nil:
-            throw VerificationError.usage("The remote-only installation policy cannot receive bundled-bootstrap inputs.")
-        case .bundledBootstrapOnly where !offline:
-            throw VerificationError.usage("The bundled-bootstrap-only installation policy requires --offline.")
-        case .bundledBootstrapOnly where values["--bootstrap-manifest"] == nil || values["--bootstrap-core-archive"] == nil:
-            throw VerificationError.usage(
-                "The bundled-bootstrap-only installation policy requires both bootstrap inputs."
-            )
-        case .cachedOnly where !offline:
-            throw VerificationError.usage("The cached-only installation policy requires --offline.")
-        case .cachedOnly where values["--bootstrap-manifest"] != nil || values["--bootstrap-core-archive"] != nil:
-            throw VerificationError.usage("The cached-only installation policy cannot receive bundled-bootstrap inputs.")
-        default:
-            break
         }
         return Arguments(
             inputManifest: URL(fileURLWithPath: inputManifest),
             inputRoot: URL(fileURLWithPath: inputRoot, isDirectory: true),
-            manifestURL: manifestURL,
-            publicKeyFile: URL(fileURLWithPath: publicKeyFile),
-            expectedManifest: URL(fileURLWithPath: expectedManifest),
-            expectedManifestFileSHA256: expectedManifestFileSHA256.lowercased(),
-            bootstrapManifest: values["--bootstrap-manifest"].map(URL.init(fileURLWithPath:)),
-            bootstrapCoreArchive: values["--bootstrap-core-archive"].map(URL.init(fileURLWithPath:)),
-            cacheRoot: URL(fileURLWithPath: cacheRoot, isDirectory: true),
+            toolchainRoot: URL(fileURLWithPath: toolchainRoot, isDirectory: true),
             output: URL(fileURLWithPath: output),
             evidence: URL(fileURLWithPath: evidence),
-            appVersion: appVersion,
-            installationPolicy: installationPolicy,
-            offline: offline,
-            allowInsecureLoopbackHTTP: allowInsecureLoopbackHTTP
+            appVersion: appVersion
         )
     }
 }
 
 private enum VerificationError: Error, LocalizedError {
     case usage(String)
-    case invalidPublicKey
-    case nonemptyCacheRoot(String)
     case missingOutput
     case invalidOutput(String)
     case invalidEvidence(String)
@@ -182,25 +109,17 @@ private enum VerificationError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .usage(let message), .invalidOutput(let message),
-             .nonemptyCacheRoot(let message), .invalidEvidence(let message):
+             .invalidEvidence(let message):
             return message
-        case .invalidPublicKey:
-            return "The toolchain public-key file is empty."
         case .missingOutput:
             return "The completed project did not record a PLY output."
         }
     }
 }
 
-private struct ExpectedManifestEvidence {
-    let manifest: ToolchainManifest
-    let fileSHA256: String
-}
-
 private struct SuccessfulRunEvidence {
     let toolchain: ToolchainInstallationEvidence
     let output: ValidatedPlyArtifactEvidence
-    let publishedManifestFileSHA256: String
 }
 
 @main
@@ -282,31 +201,6 @@ private enum ReleaseVerifier {
         }
         let markerData = initialMarkerRead.data
         let marker = try decodeCanonicalPackagedMarker(markerData)
-        let initialPublicKeyRead = try packagedStableDataRead(
-            at: arguments.publicKeyFile,
-            maximumBytes: 4 * 1_024
-        )
-        let publicKeyData = initialPublicKeyRead.data
-        guard let publicKey = String(data: publicKeyData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !publicKey.isEmpty else {
-            throw VerificationError.invalidPublicKey
-        }
-        let initialExpectedManifestRead = try packagedStableDataRead(
-            at: arguments.expectedManifest,
-            maximumBytes: ToolchainManifest.maximumEncodedBytes
-        )
-        guard let authenticatedManifest = try? ToolchainManifest.readAuthenticated(
-            at: arguments.expectedManifest,
-            publicKeyBase64: publicKey
-        ), authenticatedManifest.data == initialExpectedManifestRead.data else {
-            throw VerificationError.invalidEvidence(
-                "The expected packaged toolchain manifest is not signed by the release authority."
-            )
-        }
-        let expectedManifest = authenticatedManifest.manifest
-        let expectedManifestData = authenticatedManifest.data
-        let expectedManifestSHA256 = sha256(expectedManifestData)
         let initialExecutableEvidence = try packagedExecutableEvidence(
             at: arguments.expectedExecutable
         )
@@ -336,13 +230,8 @@ private enum ReleaseVerifier {
                 canonicalAppBundle,
             ]
         )
-        let manager = ToolchainManager(
-            appVersion: arguments.appVersion,
-            localToolchainRoot: nil,
-            installationRoot: canonicalToolchain.deletingLastPathComponent(),
-            bundledBootstrap: nil,
-            sourcePolicy: .cachedOnly
-        )
+        let canonicalToolchainData = packagedToolchainDataRoot(canonicalToolchain)
+        let manager = ToolchainManager(appVersion: arguments.appVersion)
         let markerRequest = ToolchainCapabilityRequest(
             capabilities: Set(marker.requestedCapabilities.compactMap(ToolchainCapability.init(rawValue:)))
         )
@@ -351,11 +240,10 @@ private enum ReleaseVerifier {
                 "The packaged-app marker contains an unknown toolchain capability."
             )
         }
-        let toolchainEvidenceBefore = try manager.validatedInstallationEvidence(
+        let toolchainEvidenceBefore = try manager.installedTreeEvidence(
             root: canonicalToolchain,
-            publicKeyBase64: publicKey,
-            request: markerRequest,
-            matching: expectedManifest
+            dataRoot: canonicalToolchainData,
+            toolchainIdentity: arguments.appVersion
         )
         let evidence = try await ProjectArtifactValidator.validateFinishedProject(
             at: arguments.project,
@@ -420,29 +308,18 @@ private enum ReleaseVerifier {
         let finalOutputEvidence = try ProjectArtifactValidator.validatedPlyEvidence(
             at: evidence.outputURL
         )
-        let toolchainEvidenceAfter = try manager.validatedInstallationEvidence(
+        let toolchainEvidenceAfter = try manager.installedTreeEvidence(
             root: canonicalToolchain,
-            publicKeyBase64: publicKey,
-            request: evidence.toolchainRequest,
-            matching: expectedManifest
+            dataRoot: canonicalToolchainData,
+            toolchainIdentity: arguments.appVersion
         )
         let finalExecutableEvidence = try packagedExecutableEvidence(
             at: arguments.expectedExecutable
-        )
-        let finalPublicKeyRead = try packagedStableDataRead(
-            at: arguments.publicKeyFile,
-            maximumBytes: 4 * 1_024
-        )
-        let finalExpectedManifestRead = try packagedStableDataRead(
-            at: arguments.expectedManifest,
-            maximumBytes: ToolchainManifest.maximumEncodedBytes
         )
         let finalProjectMetadataSnapshot = try packagedProjectMetadataSnapshot(
             at: projectMetadataURL
         )
         guard finalMarkerRead == initialMarkerRead,
-              finalPublicKeyRead == initialPublicKeyRead,
-              finalExpectedManifestRead == initialExpectedManifestRead,
               try privateMarkerIdentity(at: arguments.marker) == initialMarkerIdentity,
               finalProjectMetadataSnapshot == initialProjectMetadataSnapshot,
               try canonicalProjectMetadataSHA256(evidence.metadata)
@@ -462,7 +339,6 @@ private enum ReleaseVerifier {
             arguments: arguments,
             marker: marker,
             markerData: markerData,
-            expectedManifestSHA256: expectedManifestSHA256,
             executable: finalExecutableEvidence,
             toolchain: toolchainEvidenceAfter,
             projectMetadataSHA256: sha256(initialProjectMetadataSnapshot.data),
@@ -482,14 +358,6 @@ private enum ReleaseVerifier {
                     at: arguments.marker,
                     maximumBytes: 64 * 1_024
                 )
-                let postPublicKeyRead = try packagedStableDataRead(
-                    at: arguments.publicKeyFile,
-                    maximumBytes: 4 * 1_024
-                )
-                let postExpectedManifestRead = try packagedStableDataRead(
-                    at: arguments.expectedManifest,
-                    maximumBytes: ToolchainManifest.maximumEncodedBytes
-                )
                 let postProjectMetadataSnapshot = try packagedProjectMetadataSnapshot(
                     at: projectMetadataURL
                 )
@@ -499,15 +367,12 @@ private enum ReleaseVerifier {
                 let postOutputEvidence = try ProjectArtifactValidator.validatedPlyEvidence(
                     at: evidence.outputURL
                 )
-                let postToolchainEvidence = try manager.validatedInstallationEvidence(
+                let postToolchainEvidence = try manager.installedTreeEvidence(
                     root: canonicalToolchain,
-                    publicKeyBase64: publicKey,
-                    request: evidence.toolchainRequest,
-                    matching: expectedManifest
+                    dataRoot: canonicalToolchainData,
+                    toolchainIdentity: arguments.appVersion
                 )
                 guard postMarkerRead == initialMarkerRead,
-                      postPublicKeyRead == initialPublicKeyRead,
-                      postExpectedManifestRead == initialExpectedManifestRead,
                       try privateMarkerIdentity(at: arguments.marker) == initialMarkerIdentity,
                       postProjectMetadataSnapshot == initialProjectMetadataSnapshot,
                       try canonicalProjectMetadataSHA256(postEvidence.metadata)
@@ -827,7 +692,6 @@ private enum ReleaseVerifier {
         arguments: PackagedProjectArguments,
         marker: PackagedProjectMarker,
         markerData: Data,
-        expectedManifestSHA256: String,
         executable: PackagedExecutableEvidence,
         toolchain: ToolchainInstallationEvidence,
         projectMetadataSHA256: String,
@@ -855,11 +719,7 @@ private enum ReleaseVerifier {
         lines += [
             "Input digest: \(inputDigest)",
             "Output path SHA-256: \(sha256(Data(marker.outputPlyPath.utf8)))",
-            "Expected packaged manifest file SHA-256: \(expectedManifestSHA256)",
             "Toolchain version JSON: \(try attestationJSON(toolchain.toolchainVersion))",
-            "Toolchain key ID JSON: \(try attestationJSON(toolchain.keyID))",
-            "Signed payload SHA-256: \(toolchain.canonicalManifestSHA256)",
-            "Toolchain signature SHA-256: \(toolchain.signatureSHA256)",
             "Installed closure SHA-256: \(toolchain.closureSHA256)",
             "Installation identity SHA-256: \(toolchain.installationIdentitySHA256)",
         ]
@@ -913,18 +773,17 @@ private enum ReleaseVerifier {
                 "The packaged-app marker toolchain root is not a canonical ordinary directory."
             )
         }
-        let receipt = canonical.appendingPathComponent(".easysplat_toolchain_state.json")
-        var receiptStatus = stat()
-        guard lstat(receipt.path, &receiptStatus) == 0,
-              (receiptStatus.st_mode & S_IFMT) == S_IFREG,
-              (receiptStatus.st_mode & 0o7777) == mode_t(S_IRUSR | S_IWUSR),
-              receiptStatus.st_nlink == 1,
-              receiptStatus.st_size > 0 else {
-            throw VerificationError.invalidEvidence(
-                "The packaged-app marker toolchain root has no private signed receipt."
-            )
-        }
         return canonical
+    }
+
+    /// A signed bundle keeps its non-executable toolchain payload in sealed
+    /// resources, so evidence must span both roots.
+    private static func packagedToolchainDataRoot(_ root: URL) -> URL? {
+        let components = root.pathComponents.suffix(2)
+        guard Array(components) == ["Contents", "Helpers"] else { return nil }
+        return root
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/Toolchain", isDirectory: true)
     }
 
     private static func run(arguments: Arguments) async throws -> SuccessfulRunEvidence {
@@ -945,38 +804,6 @@ private enum ReleaseVerifier {
             .mixed(videos: videoFiles.map(\.path), photosFolder: photoFolder.path)
         }
 
-        let publicKeyData = try BoundedFileReader.readRegularFile(
-            at: arguments.publicKeyFile,
-            maximumBytes: 4 * 1024
-        )
-        guard let publicKey = String(data: publicKeyData, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !publicKey.isEmpty else {
-            throw VerificationError.invalidPublicKey
-        }
-        let expectedManifest = try loadExpectedManifest(
-            arguments: arguments,
-            publicKeyBase64: publicKey
-        )
-        try fileManager.createDirectory(at: arguments.cacheRoot, withIntermediateDirectories: true)
-        let cacheEntries = try fileManager.contentsOfDirectory(atPath: arguments.cacheRoot.path)
-        switch arguments.installationPolicy {
-        case .cachedOnly where cacheEntries.isEmpty:
-            throw VerificationError.nonemptyCacheRoot(
-                "Cached-only release-verification root must contain a signed installed toolchain: \(arguments.cacheRoot.path)"
-            )
-        case .remoteOnly where !cacheEntries.isEmpty:
-            throw VerificationError.nonemptyCacheRoot(
-                "Release-verification cache root must start empty: \(arguments.cacheRoot.path)"
-            )
-        case .bundledBootstrapOnly where !cacheEntries.isEmpty:
-            throw VerificationError.nonemptyCacheRoot(
-                "Release-verification cache root must start empty: \(arguments.cacheRoot.path)"
-            )
-        default:
-            break
-        }
-
         let options = RequestedRunOptions(
             capturePath: .automatic,
             detailProfile: .balanced,
@@ -993,65 +820,25 @@ private enum ReleaseVerifier {
             developmentOverrides: DevelopmentOverrides(benchmarkSeed: 42)
         )
         let request = try plan.toolchainCapabilityRequest()
-        let manifestURL: URL
-        let bundledBootstrap: ToolchainBootstrap?
-        switch arguments.installationPolicy {
-        case .remoteOnly:
-            manifestURL = arguments.manifestURL
-            bundledBootstrap = nil
-        case .bundledBootstrapOnly:
-            guard let bootstrapManifest = arguments.bootstrapManifest,
-                  let bootstrapCoreArchive = arguments.bootstrapCoreArchive else {
-                throw VerificationError.usage("Bundled-bootstrap inputs are missing.")
-            }
-            manifestURL = URL(string: "https://127.0.0.1:1/easysplat-offline-verification.json")!
-            bundledBootstrap = ToolchainBootstrap(
-                manifestURL: bootstrapManifest,
-                coreArchiveURL: bootstrapCoreArchive
-            )
-        case .cachedOnly:
-            manifestURL = URL(string: "https://127.0.0.1:1/easysplat-cached-only-verification.json")!
-            bundledBootstrap = nil
-        }
-        let sourcePolicy: ToolchainSourcePolicy = switch arguments.installationPolicy {
-        case .remoteOnly: .automatic
-        case .bundledBootstrapOnly: .bundledBootstrapOnly
-        case .cachedOnly: .cachedOnly
-        }
         let manager = ToolchainManager(
             appVersion: arguments.appVersion,
-            localToolchainRoot: nil,
-            installationRoot: arguments.cacheRoot,
-            allowInsecureLoopbackHTTP: arguments.allowInsecureLoopbackHTTP,
-            bundledBootstrap: bundledBootstrap,
-            sourcePolicy: sourcePolicy
+            locator: BundledToolchainLocator(
+                developmentOverrideRoot: arguments.toolchainRoot
+            )
         )
-        let toolchain = try await manager.ensureToolchain(
-            manifestURL: manifestURL,
-            publicKeyBase64: publicKey,
-            request: request
-        ) { fraction, message in
+        let toolchain = try await manager.resolveToolchain(request: request) { fraction, message in
             let progress = fraction >= 0 ? " \(Int((fraction * 100).rounded()))%" : ""
             print("Tools:\(progress) \(message)")
         }
-        let toolchainEvidenceBeforeRun = try manager.validatedInstallationEvidence(
+        let toolchainEvidenceBeforeRun = try manager.installedTreeEvidence(
             root: toolchain.root,
-            publicKeyBase64: publicKey,
-            request: request,
-            matching: expectedManifest.manifest
+            dataRoot: toolchain.dataRoot,
+            toolchainIdentity: toolchain.toolchainIdentity
         )
 
         let projectParent = arguments.output.deletingLastPathComponent()
         try fileManager.createDirectory(at: projectParent, withIntermediateDirectories: true)
-        let projectTitle: String
-        switch arguments.installationPolicy {
-        case .remoteOnly:
-            projectTitle = "Online"
-        case .bundledBootstrapOnly:
-            projectTitle = "Offline"
-        case .cachedOnly:
-            projectTitle = "Cached"
-        }
+        let projectTitle = Self.verificationProjectTitle
         let projectName = "\(projectTitle).easysplatproj"
         let expectedProjectURL = projectParent.appendingPathComponent(
             projectName,
@@ -1104,11 +891,10 @@ private enum ReleaseVerifier {
             }
         }
 
-        let toolchainEvidenceAfterRun = try manager.validatedInstallationEvidence(
+        let toolchainEvidenceAfterRun = try manager.installedTreeEvidence(
             root: toolchain.root,
-            publicKeyBase64: publicKey,
-            request: request,
-            matching: expectedManifest.manifest
+            dataRoot: toolchain.dataRoot,
+            toolchainIdentity: toolchain.toolchainIdentity
         )
         guard toolchainEvidenceAfterRun == toolchainEvidenceBeforeRun else {
             throw VerificationError.invalidEvidence(
@@ -1134,11 +920,10 @@ private enum ReleaseVerifier {
                 installation: toolchainEvidenceAfterRun
             )
         )
-        let toolchainEvidenceAfterReplay = try manager.validatedInstallationEvidence(
+        let toolchainEvidenceAfterReplay = try manager.installedTreeEvidence(
             root: toolchain.root,
-            publicKeyBase64: publicKey,
-            request: request,
-            matching: expectedManifest.manifest
+            dataRoot: toolchain.dataRoot,
+            toolchainIdentity: toolchain.toolchainIdentity
         )
         guard toolchainEvidenceAfterReplay == toolchainEvidenceBeforeRun else {
             throw VerificationError.invalidEvidence(
@@ -1173,18 +958,10 @@ private enum ReleaseVerifier {
                 sha256: expectedOutputSHA256
             )
         )
-        switch arguments.installationPolicy {
-        case .remoteOnly:
-            print("Fresh remote-only signed installation and reconstruction passed.")
-        case .bundledBootstrapOnly:
-            print("Bundled-bootstrap-only reconstruction passed.")
-        case .cachedOnly:
-            print("Cached-only offline reconstruction passed.")
-        }
+        print("Built-in toolchain reconstruction passed.")
         return SuccessfulRunEvidence(
             toolchain: toolchainEvidenceAfterReplay,
-            output: outputEvidence,
-            publishedManifestFileSHA256: expectedManifest.fileSHA256
+            output: outputEvidence
         )
     }
 
@@ -1216,13 +993,10 @@ private enum ReleaseVerifier {
             "# EasySplat Release Verification Evidence",
             "Schema: 1",
             "App version: \(arguments.appVersion)",
-            "Installation policy: \(arguments.installationPolicy.rawValue)",
             "Status: \(passed ? "passed" : "failed")",
         ]
         if let successfulEvidence {
             lines.append(contentsOf: provenanceLines(for: successfulEvidence))
-        } else {
-            lines.append(contentsOf: publicAuthorityLines(arguments: arguments))
         }
 
         if let runError {
@@ -1567,23 +1341,19 @@ private enum ReleaseVerifier {
         try synchronizeEvidenceDescriptor(directory)
     }
 
+    static let verificationProjectTitle = "Bundled"
+
     private static func projectURL(for arguments: Arguments) -> URL {
-        let projectName = switch arguments.installationPolicy {
-        case .remoteOnly: "Online.easysplatproj"
-        case .bundledBootstrapOnly: "Offline.easysplatproj"
-        case .cachedOnly: "Cached.easysplatproj"
-        }
         return arguments.output.deletingLastPathComponent()
-            .appendingPathComponent(projectName, isDirectory: true)
+            .appendingPathComponent(
+                "\(verificationProjectTitle).easysplatproj",
+                isDirectory: true
+            )
     }
 
     private static func provenanceLines(for evidence: SuccessfulRunEvidence) -> [String] {
         var lines = [
-            "Published manifest file SHA-256: \(evidence.publishedManifestFileSHA256)",
             "Toolchain version: \(evidence.toolchain.toolchainVersion)",
-            "Toolchain key ID: \(evidence.toolchain.keyID)",
-            "Signed payload SHA-256: \(evidence.toolchain.canonicalManifestSHA256)",
-            "Toolchain signature SHA-256: \(evidence.toolchain.signatureSHA256)",
             "Installed closure SHA-256: \(evidence.toolchain.closureSHA256)",
             "Installation identity SHA-256: \(evidence.toolchain.installationIdentitySHA256)",
         ]
@@ -1600,51 +1370,4 @@ private enum ReleaseVerifier {
         return lines
     }
 
-    private static func publicAuthorityLines(arguments: Arguments) -> [String] {
-        guard let data = try? BoundedFileReader.readRegularFile(
-            at: arguments.publicKeyFile,
-            maximumBytes: 4 * 1024
-        ),
-        let value = String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-        let keyID = ToolchainManifest.keyID(publicKeyBase64: value) else {
-            return ["Toolchain key ID: unavailable"]
-        }
-        return ["Toolchain key ID: \(keyID)"]
-    }
-
-    private static func loadExpectedManifest(
-        arguments: Arguments,
-        publicKeyBase64: String
-    ) throws -> ExpectedManifestEvidence {
-        let data: Data
-        do {
-            data = try BoundedFileReader.readRegularFile(
-                at: arguments.expectedManifest,
-                maximumBytes: ToolchainManifest.maximumEncodedBytes
-            )
-        } catch {
-            throw VerificationError.invalidEvidence(
-                "The expected published manifest could not be read safely."
-            )
-        }
-        let fileSHA256 = SHA256.hash(data: data)
-            .map { String(format: "%02x", $0) }
-            .joined()
-        guard fileSHA256 == arguments.expectedManifestFileSHA256 else {
-            throw VerificationError.invalidEvidence(
-                "The expected published manifest does not match its verified file digest."
-            )
-        }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let manifest = try? decoder.decode(ToolchainManifest.self, from: data),
-              manifest.hasMatchingKeyID(publicKeyBase64: publicKeyBase64),
-              manifest.verifying(publicKeyBase64: publicKeyBase64) else {
-            throw VerificationError.invalidEvidence(
-                "The expected published manifest could not be authenticated."
-            )
-        }
-        return ExpectedManifestEvidence(manifest: manifest, fileSHA256: fileSHA256)
-    }
 }

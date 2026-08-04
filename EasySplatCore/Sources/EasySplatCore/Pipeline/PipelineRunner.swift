@@ -4796,6 +4796,7 @@ public final class PipelineRunner: @unchecked Sendable {
 
                     let msplatToolLog = ToolLogWriter(fileURL: paths.msplatLogURL, toolName: "msplat")
                     let msplatPath = msplatToolPath()
+                    let msplatMetallibPath = msplatMetallibPath()
                     msplatToolLog.beginSection(
                         title: "train",
                         metadata: [
@@ -4887,6 +4888,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         do {
                             let result = try await self.tooling.msplat.runTrain(
                                 msplatPath: msplatPath,
+                                metallibPath: msplatMetallibPath,
                                 datasetPath: datasetURL,
                                 outputPath: outputURL,
                                 expectedIdentity: datasetIdentity,

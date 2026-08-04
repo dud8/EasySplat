@@ -144,9 +144,7 @@ final class SubjectIsolationViewerTests: XCTestCase {
 }
 
 private struct SubjectViewerToolchainManager: ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {

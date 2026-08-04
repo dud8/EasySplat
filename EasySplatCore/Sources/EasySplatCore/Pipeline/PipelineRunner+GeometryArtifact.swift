@@ -368,7 +368,7 @@ extension PipelineRunner {
             mappingByName[$0.lastPathComponent]?.timestampSeconds
         }
 
-        let toolchainVersion = config.toolchain.root.lastPathComponent
+        let toolchainVersion = config.toolchain.toolchainIdentity
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !toolchainVersion.isEmpty else {
             throw PipelineError.geometryProvenanceUnavailable("toolchain version was empty")
@@ -560,13 +560,13 @@ extension PipelineRunner {
         colmapRuntimeClosure: ColmapRuntimeClosureEvidence
     ) throws -> GeometryProvenance {
         let toolchain = config.toolchain
-        let toolchainVersion = toolchain.root.lastPathComponent
+        let toolchainVersion = toolchain.toolchainIdentity
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !toolchainVersion.isEmpty else {
             throw PipelineError.geometryProvenanceUnavailable("toolchain version was empty")
         }
 
-        let colmapReceiptURL = toolchain.root.appendingPathComponent("provenance/colmap.json")
+        let colmapReceiptURL = toolchain.dataRoot.appendingPathComponent("provenance/colmap.json")
         let colmapReceipt: ColmapBuildReceipt = try decodeProvenanceReceipt(
             at: colmapReceiptURL,
             label: "COLMAP"

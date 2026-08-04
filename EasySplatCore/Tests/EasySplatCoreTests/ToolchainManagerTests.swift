@@ -4,27 +4,6 @@ import XCTest
 
 @MainActor
 final class ToolchainManagerTests: XCTestCase {
-    func testDefaultInitializerIgnoresLocalToolchainEnvironment() async {
-        await withEnvironmentAsync([
-            "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/private/tmp/easysplat-untrusted-toolchain",
-        ]) {
-            let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
-
-            XCTAssertNil(manager.localToolchainRoot)
-        }
-    }
-
-    func testUsesExplicitInstallationRoot() {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let manager = ToolchainManager(
-            runner: MockSubprocessRunner(scripts: []),
-            installationRoot: root
-        )
-
-        XCTAssertEqual(manager.toolchainRoot().standardizedFileURL, root.standardizedFileURL)
-    }
-
     func testValidateToolchainSucceeds() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -905,84 +884,6 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testCoreToolchainLooksInstalled() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
-
-        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: root))
-
-        try FileManager.default.removeItem(at: fixture.colmap)
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: root))
-
-        let freshRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: freshRoot) }
-        let freshFixture = try ToolchainFixtureBuilder.createToolchain(at: freshRoot)
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: freshRoot))
-        try FileManager.default.removeItem(at: freshFixture.da3VendorSentinel)
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: freshRoot))
-
-        let missingMsplatRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: missingMsplatRoot) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: missingMsplatRoot, includeMsplat: false)
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: missingMsplatRoot))
-
-        let partialMsplatRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: partialMsplatRoot) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: partialMsplatRoot)
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: partialMsplatRoot))
-        try FileManager.default.removeItem(
-            at: partialMsplatRoot.appendingPathComponent("bin/default.metallib")
-        )
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: partialMsplatRoot))
-
-        let tamperedMsplatRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: tamperedMsplatRoot) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: tamperedMsplatRoot)
-        try Data("tampered metallib\n".utf8).write(
-            to: tamperedMsplatRoot.appendingPathComponent("bin/default.metallib")
-        )
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: tamperedMsplatRoot))
-
-        let legacyMsplatRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: legacyMsplatRoot) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: legacyMsplatRoot, includeMsplat: false)
-        FileManager.default.createFile(
-            atPath: legacyMsplatRoot.appendingPathComponent("bin/msplat-train").path,
-            contents: Data("legacy".utf8)
-        )
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: legacyMsplatRoot))
-    }
-
-    func testArtifactInstallProbeAcceptsOnlyCurrentComponentNames() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
-        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
-
-        XCTAssertTrue(manager.test_artifactLooksInstalled(
-            name: "macos-arm64-core",
-            root: root
-        ))
-        XCTAssertTrue(manager.test_artifactLooksInstalled(
-            name: "geometry-da3-base",
-            root: root
-        ))
-        XCTAssertTrue(manager.test_artifactLooksInstalled(
-            name: "geometry-da3-small",
-            root: root
-        ))
-        XCTAssertFalse(manager.test_artifactLooksInstalled(
-            name: "future-core",
-            root: root
-        ))
-        XCTAssertFalse(manager.test_artifactLooksInstalled(
-            name: "macos-arm64-models",
-            root: root
-        ))
-    }
-
     func testValidateToolchainFailsWhenDa3AppMissing() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1143,22 +1044,265 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testEnsureToolchainUsesLocalOverride() async throws {
+    func testResolveToolchainUsesDevelopmentOverride() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root),
+            appVersion: "9.9.9",
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let toolchain = try await manager.resolveToolchain(
+            request: ToolchainCapabilityRequest(capabilities: [.da3Base, .da3Small]),
+            onProgress: { _, _ in }
+        )
+        XCTAssertEqual(toolchain.root, root)
+        XCTAssertEqual(toolchain.dataRoot, root)
+        XCTAssertEqual(toolchain.metallib, root.appendingPathComponent("bin/default.metallib"))
+        XCTAssertEqual(toolchain.toolchainIdentity, "local-\(root.lastPathComponent)")
+    }
+
+    func testResolveToolchainUsesSplitAppBundleLayout() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: layout.helpers),
+            appVersion: "2.5.0",
+            locator: BundledToolchainLocator(bundleURL: layout.bundle)
+        )
+        let toolchain = try await manager.resolveToolchain(
+            request: ToolchainCapabilityRequest(capabilities: [.core, .colmap, .msplat]),
+            onProgress: { _, _ in }
+        )
+        XCTAssertEqual(toolchain.root, layout.helpers)
+        XCTAssertEqual(toolchain.dataRoot, layout.data)
+        XCTAssertEqual(toolchain.metallib, layout.data.appendingPathComponent("default.metallib"))
+        XCTAssertEqual(toolchain.toolchainIdentity, "2.5.0")
+    }
+
+    func testResolveToolchainRefusesDa3FromAnAppBundle() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: layout.helpers.appendingPathComponent("da3_mps").path
+            )
+        )
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: layout.helpers),
+            locator: BundledToolchainLocator(bundleURL: layout.bundle)
+        )
+        do {
+            _ = try await manager.resolveToolchain(
+                request: ToolchainCapabilityRequest(capabilities: [.core, .da3Base]),
+                onProgress: { _, _ in }
+            )
+            XCTFail("Expected artifactNotFound")
+        } catch ToolchainManager.ToolchainError.artifactNotFound {
+        } catch {
+            XCTFail("Expected artifactNotFound, got \(error)")
+        }
+    }
+
+    func testResolveToolchainAllowsDa3FromADevelopmentOverride() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root),
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let toolchain = try await manager.resolveToolchain(
+            request: ToolchainCapabilityRequest(capabilities: [.core, .da3Base]),
+            onProgress: { _, _ in }
+        )
+        XCTAssertEqual(toolchain.da3.root, root.appendingPathComponent("da3_mps", isDirectory: true))
+    }
+
+    func testResolveToolchainValidatesAKnownCapabilitySetOnce() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
         let runner = makeValidationRunner(root: root)
-
-        let manager = ToolchainManager(runner: runner, localToolchainRoot: root)
-        let manifestURL = URL(string: "https://example.com/manifest.json")!
-        let toolchain = try await manager.ensureToolchain(
-            manifestURL: manifestURL,
-            publicKeyBase64: "ignored",
-            request: ToolchainCapabilityRequest(capabilities: [.da3Base, .da3Small]),
-            onProgress: { _, _ in }
+        let manager = ToolchainManager(
+            runner: runner,
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
         )
-        XCTAssertEqual(toolchain.root, root)
+        let request = ToolchainCapabilityRequest(capabilities: [.core, .colmap, .msplat])
+        _ = try await manager.resolveToolchain(request: request, onProgress: { _, _ in })
+        let callsAfterFirst = runner.calls.count
+        XCTAssertGreaterThan(callsAfterFirst, 0)
+
+        _ = try await manager.resolveToolchain(request: request, onProgress: { _, _ in })
+        XCTAssertEqual(runner.calls.count, callsAfterFirst)
+    }
+
+    func testResolveToolchainRejectsAnEmptyCapabilityRequest() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        do {
+            _ = try await manager.resolveToolchain(
+                request: ToolchainCapabilityRequest(capabilities: []),
+                onProgress: { _, _ in }
+            )
+            XCTFail("Expected invalidToolchain")
+        } catch ToolchainManager.ToolchainError.invalidToolchain {
+        } catch {
+            XCTFail("Expected invalidToolchain, got \(error)")
+        }
+    }
+
+    /// Provenance, msplat, and supply-chain payload live under the data root in a
+    /// split layout; evidence has to read each file from the root it came from.
+    func testInstalledTreeEvidenceReadsProvenanceFromASplitLayout() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+
+        let evidence = try ToolchainManager().installedTreeEvidence(
+            root: layout.helpers,
+            dataRoot: layout.data,
+            toolchainIdentity: "2.5.0"
+        )
+
+        XCTAssertEqual(evidence.toolchainVersion, "2.5.0")
+        let recorded = Set(evidence.provenanceRecords.map(\.path))
+        XCTAssertTrue(recorded.contains("provenance/colmap.json"))
+        XCTAssertTrue(recorded.contains("msplat/build_info.json"))
+        XCTAssertTrue(recorded.contains("supply-chain/components.json"))
+        XCTAssertNotNil(evidence.installedCriticalFileSHA256["bin/default.metallib"])
+        XCTAssertFalse(evidence.nativeTrainerBuildDigest.isEmpty)
+    }
+
+    /// A single-root development tree and the split bundle carved out of it hold
+    /// identical bytes, so the trainer digest must not depend on the layout.
+    func testInstalledTreeEvidenceDigestIsIndependentOfLayout() throws {
+        let single = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: single) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: single)
+        let singleEvidence = try ToolchainManager().installedTreeEvidence(
+            root: single,
+            toolchainIdentity: "local-single"
+        )
+
+        let split = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: split) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: split)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: split.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: split
+        )
+        let splitEvidence = try ToolchainManager().installedTreeEvidence(
+            root: layout.helpers,
+            dataRoot: layout.data,
+            toolchainIdentity: "local-split"
+        )
+
+        XCTAssertEqual(
+            singleEvidence.nativeTrainerBuildDigest,
+            splitEvidence.nativeTrainerBuildDigest
+        )
+    }
+
+    func testLocatorRejectsABundleWithoutTheAppExtension() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.bundle", isDirectory: true),
+            movingTreeAt: root
+        )
+
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        )
+    }
+
+    func testLocatorRejectsAMissingHelpersDirectory() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+        try FileManager.default.removeItem(at: layout.helpers)
+
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        )
+    }
+
+    func testLocatorRejectsAMissingDataDirectory() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+        try FileManager.default.removeItem(at: layout.data)
+
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        )
+    }
+
+    func testLocatorRejectsANonExecutableColmap() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: layout.helpers.appendingPathComponent("bin/colmap").path
+        )
+
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        )
+    }
+
+    /// The override wins outright, so a bundle that would otherwise be rejected
+    /// never gets consulted.
+    func testLocatorPrefersTheDevelopmentOverrideOverTheBundle() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = try BundledToolchainLocator(
+            bundleURL: root.appendingPathComponent("Missing.app", isDirectory: true),
+            developmentOverrideRoot: root
+        ).locate()
+
+        XCTAssertEqual(source, .developmentOverride(root: root))
+        XCTAssertTrue(source.isDevelopmentOverride)
     }
 
     private func makeValidationRunner(

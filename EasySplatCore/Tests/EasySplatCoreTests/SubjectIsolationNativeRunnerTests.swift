@@ -214,6 +214,10 @@ private struct NativeIsolationRunnerFixture {
         )
     }
 
+    var metallib: URL {
+        executable.deletingLastPathComponent().appendingPathComponent("default.metallib")
+    }
+
     func cleanup() {
         try? FileManager.default.removeItem(at: root)
     }
@@ -224,6 +228,7 @@ private struct NativeIsolationRunnerFixture {
     ) -> SubjectIsolationNativeRunRequest {
         SubjectIsolationNativeRunRequest(
             executableURL: executable,
+            metallibURL: metallib,
             datasetURL: dataset,
             sourcePlyURL: source,
             maskManifestURL: manifest,

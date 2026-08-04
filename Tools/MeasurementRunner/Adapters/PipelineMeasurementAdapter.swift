@@ -275,8 +275,11 @@ func toolchain(at root: URL) -> ToolchainPaths {
   let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
   return ToolchainPaths(
     root: root,
+    dataRoot: root,
+    toolchainIdentity: "local-\(root.lastPathComponent)",
     colmap: root.appendingPathComponent("bin/colmap"),
     msplat: root.appendingPathComponent("bin/easysplat-train"),
+    metallib: root.appendingPathComponent("bin/default.metallib"),
     da3: Da3Toolchain(
       root: da3Root,
       sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
@@ -570,6 +573,7 @@ func runMeasurementTraining(
   #else
     return try await MsplatRunner().runTrain(
       msplatPath: toolchain(at: toolchainRoot).msplat,
+      metallibPath: toolchain(at: toolchainRoot).metallib,
       datasetPath: dataset.url,
       outputPath: output,
       expectedIdentity: dataset.identity,

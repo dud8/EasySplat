@@ -171,9 +171,7 @@ extension AppModel {
                 model: self,
                 token: token
             )
-            let toolchain = try await toolchainManager.ensureToolchain(
-                manifestURL: AppConfig.toolchainManifestURL,
-                publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
+            let toolchain = try await toolchainManager.resolveToolchain(
                 request: ToolchainCapabilityRequest(capabilities: [.msplat])
             ) { fraction, message in
                 progressForwarder.updateToolPreparation(
@@ -191,7 +189,8 @@ extension AppModel {
             let request = SubjectIsolationRequest(
                 projectPaths: paths,
                 nativeExecutableURL: toolchain.msplat,
-                toolchainBuildIdentity: subjectIsolationToolchainIdentity(toolchain),
+                nativeMetallibURL: toolchain.metallib,
+                toolchainBuildIdentity: toolchain.toolchainIdentity,
                 memoryBudgetBytes: min(
                     Self.subjectIsolationMemoryCapBytes,
                     automaticBudget
@@ -223,19 +222,6 @@ extension AppModel {
             subjectIsolationStatusIsError = true
             logWriter.append(String(reflecting: error), isError: true)
         }
-    }
-
-    private func subjectIsolationToolchainIdentity(
-        _ toolchain: ToolchainPaths
-    ) -> String {
-        let authenticated = toolchain.authenticatedVersion?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let authenticated, !authenticated.isEmpty {
-            return authenticated
-        }
-        let localIdentity = toolchain.root.lastPathComponent
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return localIdentity.isEmpty ? "local-toolchain" : localIdentity
     }
 
     private func handleSubjectIsolationOutcome(

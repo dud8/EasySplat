@@ -27,11 +27,8 @@ enum AppConfig {
     }
 
     private static let defaultProjectHomeURLString = "https://github.com/dud8/EasySplat"
-    private static let defaultToolchainManifestURLString = "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
     private static let releaseVerificationPoisonValues = [
         "EASYSPLAT_PROJECT_HOME_URL": "https://release-verifier-poison.invalid/project",
-        "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://release-verifier-poison.invalid/manifest.json",
-        "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-verifier-poison-public-key",
         "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/release-verifier-poison/toolchain",
         "EASYSPLAT_SKIP_TRAINING": "1",
         "EASYSPLAT_STOP_AFTER_STAGE": PipelineStage.sfmMapping.rawValue,
@@ -40,8 +37,6 @@ enum AppConfig {
     ]
     private static let releaseVerificationAttemptSentinelKeys = [
         "EASYSPLAT_PROJECT_HOME_URL",
-        "EASYSPLAT_TOOLCHAIN_MANIFEST_URL",
-        "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64",
         "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT",
     ]
 
@@ -74,102 +69,6 @@ enum AppConfig {
         return URL(string: defaultProjectHomeURLString) ?? URL(fileURLWithPath: "/")
     }
 
-    static var toolchainManifestURL: URL {
-        resolvedToolchainManifestURL(
-            environment: ProcessInfo.processInfo.environment,
-            allowsDevelopmentOverrides: allowsDevelopmentOverrides
-        )
-    }
-
-    static func resolvedToolchainManifestURL(
-        environment: [String: String],
-        allowsDevelopmentOverrides: Bool
-    ) -> URL {
-        if allowsDevelopmentOverrides,
-           let url = urlFromEnvironment("EASYSPLAT_TOOLCHAIN_MANIFEST_URL", environment: environment) {
-            return url
-        }
-        if let url = readURLResource(named: "toolchain_manifest_url") {
-            return url
-        }
-        return URL(string: defaultToolchainManifestURLString)
-            ?? resolvedProjectHomeURL(
-                environment: environment,
-                allowsDevelopmentOverrides: allowsDevelopmentOverrides
-            )
-    }
-
-    static var toolchainPublicKeyBase64: String {
-        resolvedToolchainPublicKeyBase64(
-            environment: ProcessInfo.processInfo.environment,
-            allowsDevelopmentOverrides: allowsDevelopmentOverrides
-        )
-    }
-
-    static func resolvedToolchainPublicKeyBase64(
-        environment: [String: String],
-        allowsDevelopmentOverrides: Bool
-    ) -> String {
-        if allowsDevelopmentOverrides,
-           let value = environment["EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64"],
-           !value.isEmpty {
-            return value
-        }
-        guard let url = Bundle.module.url(forResource: "public_key_ed25519", withExtension: "txt"),
-              let text = try? String(contentsOf: url, encoding: .utf8) else {
-            return ""
-        }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    static var bundledToolchainBootstrap: ToolchainBootstrap? {
-        bundledToolchainBootstrap(
-            environment: ProcessInfo.processInfo.environment,
-            resourceRoot: Bundle.main.resourceURL
-        )
-    }
-
-    static func bundledToolchainBootstrap(
-        environment: [String: String],
-        resourceRoot: URL?
-    ) -> ToolchainBootstrap? {
-        bundledToolchainBootstrap(
-            environment: environment,
-            resourceRoot: resourceRoot,
-            allowsDevelopmentOverrides: allowsDevelopmentOverrides
-        )
-    }
-
-    static func bundledToolchainBootstrap(
-        environment: [String: String],
-        resourceRoot: URL?,
-        allowsDevelopmentOverrides: Bool
-    ) -> ToolchainBootstrap? {
-        if allowsDevelopmentOverrides {
-            guard environment["EASYSPLAT_TOOLCHAIN_MANIFEST_URL"]?.isEmpty != false,
-                  environment["EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64"]?.isEmpty != false else {
-                return nil
-            }
-        }
-        guard let resourceRoot else { return nil }
-
-        let bootstrapRoot = resourceRoot
-            .appendingPathComponent("ToolchainBootstrap", isDirectory: true)
-        let manifestURL = bootstrapRoot
-            .appendingPathComponent("manifest.json", isDirectory: false)
-        let coreArchiveURL = bootstrapRoot
-            .appendingPathComponent("macos-arm64-core.zip", isDirectory: false)
-        guard isOrdinaryDirectory(bootstrapRoot),
-              isSingleLinkRegularFile(manifestURL),
-              isSingleLinkRegularFile(coreArchiveURL) else {
-            return nil
-        }
-        return ToolchainBootstrap(
-            manifestURL: manifestURL,
-            coreArchiveURL: coreArchiveURL
-        )
-    }
-
     static var currentDevelopmentOverrides: DevelopmentOverrides {
         developmentOverrides(
             environment: ProcessInfo.processInfo.environment,
@@ -183,16 +82,6 @@ enum AppConfig {
     ) -> DevelopmentOverrides {
         guard allowsDevelopmentOverrides else { return .none }
         return DevelopmentOverrides.fromEnvironment(environment)
-    }
-
-    static var allowInsecureLoopbackToolchainHTTP: Bool {
-#if DEBUG
-        guard toolchainManifestURL.scheme?.lowercased() == "http" else { return false }
-        let host = toolchainManifestURL.host?.lowercased()
-        return host == "localhost" || host == "127.0.0.1" || host == "::1"
-#else
-        return false
-#endif
     }
 
     static var releaseVerificationConfiguration: ReleaseVerificationConfiguration? {
@@ -359,13 +248,6 @@ enum AppConfig {
     private static func isOrdinaryDirectory(_ url: URL) -> Bool {
         guard let metadata = fileMetadata(at: url) else { return false }
         return (metadata.st_mode & S_IFMT) == S_IFDIR
-    }
-
-    private static func isSingleLinkRegularFile(_ url: URL) -> Bool {
-        guard let metadata = fileMetadata(at: url) else { return false }
-        return (metadata.st_mode & S_IFMT) == S_IFREG
-            && metadata.st_nlink == 1
-            && metadata.st_size > 0
     }
 
     private static func fileMetadata(at url: URL) -> stat? {

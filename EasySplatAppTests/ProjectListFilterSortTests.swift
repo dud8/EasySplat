@@ -344,9 +344,7 @@ final class ProjectListFilterSortTests: XCTestCase {
 }
 
 private struct SidebarTestToolchainManager: ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {

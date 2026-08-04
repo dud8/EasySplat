@@ -10,6 +10,7 @@ struct SubjectIsolationNativeDigests: Sendable, Equatable {
 
 struct SubjectIsolationNativeRunRequest: Sendable, Equatable {
     let executableURL: URL
+    let metallibURL: URL
     let datasetURL: URL
     let sourcePlyURL: URL
     let maskManifestURL: URL
@@ -122,6 +123,7 @@ struct SubjectIsolationNativeRunner: Sendable {
             "--expected-training-manifest-digest", request.digests.trainingManifest,
             "--memory-budget-bytes", String(request.memoryBudgetBytes),
             "--events-fd", "1",
+            "--metallib", request.metallibURL.path,
         ]
         if let anchor = request.anchor {
             arguments.append(contentsOf: [

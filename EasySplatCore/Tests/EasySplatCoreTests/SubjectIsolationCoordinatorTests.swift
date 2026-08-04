@@ -274,6 +274,9 @@ private struct CoordinatorFixture {
         SubjectIsolationRequest(
             projectPaths: paths,
             nativeExecutableURL: executable,
+            nativeMetallibURL: executable
+                .deletingLastPathComponent()
+                .appendingPathComponent("default.metallib"),
             toolchainBuildIdentity: "test-toolchain-build",
             memoryBudgetBytes: 1_073_741_824,
             anchor: anchor

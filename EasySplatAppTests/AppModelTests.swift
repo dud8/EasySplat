@@ -1748,14 +1748,10 @@ final class AppModelTests: XCTestCase {
         try Data("geometry".utf8).write(to: geometrySentinel, options: [.atomic])
         try Data("training".utf8).write(to: trainingSentinel, options: [.atomic])
         let metadataBefore = try Data(contentsOf: paths.metadataURL)
-        let missingManifestURL = URL(
-            string: "https://release-user:release-secret@example.com/toolchain/manifest.json?token=private#download"
-        )!
 
         let model = AppModel(
-            toolchainManager: MissingManifestToolchainManager(
-                statusCode: 410,
-                resourceURL: missingManifestURL
+            toolchainManager: DamagedToolchainManager(
+                message: "This EasySplat build is missing its built-in tools. Reinstall EasySplat."
             ),
             projectBaseURL: tempBase,
             hardwareProfile: standardHardwareProfile
@@ -1768,16 +1764,10 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.lastError,
-            "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
+            "EasySplat’s built-in tools are missing or damaged. Reinstall EasySplat."
         )
         let errorDetails = try XCTUnwrap(model.errorDetails)
-        XCTAssertTrue(errorDetails.contains("HTTP status: 410"))
-        XCTAssertTrue(errorDetails.contains("HTTP resource: https://example.com/toolchain/manifest.json"))
-        XCTAssertFalse(errorDetails.contains("release-user"))
-        XCTAssertFalse(errorDetails.contains("release-secret"))
-        XCTAssertFalse(errorDetails.contains("token=private"))
-        XCTAssertFalse(errorDetails.contains("#download"))
-        XCTAssertTrue(errorDetails.contains("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)"))
+        XCTAssertTrue(errorDetails.contains("missing its built-in tools"))
         XCTAssertEqual(
             model.statusDetail,
             "The saved project and its checkpoint are unchanged."
@@ -2100,7 +2090,7 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.lastError,
-            "Couldn’t prepare the required tools. Check your connection and try again."
+            "Couldn’t prepare the required tools."
         )
         XCTAssertTrue(model.errorDetails?.contains("manifest unreachable") == true)
         XCTAssertNil(model.currentProjectURL)
@@ -2204,13 +2194,9 @@ final class AppModelTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("input.mov")
         try Data("video".utf8).write(to: input)
-        let missingManifestURL = URL(
-            string: "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
-        )!
         let model = AppModel(
-            toolchainManager: MissingManifestToolchainManager(
-                statusCode: 404,
-                resourceURL: missingManifestURL
+            toolchainManager: DamagedToolchainManager(
+                message: "This EasySplat build is missing its built-in tools. Reinstall EasySplat."
             ),
             projectBaseURL: tempBase,
             hardwareProfile: standardHardwareProfile,
@@ -2224,12 +2210,10 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.lastError,
-            "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
+            "EasySplat’s built-in tools are missing or damaged. Reinstall EasySplat."
         )
         let errorDetails = try XCTUnwrap(model.errorDetails)
-        XCTAssertTrue(errorDetails.contains("HTTP status: 404"))
-        XCTAssertTrue(errorDetails.contains("HTTP resource: \(missingManifestURL.absoluteString)"))
-        XCTAssertTrue(errorDetails.contains("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)"))
+        XCTAssertTrue(errorDetails.contains("missing its built-in tools"))
         XCTAssertNil(model.currentProjectURL)
         XCTAssertTrue(model.projectSummaries.isEmpty)
     }
@@ -3756,12 +3740,8 @@ final class AppModelTests: XCTestCase {
     }
 
     func testAppConfigUsesBundledAuthorityWhenDevelopmentOverridesAreForbidden() throws {
-        let expectedPublicKey = try String(contentsOf: appResourceURL(named: "public_key_ed25519.txt"), encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         let environment = [
             "EASYSPLAT_PROJECT_HOME_URL": "https://release-verifier-poison.invalid/project",
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://release-verifier-poison.invalid/manifest.json",
-            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-verifier-poison-public-key",
             "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/release-verifier-poison/toolchain",
             "EASYSPLAT_SKIP_TRAINING": "1",
             "EASYSPLAT_STOP_AFTER_STAGE": PipelineStage.sfmMapping.rawValue,
@@ -3777,20 +3757,6 @@ final class AppModelTests: XCTestCase {
             "https://github.com/dud8/EasySplat"
         )
         XCTAssertEqual(
-            AppConfig.resolvedToolchainManifestURL(
-                environment: environment,
-                allowsDevelopmentOverrides: false
-            ).absoluteString,
-            "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
-        )
-        XCTAssertEqual(
-            AppConfig.resolvedToolchainPublicKeyBase64(
-                environment: environment,
-                allowsDevelopmentOverrides: false
-            ),
-            expectedPublicKey
-        )
-        XCTAssertEqual(
             AppConfig.developmentOverrides(
                 environment: environment,
                 allowsDevelopmentOverrides: false
@@ -3802,8 +3768,6 @@ final class AppModelTests: XCTestCase {
     func testAppConfigAllowsAuthorityOverridesForDevelopmentLaunches() {
         let environment = [
             "EASYSPLAT_PROJECT_HOME_URL": "https://example.com/project-home",
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://example.com/toolchain/manifest.json",
-            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "OVERRIDE_PUBLIC_KEY_BASE64",
         ]
 
         XCTAssertEqual(
@@ -3812,20 +3776,6 @@ final class AppModelTests: XCTestCase {
                 allowsDevelopmentOverrides: true
             ).absoluteString,
             "https://example.com/project-home"
-        )
-        XCTAssertEqual(
-            AppConfig.resolvedToolchainManifestURL(
-                environment: environment,
-                allowsDevelopmentOverrides: true
-            ).absoluteString,
-            "https://example.com/toolchain/manifest.json"
-        )
-        XCTAssertEqual(
-            AppConfig.resolvedToolchainPublicKeyBase64(
-                environment: environment,
-                allowsDevelopmentOverrides: true
-            ),
-            "OVERRIDE_PUBLIC_KEY_BASE64"
         )
     }
 
@@ -3869,19 +3819,6 @@ final class AppModelTests: XCTestCase {
 #else
         XCTAssertFalse(AppConfig.allowsDevelopmentOverrides)
 #endif
-    }
-
-    func testAppConfigDiscoversPairedBundledToolchainBootstrapFiles() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-
-        let bootstrap = try XCTUnwrap(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-
-        XCTAssertEqual(bootstrap.manifestURL, fixture.manifestURL)
-        XCTAssertEqual(bootstrap.coreArchiveURL, fixture.coreArchiveURL)
     }
 
     func testReleaseVerificationInputRejectsLegacyPositionalGate() throws {
@@ -4056,8 +3993,7 @@ final class AppModelTests: XCTestCase {
             (["EASYSPLAT_RELEASE_VERIFY_TOKEN": ""], [executable]),
             ([:], [executable, "--easysplat-release-verify-invalid"]),
             ([
-                "EASYSPLAT_TOOLCHAIN_MANIFEST_URL":
-                    "https://release-verifier-poison.invalid/manifest.json",
+                "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/release-verifier-poison/toolchain",
             ], [executable]),
         ]
 
@@ -4143,8 +4079,6 @@ final class AppModelTests: XCTestCase {
         ))
         for override in [
             "EASYSPLAT_PROJECT_HOME_URL",
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL",
-            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64",
             "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT",
             "EASYSPLAT_SKIP_TRAINING",
             "EASYSPLAT_STOP_AFTER_STAGE",
@@ -4176,8 +4110,6 @@ final class AppModelTests: XCTestCase {
         let gate = "--easysplat-release-verify-bundled-pipeline"
         let poison = [
             "EASYSPLAT_PROJECT_HOME_URL": "https://release-verifier-poison.invalid/project",
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://release-verifier-poison.invalid/manifest.json",
-            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-verifier-poison-public-key",
             "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/release-verifier-poison/toolchain",
             "EASYSPLAT_SKIP_TRAINING": "1",
             "EASYSPLAT_STOP_AFTER_STAGE": PipelineStage.sfmMapping.rawValue,
@@ -5049,164 +4981,24 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: base.path), [])
     }
 
-    func testAppConfigRejectsPartialBundledToolchainBootstrapPairs() throws {
-        for missingName in ["manifest.json", "macos-arm64-core.zip"] {
-            let fixture = try makeToolchainBootstrapFixture()
-            defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-            try FileManager.default.removeItem(
-                at: fixture.bootstrapRoot.appendingPathComponent(missingName)
-            )
-
-            XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-                environment: [:],
-                resourceRoot: fixture.resourceRoot
-            ))
-        }
-    }
-
-    func testAppConfigRejectsEmptyBundledToolchainBootstrapManifest() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        try Data().write(to: fixture.manifestURL)
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigRejectsEmptyBundledToolchainBootstrapCoreArchive() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        try Data().write(to: fixture.coreArchiveURL)
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigRejectsSymbolicLinkInBundledToolchainBootstrapPair() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        let manifestTarget = fixture.resourceRoot.appendingPathComponent("real-manifest.json")
-        try Data("manifest".utf8).write(to: manifestTarget)
-        try FileManager.default.removeItem(at: fixture.manifestURL)
-        try FileManager.default.createSymbolicLink(
-            at: fixture.manifestURL,
-            withDestinationURL: manifestTarget
-        )
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigRejectsDirectoryInBundledToolchainBootstrapPair() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        try FileManager.default.removeItem(at: fixture.coreArchiveURL)
-        try FileManager.default.createDirectory(
-            at: fixture.coreArchiveURL,
-            withIntermediateDirectories: false
-        )
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigRejectsMultiplyLinkedBundledToolchainBootstrapFile() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        try FileManager.default.linkItem(
-            at: fixture.coreArchiveURL,
-            to: fixture.resourceRoot.appendingPathComponent("second-core-link.zip")
-        )
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigManifestOverrideDisablesBundledToolchainBootstrap() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: ["EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://example.com/manifest.json"],
-            resourceRoot: fixture.resourceRoot,
-            allowsDevelopmentOverrides: true
-        ))
-    }
-
-    func testAppConfigPublicKeyOverrideDisablesBundledToolchainBootstrap() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: ["EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-authority-override"],
-            resourceRoot: fixture.resourceRoot,
-            allowsDevelopmentOverrides: true
-        ))
-    }
-
-    func testBundledToolchainBootstrapIgnoresAuthorityEnvironmentWhenOverridesAreForbidden() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-
-        let bootstrap = AppConfig.bundledToolchainBootstrap(
-            environment: [
-                "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://example.com/manifest.json",
-                "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-authority-override",
-            ],
-            resourceRoot: fixture.resourceRoot,
-            allowsDevelopmentOverrides: false
-        )
-
-        XCTAssertEqual(bootstrap?.manifestURL, fixture.manifestURL)
-        XCTAssertEqual(bootstrap?.coreArchiveURL, fixture.coreArchiveURL)
-    }
-
-    func testDefaultToolchainManagerFactoryReceivesBundledBootstrapAndExplicitLocalRoot() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        let expected = try XCTUnwrap(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
+    func testDefaultToolchainManagerFactoryReceivesTheDevelopmentOverrideRoot() {
         let localRoot = URL(fileURLWithPath: "/private/tmp/easysplat-toolchain", isDirectory: true)
-        var received: ToolchainBootstrap?
-        var receivedPolicy: ToolchainSourcePolicy?
         var receivedLocalRoot: URL?
 
         _ = AppModel.makeDefaultToolchainManager(
-            bundledBootstrap: expected,
-            sourcePolicy: .bundledBootstrapOnly,
             developmentOverrides: DevelopmentOverrides(localToolchainRoot: localRoot)
-        ) { bootstrap, sourcePolicy, explicitLocalRoot in
-            received = bootstrap
-            receivedPolicy = sourcePolicy
+        ) { explicitLocalRoot in
             receivedLocalRoot = explicitLocalRoot
             return MockToolchainManager()
         }
 
-        XCTAssertEqual(received, expected)
-        XCTAssertEqual(receivedPolicy, .bundledBootstrapOnly)
         XCTAssertEqual(receivedLocalRoot, localRoot)
     }
 
     func testDefaultToolchainManagerFactoryReceivesNoLocalRootWithoutDevelopmentOverride() {
         var receivedLocalRoot: URL?
 
-        _ = AppModel.makeDefaultToolchainManager(
-            bundledBootstrap: nil,
-            sourcePolicy: .automatic,
-            developmentOverrides: .none
-        ) { _, _, explicitLocalRoot in
+        _ = AppModel.makeDefaultToolchainManager(developmentOverrides: .none) { explicitLocalRoot in
             receivedLocalRoot = explicitLocalRoot
             return MockToolchainManager()
         }
@@ -5229,49 +5021,6 @@ final class AppModelTests: XCTestCase {
         )
         try data.write(to: manifest)
         return manifest
-    }
-
-    func testDefaultToolchainSourcePolicyUsesOnlyBundledCoreForReleaseVerification() {
-        let home = URL(fileURLWithPath: "/private/tmp/easysplat-release-home", isDirectory: true)
-        let configuration = AppConfig.ReleaseVerificationConfiguration(
-            inputManifestURL: home.appendingPathComponent("inputs.json"),
-            inputRootURL: home.appendingPathComponent("inputs", isDirectory: true),
-            successMarkerURL: home.appendingPathComponent("passed.json"),
-            verificationToken: "easysplat-release-verify-12345678-1234-4abc-9def-1234567890ab"
-        )
-
-        XCTAssertEqual(
-            AppModel.defaultToolchainSourcePolicy(
-                releaseVerificationConfiguration: configuration
-            ),
-            .bundledBootstrapOnly
-        )
-        XCTAssertEqual(
-            AppModel.defaultToolchainSourcePolicy(
-                releaseVerificationConfiguration: nil
-            ),
-            .automatic
-        )
-    }
-
-    func testAppConfigEnablesInsecureLoopbackOnlyForDebugManifest() async {
-        await withAppEnvironmentAsync([
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "http://127.0.0.1:8000/manifest.json",
-        ]) {
-            XCTAssertTrue(AppConfig.allowInsecureLoopbackToolchainHTTP)
-        }
-
-        await withAppEnvironmentAsync([
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "http://downloads.example.com/manifest.json",
-        ]) {
-            XCTAssertFalse(AppConfig.allowInsecureLoopbackToolchainHTTP)
-        }
-
-        await withAppEnvironmentAsync([
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://downloads.example.com/manifest.json",
-        ]) {
-            XCTAssertFalse(AppConfig.allowInsecureLoopbackToolchainHTTP)
-        }
     }
 
     func testErrorDetailsTextCombinesFields() {
@@ -5912,8 +5661,11 @@ private func makeMockToolchainPaths() -> ToolchainPaths {
     let da3Root = URL(fileURLWithPath: "/mock/da3")
     return ToolchainPaths(
         root: URL(fileURLWithPath: "/tmp/toolchain"),
+        dataRoot: URL(fileURLWithPath: "/tmp/toolchain"),
+        toolchainIdentity: "local-toolchain",
         colmap: URL(fileURLWithPath: "/mock/colmap"),
         msplat: URL(fileURLWithPath: "/mock/easysplat-train"),
+        metallib: URL(fileURLWithPath: "/mock/default.metallib"),
         da3: Da3Toolchain(
             root: da3Root,
             sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
@@ -5948,9 +5700,7 @@ private final class LockedRunTimingSamples: @unchecked Sendable {
 }
 
 final class MockToolchainManager: ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
@@ -5970,9 +5720,7 @@ final class CapabilityRecordingToolchainManager: @unchecked Sendable, ToolchainM
         queue.sync { requests.count }
     }
 
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
@@ -5984,9 +5732,7 @@ final class CapabilityRecordingToolchainManager: @unchecked Sendable, ToolchainM
 struct FailingToolchainManager: ToolchainManaging {
     var message: String
 
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
@@ -5994,20 +5740,14 @@ struct FailingToolchainManager: ToolchainManaging {
     }
 }
 
-struct MissingManifestToolchainManager: ToolchainManaging {
-    var statusCode: Int
-    var resourceURL: URL
+struct DamagedToolchainManager: ToolchainManaging {
+    var message: String
 
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
-        throw ToolchainManager.ToolchainError.manifestHTTPFailure(
-            statusCode: statusCode,
-            resourceURL: resourceURL
-        )
+        throw ToolchainManager.ToolchainError.invalidToolchain(message)
     }
 }
 

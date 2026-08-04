@@ -1505,6 +1505,7 @@ final class MsplatRunnerTests: XCTestCase {
         do {
             _ = try await MsplatRunner(runner: mock).runTrain(
                 msplatPath: context.executable,
+                metallibPath: context.metallib,
                 datasetPath: context.dataset,
                 outputPath: context.output,
                 expectedIdentity: testDatasetIdentity,
@@ -1732,6 +1733,10 @@ final class MsplatRunnerTests: XCTestCase {
                 ),
                 onRun: { arguments in
                     XCTAssertEqual(argumentValue("--resume", in: arguments), context.checkpoint.path)
+                    XCTAssertEqual(
+                        argumentValue("--metallib", in: arguments),
+                        context.metallib.path
+                    )
                     try? writeFixtureOutput(arguments: arguments)
                 }
             ),
@@ -2131,6 +2136,7 @@ final class MsplatRunnerTests: XCTestCase {
 private extension MsplatRunner {
     func runTrain(
         msplatPath: URL,
+        metallibPath: URL? = nil,
         datasetPath: URL,
         outputPath: URL,
         checkpointPath: URL? = nil,
@@ -2151,6 +2157,9 @@ private extension MsplatRunner {
     ) async throws -> MsplatTrainingResult {
         try await runTrain(
             msplatPath: msplatPath,
+            metallibPath: metallibPath ?? msplatPath
+                .deletingLastPathComponent()
+                .appendingPathComponent("default.metallib"),
             datasetPath: datasetPath,
             outputPath: outputPath,
             expectedIdentity: testDatasetIdentity,
@@ -2176,6 +2185,11 @@ private extension MsplatRunner {
 private struct MsplatTestContext {
     let root: URL
     let executable: URL
+
+    var metallib: URL {
+        executable.deletingLastPathComponent().appendingPathComponent("default.metallib")
+    }
+
     let dataset: URL
     let output: URL
     let checkpoint: URL

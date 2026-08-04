@@ -109,7 +109,7 @@ enum ToolchainFixtureBuilder {
                 "projection_vjp_patch_sha256": "e283e1c608f2ea940c46cdcc08252ba0381fa7c33f9490c2812e2f1a83157667",
                 "alpha_cap_patch_sha256": "ee5b7f1563248d279f0b1a9d5fe9637feeb171cfa42546004772e7424b7bd7a6",
                 "projection_oracle_patch_sha256": "cfcf5a0c70bb6cbd05c25c1263d19ff87792abfc326fb43df4e1d17baf77c0a3",
-                "overlay_sha256": "9d5f0e509f556061bff4ab16357e1d3fc5e2b54b638628529cb2fbfe54009869",
+                "overlay_sha256": "a7c9ccd00e697c820b6f1335653922e114350b97141443adcda2175b161ddbbf",
                 "raster_test_sha256": "2f9b7c7241accbae20dd3c93ff2a5c13934a391b75438328e5fa9725ea2bdb5a",
                 "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
                 "isolation_source_sha256": "65504b0448c61b4f2602d86150ff6ce83be61bfc48cc9f632fa72d95b4992e61",
@@ -261,9 +261,54 @@ enum ToolchainFixtureBuilder {
         )
         return ToolchainPaths(
             root: fixture.root,
+            dataRoot: fixture.root,
+            toolchainIdentity: "local-\(fixture.root.lastPathComponent)",
             colmap: fixture.colmap,
             msplat: fixture.root.appendingPathComponent("bin/easysplat-train"),
+            metallib: fixture.root.appendingPathComponent("bin/default.metallib"),
             da3: da3
         )
     }
+
+    /// Rearranges a single-root tree into the split layout a signed app bundle
+    /// uses: Mach-Os under `Contents/Helpers`, everything else under
+    /// `Contents/Resources/Toolchain`.
+    static func makeAppBundleLayout(
+        at bundle: URL,
+        movingTreeAt tree: URL
+    ) throws -> AppBundleToolchainLayout {
+        let fm = FileManager.default
+        let helpers = bundle.appendingPathComponent(
+            BundledToolchainLocator.helpersRelativePath,
+            isDirectory: true
+        )
+        let data = bundle.appendingPathComponent(
+            BundledToolchainLocator.dataRelativePath,
+            isDirectory: true
+        )
+        try fm.createDirectory(at: helpers, withIntermediateDirectories: true)
+        try fm.createDirectory(at: data, withIntermediateDirectories: true)
+
+        for name in ["bin", "lib", "licenses", "da3_mps"] {
+            let source = tree.appendingPathComponent(name)
+            guard fm.fileExists(atPath: source.path) else { continue }
+            try fm.moveItem(at: source, to: helpers.appendingPathComponent(name))
+        }
+        for name in ["msplat", "provenance", "supply-chain"] {
+            let source = tree.appendingPathComponent(name)
+            guard fm.fileExists(atPath: source.path) else { continue }
+            try fm.moveItem(at: source, to: data.appendingPathComponent(name))
+        }
+        let stagedMetallib = helpers.appendingPathComponent("bin/default.metallib")
+        if fm.fileExists(atPath: stagedMetallib.path) {
+            try fm.moveItem(at: stagedMetallib, to: data.appendingPathComponent("default.metallib"))
+        }
+        return AppBundleToolchainLayout(bundle: bundle, helpers: helpers, data: data)
+    }
+}
+
+struct AppBundleToolchainLayout {
+    let bundle: URL
+    let helpers: URL
+    let data: URL
 }

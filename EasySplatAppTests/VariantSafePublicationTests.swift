@@ -349,9 +349,7 @@ private final class PublicationArtifactState: @unchecked Sendable {
 }
 
 private struct PublicationTestToolchainManager: ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {

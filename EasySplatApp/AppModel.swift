@@ -504,29 +504,13 @@ final class AppModel: ObservableObject {
     }
 
     static func makeDefaultToolchainManager(
-        bundledBootstrap: ToolchainBootstrap? = AppConfig.bundledToolchainBootstrap,
-        sourcePolicy: ToolchainSourcePolicy = AppModel.defaultToolchainSourcePolicy(),
         developmentOverrides: DevelopmentOverrides = AppConfig.currentDevelopmentOverrides,
-        factory: (ToolchainBootstrap?, ToolchainSourcePolicy, URL?) -> ToolchainManaging = {
-            bundledBootstrap,
-            sourcePolicy,
-            localToolchainRoot in
+        factory: (URL?) -> ToolchainManaging = { overrideRoot in
             ToolchainManager(
-                appVersion: EasySplatReleaseIdentity.version(),
-                localToolchainRoot: localToolchainRoot,
-                allowInsecureLoopbackHTTP: AppConfig.allowInsecureLoopbackToolchainHTTP,
-                bundledBootstrap: bundledBootstrap,
-                sourcePolicy: sourcePolicy
+                locator: BundledToolchainLocator(developmentOverrideRoot: overrideRoot)
             )
         }
     ) -> ToolchainManaging {
-        factory(bundledBootstrap, sourcePolicy, developmentOverrides.localToolchainRoot)
-    }
-
-    static func defaultToolchainSourcePolicy(
-        releaseVerificationConfiguration: AppConfig.ReleaseVerificationConfiguration?
-            = AppConfig.releaseVerificationConfiguration
-    ) -> ToolchainSourcePolicy {
-        releaseVerificationConfiguration == nil ? .automatic : .bundledBootstrapOnly
+        factory(developmentOverrides.localToolchainRoot)
     }
 }

@@ -3,6 +3,7 @@ import Foundation
 public struct SubjectIsolationRequest: Sendable {
     public let projectPaths: ProjectPaths
     public let nativeExecutableURL: URL
+    public let nativeMetallibURL: URL
     public let toolchainBuildIdentity: String
     public let memoryBudgetBytes: Int64
     public let anchor: SubjectAnchor?
@@ -10,12 +11,14 @@ public struct SubjectIsolationRequest: Sendable {
     public init(
         projectPaths: ProjectPaths,
         nativeExecutableURL: URL,
+        nativeMetallibURL: URL,
         toolchainBuildIdentity: String,
         memoryBudgetBytes: Int64,
         anchor: SubjectAnchor? = nil
     ) {
         self.projectPaths = projectPaths
         self.nativeExecutableURL = nativeExecutableURL
+        self.nativeMetallibURL = nativeMetallibURL
         self.toolchainBuildIdentity = toolchainBuildIdentity
         self.memoryBudgetBytes = memoryBudgetBytes
         self.anchor = anchor
@@ -300,6 +303,7 @@ public struct SubjectIsolationCoordinator: SubjectIsolationCoordinating, Sendabl
         return try await nativeOperation(
             SubjectIsolationNativeRunRequest(
                 executableURL: request.nativeExecutableURL,
+                metallibURL: request.nativeMetallibURL,
                 datasetURL: datasetURL,
                 sourcePlyURL: request.projectPaths.outputSplatURL,
                 maskManifestURL: maskManifestURL,

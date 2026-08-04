@@ -239,9 +239,11 @@ extension ProjectArtifactValidator {
         let da3Root = root.appendingPathComponent("da3", isDirectory: true)
         let replayToolchain = ToolchainPaths(
             root: root,
-            authenticatedVersion: geometryArtifact.provenance.toolchainVersion,
+            dataRoot: root,
+            toolchainIdentity: geometryArtifact.provenance.toolchainVersion,
             colmap: colmapURL,
             msplat: root.appendingPathComponent("bin/easysplat-train"),
+            metallib: root.appendingPathComponent("bin/default.metallib"),
             da3: Da3Toolchain(
                 root: da3Root,
                 sfmTool: da3Root.appendingPathComponent("bin/da3-sfm"),

@@ -202,6 +202,7 @@ public final class MsplatRunner: Sendable {
 
     public func runTrain(
         msplatPath: URL,
+        metallibPath: URL,
         datasetPath: URL,
         outputPath: URL,
         expectedIdentity: MsplatDatasetIdentity,
@@ -295,6 +296,7 @@ public final class MsplatRunner: Sendable {
             "--expected-geometry-digest", expectedIdentity.geometryDigest,
             "--memory-budget-bytes", String(memoryBudgetBytes),
             "--events-fd", "1",
+            "--metallib", metallibPath.path,
         ]
         if let resumeFrom {
             arguments.append(contentsOf: ["--resume", resumeFrom.path])

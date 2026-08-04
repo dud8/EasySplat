@@ -80,6 +80,7 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         let request = try XCTUnwrap(operation.request)
         XCTAssertEqual(request.projectPaths.root, projectURL)
         XCTAssertEqual(request.nativeExecutableURL, makeIsolationToolchainPaths().msplat)
+        XCTAssertEqual(request.nativeMetallibURL, makeIsolationToolchainPaths().metallib)
         XCTAssertEqual(request.toolchainBuildIdentity, "test-toolchain-v1")
         XCTAssertEqual(request.memoryBudgetBytes, 8 * 1_073_741_824)
         XCTAssertNil(request.anchor)
@@ -777,9 +778,11 @@ private func makeIsolationToolchainPaths() -> ToolchainPaths {
     let da3Root = root.appendingPathComponent("da3", isDirectory: true)
     return ToolchainPaths(
         root: root,
-        authenticatedVersion: "test-toolchain-v1",
+        dataRoot: root,
+        toolchainIdentity: "test-toolchain-v1",
         colmap: root.appendingPathComponent("bin/colmap"),
         msplat: root.appendingPathComponent("bin/easysplat-train"),
+        metallib: root.appendingPathComponent("bin/default.metallib"),
         da3: Da3Toolchain(
             root: da3Root,
             sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
@@ -807,9 +810,7 @@ private final class RecordingIsolationToolchainManager:
         lock.withLock { request }
     }
 
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {

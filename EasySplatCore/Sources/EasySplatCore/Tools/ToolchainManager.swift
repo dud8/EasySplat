@@ -1,29 +1,39 @@
 import Foundation
 
-/// Resolved paths for a validated EasySplat toolchain installation.
+/// Resolved paths for a validated EasySplat toolchain.
 public struct ToolchainPaths: Sendable {
+    /// Executable root: `<root>/bin/colmap`, `<root>/lib/libomp.dylib`.
     public var root: URL
-    public var authenticatedVersion: String?
+    /// Non-executable payload root: `default.metallib`, `msplat/`, `provenance/`,
+    /// `supply-chain/`. A single-root tree keeps this equal to `root`.
+    public var dataRoot: URL
+    /// Identity persisted with per-project geometry provenance.
+    public var toolchainIdentity: String
     public var colmap: URL
     public var msplat: URL
+    public var metallib: URL
     public var da3: Da3Toolchain
 
     public init(
         root: URL,
-        authenticatedVersion: String? = nil,
+        dataRoot: URL,
+        toolchainIdentity: String,
         colmap: URL,
         msplat: URL,
+        metallib: URL,
         da3: Da3Toolchain
     ) {
         self.root = root
-        self.authenticatedVersion = authenticatedVersion
+        self.dataRoot = dataRoot
+        self.toolchainIdentity = toolchainIdentity
         self.colmap = colmap
         self.msplat = msplat
+        self.metallib = metallib
         self.da3 = da3
     }
 }
 
-/// Paths for the bundled Depth Anything 3 runtime inside a toolchain install.
+/// Paths for the bundled Depth Anything 3 runtime inside a toolchain tree.
 public struct Da3Toolchain: Sendable {
     public var root: URL
     public var sfmTool: URL
@@ -42,22 +52,10 @@ public struct Da3Toolchain: Sendable {
     }
 }
 
-/// Authenticated, app-bundled bootstrap inputs used when the network and signed cache are unavailable.
-public struct ToolchainBootstrap: Sendable, Equatable {
-    public let manifestURL: URL
-    public let coreArchiveURL: URL
-
-    public init(manifestURL: URL, coreArchiveURL: URL) {
-        self.manifestURL = manifestURL
-        self.coreArchiveURL = coreArchiveURL
-    }
-}
-
-/// Authenticated evidence for one exact installed toolchain closure.
+/// Evidence for one exact installed toolchain closure.
 ///
-/// Component names, archive hashes, and capabilities are derived from the
-/// signed manifest after the installed tree and receipt have been revalidated.
-/// No caller-supplied receipt fields are reflected directly.
+/// Every field is derived from the installed tree after it has been revalidated;
+/// no caller-supplied value is reflected directly.
 public struct ToolchainInstallationEvidence: Sendable, Equatable {
     public struct SignedComponent: Sendable, Equatable {
         public let name: String
@@ -142,11 +140,9 @@ public struct ToolchainInstallationEvidence: Sendable, Equatable {
     }
 }
 
-/// Interface for acquiring and validating an EasySplat toolchain.
+/// Interface for resolving and validating the toolchain a run executes.
 public protocol ToolchainManaging: Sendable {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths
@@ -159,374 +155,141 @@ public enum ToolchainCapability: String, Sendable, CaseIterable {
     case msplat = "training.msplat"
     case da3Base = "geometry.da3.base"
     case da3Small = "geometry.da3.small"
+
+    /// Depth Anything 3 is a development-only route; it is never shipped.
+    public var isDa3: Bool {
+        switch self {
+        case .da3Runtime, .da3Base, .da3Small:
+            return true
+        case .core, .colmap, .msplat:
+            return false
+        }
+    }
 }
 
-/// Typed capabilities requested from a schema-2 component manifest.
+/// Capabilities a run needs from the toolchain.
 public struct ToolchainCapabilityRequest: Sendable, Equatable {
     public var capabilities: Set<ToolchainCapability>
 
     public init(capabilities: Set<ToolchainCapability>) {
         self.capabilities = capabilities
     }
-
-    var manifestCapabilities: Set<String> {
-        Set(capabilities.map(\.rawValue))
-    }
-
 }
 
-/// Restricts where the toolchain resolver may obtain an installation.
-public enum ToolchainSourcePolicy: Sendable, Equatable {
-    case automatic
-    case bundledBootstrapOnly
-    case cachedOnly
-}
-
-/// Downloads, verifies, installs, and validates toolchains for the app.
+/// Resolves and validates the toolchain a run executes.
 public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
-    struct ToolchainInstallState: Codable, Sendable {
-        var schemaVersion: Int
-        var installedArtifacts: [String: String]
-        var installedCapabilities: [String]
-        var signedManifest: ToolchainManifest?
-
-        init(
-            schemaVersion: Int = ToolchainManifest.currentSchemaVersion,
-            installedArtifacts: [String: String] = [:],
-            installedCapabilities: [String] = [],
-            signedManifest: ToolchainManifest? = nil
-        ) {
-            self.schemaVersion = schemaVersion
-            self.installedArtifacts = installedArtifacts
-            self.installedCapabilities = installedCapabilities
-            self.signedManifest = signedManifest
-        }
-    }
-
-    /// Errors that can occur while resolving or validating a toolchain install.
+    /// Errors that can occur while resolving or validating a toolchain.
     public enum ToolchainError: Error, LocalizedError {
-        case invalidManifest
-        case signatureFailed
         case artifactNotFound
-        case downloadFailed
-        case manifestHTTPFailure(statusCode: Int, resourceURL: URL)
-        case artifactHTTPFailure(statusCode: Int, resourceURL: URL)
-        case manifestTooLarge(maximumBytes: Int)
-        case hashMismatch
-        case unzipFailed
         case missingBinary(String)
         case missingLibrary(String)
         case invalidToolchain(String)
-        case noApplicationSupportDirectory
-        case invalidArtifactURL(String)
         case fileIOFailed(String)
-        case insufficientDiskSpace(required: UInt64, available: UInt64)
 
         public var errorDescription: String? {
             switch self {
-            case .invalidManifest:
-                return "Toolchain manifest is invalid."
-            case .signatureFailed:
-                return "Toolchain signature verification failed."
             case .artifactNotFound:
                 return "Toolchain artifact not found for this Mac."
-            case .downloadFailed:
-                return "Failed to download the toolchain."
-            case .manifestHTTPFailure(let statusCode, let resourceURL):
-                return "Toolchain manifest request failed with HTTP \(statusCode): \(resourceURL.absoluteString)"
-            case .artifactHTTPFailure(let statusCode, let resourceURL):
-                return "Toolchain component request failed with HTTP \(statusCode): \(resourceURL.absoluteString)"
-            case .manifestTooLarge(let maximumBytes):
-                return "Toolchain manifest exceeds the \(maximumBytes)-byte download limit."
-            case .hashMismatch:
-                return "Downloaded toolchain did not match the expected checksum."
-            case .unzipFailed:
-                return "Failed to unpack the downloaded toolchain."
             case .missingBinary(let name):
                 return "Toolchain is missing required binary: \(name)."
             case .missingLibrary(let name):
                 return "Toolchain is missing required library: \(name)."
             case .invalidToolchain(let message):
                 return "Toolchain is invalid. \(message)"
-            case .noApplicationSupportDirectory:
-                return "Unable to locate the Application Support directory."
-            case .invalidArtifactURL(let urlString):
-                return "Toolchain artifact URL is invalid: \(urlString)"
             case .fileIOFailed(let message):
                 return message
-            case .insufficientDiskSpace(let required, let available):
-                return "Not enough disk space for the toolchain (requires \(required) bytes, \(available) bytes available)."
             }
         }
+    }
+
+    private struct ValidatedToolchain {
+        var validated: Set<ToolchainCapability>
+        var paths: ToolchainPaths
     }
 
     let fileManager = FileManager.default
     let runner: SubprocessRunning
-    let urlSession: URLSession
     let appVersion: String
-    let localToolchainRoot: URL?
-    let installationRoot: URL?
-    let allowInsecureLoopbackHTTP: Bool
-    let bundledBootstrap: ToolchainBootstrap?
-    let sourcePolicy: ToolchainSourcePolicy
+    private let locator: BundledToolchainLocator
+    private let memoLock = NSLock()
+    private var memo: [String: ValidatedToolchain] = [:]
 
     public init(
         runner: SubprocessRunning = SubprocessRunner(),
-        urlSession: URLSession? = nil,
         appVersion: String = EasySplatReleaseIdentity.version(),
-        localToolchainRoot: URL? = nil,
-        installationRoot: URL? = nil,
-        allowInsecureLoopbackHTTP: Bool = false,
-        bundledBootstrap: ToolchainBootstrap? = nil,
-        sourcePolicy: ToolchainSourcePolicy = .automatic
+        locator: BundledToolchainLocator = BundledToolchainLocator()
     ) {
         self.runner = runner
-        self.urlSession = urlSession ?? Self.makeDefaultURLSession()
         self.appVersion = appVersion
-        self.localToolchainRoot = localToolchainRoot
-        self.installationRoot = installationRoot
-        self.allowInsecureLoopbackHTTP = allowInsecureLoopbackHTTP
-        self.bundledBootstrap = bundledBootstrap
-        self.sourcePolicy = sourcePolicy
+        self.locator = locator
     }
 
-    private static func makeDefaultURLSession() -> URLSession {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.urlCache = nil
-        configuration.httpCookieStorage = nil
-        configuration.urlCredentialStorage = nil
-        configuration.httpShouldSetCookies = false
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return URLSession(configuration: configuration)
-    }
-
-    public func toolchainRoot() -> URL {
-        (try? toolchainRootURL()) ?? fileManager.temporaryDirectory.appendingPathComponent("EasySplat/Toolchains", isDirectory: true)
-    }
-
-    func toolchainRootURL() throws -> URL {
-        if let installationRoot {
-            return installationRoot
-        }
-        guard let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            throw ToolchainError.noApplicationSupportDirectory
-        }
-        return base.appendingPathComponent("EasySplat/Toolchains", isDirectory: true)
-    }
-
-    /// Installs only components providing the requested capabilities and their dependencies.
-    public func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    /// Validates the toolchain this build is allowed to execute, once per
+    /// capability set. Validation spawns the tools it attests, so repeat
+    /// requests for an already validated set reuse the first result.
+    public func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
         guard !request.capabilities.isEmpty else {
-            throw ToolchainError.invalidManifest
+            throw ToolchainError.invalidToolchain("No toolchain capabilities were requested.")
         }
-        if sourcePolicy == .bundledBootstrapOnly {
-            guard localToolchainOverrideURL() == nil,
-                  let validatedBootstrap = try validateBundledBootstrap(
-                      bundledBootstrap,
-                      publicKeyBase64: publicKeyBase64
-                  ) else {
-                throw ToolchainError.invalidManifest
-            }
-            guard bundledCoreCanSatisfy(request, bootstrap: validatedBootstrap) else {
-                throw ToolchainError.artifactNotFound
-            }
-            onProgress(-1.0, "Checking bundled tools")
-            let installed = try await installBundledBootstrap(
-                validatedBootstrap,
-                publicKeyBase64: publicKeyBase64,
-                request: request,
-                onProgress: onProgress
-            )
-            onProgress(1.0, "Tools ready (bundled)")
-            return installed
-        }
-        if sourcePolicy == .cachedOnly {
-            guard bundledBootstrap == nil, localToolchainOverrideURL() == nil else {
-                throw ToolchainError.invalidManifest
-            }
-            onProgress(-1.0, "Checking installed tools")
-            onProgress(-1.0, "Trying cached tools")
-            do {
-                guard let cached = try loadBestCachedToolchain(
-                    publicKeyBase64: publicKeyBase64,
-                    request: request,
-                    minimumVersion: nil,
-                    readOnly: true
-                ) else {
-                    throw ToolchainError.invalidToolchain("No verified cached toolchain satisfies this run.")
-                }
-                onProgress(1.0, "Tools ready (offline cached)")
-                return cached
-            } catch let error as ToolchainError {
-                throw error
-            } catch {
-                throw ToolchainError.invalidToolchain(
-                    "Cached tools could not be verified. \(error.localizedDescription)"
-                )
-            }
+        let source = try locator.locate()
+        if case .appBundle = source, request.capabilities.contains(where: \.isDa3) {
+            throw ToolchainError.artifactNotFound
         }
 
-        if let localRoot = localToolchainOverrideURL() {
-            onProgress(-1.0, "Checking installed tools")
-            onProgress(-1.0, "Validating tools")
-            let toolchain = try validateToolchain(
-                root: localRoot,
-                requiredCapabilities: request.capabilities
-            )
-            onProgress(1.0, "Tools ready (local)")
-            return toolchain
+        let key = source.root.standardizedFileURL.path
+        if let cached = memoizedPaths(key: key, satisfying: request.capabilities) {
+            onProgress(1.0, "Tools ready")
+            return cached
         }
 
-        let validatedBootstrap = try validateBundledBootstrap(
-            bundledBootstrap,
-            publicKeyBase64: publicKeyBase64
+        onProgress(-1.0, "Checking tools")
+        let paths = try validateToolchain(
+            root: source.root,
+            dataRoot: source.dataRoot,
+            metallib: source.metallib,
+            requiredCapabilities: request.capabilities,
+            repairExecutablePermissions: source.isDevelopmentOverride,
+            toolchainIdentity: toolchainIdentity(for: source)
         )
-
-        onProgress(-1.0, "Checking installed tools")
-        let manifest: ToolchainManifest
-        do {
-            manifest = try await downloadManifest(url: manifestURL)
-        } catch {
-            if shouldAttemptOfflineFallback(forManifestError: error),
-               let offline = try await resolveAuthenticatedOfflineToolchain(
-                publicKeyBase64: publicKeyBase64,
-                request: request,
-                bootstrap: validatedBootstrap,
-                onProgress: onProgress
-               ) {
-                return offline
-            }
-            throw error
-        }
-        guard manifest.verifying(publicKeyBase64: publicKeyBase64) else {
-            throw ToolchainError.signatureFailed
-        }
-        guard semanticVersionComponents(from: manifest.version) != nil else {
-            throw ToolchainError.invalidManifest
-        }
-
-        try validateSchema2Manifest(manifest, publicKeyBase64: publicKeyBase64)
-        try validateRemoteVersionFloor(manifest, bootstrap: validatedBootstrap)
-        let components: [ToolchainManifest.Component]
-        do {
-            components = try manifest.resolvedComponents(requesting: request.manifestCapabilities)
-        } catch {
-            throw ToolchainError.invalidManifest
-        }
-        guard !components.isEmpty else { throw ToolchainError.artifactNotFound }
-
-        let versionedRoot = try versionedToolchainRoot(for: manifest.version)
-        guard let versionIdentity = semanticVersionIdentity(from: manifest.version) else {
-            throw ToolchainError.invalidManifest
-        }
-        let toolchain: ToolchainPaths
-        do {
-            toolchain = try await withInstallLock(for: versionedRoot) {
-                let container = versionedRoot.deletingLastPathComponent()
-                try validateAuthenticatedPublicationIdentity(
-                    manifest,
-                    in: container,
-                    publicKeyBase64: publicKeyBase64
-                )
-                try recoverInterruptedInstallLocked(
-                    at: container,
-                    identity: versionIdentity,
-                    publicKeyBase64: publicKeyBase64
-                )
-                try validateAuthenticatedPublicationIdentity(
-                    manifest,
-                    in: container,
-                    publicKeyBase64: publicKeyBase64
-                )
-
-                if fileManager.fileExists(atPath: versionedRoot.path) {
-                    onProgress(-1.0, "Validating tools")
-                    if let receipt = try? validateSignedReceipt(
-                        root: versionedRoot,
-                        publicKeyBase64: publicKeyBase64,
-                        request: request
-                    ),
-                       receipt.signatureEd25519 == manifest.signatureEd25519,
-                       let cached = try? validateToolchain(
-                        root: versionedRoot,
-                        requiredCapabilities: request.capabilities,
-                        repairExecutablePermissions: false,
-                        authenticatedVersion: receipt.version
-                       ) {
-                        onProgress(1.0, "Tools ready (cached)")
-                        return cached
-                    }
-                }
-
-                let reusableState = try? validatedReusableInstallState(
-                    root: versionedRoot,
-                    publicKeyBase64: publicKeyBase64,
-                    matching: manifest
-                )
-                let reusableNames = Set(
-                    reusableState.map { Array($0.installedArtifacts.keys) } ?? []
-                )
-                let requestedNames = Set(components.map(\.name))
-                let retainedNames = reusableNames.union(requestedNames)
-                let retainedComponents = manifest.components.filter {
-                    retainedNames.contains($0.name)
-                }
-                let missingComponents = retainedComponents.filter {
-                    !reusableNames.contains($0.name)
-                }
-                let retainedCapabilities = Set(retainedComponents.flatMap(\.capabilities))
-                let validationCapabilities = Set(
-                    retainedCapabilities.compactMap(ToolchainCapability.init(rawValue:))
-                )
-                let seedFromExistingRoot = reusableState == nil ? nil : versionedRoot
-                try preflightDiskSpace(
-                    for: missingComponents,
-                    at: versionedRoot,
-                    seedFromExistingRoot: seedFromExistingRoot
-                )
-                return try await installToolchainAtomicallyLocked(
-                    versionedRoot: versionedRoot,
-                    requiredCapabilities: validationCapabilities,
-                    authenticatedManifest: manifest,
-                    seedFromExistingRoot: seedFromExistingRoot,
-                    onProgress: onProgress
-                ) { stagingRoot in
-                    var state = reusableState ?? ToolchainInstallState()
-                    state.schemaVersion = ToolchainManifest.currentSchemaVersion
-                    state.installedCapabilities = retainedCapabilities.sorted()
-                    state.signedManifest = manifest
-                    for component in retainedComponents {
-                        try await ensureArtifact(
-                            component,
-                            root: stagingRoot,
-                            state: &state,
-                            onProgress: onProgress
-                        )
-                    }
-                    try saveInstallState(state, root: stagingRoot)
-                }
-            }
-        } catch {
-            guard shouldAttemptOfflineFallback(forComponentTransferError: error) else {
-                throw error
-            }
-            if let offline = try await resolveAuthenticatedOfflineToolchain(
-                publicKeyBase64: publicKeyBase64,
-                request: request,
-                bootstrap: validatedBootstrap,
-                onProgress: onProgress
-            ) {
-                return offline
-            }
-            throw error
-        }
-        pruneSchema2Toolchains(keeping: manifest.version, publicKeyBase64: publicKeyBase64)
+        recordValidation(key: key, capabilities: request.capabilities, paths: paths)
         onProgress(1.0, "Tools ready")
-        return toolchain
+        return paths
+    }
+
+    /// `root.lastPathComponent` is meaningless for a bundle, and the identity is
+    /// persisted per project, so a bundle reports the app version instead.
+    private func toolchainIdentity(for source: ToolchainSource) -> String {
+        switch source {
+        case .appBundle:
+            return appVersion
+        case .developmentOverride(let root):
+            return "local-\(root.lastPathComponent)"
+        }
+    }
+
+    private func memoizedPaths(
+        key: String,
+        satisfying capabilities: Set<ToolchainCapability>
+    ) -> ToolchainPaths? {
+        memoLock.lock()
+        defer { memoLock.unlock() }
+        guard let entry = memo[key], capabilities.isSubset(of: entry.validated) else {
+            return nil
+        }
+        return entry.paths
+    }
+
+    private func recordValidation(
+        key: String,
+        capabilities: Set<ToolchainCapability>,
+        paths: ToolchainPaths
+    ) {
+        memoLock.lock()
+        defer { memoLock.unlock() }
+        let validated = (memo[key]?.validated ?? []).union(capabilities)
+        memo[key] = ValidatedToolchain(validated: validated, paths: paths)
     }
 }

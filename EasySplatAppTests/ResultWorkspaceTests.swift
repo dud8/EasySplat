@@ -3955,9 +3955,7 @@ private final class ShareHashCancellationProbe: @unchecked Sendable {
 }
 
 private struct ResultTestToolchainManager: ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {

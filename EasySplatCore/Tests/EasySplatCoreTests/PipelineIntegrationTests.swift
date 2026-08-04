@@ -1616,7 +1616,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNil(geometry.timings["orientation_seconds"])
         XCTAssertEqual(geometry.schemaVersion, GeometryArtifact.currentSchemaVersion)
         XCTAssertEqual(geometry.modelVersion, "none")
-        XCTAssertEqual(geometry.provenance.toolchainVersion, "Toolchain")
+        XCTAssertEqual(geometry.provenance.toolchainVersion, "local-Toolchain")
         XCTAssertEqual(geometry.provenance.solver.identifier, "colmap")
         XCTAssertNil(geometry.provenance.runtime)
         XCTAssertNil(geometry.provenance.model)
@@ -11904,8 +11904,11 @@ final class PipelineIntegrationTests: XCTestCase {
         let da3 = try TestToolchains.da3Toolchain(root: toolchainRoot, createFiles: createDa3Files)
         return ToolchainPaths(
             root: toolchainRoot,
+            dataRoot: toolchainRoot,
+            toolchainIdentity: "local-\(toolchainRoot.lastPathComponent)",
             colmap: colmap,
             msplat: msplat,
+            metallib: toolchainRoot.appendingPathComponent("bin/default.metallib"),
             da3: da3
         )
     }

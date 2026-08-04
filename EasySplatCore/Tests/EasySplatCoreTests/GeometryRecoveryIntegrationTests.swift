@@ -2279,8 +2279,11 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         """.write(to: provenance, atomically: true, encoding: .utf8)
         return ToolchainPaths(
             root: toolchainRoot,
+            dataRoot: toolchainRoot,
+            toolchainIdentity: "local-\(toolchainRoot.lastPathComponent)",
             colmap: colmap,
             msplat: toolchainRoot.appendingPathComponent("bin/easysplat-train"),
+            metallib: toolchainRoot.appendingPathComponent("bin/default.metallib"),
             da3: da3
         )
     }

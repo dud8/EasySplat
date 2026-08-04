@@ -1279,7 +1279,7 @@ public enum ProjectArtifactValidator {
             finishedProject.toolchainRequest.capabilities.map(\.rawValue)
         )
         guard requiredCapabilities.isSubset(of: installedCapabilities),
-              installation.installedArtifacts["macos-arm64-core"] != nil,
+              !installation.installedArtifacts.isEmpty,
               geometry.provenance.toolchainVersion == installation.toolchainVersion else {
             throw finishedProjectError(
                 "the authenticated toolchain does not satisfy the finished run"
@@ -1318,13 +1318,11 @@ public enum ProjectArtifactValidator {
         }
 
         let componentNames = installation.signedComponents.map(\.name)
+        let closurePaths = Set(runtimeClosure.components.map(\.toolchainRelativePath))
         guard Set(componentNames).count == componentNames.count,
-              let coreComponent = uniqueSignedComponent(
-                named: "macos-arm64-core",
-                installation: installation
-              ),
-              Set(runtimeClosure.components.map(\.toolchainRelativePath))
-                .isSubset(of: Set(coreComponent.declaredContents)) else {
+              installation.signedComponents.filter({
+                  closurePaths.isSubset(of: Set($0.declaredContents))
+              }).count == 1 else {
             throw finishedProjectError(
                 "the authenticated toolchain has duplicate or missing signed components"
             )
@@ -2573,8 +2571,11 @@ public enum ProjectArtifactValidator {
             config: .init(
                 toolchain: ToolchainPaths(
                     root: root,
+                    dataRoot: root,
+                    toolchainIdentity: "local-\(root.lastPathComponent)",
                     colmap: root,
                     msplat: root,
+                    metallib: root,
                     da3: da3
                 )
             )

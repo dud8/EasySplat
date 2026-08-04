@@ -42,6 +42,7 @@
 #include "isolation_runtime.hpp"
 #include "loaders.hpp"
 #include "model.hpp"
+#include "msplat_c_api.h"
 #include "random_iter.hpp"
 
 namespace fs = std::filesystem;
@@ -1596,13 +1597,24 @@ fs::path trainerExecutablePath() {
     return fs::canonical(fs::path(buffer.data()));
 }
 
+// Set once from --metallib before any mode dispatch; empty means the
+// executable-adjacent default.metallib.
+fs::path explicitMetallibPath;
+
+fs::path resolvedMetallibPath() {
+    if (!explicitMetallibPath.empty()) return explicitMetallibPath;
+    return trainerExecutablePath().parent_path() / "default.metallib";
+}
+
 std::string computeTrainerBuildDigest() {
     const fs::path executable = trainerExecutablePath();
-    const fs::path directory = executable.parent_path();
-    return digestFiles(
-        directory,
-        {executable.filename().string(), "default.metallib"}
-    );
+    // The digest labels stay location-independent so a relocated metallib with
+    // identical content yields the identical build digest.
+    Sha256Accumulator digest;
+    digest.update("EasySplat file digest v1");
+    hashFileInto(digest, executable, executable.filename().string());
+    hashFileInto(digest, resolvedMetallibPath(), "default.metallib");
+    return digest.finish();
 }
 
 struct BenchmarkDecodeOutput {
@@ -3258,6 +3270,12 @@ int main(int argc, char *argv[]) {
         selfCheck,
         "Initialize Metal and load the adjacent metallib"
     );
+    std::string metallibPathArgument;
+    CLI::Option *metallibOption = app.add_option(
+        "--metallib",
+        metallibPathArgument,
+        "Metal library path (defaults to default.metallib beside the executable)"
+    );
     CLI::Option *validatePlyOption = app.add_option(
         "--validate-ply",
         plyToValidate,
@@ -3297,6 +3315,22 @@ int main(int argc, char *argv[]) {
 
     if (eventsFileDescriptor == STDERR_FILENO) {
         std::cerr.rdbuf(std::cout.rdbuf());
+    }
+
+    if (metallibOption->count() != 0) {
+        if (metallibOption->count() != 1) {
+            std::cerr << "easysplat-train: --metallib must be provided at most once\n";
+            return 1;
+        }
+        try {
+            const fs::path candidate(metallibPathArgument);
+            (void)requireRegularFile(candidate, true);
+            explicitMetallibPath = fs::canonical(candidate);
+            msplat_set_metallib_path(explicitMetallibPath.c_str());
+        } catch (const std::exception &error) {
+            std::cerr << "easysplat-train: invalid --metallib: " << error.what() << '\n';
+            return 1;
+        }
     }
 
     std::optional<EventWriter> events;
@@ -3602,7 +3636,7 @@ int main(int argc, char *argv[]) {
             const fs::path executable = trainerExecutablePath();
             const auto [executableDigest, executableBytes] = hashFileContent(executable, true);
             const auto [metallibDigest, metallibBytes] = hashFileContent(
-                executable.parent_path() / "default.metallib",
+                resolvedMetallibPath(),
                 true
             );
             const std::string trainerBuildDigest = computeTrainerBuildDigest();

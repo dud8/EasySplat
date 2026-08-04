@@ -15,8 +15,11 @@ enum TestToolchains {
         )
         return ToolchainPaths(
             root: root,
+            dataRoot: root,
+            toolchainIdentity: "local-\(root.lastPathComponent)",
             colmap: colmap ?? root,
             msplat: msplat ?? root.appendingPathComponent("bin/easysplat-train"),
+            metallib: root.appendingPathComponent("bin/default.metallib"),
             da3: da3
         )
     }

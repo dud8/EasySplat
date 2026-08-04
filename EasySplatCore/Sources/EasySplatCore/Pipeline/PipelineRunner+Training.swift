@@ -716,6 +716,10 @@ extension PipelineRunner {
         config.toolchain.msplat
     }
 
+    func msplatMetallibPath() -> URL {
+        config.toolchain.metallib
+    }
+
     func msplatResumeURL(
         paths: ProjectPaths,
         profile: DetailProfile,

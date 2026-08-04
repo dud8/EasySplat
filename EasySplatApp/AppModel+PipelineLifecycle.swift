@@ -477,9 +477,7 @@ extension AppModel {
             statusDetail = nil
             progress = nil
             let progressForwarder = ProgressForwarder(model: self, taskToken: taskToken)
-            let toolchain = try await toolchainManager.ensureToolchain(
-                manifestURL: AppConfig.toolchainManifestURL,
-                publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
+            let toolchain = try await toolchainManager.resolveToolchain(
                 request: capabilityRequest
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
@@ -624,7 +622,7 @@ extension AppModel {
             lastError = message
             statusTitle = message
             statusDetail = nil
-            errorDetails = "Preflight stopped before downloading tools or creating a project."
+            errorDetails = "Preflight stopped before preparing tools or creating a project."
             progress = nil
             viewState = .processing
         } catch let failure as PhotoInputPreflightFailure {
@@ -657,7 +655,7 @@ extension AppModel {
                 validationRecovery = Self.validationRecovery(for: validationError)
                 lastError = message
                 statusTitle = message
-                errorDetails = "Preflight stopped before downloading tools or creating a project."
+                errorDetails = "Preflight stopped before preparing tools or creating a project."
             } else {
                 lastError = "Photos couldn’t be prepared"
                 statusTitle = "Photos couldn’t be prepared"
@@ -956,9 +954,9 @@ extension AppModel {
             appendLogLine("========== NEW LOG START (current run) ==========")
             appendLogLine("Resumed project")
 
-            // A resume that must re-run holds the awake assertion across the toolchain
-            // download and the run; a resume that just opens a ready project (returned
-            // above) never reaches here, so it does not hold one.
+            // A resume that must re-run holds the awake assertion across toolchain
+            // validation and the run; a resume that just opens a ready project
+            // (returned above) never reaches here, so it does not hold one.
             let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is preparing and resuming a project")
             defer { idleSleepAssertion.release() }
 
@@ -966,9 +964,7 @@ extension AppModel {
             statusDetail = nil
             progress = nil
             let progressForwarder = ProgressForwarder(model: self, taskToken: taskToken)
-            let toolchain = try await toolchainManager.ensureToolchain(
-                manifestURL: AppConfig.toolchainManifestURL,
-                publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
+            let toolchain = try await toolchainManager.resolveToolchain(
                 request: capabilityRequest
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
@@ -1027,7 +1023,7 @@ extension AppModel {
             lastError = message
             statusTitle = message
             statusDetail = "The saved project and its checkpoint are unchanged."
-            errorDetails = "Resume preflight stopped before downloading tools or changing project files."
+            errorDetails = "Resume preflight stopped before preparing tools or changing project files."
             progress = nil
             viewState = .processing
             refreshProjectSummaries()
@@ -1089,38 +1085,20 @@ extension AppModel {
     }
 
     private func toolchainPreparationFailureMessage(for error: Error) -> String {
-        if let toolchainError = error as? ToolchainManager.ToolchainError,
-           case .manifestHTTPFailure(let statusCode, _) = toolchainError,
-           statusCode == 404 || statusCode == 410 {
-            return "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
+        guard error is ToolchainManager.ToolchainError else {
+            return "Couldn’t prepare the required tools."
         }
-        return "Couldn’t prepare the required tools. Check your connection and try again."
+        return "EasySplat’s built-in tools are missing or damaged. Reinstall EasySplat."
     }
 
     private func failureTechnicalDetails(for error: Error) -> String {
-        var lines: [String]
-        if let toolchainError = error as? ToolchainManager.ToolchainError,
-           case .manifestHTTPFailure(let statusCode, let resourceURL) = toolchainError {
-            lines = ["Underlying error: EasySplatCore.ToolchainManager.ToolchainError.manifestHTTPFailure"]
-            lines.append("HTTP status: \(statusCode)")
-            lines.append("HTTP resource: \(redactedDiagnosticURL(resourceURL))")
-        } else {
-            lines = ["Underlying error: \(String(reflecting: error))"]
+        var lines = ["Underlying error: \(String(reflecting: error))"]
+        if AppConfig.allowsDevelopmentOverrides {
+            lines.append(
+                "Development builds resolve tools from EASYSPLAT_LOCAL_TOOLCHAIN_ROOT."
+            )
         }
-        lines.append("Manifest URL: \(redactedDiagnosticURL(AppConfig.toolchainManifestURL))")
-        lines.append("Public key present: \(!AppConfig.toolchainPublicKeyBase64.isEmpty)")
         return lines.joined(separator: "\n")
-    }
-
-    private func redactedDiagnosticURL(_ url: URL) -> String {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return "<invalid URL>"
-        }
-        components.user = nil
-        components.password = nil
-        components.query = nil
-        components.fragment = nil
-        return components.string ?? "<invalid URL>"
     }
 
     func reset() {

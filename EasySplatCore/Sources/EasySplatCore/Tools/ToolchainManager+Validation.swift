@@ -2,12 +2,17 @@ import CoreFoundation
 import Foundation
 
 extension ToolchainManager {
+    /// `dataRoot` and `metallib` default to the single-root layout a development
+    /// tree uses; a split layout passes both explicitly.
     func validateToolchain(
         root: URL,
+        dataRoot: URL? = nil,
+        metallib: URL? = nil,
         requiredCapabilities: Set<ToolchainCapability>,
         repairExecutablePermissions: Bool = true,
-        authenticatedVersion: String? = nil
+        toolchainIdentity: String
     ) throws -> ToolchainPaths {
+        let payloadRoot = dataRoot ?? root
         let colmap = root.appendingPathComponent("bin/colmap")
         if repairExecutablePermissions { ensureExecutable(at: colmap) }
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
@@ -177,11 +182,11 @@ extension ToolchainManager {
         )
 
         let msplat = root.appendingPathComponent("bin/easysplat-train")
-        let msplatMetallib = root.appendingPathComponent("bin/default.metallib")
-        let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
+        let msplatMetallib = metallib ?? root.appendingPathComponent("bin/default.metallib")
+        let msplatRoot = payloadRoot.appendingPathComponent("msplat", isDirectory: true)
         let msplatBuildInfo = msplatRoot.appendingPathComponent("build_info.json")
         let msplatLicense = msplatRoot.appendingPathComponent("LICENSE")
-        try rejectLegacyMsplatFootprint(root: root)
+        try rejectLegacyMsplatFootprint(root: root, dataRoot: payloadRoot)
         guard pathExistsIncludingSymlink(msplat) else {
             throw ToolchainError.missingBinary("bin/easysplat-train")
         }
@@ -197,6 +202,7 @@ extension ToolchainManager {
 
         let runtimeVersion = try validateNativeMsplatClosure(
             root: root,
+            dataRoot: payloadRoot,
             executable: msplat,
             metallib: msplatMetallib,
             buildInfo: msplatBuildInfo,
@@ -207,13 +213,19 @@ extension ToolchainManager {
             throw ToolchainError.missingBinary("bin/easysplat-train")
         }
         try requireArm64Binary(at: msplat, label: "easysplat-train")
-        try validateMsplatSelfCheck(executable: msplat, runtimeVersion: runtimeVersion)
+        try validateMsplatSelfCheck(
+            executable: msplat,
+            metallib: msplatMetallib,
+            runtimeVersion: runtimeVersion
+        )
 
         return ToolchainPaths(
             root: root,
-            authenticatedVersion: authenticatedVersion,
+            dataRoot: payloadRoot,
+            toolchainIdentity: toolchainIdentity,
             colmap: colmap,
             msplat: msplat,
+            metallib: msplatMetallib,
             da3: da3
         )
     }
@@ -335,18 +347,25 @@ extension ToolchainManager {
 
     func validateNativeMsplatClosure(
         root: URL,
+        dataRoot: URL,
         executable: URL,
         metallib: URL,
         buildInfo: URL,
         license: URL
     ) throws -> String {
-        let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
+        let msplatRoot = dataRoot.appendingPathComponent("msplat", isDirectory: true)
         let expectedFiles = Set(["LICENSE", "build_info.json"])
 
-        for url in [executable, metallib, msplatRoot, buildInfo, license] {
-            if let symlink = firstSymbolicLinkComponent(from: root, through: url) {
+        for (url, container) in [
+            (executable, root),
+            (metallib, dataRoot),
+            (msplatRoot, dataRoot),
+            (buildInfo, dataRoot),
+            (license, dataRoot),
+        ] {
+            if let symlink = firstSymbolicLinkComponent(from: container, through: url) {
                 throw ToolchainError.invalidToolchain(
-                    "Native msplat closure contains a symbolic link: \(projectRelativePath(symlink, root: root))."
+                    "Native msplat closure contains a symbolic link: \(projectRelativePath(symlink, root: container))."
                 )
             }
         }
@@ -511,7 +530,7 @@ extension ToolchainManager {
             "projection_vjp_patch_sha256": "e283e1c608f2ea940c46cdcc08252ba0381fa7c33f9490c2812e2f1a83157667",
             "alpha_cap_patch_sha256": "ee5b7f1563248d279f0b1a9d5fe9637feeb171cfa42546004772e7424b7bd7a6",
             "projection_oracle_patch_sha256": "cfcf5a0c70bb6cbd05c25c1263d19ff87792abfc326fb43df4e1d17baf77c0a3",
-            "overlay_sha256": "9d5f0e509f556061bff4ab16357e1d3fc5e2b54b638628529cb2fbfe54009869",
+            "overlay_sha256": "a7c9ccd00e697c820b6f1335653922e114350b97141443adcda2175b161ddbbf",
             "raster_test_sha256": "2f9b7c7241accbae20dd3c93ff2a5c13934a391b75438328e5fa9725ea2bdb5a",
             "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
             "isolation_source_sha256": "65504b0448c61b4f2602d86150ff6ce83be61bfc48cc9f632fa72d95b4992e61",
@@ -637,10 +656,13 @@ extension ToolchainManager {
         return "\(sourceVersion) (git \(sourceCommit.prefix(7)))"
     }
 
-    func validateMsplatSelfCheck(executable: URL, runtimeVersion: String) throws {
+    func validateMsplatSelfCheck(executable: URL, metallib: URL, runtimeVersion: String) throws {
         let result: SubprocessResult
         do {
-            result = try runner.run(executable.path, ["--self-check", "--events-fd", "1"])
+            result = try runner.run(
+                executable.path,
+                ["--self-check", "--events-fd", "1", "--metallib", metallib.path]
+            )
         } catch {
             throw ToolchainError.invalidToolchain("easysplat-train self-check could not run (\(error.localizedDescription)).")
         }
@@ -683,16 +705,16 @@ extension ToolchainManager {
         return number.int64Value == expected
     }
 
-    func rejectLegacyMsplatFootprint(root: URL) throws {
+    func rejectLegacyMsplatFootprint(root: URL, dataRoot: URL) throws {
         let legacyPaths = [
-            root.appendingPathComponent("bin/msplat-train"),
-            root.appendingPathComponent("msplat/bin"),
-            root.appendingPathComponent("msplat/python"),
-            root.appendingPathComponent("msplat/core_extension_path.txt"),
+            (root.appendingPathComponent("bin/msplat-train"), root),
+            (dataRoot.appendingPathComponent("msplat/bin"), dataRoot),
+            (dataRoot.appendingPathComponent("msplat/python"), dataRoot),
+            (dataRoot.appendingPathComponent("msplat/core_extension_path.txt"), dataRoot),
         ]
-        if let legacy = legacyPaths.first(where: { pathExistsIncludingSymlink($0) }) {
+        if let legacy = legacyPaths.first(where: { pathExistsIncludingSymlink($0.0) }) {
             throw ToolchainError.invalidToolchain(
-                "Remove the legacy msplat footprint at \(projectRelativePath(legacy, root: root))."
+                "Remove the legacy msplat footprint at \(projectRelativePath(legacy.0, root: legacy.1))."
             )
         }
     }
@@ -774,66 +796,6 @@ extension ToolchainManager {
                 "\(label) must be an arm64-only Mach-O binary."
             )
         }
-    }
-
-    func artifactLooksInstalled(name: String, root: URL) -> Bool {
-        switch name {
-        case "macos-arm64-core":
-            return coreToolchainLooksInstalled(root: root)
-        case "geometry-da3-base":
-            return da3RuntimeLooksInstalled(root: root)
-                && da3ModelLooksInstalled(named: "DA3-BASE", root: root)
-        case "geometry-da3-small":
-            return da3ModelLooksInstalled(named: "DA3-SMALL", root: root)
-        default:
-            return false
-        }
-    }
-
-    func da3ModelLooksInstalled(named modelName: String, root: URL) -> Bool {
-        let bundle = root.appendingPathComponent("da3_mps/models/\(modelName)", isDirectory: true)
-        return fileManager.fileExists(atPath: bundle.appendingPathComponent("model.safetensors").path)
-            && fileManager.fileExists(atPath: bundle.appendingPathComponent("config.json").path)
-            && fileManager.fileExists(atPath: bundle.appendingPathComponent("easysplat_model_info.json").path)
-    }
-
-    func da3RuntimeLooksInstalled(root: URL) -> Bool {
-        let da3 = root.appendingPathComponent("da3_mps", isDirectory: true)
-        return fileManager.fileExists(atPath: da3.appendingPathComponent("bin/easysplat_da3_sfm").path)
-            && fileManager.fileExists(atPath: da3.appendingPathComponent("python/bin/python3").path)
-            && fileManager.fileExists(atPath: da3.appendingPathComponent("build_info.json").path)
-            && fileManager.fileExists(atPath: da3.appendingPathComponent("app/easysplat_da3_sfm/run.py").path)
-            && fileManager.fileExists(
-                atPath: da3.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py").path
-            )
-    }
-
-    func coreToolchainLooksInstalled(root: URL) -> Bool {
-        let colmap = root.appendingPathComponent("bin/colmap")
-        let msplat = root.appendingPathComponent("msplat", isDirectory: true)
-        let msplatTrain = root.appendingPathComponent("bin/easysplat-train")
-        let msplatMetallib = root.appendingPathComponent("bin/default.metallib")
-        let msplatBuildInfo = msplat.appendingPathComponent("build_info.json")
-        let msplatLicense = msplat.appendingPathComponent("LICENSE")
-        let legacyMsplatPresent = [
-            root.appendingPathComponent("bin/msplat-train"),
-            root.appendingPathComponent("msplat/bin"),
-            root.appendingPathComponent("msplat/python"),
-            root.appendingPathComponent("msplat/core_extension_path.txt"),
-        ].contains { pathExistsIncludingSymlink($0) }
-        let msplatOK = !legacyMsplatPresent
-            && !isSymbolicLink(msplatTrain)
-            && fileManager.isExecutableFile(atPath: msplatTrain.path)
-            && (try? validateNativeMsplatClosure(
-                root: root,
-                executable: msplatTrain,
-                metallib: msplatMetallib,
-                buildInfo: msplatBuildInfo,
-                license: msplatLicense
-            )) != nil
-
-        return fileManager.isExecutableFile(atPath: colmap.path)
-            && msplatOK
     }
 
 }
