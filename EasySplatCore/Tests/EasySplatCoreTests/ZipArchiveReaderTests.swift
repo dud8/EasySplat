@@ -193,3 +193,48 @@ final class ZipArchiveReaderTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: victim), Data("original".utf8))
     }
 }
+
+extension ZipArchiveReaderTests {
+    /// A declared size or offset above `Int.max` must be rejected, not converted.
+    /// Narrowing it first traps, and a trap cannot be caught by the `try?` these
+    /// calls sit behind.
+    func testRejectsDeclaredValuesTooLargeToAddress() throws {
+        let archive = try ZipFixtureBuilder.build(
+            at: root.appendingPathComponent("huge.zip"),
+            entries: [.file(path: "a.txt", contents: Data("payload".utf8))]
+        )
+        var bytes = try Data(contentsOf: archive)
+
+        // Central directory: compressed and uncompressed size both sit at a fixed
+        // offset from the header signature.
+        let signature: [UInt8] = [0x50, 0x4B, 0x01, 0x02]
+        let header = try XCTUnwrap(bytes.firstRange(of: Data(signature)))
+        for field in [20, 24] {
+            let start = header.lowerBound + field
+            for offset in 0..<4 {
+                bytes[start + offset] = 0xFF
+            }
+        }
+        try bytes.write(to: archive)
+
+        // Reading must fail cleanly; the process must still be here to observe it.
+        let entries = try? ZipArchiveReader.readEntries(at: archive)
+        if let entry = entries?.first {
+            let destination = root.appendingPathComponent("huge-out", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: destination,
+                withIntermediateDirectories: true
+            )
+            let descriptor = open(destination.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            defer { close(descriptor) }
+            XCTAssertThrowsError(
+                try ZipArchiveReader.extract(
+                    entry: entry,
+                    from: archive,
+                    into: descriptor,
+                    relativePath: "a.txt"
+                )
+            )
+        }
+    }
+}

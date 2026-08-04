@@ -1487,6 +1487,29 @@ def expected_spdx_document(
                 ),
             }
         )
+    # The embedded toolchain is a package in its own right: it has no file of its
+    # own, so it is identified by the closure digest the app carries.
+    packages.append(
+        {
+            "SPDXID": artifact_ids["core"],
+            "name": "EasySplat-toolchain",
+            "versionInfo": provenance["toolchainVersion"],
+            "downloadLocation": "NONE",
+            "sourceInfo": "Embedded in the application bundle.",
+            "filesAnalyzed": False,
+            "checksums": [
+                {
+                    "algorithm": "SHA256",
+                    "checksumValue": provenance["supplyChain"]["componentsSHA256"],
+                }
+            ],
+            "licenseConcluded": "LicenseRef-EasySplat-Toolchain-Closure",
+            "licenseDeclared": "LicenseRef-EasySplat-Toolchain-Closure",
+            "copyrightText": (
+                "Copyright information is provided by the declared license files."
+            ),
+        }
+    )
     for component_id in sorted(components):
         component = components[component_id]
         closure_checksum = spdx_component_checksum(component, files)

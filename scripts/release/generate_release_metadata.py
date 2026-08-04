@@ -432,8 +432,22 @@ def validate_toolchain_tree(toolchain_dir: Path, expected_version: str) -> Valid
     declared = {path for path in license_paths if archive_for_path(path) == "core"}
     if set(license_bytes) != declared:
         fail(f"license closure is incomplete: {sorted(declared - set(license_bytes))[:5]}")
+    # The receipt that ships has to describe what ships. Keeping the original
+    # bytes would embed a manifest naming components and files the app does not
+    # carry, while its digest, counts, and licence set described the filtered
+    # closure — a document that disagrees with itself.
+    shipped_payload = dict(payload)
+    shipped_payload["components"] = [
+        component
+        for component in payload["components"]
+        if component["id"] in shipped
+    ]
+    shipped_payload["files"] = [
+        row for row in payload["files"] if row["path"] in embedded
+    ]
+    shipped_raw = canonical_json_bytes(shipped_payload)
     return ValidatedClosure(
-        payload, raw, shipped, embedded, license_bytes, {"core": rows}
+        shipped_payload, shipped_raw, shipped, embedded, license_bytes, {"core": rows}
     )
 
 
@@ -650,6 +664,23 @@ def build_spdx(
             "licenseDeclared": artifact_licenses[identifier],
             "copyrightText": "Copyright information is provided by the declared license files.",
         })
+    # The embedded toolchain is a package in its own right: it has no file of its
+    # own, so it is identified by the closure digest the app carries.
+    packages.append({
+        "SPDXID": artifact_ids["core"],
+        "name": "EasySplat-toolchain",
+        "versionInfo": provenance["toolchainVersion"],
+        "downloadLocation": "NONE",
+        "sourceInfo": "Embedded in the application bundle.",
+        "filesAnalyzed": False,
+        "checksums": [{
+            "algorithm": "SHA256",
+            "checksumValue": provenance["supplyChain"]["componentsSHA256"],
+        }],
+        "licenseConcluded": "LicenseRef-EasySplat-Toolchain-Closure",
+        "licenseDeclared": "LicenseRef-EasySplat-Toolchain-Closure",
+        "copyrightText": "Copyright information is provided by the declared license files.",
+    })
     for component_id in sorted(closure.components):
         component = closure.components[component_id]
         closure_checksum = component_checksum(component, closure)

@@ -5529,27 +5529,6 @@ extension ProjectArtifactValidator {
         shouldCancel: @escaping @Sendable () -> Bool
     ) throws -> ValidatedPlyArtifactEvidence {
         try throwIfCancellationRequested(shouldCancel)
-        var payload = Data()
-        payload.reserveCapacity(Int(sourceEvidence.byteCount))
-        var offset: Int64 = 0
-        var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
-        while offset < Int64(sourceEvidence.byteCount) {
-            try throwIfCancellationRequested(shouldCancel)
-            let requested = min(buffer.count, Int(sourceEvidence.byteCount - UInt64(offset)))
-            let count = buffer.withUnsafeMutableBytes { bytes in
-                systemCalls.readAt(sourceDescriptor, bytes.baseAddress, requested, off_t(offset))
-            }
-            if count < 0 && errno == EINTR { continue }
-            guard count > 0, count <= requested else {
-                throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
-            }
-            payload.append(contentsOf: buffer[0..<count])
-            offset += Int64(count)
-        }
-        guard UInt64(payload.count) == sourceEvidence.byteCount else {
-            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
-        }
-
         let staging: URL
         do {
             staging = try FileManager.default.url(
@@ -5563,12 +5542,68 @@ extension ProjectArtifactValidator {
         }
         defer { try? FileManager.default.removeItem(at: staging) }
 
+        // A validated splat can be gigabytes, so it is streamed rather than held.
         let candidate = staging.appendingPathComponent(destination.lastPathComponent)
-        do {
-            try payload.write(to: candidate, options: [.atomic])
-        } catch {
+        guard FileManager.default.createFile(atPath: candidate.path, contents: nil) else {
             throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
         }
+        let candidateDescriptor = Darwin.open(
+            candidate.path,
+            O_WRONLY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard candidateDescriptor >= 0 else {
+            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+        }
+        var copied: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
+        do {
+            while copied < Int64(sourceEvidence.byteCount) {
+                try throwIfCancellationRequested(shouldCancel)
+                let requested = min(
+                    buffer.count,
+                    Int(sourceEvidence.byteCount - UInt64(copied))
+                )
+                let read = buffer.withUnsafeMutableBytes { bytes in
+                    systemCalls.readAt(
+                        sourceDescriptor,
+                        bytes.baseAddress,
+                        requested,
+                        off_t(copied)
+                    )
+                }
+                if read < 0 && errno == EINTR { continue }
+                guard read > 0, read <= requested else {
+                    throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+                }
+                var written = 0
+                while written < read {
+                    let result = buffer.withUnsafeBytes { bytes in
+                        systemCalls.write(
+                            candidateDescriptor,
+                            bytes.baseAddress?.advanced(by: written),
+                            read - written
+                        )
+                    }
+                    if result < 0 && errno == EINTR { continue }
+                    guard result > 0, result <= read - written else {
+                        throw ProjectArtifactError.invalidOutput(
+                            destination.lastPathComponent
+                        )
+                    }
+                    written += result
+                }
+                copied += Int64(read)
+            }
+            try synchronize(
+                candidateDescriptor,
+                label: destination.lastPathComponent,
+                systemCalls: systemCalls
+            )
+        } catch {
+            Darwin.close(candidateDescriptor)
+            throw error
+        }
+        Darwin.close(candidateDescriptor)
 
         do {
             _ = try FileManager.default.replaceItemAt(
@@ -5581,7 +5616,13 @@ extension ProjectArtifactValidator {
             // replaceItemAt needs the destination to exist on some volumes; a
             // first export has nothing to replace.
             do {
-                try payload.write(to: destination, options: [.atomic])
+                try FileManager.default.removeItem(at: destination)
+            } catch CocoaError.fileNoSuchFile {
+            } catch {
+                throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+            }
+            do {
+                try FileManager.default.moveItem(at: candidate, to: destination)
             } catch {
                 throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
             }

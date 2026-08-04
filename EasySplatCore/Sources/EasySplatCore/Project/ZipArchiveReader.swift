@@ -47,6 +47,7 @@ enum ZipArchiveReader {
     private static let centralFileHeaderSignature: UInt32 = 0x0201_4B50
     private static let localFileHeaderSignature: UInt32 = 0x0403_4B50
     private static let maximumEntryCount = 512_000
+    private static let maximumEntryBytes: UInt64 = 8 << 30
 
     // MARK: - Central directory
 
@@ -62,12 +63,18 @@ enum ZipArchiveReader {
 
         if entryCount == 0xFFFF || directoryOffset == 0xFFFF_FFFF || directorySize == 0xFFFF_FFFF {
             let locator = try locateZip64Locator(in: data, endOfCentralDirectory: eocd)
-            let zip64End = Int(read64(data, locator + 8))
-            guard zip64End >= 0, zip64End + 56 <= data.count,
+            guard let zip64End = boundedOffset(read64(data, locator + 8), limit: data.count),
+                  zip64End + 56 <= data.count,
                   read32(data, zip64End) == zip64EndSignature else {
                 throw ReaderError.malformed("zip64 end record is missing")
             }
-            entryCount = Int(read64(data, zip64End + 32))
+            guard let declaredCount = boundedOffset(
+                read64(data, zip64End + 32),
+                limit: maximumEntryCount
+            ) else {
+                throw ReaderError.malformed("zip64 entry count is out of range")
+            }
+            entryCount = declaredCount
             directorySize = read64(data, zip64End + 40)
             directoryOffset = read64(data, zip64End + 48)
         }
@@ -159,9 +166,15 @@ enum ZipArchiveReader {
         case 0:
             produced = data.subdata(in: payload)
         case 8:
+            guard let expected = boundedOffset(
+                entry.uncompressedSize,
+                limit: Int(maximumEntryBytes)
+            ) else {
+                throw ReaderError.malformed("entry declares an unusable size: \(entry.path)")
+            }
             produced = try inflate(
                 data.subdata(in: payload),
-                expectedSize: Int(entry.uncompressedSize),
+                expectedSize: expected,
                 name: entry.path
             )
         default:
@@ -214,19 +227,26 @@ enum ZipArchiveReader {
     }
 
     private static func payloadRange(_ data: Data, entry: Entry) throws -> Range<Int> {
-        let offset = Int(entry.localHeaderOffset)
-        guard offset >= 0, offset + 30 <= data.count,
+        guard let offset = boundedOffset(entry.localHeaderOffset, limit: data.count),
+              let compressed = boundedOffset(entry.compressedSize, limit: data.count),
+              offset + 30 <= data.count,
               read32(data, offset) == localFileHeaderSignature else {
             throw ReaderError.malformed("local header is malformed: \(entry.path)")
         }
         let nameLength = Int(read16(data, offset + 26))
         let extraLength = Int(read16(data, offset + 28))
         let start = offset + 30 + nameLength + extraLength
-        let end = start + Int(entry.compressedSize)
-        guard start >= 0, end >= start, end <= data.count else {
+        let (end, overflowed) = start.addingReportingOverflow(compressed)
+        guard start >= 0, !overflowed, end <= data.count else {
             throw ReaderError.malformed("entry payload overruns the archive: \(entry.path)")
         }
         return start..<end
+    }
+
+    /// Narrows an archive-declared 64-bit value to an in-range offset, or nil.
+    private static func boundedOffset(_ value: UInt64, limit: Int) -> Int? {
+        guard limit >= 0, value <= UInt64(limit) else { return nil }
+        return Int(value)
     }
 
     private static func readZip64Extra(
