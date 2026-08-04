@@ -115,7 +115,7 @@ final class StandaloneSplatWindowPresenter: NSObject, NSWindowDelegate {
         let key = url.standardizedFileURL
         if let existing = windows[key] {
             existing.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
             return
         }
 
@@ -133,7 +133,7 @@ final class StandaloneSplatWindowPresenter: NSObject, NSWindowDelegate {
         window.delegate = self
         windows[key] = window
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
     }
 
     func windowWillClose(_ notification: Notification) {
