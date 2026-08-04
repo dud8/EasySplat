@@ -218,14 +218,21 @@ extension AppModel {
         if source.standardizedFileURL == destination.standardizedFileURL {
             return
         }
+        // The destination came from a save panel, so the sandbox grants the file
+        // itself and not the directory around it.
         if let expected {
             _ = try ProjectArtifactValidator.publishValidatedPly(
                 from: source,
                 to: destination,
-                expected: expected
+                expected: expected,
+                destinationKind: .userSelected
             )
         } else {
-            _ = try ProjectArtifactValidator.publishValidatedPly(from: source, to: destination)
+            _ = try ProjectArtifactValidator.publishValidatedPly(
+                from: source,
+                to: destination,
+                destinationKind: .userSelected
+            )
         }
     }
 

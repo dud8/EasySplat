@@ -257,36 +257,28 @@ final class DatasetInputPreflightTests: XCTestCase {
         "\(mode)  3.0 unx \(size) bx \(size) defN 01-Jan-26 00:00 \(name)"
     }
 
-    private func zipScripts(
-        names: [String],
-        onExtract: @escaping @Sendable ([String]) throws -> Void
-    ) -> [MockSubprocessRunner.Script] {
-        [
-            .init(
-                path: "/usr/bin/zipinfo",
-                argsPrefix: ["-l"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                stdoutLines: names.map {
-                    metadataLine(
-                        mode: $0.hasSuffix("/") ? "drwxr-xr-x" : "-rw-r--r--",
-                        size: $0.hasSuffix("/") ? 0 : 1_000,
-                        name: $0
-                    )
-                }
-            ),
-            .init(
-                path: "/usr/bin/unzip",
-                argsPrefix: ["-Z1"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                stdoutLines: names
-            ),
-            .init(
-                path: "/usr/bin/unzip",
-                argsPrefix: ["-o"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: onExtract
-            ),
-        ]
+    /// Zips a directory under a single wrapping folder, as a real export would.
+    private func makeZip(
+        at url: URL,
+        wrapping payload: URL,
+        as wrapper: String
+    ) throws -> URL {
+        var entries: [ZipFixtureBuilder.Entry] = []
+        let enumerator = FileManager.default.enumerator(
+            at: payload,
+            includingPropertiesForKeys: [.isRegularFileKey]
+        )
+        let base = payload.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        while let item = enumerator?.nextObject() as? URL {
+            guard (try? item.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                continue
+            }
+            let components = item.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+            guard components.count > base.count else { continue }
+            let relative = components.dropFirst(base.count).joined(separator: "/")
+            entries.append(.file(path: "\(wrapper)/\(relative)", contents: try Data(contentsOf: item)))
+        }
+        return try ZipFixtureBuilder.build(at: url, entries: entries)
     }
 
     func testZipDescendsSingleWrapperFolderAndPlansNerfstudio() async throws {
@@ -296,27 +288,18 @@ final class DatasetInputPreflightTests: XCTestCase {
         // entries are omitted from the listing: the extractor's entry-path
         // validation accepts regular-file names only.
         let payload = try makeNerfstudioDataset(in: root)
-        let names = [
-            "wrapper/transforms.json",
-            "wrapper/images/frame_0001.jpg",
-            "wrapper/images/frame_0002.jpg",
-            "wrapper/images/frame_0003.jpg",
-        ]
-        let runner = MockSubprocessRunner(scripts: zipScripts(names: names) { args in
-            guard let index = args.firstIndex(of: "-d") else { return }
-            let destination = URL(fileURLWithPath: args[index + 1], isDirectory: true)
-            try FileManager.default.copyItem(
-                at: payload,
-                to: destination.appendingPathComponent("wrapper", isDirectory: true)
-            )
-        })
+        let archive = try makeZip(
+            at: root.appendingPathComponent("export.zip"),
+            wrapping: payload,
+            as: "wrapper"
+        )
 
         let prepared = try await prepare(
-            source: root.appendingPathComponent("export.zip"),
+            source: archive,
             isZip: true,
             kind: .nerfstudio,
             stagingParent: root,
-            runner: runner
+            runner: MockSubprocessRunner(scripts: [])
         )
         defer { prepared.discard() }
 
@@ -330,21 +313,15 @@ final class DatasetInputPreflightTests: XCTestCase {
     func testZipWithoutDatasetStructureThrowsArchiveNotADataset() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let names = ["wrapper/readme.txt"]
-        let runner = MockSubprocessRunner(scripts: zipScripts(names: names) { args in
-            guard let index = args.firstIndex(of: "-d") else { return }
-            let destination = URL(fileURLWithPath: args[index + 1], isDirectory: true)
-            let readme = destination.appendingPathComponent("wrapper/readme.txt")
-            try FileManager.default.createDirectory(
-                at: readme.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try Data("hello".utf8).write(to: readme)
-        })
+        let archive = try ZipFixtureBuilder.build(
+            at: root.appendingPathComponent("export.zip"),
+            entries: [.file(path: "wrapper/readme.txt", contents: Data("hello".utf8))]
+        )
+        let runner = MockSubprocessRunner(scripts: [])
 
         await assertThrows(.archiveNotADataset) {
             _ = try await self.prepare(
-                source: root.appendingPathComponent("export.zip"),
+                source: archive,
                 isZip: true,
                 kind: .nerfstudio,
                 stagingParent: root,

@@ -348,8 +348,7 @@ public struct DatasetInputPreflight {
         try SafeArchiveExtractor.extract(
             zipURL: source,
             to: extractionRoot,
-            limits: extractionLimits,
-            runner: runner
+            limits: extractionLimits
         )
         let root = descendSingleWrapper(extractionRoot)
         guard datasetAnchorPresent(kind: kind, datasetRoot: root) else {

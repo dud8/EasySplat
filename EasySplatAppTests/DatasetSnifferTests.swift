@@ -151,12 +151,55 @@ final class DatasetSnifferTests: XCTestCase {
         XCTAssertNil(DatasetSniffer.detect(at: missing))
     }
 
-    // MARK: - Zip detection (stubbed listing)
+    // MARK: - Zip detection
 
-    private func detection(forZipEntries entries: [String], exitCode: Int32 = 0) -> DatasetSniffer.DatasetDetection? {
-        let zipURL = root.appendingPathComponent("dataset.zip")
-        let runner = StubZipListingRunner(lines: entries, exitCode: exitCode)
-        return DatasetSniffer.detectInZip(at: zipURL, runner: runner)
+    /// Builds a real archive holding the named entries; detection reads its
+    /// central directory rather than a listing subprocess.
+    private func detection(
+        forZipEntries entries: [String],
+        unreadable: Bool = false
+    ) -> DatasetSniffer.DatasetDetection? {
+        let zipURL = root.appendingPathComponent("dataset-\(UUID().uuidString).zip")
+        if unreadable {
+            try? Data("not a zip".utf8).write(to: zipURL)
+            return DatasetSniffer.detectInZip(at: zipURL)
+        }
+        let payload = root.appendingPathComponent("payload-\(UUID().uuidString)", isDirectory: true)
+        // Trailing-slash names are directory markers, not files; creating them
+        // as files would block the nested entries that follow.
+        for entry in entries.sorted() {
+            let target = payload.appendingPathComponent(entry)
+            if entry.hasSuffix("/") {
+                try? FileManager.default.createDirectory(
+                    at: target,
+                    withIntermediateDirectories: true
+                )
+                continue
+            }
+            try? FileManager.default.createDirectory(
+                at: target.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? Data("x".utf8).write(to: target)
+        }
+        guard !entries.isEmpty else {
+            try? FileManager.default.createDirectory(at: payload, withIntermediateDirectories: true)
+            return DatasetSniffer.detectInZip(at: zipURL)
+        }
+        // Zip the top-level names rather than ".", so entries do not gain a
+        // "./" prefix that would consume the single-root-folder allowance.
+        let topLevel = (try? FileManager.default.contentsOfDirectory(
+            atPath: payload.path
+        )) ?? []
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        process.arguments = ["-q", "-r", "-X", zipURL.path] + topLevel.sorted()
+        process.currentDirectoryURL = payload
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+        return DatasetSniffer.detectInZip(at: zipURL)
     }
 
     func testZipDetectsColmapEntries() {
@@ -211,7 +254,7 @@ final class DatasetSnifferTests: XCTestCase {
     }
 
     func testZipListingFailureIsNotADataset() {
-        XCTAssertNil(detection(forZipEntries: [], exitCode: 1))
+        XCTAssertNil(detection(forZipEntries: [], unreadable: true))
     }
 
     // MARK: - Zip detection (real archive)
@@ -233,46 +276,5 @@ final class DatasetSnifferTests: XCTestCase {
 
 /// Emits a canned `zipinfo -1` listing so signature matching is exercised
 /// without touching a real archive.
-private struct StubZipListingRunner: SubprocessRunning {
-    let lines: [String]
-    let exitCode: Int32
 
-    func run(
-        _ launchPath: String,
-        _ arguments: [String],
-        currentDirectory: URL?,
-        environment: [String: String],
-        removingEnvironmentKeys: Set<String>,
-        onStdout: @escaping @Sendable (String) -> Void,
-        onStderr: @escaping @Sendable (String) -> Void
-    ) throws -> SubprocessResult {
-        lines.forEach(onStdout)
-        return SubprocessResult(
-            exitCode: exitCode,
-            terminationReason: .exit,
-            stdout: lines.joined(separator: "\n"),
-            stderr: ""
-        )
-    }
-
-    func runAsync(
-        _ launchPath: String,
-        _ arguments: [String],
-        currentDirectory: URL?,
-        environment: [String: String],
-        removingEnvironmentKeys: Set<String>,
-        onStdout: @escaping @Sendable (String) -> Void,
-        onStderr: @escaping @Sendable (String) -> Void
-    ) async throws -> SubprocessResult {
-        try run(
-            launchPath,
-            arguments,
-            currentDirectory: currentDirectory,
-            environment: environment,
-            removingEnvironmentKeys: removingEnvironmentKeys,
-            onStdout: onStdout,
-            onStderr: onStderr
-        )
-    }
-}
 #endif

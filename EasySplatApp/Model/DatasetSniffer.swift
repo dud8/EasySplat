@@ -151,22 +151,13 @@ enum DatasetSniffer {
     /// Peeks at a zip's entry names (no extraction) and matches the same
     /// signatures folder detection uses, allowing one leading root-folder
     /// prefix. Returns nil for any zip that fails to list or match, so the
-    /// caller can warn. Synchronous: the listing is a single short subprocess.
-    nonisolated static func detectInZip(
-        at url: URL,
-        runner: SubprocessRunning = SubprocessRunner()
-    ) -> DatasetDetection? {
-        let collector = ZipNameCollector()
-        guard let result = try? runner.run(
-            "/usr/bin/zipinfo",
-            ["-1", url.path],
-            onStdout: { collector.append($0) },
-            onStderr: { _ in }
-        ), result.exitCode == 0 else {
+    /// caller can warn. Reads the central directory directly.
+    nonisolated static func detectInZip(at url: URL) -> DatasetDetection? {
+        guard let names = try? SafeArchiveExtractor.entryNames(inZipAt: url),
+              !names.isEmpty else {
             return nil
         }
-        let paths = collector.paths()
-        guard !paths.isEmpty else { return nil }
+        let paths = Set(names)
         // Match at the archive root first; only when nothing matches there,
         // retry with a single wrapping folder stripped. Stripping first would
         // eat marker directories like a top-level `keyframes/`.

@@ -6,7 +6,7 @@ import Foundation
 /// The archive is inspected name-only before a single byte is written to disk: entries
 /// that are symbolic links, special files, absolute paths, path-traversal attempts, or
 /// case-insensitive collisions are rejected, and per-entry, aggregate, and entry-count
-/// limits are enforced from the ZIP central directory. After `/usr/bin/unzip` runs, the
+/// limits are enforced from the ZIP central directory. After the entries are written, the
 /// destination is walked to confirm that only regular files and directories landed.
 ///
 /// The name-only path validation and the archive listing mechanics are shared verbatim
@@ -136,12 +136,10 @@ public enum SafeArchiveExtractor {
     public static func extract(
         zipURL: URL,
         to destination: URL,
-        limits: ExtractionLimits = .default,
-        runner: SubprocessRunning
+        limits: ExtractionLimits = .default
     ) throws -> Inventory {
         let listing = try listArchive(
             zipURL: zipURL,
-            runner: runner,
             maximumListingBytes: listingByteBudget,
             maximumEntryCount: limits.maxEntryCount
         )
@@ -182,12 +180,24 @@ public enum SafeArchiveExtractor {
             throw ExtractionError.extractionRootUnavailable
         }
 
-        let result = try runner.run("/usr/bin/unzip", ["-o", zipURL.path, "-d", destination.path])
-        guard result.exitCode == 0 else {
+        do {
+            try writeEntries(zipURL: zipURL, to: destination)
+        } catch let error as ExtractionError {
+            throw error
+        } catch {
             throw ExtractionError.extractionFailed
         }
 
         return try inventory(of: destination)
+    }
+
+    /// Entry names as the archive declares them, without extracting anything.
+    public static func entryNames(inZipAt url: URL) throws -> [String] {
+        do {
+            return try ZipArchiveReader.readEntries(at: url).map(\.path)
+        } catch {
+            throw ExtractionError.listingFailed
+        }
     }
 
     // MARK: - Shared name-only validation
@@ -259,47 +269,74 @@ public enum SafeArchiveExtractor {
         let largestEntryBytes: UInt64
     }
 
-    /// List an archive name-only via `zipinfo -l` (types and uncompressed sizes) and
-    /// `unzip -Z1` (entry names), rejecting symbolic links and special files before names
-    /// are even collected.
+    /// List an archive name-only from its central directory, rejecting symbolic
+    /// links and special files before names are even collected.
     ///
     /// Shared with `ToolchainManager.inspectArchiveEntries`.
     static func listArchive(
         zipURL: URL,
-        runner: SubprocessRunning,
         maximumListingBytes: Int,
         maximumEntryCount: Int
     ) throws -> ArchiveListing {
-        let accumulator = ArchiveListingAccumulator(
-            maximumListingBytes: maximumListingBytes,
-            maximumEntryCount: maximumEntryCount
-        )
-
-        let metadata = try runner.run(
-            "/usr/bin/zipinfo",
-            ["-l", zipURL.path],
-            onStdout: accumulator.inspectMetadataLine
-        )
-        guard metadata.exitCode == 0 else {
-            throw ExtractionError.listingFailed
-        }
-        if accumulator.foundSymbolicLink() {
-            throw ExtractionError.symbolicLinkEntry
-        }
-        if accumulator.foundSpecialFile() {
-            throw ExtractionError.specialFileEntry
-        }
-
-        let names = try runner.run(
-            "/usr/bin/unzip",
-            ["-Z1", zipURL.path],
-            onStdout: accumulator.appendEntry
-        )
-        guard names.exitCode == 0 else {
+        let entries: [ZipArchiveReader.Entry]
+        do {
+            entries = try ZipArchiveReader.readEntries(at: zipURL)
+        } catch {
             throw ExtractionError.listingFailed
         }
 
-        return accumulator.snapshot()
+        var names: [String] = []
+        var listingBytes = 0
+        var breach: ListingLimitBreach = .none
+        var totalUncompressed: UInt64 = 0
+        var totalOverflowed = false
+        var largestName = ""
+        var largestBytes: UInt64 = 0
+
+        for entry in entries {
+            if entry.isSymbolicLink {
+                throw ExtractionError.symbolicLinkEntry
+            }
+            // A zip written on a Unix host records its mode; anything that is
+            // neither a plain file nor a directory has no business here.
+            let mode = entry.unixMode & S_IFMT
+            if mode != 0 && mode != S_IFREG && mode != S_IFDIR {
+                throw ExtractionError.specialFileEntry
+            }
+            if names.count >= maximumEntryCount {
+                breach = .entryCount
+                break
+            }
+            listingBytes += entry.path.utf8.count + 1
+            if listingBytes > maximumListingBytes {
+                breach = .byteBudget
+                break
+            }
+            names.append(entry.path)
+            if entry.isDirectory { continue }
+            let (sum, overflow) = totalUncompressed.addingReportingOverflow(entry.uncompressedSize)
+            if overflow {
+                totalOverflowed = true
+                totalUncompressed = UInt64.max
+            } else {
+                totalUncompressed = sum
+            }
+            if entry.uncompressedSize > largestBytes {
+                largestBytes = entry.uncompressedSize
+                largestName = entry.path
+            }
+        }
+
+        return ArchiveListing(
+            names: names,
+            breach: breach,
+            containsSymbolicLink: false,
+            containsSpecialFile: false,
+            totalUncompressedBytes: totalUncompressed,
+            totalOverflowed: totalOverflowed,
+            largestEntryName: largestName,
+            largestEntryBytes: largestBytes
+        )
     }
 
     // MARK: - Post-extraction inventory
@@ -456,5 +493,42 @@ final class ArchiveListingAccumulator: @unchecked Sendable {
             largestEntryName: largestEntryName,
             largestEntryBytes: largestEntryBytes
         )
+    }
+}
+
+extension SafeArchiveExtractor {
+    /// Materialise the archive under `destination`.
+    ///
+    /// Directories are created one component at a time and every file is opened
+    /// with `O_NOFOLLOW`, so a link planted between the check and the write
+    /// cannot redirect content outside the destination.
+    static func writeEntries(zipURL: URL, to destination: URL) throws {
+        let entries = try ZipArchiveReader.readEntries(at: zipURL)
+        let descriptor = destination.path.withCString {
+            open($0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else { throw ExtractionError.extractionRootUnavailable }
+        defer { close(descriptor) }
+
+        for entry in entries where !entry.isSymbolicLink {
+            let components = entry.path.split(separator: "/").map(String.init)
+            guard !components.isEmpty else { continue }
+            let directories = entry.isDirectory ? components : Array(components.dropLast())
+            var relative = ""
+            for component in directories {
+                relative = relative.isEmpty ? component : "\(relative)/\(component)"
+                let made = relative.withCString { mkdirat(descriptor, $0, 0o755) }
+                if made != 0 && errno != EEXIST {
+                    throw ExtractionError.extractionFailed
+                }
+            }
+            if entry.isDirectory { continue }
+            try ZipArchiveReader.extract(
+                entry: entry,
+                from: zipURL,
+                into: descriptor,
+                relativePath: entry.path
+            )
+        }
     }
 }

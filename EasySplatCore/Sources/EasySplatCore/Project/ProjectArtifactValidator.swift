@@ -155,6 +155,18 @@ public enum FinishedProjectArtifactValidationError: Error, LocalizedError, Equat
     }
 }
 
+/// Where a validated PLY is being published.
+///
+/// The hardened path opens the destination's directory and creates a temporary
+/// sibling before renaming it into place. Under App Sandbox a save panel grants
+/// the chosen file, not its directory, so that sequence cannot run for somewhere
+/// the user picked. Project-owned writes keep it; user-chosen writes swap in the
+/// system's own replace primitive, which is what the grant covers.
+public enum PlyPublicationDestination: Sendable, Equatable {
+    case projectOwned
+    case userSelected
+}
+
 struct PlyPublicationSystemCalls {
     var synchronize: (Int32) -> Int32
     var renameExclusively: (Int32, String, String) -> Int32
@@ -4220,12 +4232,14 @@ public enum ProjectArtifactValidator {
     /// visible at `destination`.
     public static func publishValidatedPly(
         from source: URL,
-        to destination: URL
+        to destination: URL,
+        destinationKind: PlyPublicationDestination = .projectOwned
     ) throws -> ValidatedPlyArtifactEvidence {
         try publishValidatedPly(
             from: source,
             to: destination,
             expected: nil,
+            destinationKind: destinationKind,
             systemCalls: .system(),
             shouldCancel: { Task.isCancelled }
         )
@@ -4234,12 +4248,14 @@ public enum ProjectArtifactValidator {
     public static func publishValidatedPly(
         from source: URL,
         to destination: URL,
-        expected: ExpectedPlyArtifactIdentity
+        expected: ExpectedPlyArtifactIdentity,
+        destinationKind: PlyPublicationDestination = .projectOwned
     ) throws -> ValidatedPlyArtifactEvidence {
         try publishValidatedPly(
             from: source,
             to: destination,
             expected: Optional(expected),
+            destinationKind: destinationKind,
             systemCalls: .system(),
             shouldCancel: { Task.isCancelled }
         )
@@ -4249,6 +4265,7 @@ public enum ProjectArtifactValidator {
         from source: URL,
         to destination: URL,
         expected: ExpectedPlyArtifactIdentity?,
+        destinationKind: PlyPublicationDestination = .projectOwned,
         systemCalls: PlyPublicationSystemCalls,
         shouldCancel: @escaping @Sendable () -> Bool = { Task.isCancelled }
     ) throws -> ValidatedPlyArtifactEvidence {
@@ -4275,6 +4292,16 @@ public enum ProjectArtifactValidator {
                 throw ProjectArtifactError.invalidOutput(source.lastPathComponent)
             }
         }
+        if destinationKind == .userSelected {
+            return try publishValidatedPlyToUserSelectedDestination(
+                sourceDescriptor: sourceDescriptor,
+                sourceEvidence: sourceEvidence,
+                destination: destination,
+                systemCalls: systemCalls,
+                shouldCancel: shouldCancel
+            )
+        }
+
         let destinationDirectory = destination.deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: destinationDirectory,
@@ -5482,5 +5509,88 @@ public enum ProjectArtifactError: Error, LocalizedError, Equatable {
         case .publicationConflictPreservingFiles(let path, let recoveredPaths):
             return "The destination changed while EasySplat was publishing: \(path). Displaced files were preserved as \(recoveredPaths.joined(separator: ", "))."
         }
+    }
+}
+
+extension ProjectArtifactValidator {
+    /// Publish to somewhere the user picked.
+    ///
+    /// A save-panel grant covers the chosen item, not its directory, so the
+    /// descriptor-bound sequence used for project-owned writes has nothing to
+    /// open. `replaceItemAt` is the system's own primitive for exactly this and
+    /// is what the grant admits. Losing the directory descriptor loses the
+    /// swap-under-us protections with it, so the published file is re-opened and
+    /// re-measured before the write is reported as good.
+    static func publishValidatedPlyToUserSelectedDestination(
+        sourceDescriptor: Int32,
+        sourceEvidence: ValidatedPlyArtifactEvidence,
+        destination: URL,
+        systemCalls: PlyPublicationSystemCalls,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> ValidatedPlyArtifactEvidence {
+        try throwIfCancellationRequested(shouldCancel)
+        var payload = Data()
+        payload.reserveCapacity(Int(sourceEvidence.byteCount))
+        var offset: Int64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
+        while offset < Int64(sourceEvidence.byteCount) {
+            try throwIfCancellationRequested(shouldCancel)
+            let requested = min(buffer.count, Int(sourceEvidence.byteCount - UInt64(offset)))
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                systemCalls.readAt(sourceDescriptor, bytes.baseAddress, requested, off_t(offset))
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0, count <= requested else {
+                throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+            }
+            payload.append(contentsOf: buffer[0..<count])
+            offset += Int64(count)
+        }
+        guard UInt64(payload.count) == sourceEvidence.byteCount else {
+            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+        }
+
+        let staging: URL
+        do {
+            staging = try FileManager.default.url(
+                for: .itemReplacementDirectory,
+                in: .userDomainMask,
+                appropriateFor: destination,
+                create: true
+            )
+        } catch {
+            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+        }
+        defer { try? FileManager.default.removeItem(at: staging) }
+
+        let candidate = staging.appendingPathComponent(destination.lastPathComponent)
+        do {
+            try payload.write(to: candidate, options: [.atomic])
+        } catch {
+            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+        }
+
+        do {
+            _ = try FileManager.default.replaceItemAt(
+                destination,
+                withItemAt: candidate,
+                backupItemName: nil,
+                options: [.usingNewMetadataOnly]
+            )
+        } catch {
+            // replaceItemAt needs the destination to exist on some volumes; a
+            // first export has nothing to replace.
+            do {
+                try payload.write(to: destination, options: [.atomic])
+            } catch {
+                throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+            }
+        }
+
+        let published = try validatedPlyEvidence(at: destination)
+        guard published == sourceEvidence else {
+            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+        }
+        return published
     }
 }
