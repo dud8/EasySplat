@@ -1256,13 +1256,9 @@ def validate_provenance(
         release_mode=release_mode,
     )
     artifacts = payload["artifacts"]
-    expected_keys = {
-        "dmg",
-        "manifest",
-        "core",
-        "geometry-da3-base",
-        "geometry-da3-small",
-    }
+    # The toolchain ships inside the app, so the disk image is the only
+    # published artifact; the closure sections still describe every embedded file.
+    expected_keys = {"dmg"}
     if set(artifacts) != expected_keys:
         fail("release provenance artifact allowlist is invalid")
     for identifier, row in artifacts.items():
@@ -1286,7 +1282,6 @@ def validate_provenance(
             fail(f"artifact {identifier} URL is invalid")
     local_artifacts = {
         "dmg": (dmg, dmg.name, MAX_RELEASE_ASSET_BYTES),
-        "manifest": (manifest, "manifest.json", 8 * 1_024 * 1_024),
     }
     for identifier, (
         local_path,
@@ -1310,10 +1305,6 @@ def validate_provenance(
         "dmg": (
             f"https://github.com/{source_repository}/releases/download/"
             f"v{urllib.parse.quote(app_version, safe='.-')}/{dmg.name}"
-        ),
-        "manifest": (
-            f"https://github.com/{source_repository}/releases/download/"
-            f"toolchain-v{urllib.parse.quote(toolchain_version, safe='.-')}/manifest.json"
         ),
     }
     for identifier, expected_url in expected_download_urls.items():
@@ -1393,15 +1384,13 @@ def expected_spdx_document(
     files = {row["path"]: row for row in component_payload["files"]}
     archive_rows = {
         archive["id"]: archive["entries"]
-        for archive in license_closure["archives"]["archives"]
+        for archive in license_closure["archives"]["embedded"]
     }
     app_id = "SPDXRef-Package-EasySplat"
     viewer_id = "SPDXRef-Package-MetalSplatter"
     artifact_ids = {
-        "manifest": "SPDXRef-Package-Toolchain-Manifest",
+        "dmg": "SPDXRef-Package-DiskImage",
         "core": "SPDXRef-Package-Toolchain-Core",
-        "geometry-da3-base": "SPDXRef-Package-Geometry-DA3-Base",
-        "geometry-da3-small": "SPDXRef-Package-Geometry-DA3-Small",
     }
     component_ids = {
         component_id: spdx_component_id(component_id) for component_id in components
@@ -1475,17 +1464,9 @@ def expected_spdx_document(
         },
     ]
     artifact_licenses = {
-        "manifest": "MIT",
-        "core": "LicenseRef-EasySplat-Toolchain-Closure",
-        "geometry-da3-base": "LicenseRef-EasySplat-Toolchain-Closure",
-        "geometry-da3-small": "LicenseRef-EasySplat-Toolchain-Closure",
+        "dmg": "LicenseRef-EasySplat-Toolchain-Closure",
     }
-    for identifier in (
-        "manifest",
-        "core",
-        "geometry-da3-base",
-        "geometry-da3-small",
-    ):
+    for identifier in ("dmg",):
         artifact = artifacts[identifier]
         license_id = artifact_licenses[identifier]
         packages.append(
@@ -1550,12 +1531,7 @@ def expected_spdx_document(
             "relatedSpdxElement": viewer_id,
         },
     ]
-    for identifier in (
-        "manifest",
-        "core",
-        "geometry-da3-base",
-        "geometry-da3-small",
-    ):
+    for identifier in ("dmg",):
         relationships.append(
             {
                 "spdxElementId": app_id,
@@ -1563,8 +1539,14 @@ def expected_spdx_document(
                 "relatedSpdxElement": artifact_ids[identifier],
             }
         )
-    for identifier in ("core", "geometry-da3-base", "geometry-da3-small"):
-        owners = sorted({row["component"] for row in archive_rows[identifier]})
+    for identifier in ("core",):
+        # A shared licence can be attributed to a component the app does not
+        # otherwise carry; the file ships, but there is no package to relate it to.
+        owners = sorted({
+            row["component"]
+            for row in archive_rows[identifier]
+            if row["component"] in component_ids
+        })
         for owner in owners:
             relationships.append(
                 {
@@ -2468,13 +2450,15 @@ def validate_open_license_archive(
 
     require_exact_keys(
         archive_closure,
-        {"schemaVersion", "toolchainVersion", "componentsSHA256", "archives"},
+        {"schemaVersion", "toolchainVersion", "componentsSHA256", "embedded"},
         "toolchain archive closure",
     )
-    archive_rows = archive_closure["archives"]
-    expected_archive_ids = ("core", "geometry-da3-base", "geometry-da3-small")
+    archive_rows = archive_closure["embedded"]
+    # The app carries one closure; nothing is published on its own any more, so
+    # the rows describe embedded content rather than downloadable archives.
+    expected_archive_ids = ("core",)
     if (
-        archive_closure["schemaVersion"] != 1
+        archive_closure["schemaVersion"] != 2
         or archive_closure["toolchainVersion"] != toolchain_version
         or archive_closure["componentsSHA256"] != components_sha
         or not isinstance(archive_rows, list)
@@ -2489,23 +2473,15 @@ def validate_open_license_archive(
             fail("toolchain archive closure row must be an object")
         require_exact_keys(
             archive_row,
-            {"id", "file", "sha256", "size", "entries"},
+            {"id", "entries"},
             f"toolchain archive closure {archive_id}",
         )
-        artifact = provenance_artifacts.get(archive_id)
         expected_entries = [
             row
             for row in file_rows
             if supply_chain_archive_for_path(row["path"]) == archive_id
         ]
-        if (
-            not isinstance(artifact, dict)
-            or archive_row["id"] != archive_id
-            or archive_row["file"] != artifact.get("file")
-            or archive_row["sha256"] != artifact.get("sha256")
-            or archive_row["size"] != artifact.get("size")
-            or archive_row["entries"] != expected_entries
-        ):
+        if archive_row["id"] != archive_id or archive_row["entries"] != expected_entries:
             fail(f"toolchain archive closure differs for {archive_id}")
     return {
         "components": components_payload,

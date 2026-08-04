@@ -490,18 +490,16 @@ def supply_chain_fixture(
         ]
     }
     closure_payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "toolchainVersion": TOOLCHAIN_VERSION,
         "componentsSHA256": component_sha,
-        "archives": [
+        "embedded": [
             {
                 "id": archive_id,
-                "file": artifact_rows[archive_id]["file"],
-                "sha256": artifact_rows[archive_id]["sha256"],
-                "size": artifact_rows[archive_id]["size"],
                 "entries": [row for row in files if row["component"] == component_id],
             }
             for archive_id, _path, component_id in archives
+            if archive_id == "core"
         ],
     }
     archive_path = root / "licenses.zip"
@@ -722,18 +720,16 @@ def production_supply_chain_fixture(
         ]
     }
     closure_payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "toolchainVersion": TOOLCHAIN_VERSION,
         "componentsSHA256": component_sha,
-        "archives": [
+        "embedded": [
             {
                 "id": archive_id,
-                "file": artifact_rows[archive_id]["file"],
-                "sha256": artifact_rows[archive_id]["sha256"],
-                "size": artifact_rows[archive_id]["size"],
                 "entries": archive_entries[archive_id],
             }
             for archive_id in archive_entries
+            if archive_id == "core"
         ],
     }
     archive_path = root / "licenses.zip"
@@ -784,7 +780,7 @@ def spdx_fixture(supply_chain: dict[str, object]) -> dict[str, object]:
         components={row["id"]: row for row in component_payload["components"]},
         files={row["path"]: row for row in component_payload["files"]},
         license_bytes={},
-        archive_rows={row["id"]: row["entries"] for row in closure_payload["archives"]},
+        archive_rows={row["id"]: row["entries"] for row in closure_payload["embedded"]},
     )
     return GENERATOR.build_spdx(
         supply_chain["provenance"],
@@ -2065,14 +2061,14 @@ class ArtifactContentTests(unittest.TestCase):
             )
 
             self.assertEqual(len(closure["components"]["components"]), 63)
-            base = next(
+            core = next(
                 row
-                for row in closure["archives"]["archives"]
-                if row["id"] == "geometry-da3-base"
+                for row in closure["archives"]["embedded"]
+                if row["id"] == "core"
             )
             self.assertIn(
-                "da3_mps/app/easysplat_da3_sfm/run.py",
-                {row["path"] for row in base["entries"]},
+                "bin/colmap",
+                {row["path"] for row in core["entries"]},
             )
 
     def test_license_archive_rejects_forged_public_legal_files(self) -> None:
@@ -2243,16 +2239,14 @@ class ArtifactContentTests(unittest.TestCase):
                 with self.subTest(mutation=mutation):
                     fixture = production_supply_chain_fixture(root / mutation)
                     closure = fixture["closure"]
-                    core, base, _small = closure["archives"]
+                    (core,) = closure["embedded"]
                     runtime = next(
-                        row
-                        for row in base["entries"]
-                        if row["path"] == "da3_mps/app/easysplat_da3_sfm/run.py"
+                        row for row in core["entries"] if row["path"] == "bin/colmap"
                     )
                     if mutation == "missing":
-                        base["entries"].remove(runtime)
+                        core["entries"].remove(runtime)
                     else:
-                        core["entries"].append(runtime)
+                        core["entries"].append(dict(runtime))
                     replace_zip_entry(
                         fixture["archive_path"],
                         "toolchain-closure.json",
@@ -2474,9 +2468,8 @@ class ArtifactContentTests(unittest.TestCase):
                     {"publishedAt": "2026-07-15T12:00:01Z"},
                 )
 
-    def test_release_metadata_creation_time_is_current_and_not_predated(self) -> None:
+    def test_release_metadata_creation_time_is_truncated_to_whole_seconds(self) -> None:
         created_at = GENERATOR.release_created_at(
-            "2026-07-15T12:00:00Z",
             now=GENERATOR.datetime(
                 2026,
                 7,
@@ -2489,13 +2482,6 @@ class ArtifactContentTests(unittest.TestCase):
             ),
         )
         self.assertEqual(created_at, "2026-07-15T12:00:01Z")
-        with self.assertRaisesRegex(GENERATOR.MetadataError, "predates"):
-            GENERATOR.release_created_at(
-                "2026-07-15T12:00:01Z",
-                now=GENERATOR.datetime(
-                    2026, 7, 15, 12, 0, 0, tzinfo=GENERATOR.timezone.utc
-                ),
-            )
 
     def test_semver_comparison_honors_prerelease_precedence(self) -> None:
         ordered = (
@@ -2576,7 +2562,9 @@ class ArtifactContentTests(unittest.TestCase):
                 f"EasySplat-{VERSION}+builder.1-unsigned.dmg",
             )
         with self.assertRaisesRegex(GENERATOR.MetadataError, "build metadata"):
-            GENERATOR.validate_archives({}, f"{TOOLCHAIN_VERSION}+builder.1")
+            GENERATOR.validate_toolchain_tree(
+                Path("/nonexistent"), f"{TOOLCHAIN_VERSION}+builder.1"
+            )
 
     def test_required_zip_entries_must_be_nonempty_regular_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2694,7 +2682,7 @@ class ArtifactContentTests(unittest.TestCase):
                 source_commit=COMMIT,
             )
 
-    def test_provenance_requires_exact_app_and_manifest_release_urls(self) -> None:
+    def test_provenance_requires_the_exact_app_release_url(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dmg = root / f"EasySplat-{VERSION}-unsigned.dmg"
@@ -2741,14 +2729,6 @@ class ArtifactContentTests(unittest.TestCase):
                         f"{source_prefix}/v{VERSION}/wrong.dmg",
                         dmg.read_bytes(),
                     ),
-                    "manifest": artifact(
-                        "manifest.json",
-                        f"{source_prefix}/toolchain-v{TOOLCHAIN_VERSION}/manifest.json",
-                        manifest.read_bytes(),
-                    ),
-                    "core": artifact("core.zip", f"{source_prefix}/toolchain-v{TOOLCHAIN_VERSION}/core.zip"),
-                    "geometry-da3-base": artifact("base.zip", f"{source_prefix}/toolchain-v{TOOLCHAIN_VERSION}/base.zip"),
-                    "geometry-da3-small": artifact("small.zip", f"{source_prefix}/toolchain-v{TOOLCHAIN_VERSION}/small.zip"),
                 },
             }
             provenance_path = root / "provenance.json"

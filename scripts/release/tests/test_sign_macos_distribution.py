@@ -22,6 +22,7 @@ assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 BUILD_DMG_SCRIPT = SCRIPT.parent / "build_dmg.sh"
+TOOLCHAIN_DIR = SCRIPT.parent.parent.parent / "Toolchains/out"
 BUILD_APP_SCRIPT = SCRIPT.parent / "build_app.sh"
 CREATE_DMG_SCRIPT = SCRIPT.parent / "create_dmg.sh"
 NOTARIZE_SCRIPT = SCRIPT.parent / "notarize_artifact.sh"
@@ -2135,16 +2136,10 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
             app_result = subprocess.run(
                 [
                     str(BUILD_APP_SCRIPT),
-                    "--manifest-url",
-                    "https://example.test/manifest.json",
-                    "--public-key-path",
-                    "/tmp/missing-public-key",
+                    "--toolchain-dir",
+                    os.fspath(TOOLCHAIN_DIR),
                     "--version",
                     "0.2.0",
-                    "--bootstrap-manifest",
-                    "/tmp/missing-manifest",
-                    "--bootstrap-core-archive",
-                    "/tmp/missing-core.zip",
                     "--build-root",
                     str(app_build),
                     "--production",
@@ -2168,15 +2163,8 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
                     "0.2.0",
                     "--toolchain-version",
                     "2.0.0",
-                    "--manifest-url",
-                    "https://example.test/manifest.json",
-                    "--core-artifact-url",
-                    "https://example.test/core.zip",
-                    "--da3-base-artifact-url",
-                    "https://example.test/base.zip",
-                    "--da3-small-artifact-url",
-                    "https://example.test/small.zip",
-                    "--use-existing-toolchain",
+                    "--toolchain-dir",
+                    os.fspath(TOOLCHAIN_DIR),
                     "--build-root",
                     str(dmg_build),
                     "--output-dir",
@@ -2203,7 +2191,6 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=15.0", source)
         self.assertIn("SDKROOT=macosx", source)
         self.assertIn("XCRUN_BIN=/usr/bin/xcrun", source)
-        self.assertIn("/usr/bin/swift run", source)
         self.assertNotIn("if ! xcrun -sdk macosx metal", source)
 
         dmg_source = BUILD_DMG_SCRIPT.read_text(encoding="utf-8")
@@ -2256,16 +2243,10 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
         app_result = subprocess.run(
             [
                 str(BUILD_APP_SCRIPT),
-                "--manifest-url",
-                "https://example.test/manifest.json",
-                "--public-key-path",
-                "/tmp/missing-public-key",
+                    "--toolchain-dir",
+                    os.fspath(TOOLCHAIN_DIR),
                 "--version",
                 "0.2.0",
-                "--bootstrap-manifest",
-                "/tmp/missing-manifest",
-                "--bootstrap-core-archive",
-                "/tmp/missing-core.zip",
                 "--production",
                 "--identity-fingerprint",
                 FINGERPRINT,
@@ -2291,15 +2272,8 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
                 "0.2.0",
                 "--toolchain-version",
                 "2.0.0",
-                "--manifest-url",
-                "https://example.test/manifest.json",
-                "--core-artifact-url",
-                "https://example.test/core.zip",
-                "--da3-base-artifact-url",
-                "https://example.test/base.zip",
-                "--da3-small-artifact-url",
-                "https://example.test/small.zip",
-                "--use-existing-toolchain",
+                    "--toolchain-dir",
+                    os.fspath(TOOLCHAIN_DIR),
                 "--production",
                 "--identity-fingerprint",
                 FINGERPRINT,
@@ -2358,7 +2332,7 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
             '/usr/bin/python3 -I '
             '"$ROOT/scripts/release/generate_release_metadata.py"'
         )
-        self.assertEqual(dmg_source.count(trusted_invocation), 2)
+        self.assertEqual(dmg_source.count(trusted_invocation), 1)
         self.assertNotIn(
             'python3 "$ROOT/scripts/release/generate_release_metadata.py"',
             dmg_source.replace(trusted_invocation, ""),
@@ -2424,15 +2398,7 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
         self.assertIn("--prepared-release-root", source)
         self.assertIn('PREPARED_APP="$PREPARED_RELEASE_ROOT/product/EasySplat.app"', source)
         self.assertIn('PREPARED_DSYM="$PREPARED_RELEASE_ROOT/product/EasySplat.app.dSYM"', source)
-        self.assertIn('--manifest-tool-bin', source)
-        self.assertIn('manifest_tool=("$MANIFEST_TOOL_BIN")', source)
-        self.assertIn(
-            'Trusted ManifestTool must be outside the prepared artifact.', source
-        )
-        self.assertNotIn(
-            'PREPARED_MANIFEST_TOOL="$PREPARED_RELEASE_ROOT/product/ManifestTool"',
-            source,
-        )
+        self.assertNotIn("ManifestTool", source)
         self.assertIn('if [ -n "$PREPARED_RELEASE_ROOT" ]; then', source)
         self.assertIn('SOURCE_COMMIT="$SOURCE_COMMIT_OVERRIDE"', source)
         self.assertIn(

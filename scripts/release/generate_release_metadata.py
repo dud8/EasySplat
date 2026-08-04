@@ -23,11 +23,6 @@ COMPONENTS_PATH = "supply-chain/components.json"
 LICENSE_COMPONENTS_PATH = "Toolchain/supply-chain/components.json"
 ARCHIVE_CLOSURE_PATH = "toolchain-closure.json"
 ARCHIVE_ORDER = ("core", "geometry-da3-base", "geometry-da3-small")
-MANIFEST_COMPONENT_NAMES = {
-    "core": "macos-arm64-core",
-    "geometry-da3-base": "geometry-da3-base",
-    "geometry-da3-small": "geometry-da3-small",
-}
 PLACEHOLDER = re.compile(r"(?:^|[^A-Za-z])(unknown|noassertion|none)(?:$|[^A-Za-z])", re.I)
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SOURCE_REVISION = re.compile(r"[0-9a-f]{7,64}")
@@ -129,19 +124,6 @@ def canonical_json_bytes(value: Any) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def validate_normal_photo_install_size(sizes: dict[str, int]) -> None:
-    if set(sizes) != set(ARCHIVE_ORDER):
-        fail("normal photo install size requires all release archives")
-    if any(not isinstance(size, int) or size <= 0 for size in sizes.values()):
-        fail("normal photo install archive sizes must be positive integers")
-    core_size = sizes["core"]
-    if core_size > MAX_CORE_DOWNLOAD_BYTES:
-        fail(f"core-only toolchain download exceeds 2.5 GB: {core_size} bytes")
-    total = sum(sizes.values())
-    if total > MAX_FULL_TOOLCHAIN_DOWNLOAD_BYTES:
-        fail(f"full optional toolchain download exceeds 6 GB: {total} bytes")
-
-
 def load_json(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -219,30 +201,23 @@ def archive_for_path(path: str) -> str:
     return "core"
 
 
-def archive_expanded_size(path: Path) -> int:
-    total = 0
+def read_components(toolchain_dir: Path) -> tuple[dict[str, Any], bytes]:
+    source = toolchain_dir / COMPONENTS_PATH
     try:
-        with zipfile.ZipFile(path) as archive:
-            for info in archive.infolist():
-                if info.is_dir():
-                    continue
-                if is_zip_symlink(info):
-                    fail(f"release archive contains a symbolic link: {info.filename}")
-                total += info.file_size
-                if total > 16 * 1024 * 1024 * 1024:
-                    fail(f"release archive expands beyond 16 GiB: {path}")
-    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
-        fail(f"cannot inspect expanded archive size for {path}: {exc}")
-    if total <= 0:
-        fail(f"release archive has no regular file payload: {path}")
-    return total
-
-
-@dataclass(frozen=True)
-class ArchiveSpec:
-    identifier: str
-    path: Path
-    download_url: str
+        if source.is_symlink() or not source.is_file():
+            fail(f"toolchain must contain one regular {COMPONENTS_PATH}")
+        if source.stat().st_size > 64 * 1024 * 1024:
+            fail("components.json is unreasonably large")
+        raw = source.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read {source}: {exc}")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(f"invalid {COMPONENTS_PATH}: {exc}")
+    if not isinstance(payload, dict):
+        fail("components.json must be an object")
+    return payload, raw
 
 
 @dataclass
@@ -253,26 +228,6 @@ class ValidatedClosure:
     files: dict[str, dict[str, Any]]
     license_bytes: dict[str, bytes]
     archive_rows: dict[str, list[dict[str, Any]]]
-
-
-def read_components(core: Path) -> tuple[dict[str, Any], bytes]:
-    try:
-        with zipfile.ZipFile(core) as archive:
-            matches = [entry for entry in archive.infolist() if entry.filename == COMPONENTS_PATH]
-            if len(matches) != 1 or matches[0].is_dir() or is_zip_symlink(matches[0]):
-                fail(f"core archive must contain one regular {COMPONENTS_PATH}")
-            if matches[0].file_size > 64 * 1024 * 1024:
-                fail("components.json is unreasonably large")
-            raw = archive.read(matches[0])
-    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
-        fail(f"cannot read core archive {core}: {exc}")
-    try:
-        payload = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        fail(f"invalid {COMPONENTS_PATH}: {exc}")
-    if not isinstance(payload, dict):
-        fail("components.json must be an object")
-    return payload, raw
 
 
 def validate_component_payload(
@@ -390,138 +345,96 @@ def validate_component_payload(
     return components, files, license_paths
 
 
-def inspect_archive(
-    spec: ArchiveSpec,
+def inspect_toolchain_tree(
+    toolchain_dir: Path,
     expected: dict[str, dict[str, Any]],
     license_paths: set[str],
 ) -> tuple[list[dict[str, Any]], dict[str, bytes]]:
-    expected_paths = set(expected)
-    if spec.identifier == "core":
-        expected_paths.add(COMPONENTS_PATH)
-    seen: set[str] = set()
+    """Verify the staged tree against the closure its own receipt declares.
+
+    The archives this replaced could hold entries the closure never mentioned, so
+    the check ran in both directions. A tree can too, and the walk keeps that.
+    """
     rows: list[dict[str, Any]] = []
     licenses: dict[str, bytes] = {}
-    try:
-        with zipfile.ZipFile(spec.path) as archive:
-            for info in archive.infolist():
-                raw_name = info.filename[:-1] if info.is_dir() and info.filename.endswith("/") else info.filename
-                path = safe_archive_path(raw_name, f"{spec.identifier} archive entry")
-                if info.is_dir():
-                    continue
-                if info.flag_bits & 0x1:
-                    fail(f"encrypted archive entry is forbidden: {path}")
-                if path in seen:
-                    fail(f"duplicate archive entry in {spec.identifier}: {path}")
-                seen.add(path)
-                if path == COMPONENTS_PATH:
-                    if spec.identifier != "core" or is_zip_symlink(info):
-                        fail(f"unexpected {COMPONENTS_PATH} entry")
-                    continue
-                row = expected.get(path)
-                if row is None:
-                    fail(f"unmapped archive file in {spec.identifier}: {path}")
-                kind = row["kind"]
-                if kind == "symlink":
-                    if not is_zip_symlink(info):
-                        fail(f"archive materialized closure symlink as a file: {path}")
-                    target_bytes = archive.read(info)
-                    try:
-                        target = target_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        fail(f"symlink target is not UTF-8: {path}")
-                    validate_symlink_target(path, target)
-                    if target != row["target"]:
-                        fail(f"symlink target mismatch: {path}")
+    seen: set[str] = set()
+
+    # The closure declares which subtrees make up the toolchain. Packaging writes
+    # its archives and temporaries beside them, so anything outside those
+    # subtrees is not part of the tree; anything unexpected inside one still is.
+    owned = {path.split("/", 1)[0] for path in expected} | {COMPONENTS_PATH.split("/", 1)[0]}
+
+    for entry in sorted(toolchain_dir.rglob("*")):
+        relative_root = entry.relative_to(toolchain_dir).parts[0]
+        if relative_root not in owned:
+            continue
+        relative = entry.relative_to(toolchain_dir).as_posix()
+        if entry.is_dir() and not entry.is_symlink():
+            continue
+        path = safe_archive_path(relative, "toolchain entry")
+        if path == COMPONENTS_PATH:
+            seen.add(path)
+            continue
+        row = expected.get(path)
+        if row is None:
+            fail(f"unmapped file in the staged toolchain: {path}")
+        seen.add(path)
+        kind = row["kind"]
+        if kind == "symlink":
+            if not entry.is_symlink():
+                fail(f"staged toolchain materialized closure symlink as a file: {path}")
+            target = os.readlink(entry)
+            validate_symlink_target(path, target)
+            if target != row["target"]:
+                fail(f"symlink target mismatch: {path}")
+        else:
+            if entry.is_symlink():
+                fail(f"staged toolchain replaced regular file with a symlink: {path}")
+            metadata = entry.stat()
+            if metadata.st_size != row["size"]:
+                fail(f"size mismatch for {path}")
+            with entry.open("rb") as stream:
+                if kind == "mach-o":
+                    digest = sha256_arm64_macho_stream(stream, path)
                 else:
-                    if is_zip_symlink(info):
-                        fail(f"archive replaced regular file with a symlink: {path}")
-                    if info.file_size != row["size"]:
-                        fail(f"size mismatch for {path}")
-                    with archive.open(info) as stream:
-                        if kind == "mach-o":
-                            digest = sha256_arm64_macho_stream(stream, path)
-                        else:
-                            digest = sha256_stream(stream)
-                    if digest != row["sha256"]:
-                        fail(f"checksum mismatch for {path}")
-                    if path in license_paths:
-                        licenses[path] = archive.read(info)
-                rows.append(dict(row))
-    except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
-        fail(f"cannot inspect {spec.identifier} archive {spec.path}: {exc}")
+                    digest = sha256_stream(stream)
+            if digest != row["sha256"]:
+                fail(f"checksum mismatch for {path}")
+            if path in license_paths:
+                licenses[path] = entry.read_bytes()
+        rows.append(dict(row))
+
+    expected_paths = set(expected) | {COMPONENTS_PATH}
     if seen != expected_paths:
         missing = sorted(expected_paths - seen)
         extra = sorted(seen - expected_paths)
-        fail(f"{spec.identifier} archive closure mismatch; missing={missing[:5]} extra={extra[:5]}")
+        fail(f"staged toolchain closure mismatch; missing={missing[:5]} extra={extra[:5]}")
     return sorted(rows, key=lambda row: row["path"]), licenses
 
 
-def validate_archives(specs: dict[str, ArchiveSpec], expected_version: str) -> ValidatedClosure:
+def validate_toolchain_tree(toolchain_dir: Path, expected_version: str) -> ValidatedClosure:
     reject_semver_build_metadata(expected_version, "toolchain version")
-    if set(specs) != set(ARCHIVE_ORDER):
-        fail("release requires core, DA3 Base, and DA3 Small archives")
-    validate_normal_photo_install_size({
-        identifier: specs[identifier].path.stat().st_size for identifier in ARCHIVE_ORDER
-    })
-    payload, raw = read_components(specs["core"].path)
+    payload, raw = read_components(toolchain_dir)
     components, files, license_paths = validate_component_payload(payload, expected_version)
-    archive_rows: dict[str, list[dict[str, Any]]] = {}
-    license_bytes: dict[str, bytes] = {}
-    for identifier in ARCHIVE_ORDER:
-        expected = {
-            path: row for path, row in files.items() if archive_for_path(path) == identifier
-        }
-        rows, archive_licenses = inspect_archive(specs[identifier], expected, license_paths)
-        archive_rows[identifier] = rows
-        for path, data in archive_licenses.items():
-            if path in license_bytes:
-                fail(f"license file appears in multiple archives: {path}")
-            license_bytes[path] = data
-    if set(license_bytes) != license_paths:
-        fail(f"license closure is incomplete: {sorted(license_paths - set(license_bytes))[:5]}")
-    return ValidatedClosure(payload, raw, components, files, license_bytes, archive_rows)
-
-
-def validate_manifest(
-    path: Path, toolchain_version: str, specs: dict[str, ArchiveSpec]
-) -> str:
-    manifest = load_json(path, "signed toolchain manifest")
-    if manifest.get("schemaVersion") != 2 or manifest.get("toolchainAPI") != 2:
-        fail("toolchain manifest must use schema and API 2")
-    if manifest.get("version") != toolchain_version:
-        fail("toolchain manifest version does not match the release")
-    published_at = require_text(manifest.get("publishedAt"), "manifest publishedAt")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", published_at):
-        fail("manifest publishedAt must be a UTC ISO-8601 timestamp")
-    require_text(manifest.get("keyID"), "manifest keyID")
-    require_text(manifest.get("signatureEd25519"), "manifest signature")
-    rows = manifest.get("components")
-    if not isinstance(rows, list):
-        fail("toolchain manifest components are missing")
-    by_name: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            fail("toolchain manifest component is not an object")
-        name = require_text(row.get("name"), "manifest component name")
-        if name in by_name:
-            fail(f"duplicate manifest component: {name}")
-        by_name[name] = row
-    expected_names = set(MANIFEST_COMPONENT_NAMES.values())
-    if set(by_name) != expected_names:
-        fail("toolchain manifest component set does not match release archives")
-    for identifier, component_name in MANIFEST_COMPONENT_NAMES.items():
-        row = by_name[component_name]
-        spec = specs[identifier]
-        url = validate_https_url(row.get("url"), f"manifest {component_name} URL", allow_loopback=True)
-        if url != spec.download_url:
-            fail(f"manifest URL mismatch for {component_name}")
-        if (
-            row.get("sha256") != sha256_file(spec.path)
-            or row.get("sizeBytes") != spec.path.stat().st_size
-            or row.get("expandedSizeBytes") != archive_expanded_size(spec.path)
-        ):
-            fail(f"manifest checksum or size mismatch for {component_name}")
-    return published_at
+    # Only the component the app embeds is verified; the remaining rows describe
+    # tooling this release does not carry.
+    embedded = {
+        path: row for path, row in files.items() if archive_for_path(path) == "core"
+    }
+    # A component ships only if every file it declares is embedded; the rest
+    # describe tooling this release does not carry.
+    shipped = {
+        component_id: component
+        for component_id, component in components.items()
+        if component["files"] and all(path in embedded for path in component["files"])
+    }
+    rows, license_bytes = inspect_toolchain_tree(toolchain_dir, embedded, license_paths)
+    declared = {path for path in license_paths if archive_for_path(path) == "core"}
+    if set(license_bytes) != declared:
+        fail(f"license closure is incomplete: {sorted(declared - set(license_bytes))[:5]}")
+    return ValidatedClosure(
+        payload, raw, shipped, embedded, license_bytes, {"core": rows}
+    )
 
 
 def parse_utc_timestamp(value: str, label: str) -> datetime:
@@ -533,16 +446,11 @@ def parse_utc_timestamp(value: str, label: str) -> datetime:
         fail(f"{label} must be a UTC ISO-8601 timestamp: {error}")
 
 
-def release_created_at(
-    published_at: str, *, now: datetime | None = None
-) -> str:
-    published = parse_utc_timestamp(published_at, "manifest publishedAt")
+def release_created_at(*, now: datetime | None = None) -> str:
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None or current.utcoffset() is None:
         fail("release metadata creation time must include a UTC offset")
     current = current.astimezone(timezone.utc).replace(microsecond=0)
-    if current < published:
-        fail("release metadata creation time predates the toolchain manifest")
     return current.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
@@ -571,9 +479,6 @@ def build_provenance(
     source_commit: str,
     created_at: str,
     dmg: Path,
-    manifest: Path,
-    manifest_url: str,
-    specs: dict[str, ArchiveSpec],
     closure: ValidatedClosure,
     viewer_license: Path,
 ) -> dict[str, Any]:
@@ -582,14 +487,6 @@ def build_provenance(
         fail("source commit must be a hexadecimal revision")
     artifacts = {
         "dmg": artifact_row(dmg, release_asset_url(source_url, app_version, dmg.name)),
-        "manifest": artifact_row(manifest, manifest_url),
-        "core": artifact_row(specs["core"].path, specs["core"].download_url),
-        "geometry-da3-base": artifact_row(
-            specs["geometry-da3-base"].path, specs["geometry-da3-base"].download_url
-        ),
-        "geometry-da3-small": artifact_row(
-            specs["geometry-da3-small"].path, specs["geometry-da3-small"].download_url
-        ),
     }
     viewer_digest, viewer_file_count = vendored_viewer_source(viewer_license)
     return {
@@ -674,10 +571,8 @@ def build_spdx(
     viewer_id = "SPDXRef-Package-MetalSplatter"
     viewer = provenance["sourceDependencies"]["MetalSplatter"]
     artifact_ids = {
-        "manifest": "SPDXRef-Package-Toolchain-Manifest",
+        "dmg": "SPDXRef-Package-DiskImage",
         "core": "SPDXRef-Package-Toolchain-Core",
-        "geometry-da3-base": "SPDXRef-Package-Geometry-DA3-Base",
-        "geometry-da3-small": "SPDXRef-Package-Geometry-DA3-Small",
     }
     component_ids = {
         component_id: spdx_id("Package-Component", component_id)
@@ -739,12 +634,9 @@ def build_spdx(
         }],
     }]
     artifact_licenses = {
-        "manifest": "MIT",
-        "core": "LicenseRef-EasySplat-Toolchain-Closure",
-        "geometry-da3-base": "LicenseRef-EasySplat-Toolchain-Closure",
-        "geometry-da3-small": "LicenseRef-EasySplat-Toolchain-Closure",
+        "dmg": "LicenseRef-EasySplat-Toolchain-Closure",
     }
-    for identifier in ("manifest", *ARCHIVE_ORDER):
+    for identifier in ("dmg",):
         row = artifacts[identifier]
         packages.append({
             "SPDXID": artifact_ids[identifier],
@@ -794,14 +686,21 @@ def build_spdx(
         "relationshipType": "STATIC_LINK",
         "relatedSpdxElement": viewer_id,
     }]
-    for identifier in ("manifest", *ARCHIVE_ORDER):
+    for identifier in ("dmg",):
         relationships.append({
             "spdxElementId": app_id,
             "relationshipType": "DEPENDS_ON",
             "relatedSpdxElement": artifact_ids[identifier],
         })
-    for identifier in ARCHIVE_ORDER:
-        owners = sorted({row["component"] for row in closure.archive_rows[identifier]})
+    for identifier in ("core",):
+        # A shared licence can be attributed to a component the app does not
+        # otherwise carry; the file still ships, but there is no package to
+        # relate it to.
+        owners = sorted({
+            row["component"]
+            for row in closure.archive_rows[identifier]
+            if row["component"] in component_ids
+        })
         for owner in owners:
             relationships.append({
                 "spdxElementId": artifact_ids[identifier],
@@ -857,26 +756,20 @@ def build_spdx(
     }
 
 
-def build_archive_closure(
-    specs: dict[str, ArchiveSpec], closure: ValidatedClosure
-) -> dict[str, Any]:
+def build_archive_closure(closure: ValidatedClosure) -> dict[str, Any]:
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "toolchainVersion": closure.payload["toolchainVersion"],
         "componentsSHA256": sha256_bytes(closure.raw),
-        "archives": [{
-            "id": identifier,
-            "file": specs[identifier].path.name,
-            "sha256": sha256_file(specs[identifier].path),
-            "size": specs[identifier].path.stat().st_size,
-            "entries": closure.archive_rows[identifier],
-        } for identifier in ARCHIVE_ORDER],
+        "embedded": [{
+            "id": "core",
+            "entries": closure.archive_rows["core"],
+        }],
     }
 
 
 def license_payload(
     closure: ValidatedClosure,
-    specs: dict[str, ArchiveSpec],
     app_license: Path,
     notice: Path,
     viewer_license: Path,
@@ -887,7 +780,7 @@ def license_payload(
             "EasySplat/NOTICE.md": notice.read_bytes(),
             "MetalSplatter/LICENSE": viewer_license.read_bytes(),
             LICENSE_COMPONENTS_PATH: closure.raw,
-            ARCHIVE_CLOSURE_PATH: canonical_json_bytes(build_archive_closure(specs, closure)),
+            ARCHIVE_CLOSURE_PATH: canonical_json_bytes(build_archive_closure(closure)),
         }
     except OSError as exc:
         fail(f"cannot read application license material: {exc}")
@@ -953,7 +846,7 @@ def verify_license_zip(path: Path, expected: dict[str, bytes]) -> None:
         fail(f"license ZIP is missing entries: {sorted(set(expected) - seen)[:5]}")
 
 
-def common_args(parser: argparse.ArgumentParser, *, require_urls: bool) -> None:
+def common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--app-version", required=True)
     parser.add_argument("--toolchain-version", required=True)
     parser.add_argument(
@@ -962,36 +855,15 @@ def common_args(parser: argparse.ArgumentParser, *, require_urls: bool) -> None:
         required=True,
     )
     parser.add_argument("--dmg", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--manifest-url", required=require_urls)
-    parser.add_argument("--core", type=Path, required=True)
-    parser.add_argument("--core-url", required=require_urls)
-    parser.add_argument("--da3-base", type=Path, required=True)
-    parser.add_argument("--da3-base-url", required=require_urls)
-    parser.add_argument("--da3-small", type=Path, required=True)
-    parser.add_argument("--da3-small-url", required=require_urls)
+    parser.add_argument("--toolchain-dir", type=Path, required=True)
     parser.add_argument("--app-license", type=Path, required=True)
     parser.add_argument("--notice", type=Path, required=True)
     parser.add_argument("--viewer-license", type=Path, required=True)
 
 
-def specs_from_args(args: argparse.Namespace) -> dict[str, ArchiveSpec]:
-    return {
-        "core": ArchiveSpec("core", args.core, args.core_url),
-        "geometry-da3-base": ArchiveSpec(
-            "geometry-da3-base", args.da3_base, args.da3_base_url
-        ),
-        "geometry-da3-small": ArchiveSpec(
-            "geometry-da3-small", args.da3_small, args.da3_small_url
-        ),
-    }
-
-
 def generate(args: argparse.Namespace) -> None:
-    specs = specs_from_args(args)
-    closure = validate_archives(specs, args.toolchain_version)
-    published_at = validate_manifest(args.manifest, args.toolchain_version, specs)
-    created_at = release_created_at(published_at)
+    closure = validate_toolchain_tree(args.toolchain_dir, args.toolchain_version)
+    created_at = release_created_at()
     provenance = build_provenance(
         app_version=args.app_version,
         toolchain_version=args.toolchain_version,
@@ -1000,9 +872,6 @@ def generate(args: argparse.Namespace) -> None:
         source_commit=args.source_commit,
         created_at=created_at,
         dmg=args.dmg,
-        manifest=args.manifest,
-        manifest_url=args.manifest_url,
-        specs=specs,
         closure=closure,
         viewer_license=args.viewer_license,
     )
@@ -1011,29 +880,15 @@ def generate(args: argparse.Namespace) -> None:
     args.spdx_out.write_bytes(canonical_json_bytes(spdx))
     write_license_zip(
         args.licenses_out,
-        license_payload(closure, specs, args.app_license, args.notice, args.viewer_license),
+        license_payload(closure, args.app_license, args.notice, args.viewer_license),
     )
 
 
 def verify(args: argparse.Namespace) -> None:
     provenance = load_json(args.provenance, "release provenance")
-    artifact_claims = provenance.get("artifacts")
-    if not isinstance(artifact_claims, dict):
-        fail("release provenance artifacts are missing")
-    try:
-        args.manifest_url = artifact_claims["manifest"]["downloadURL"]
-        args.core_url = artifact_claims["core"]["downloadURL"]
-        args.da3_base_url = artifact_claims["geometry-da3-base"]["downloadURL"]
-        args.da3_small_url = artifact_claims["geometry-da3-small"]["downloadURL"]
-    except (KeyError, TypeError):
-        fail("release provenance artifact download URLs are incomplete")
-    specs = specs_from_args(args)
-    closure = validate_archives(specs, args.toolchain_version)
-    published_at = validate_manifest(args.manifest, args.toolchain_version, specs)
+    closure = validate_toolchain_tree(args.toolchain_dir, args.toolchain_version)
     created_at = require_text(provenance.get("createdAt"), "release provenance createdAt")
-    created = parse_utc_timestamp(created_at, "release provenance createdAt")
-    if created < parse_utc_timestamp(published_at, "manifest publishedAt"):
-        fail("release provenance creation time predates the toolchain manifest")
+    parse_utc_timestamp(created_at, "release provenance createdAt")
     expected_provenance = build_provenance(
         app_version=args.app_version,
         toolchain_version=args.toolchain_version,
@@ -1042,34 +897,26 @@ def verify(args: argparse.Namespace) -> None:
         source_commit=args.source_commit,
         created_at=created_at,
         dmg=args.dmg,
-        manifest=args.manifest,
-        manifest_url=args.manifest_url,
-        specs=specs,
         closure=closure,
         viewer_license=args.viewer_license,
     )
-    if provenance != expected_provenance:
-        fail("release provenance does not exactly match shipped artifacts")
+    if canonical_json_bytes(provenance) != canonical_json_bytes(expected_provenance):
+        fail("release provenance does not match the built artifacts")
     expected_spdx = build_spdx(expected_provenance, closure, args.licenses.name)
-    if load_json(args.spdx, "SPDX document") != expected_spdx:
-        fail("SPDX document does not exactly match the release closure")
+    if canonical_json_bytes(load_json(args.spdx, "release SBOM")) != canonical_json_bytes(
+        expected_spdx
+    ):
+        fail("release SBOM does not match the built artifacts")
     verify_license_zip(
         args.licenses,
-        license_payload(closure, specs, args.app_license, args.notice, args.viewer_license),
+        license_payload(closure, args.app_license, args.notice, args.viewer_license),
     )
-
-
-def verify_toolchain(args: argparse.Namespace) -> None:
-    specs = specs_from_args(args)
-    validate_archives(specs, args.toolchain_version)
-    validate_manifest(args.manifest, args.toolchain_version, specs)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     generate_parser = subparsers.add_parser("generate")
-    common_args(generate_parser, require_urls=True)
+    common_args(generate_parser)
     generate_parser.add_argument("--source-url", required=True)
     generate_parser.add_argument("--source-commit", required=True)
     generate_parser.add_argument("--provenance-out", type=Path, required=True)
@@ -1077,23 +924,13 @@ def parse_args() -> argparse.Namespace:
     generate_parser.add_argument("--licenses-out", type=Path, required=True)
     generate_parser.set_defaults(operation=generate)
     verify_parser = subparsers.add_parser("verify")
-    common_args(verify_parser, require_urls=False)
+    common_args(verify_parser)
     verify_parser.add_argument("--source-url", required=True)
     verify_parser.add_argument("--source-commit", required=True)
     verify_parser.add_argument("--provenance", type=Path, required=True)
     verify_parser.add_argument("--spdx", type=Path, required=True)
     verify_parser.add_argument("--licenses", type=Path, required=True)
     verify_parser.set_defaults(operation=verify)
-    toolchain_parser = subparsers.add_parser("verify-toolchain")
-    toolchain_parser.add_argument("--toolchain-version", required=True)
-    toolchain_parser.add_argument("--manifest", type=Path, required=True)
-    toolchain_parser.add_argument("--core", type=Path, required=True)
-    toolchain_parser.add_argument("--core-url", required=True)
-    toolchain_parser.add_argument("--da3-base", type=Path, required=True)
-    toolchain_parser.add_argument("--da3-base-url", required=True)
-    toolchain_parser.add_argument("--da3-small", type=Path, required=True)
-    toolchain_parser.add_argument("--da3-small-url", required=True)
-    toolchain_parser.set_defaults(operation=verify_toolchain)
     return parser.parse_args()
 
 
