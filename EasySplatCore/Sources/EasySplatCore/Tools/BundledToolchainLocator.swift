@@ -1,5 +1,18 @@
 import Foundation
 
+/// How far a toolchain's build receipts can be trusted to describe the bytes on
+/// disk.
+///
+/// Receipts record the executable a build produced. Distribution signing rewrites
+/// that executable afterwards, so inside a signed bundle the receipt digest and
+/// the shipped bytes belong to different domains and comparing them is a
+/// guaranteed failure rather than a check. The app's own signature covers the
+/// helpers there. An unsigned tree has no such cover, so the digests must agree.
+public enum ToolchainIntegrityPolicy: String, Sendable, Equatable, Codable {
+    case signedAppBundle
+    case unsignedDevelopmentTree
+}
+
 /// Where a run's toolchain binaries come from.
 ///
 /// Release builds execute only the helpers sealed inside the signed app bundle.
@@ -40,6 +53,13 @@ public enum ToolchainSource: Sendable, Equatable {
     public var isDevelopmentOverride: Bool {
         if case .developmentOverride = self { return true }
         return false
+    }
+
+    public var integrityPolicy: ToolchainIntegrityPolicy {
+        switch self {
+        case .appBundle: return .signedAppBundle
+        case .developmentOverride: return .unsignedDevelopmentTree
+        }
     }
 }
 

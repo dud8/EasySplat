@@ -12,12 +12,14 @@ extension ToolchainInstallationEvidence {
         root: URL,
         dataRoot: URL? = nil,
         toolchainIdentity: String,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree,
         using manager: ToolchainManager = ToolchainManager()
     ) throws -> ToolchainInstallationEvidence {
         try manager.installedTreeEvidence(
             root: root,
             dataRoot: dataRoot,
-            toolchainIdentity: toolchainIdentity
+            toolchainIdentity: toolchainIdentity,
+            integrityPolicy: integrityPolicy
         )
     }
 }
@@ -35,7 +37,8 @@ extension ToolchainManager {
     public func installedTreeEvidence(
         root: URL,
         dataRoot: URL? = nil,
-        toolchainIdentity: String
+        toolchainIdentity: String,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree
     ) throws -> ToolchainInstallationEvidence {
         var sources = [(root: root, paths: try installedTreeRelativePaths(root: root))]
         if let dataRoot, dataRoot.standardizedFileURL.path != root.standardizedFileURL.path {
@@ -52,6 +55,7 @@ extension ToolchainManager {
         )
         return ToolchainInstallationEvidence(
             toolchainVersion: toolchainIdentity,
+            integrityPolicy: integrityPolicy,
             keyID: "",
             canonicalManifestSHA256: "",
             signatureSHA256: "",

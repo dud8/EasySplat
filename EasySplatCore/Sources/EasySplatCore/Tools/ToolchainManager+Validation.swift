@@ -10,7 +10,8 @@ extension ToolchainManager {
         metallib: URL? = nil,
         requiredCapabilities: Set<ToolchainCapability>,
         repairExecutablePermissions: Bool = true,
-        toolchainIdentity: String
+        toolchainIdentity: String,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree
     ) throws -> ToolchainPaths {
         let payloadRoot = dataRoot ?? root
         let colmap = root.appendingPathComponent("bin/colmap")
@@ -201,6 +202,7 @@ extension ToolchainManager {
         }
 
         let runtimeVersion = try validateNativeMsplatClosure(
+            integrityPolicy: integrityPolicy,
             root: root,
             dataRoot: payloadRoot,
             executable: msplat,
@@ -223,6 +225,7 @@ extension ToolchainManager {
             root: root,
             dataRoot: payloadRoot,
             toolchainIdentity: toolchainIdentity,
+            integrityPolicy: integrityPolicy,
             colmap: colmap,
             msplat: msplat,
             metallib: msplatMetallib,
@@ -346,6 +349,7 @@ extension ToolchainManager {
     }
 
     func validateNativeMsplatClosure(
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree,
         root: URL,
         dataRoot: URL,
         executable: URL,
@@ -429,10 +433,20 @@ extension ToolchainManager {
             }
         }
 
-        return try validateMsplatBuildInfo(at: buildInfo, executable: executable, metallib: metallib)
+        return try validateMsplatBuildInfo(
+            at: buildInfo,
+            executable: executable,
+            metallib: metallib,
+            integrityPolicy: integrityPolicy
+        )
     }
 
-    func validateMsplatBuildInfo(at url: URL, executable: URL, metallib: URL) throws -> String {
+    func validateMsplatBuildInfo(
+        at url: URL,
+        executable: URL,
+        metallib: URL,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree
+    ) throws -> String {
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -641,11 +655,13 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("msplat build_info.json build_timestamp is not ISO 8601.")
         }
 
-        let executableHash = try sha256Hex(url: executable)
-        guard executableHash == payload["executable_sha256"] as? String else {
-            throw ToolchainError.invalidToolchain(
-                "msplat build_info.json executable_sha256 mismatch."
-            )
+        if integrityPolicy == .unsignedDevelopmentTree {
+            let executableHash = try sha256Hex(url: executable)
+            guard executableHash == payload["executable_sha256"] as? String else {
+                throw ToolchainError.invalidToolchain(
+                    "msplat build_info.json executable_sha256 mismatch."
+                )
+            }
         }
         let metallibHash = try sha256Hex(url: metallib)
         guard metallibHash == payload["metallib_sha256"] as? String else {

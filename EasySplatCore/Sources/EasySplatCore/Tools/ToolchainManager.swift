@@ -9,6 +9,8 @@ public struct ToolchainPaths: Sendable {
     public var dataRoot: URL
     /// Identity persisted with per-project geometry provenance.
     public var toolchainIdentity: String
+    /// How far this tree's build receipts describe the bytes on disk.
+    public var integrityPolicy: ToolchainIntegrityPolicy
     public var colmap: URL
     public var msplat: URL
     public var metallib: URL
@@ -18,6 +20,7 @@ public struct ToolchainPaths: Sendable {
         root: URL,
         dataRoot: URL,
         toolchainIdentity: String,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree,
         colmap: URL,
         msplat: URL,
         metallib: URL,
@@ -26,6 +29,7 @@ public struct ToolchainPaths: Sendable {
         self.root = root
         self.dataRoot = dataRoot
         self.toolchainIdentity = toolchainIdentity
+        self.integrityPolicy = integrityPolicy
         self.colmap = colmap
         self.msplat = msplat
         self.metallib = metallib
@@ -99,6 +103,7 @@ public struct ToolchainInstallationEvidence: Sendable, Equatable {
     }
 
     public let toolchainVersion: String
+    public let integrityPolicy: ToolchainIntegrityPolicy
     public let keyID: String
     public let canonicalManifestSHA256: String
     public let signatureSHA256: String
@@ -113,6 +118,7 @@ public struct ToolchainInstallationEvidence: Sendable, Equatable {
 
     public init(
         toolchainVersion: String,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree,
         keyID: String,
         canonicalManifestSHA256: String,
         signatureSHA256: String,
@@ -126,6 +132,7 @@ public struct ToolchainInstallationEvidence: Sendable, Equatable {
         provenanceRecords: [ProvenanceRecord] = []
     ) {
         self.toolchainVersion = toolchainVersion
+        self.integrityPolicy = integrityPolicy
         self.keyID = keyID
         self.canonicalManifestSHA256 = canonicalManifestSHA256
         self.signatureSHA256 = signatureSHA256
@@ -252,7 +259,8 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             metallib: source.metallib,
             requiredCapabilities: request.capabilities,
             repairExecutablePermissions: source.isDevelopmentOverride,
-            toolchainIdentity: toolchainIdentity(for: source)
+            toolchainIdentity: toolchainIdentity(for: source),
+            integrityPolicy: source.integrityPolicy
         )
         recordValidation(key: key, capabilities: request.capabilities, paths: paths)
         onProgress(1.0, "Tools ready")

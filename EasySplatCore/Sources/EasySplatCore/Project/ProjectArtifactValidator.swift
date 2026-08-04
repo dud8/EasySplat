@@ -1342,8 +1342,9 @@ public enum ProjectArtifactValidator {
                     == geometry.provenance.solver.version,
                   colmapRecord.stringFields["source_commit"]
                     == geometry.provenance.solver.revision,
-                  colmapRecord.stringFields["executable_sha256"]
-                    == runtimeClosure.sha256(for: "bin/colmap"),
+                  installation.integrityPolicy != .unsignedDevelopmentTree
+                    || colmapRecord.stringFields["executable_sha256"]
+                        == runtimeClosure.sha256(for: "bin/colmap"),
                   geometry.solverVersion.hasSuffix(
                     "COLMAP \(geometry.provenance.solver.version) "
                         + "(git \(geometry.provenance.solver.revision.prefix(7)))"

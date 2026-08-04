@@ -5,8 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/strict_semver.sh
 source "$ROOT/scripts/release/lib/strict_semver.sh"
-MANIFEST_URL=""
-PUBLIC_KEY_PATH=""
+TOOLCHAIN_DIR=""
 PROJECT_URL=""
 VERSION=""
 RELEASE_MODE=""
@@ -14,9 +13,6 @@ IDENTITY_FINGERPRINT=""
 TEAM_ID=""
 IDENTITY_FINGERPRINT_SET=0
 TEAM_ID_SET=0
-BOOTSTRAP_MANIFEST=""
-BOOTSTRAP_CORE_ARCHIVE=""
-PREPARED_BOOTSTRAP_VERIFIER=""
 BUILD_ROOT="$ROOT/build"
 XCODEBUILD_BIN="${EASYSPLAT_XCODEBUILD_BIN:-xcodebuild}"
 CODESIGN_BIN="${EASYSPLAT_CODESIGN_BIN:-codesign}"
@@ -48,12 +44,16 @@ trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --manifest-url)
-      MANIFEST_URL="$2"
-      shift 2
-      ;;
-    --public-key-path)
-      PUBLIC_KEY_PATH="$2"
+    --toolchain-dir)
+      if [ -n "$TOOLCHAIN_DIR" ]; then
+        echo "--toolchain-dir may be supplied only once." >&2
+        exit 1
+      fi
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--toolchain-dir requires an absolute path." >&2
+        exit 1
+      fi
+      TOOLCHAIN_DIR="$2"
       shift 2
       ;;
     --project-url)
@@ -64,36 +64,12 @@ while [[ $# -gt 0 ]]; do
       VERSION="$2"
       shift 2
       ;;
-    --bootstrap-manifest)
-      if [ -n "$BOOTSTRAP_MANIFEST" ]; then
-        echo "--bootstrap-manifest may be supplied only once." >&2
-        exit 1
-      fi
-      BOOTSTRAP_MANIFEST="$2"
-      shift 2
-      ;;
-    --bootstrap-core-archive)
-      if [ -n "$BOOTSTRAP_CORE_ARCHIVE" ]; then
-        echo "--bootstrap-core-archive may be supplied only once." >&2
-        exit 1
-      fi
-      BOOTSTRAP_CORE_ARCHIVE="$2"
-      shift 2
-      ;;
     --build-root)
       if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
         echo "--build-root requires an absolute path." >&2
         exit 1
       fi
       BUILD_ROOT="$2"
-      shift 2
-      ;;
-    --manifest-tool-bin)
-      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
-        echo "--manifest-tool-bin requires an absolute executable path." >&2
-        exit 1
-      fi
-      PREPARED_BOOTSTRAP_VERIFIER="$2"
       shift 2
       ;;
     --development-unsigned)
@@ -155,8 +131,8 @@ done
 
 unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
 
-if [ -z "$MANIFEST_URL" ] || [ -z "$PUBLIC_KEY_PATH" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> --bootstrap-manifest <path> --bootstrap-core-archive <path> [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release | --production --identity-fingerprint <sha1> --team-id <id>)" >&2
+if [ -z "$TOOLCHAIN_DIR" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
+  echo "Usage: build_app.sh --toolchain-dir <path> --version <semver> [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release | --production --identity-fingerprint <sha1> --team-id <id>)" >&2
   exit 1
 fi
 if [ "$RELEASE_MODE" = production ]; then
@@ -218,37 +194,6 @@ if [ "$RELEASE_MODE" = prepare-release ]; then
   CODESIGN_BIN=/usr/bin/codesign
   XCRUN_BIN=/usr/bin/xcrun
 fi
-if { [ -n "$BOOTSTRAP_MANIFEST" ] && [ -z "$BOOTSTRAP_CORE_ARCHIVE" ]; } \
-  || { [ -z "$BOOTSTRAP_MANIFEST" ] && [ -n "$BOOTSTRAP_CORE_ARCHIVE" ]; }; then
-  echo "--bootstrap-manifest and --bootstrap-core-archive must be supplied together." >&2
-  exit 1
-fi
-if [ -z "$BOOTSTRAP_MANIFEST" ]; then
-  echo "Release app builds require --bootstrap-manifest and --bootstrap-core-archive." >&2
-  exit 1
-fi
-if [ -n "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
-  if [ "$RELEASE_MODE" != prepare-release ] \
-      || [ ! -x "$PREPARED_BOOTSTRAP_VERIFIER" ] \
-      || [ -L "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
-    echo "A prebuilt ManifestTool is only accepted for a prepared production build." >&2
-    exit 1
-  fi
-  PREPARED_BOOTSTRAP_VERIFIER="$(/usr/bin/python3 -I - "$PREPARED_BOOTSTRAP_VERIFIER" <<'PY'
-import os
-import sys
-
-value = sys.argv[1]
-if not os.path.isabs(value) or os.path.normpath(value) != value:
-    raise SystemExit("ManifestTool path must be absolute and normalized.")
-resolved = os.path.realpath(value)
-if resolved != value:
-    raise SystemExit("ManifestTool path must contain no symlink ancestry.")
-print(resolved)
-PY
-)" || exit 1
-fi
-
 validated_build_root="$(/usr/bin/python3 -I - "$BUILD_ROOT" "$ROOT" <<'PY'
 import os
 import sys
@@ -285,16 +230,15 @@ PY
 )" || exit 1
 BUILD_ROOT="$validated_build_root"
 
-/usr/bin/python3 -I - "$MANIFEST_URL" "$PROJECT_URL" <<'PY'
+/usr/bin/python3 -I - "$PROJECT_URL" <<'PY'
 import sys
 from urllib.parse import urlparse
 
-for label, value in (("Manifest URL", sys.argv[1]), ("Project URL", sys.argv[2])):
-    if not value and label == "Project URL":
-        continue
+value = sys.argv[1]
+if value:
     parsed = urlparse(value)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-        raise SystemExit(f"{label} must use HTTPS and contain no credentials.")
+        raise SystemExit("Project URL must use HTTPS and contain no credentials.")
 PY
 
 if ! easysplat_is_strict_semver_without_build_metadata "$VERSION"; then
@@ -308,61 +252,44 @@ if [ "$RELEASE_MODE" != development-unsigned ] \
 fi
 NUMERIC_VERSION="${VERSION%%-*}"
 
-/usr/bin/python3 -I - "$PUBLIC_KEY_PATH" "$BOOTSTRAP_MANIFEST" "$BOOTSTRAP_CORE_ARCHIVE" <<'PY'
+TOOLCHAIN_DIR="$(/usr/bin/python3 -I - "$TOOLCHAIN_DIR" <<'PY'
 import os
 import stat
 import sys
 
-for label, value in (
-    ("Public key", sys.argv[1]),
-    ("Bootstrap manifest", sys.argv[2]),
-    ("Bootstrap core archive", sys.argv[3]),
-):
+root = sys.argv[1]
+if not os.path.isabs(root) or os.path.normpath(root) != root:
+    raise SystemExit("Toolchain directory must be an absolute, normalized path.")
+if os.path.realpath(root) != root:
+    raise SystemExit("Toolchain directory must contain no symlink ancestry.")
+
+required = (
+    "bin/colmap",
+    "bin/easysplat-train",
+    "bin/default.metallib",
+    "lib/libomp.dylib",
+    "msplat/build_info.json",
+    "msplat/LICENSE",
+    "provenance/colmap.json",
+    "supply-chain/components.json",
+)
+for relative in required:
+    path = os.path.join(root, relative)
     try:
-        metadata = os.lstat(value)
+        metadata = os.lstat(path)
     except FileNotFoundError:
-        raise SystemExit(f"{label} is missing: {value}")
+        raise SystemExit(f"Toolchain directory is missing {relative}: {path}")
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise SystemExit(f"{label} must be an ordinary, non-hardlinked regular file: {value}")
+        raise SystemExit(f"{relative} must be an ordinary, non-hardlinked regular file")
     if metadata.st_size == 0:
-        raise SystemExit(f"{label} must not be empty: {value}")
+        raise SystemExit(f"{relative} must not be empty")
+
+print(root)
 PY
+)" || exit 1
 
 INPUT_SNAPSHOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-inputs.XXXXXX")"
 chmod 0700 "$INPUT_SNAPSHOT_DIR"
-SNAPSHOT_PUBLIC_KEY="$INPUT_SNAPSHOT_DIR/public_key_ed25519.txt"
-SNAPSHOT_BOOTSTRAP_MANIFEST="$INPUT_SNAPSHOT_DIR/manifest.json"
-SNAPSHOT_BOOTSTRAP_CORE="$INPUT_SNAPSHOT_DIR/macos-arm64-core.zip"
-install -m 0600 "$PUBLIC_KEY_PATH" "$SNAPSHOT_PUBLIC_KEY"
-install -m 0600 "$BOOTSTRAP_MANIFEST" "$SNAPSHOT_BOOTSTRAP_MANIFEST"
-install -m 0600 "$BOOTSTRAP_CORE_ARCHIVE" "$SNAPSHOT_BOOTSTRAP_CORE"
-
-verify_bootstrap() {
-  local public_key=$1
-  local manifest=$2
-  local core_archive=$3
-  local args=(
-    verify-bootstrap
-    --manifest "$manifest"
-    --public-key-file "$public_key"
-    --app-version "$VERSION"
-    --core-zip "$core_archive"
-    --url-policy "$BOOTSTRAP_URL_POLICY"
-  )
-  if [ -n "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
-    "$PREPARED_BOOTSTRAP_VERIFIER" "${args[@]}"
-  else
-    /usr/bin/swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
-  fi
-}
-BOOTSTRAP_URL_POLICY=release
-if [ "$RELEASE_MODE" = development-unsigned ]; then
-  BOOTSTRAP_URL_POLICY=loopback-development
-fi
-verify_bootstrap \
-  "$SNAPSHOT_PUBLIC_KEY" \
-  "$SNAPSHOT_BOOTSTRAP_MANIFEST" \
-  "$SNAPSHOT_BOOTSTRAP_CORE"
 
 if [ "${XCODEBUILD_BIN##*/}" = "xcodebuild" ]; then
   if ! "$XCODEBUILD_BIN" -license check >/dev/null 2>&1; then
@@ -402,12 +329,9 @@ RES_DIR="$APP_BUNDLE/Contents/Resources"
 MACOS_DIR="$APP_BUNDLE/Contents/MacOS"
 OVERRIDE_RES_DIR="$OUT/AppResourcesOverride"
 
-if [ -z "$PROJECT_URL" ]; then
-  if [[ "$MANIFEST_URL" == *"/releases/"* ]]; then
-    PROJECT_URL="${MANIFEST_URL%/releases/*}"
-  elif [ -f "$ROOT/EasySplatApp/Resources/project_home_url.txt" ]; then
-    PROJECT_URL="$(cat "$ROOT/EasySplatApp/Resources/project_home_url.txt")"
-  fi
+if [ -z "$PROJECT_URL" ] \
+  && [ -f "$ROOT/EasySplatApp/Resources/project_home_url.txt" ]; then
+  PROJECT_URL="$(cat "$ROOT/EasySplatApp/Resources/project_home_url.txt")"
 fi
 
 rm -rf "$DERIVED" "$OUT"
@@ -525,14 +449,43 @@ EOF
 if [ -d "$ROOT/EasySplatApp/Resources" ]; then
   cp -R "$ROOT/EasySplatApp/Resources/." "$RES_DIR/"
 fi
-BOOTSTRAP_RES_DIR="$RES_DIR/ToolchainBootstrap"
-rm -rf "$BOOTSTRAP_RES_DIR"
-mkdir -p "$BOOTSTRAP_RES_DIR"
-install -m 0644 "$SNAPSHOT_BOOTSTRAP_MANIFEST" "$BOOTSTRAP_RES_DIR/manifest.json"
-install -m 0644 "$SNAPSHOT_BOOTSTRAP_CORE" "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"
-if ! cmp -s "$SNAPSHOT_BOOTSTRAP_MANIFEST" "$BOOTSTRAP_RES_DIR/manifest.json" \
-  || ! cmp -s "$SNAPSHOT_BOOTSTRAP_CORE" "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"; then
-  echo "Copied bootstrap bytes changed while the app bundle was being assembled." >&2
+# Code signing treats every plain file under Contents/Helpers as unsigned nested
+# code, so only Mach-Os live there; the payload is sealed as ordinary resources.
+HELPERS_DIR="$APP_BUNDLE/Contents/Helpers"
+TOOLCHAIN_RES_DIR="$RES_DIR/Toolchain"
+rm -rf "$HELPERS_DIR" "$TOOLCHAIN_RES_DIR"
+mkdir -p "$HELPERS_DIR/bin" "$HELPERS_DIR/lib" "$TOOLCHAIN_RES_DIR"
+for helper in colmap easysplat-train; do
+  install -m 0755 "$TOOLCHAIN_DIR/bin/$helper" "$HELPERS_DIR/bin/$helper"
+done
+install -m 0755 "$TOOLCHAIN_DIR/lib/libomp.dylib" "$HELPERS_DIR/lib/libomp.dylib"
+install -m 0644 "$TOOLCHAIN_DIR/bin/default.metallib" "$TOOLCHAIN_RES_DIR/default.metallib"
+for payload in msplat provenance supply-chain licenses; do
+  if [ -d "$TOOLCHAIN_DIR/$payload" ]; then
+    cp -R "$TOOLCHAIN_DIR/$payload" "$TOOLCHAIN_RES_DIR/$payload"
+  fi
+done
+/usr/bin/find "$TOOLCHAIN_RES_DIR" -type d -exec chmod 0755 {} +
+/usr/bin/find "$TOOLCHAIN_RES_DIR" -type f -exec chmod 0644 {} +
+for staged in \
+  "bin/colmap:$HELPERS_DIR/bin/colmap" \
+  "bin/easysplat-train:$HELPERS_DIR/bin/easysplat-train" \
+  "lib/libomp.dylib:$HELPERS_DIR/lib/libomp.dylib" \
+  "bin/default.metallib:$TOOLCHAIN_RES_DIR/default.metallib"; do
+  if ! cmp -s "$TOOLCHAIN_DIR/${staged%%:*}" "${staged#*:}"; then
+    echo "Staged toolchain bytes differ from the source tree: ${staged%%:*}" >&2
+    exit 1
+  fi
+done
+if /usr/bin/find "$HELPERS_DIR" "$TOOLCHAIN_RES_DIR" \
+  \( -type l -o \( -type f -a ! -links 1 \) \) -print | /usr/bin/grep -q .; then
+  echo "Staged toolchain must contain no symlinks and no hard links." >&2
+  exit 1
+fi
+# colmap finds libomp through its own rpath; nothing is rewritten at package time.
+if ! /usr/bin/otool -l "$HELPERS_DIR/bin/colmap" \
+  | /usr/bin/grep -q "@executable_path/../lib"; then
+  echo "colmap no longer carries the rpath the bundled layout depends on." >&2
   exit 1
 fi
 if [ ! -s "$RES_DIR/EasySplatAppIcon.icns" ]; then
@@ -546,8 +499,6 @@ install -m 0644 "$ROOT/NOTICE.md" "$LICENSE_DIR/EasySplat-NOTICE.md"
 install -m 0644 "$ROOT/ThirdParty/MetalSplatter/LICENSE" "$LICENSE_DIR/MetalSplatter-LICENSE.txt"
 
 mkdir -p "$OVERRIDE_RES_DIR"
-printf "%s" "$MANIFEST_URL" > "$OVERRIDE_RES_DIR/toolchain_manifest_url.txt"
-install -m 0644 "$SNAPSHOT_PUBLIC_KEY" "$OVERRIDE_RES_DIR/public_key_ed25519.txt"
 printf "%s" "$PROJECT_URL" > "$OVERRIDE_RES_DIR/project_home_url.txt"
 cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/"
 if [ "$RELEASE_MODE" = production ]; then
@@ -573,24 +524,6 @@ fi
 rm -rf "$EXPORTED_DSYM_PATH"
 cp -R "$BUILT_DSYM_PATH" "$EXPORTED_DSYM_PATH"
 
-BUNDLED_PUBLIC_KEY="$RES_DIR/public_key_ed25519.txt"
-authority_files=("$BUNDLED_PUBLIC_KEY")
-if [ -d "$RES_DIR/EasySplat_EasySplatApp.bundle" ]; then
-  authority_files+=("$RES_DIR/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt")
-  if [ -d "$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources" ]; then
-    authority_files+=("$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources/public_key_ed25519.txt")
-  fi
-fi
-for authority_file in "${authority_files[@]}"; do
-  if ! cmp -s "$SNAPSHOT_PUBLIC_KEY" "$authority_file"; then
-    echo "Bundled app authority differs from the verified release input snapshot: $authority_file" >&2
-    exit 1
-  fi
-done
-verify_bootstrap "$BUNDLED_PUBLIC_KEY" \
-  "$BOOTSTRAP_RES_DIR/manifest.json" \
-  "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"
-
 plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
 if [ "$RELEASE_MODE" = production ]; then
   signing_args=(
@@ -612,7 +545,13 @@ if [ "$RELEASE_MODE" = production ]; then
     --receipt "$SIGNING_RECEIPT"
   SIGNED_BUILD_COMPLETE=1
 else
-  "$CODESIGN_BIN" --force --deep --sign - --timestamp=none "$APP_BUNDLE"
+  # Sign inside out. --deep is unsupported for distribution and would hide a
+  # broken nesting order here that then fails in the signed lane.
+  "$CODESIGN_BIN" --force --sign - --timestamp=none "$HELPERS_DIR/lib/libomp.dylib"
+  for helper in colmap easysplat-train; do
+    "$CODESIGN_BIN" --force --sign - --timestamp=none "$HELPERS_DIR/bin/$helper"
+  done
+  "$CODESIGN_BIN" --force --sign - --timestamp=none "$APP_BUNDLE"
   "$CODESIGN_BIN" --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 fi
 

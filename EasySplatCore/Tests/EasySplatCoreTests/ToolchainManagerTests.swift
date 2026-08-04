@@ -1434,3 +1434,66 @@ enum NativeColmapHelpFixture {
             options.sorted().map { "  --\($0) <value>" }.joined(separator: "\n") + "\n"
     }
 }
+
+extension ToolchainManagerTests {
+    /// Distribution signing rewrites the helper after its receipt is written, so
+    /// the receipt digest and the shipped bytes belong to different domains.
+    /// A signed bundle must not compare them; an unsigned tree still must.
+    func testSignedBundlePolicySkipsTheRewrittenExecutableDigest() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        // Stand in for what signing does to the executable's bytes.
+        let trainer = root.appendingPathComponent("bin/easysplat-train")
+        let handle = try FileHandle(forWritingTo: trainer)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("signature".utf8))
+        try handle.close()
+
+        let capabilities: Set<ToolchainCapability> = [.core, .colmap, .msplat]
+
+        XCTAssertThrowsError(
+            try ToolchainManager(runner: makeValidationRunner(root: root)).validateToolchain(
+                root: root,
+                requiredCapabilities: capabilities,
+                toolchainIdentity: "local-fixture",
+                integrityPolicy: .unsignedDevelopmentTree
+            ),
+            "an unsigned tree must still match its receipt"
+        )
+
+        let signed = try ToolchainManager(
+            runner: makeValidationRunner(root: root)
+        ).validateToolchain(
+            root: root,
+            requiredCapabilities: capabilities,
+            toolchainIdentity: "0.2.0",
+            integrityPolicy: .signedAppBundle
+        )
+        XCTAssertEqual(signed.integrityPolicy, .signedAppBundle)
+    }
+
+    /// The metallib is not Mach-O and signing leaves it alone, so its digest is
+    /// still load-bearing in a signed bundle.
+    func testSignedBundlePolicyStillRejectsATamperedMetallib() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let metallib = root.appendingPathComponent("bin/default.metallib")
+        let handle = try FileHandle(forWritingTo: metallib)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("tampered".utf8))
+        try handle.close()
+
+        XCTAssertThrowsError(
+            try ToolchainManager(runner: makeValidationRunner(root: root)).validateToolchain(
+                root: root,
+                requiredCapabilities: [.core, .colmap, .msplat],
+                toolchainIdentity: "0.2.0",
+                integrityPolicy: .signedAppBundle
+            )
+        )
+    }
+}

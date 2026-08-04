@@ -577,10 +577,16 @@ extension PipelineRunner {
                 "COLMAP runtime closure was invalid"
             )
         }
+        // Distribution signing rewrites the executable after the receipt is
+        // written, so only an unsigned tree can be compared against it. The
+        // signed bundle's own signature covers the helper instead.
+        let receiptDescribesInstalledBytes = toolchain.integrityPolicy
+            == .unsignedDevelopmentTree
         guard colmapReceipt.toolchainName == "colmap",
               !colmapReceipt.sourceVersion.isEmpty,
               !colmapReceipt.sourceCommit.isEmpty,
-              colmapReceipt.executableSHA256 == colmapSHA256 else {
+              !receiptDescribesInstalledBytes
+                || colmapReceipt.executableSHA256 == colmapSHA256 else {
             throw PipelineError.geometryProvenanceUnavailable(
                 "COLMAP receipt did not match the installed executable"
             )
