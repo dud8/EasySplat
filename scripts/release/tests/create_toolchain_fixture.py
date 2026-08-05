@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +27,51 @@ MACHO_FIXTURE_PATHS = frozenset({
 REGULAR_BIN_FIXTURE_PATHS = frozenset({"bin/default.metallib"})
 
 
-def thin_arm64_macho(payload: bytes) -> bytes:
-    return b"\xcf\xfa\xed\xfe" + struct.pack("<II", 0x0100000C, 0) + payload
+_MACHO_CACHE: dict[tuple[bytes, str, bytes | None], bytes] = {}
+
+
+def thin_arm64_macho(
+    payload: bytes,
+    *,
+    kind: str = "executable",
+    rpath: bytes | None = None,
+) -> bytes:
+    """A real arm64 Mach-O whose bytes are distinct per payload.
+
+    The app build signs the helpers it stages and verifies the bundle
+    strictly, and it proves colmap's rpath with otool, so a truncated header
+    is no longer enough to stand in for a native tool. `-no_uuid` keeps
+    repeated fixture runs byte-identical.
+    """
+    key = (payload, kind, rpath)
+    cached = _MACHO_CACHE.get(key)
+    if cached is not None:
+        return cached
+    marker = payload.decode("ascii")
+    with tempfile.TemporaryDirectory() as scratch:
+        directory = Path(scratch)
+        source = directory / "fixture.c"
+        if kind == "dylib":
+            source.write_text(
+                f'const char easysplat_fixture[] = "{marker}";\n', encoding="ascii"
+            )
+        else:
+            source.write_text(
+                f'const char easysplat_fixture[] = "{marker}";\n'
+                "int main(void) { return 0; }\n",
+                encoding="ascii",
+            )
+        binary = directory / "fixture"
+        command = ["xcrun", "clang", "-arch", "arm64", "-Wl,-no_uuid"]
+        if kind == "dylib":
+            command += ["-dynamiclib", "-install_name", "@rpath/libomp.dylib"]
+        if rpath is not None:
+            command += ["-Wl,-rpath," + rpath.decode("ascii")]
+        command += [str(source), "-o", str(binary)]
+        subprocess.run(command, check=True, capture_output=True)
+        data = binary.read_bytes()
+    _MACHO_CACHE[key] = data
+    return data
 
 
 def fixture_file_kind(path: str) -> str:
@@ -347,14 +393,14 @@ def owner(path: str) -> str:
 
 def create_files(root: Path) -> tuple[dict[str, Path], bytes, bytes]:
     roots = {name: root / name for name in ("core", "base", "small")}
-    colmap = thin_arm64_macho(b"native-colmap")
+    colmap = thin_arm64_macho(b"native-colmap", rpath=b"@executable_path/../lib")
     trainer = thin_arm64_macho(b"native-msplat")
     metallib = b"native-metallib"
     for relative, data in {
         "bin/colmap": colmap,
         "bin/easysplat-train": trainer,
         "bin/default.metallib": metallib,
-        "lib/libomp.dylib": thin_arm64_macho(b"libomp"),
+        "lib/libomp.dylib": thin_arm64_macho(b"libomp", kind="dylib"),
         "msplat/LICENSE": b"Apache-2.0",
         "licenses/COLMAP/COPYING.txt": b"BSD-3-Clause",
         "licenses/ceres/LICENSE": b"BSD-3-Clause",
@@ -594,7 +640,7 @@ def native_receipts(roots: dict[str, Path], colmap: bytes, trainer_metallib: byt
                     (ROOT / "scripts/toolchain/colmap-support-lock.json").read_bytes()
                 ),
                 "library_sha256": {
-                    "lib/libomp.dylib": sha256(thin_arm64_macho(b"libomp"))
+                    "lib/libomp.dylib": sha256(thin_arm64_macho(b"libomp", kind="dylib"))
                 },
                 "dependencies": support_dependencies,
             }
@@ -825,7 +871,7 @@ def main() -> None:
     all_files: dict[str, Path] = {}
     for archive_root in roots.values():
         for path in archive_root.rglob("*"):
-            if path.is_file():
+            if path.is_symlink() or path.is_file():
                 relative = path.relative_to(archive_root).as_posix()
                 if relative == "supply-chain/components.json":
                     continue
@@ -834,9 +880,20 @@ def main() -> None:
                 all_files[relative] = path
     files: list[dict[str, Any]] = []
     for relative in sorted(all_files):
-        data = all_files[relative].read_bytes()
+        path = all_files[relative]
         component_id = owner(relative)
         by_id[component_id]["files"].append(relative)
+        # A closure describes a link by where it points, never by the bytes on
+        # the other end.
+        if path.is_symlink():
+            files.append({
+                "path": relative,
+                "component": component_id,
+                "kind": "symlink",
+                "target": os.readlink(path),
+            })
+            continue
+        data = path.read_bytes()
         row: dict[str, Any] = {
             "path": relative,
             "component": component_id,

@@ -1901,7 +1901,7 @@ private struct EvidenceBindingProbe {
         capture = helper.index(binding_literal)
         decode = helper.index("ProjectMetadataStore.decodeValidatedMetadataSnapshot(")
         semantic_guard = helper.index(
-            "metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion"
+            "ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion)"
         )
         revalidate = helper.index("try metadataBinding.revalidate()")
         envelope = helper.rindex("    return [")
@@ -1923,7 +1923,7 @@ private struct EvidenceBindingProbe {
         recovery = source[recovery_start:recovery_end]
 
         for required in (
-            "metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion",
+            "ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion)",
             "metadata.lastRunStartedAt == nil",
             "metadata.resolvedRunPlan == resolvedPlan",
             "verifiedMatchingRecovery(",

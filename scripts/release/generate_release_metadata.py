@@ -34,8 +34,12 @@ METALSPLATTER_SOURCE_ROOTS = (
     "PLYIO/Sources",
     "SplatIO/Sources",
 )
-MAX_CORE_DOWNLOAD_BYTES = 2_500_000_000
-MAX_FULL_TOOLCHAIN_DOWNLOAD_BYTES = 6_000_000_000
+# The app carries the toolchain rather than fetching it, so this bounds what a
+# release can ask a user to install rather than what it can ask them to
+# download. It sits a gigabyte under the 4 GiB whole-app ceiling that
+# verify_publication_bundle enforces, so a payload that passes here still leaves
+# room for the rest of the bundle instead of failing at publication.
+MAX_BUNDLED_TOOLCHAIN_BYTES = 3 * 1_024 * 1_024 * 1_024
 CPU_TYPE_ARM64 = 0x0100000C
 CPU_SUBTYPE_ARM64_ALL = 0
 THIN_64_MACHO_ENDIAN = {
@@ -345,6 +349,14 @@ def validate_component_payload(
     return components, files, license_paths
 
 
+def validate_bundled_toolchain_size(total_bytes: int) -> None:
+    if total_bytes > MAX_BUNDLED_TOOLCHAIN_BYTES:
+        fail(
+            "bundled toolchain exceeds the install budget: "
+            f"{total_bytes} > {MAX_BUNDLED_TOOLCHAIN_BYTES}"
+        )
+
+
 def inspect_toolchain_tree(
     toolchain_dir: Path,
     expected: dict[str, dict[str, Any]],
@@ -409,7 +421,44 @@ def inspect_toolchain_tree(
         missing = sorted(expected_paths - seen)
         extra = sorted(seen - expected_paths)
         fail(f"staged toolchain closure mismatch; missing={missing[:5]} extra={extra[:5]}")
+    validate_bundled_toolchain_size(sum(int(row.get("size", 0)) for row in rows))
     return sorted(rows, key=lambda row: row["path"]), licenses
+
+
+def shipped_components(
+    components: dict[str, dict[str, Any]],
+    embedded: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """The components this release actually carries.
+
+    A component that contributes files ships when every file it declares is
+    embedded. Statically linked dependencies declare no files of their own, so
+    they are pulled in by what references them: dropping them would both lose
+    real SBOM content and leave the relationship graph pointing at packages the
+    document never defines.
+    """
+    shipped = {
+        component_id: component
+        for component_id, component in components.items()
+        if component["files"] and all(path in embedded for path in component["files"])
+    }
+    pending = list(shipped)
+    while pending:
+        component = components[pending.pop()]
+        referenced = list(component["dependencies"]) + [
+            target
+            for target, row in components.items()
+            if component["id"] in row.get("incorporatedInto", [])
+        ]
+        for related in referenced:
+            if related in shipped:
+                continue
+            row = components[related]
+            if any(path not in embedded for path in row["files"]):
+                continue
+            shipped[related] = row
+            pending.append(related)
+    return shipped
 
 
 def validate_toolchain_tree(toolchain_dir: Path, expected_version: str) -> ValidatedClosure:
@@ -421,13 +470,7 @@ def validate_toolchain_tree(toolchain_dir: Path, expected_version: str) -> Valid
     embedded = {
         path: row for path, row in files.items() if archive_for_path(path) == "core"
     }
-    # A component ships only if every file it declares is embedded; the rest
-    # describe tooling this release does not carry.
-    shipped = {
-        component_id: component
-        for component_id, component in components.items()
-        if component["files"] and all(path in embedded for path in component["files"])
-    }
+    shipped = shipped_components(components, embedded)
     rows, license_bytes = inspect_toolchain_tree(toolchain_dir, embedded, license_paths)
     declared = {path for path in license_paths if archive_for_path(path) == "core"}
     if set(license_bytes) != declared:

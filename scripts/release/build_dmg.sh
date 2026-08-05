@@ -337,6 +337,12 @@ PY
 PACKAGE_BUILD_ROOT="$(mktemp -d "$BUILD_ROOT/.EasySplat-$APP_VERSION.package.XXXXXX")"
 chmod 0700 "$PACKAGE_BUILD_ROOT"
 
+# The app build and the release metadata each read the toolchain separately, so
+# a tree that changes between them would ship one closure and describe another.
+# Freezing it once here is what makes the SBOM describe the sealed helpers.
+/usr/bin/ditto --noqtn "$TOOLCHAIN_DIR" "$PACKAGE_BUILD_ROOT/toolchain"
+TOOLCHAIN_DIR="$PACKAGE_BUILD_ROOT/toolchain"
+
 if [ -n "$PREPARED_RELEASE_ROOT" ]; then
   PREPARED_RELEASE_ROOT="$(/usr/bin/python3 -I - "$PREPARED_RELEASE_ROOT" <<'PY'
 import os

@@ -291,6 +291,13 @@ PY
 INPUT_SNAPSHOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-inputs.XXXXXX")"
 chmod 0700 "$INPUT_SNAPSHOT_DIR"
 
+# The build validates the toolchain tree and then reads it again to stage and to
+# compare the staged bytes. Taking a private copy first is what makes those the
+# same bytes: whatever happens to the caller's tree afterwards, the product is
+# built from what was checked here.
+/usr/bin/ditto --noqtn "$TOOLCHAIN_DIR" "$INPUT_SNAPSHOT_DIR/toolchain"
+TOOLCHAIN_DIR="$INPUT_SNAPSHOT_DIR/toolchain"
+
 if [ "${XCODEBUILD_BIN##*/}" = "xcodebuild" ]; then
   if ! "$XCODEBUILD_BIN" -license check >/dev/null 2>&1; then
     echo "Xcode license not accepted. Run: sudo xcodebuild -license accept" >&2

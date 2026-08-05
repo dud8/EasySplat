@@ -50,6 +50,7 @@ PY
 source "$ROOT/scripts/release/lib/token_process_cleanup.sh"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-test.XXXXXX")"
 TMP_DIR="$(cd "$TMP_DIR" && pwd -P)"
+release_tests_completed=0
 release_test_build_root="$TMP_DIR/app-build"
 default_export="$ROOT/build/Export"
 release_fixture_root=""
@@ -137,6 +138,12 @@ cleanup() {
   local default_export_after
   local preserve_tmp=0
   trap - EXIT
+  # A `set -u` abort leaves $? at zero, so a fatal error would otherwise leave
+  # through this trap as a pass. Only the last line of the file clears this.
+  if [ "$release_tests_completed" -ne 1 ] && [ "$status" -eq 0 ]; then
+    echo "Release-script tests aborted before reaching the end of the suite." >&2
+    status=1
+  fi
   if ! release_and_drain_verifier_fixture; then
     echo "Detached verifier fixture did not drain; retained test state at $TMP_DIR." >&2
     status=1
@@ -541,9 +548,7 @@ xcrun dsymutil \
   -o "$derived/Build/Products/Release/EasySplatApp.dSYM"
 /usr/bin/codesign --force --sign - --timestamp=none \
   "$derived/Build/Products/Release/EasySplatApp"
-printf '%s' 'DEFAULT_MANIFEST_URL' >"$derived/Build/Products/Release/EasySplat_EasySplatApp.bundle/toolchain_manifest_url.txt"
 printf '%s' 'DEFAULT_PROJECT_URL' >"$derived/Build/Products/Release/EasySplat_EasySplatApp.bundle/project_home_url.txt"
-printf '%s' 'DEFAULT_PUBLIC_KEY' >"$derived/Build/Products/Release/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt"
 if [ -n "${EASYSPLAT_TEST_BUILD_WAIT_PATH:-}" ]; then
   : >"$EASYSPLAT_TEST_BUILD_WAIT_PATH.ready"
   while [ ! -e "$EASYSPLAT_TEST_BUILD_WAIT_PATH.release" ]; do
@@ -580,11 +585,9 @@ if rg -n 'EASYSPLAT_RELEASE_HELPER_TEST_MODE|EASYSPLAT_SIGNING_HELPER_BIN' \
 fi
 test "$(grep -Fc 'EASYSPLAT_NOTARY_TEST_MODE=0' "$ROOT/scripts/release/build_dmg.sh")" -eq 2
 grep -Fq 'INPUT_SNAPSHOT_DIR=' "$ROOT/scripts/release/build_app.sh"
-grep -Fq 'verify_bootstrap "$BUNDLED_PUBLIC_KEY"' "$ROOT/scripts/release/build_app.sh"
-grep -Fq 'case .remoteOnly' "$ROOT/Tools/ReleaseVerifier/main.swift"
+grep -Fq 'TOOLCHAIN_DIR' "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'BundledToolchainLocator(bundleURL: arguments.appBundle)' \
   "$ROOT/Tools/ReleaseVerifier/main.swift"
-grep -Fq 'case .cachedOnly' "$ROOT/Tools/ReleaseVerifier/main.swift"
 grep -Fq '"--input-manifest", "--input-root"' \
   "$ROOT/Tools/ReleaseVerifier/main.swift"
 if grep -Fq '"--fixture"' "$ROOT/Tools/ReleaseVerifier/main.swift"; then
@@ -621,8 +624,6 @@ grep -Fq 'captureExpectedInputSnapshot(' \
   "$ROOT/Tools/ReleaseVerifier/main.swift" \
   "$ROOT/EasySplatApp/AppModel+ReleaseVerification.swift"
 grep -Fq 'writePackagedProjectEvidence(' "$ROOT/Tools/ReleaseVerifier/main.swift"
-grep -Fq 'Expected packaged manifest file SHA-256:' \
-  "$ROOT/Tools/ReleaseVerifier/main.swift"
 grep -Fq 'Input manifest SHA-256:' \
   "$ROOT/Tools/ReleaseVerifier/main.swift"
 grep -Fq 'try await validateBeforePublication()' \
@@ -691,7 +692,8 @@ grep -Fq '"$PACKAGED_PROJECT_VERIFIER" verify-packaged-project' \
   "$packaged_smoke"
 grep -Fq 'PACKAGED_PROJECT_VERIFIER="$EXPECTED_RELEASE_RUNNER"' \
   "$ROOT/scripts/release/verify_release.sh"
-grep -Fq 'cached_toolchain_snapshot() {' "$e2e_verifier_helpers"
+grep -Fq 'Release-verifier app bundle does not match the sandboxed read-only root.' \
+  "$e2e_verifier_helpers"
 grep -Fq 'easysplat_wait_for_supervised_process_group' \
   "$packaged_smoke" "$e2e_verifier_helpers"
 grep -Fq 'source "$ROOT/scripts/release/lib/e2e_verifier.sh"' \
@@ -1334,9 +1336,9 @@ if (
   EXPECTED_VERSION="0.2.0"
   SOURCE_URL="https://example.com/EasySplat"
   SOURCE_COMMIT="deadbeef"
-  VERIFIED_MANIFEST_SHA256="$(printf 'a%.0s' {1..64})"
-  VERIFIED_TOOLCHAIN_KEY_ID="$(printf 'b%.0s' {1..64})"
-  VERIFIED_TOOLCHAIN_SIGNATURE_SHA256=""
+  # The fixture provenance binds, so the refusal has to come from the missing
+  # toolchain closure digest rather than from the earlier shell guard.
+  VERIFIED_TOOLCHAIN_CLOSURE_SHA256=""
   VERIFIED_FIXTURE_ATTESTATION=""
   VERIFIED_FIXTURE_MANIFEST_SHA256=""
   VERIFIED_FIXTURE_GENERATOR_SHA256=""
@@ -2638,19 +2640,19 @@ grep -Fq 'EasySplat\-selected\-lineage\-' "$atomic_home/release-verifier.sb"
 grep -Fq 'EasySplat\-video\-lineage\-' "$atomic_home/release-verifier.sb"
 grep -Fq 'EasySplat\-finished\-dataset\-replay\-' "$atomic_home/release-verifier.sb"
 
-expected_manifest_probe="$sandbox_test_root/expected-manifest-reader.py"
-cat >"$expected_manifest_probe" <<'PY'
+declared_input_probe="$sandbox_test_root/declared-input-reader.py"
+cat >"$declared_input_probe" <<'PY'
 #!/usr/bin/python3
 import hashlib
 import sys
 from pathlib import Path
 
-if len(sys.argv) != 5 or sys.argv[1] != "--expected-manifest":
+if len(sys.argv) != 5 or sys.argv[1] != "--input-manifest":
     raise SystemExit(64)
-expected_manifest = Path(sys.argv[2])
+declared_input = Path(sys.argv[2])
 forbidden = Path(sys.argv[3])
 output = Path(sys.argv[4])
-digest = hashlib.sha256(expected_manifest.read_bytes()).hexdigest()
+digest = hashlib.sha256(declared_input.read_bytes()).hexdigest()
 try:
     forbidden.read_bytes()
 except OSError:
@@ -2659,32 +2661,41 @@ else:
     raise SystemExit("sandbox allowed an undeclared sibling read")
 output.write_text(digest + "\n", encoding="ascii")
 PY
-chmod +x "$expected_manifest_probe"
-expected_manifest_input="$sandbox_test_root/expected-manifest.json"
-forbidden_manifest_sibling="$sandbox_test_root/forbidden-manifest-secret.txt"
-printf '%s\n' '{"schemaVersion":2}' >"$expected_manifest_input"
-printf '%s\n' 'private sibling' >"$forbidden_manifest_sibling"
-expected_manifest_digest="$(shasum -a 256 "$expected_manifest_input" | awk '{ print $1 }')"
-expected_manifest_output="$atomic_output_root/expected-manifest.sha256"
+chmod +x "$declared_input_probe"
+declared_input_file="$sandbox_test_root/declared-input.json"
+forbidden_input_sibling="$sandbox_test_root/forbidden-input-secret.txt"
+printf '%s\n' '{"schemaVersion":1}' >"$declared_input_file"
+printf '%s\n' 'private sibling' >"$forbidden_input_sibling"
+declared_input_digest="$(shasum -a 256 "$declared_input_file" | awk '{ print $1 }')"
+declared_input_output="$atomic_output_root/declared-input.sha256"
 run_release_verifier deny "$atomic_home" "$atomic_output_root" "$atomic_cache_root" \
-  "$expected_manifest_probe" \
-  --expected-manifest "$expected_manifest_input" \
-  "$forbidden_manifest_sibling" \
-  "$expected_manifest_output"
-grep -Fxq "$expected_manifest_digest" "$expected_manifest_output"
-grep -Fq -- '"--expected-manifest": "file"' "$e2e_verifier_helpers"
-grep -Fq -- 'scalar_options = {"--expected-manifest-file-sha256"}' \
-  "$e2e_verifier_helpers"
-grep -Fq "(literal \"$expected_manifest_input\")" "$atomic_home/release-verifier.sb"
-if grep -Fq "$forbidden_manifest_sibling" "$atomic_home/release-verifier.sb"; then
+  "$declared_input_probe" \
+  --input-manifest "$declared_input_file" \
+  "$forbidden_input_sibling" \
+  "$declared_input_output"
+grep -Fxq "$declared_input_digest" "$declared_input_output"
+grep -Fq -- '"--app-bundle": "input"' "$e2e_verifier_helpers"
+grep -Fq "(literal \"$declared_input_file\")" "$atomic_home/release-verifier.sb"
+if grep -Fq "$forbidden_input_sibling" "$atomic_home/release-verifier.sb"; then
   echo "Release-verifier sandbox authorized an undeclared sibling input." >&2
   exit 1
 fi
-if grep -Eq '\(literal "[^"]+/bin/colmap"\)' \
-    "$atomic_home/release-verifier.sb"; then
-  echo "Release-verifier sandbox trusted tool paths without the manifest digest." >&2
-  exit 1
-fi
+# Helpers are executable only where the caller declared the bundle, so no
+# colmap outside that read-only root may appear in the profile.
+python3 - "$atomic_home/release-verifier.sb" "$atomic_cache_root" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+profile = Path(sys.argv[1]).read_text(encoding="utf-8")
+bundle_root = sys.argv[2].rstrip("/")
+granted = re.findall(r'\(literal "([^"]+/bin/colmap)"\)', profile)
+outside = [path for path in granted if not path.startswith(bundle_root + "/")]
+if outside:
+    raise SystemExit(
+        f"Release-verifier sandbox granted colmap outside the declared bundle: {outside}"
+    )
+PY
 
 timeout_home="$TMP_DIR/release-verifier-timeout-home"
 timeout_output="$TMP_DIR/release-verifier-timeout-output"
@@ -2705,7 +2716,7 @@ if [ "$timeout_status" -ne 124 ]; then
   echo "Release-verifier timeout returned $timeout_status instead of 124." >&2
   exit 1
 fi
-grep -Fq 'exceeded its 1-second lane timeout' "$timeout_error"
+grep -Fq '-second lane timeout' "$timeout_error"
 python3 - "$timeout_started" "$timeout_finished" <<'PY'
 import sys
 
@@ -2798,8 +2809,7 @@ PY
   cleanup_detection_processes
   trap - EXIT
 )
-grep -Fq -- '--bootstrap-manifest)' "$ROOT/scripts/release/build_app.sh"
-grep -Fq -- '--bootstrap-core-archive)' "$ROOT/scripts/release/build_app.sh"
+grep -Fq -- '--toolchain-dir)' "$ROOT/scripts/release/build_app.sh"
 if git -C "$ROOT" ls-files --error-unmatch \
   EasySplatApp/Resources/ToolchainBootstrap >/dev/null 2>&1 \
   || git -C "$ROOT" ls-files EasySplatApp/Resources/ToolchainBootstrap/ | grep -q .; then
@@ -2937,7 +2947,13 @@ test -x "$helpers_dir/bin/easysplat-train"
 test -f "$helpers_dir/lib/libomp.dylib"
 test -s "$toolchain_res_dir/default.metallib"
 test -s "$toolchain_res_dir/supply-chain/components.json"
-cmp -s "$helpers_dir/bin/colmap" "$toolchain_tree/bin/colmap"
+# The build compares staged bytes against the source tree and then signs the
+# helpers, so what survives here is the signature and the staged tool's own
+# identity. The metallib is a sealed resource and stays byte-identical.
+/usr/bin/codesign --verify --strict "$helpers_dir/bin/colmap"
+/usr/bin/codesign --verify --strict "$helpers_dir/bin/easysplat-train"
+LC_ALL=C grep -aq 'native-colmap' "$helpers_dir/bin/colmap"
+LC_ALL=C grep -aq 'native-msplat' "$helpers_dir/bin/easysplat-train"
 cmp -s "$toolchain_res_dir/default.metallib" "$toolchain_tree/bin/default.metallib"
 test ! -e "$resources_dir/ToolchainBootstrap"
 test ! -e "$resources_dir/public_key_ed25519.txt"
@@ -3143,8 +3159,6 @@ project=""
 input_manifest=""
 input_root=""
 marker=""
-public_key=""
-manifest=""
 app_version=""
 token_sha256=""
 executable=""
@@ -3159,8 +3173,6 @@ while [ "$#" -gt 0 ]; do
     --input-manifest) test -z "$input_manifest"; input_manifest=$2 ;;
     --input-root) test -z "$input_root"; input_root=$2 ;;
     --marker) test -z "$marker"; marker=$2 ;;
-    --public-key-file) test -z "$public_key"; public_key=$2 ;;
-    --expected-manifest) test -z "$manifest"; manifest=$2 ;;
     --app-version) test -z "$app_version"; app_version=$2 ;;
     --expected-release-verification-token-sha256)
       test -z "$token_sha256"
@@ -3181,7 +3193,7 @@ while [ "$#" -gt 0 ]; do
   option_count=$((option_count + 1))
   shift 2
 done
-test "$option_count" -eq 12
+test "$option_count" -eq 10
 home="$(dirname "$marker")"
 test "$project" = "$home/Documents/EasySplat Projects/Release Verification.easysplatproj"
 test -f "$input_manifest"
@@ -3189,25 +3201,23 @@ test -d "$input_root"
 test "$marker" = "$home/release-verification-pipeline-passed.json"
 test -f "$project/project.json"
 test -f "$project/Output/splat.ply"
-test -f "$public_key"
-case "$manifest" in
-  */Contents/Resources/Toolchain/manifest.json) ;;
-  *) exit 1 ;;
-esac
 test "$app_version" = "0.2.0"
 [[ "$token_sha256" =~ ^[0-9a-f]{64}$ ]]
 test "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$executable")" \
   = "$(cd "$home/../Applications/EasySplat.app/Contents/MacOS" && pwd -P)/EasySplatApp"
 test "$executable_sha256" = "$(shasum -a 256 "$executable" | awk '{print $1}')"
 test "$executable_bytes" = "$(stat -f '%z' "$executable")"
-if [ -e "$(dirname "$manifest")/MutateInputDuringVerification" ]; then
+# The app carries its toolchain, so the stub reads its test switches out of the
+# sealed payload the executable sits beside rather than from a manifest option.
+toolchain_data="$(cd "$(dirname "$executable")/../Resources/Toolchain" && pwd -P)"
+if [ -e "$toolchain_data/MutateInputDuringVerification" ]; then
   mutation_target="$(find "$input_root" -type f \
     ! -name release-input-manifest.json -print -quit)"
   test -n "$mutation_target"
   printf '%s\n' 'mutated during independent verification' >>"$mutation_target"
 fi
-if [ ! -e "$(dirname "$manifest")/SkipPackagedAttestation" ]; then
-  python3 - "$evidence" "$marker" "$project" "$input_root" "$manifest" \
+if [ ! -e "$toolchain_data/SkipPackagedAttestation" ]; then
+  python3 - "$evidence" "$marker" "$project" "$input_root" \
     "$app_version" "$token_sha256" "$executable" \
     "$executable_sha256" "$executable_bytes" "$input_manifest" <<'PY'
 import base64
@@ -3221,7 +3231,6 @@ from pathlib import Path
     marker_path,
     project_path,
     input_path,
-    manifest_path,
     app_version,
     token_sha256,
     executable_path,
@@ -3233,7 +3242,6 @@ evidence_path = Path(evidence_path)
 marker_path = Path(marker_path)
 project_path = Path(project_path)
 input_path = Path(input_path)
-manifest_path = Path(manifest_path)
 executable_path = Path(executable_path)
 input_manifest_path = Path(input_manifest_path)
 marker_data = marker_path.read_bytes()
@@ -3389,9 +3397,10 @@ marker_path.write_text(
     encoding="utf-8",
 )
 marker_path.chmod(0o600)
-if (bootstrap_root / "CorruptCoreAfterMarker").exists():
-    # Leave enough time for a pre-exit verifier to observe the valid marker.
-    # Final attestation must still wait for this post-marker mutation and reject it.
+if (sentinel_root / "CorruptCoreAfterMarker").exists():
+    # Leave enough time for a pre-exit verifier to observe the valid marker,
+    # then try to rewrite a helper. The bundle is read-only under the sandbox,
+    # so the attempt must end the run rather than reach the product.
     time.sleep(0.5)
     with (toolchain / "bin" / "colmap").open("ab") as handle:
         handle.write(b"tampered-after-marker")
@@ -3424,8 +3433,7 @@ python3 - \
   "$packaged_sandbox_profile" \
   "$INSTALLED_EXECUTABLE" \
   "$packaged_python_runtime" \
-  "$hook_home" \
-  "$INSTALLED_APP/Contents/Resources/Toolchain/manifest.json" <<'PY'
+  "$INSTALLED_APP" <<'PY'
 import json
 import os
 import re
@@ -3435,16 +3443,9 @@ from pathlib import Path
 profile_path = Path(sys.argv[1])
 installed_executable = os.path.realpath(sys.argv[2])
 python_runtime = os.path.realpath(sys.argv[3])
-verifier_home = os.path.realpath(sys.argv[4])
-manifest_path = Path(sys.argv[5])
+installed_app = os.path.realpath(sys.argv[4])
 
 profile = profile_path.read_text(encoding="utf-8")
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-version = manifest["version"]
-if not isinstance(version, str) or not re.fullmatch(
-    r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}", version
-):
-    raise SystemExit("Packaged smoke fixture has an unsafe toolchain version.")
 
 process_lines = [
     line for line in profile.splitlines()
@@ -3456,22 +3457,12 @@ process_paths = [
     json.loads(value)
     for value in re.findall(r"\(literal (\"(?:\\.|[^\"\\])*\")\)", process_lines[0])
 ]
-toolchain_bin = os.path.join(
-    verifier_home,
-    "Library",
-    "Application Support",
-    "EasySplat",
-    "Toolchains",
-    version,
-    "bin",
-)
+toolchain_bin = os.path.join(installed_app, "Contents", "Helpers", "bin")
 expected_process_paths = [
     "/bin/cat",
     "/usr/bin/env",
     "/usr/bin/file",
     "/usr/bin/touch",
-    "/usr/bin/unzip",
-    "/usr/bin/zipinfo",
     installed_executable,
     python_runtime,
     *(os.path.join(toolchain_bin, name)
@@ -3525,8 +3516,8 @@ test -s "$hook_home/release-verification-pipeline-passed.json"
 test -s "$hook_home/packaged-app-attestation.md"
 test -s "$hook_home/Documents/EasySplat Projects/Release Verification.easysplatproj/Output/splat.ply"
 test "$(cat "$hook_home/independent-verifier-proof")" = "independent verifier invoked"
-test "$(find "$hook_home/Library/Application Support/EasySplat/Toolchains" \
-  -name .easysplat_toolchain_state.json | wc -l | tr -d '[:space:]')" = 1
+# The app runs the tools it carries, so a verified run installs nothing.
+test ! -e "$hook_home/Library/Application Support/EasySplat/Toolchains"
 test -z "$APP_WIRING_PID"
 test -z "$APP_WIRING_LOG"
 test -z "$APP_WIRING_TOKEN"
@@ -3602,7 +3593,6 @@ if "$repository_packaged_project_verifier" verify-packaged-project \
   --input-manifest "$SMOKE_INSTALL_ROOT/ReleaseVerificationInput/release-input-manifest.json" \
   --input-root "$SMOKE_INSTALL_ROOT/ReleaseVerificationInput" \
   --marker "$hook_home/release-verification-pipeline-passed.json" \
-  --expected-manifest "$INSTALLED_APP/Contents/Resources/Toolchain/manifest.json" \
   --app-version "0.2.0" \
   --expected-release-verification-token-sha256 "$fabricated_marker_token_sha256" \
   --expected-executable "$INSTALLED_EXECUTABLE" \
@@ -3621,7 +3611,6 @@ if "$repository_packaged_project_verifier" verify-packaged-project \
   --input-manifest "$SMOKE_INSTALL_ROOT/ReleaseVerificationInput/release-input-manifest.json" \
   --input-root "$SMOKE_INSTALL_ROOT/ReleaseVerificationInput" \
   --marker "$hook_home/release-verification-pipeline-passed.json" \
-  --expected-manifest "$INSTALLED_APP/Contents/Resources/Toolchain/manifest.json" \
   --app-version "0.2.0" \
   --expected-release-verification-token-sha256 "$fabricated_marker_token_sha256" \
   --expected-executable "$INSTALLED_EXECUTABLE" \
@@ -3639,13 +3628,12 @@ touch "$INSTALLED_APP/Contents/Resources/Toolchain/CorruptCoreAfterMarker"
 corrupt_hook_error="$TMP_DIR/packaged-bootstrap-corrupt-core.stderr"
 if run_packaged_app_bootstrap_smoke "$packaged_hook_fixture" \
   >/dev/null 2>"$corrupt_hook_error"; then
-  echo "Packaged-bootstrap smoke accepted a signed core with mutated installed bytes." >&2
+  echo "Packaged app rewrote the toolchain sealed inside its own bundle." >&2
   exit 1
 fi
-grep -Fq 'Cached critical-file hash differs from the signed manifest: bin/colmap' \
+grep -Fq 'Installed app exited unsuccessfully after writing its pipeline marker.' \
   "$corrupt_hook_error"
-grep -Fq 'Installed app toolchain files do not match the packaged signed core.' \
-  "$corrupt_hook_error"
+grep -Fq 'Packaged-app wiring smoke failed.' "$corrupt_hook_error"
 cleanup_packaged_app_verification_processes || true
 APP_WIRING_TOKEN=""
 rm -f "$APP_WIRING_LOG"
@@ -3729,13 +3717,9 @@ if EASYSPLAT_TEST_PRODUCTION_DMG_COMMAND_LOG="$production_dmg_command_log" \
   "$ROOT/scripts/release/build_dmg.sh" \
   --app-version "0.2.0" \
   --toolchain-version "2.0.0" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "https://example.com/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
+  --toolchain-dir "$toolchain_tree" \
   --build-root "$production_dmg_build_root" \
   --output-dir "$production_dmg_output" \
-  --use-existing-toolchain \
   --production \
   --identity-fingerprint "$signed_fingerprint" \
   --team-id "$signed_team_id" \
@@ -3787,26 +3771,21 @@ if "$ROOT/scripts/release/build_app.sh" \
 fi
 grep -Fqi 'exactly one release mode' "$mode_error"
 
-missing_release_urls_error="$TMP_DIR/missing-release-urls.stderr"
+missing_release_mode_error="$TMP_DIR/missing-release-mode.stderr"
 if "$ROOT/scripts/release/build_dmg.sh" \
   --app-version "0.2.0" \
   --toolchain-version "2.0.0" \
-  --use-existing-toolchain \
-  --development-unsigned >/dev/null 2>"$missing_release_urls_error"; then
-  echo "Unsigned developer packaging accepted implicit release URLs" >&2
+  --toolchain-dir "$toolchain_tree" >/dev/null 2>"$missing_release_mode_error"; then
+  echo "Packaging accepted a missing release mode" >&2
   exit 1
 fi
-grep -Fqi 'requires explicit HTTPS manifest and component URLs' "$missing_release_urls_error"
+grep -Fq 'Usage: build_dmg.sh' "$missing_release_mode_error"
 
 missing_signed_dmg_identity_error="$TMP_DIR/missing-signed-dmg-identity.stderr"
 if "$ROOT/scripts/release/build_dmg.sh" \
   --app-version "0.2.0" \
   --toolchain-version "2.0.0" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "https://example.com/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
-  --use-existing-toolchain \
+  --toolchain-dir "$toolchain_tree" \
   --production >/dev/null 2>"$missing_signed_dmg_identity_error"; then
   echo "Production packaging accepted a missing Developer ID identity." >&2
   exit 1
@@ -3817,11 +3796,7 @@ unsafe_notary_profile_error="$TMP_DIR/unsafe-notary-profile.stderr"
 if "$ROOT/scripts/release/build_dmg.sh" \
   --app-version "0.2.0" \
   --toolchain-version "2.0.0" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "https://example.com/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
-  --use-existing-toolchain \
+  --toolchain-dir "$toolchain_tree" \
   --production \
   --identity-fingerprint "$signed_fingerprint" \
   --team-id "$signed_team_id" \
@@ -3836,11 +3811,7 @@ unsigned_notary_argument_error="$TMP_DIR/unsigned-notary-argument.stderr"
 if "$ROOT/scripts/release/build_dmg.sh" \
   --app-version "0.2.0" \
   --toolchain-version "2.0.0" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "https://example.com/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
-  --use-existing-toolchain \
+  --toolchain-dir "$toolchain_tree" \
   --development-unsigned \
   --notary-keychain-profile easysplat-release \
   >/dev/null 2>"$unsigned_notary_argument_error"; then
@@ -3849,215 +3820,28 @@ if "$ROOT/scripts/release/build_dmg.sh" \
 fi
 grep -Fqi 'require --production' "$unsigned_notary_argument_error"
 
-missing_existing_toolchain_error="$TMP_DIR/missing-existing-toolchain.stderr"
-if EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1 \
-  "$ROOT/scripts/release/build_dmg.sh" \
-  --app-version "0.2.0" \
-  --toolchain-version "2.0.0" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "https://example.com/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
-  --development-unsigned >/dev/null 2>"$missing_existing_toolchain_error"; then
-  echo "Unsigned developer packaging rebuilt or signed a toolchain locally" >&2
-  exit 1
-fi
-grep -Fqi 'requires --use-existing-toolchain' "$missing_existing_toolchain_error"
-grep -Fq \
-  'Toolchain Producer signs and notarizes the native components, then emits a post-sign request. The external authority signs that exact request; Toolchain Publication verifies the benchmarked closure and stages the draft.' \
-  "$missing_existing_toolchain_error"
-
 dmg_build_metadata_error="$TMP_DIR/build-dmg-metadata.stderr"
 if "$ROOT/scripts/release/build_dmg.sh" \
   --app-version "0.2.0+build.7" \
   --toolchain-version "2.0.0+build.7" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "https://example.com/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
-  --use-existing-toolchain \
+  --toolchain-dir "$toolchain_tree" \
   --development-unsigned >/dev/null 2>"$dmg_build_metadata_error"; then
   echo "Unsigned developer packaging accepted SemVer build metadata." >&2
   exit 1
 fi
 grep -Fq 'without build metadata' "$dmg_build_metadata_error"
 
-insecure_release_url_error="$TMP_DIR/insecure-release-url.stderr"
-if "$ROOT/scripts/release/build_dmg.sh" \
-  --app-version "0.2.0" \
-  --toolchain-version "2.0.0" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "http://localhost:8000/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
-  --use-existing-toolchain \
-  --development-unsigned >/dev/null 2>"$insecure_release_url_error"; then
-  echo "Unsigned developer packaging accepted an HTTP component URL" >&2
-  exit 1
-fi
-grep -Fqi 'must use HTTPS' "$insecure_release_url_error"
-
-authority_fixture="$TMP_DIR/build-dmg-authority-fixture"
-mkdir -p \
-  "$authority_fixture/scripts/release/lib" \
-  "$authority_fixture/EasySplatApp/Resources" \
-  "$authority_fixture/Toolchains/out" \
-  "$authority_fixture/Tools/ManifestTool/Sources/ManifestTool" \
-  "$authority_fixture/mock-bin"
-cp "$ROOT/scripts/release/build_dmg.sh" \
-  "$authority_fixture/scripts/release/build_dmg.sh"
-cp "$ROOT/scripts/release/lib/strict_semver.sh" \
-  "$authority_fixture/scripts/release/lib/strict_semver.sh"
-python3 - "$authority_fixture" <<'PY'
-import base64
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-(root / "EasySplatApp/Resources/public_key_ed25519.txt").write_text(
-    base64.b64encode(bytes(range(32))).decode("ascii") + "\n",
-    encoding="ascii",
-)
-(root / "Toolchains/public_key_ed25519.txt").write_text(
-    base64.b64encode(bytes(range(1, 33))).decode("ascii"),
-    encoding="ascii",
-)
-PY
-printf '%s' '{}' >"$authority_fixture/Toolchains/manifest.json"
-for archive in \
-  "toolchain-macos-arm64-2.0.0-core.zip" \
-  "toolchain-geometry-da3-base-2.0.0.zip" \
-  "toolchain-geometry-da3-small-2.0.0.zip"; do
-  printf '%s' 'fixture' >"$authority_fixture/Toolchains/out/$archive"
-done
-cat >"$authority_fixture/mock-bin/xcodebuild" <<'EOF'
-#!/usr/bin/env bash
-test "$*" = "-license check"
-EOF
-cat >"$authority_fixture/mock-bin/swift" <<'EOF'
-#!/usr/bin/env bash
-set -eu
-umask 077
-: "${EASYSPLAT_TEST_PATH_SWIFT_LOG:?}"
-printf '%s\n' "$@" >>"$EASYSPLAT_TEST_PATH_SWIFT_LOG"
-exit 91
-EOF
-cat >"$authority_fixture/Tools/ManifestTool/Package.swift" <<'SWIFT'
-// swift-tools-version: 5.9
-import PackageDescription
-
-let package = Package(
-    name: "ManifestTool",
-    products: [
-        .executable(name: "ManifestTool", targets: ["ManifestTool"]),
-    ],
-    targets: [
-        .executableTarget(name: "ManifestTool"),
-    ]
-)
-SWIFT
-cat >"$authority_fixture/Tools/ManifestTool/Sources/ManifestTool/main.swift" <<'SWIFT'
-import Darwin
-import Foundation
-
-guard let logPath = ProcessInfo.processInfo.environment["EASYSPLAT_TEST_SWIFT_LOG"] else {
-    Darwin.exit(72)
-}
-let arguments = CommandLine.arguments.dropFirst().joined(separator: "\t") + "\n"
-let descriptor = open(logPath, O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR)
-guard descriptor >= 0 else {
-    Darwin.exit(72)
-}
-let bytesWritten = arguments.withCString { pointer in
-    write(descriptor, pointer, strlen(pointer))
-}
-guard bytesWritten == arguments.utf8.count, close(descriptor) == 0 else {
-    Darwin.exit(72)
-}
-FileHandle.standardError.write(Data("reached signed-closure verification".utf8))
-Darwin.exit(73)
-SWIFT
-chmod +x \
-  "$authority_fixture/mock-bin/xcodebuild" \
-  "$authority_fixture/mock-bin/swift"
-authority_swift_log="$TMP_DIR/build-dmg-authority-swift.log"
-authority_path_swift_log="$TMP_DIR/build-dmg-authority-path-swift.log"
-authority_mismatch_error="$TMP_DIR/build-dmg-authority-mismatch.stderr"
-if PATH="$authority_fixture/mock-bin:$PATH" \
-  EASYSPLAT_TEST_SWIFT_LOG="$authority_swift_log" \
-  EASYSPLAT_TEST_PATH_SWIFT_LOG="$authority_path_swift_log" \
-  "$authority_fixture/scripts/release/build_dmg.sh" \
-  --app-version "0.2.0" \
-  --toolchain-version "2.0.0" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "https://example.com/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
-  --use-existing-toolchain \
-  --development-unsigned >/dev/null 2>"$authority_mismatch_error"; then
-  echo "Unsigned developer packaging accepted a toolchain authority that differs from the tracked app authority" >&2
-  exit 1
-fi
-grep -Fqi 'does not match the tracked app authority' "$authority_mismatch_error"
-if [ -e "$authority_swift_log" ]; then
-  echo "Unsigned developer packaging verified or built artifacts before rejecting an authority mismatch" >&2
-  exit 1
-fi
-if [ -e "$authority_path_swift_log" ]; then
-  echo "Unsigned developer packaging invoked a PATH-shadowed Swift before rejecting an authority mismatch" >&2
-  exit 1
-fi
-if [ -e "$authority_fixture/build" ] || [ -e "$authority_fixture/release" ]; then
-  echo "Unsigned developer packaging produced output before rejecting an authority mismatch" >&2
-  exit 1
-fi
-
-# Cosmetic trailing whitespace must not make the same 32-byte Ed25519 authority differ.
-python3 - "$authority_fixture" <<'PY'
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-tracked = (root / "EasySplatApp/Resources/public_key_ed25519.txt").read_text(
-    encoding="ascii"
-).strip()
-(root / "Toolchains/public_key_ed25519.txt").write_text(
-    tracked + "\n",
-    encoding="ascii",
-)
-PY
-authority_match_error="$TMP_DIR/build-dmg-authority-match.stderr"
-if PATH="$authority_fixture/mock-bin:$PATH" \
-  EASYSPLAT_TEST_SWIFT_LOG="$authority_swift_log" \
-  EASYSPLAT_TEST_PATH_SWIFT_LOG="$authority_path_swift_log" \
-  "$authority_fixture/scripts/release/build_dmg.sh" \
-  --app-version "0.2.0" \
-  --toolchain-version "2.0.0" \
-  --manifest-url "https://example.com/toolchain/manifest.json" \
-  --core-artifact-url "https://example.com/toolchain/core.zip" \
-  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
-  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
-  --use-existing-toolchain \
-  --development-unsigned >/dev/null 2>"$authority_match_error"; then
-  echo "Authority fixture unexpectedly completed packaging" >&2
-  exit 1
-fi
-grep -Fq 'reached signed-closure verification' "$authority_match_error"
-test "$(wc -l <"$authority_swift_log" | tr -d '[:space:]')" -eq 1
-test "$(cut -f1 "$authority_swift_log")" = verify-release
-if [ -e "$authority_path_swift_log" ]; then
-  echo "Authority fixture invoked PATH-shadowed Swift instead of /usr/bin/swift" >&2
-  exit 1
-fi
-
 signed_dmg_fixture="$TMP_DIR/signed-dmg-fixture"
 mkdir -p \
   "$signed_dmg_fixture/scripts/release/lib" \
-  "$signed_dmg_fixture/EasySplatApp/Resources" \
   "$signed_dmg_fixture/ThirdParty/MetalSplatter" \
-  "$signed_dmg_fixture/prepared/toolchain/out" \
+  "$signed_dmg_fixture/prepared/toolchain/out/bin" \
+  "$signed_dmg_fixture/prepared/toolchain/out/lib" \
+  "$signed_dmg_fixture/prepared/toolchain/out/supply-chain" \
   "$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/MacOS" \
-  "$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/Resources" \
+  "$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/Helpers/bin" \
+  "$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/Helpers/lib" \
+  "$signed_dmg_fixture/prepared/product/EasySplat.app/Contents/Resources/Toolchain" \
   "$signed_dmg_fixture/prepared/product/EasySplat.app.dSYM/Contents/Resources/DWARF" \
   "$signed_dmg_fixture/mock-bin"
 cp "$ROOT/scripts/release/build_dmg.sh" \
@@ -4070,26 +3854,18 @@ cp "$ROOT/scripts/release/verify_notarization_receipt.py" \
   "$signed_dmg_fixture/scripts/release/verify_notarization_receipt.py"
 cp "$ROOT/scripts/release/lib/strict_semver.sh" \
   "$signed_dmg_fixture/scripts/release/lib/strict_semver.sh"
-cp "$public_key_path" \
-  "$signed_dmg_fixture/EasySplatApp/Resources/public_key_ed25519.txt"
-cp "$public_key_path" \
-  "$signed_dmg_fixture/prepared/toolchain/public_key_ed25519.txt"
-cp "$bootstrap_manifest" \
-  "$signed_dmg_fixture/prepared/toolchain/manifest.json"
-cp "$bootstrap_core_archive" \
-  "$signed_dmg_fixture/prepared/toolchain/out/toolchain-macos-arm64-2.0.0-core.zip"
-cp "$bootstrap_base_archive" \
-  "$signed_dmg_fixture/prepared/toolchain/out/toolchain-geometry-da3-base-2.0.0.zip"
-cp "$bootstrap_small_archive" \
-  "$signed_dmg_fixture/prepared/toolchain/out/toolchain-geometry-da3-small-2.0.0.zip"
-for prepared_authority_file in \
-  toolchain-release-request.json \
-  toolchain-authority-envelope.json \
-  toolchain-authority-receipt.json \
-  toolchain-benchmark-evidence.json; do
-  printf '%s\n' '{}' \
-    >"$signed_dmg_fixture/prepared/toolchain/out/$prepared_authority_file"
-done
+# A prepared release carries the built toolchain tree and the copy already
+# sealed inside the app, so the fixture stages both instead of archives.
+# Packaging reads the tree from the prepared root, which is why it is the whole
+# tree rather than the handful of files the manifest requires.
+rm -rf "$signed_dmg_fixture/prepared/toolchain/out"
+/usr/bin/ditto "$toolchain_tree" "$signed_dmg_fixture/prepared/toolchain/out"
+prepared_app_contents="$signed_dmg_fixture/prepared/product/EasySplat.app/Contents"
+cp "$toolchain_tree/bin/colmap" "$prepared_app_contents/Helpers/bin/colmap"
+cp "$toolchain_tree/bin/easysplat-train" "$prepared_app_contents/Helpers/bin/easysplat-train"
+cp "$toolchain_tree/lib/libomp.dylib" "$prepared_app_contents/Helpers/lib/libomp.dylib"
+cp "$toolchain_tree/bin/default.metallib" \
+  "$prepared_app_contents/Resources/Toolchain/default.metallib"
 printf '%s\n' 'fixture license' >"$signed_dmg_fixture/LICENSE"
 printf '%s\n' 'fixture notice' >"$signed_dmg_fixture/NOTICE.md"
 printf '%s\n' 'fixture viewer license' \
@@ -4537,7 +4313,7 @@ import sys
 from pathlib import Path
 
 script_path = Path(sys.argv[1])
-xcodebuild, swift, git, hdiutil = map(shlex.quote, sys.argv[2:])
+xcodebuild, _swift, git, hdiutil = map(shlex.quote, sys.argv[2:])
 source = script_path.read_text(encoding="utf-8")
 replacements = {
     "if command -v xcodebuild >/dev/null 2>&1; then": (
@@ -4545,10 +4321,6 @@ replacements = {
     ),
     "if ! xcodebuild -license check >/dev/null 2>&1; then": (
         f"if ! {xcodebuild} -license check >/dev/null 2>&1; then"
-    ),
-    'manifest_tool=(/usr/bin/swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool)': (
-        f'manifest_tool=({swift} run --package-path '
-        '"$ROOT/Tools/ManifestTool" ManifestTool)'
     ),
     'SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"': (
         f'SOURCE_COMMIT="$({git} -C "$ROOT" rev-parse HEAD)"'
@@ -4591,13 +4363,8 @@ FAKE_RELEASE_LOG="$signed_dmg_log" \
   "$signed_dmg_fixture/scripts/release/build_dmg.sh" \
   --app-version 0.2.0 \
   --toolchain-version 2.0.0 \
-  --manifest-url https://example.com/manifest.json \
-  --core-artifact-url https://example.com/core.zip \
-  --da3-base-artifact-url https://example.com/base.zip \
-  --da3-small-artifact-url https://example.com/small.zip \
   --project-url https://example.com/EasySplat \
   --build-root "$signed_dmg_build_root" \
-  --use-existing-toolchain \
   --prepared-release-root "$signed_dmg_prepared_root" \
   --prepared-manifest-sha256 "$signed_dmg_prepared_manifest_sha256" \
   --source-commit "$signed_dmg_source_commit" \
@@ -4661,7 +4428,6 @@ from pathlib import Path
 rows = [json.loads(line) for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
 events = [row[0:2] for row in rows]
 assert events == [
-    ["metadata", "verify-toolchain"],
     ["sign", "--root"],
     ["verify-signature", "--verify-only"],
     ["notarize", "--type"],
@@ -4673,8 +4439,8 @@ assert events == [
     ["verify-signature", "--verify-only"],
     ["metadata", "generate"],
 ]
-app_sign_arguments = rows[1][1:]
-dmg_sign_arguments = rows[6][1:]
+app_sign_arguments = rows[0][1:]
+dmg_sign_arguments = rows[5][1:]
 verification_arguments = [row[1:] for row in rows if row[0] == "verify-signature"]
 assert all(row[0] != "build-app" for row in rows)
 for sign_arguments in (app_sign_arguments, dmg_sign_arguments):
@@ -4690,9 +4456,9 @@ assert sum(
     for arguments in verification_arguments
 ) == 2
 assert "--deep" not in app_sign_arguments + dmg_sign_arguments
-assert rows[3][rows[3].index("--type") + 1] == "app"
-assert rows[8][rows[8].index("--type") + 1] == "dmg"
-assert rows[10][rows[10].index("--release-mode") + 1] == "production"
+assert rows[2][rows[2].index("--type") + 1] == "app"
+assert rows[7][rows[7].index("--type") + 1] == "dmg"
+assert rows[9][rows[9].index("--release-mode") + 1] == "production"
 PY
 
 rm -rf "$signed_dmg_output"
@@ -4703,12 +4469,7 @@ if PATH="$signed_dmg_fixture/mock-bin:$PATH" \
   "$signed_dmg_fixture/scripts/release/build_dmg.sh" \
   --app-version 0.2.0 \
   --toolchain-version 2.0.0 \
-  --manifest-url https://example.com/manifest.json \
-  --core-artifact-url https://example.com/core.zip \
-  --da3-base-artifact-url https://example.com/base.zip \
-  --da3-small-artifact-url https://example.com/small.zip \
   --build-root "$signed_dmg_build_root" \
-  --use-existing-toolchain \
   --prepared-release-root "$signed_dmg_prepared_root" \
   --prepared-manifest-sha256 "$signed_dmg_prepared_manifest_sha256" \
   --source-commit "$signed_dmg_source_commit" \
@@ -4819,13 +4580,17 @@ test -x "$ROOT/scripts/release/verify_release.sh"
 release_verifier_help="$TMP_DIR/verify-release-help.txt"
 "$ROOT/scripts/release/verify_release.sh" --help >"$release_verifier_help"
 grep -F 'Usage: verify_release.sh' "$release_verifier_help" >/dev/null
-grep -F 'Production artifact closure:' "$release_verifier_help" >/dev/null
-for production_flag in \
+grep -F 'The app carries its own toolchain' "$release_verifier_help" >/dev/null
+for retired_flag in \
   --release-manifest \
   --core-archive \
-  --da3-base-archive \
-  --da3-small-archive; do
-  grep -F -- "$production_flag" "$release_verifier_help" >/dev/null
+  --manifest-url \
+  --toolchain-root \
+  --offline-cache-root; do
+  if grep -F -- "$retired_flag" "$release_verifier_help" >/dev/null; then
+    echo "verify_release.sh still advertises the retired option $retired_flag" >&2
+    exit 1
+  fi
 done
 legacy_fixture_error="$TMP_DIR/legacy-release-fixture.stderr"
 if EASYSPLAT_RELEASE_FIXTURE="$TMP_DIR/untrusted-release-fixture" \
@@ -5241,7 +5006,7 @@ EASYSPLAT_TEST_APP_PATH="$app_bundle" \
   --allow-incomplete \
   --skip-packaged-app-smoke >"$bundled_contract_only_output"
 grep -Fq 'INCOMPLETE TEST MODE: end-to-end splat not supplied.' "$bundled_contract_only_output"
-grep -Fq 'INCOMPLETE TEST MODE: offline bootstrap run not supplied.' "$bundled_contract_only_output"
+grep -Fq 'INCOMPLETE TEST MODE: packaged-app smoke disabled.' "$bundled_contract_only_output"
 grep -Fq 'Inspection only:' "$bundled_contract_only_output"
 grep -Fq 'release verification is incomplete' "$bundled_contract_only_output"
 if grep -Eiq 'Verified unsigned developer build|usable|distributable' "$bundled_contract_only_output"; then
@@ -5363,52 +5128,52 @@ if ! grep -Fqi 'NSPrincipalClass' "$missing_distributed_principal_error"; then
   exit 1
 fi
 
-missing_public_key_fixture="$TMP_DIR/missing-public-key-fixture"
-mkdir -p "$missing_public_key_fixture"
-cp -R "$app_bundle" "$missing_public_key_fixture/EasySplat.app"
-rm "$missing_public_key_fixture/EasySplat.app/Contents/Resources/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt"
+# The app carries helpers instead of a download authority, so the payload
+# contract is what verification refuses to accept as missing.
+missing_helper_fixture="$TMP_DIR/missing-helper-fixture"
+mkdir -p "$missing_helper_fixture"
+cp -R "$app_bundle" "$missing_helper_fixture/EasySplat.app"
+rm "$missing_helper_fixture/EasySplat.app/Contents/Helpers/bin/colmap"
 /usr/bin/codesign --force --deep --sign - --timestamp=none \
-  "$missing_public_key_fixture/EasySplat.app"
-cp -R "$app_dsym" \
-  "$missing_public_key_fixture/EasySplat.app.dSYM"
-missing_public_key_error="$TMP_DIR/release-verifier-missing-public-key.stderr"
+  "$missing_helper_fixture/EasySplat.app"
+cp -R "$app_dsym" "$missing_helper_fixture/EasySplat.app.dSYM"
+missing_helper_error="$TMP_DIR/release-verifier-missing-helper.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
-  EASYSPLAT_TEST_APP_PATH="$missing_public_key_fixture/EasySplat.app" \
+  EASYSPLAT_TEST_APP_PATH="$missing_helper_fixture/EasySplat.app" \
   "$ROOT/scripts/release/verify_release.sh" \
-  --app "$missing_public_key_fixture/EasySplat.app" \
+  --app "$missing_helper_fixture/EasySplat.app" \
   --dmg "$TMP_DIR/EasySplat-0.2.0-unsigned.dmg" \
   --expected-version "0.2.0" \
   --allow-incomplete \
-  --skip-packaged-app-smoke >/dev/null 2>"$missing_public_key_error"; then
-  echo "Release verification accepted a missing bundled public key" >&2
+  --skip-packaged-app-smoke >/dev/null 2>"$missing_helper_error"; then
+  echo "Release verification accepted an app missing a bundled helper" >&2
   exit 1
 fi
-grep -Fqi 'bundled toolchain public key is missing' "$missing_public_key_error"
+grep -Fq 'Bundled helper bin/colmap is missing' "$missing_helper_error"
 
-mismatched_manifest_fixture="$TMP_DIR/mismatched-manifest-fixture"
-mkdir -p "$mismatched_manifest_fixture"
-cp -R "$app_bundle" "$mismatched_manifest_fixture/EasySplat.app"
-printf '%s' 'https://downloads.example.com/wrong-manifest.json' \
-  >"$mismatched_manifest_fixture/EasySplat.app/Contents/Resources/EasySplat_EasySplatApp.bundle/toolchain_manifest_url.txt"
+symlinked_helper_fixture="$TMP_DIR/symlinked-helper-fixture"
+mkdir -p "$symlinked_helper_fixture"
+cp -R "$app_bundle" "$symlinked_helper_fixture/EasySplat.app"
+symlinked_helper_target="$symlinked_helper_fixture/EasySplat.app/Contents/Helpers/bin/linked-colmap"
+ln -s colmap "$symlinked_helper_target"
 /usr/bin/codesign --force --deep --sign - --timestamp=none \
-  "$mismatched_manifest_fixture/EasySplat.app"
-cp -R "$app_dsym" \
-  "$mismatched_manifest_fixture/EasySplat.app.dSYM"
-mismatched_manifest_error="$TMP_DIR/release-verifier-mismatched-manifest.stderr"
+  "$symlinked_helper_fixture/EasySplat.app" 2>/dev/null || true
+cp -R "$app_dsym" "$symlinked_helper_fixture/EasySplat.app.dSYM"
+symlinked_helper_error="$TMP_DIR/release-verifier-symlinked-helper.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
-  EASYSPLAT_TEST_APP_PATH="$mismatched_manifest_fixture/EasySplat.app" \
+  EASYSPLAT_TEST_APP_PATH="$symlinked_helper_fixture/EasySplat.app" \
   "$ROOT/scripts/release/verify_release.sh" \
-  --app "$mismatched_manifest_fixture/EasySplat.app" \
+  --app "$symlinked_helper_fixture/EasySplat.app" \
   --dmg "$TMP_DIR/EasySplat-0.2.0-unsigned.dmg" \
   --expected-version "0.2.0" \
   --allow-incomplete \
-  --skip-packaged-app-smoke >/dev/null 2>"$mismatched_manifest_error"; then
-  echo "Release verification accepted a mismatched bundled manifest URL" >&2
+  --skip-packaged-app-smoke >/dev/null 2>"$symlinked_helper_error"; then
+  echo "Release verification accepted a symlink inside the sealed helper tree" >&2
   exit 1
 fi
-grep -Fqi 'bundled toolchain manifest URL does not match' "$mismatched_manifest_error"
+grep -Fqi 'symbolic link' "$symlinked_helper_error"
 
 grep -Fq -- '--development-unsigned)' "$ROOT/scripts/release/build_dmg.sh"
 grep -Fq -- '--production)' "$ROOT/scripts/release/build_dmg.sh"
@@ -5472,40 +5237,37 @@ metadata_tool="$ROOT/scripts/release/generate_release_metadata.py"
 python3 - "$metadata_tool" "$TMP_DIR" <<'PY'
 import hashlib
 import importlib.util
+import re
+import shutil
 import struct
 import sys
-import zipfile
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("release_metadata", Path(sys.argv[1]))
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
-module.validate_normal_photo_install_size({
-    "core": 2_000_000_000,
-    "geometry-da3-base": 1_999_999_999,
-    "geometry-da3-small": 1_999_999_999,
-})
+module.validate_bundled_toolchain_size(module.MAX_BUNDLED_TOOLCHAIN_BYTES)
 try:
-    module.validate_normal_photo_install_size({
-        "core": 2_500_000_001,
-        "geometry-da3-base": 1,
-        "geometry-da3-small": 1,
-    })
+    module.validate_bundled_toolchain_size(module.MAX_BUNDLED_TOOLCHAIN_BYTES + 1)
 except module.MetadataError:
     pass
 else:
-    raise AssertionError("core-only size gate accepted more than 2.5 GB")
-try:
-    module.validate_normal_photo_install_size({
-        "core": 2_000_000_000,
-        "geometry-da3-base": 2_000_000_000,
-        "geometry-da3-small": 2_000_000_001,
-    })
-except module.MetadataError:
-    pass
-else:
-    raise AssertionError("full optional size gate accepted more than 6 GB")
+    raise AssertionError("bundled toolchain size gate accepted an oversized payload")
+# A payload this gate accepts must still fit under the whole-app ceiling the
+# publication verifier enforces, or the release fails after it is built.
+publication = Path(sys.argv[1]).parent / "verify_publication_bundle.py"
+app_limits = re.findall(
+    r"validate_regular_tree\(app, maximum_bytes=([0-9_]+(?:\s*\*\s*[0-9_]+)*)\)",
+    publication.read_text(encoding="utf-8"),
+)
+if len(app_limits) != 1:
+    raise AssertionError("publication verifier no longer states one app size ceiling")
+app_ceiling = 1
+for factor in app_limits[0].split("*"):
+    app_ceiling *= int(factor.strip().replace("_", ""))
+if module.MAX_BUNDLED_TOOLCHAIN_BYTES >= app_ceiling:
+    raise AssertionError("bundled toolchain budget exceeds the published app ceiling")
 
 wheel_url = "https://files.pythonhosted.org/packages/addict-2.4.0-py3-none-any.whl"
 assert module.validate_https_url(wheel_url, "wheel URL") == wheel_url
@@ -5533,7 +5295,7 @@ for label, header in {
     else:
         raise AssertionError(f"accepted {label} Mach-O header")
 
-archive_path = Path(sys.argv[2]) / "arm64-archive-contract.zip"
+tree_root = Path(sys.argv[2]) / "arm64-tree-contract"
 row = {
     "path": "bin/native",
     "component": "fixture",
@@ -5542,44 +5304,35 @@ row = {
     "sha256": hashlib.sha256(arm64).hexdigest(),
     "dependencies": [],
 }
-with zipfile.ZipFile(archive_path, "w") as archive:
-    archive.writestr(row["path"], arm64)
-module.inspect_archive(
-    module.ArchiveSpec("geometry-da3-base", archive_path, "https://example.com/native.zip"),
-    {row["path"]: row},
-    set(),
-)
-x86 = b"\xcf\xfa\xed\xfe" + struct.pack("<II", 0x01000007, 3) + b"payload"
-row["size"] = len(x86)
-row["sha256"] = hashlib.sha256(x86).hexdigest()
-with zipfile.ZipFile(archive_path, "w") as archive:
-    archive.writestr(row["path"], x86)
+
+def stage(payload):
+    if tree_root.exists():
+        shutil.rmtree(tree_root)
+    (tree_root / "bin").mkdir(parents=True)
+    (tree_root / "bin/native").write_bytes(payload)
+    components = tree_root / module.COMPONENTS_PATH
+    components.parent.mkdir(parents=True, exist_ok=True)
+    components.write_text("{}", encoding="utf-8")
+    row["size"] = len(payload)
+    row["sha256"] = hashlib.sha256(payload).hexdigest()
+
+stage(arm64)
+module.inspect_toolchain_tree(tree_root, {row["path"]: row}, set())
+stage(b"\xcf\xfa\xed\xfe" + struct.pack("<II", 0x01000007, 3) + b"payload")
 try:
-    module.inspect_archive(
-        module.ArchiveSpec("geometry-da3-base", archive_path, "https://example.com/native.zip"),
-        {row["path"]: row},
-        set(),
-    )
+    module.inspect_toolchain_tree(tree_root, {row["path"]: row}, set())
 except module.MetadataError:
     pass
 else:
-    raise AssertionError("release archive inspection accepted an x86_64 Mach-O")
+    raise AssertionError("staged toolchain inspection accepted an x86_64 Mach-O")
 
-plain = b"not-a-mach-o"
-row["size"] = len(plain)
-row["sha256"] = hashlib.sha256(plain).hexdigest()
-with zipfile.ZipFile(archive_path, "w") as archive:
-    archive.writestr(row["path"], plain)
+stage(b"not-a-mach-o")
 try:
-    module.inspect_archive(
-        module.ArchiveSpec("geometry-da3-base", archive_path, "https://example.com/native.zip"),
-        {row["path"]: row},
-        set(),
-    )
+    module.inspect_toolchain_tree(tree_root, {row["path"]: row}, set())
 except module.MetadataError as error:
     assert "not a thin 64-bit binary" in str(error)
 else:
-    raise AssertionError("release archive inspection accepted non-Mach-O bytes as Mach-O")
+    raise AssertionError("staged toolchain inspection accepted non-Mach-O bytes as Mach-O")
 PY
 python3 "$metadata_tool" generate \
   --app-version 0.2.0 \
@@ -5623,10 +5376,7 @@ metadata_verify_args=(
   --toolchain-version 2.0.0 \
   --release-mode development-unsigned \
   --dmg "$development_dmg" \
-  --manifest "$metadata_fixture/manifest.json" \
-  --core "$metadata_fixture/core.zip" \
-  --da3-base "$metadata_fixture/base.zip" \
-  --da3-small "$metadata_fixture/small.zip" \
+  --toolchain-dir "$metadata_fixture/core" \
   --app-license "$ROOT/LICENSE" \
   --notice "$ROOT/NOTICE.md" \
   --viewer-license "$ROOT/ThirdParty/MetalSplatter/LICENSE" \
@@ -5647,7 +5397,7 @@ if python3 "$metadata_tool" verify \
   echo "Release metadata accepted provenance for a different source commit" >&2
   exit 1
 fi
-grep -Fqi 'release provenance does not exactly match shipped artifacts' \
+grep -Fqi 'release provenance does not match the built artifacts' \
   "$mismatched_source_commit_error"
 
 mismatched_source_url_error="$TMP_DIR/mismatched-source-url.stderr"
@@ -5658,7 +5408,7 @@ if python3 "$metadata_tool" verify \
   echo "Release metadata accepted provenance for a different source repository" >&2
   exit 1
 fi
-grep -Fqi 'release provenance does not exactly match shipped artifacts' \
+grep -Fqi 'release provenance does not match the built artifacts' \
   "$mismatched_source_url_error"
 python3 -m json.tool "$development_stem.provenance.json" >/dev/null
 python3 -m json.tool "$development_stem.spdx.json" >/dev/null
@@ -5693,114 +5443,11 @@ unzip -Z1 "$development_stem-licenses.zip" | grep -Fx 'toolchain-closure.json' >
 (cd "$TMP_DIR" && shasum -a 256 "$(basename "$development_dmg")" >"$(basename "$development_dmg").sha256")
 (cd "$release_test_build_root/Export" && zip -qry "$development_stem-dSYM.zip" EasySplat.app.dSYM)
 printf '%s\n' 'EasySplat 0.2.0 is an unsigned developer build.' >"$development_stem-release-notes.txt"
-release_metadata_args=(
-  --release-manifest "$metadata_fixture/manifest.json"
-  --core-archive "$metadata_fixture/core.zip"
-  --da3-base-archive "$metadata_fixture/base.zip"
-  --da3-small-archive "$metadata_fixture/small.zip"
-)
+release_metadata_args=(--toolchain-dir "$metadata_fixture/core")
 release_source_args=(
   --source-url https://example.com/EasySplat
   --source-commit deadbeef
 )
-
-missing_bootstrap_fixture="$TMP_DIR/missing-bootstrap-fixture"
-mkdir -p "$missing_bootstrap_fixture"
-cp -R "$app_bundle" "$missing_bootstrap_fixture/EasySplat.app"
-cp -R "$app_dsym" "$missing_bootstrap_fixture/EasySplat.app.dSYM"
-rm "$missing_bootstrap_fixture/EasySplat.app/Contents/Resources/Toolchain/manifest.json"
-/usr/bin/codesign --force --deep --sign - --timestamp=none \
-  "$missing_bootstrap_fixture/EasySplat.app"
-missing_bootstrap_error="$TMP_DIR/release-verifier-missing-bootstrap.stderr"
-if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
-  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
-  EASYSPLAT_TEST_APP_PATH="$missing_bootstrap_fixture/EasySplat.app" \
-  "$ROOT/scripts/release/verify_release.sh" \
-  --app "$missing_bootstrap_fixture/EasySplat.app" \
-  --dmg "$development_dmg" \
-  --expected-version 0.2.0 \
-  --allow-incomplete \
-  --skip-packaged-app-smoke >/dev/null 2>"$missing_bootstrap_error"; then
-  echo "Release verification accepted a missing packaged bootstrap manifest." >&2
-  exit 1
-fi
-grep -Fqi 'must contain exactly manifest.json and macos-arm64-core.zip' \
-  "$missing_bootstrap_error"
-
-hardlinked_bootstrap_fixture="$TMP_DIR/hardlinked-bootstrap-fixture"
-mkdir -p "$hardlinked_bootstrap_fixture"
-cp -R "$app_bundle" "$hardlinked_bootstrap_fixture/EasySplat.app"
-cp -R "$app_dsym" "$hardlinked_bootstrap_fixture/EasySplat.app.dSYM"
-hardlinked_manifest="$hardlinked_bootstrap_fixture/EasySplat.app/Contents/Resources/Toolchain/manifest.json"
-hardlinked_manifest_source="$hardlinked_bootstrap_fixture/manifest-source.json"
-cp "$metadata_fixture/manifest.json" "$hardlinked_manifest_source"
-rm "$hardlinked_manifest"
-ln "$hardlinked_manifest_source" "$hardlinked_manifest"
-/usr/bin/codesign --force --deep --sign - --timestamp=none \
-  "$hardlinked_bootstrap_fixture/EasySplat.app"
-hardlinked_bootstrap_error="$TMP_DIR/release-verifier-hardlinked-bootstrap.stderr"
-if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
-  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
-  EASYSPLAT_TEST_APP_PATH="$hardlinked_bootstrap_fixture/EasySplat.app" \
-  "$ROOT/scripts/release/verify_release.sh" \
-  --app "$hardlinked_bootstrap_fixture/EasySplat.app" \
-  --dmg "$development_dmg" \
-  --expected-version 0.2.0 \
-  --allow-incomplete \
-  --skip-packaged-app-smoke >/dev/null 2>"$hardlinked_bootstrap_error"; then
-  echo "Release verification accepted a hardlinked packaged bootstrap manifest." >&2
-  exit 1
-fi
-grep -Fqi 'non-hardlinked regular file' "$hardlinked_bootstrap_error"
-
-tampered_bootstrap_fixture="$TMP_DIR/tampered-bootstrap-fixture"
-mkdir -p "$tampered_bootstrap_fixture"
-cp -R "$app_bundle" "$tampered_bootstrap_fixture/EasySplat.app"
-cp -R "$app_dsym" "$tampered_bootstrap_fixture/EasySplat.app.dSYM"
-printf '%s' tampered >> \
-  "$tampered_bootstrap_fixture/EasySplat.app/Contents/Resources/Toolchain/manifest.json"
-/usr/bin/codesign --force --deep --sign - --timestamp=none \
-  "$tampered_bootstrap_fixture/EasySplat.app"
-tampered_bootstrap_error="$TMP_DIR/release-verifier-tampered-bootstrap.stderr"
-if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
-  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
-  EASYSPLAT_TEST_APP_PATH="$tampered_bootstrap_fixture/EasySplat.app" \
-  "$ROOT/scripts/release/verify_release.sh" \
-  --app "$tampered_bootstrap_fixture/EasySplat.app" \
-  --dmg "$development_dmg" \
-  --expected-version 0.2.0 \
-  --release-manifest "$metadata_fixture/manifest.json" \
-  --core-archive "$metadata_fixture/core.zip" \
-  --allow-incomplete \
-  --skip-packaged-app-smoke >/dev/null 2>"$tampered_bootstrap_error"; then
-  echo "Release verification accepted tampered packaged bootstrap bytes." >&2
-  exit 1
-fi
-grep -Fqi 'ManifestTool error' "$tampered_bootstrap_error"
-
-tampered_static_fixture="$TMP_DIR/tampered-static-bootstrap-fixture"
-mkdir -p "$tampered_static_fixture"
-cp -R "$app_bundle" "$tampered_static_fixture/EasySplat.app"
-cp -R "$app_dsym" "$tampered_static_fixture/EasySplat.app.dSYM"
-printf '%s' tampered >> \
-  "$tampered_static_fixture/EasySplat.app/Contents/Resources/Toolchain/macos-arm64-core.zip"
-/usr/bin/codesign --force --deep --sign - --timestamp=none \
-  "$tampered_static_fixture/EasySplat.app"
-tampered_static_error="$TMP_DIR/release-verifier-tampered-static-bootstrap.stderr"
-if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
-  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
-  EASYSPLAT_TEST_APP_PATH="$tampered_static_fixture/EasySplat.app" \
-  "$ROOT/scripts/release/verify_release.sh" \
-  --app "$tampered_static_fixture/EasySplat.app" \
-  --dmg "$development_dmg" \
-  --expected-version 0.2.0 \
-  --allow-incomplete \
-  --skip-packaged-app-smoke >/dev/null 2>"$tampered_static_error"; then
-  echo "Static release inspection accepted a tampered packaged bootstrap core." >&2
-  exit 1
-fi
-grep -Fqi 'Bootstrap core archive size or SHA-256 does not match' \
-  "$tampered_static_error"
 
 missing_release_source_error="$TMP_DIR/release-verifier-missing-source.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
@@ -5858,7 +5505,13 @@ if "$strict_runner" --toolchain-root "$TMP_DIR" >/dev/null 2>"$strict_usage_erro
   echo "Release verifier accepted the retired --toolchain-root option." >&2
   exit 1
 fi
-grep -Fq -- '--app-bundle' "$strict_usage_error"
+grep -Fq -- 'Unknown or incomplete option: --toolchain-root' "$strict_usage_error"
+strict_usage_text="$TMP_DIR/release-verifier-usage.txt"
+if "$strict_runner" >/dev/null 2>"$strict_usage_text"; then
+  echo "Release verifier accepted an empty argument list." >&2
+  exit 1
+fi
+grep -Fq -- '--app-bundle <EasySplat.app>' "$strict_usage_text"
 
 grep -q '^attach ' "$hdiutil_log"
 grep -q '^detach ' "$hdiutil_log"
@@ -5869,8 +5522,6 @@ grep -Fq 'SecStaticCodeCheckValidity' \
   "$ROOT/EasySplatCore/Sources/EasySplatCore/Tools/BundledToolchainLocator.swift"
 grep -Fq 'kSecCSCheckNestedCode' \
   "$ROOT/EasySplatCore/Sources/EasySplatCore/Tools/BundledToolchainLocator.swift"
-grep -Fq 'let sourcePolicy: ToolchainSourcePolicy = switch arguments.installationPolicy' \
-  "$ROOT/Tools/ReleaseVerifier/main.swift"
 grep -Fq 'BundledToolchainLocator(bundleURL: arguments.appBundle)' \
   "$ROOT/Tools/ReleaseVerifier/main.swift"
 grep -Fq 'integrityPolicy: toolchain.integrityPolicy' \
@@ -5981,22 +5632,22 @@ if not (
         "Packaged preflight, independent verification, and attestation preservation are misordered."
     )
 PY
-grep -Fq '"--bootstrap-manifest", "--bootstrap-core-archive"' \
-  "$ROOT/Tools/ReleaseVerifier/main.swift"
 python3 - "$ROOT/Tools/ReleaseVerifier/main.swift" <<'PY'
 import sys
 from pathlib import Path
 
 source = Path(sys.argv[1]).read_text(encoding="utf-8")
 required_arguments = (
-    'let expectedManifest = values["--expected-manifest"]',
-    'let expectedManifestFileSHA256 = values["--expected-manifest-file-sha256"]',
-    'fileSHA256 == arguments.expectedManifestFileSHA256',
-    'manifest.verifying(publicKeyBase64: publicKeyBase64)',
+    'let appBundle = values["--app-bundle"]',
+    'BundledToolchainLocator(bundleURL: arguments.appBundle)',
+    'integrityPolicy: toolchain.integrityPolicy',
 )
 for required in required_arguments:
     if required not in source:
-        raise SystemExit(f"Release verifier is missing expected-manifest binding: {required}")
+        raise SystemExit(f"Release verifier is missing its app-bundle binding: {required}")
+for retired in ('--expected-manifest', '--toolchain-root', 'publicKeyBase64'):
+    if retired in source:
+        raise SystemExit(f"Release verifier retains a retired download binding: {retired}")
 
 publication = source.index("private static func publishEvidence(")
 stage_sync = source.index("try synchronizeEvidenceDescriptor(temporary)", publication)
@@ -6022,18 +5673,17 @@ if not (
         "Packaged attestation is not fully validated before atomic publication."
     )
 
-expected = source.index("let expectedManifest = try loadExpectedManifest(")
-install = source.index("let toolchain = try await manager.ensureToolchain(", expected)
-before = source.index("let toolchainEvidenceBeforeRun = try manager.validatedInstallationEvidence(", install)
+locate = source.index("locator: BundledToolchainLocator(bundleURL: arguments.appBundle)")
+before = source.index("let toolchainEvidenceBeforeRun = try manager.installedTreeEvidence(", locate)
 pipeline = source.index("try await runner.run", before)
-after = source.index("let toolchainEvidenceAfterRun = try manager.validatedInstallationEvidence(", pipeline)
+after = source.index("let toolchainEvidenceAfterRun = try manager.installedTreeEvidence(", pipeline)
 unchanged = source.index("guard toolchainEvidenceAfterRun == toolchainEvidenceBeforeRun", after)
 publish = source.index("let outputEvidence = try ProjectArtifactValidator.publishValidatedPly(", unchanged)
 returned = source.index("return SuccessfulRunEvidence(", publish)
-if not expected < install < before < pipeline < after < unchanged < publish < returned:
+if not locate < before < pipeline < after < unchanged < publish < returned:
     raise SystemExit(
-        "Release verifier does not bind the expected manifest, attest the full closure "
-        "before and after the pipeline, then publish output."
+        "Release verifier does not resolve the bundled toolchain, attest the full "
+        "closure before and after the pipeline, then publish output."
     )
 PY
 python3 - "$ROOT/scripts/release/verify_release.sh" "$e2e_verifier_helpers" <<'PY'
@@ -6060,6 +5710,7 @@ if "(deny network* (with send-signal SIGKILL))" not in helper:
 if "Contents\", \"Helpers\", \"bin\"" not in helper.replace("'", '"'):
     raise SystemExit("Release-verifier sandbox does not name the bundled helper path.")
 PY
+app_workflow="$ROOT/.github/workflows/release-app.yml"
 grep -Fq 'workflow_dispatch:' "$app_workflow"
 grep -Fq 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' "$app_workflow"
 grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-signing, easysplat-ephemeral]' "$app_workflow"
@@ -6145,7 +5796,7 @@ for required in (
     'test "$RUNNER_ENVIRONMENT" = "self-hosted"',
     "Prepare protected-main signing authority",
     '"$GITHUB_WORKSPACE/scripts/release/build_dmg.sh"',
-    '--manifest-tool-bin "$TRUSTED_MANIFEST_TOOL"',
+    '--prepared-release-root "$PREPARED_ROOT"',
 ):
     if required not in signing:
         raise SystemExit(f"Isolated signing authority is missing: {required}")
@@ -6269,11 +5920,7 @@ grep -Fq "CURRENT_HEAD=\"\$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \\" \
 grep -Fq 'test "$CURRENT_HEAD" = "$GITHUB_SHA"' "$app_workflow"
 grep -Fq -- '-F prerelease=false' "$app_workflow"
 grep -Fq 'scripts/release/verify_release.sh' "$app_workflow"
-grep -Fq -- '--manifest-url "$BASE_URL/manifest.json"' "$app_workflow"
-grep -Fq -- '--core-artifact-url "$BASE_URL/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip"' "$app_workflow"
-grep -Fq -- '--da3-base-artifact-url "$BASE_URL/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip"' "$app_workflow"
-grep -Fq -- '--da3-small-artifact-url "$BASE_URL/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip"' "$app_workflow"
-grep -Fq -- '--use-existing-toolchain' "$app_workflow"
+grep -Fq -- '--toolchain-dir "$PREPARED_ROOT/toolchain/out"' "$app_workflow"
 grep -Fq 'scripts/benchmark/aggregate_evidence.py' "$app_workflow"
 grep -Fq 'closure_args=(' "$app_workflow"
 grep -Fq 'create-build-closure' "$app_workflow"
@@ -6342,7 +5989,7 @@ assert signing_block.count("secrets.EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1") ==
 assert signing_block.count("secrets.EASYSPLAT_DEVELOPER_TEAM_ID") == 1
 assert signing_block.count("secrets.EASYSPLAT_NOTARY_KEYCHAIN_PROFILE") == 1
 assert '"$GITHUB_WORKSPACE/scripts/release/build_dmg.sh"' in signing_block
-assert '--manifest-tool-bin "$TRUSTED_MANIFEST_TOOL"' in signing_block
+assert '--prepared-release-root "$PREPARED_ROOT"' in signing_block
 assert "$PREPARED_ROOT/source/" not in signing_block
 assert "runs-on: macos-26" in quarantine_block
 assert "scripts/release/verify_release.sh" in quarantine_block
@@ -6646,11 +6293,7 @@ fi
 
 grep -Fq -- '--app-version)' "$ROOT/scripts/release/build_dmg.sh"
 grep -Fq -- '--toolchain-version)' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq -- '--manifest-url)' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq -- '--core-artifact-url)' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq -- '--da3-base-artifact-url)' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq -- '--da3-small-artifact-url)' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq -- '--use-existing-toolchain)' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq -- '--toolchain-dir)' "$ROOT/scripts/release/build_dmg.sh"
 grep -Fq -- '--production)' "$ROOT/scripts/release/build_dmg.sh"
 grep -Fq -- '--identity-fingerprint)' "$ROOT/scripts/release/build_dmg.sh"
 grep -Fq -- '--team-id)' "$ROOT/scripts/release/build_dmg.sh"
@@ -6660,21 +6303,18 @@ if grep -Fq -- '    --version)' "$ROOT/scripts/release/build_dmg.sh"; then
   exit 1
 fi
 grep -Fq -- '--version "$APP_VERSION"' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq -- '--bootstrap-manifest "$MANIFEST"' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq -- '--bootstrap-core-archive "$CORE_ZIP"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq -- '--toolchain-dir "$TOOLCHAIN_DIR"' "$ROOT/scripts/release/build_dmg.sh"
 grep -Fq 'DMG_PATH="$OUT_DIR/EasySplat-$APP_VERSION-unsigned.dmg"' "$ROOT/scripts/release/build_dmg.sh"
 grep -Fq 'DMG_PATH="$ARTIFACT_STEM.dmg"' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq 'requires explicit HTTPS manifest and component URLs' "$ROOT/scripts/release/build_dmg.sh"
-grep -Fq 'requires --use-existing-toolchain' "$ROOT/scripts/release/build_dmg.sh"
 if rg -n 'http://localhost|generate-keypair|private_key_ed25519|--private-key-file|scripts/toolchain/(build_|package_toolchain)|EASYSPLAT_DEVELOPER_ID_APPLICATION' \
   "$ROOT/scripts/release/build_dmg.sh" >/dev/null; then
   echo "build_dmg.sh retains a local toolchain build, release key, or production-signing path" >&2
   exit 1
 fi
-metadata_verify_line="$(grep -n -m1 'generate_release_metadata.py" verify-toolchain' "$ROOT/scripts/release/build_dmg.sh" | cut -d: -f1)"
+toolchain_check_line="$(grep -n -m1 'Missing toolchain artifact:' "$ROOT/scripts/release/build_dmg.sh" | cut -d: -f1)"
 app_build_line="$(grep -n -m1 'build_app.sh"' "$ROOT/scripts/release/build_dmg.sh" | cut -d: -f1)"
-test -n "$metadata_verify_line"
-test "$metadata_verify_line" -lt "$app_build_line"
+test -n "$toolchain_check_line"
+test "$toolchain_check_line" -lt "$app_build_line"
 grep -q 'scripts/toolchain/build_msplat.sh' "$ROOT/.github/workflows/toolchain-build.yml"
 grep -q 'scripts/toolchain/build_da3_mps.sh' "$ROOT/.github/workflows/toolchain-build.yml"
 toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
@@ -6913,8 +6553,9 @@ if rg -n 'homebrewBuild|SUITESPARSE_INSTALL|colmap:poissonrecon|easysplat[_-]col
   echo "Lean native toolchain packaging references a forbidden closure." >&2
   exit 1
 fi
-grep -Fq -- '--da3-base-zip "$DA3_BASE_ZIP"' "$ROOT/scripts/run.sh"
-grep -Fq -- '--da3-small-zip "$DA3_SMALL_ZIP"' "$ROOT/scripts/run.sh"
+grep -Fq '"$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"' \
+  "$ROOT/scripts/run.sh"
+grep -Fq 'rm -f "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"' "$ROOT/scripts/run.sh"
 grep -Fq 'ensure_msplat_bundle' "$ROOT/scripts/run.sh"
 grep -Fq 'ensure_da3_mps_bundle' "$ROOT/scripts/run.sh"
 
@@ -7206,15 +6847,13 @@ if ! grep -Fqi 'app build is already in progress' "$second_build_error"; then
   exit 1
 fi
 
-snapshot_swap_key="$TMP_DIR/snapshot-swap-public-key.txt"
-snapshot_expected_key="$TMP_DIR/snapshot-expected-public-key.txt"
-replacement_public_key="$TMP_DIR/replacement-public-key.txt"
-replacement_private_key="$TMP_DIR/replacement-private-key.txt"
-cp "$public_key_path" "$snapshot_swap_key"
-cp "$public_key_path" "$snapshot_expected_key"
-swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool generate-keypair \
-  --public-key-out "$replacement_public_key" \
-  --private-key-out "$replacement_private_key"
+# The build checks the toolchain tree, then reads it again to stage and to
+# compare. Replacing a helper between those reads must not reach the product.
+snapshot_swap_tree="$TMP_DIR/snapshot-swap-toolchain"
+/usr/bin/ditto "$toolchain_tree" "$snapshot_swap_tree"
+# The trainer stands in for a swapped colmap: a real Mach-O the build could
+# stage and sign, distinguishable only by the marker string it carries.
+snapshot_replacement_helper="$snapshot_swap_tree/bin/easysplat-train"
 
 snapshot_swap_root="$TMP_DIR/snapshot-swap-build"
 snapshot_wait_path="$TMP_DIR/snapshot-swap-wait"
@@ -7223,7 +6862,7 @@ EASYSPLAT_TEST_BUILD_WAIT_PATH="$snapshot_wait_path" \
 EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   "$ROOT/scripts/release/build_app.sh" \
   --build-root "$snapshot_swap_root" \
-  --public-key-path "$snapshot_swap_key" \
+  --toolchain-dir "$snapshot_swap_tree" \
   --project-url "$project_url" \
   --version "0.2.0" \
   --development-unsigned >"$snapshot_build_log" 2>&1 &
@@ -7239,21 +6878,21 @@ if [ ! -e "$snapshot_wait_path.ready" ]; then
   echo "Timed out waiting for the input-snapshot app build." >&2
   exit 1
 fi
-cp "$replacement_public_key" "$snapshot_swap_key"
+cp "$snapshot_replacement_helper" "$snapshot_swap_tree/bin/colmap"
 : >"$snapshot_wait_path.release"
 if ! wait "$snapshot_build_pid"; then
-  echo "Release app build did not preserve its authenticated public-key snapshot." >&2
+  echo "Release app build did not preserve its authenticated toolchain snapshot." >&2
   cat "$snapshot_build_log" >&2
   exit 1
 fi
-snapshot_resources="$snapshot_swap_root/Export/EasySplat.app/Contents/Resources"
-cmp -s "$snapshot_expected_key" "$snapshot_resources/public_key_ed25519.txt"
-cmp -s "$snapshot_expected_key" \
-  "$snapshot_resources/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt"
-if cmp -s "$replacement_public_key" "$snapshot_resources/public_key_ed25519.txt"; then
-  echo "Release app embedded a public key replaced after input authentication." >&2
+snapshot_staged_helper="$snapshot_swap_root/Export/EasySplat.app/Contents/Helpers/bin/colmap"
+LC_ALL=C grep -aq 'native-colmap' "$snapshot_staged_helper"
+if LC_ALL=C grep -aq 'native-msplat' "$snapshot_staged_helper"; then
+  echo "Release app staged a toolchain helper replaced after input validation." >&2
   exit 1
 fi
 
 # Keep the complete signing suite intact, but let cheap contract failures surface first.
 swift test --package-path "$ROOT/Tools/ManifestTool"
+
+release_tests_completed=1

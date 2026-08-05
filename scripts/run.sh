@@ -75,7 +75,39 @@ OUT="$TOOLCHAINS/out"
 if [ -z "$TOOLCHAIN_ROOT" ]; then
   TOOLCHAIN_ROOT="$OUT"
 fi
-TOOLCHAIN_ROOT="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve())' "$TOOLCHAIN_ROOT")"
+# This script extracts archives into the toolchain root and replaces payload
+# directories inside it, so the root is bounded to the staging tree and the
+# per-version install locations. An arbitrary path would be destroyed.
+TOOLCHAIN_ROOT="$(python3 - \
+  "$TOOLCHAIN_ROOT" \
+  "$VERSION" \
+  "$OUT" \
+  "$HOME/Library/Application Support/EasySplat/Toolchains" \
+  "$ROOT/Toolchains/dev" \
+  "${TMPDIR:-/tmp}/EasySplat/Toolchains" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).expanduser().resolve(strict=False)
+version = sys.argv[2]
+staging = Path(sys.argv[3]).expanduser().resolve(strict=False)
+allowed_parents = {Path(value).expanduser().resolve(strict=False) for value in sys.argv[4:]}
+semver = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+if not semver.fullmatch(version):
+    raise SystemExit(f"Invalid toolchain version: {version}")
+if root != staging and (root.name != version or root.parent not in allowed_parents):
+    allowed = ", ".join([str(staging)] + [str(parent / version) for parent in sorted(allowed_parents)])
+    raise SystemExit(
+        f"Refusing unsafe toolchain root: {root}. Expected one of: {allowed}"
+    )
+print(root)
+PY
+)"
 
 python3 - "$VERSION" <<'PY'
 import re
