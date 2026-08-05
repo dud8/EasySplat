@@ -90,7 +90,7 @@ class BuildDMGTrustBoundaryTests(unittest.TestCase):
                 )
 
             key = base64.b64encode(bytes(range(32))).decode("ascii") + "\n"
-            (repository / "EasySplatApp/Resources/public_key_ed25519.txt").write_text(
+            (repository / "scripts/release/toolchain_authority_public_key.txt").write_text(
                 key, encoding="ascii"
             )
             (prepared / "toolchain/out").mkdir(parents=True)

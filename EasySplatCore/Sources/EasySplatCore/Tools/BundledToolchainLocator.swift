@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 /// How far a toolchain's build receipts can be trusted to describe the bytes on
 /// disk.
@@ -8,6 +9,11 @@ import Foundation
 /// the shipped bytes belong to different domains and comparing them is a
 /// guaranteed failure rather than a check. The app's own signature covers the
 /// helpers there. An unsigned tree has no such cover, so the digests must agree.
+///
+/// `signedAppBundle` is therefore only sound once the seal has actually been
+/// checked: the locator verifies the bundle's static code signature, including
+/// nested code, before it hands back that policy. Without that step the relaxed
+/// comparison would trust any `.app`-shaped directory.
 public enum ToolchainIntegrityPolicy: String, Sendable, Equatable, Codable {
     case signedAppBundle
     case unsignedDevelopmentTree
@@ -74,13 +80,31 @@ public struct BundledToolchainLocator: Sendable {
 
     private let bundleURL: URL
     private let developmentOverrideRoot: URL?
+    private let validateSignature: @Sendable (URL) throws -> Void
 
     public init(
         bundleURL: URL = Bundle.main.bundleURL,
         developmentOverrideRoot: URL? = nil
     ) {
+        self.init(
+            bundleURL: bundleURL,
+            developmentOverrideRoot: developmentOverrideRoot,
+            validateSignature: Self.requireIntactCodeSignature
+        )
+    }
+
+    /// Module-internal seam for tests whose fixture helpers are scripts rather
+    /// than Mach-Os and so cannot carry a signature. The public initializer
+    /// always installs the real check, so no caller outside this module can
+    /// reach a locator that skips it.
+    init(
+        bundleURL: URL,
+        developmentOverrideRoot: URL?,
+        validateSignature: @escaping @Sendable (URL) throws -> Void
+    ) {
         self.bundleURL = bundleURL
         self.developmentOverrideRoot = developmentOverrideRoot
+        self.validateSignature = validateSignature
     }
 
     public func locate() throws -> ToolchainSource {
@@ -103,7 +127,42 @@ public struct BundledToolchainLocator: Sendable {
                 "This EasySplat build is missing its built-in tools. Reinstall EasySplat."
             )
         }
+        try validateSignature(bundleURL)
         return .appBundle(root: root, dataRoot: dataRoot)
+    }
+
+    /// Confirms the bundle still matches what its signer sealed.
+    ///
+    /// The bundled tools are trusted because the app's signature covers them, so
+    /// that signature has to be checked rather than assumed. This validates the
+    /// seal, not the signing authority: an ad-hoc developer build passes, while
+    /// any bundle whose helpers were replaced after signing fails. Gatekeeper
+    /// gates the first launch; nothing re-checks a bundle a local attacker edits
+    /// afterwards, and the helpers run as child processes that macOS does not
+    /// verify on the app's behalf.
+    static func requireIntactCodeSignature(at bundleURL: URL) throws {
+        var staticCode: SecStaticCode?
+        let created = SecStaticCodeCreateWithPath(
+            bundleURL as CFURL,
+            SecCSFlags(rawValue: 0),
+            &staticCode
+        )
+        guard created == errSecSuccess, let staticCode else {
+            throw ToolchainManager.ToolchainError.invalidToolchain(
+                "This EasySplat build is not signed. Reinstall EasySplat."
+            )
+        }
+        let flags = SecCSFlags(
+            rawValue: kSecCSCheckAllArchitectures
+                | kSecCSCheckNestedCode
+                | kSecCSStrictValidate
+        )
+        let status = SecStaticCodeCheckValidity(staticCode, flags, nil)
+        guard status == errSecSuccess else {
+            throw ToolchainManager.ToolchainError.invalidToolchain(
+                "This EasySplat build has been modified since it was signed. Reinstall EasySplat."
+            )
+        }
     }
 
     private func requirePlainDirectory(at url: URL) throws {

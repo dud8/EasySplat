@@ -144,6 +144,23 @@ if positions != sorted(positions):
     raise SystemExit("Toolchain workflow build order is not the reviewed native release order.")
 PY
 
+# The app carries its toolchain, so nothing may name a download authority or a
+# bootstrap payload it no longer has.
+if [ -e "$ROOT/EasySplatApp/Resources/public_key_ed25519.txt" ] \
+  || [ -e "$ROOT/EasySplatApp/Resources/toolchain_manifest_url.txt" ] \
+  || [ -e "$ROOT/EasySplatApp/Resources/ToolchainBootstrap" ]; then
+  echo "App resources still carry a retired toolchain-download surface." >&2
+  exit 1
+fi
+# Workflow paths always name the repository, so they can be checked exactly.
+# Test fixtures build synthetic repository roots and are deliberately excluded:
+# a path inside a fixture is not a path into this tree.
+if rg -n 'EasySplatApp/Resources/(public_key_ed25519|toolchain_manifest_url)\.txt' \
+  "$ROOT/.github/workflows" >/dev/null; then
+  echo "A release workflow still reads a deleted app toolchain resource." >&2
+  exit 1
+fi
+
 for retired_source in \
   "$ROOT/Tools/Da3Sfm/colmap_launcher.c" \
   "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py" \

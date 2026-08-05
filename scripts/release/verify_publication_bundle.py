@@ -68,25 +68,18 @@ SYSTEM_TOOLS = {
     "codesign": "/usr/bin/codesign",
     "dwarfdump": "/usr/bin/dwarfdump",
 }
-APP_TOOLCHAIN_RESOURCE_PATHS = (
-    "Contents/Resources/public_key_ed25519.txt",
-    "Contents/Resources/toolchain_manifest_url.txt",
-    (
-        "Contents/Resources/EasySplat_EasySplatApp.bundle/"
-        "public_key_ed25519.txt"
-    ),
-    (
-        "Contents/Resources/EasySplat_EasySplatApp.bundle/"
-        "toolchain_manifest_url.txt"
-    ),
-    (
-        "Contents/Resources/EasySplat_EasySplatApp.bundle/Contents/Resources/"
-        "public_key_ed25519.txt"
-    ),
-    (
-        "Contents/Resources/EasySplat_EasySplatApp.bundle/Contents/Resources/"
-        "toolchain_manifest_url.txt"
-    ),
+APP_BUNDLED_TOOLCHAIN_EXECUTABLES = (
+    "Contents/Helpers/bin/colmap",
+    "Contents/Helpers/bin/easysplat-train",
+)
+APP_BUNDLED_TOOLCHAIN_PAYLOAD = (
+    "Contents/Helpers/lib/libomp.dylib",
+    "Contents/Resources/Toolchain/default.metallib",
+    "Contents/Resources/Toolchain/supply-chain/components.json",
+)
+APP_RETIRED_TOOLCHAIN_RESOURCE_NAMES = (
+    "public_key_ed25519.txt",
+    "toolchain_manifest_url.txt",
 )
 
 
@@ -2664,50 +2657,29 @@ def parse_uuid(output: str, label: str) -> str:
     return match.group(1)
 
 
-def validate_app_toolchain_resources(
-    app: Path,
-    *,
-    toolchain_version: str,
-    source_repository: str,
-    toolchain_public_key: Path,
-) -> None:
-    resource_names = {"public_key_ed25519.txt", "toolchain_manifest_url.txt"}
-    found = {
+def validate_app_toolchain_resources(app: Path) -> None:
+    """The app carries its tools; nothing in it may name a download."""
+    stale = {
         path.relative_to(app).as_posix()
         for path in app.rglob("*")
-        if path.name in resource_names
+        if path.name in APP_RETIRED_TOOLCHAIN_RESOURCE_NAMES
     }
-    expected = set(APP_TOOLCHAIN_RESOURCE_PATHS)
-    if found != expected:
-        fail("bundled toolchain resource closure is not exact")
+    if stale:
+        fail(f"app still carries a download-era toolchain resource: {sorted(stale)[0]}")
+    if (app / "Contents/Resources/ToolchainBootstrap").exists():
+        fail("app still carries a toolchain bootstrap directory")
 
-    expected_public_key = file_record(
-        toolchain_public_key,
-        maximum_size=1_024,
-    )
-    expected_manifest_url = (
-        f"https://github.com/{source_repository}/releases/download/"
-        f"toolchain-v{toolchain_version}/manifest.json"
-    ).encode("ascii")
-    expected_records = {
-        "public_key_ed25519.txt": (
-            expected_public_key["size_bytes"],
-            expected_public_key["sha256"],
-        ),
-        "toolchain_manifest_url.txt": (
-            len(expected_manifest_url),
-            hashlib.sha256(expected_manifest_url).hexdigest(),
-        ),
-    }
-
-    for relative in APP_TOOLCHAIN_RESOURCE_PATHS:
-        resource = app / relative
-        actual = file_record(resource, maximum_size=1_024)
-        if (actual["size_bytes"], actual["sha256"]) != expected_records[resource.name]:
-            fail(
-                "bundled toolchain resource does not match release authority: "
-                f"{relative}"
-            )
+    for relative in APP_BUNDLED_TOOLCHAIN_EXECUTABLES:
+        helper = app / relative
+        if helper.is_symlink() or not helper.is_file():
+            fail(f"app is missing a bundled helper: {relative}")
+        mode = helper.stat().st_mode
+        if not mode & 0o111 or mode & 0o022:
+            fail(f"bundled helper has an unsafe mode: {relative}")
+    for relative in APP_BUNDLED_TOOLCHAIN_PAYLOAD:
+        payload = app / relative
+        if payload.is_symlink() or not payload.is_file() or payload.stat().st_size == 0:
+            fail(f"app is missing bundled toolchain payload: {relative}")
 
 
 def validate_app_bundle(
@@ -2722,19 +2694,14 @@ def validate_app_bundle(
     if app.is_symlink() or not app.is_dir():
         fail("DMG must contain a real EasySplat.app directory")
     contents = app / "Contents"
-    expected = {"Info.plist", "MacOS", "Resources", "_CodeSignature"}
+    expected = {"Helpers", "Info.plist", "MacOS", "Resources", "_CodeSignature"}
     if (
         not contents.is_dir()
         or {entry.name for entry in contents.iterdir()} != expected
     ):
         fail("app Contents allowlist is invalid")
     validate_regular_tree(app, maximum_bytes=4 * 1_024 * 1_024 * 1_024)
-    validate_app_toolchain_resources(
-        app,
-        toolchain_version=toolchain_version,
-        source_repository=source_repository,
-        toolchain_public_key=toolchain_public_key,
-    )
+    validate_app_toolchain_resources(app)
     plist = contents / "Info.plist"
     executable = contents / "MacOS/EasySplatApp"
     if not executable.is_file() or executable.is_symlink():

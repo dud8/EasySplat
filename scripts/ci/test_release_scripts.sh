@@ -553,9 +553,7 @@ fi
 EOF
 chmod +x "$mock_xcodebuild"
 
-manifest_before="$(cat "$ROOT/EasySplatApp/Resources/toolchain_manifest_url.txt")"
 project_before="$(cat "$ROOT/EasySplatApp/Resources/project_home_url.txt")"
-public_before="$(cat "$ROOT/EasySplatApp/Resources/public_key_ed25519.txt")"
 
 manifest_url="https://example.com/releases/download/toolchain-v1.2.3/manifest.json"
 project_url="https://example.com/EasySplat"
@@ -3166,9 +3164,7 @@ app_bundle="$release_test_build_root/Export/EasySplat.app"
 app_dsym="$release_test_build_root/Export/EasySplat.app.dSYM"
 resources_dir="$app_bundle/Contents/Resources"
 
-test "$(cat "$ROOT/EasySplatApp/Resources/toolchain_manifest_url.txt")" = "$manifest_before"
 test "$(cat "$ROOT/EasySplatApp/Resources/project_home_url.txt")" = "$project_before"
-test "$(cat "$ROOT/EasySplatApp/Resources/public_key_ed25519.txt")" = "$public_before"
 
 test "$(cat "$resources_dir/toolchain_manifest_url.txt")" = "$manifest_url"
 test "$(cat "$resources_dir/project_home_url.txt")" = "$project_url"

@@ -9,9 +9,9 @@ import Foundation
 /// limits are enforced from the ZIP central directory. After the entries are written, the
 /// destination is walked to confirm that only regular files and directories landed.
 ///
-/// The name-only path validation and the archive listing mechanics are shared verbatim
-/// with the toolchain download path (`ToolchainManager`), which delegates its own
-/// hardened unzip to the same primitives so the two cannot drift apart.
+/// Listing and inflation both run in process through `ZipArchiveReader`: a
+/// sandboxed app cannot lend its file access to a helper process, so an
+/// out-of-process unzip would fail on exactly the paths a user just granted.
 public enum SafeArchiveExtractor {
 
     /// Ceilings applied to an untrusted archive before and after extraction.
@@ -125,8 +125,8 @@ public enum SafeArchiveExtractor {
         }
     }
 
-    /// Upper bound on the raw `unzip -Z1` name listing text, guarding the inspector
-    /// against archives whose entry names alone would exhaust memory.
+    /// Upper bound on the total entry-name text, guarding the inspector against
+    /// archives whose names alone would exhaust memory.
     static let listingByteBudget = 128 * 1024 * 1024
 
     /// Validate and extract `zipURL` into `destination`, returning the regular files that landed.
@@ -389,11 +389,11 @@ public enum SafeArchiveExtractor {
     }
 }
 
-/// Streaming accumulator for the two subprocess passes an archive listing performs.
+/// Streaming accumulator for the two passes an archive listing performs.
 ///
-/// `inspectMetadataLine` consumes `zipinfo -l` output to detect symbolic links and special
-/// files and to sum uncompressed sizes; `appendEntry` consumes `unzip -Z1` output to collect
-/// entry names under a memory budget.
+/// `inspectMetadataLine` detects symbolic links and special files and sums
+/// uncompressed sizes; `appendEntry` collects entry names under a memory
+/// budget.
 final class ArchiveListingAccumulator: @unchecked Sendable {
     private let lock = NSLock()
     private let maximumListingBytes: Int

@@ -190,7 +190,7 @@ PHOTO_PERMUTATION_ATTESTATION_WORKFLOW = (
 MONOTONIC_TIMESTAMP_TOLERANCE_SECONDS = 1e-6
 PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = (
     Path(__file__).resolve().parents[2]
-    / "EasySplatApp/Resources/public_key_ed25519.txt"
+    / "scripts/release/toolchain_authority_public_key.txt"
 )
 PINNED_TOOLCHAIN_PUBLIC_KEY_BASE64_OVERRIDE: str | None = None
 MAX_TOOLCHAIN_INSTALL_STATE_BYTES = 16 * 1024 * 1024

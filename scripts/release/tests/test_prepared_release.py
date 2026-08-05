@@ -20,31 +20,22 @@ class PreparedReleaseTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
         self.root = Path(self.temporary.name) / "prepared"
-        (self.root / "product/EasySplat.app/Contents/MacOS").mkdir(parents=True)
-        (self.root / "product/EasySplat.app/Contents/MacOS/EasySplatApp").write_bytes(
-            b"app fixture"
-        )
-        (self.root / "product/EasySplat.app.dSYM/Contents/Resources/DWARF").mkdir(
-            parents=True
-        )
-        (self.root / "product/EasySplat.app.dSYM/Contents/Resources/DWARF/EasySplatApp").write_bytes(
-            b"symbols"
-        )
-        (self.root / "toolchain/out").mkdir(parents=True)
-        (self.root / "toolchain/manifest.json").write_text("{}\n", encoding="utf-8")
-        (self.root / "toolchain/public_key_ed25519.txt").write_text(
-            "authority\n", encoding="utf-8"
-        )
-        for name in (
-            "toolchain-macos-arm64-2.0.0-core.zip",
-            "toolchain-geometry-da3-base-2.0.0.zip",
-            "toolchain-geometry-da3-small-2.0.0.zip",
-            "toolchain-release-request.json",
-            "toolchain-authority-envelope.json",
-            "toolchain-authority-receipt.json",
-            "toolchain-benchmark-evidence.json",
+        for relative in (
+            "product/EasySplat.app/Contents/MacOS/EasySplatApp",
+            "product/EasySplat.app/Contents/Helpers/bin/colmap",
+            "product/EasySplat.app/Contents/Helpers/bin/easysplat-train",
+            "product/EasySplat.app/Contents/Helpers/lib/libomp.dylib",
+            "product/EasySplat.app/Contents/Resources/Toolchain/default.metallib",
+            "product/EasySplat.app.dSYM/Contents/Resources/DWARF/EasySplatApp",
+            "toolchain/out/bin/colmap",
+            "toolchain/out/bin/easysplat-train",
+            "toolchain/out/bin/default.metallib",
+            "toolchain/out/lib/libomp.dylib",
+            "toolchain/out/supply-chain/components.json",
         ):
-            (self.root / "toolchain/out" / name).write_bytes(name.encode("utf-8"))
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(relative.encode("utf-8"))
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -232,8 +223,8 @@ class PreparedReleaseTests(unittest.TestCase):
         self.assertIn("data-only", self.run_script("create", expect_success=False).stderr)
 
     def test_hardlink_is_rejected(self) -> None:
-        source = self.root / "toolchain/manifest.json"
-        os.link(source, self.root / "toolchain/manifest-copy.json")
+        source = self.root / "toolchain/out/bin/colmap"
+        os.link(source, self.root / "toolchain/out/bin/colmap-copy")
         self.assertIn("hardlink", self.run_script("create", expect_success=False).stderr)
 
     def test_manifest_must_be_single_link_regular_file(self) -> None:

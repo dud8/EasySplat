@@ -375,31 +375,25 @@ jobs:
           actionlint
           gitleaks git --redact
 
-      - name: Fetch signed toolchain closure
+      - name: Stage the toolchain tree the app will carry
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          test -s EasySplatApp/Resources/public_key_ed25519.txt
-          rm -rf Toolchains/out
-          mkdir -p Toolchains/out
+          # The app embeds these bytes, so the build stages the tree itself
+          # rather than handing an archive to an installer.
+          rm -rf Toolchains/download Toolchains/out
+          mkdir -p Toolchains/download Toolchains/out
           gh release download "$TOOLCHAIN_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --dir Toolchains/out \
-            --pattern manifest.json \
-            --pattern toolchain-release-request.json \
-            --pattern toolchain-authority-envelope.json \
-            --pattern toolchain-authority-receipt.json \
-            --pattern toolchain-benchmark-evidence.json \
-            --pattern "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
-            --pattern "toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
-            --pattern "toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"
-          mv Toolchains/out/manifest.json Toolchains/manifest.json
-          install -m 0644 \
-            EasySplatApp/Resources/public_key_ed25519.txt \
-            Toolchains/public_key_ed25519.txt
-          cmp -s \
-            EasySplatApp/Resources/public_key_ed25519.txt \
-            Toolchains/public_key_ed25519.txt
+            --dir Toolchains/download \
+            --pattern "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip"
+          /usr/bin/ditto -x -k \
+            "Toolchains/download/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
+            Toolchains/out
+          for required in bin/colmap bin/easysplat-train bin/default.metallib \
+            lib/libomp.dylib supply-chain/components.json; do
+            test -f "Toolchains/out/$required"
+          done
 
       - name: Prepare data-only uncredentialed app handoff
         run: |
@@ -415,35 +409,12 @@ jobs:
           mkdir -m 0700 \
             "$PREPARED_ROOT/product" \
             "$PREPARED_ROOT/toolchain"
-          mkdir -m 0700 "$PREPARED_ROOT/toolchain/out"
-          install -m 0600 Toolchains/manifest.json "$PREPARED_ROOT/toolchain/manifest.json"
-          install -m 0600 Toolchains/public_key_ed25519.txt "$PREPARED_ROOT/toolchain/public_key_ed25519.txt"
-          for name in \
-            "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
-            "toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
-            "toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip" \
-            toolchain-release-request.json \
-            toolchain-authority-envelope.json \
-            toolchain-authority-receipt.json \
-            toolchain-benchmark-evidence.json; do
-            install -m 0600 "Toolchains/out/$name" "$PREPARED_ROOT/toolchain/out/$name"
-          done
-          MANIFEST_TOOL_BUILD="$RUNNER_TEMP/easysplat-manifest-tool-build"
-          /usr/bin/swift build \
-            -c release \
-            --package-path Tools/ManifestTool \
-            --scratch-path "$MANIFEST_TOOL_BUILD" \
-            --product ManifestTool
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TOOLCHAIN_TAG"
+          /usr/bin/ditto Toolchains/out "$PREPARED_ROOT/toolchain/out"
           scripts/release/build_app.sh \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --public-key-path "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
+            --toolchain-dir "$PREPARED_ROOT/toolchain/out" \
             --version "$VERSION" \
-            --bootstrap-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
-            --bootstrap-core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
             --project-url "https://github.com/$GITHUB_REPOSITORY" \
             --build-root "$PREPARED_BUILD" \
-            --manifest-tool-bin "$MANIFEST_TOOL_BUILD/release/ManifestTool" \
             --prepare-release
           /usr/bin/ditto --noqtn \
             "$PREPARED_BUILD/Export/EasySplat.app" \
@@ -559,21 +530,6 @@ jobs:
           test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
           test "$(git rev-parse "v${{ inputs.version }}^{commit}")" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
-          TRUSTED_BUILD="$RUNNER_TEMP/easysplat-trusted-manifest-tool"
-          test ! -e "$TRUSTED_BUILD"
-          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-            /usr/bin/swift build \
-              -c release \
-              --package-path Tools/ManifestTool \
-              --scratch-path "$TRUSTED_BUILD" \
-              --product ManifestTool
-          TRUSTED_AUTHORITY="$RUNNER_TEMP/easysplat-trusted-signing-authority"
-          test ! -e "$TRUSTED_AUTHORITY"
-          mkdir -m 0700 "$TRUSTED_AUTHORITY"
-          install -m 0500 \
-            "$TRUSTED_BUILD/release/ManifestTool" \
-            "$TRUSTED_AUTHORITY/ManifestTool"
-          echo "TRUSTED_MANIFEST_TOOL=$TRUSTED_AUTHORITY/ManifestTool" >>"$GITHUB_ENV"
 
       - name: Download exact prepared release
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -711,7 +667,6 @@ jobs:
           PREPARED_ROOT="$RUNNER_TEMP/prepared-extract/easysplat-prepared-release"
           SIGNED_OUTPUT="$RUNNER_TEMP/easysplat-signed-output"
           SIGNING_BUILD="$RUNNER_TEMP/easysplat-signing-build"
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
           /usr/bin/env -i \
             HOME="$HOME" \
             USER="$USER" \
@@ -722,18 +677,12 @@ jobs:
             "$GITHUB_WORKSPACE/scripts/release/build_dmg.sh" \
             --app-version "${{ inputs.version }}" \
             --toolchain-version "${{ inputs.toolchain_version }}" \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --core-artifact-url "$BASE_URL/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
-            --da3-base-artifact-url "$BASE_URL/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
-            --da3-small-artifact-url "$BASE_URL/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
             --project-url "https://github.com/$GITHUB_REPOSITORY" \
             --build-root "$SIGNING_BUILD" \
             --output-dir "$SIGNED_OUTPUT" \
             --prepared-release-root "$PREPARED_ROOT" \
             --prepared-manifest-sha256 "$PREPARED_MANIFEST_SHA256" \
             --source-commit "$GITHUB_SHA" \
-            --manifest-tool-bin "$TRUSTED_MANIFEST_TOOL" \
-            --use-existing-toolchain \
             --production \
             --identity-fingerprint "$EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1" \
             --team-id "$EASYSPLAT_DEVELOPER_TEAM_ID" \
@@ -919,7 +868,6 @@ jobs:
           /usr/bin/syspolicy_check distribution "$INSTALL" \
             >"$EVIDENCE/syspolicy.txt" 2>&1
           PREPARED_ROOT="$RUNNER_TEMP/prepared-extract/easysplat-prepared-release"
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
           FIXTURE_ROOT="$RUNNER_TEMP/easysplat-release-fixture"
           test ! -e "$FIXTURE_ROOT"
           /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/generate_release_fixture.py" generate \
@@ -931,13 +879,6 @@ jobs:
           cmp -s \
             "$EVIDENCE/release-fixture-generation.json" \
             "$EVIDENCE/release-fixture-preflight.json"
-          ONLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-online-toolchains"
-          OFFLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-offline-toolchains"
-          CACHED_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-cached-toolchains"
-          mkdir -m 0700 \
-            "$ONLINE_CACHE_ROOT" \
-            "$OFFLINE_CACHE_ROOT" \
-            "$CACHED_CACHE_ROOT"
           "$GITHUB_WORKSPACE/scripts/release/verify_release.sh" \
             --app "$INSTALL" \
             --dmg "$DMG" \
@@ -951,19 +892,9 @@ jobs:
             --packaged-app-smoke \
             --source-url "https://github.com/$GITHUB_REPOSITORY" \
             --source-commit "$GITHUB_SHA" \
-            --release-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
-            --core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
-            --da3-base-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
-            --da3-small-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
+            --toolchain-dir "$PREPARED_ROOT/toolchain/out" \
             --fixture "$FIXTURE_ROOT" \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --public-key-file "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
-            --toolchain-root "$ONLINE_CACHE_ROOT" \
             --e2e-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
-            --offline-cache-root "$OFFLINE_CACHE_ROOT" \
-            --offline-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
-            --cached-cache-root "$CACHED_CACHE_ROOT" \
-            --cached-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
             --evidence-dir "$EVIDENCE/full-verification"
           HOME="$HOME_ROOT" TMPDIR="$HOME_ROOT" /usr/bin/open -n "$INSTALL"
           sleep 5
@@ -1120,11 +1051,6 @@ jobs:
           cmp -s \
             "$EVIDENCE/release-fixture-generation.json" \
             "$EVIDENCE/release-fixture-preflight.json"
-          ONLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-online-toolchains"
-          OFFLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-offline-toolchains"
-          CACHED_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-cached-toolchains"
-          mkdir -m 0700 "$ONLINE_CACHE_ROOT" "$OFFLINE_CACHE_ROOT" "$CACHED_CACHE_ROOT"
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
           scripts/release/verify_release.sh \
             --app "$INSTALL" \
             --dmg "$DMG" \
@@ -1138,19 +1064,9 @@ jobs:
             --packaged-app-smoke \
             --source-url "https://github.com/$GITHUB_REPOSITORY" \
             --source-commit "$GITHUB_SHA" \
-            --release-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
-            --core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
-            --da3-base-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
-            --da3-small-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
+            --toolchain-dir "$PREPARED_ROOT/toolchain/out" \
             --fixture "$FIXTURE_ROOT" \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --public-key-file "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
-            --toolchain-root "$ONLINE_CACHE_ROOT" \
             --e2e-runner "$VERIFIER_BIN" \
-            --offline-cache-root "$OFFLINE_CACHE_ROOT" \
-            --offline-runner "$VERIFIER_BIN" \
-            --cached-cache-root "$CACHED_CACHE_ROOT" \
-            --cached-runner "$VERIFIER_BIN" \
             --evidence-dir "$EVIDENCE/full-verification"
           {
             echo "source_commit=$GITHUB_SHA"
@@ -1310,7 +1226,7 @@ jobs:
             --release-mode production
             --bundle "$RUNNER_TEMP/build-bundle"
             --output "$PUBLICATION"
-            --toolchain-public-key EasySplatApp/Resources/public_key_ed25519.txt
+            --toolchain-public-key scripts/release/toolchain_authority_public_key.txt
             --app-version "${{ inputs.version }}"
             --toolchain-version "${{ inputs.toolchain_version }}"
             --source-repository "$GITHUB_REPOSITORY"

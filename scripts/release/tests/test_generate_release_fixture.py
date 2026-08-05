@@ -779,12 +779,12 @@ class ReleaseFixtureIntegrationContractTests(unittest.TestCase):
         cases = (
             (
                 "packaged_app_attestation_snapshot",
-                10,
+                9,
                 "Packaged attestation validation requires an input manifest.",
             ),
             (
                 "validate_packaged_app_bootstrap_result",
-                9,
+                7,
                 "Packaged app bootstrap validation requires an input manifest.",
             ),
         )
@@ -840,9 +840,9 @@ class ReleaseFixtureIntegrationContractTests(unittest.TestCase):
             for line in source.splitlines()
             if line.strip() == "assert_release_fixture_unchanged"
         ]
-        self.assertEqual(len(calls), 8)
-        self.assertEqual(source.count('--input-manifest "$E2E_INPUT_MANIFEST" \\'), 3)
-        self.assertEqual(source.count('--input-root "$E2E_FIXTURE" \\'), 3)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(source.count('--input-manifest "$E2E_INPUT_MANIFEST" \\'), 1)
+        self.assertEqual(source.count('--input-root "$E2E_FIXTURE" \\'), 1)
         self.assertIn('run_packaged_app_bootstrap_smoke "$E2E_FIXTURE_MEDIA"', source)
         self.assertIn("EASYSPLAT_RELEASE_FIXTURE is forbidden", source)
         self.assertIn("release-fixture-attestation.json", source)
@@ -850,9 +850,10 @@ class ReleaseFixtureIntegrationContractTests(unittest.TestCase):
         self.assertIn("Release fixture generator SHA-256: ", source)
         self.assertIn("Release fixture closure SHA-256: ", source)
         self.assertIn(
-            "Generated release fixture must be disjoint from evidence, app, repository, and toolchain roots.",
+            "Generated release fixture must be disjoint from evidence, app, and repository roots.",
             source,
         )
+        self.assertIn('--app-bundle "$E2E_APP_BUNDLE"', source)
 
     def test_release_gates_exercise_generator_and_forbid_legacy_input(self) -> None:
         workflow_check = (RELEASE_DIR.parents[0] / "ci/check_workflows.sh").read_text(

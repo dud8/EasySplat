@@ -332,7 +332,7 @@ for contract in \
   'PATH=/usr/bin:/bin:/usr/sbin:/sbin' \
   '/bin/bash --noprofile --norc -p' \
   '"$GITHUB_WORKSPACE/scripts/release/build_dmg.sh"' \
-  '--manifest-tool-bin "$TRUSTED_MANIFEST_TOOL"'; do
+  '--prepared-release-root "$PREPARED_ROOT"'; do
   grep -Fq -- "$contract" <<<"$signing_release_block" \
     || fail "credentialed app signing is missing: $contract"
 done

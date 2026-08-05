@@ -2409,6 +2409,64 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         }
     }
 
+    func testSignedBundleAcceptsRewrittenHelpersButStillPinsTheMetallib() throws {
+        let fixture = try makeFinishedProjectFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let finished = try ProjectArtifactValidator.validateFinishedProject(
+            at: fixture.paths.root,
+            expectedInput: .photoFolder(fixture.input),
+            context: fixture.validationContext
+        )
+        let colmapSHA256 = try XCTUnwrap(
+            fixture.geometry.workerExecution.colmapRuntimeClosure.sha256(
+                for: "bin/colmap"
+            )
+        )
+        let rewrittenTrainer = String(repeating: "7", count: 64)
+
+        // Distribution signing rewrote the trainer, so its build receipt records
+        // bytes that no longer exist. The bundle signature covers it instead.
+        XCTAssertNoThrow(
+            try ProjectArtifactValidator.validateToolchainBinding(
+                finishedProject: finished,
+                installation: makeToolchainEvidence(
+                    toolchainVersion: fixture.geometry.provenance.toolchainVersion,
+                    colmapSHA256: colmapSHA256,
+                    trainerBuildDigest: fixture.training.trainerBuildDigest,
+                    integrityPolicy: .signedAppBundle,
+                    installedTrainerSHA256: rewrittenTrainer
+                )
+            )
+        )
+
+        // An unsigned tree has no such cover, so the same tree must be rejected.
+        XCTAssertThrowsError(
+            try ProjectArtifactValidator.validateToolchainBinding(
+                finishedProject: finished,
+                installation: makeToolchainEvidence(
+                    toolchainVersion: fixture.geometry.provenance.toolchainVersion,
+                    colmapSHA256: colmapSHA256,
+                    trainerBuildDigest: fixture.training.trainerBuildDigest,
+                    installedTrainerSHA256: rewrittenTrainer
+                )
+            )
+        )
+
+        // Signing never touches the metallib, so its digest stays enforced.
+        XCTAssertThrowsError(
+            try ProjectArtifactValidator.validateToolchainBinding(
+                finishedProject: finished,
+                installation: makeToolchainEvidence(
+                    toolchainVersion: fixture.geometry.provenance.toolchainVersion,
+                    colmapSHA256: colmapSHA256,
+                    trainerBuildDigest: fixture.training.trainerBuildDigest,
+                    integrityPolicy: .signedAppBundle,
+                    installedMetallibSHA256: String(repeating: "8", count: 64)
+                )
+            )
+        )
+    }
+
     func testToolchainBindingRejectsClassicalArtifactRelabeledAsDa3() throws {
         let fixture = try makeFinishedProjectFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -5619,7 +5677,10 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         colmapSourceVersion: String = "4.1.1",
         duplicateColmapProvenance: Bool = false,
         omitOpenMPFromCriticalFiles: Bool = false,
-        omitOpenMPFromDeclaredContents: Bool = false
+        omitOpenMPFromDeclaredContents: Bool = false,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree,
+        installedTrainerSHA256: String = String(repeating: "b", count: 64),
+        installedMetallibSHA256: String = String(repeating: "c", count: 64)
     ) -> ToolchainInstallationEvidence {
         let colmapRecord = ToolchainInstallationEvidence.ProvenanceRecord(
             path: "provenance/colmap.json",
@@ -5634,8 +5695,8 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         )
         var criticalFiles = [
             "bin/colmap": colmapSHA256,
-            "bin/easysplat-train": String(repeating: "b", count: 64),
-            "bin/default.metallib": String(repeating: "c", count: 64),
+            "bin/easysplat-train": installedTrainerSHA256,
+            "bin/default.metallib": installedMetallibSHA256,
             "provenance/colmap.json": String(repeating: "d", count: 64),
             "msplat/build_info.json": String(repeating: "e", count: 64),
         ]
@@ -5654,6 +5715,7 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         }
         return ToolchainInstallationEvidence(
             toolchainVersion: toolchainVersion,
+            integrityPolicy: integrityPolicy,
             keyID: String(repeating: "5", count: 64),
             canonicalManifestSHA256: String(repeating: "6", count: 64),
             signatureSHA256: String(repeating: "7", count: 64),

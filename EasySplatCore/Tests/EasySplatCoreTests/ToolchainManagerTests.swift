@@ -1076,7 +1076,11 @@ final class ToolchainManagerTests: XCTestCase {
         let manager = ToolchainManager(
             runner: makeValidationRunner(root: layout.helpers),
             appVersion: "2.5.0",
-            locator: BundledToolchainLocator(bundleURL: layout.bundle)
+            locator: BundledToolchainLocator(
+                bundleURL: layout.bundle,
+                developmentOverrideRoot: nil,
+                validateSignature: { _ in }
+            )
         )
         let toolchain = try await manager.resolveToolchain(
             request: ToolchainCapabilityRequest(capabilities: [.core, .colmap, .msplat]),
@@ -1104,7 +1108,11 @@ final class ToolchainManagerTests: XCTestCase {
 
         let manager = ToolchainManager(
             runner: makeValidationRunner(root: layout.helpers),
-            locator: BundledToolchainLocator(bundleURL: layout.bundle)
+            locator: BundledToolchainLocator(
+                bundleURL: layout.bundle,
+                developmentOverrideRoot: nil,
+                validateSignature: { _ in }
+            )
         )
         do {
             _ = try await manager.resolveToolchain(
@@ -1288,6 +1296,39 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertThrowsError(
             try BundledToolchainLocator(bundleURL: layout.bundle).locate()
         )
+    }
+
+    /// The relaxed `signedAppBundle` policy skips helper receipt digests because
+    /// the app signature covers them. A structurally perfect but unsigned bundle
+    /// carries no such cover, so shape alone must not earn that policy.
+    func testLocatorRejectsAStructurallyValidButUnsignedBundle() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+
+        // Every shape check passes; only the missing signature can reject it.
+        XCTAssertNoThrow(
+            try BundledToolchainLocator(
+                bundleURL: layout.bundle,
+                developmentOverrideRoot: nil,
+                validateSignature: { _ in }
+            ).locate()
+        )
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("expected invalidToolchain; got \(error)")
+            }
+            XCTAssertTrue(
+                message.contains("not signed") || message.contains("modified"),
+                "expected a signature failure; got \(message)"
+            )
+        }
     }
 
     /// The override wins outright, so a bundle that would otherwise be rejected

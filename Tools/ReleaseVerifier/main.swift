@@ -57,7 +57,7 @@ private struct PackagedProjectMetadataSnapshot: Equatable {
 private struct Arguments {
     var inputManifest: URL
     var inputRoot: URL
-    var toolchainRoot: URL
+    var appBundle: URL
     var output: URL
     var evidence: URL
     var appVersion: String
@@ -68,7 +68,7 @@ private struct Arguments {
         while index < raw.count {
             let option = raw[index]
             guard [
-                "--input-manifest", "--input-root", "--toolchain-root", "--output",
+                "--input-manifest", "--input-root", "--app-bundle", "--output",
                 "--app-version", "--evidence",
             ].contains(option), index + 1 < raw.count else {
                 throw VerificationError.usage("Unknown or incomplete option: \(option)")
@@ -79,20 +79,20 @@ private struct Arguments {
 
         guard let inputManifest = values["--input-manifest"],
               let inputRoot = values["--input-root"],
-              let toolchainRoot = values["--toolchain-root"],
+              let appBundle = values["--app-bundle"],
               let output = values["--output"],
               let evidence = values["--evidence"],
               let appVersion = values["--app-version"] else {
             throw VerificationError.usage(
                 "Usage: EasySplatReleaseVerifier --input-manifest <schema1.json> --input-root <directory> "
-                    + "--toolchain-root <dir> --output <splat.ply> "
+                    + "--app-bundle <EasySplat.app> --output <splat.ply> "
                     + "--app-version <semver> --evidence <diagnostic.md>"
             )
         }
         return Arguments(
             inputManifest: URL(fileURLWithPath: inputManifest),
             inputRoot: URL(fileURLWithPath: inputRoot, isDirectory: true),
-            toolchainRoot: URL(fileURLWithPath: toolchainRoot, isDirectory: true),
+            appBundle: URL(fileURLWithPath: appBundle, isDirectory: true),
             output: URL(fileURLWithPath: output),
             evidence: URL(fileURLWithPath: evidence),
             appVersion: appVersion
@@ -231,6 +231,11 @@ private enum ReleaseVerifier {
             ]
         )
         let canonicalToolchainData = packagedToolchainDataRoot(canonicalToolchain)
+        // Distribution signing rewrote the helpers after their build receipts
+        // were written, so a bundle layout must be attested under the policy
+        // that trusts the enclosing signature instead of those digests.
+        let toolchainIntegrityPolicy: ToolchainIntegrityPolicy =
+            canonicalToolchainData == nil ? .unsignedDevelopmentTree : .signedAppBundle
         let manager = ToolchainManager(appVersion: arguments.appVersion)
         let markerRequest = ToolchainCapabilityRequest(
             capabilities: Set(marker.requestedCapabilities.compactMap(ToolchainCapability.init(rawValue:)))
@@ -243,7 +248,8 @@ private enum ReleaseVerifier {
         let toolchainEvidenceBefore = try manager.installedTreeEvidence(
             root: canonicalToolchain,
             dataRoot: canonicalToolchainData,
-            toolchainIdentity: arguments.appVersion
+            toolchainIdentity: arguments.appVersion,
+            integrityPolicy: toolchainIntegrityPolicy
         )
         let evidence = try await ProjectArtifactValidator.validateFinishedProject(
             at: arguments.project,
@@ -311,7 +317,8 @@ private enum ReleaseVerifier {
         let toolchainEvidenceAfter = try manager.installedTreeEvidence(
             root: canonicalToolchain,
             dataRoot: canonicalToolchainData,
-            toolchainIdentity: arguments.appVersion
+            toolchainIdentity: arguments.appVersion,
+            integrityPolicy: toolchainIntegrityPolicy
         )
         let finalExecutableEvidence = try packagedExecutableEvidence(
             at: arguments.expectedExecutable
@@ -370,7 +377,8 @@ private enum ReleaseVerifier {
                 let postToolchainEvidence = try manager.installedTreeEvidence(
                     root: canonicalToolchain,
                     dataRoot: canonicalToolchainData,
-                    toolchainIdentity: arguments.appVersion
+                    toolchainIdentity: arguments.appVersion,
+                    integrityPolicy: toolchainIntegrityPolicy
                 )
                 guard postMarkerRead == initialMarkerRead,
                       try privateMarkerIdentity(at: arguments.marker) == initialMarkerIdentity,
@@ -733,6 +741,7 @@ private enum ReleaseVerifier {
             "Installed capabilities JSON: "
                 + (try attestationJSON(toolchain.installedCapabilities))
         )
+        lines.append("Integrity policy: \(toolchain.integrityPolicy.rawValue)")
         lines.append("Output bytes: \(output.byteCount)")
         lines.append("Output vertices: \(output.vertexCount)")
         lines.append("Output format: \(output.format)")
@@ -822,9 +831,7 @@ private enum ReleaseVerifier {
         let request = try plan.toolchainCapabilityRequest()
         let manager = ToolchainManager(
             appVersion: arguments.appVersion,
-            locator: BundledToolchainLocator(
-                developmentOverrideRoot: arguments.toolchainRoot
-            )
+            locator: BundledToolchainLocator(bundleURL: arguments.appBundle)
         )
         let toolchain = try await manager.resolveToolchain(request: request) { fraction, message in
             let progress = fraction >= 0 ? " \(Int((fraction * 100).rounded()))%" : ""
@@ -833,7 +840,8 @@ private enum ReleaseVerifier {
         let toolchainEvidenceBeforeRun = try manager.installedTreeEvidence(
             root: toolchain.root,
             dataRoot: toolchain.dataRoot,
-            toolchainIdentity: toolchain.toolchainIdentity
+            toolchainIdentity: toolchain.toolchainIdentity,
+            integrityPolicy: toolchain.integrityPolicy
         )
 
         let projectParent = arguments.output.deletingLastPathComponent()
@@ -894,7 +902,8 @@ private enum ReleaseVerifier {
         let toolchainEvidenceAfterRun = try manager.installedTreeEvidence(
             root: toolchain.root,
             dataRoot: toolchain.dataRoot,
-            toolchainIdentity: toolchain.toolchainIdentity
+            toolchainIdentity: toolchain.toolchainIdentity,
+            integrityPolicy: toolchain.integrityPolicy
         )
         guard toolchainEvidenceAfterRun == toolchainEvidenceBeforeRun else {
             throw VerificationError.invalidEvidence(
@@ -923,7 +932,8 @@ private enum ReleaseVerifier {
         let toolchainEvidenceAfterReplay = try manager.installedTreeEvidence(
             root: toolchain.root,
             dataRoot: toolchain.dataRoot,
-            toolchainIdentity: toolchain.toolchainIdentity
+            toolchainIdentity: toolchain.toolchainIdentity,
+            integrityPolicy: toolchain.integrityPolicy
         )
         guard toolchainEvidenceAfterReplay == toolchainEvidenceBeforeRun else {
             throw VerificationError.invalidEvidence(
@@ -1354,6 +1364,7 @@ private enum ReleaseVerifier {
     private static func provenanceLines(for evidence: SuccessfulRunEvidence) -> [String] {
         var lines = [
             "Toolchain version: \(evidence.toolchain.toolchainVersion)",
+            "Integrity policy: \(evidence.toolchain.integrityPolicy.rawValue)",
             "Installed closure SHA-256: \(evidence.toolchain.closureSHA256)",
             "Installation identity SHA-256: \(evidence.toolchain.installationIdentitySHA256)",
         ]

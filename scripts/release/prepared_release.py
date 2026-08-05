@@ -142,43 +142,39 @@ def digest_file(path: Path, before: os.stat_result) -> str:
     return digest.hexdigest()
 
 
-def allowed_toolchain_files(toolchain_version: str) -> set[str]:
-    return {
-        "toolchain/manifest.json",
-        "toolchain/public_key_ed25519.txt",
-        "toolchain/out/toolchain-release-request.json",
-        "toolchain/out/toolchain-authority-envelope.json",
-        "toolchain/out/toolchain-authority-receipt.json",
-        "toolchain/out/toolchain-benchmark-evidence.json",
-        f"toolchain/out/toolchain-macos-arm64-{toolchain_version}-core.zip",
-        f"toolchain/out/toolchain-geometry-da3-base-{toolchain_version}.zip",
-        f"toolchain/out/toolchain-geometry-da3-small-{toolchain_version}.zip",
-    }
+# The signing runner rebuilds the release documents from the staged toolchain
+# tree the app was built from, so the handoff carries that tree rather than the
+# archives an installer once downloaded.
+REQUIRED_PREPARED_FILES = (
+    "product/EasySplat.app/Contents/MacOS/EasySplatApp",
+    "product/EasySplat.app/Contents/Helpers/bin/colmap",
+    "product/EasySplat.app/Contents/Helpers/bin/easysplat-train",
+    "product/EasySplat.app/Contents/Helpers/lib/libomp.dylib",
+    "product/EasySplat.app/Contents/Resources/Toolchain/default.metallib",
+    "product/EasySplat.app.dSYM/Contents/Resources/DWARF/EasySplatApp",
+    "toolchain/out/bin/colmap",
+    "toolchain/out/bin/easysplat-train",
+    "toolchain/out/bin/default.metallib",
+    "toolchain/out/lib/libomp.dylib",
+    "toolchain/out/supply-chain/components.json",
+)
 
 
-def require_data_only_path(
-    relative: str,
-    *,
-    is_directory: bool,
-    toolchain_version: str,
-) -> None:
-    product_roots = (
+def require_data_only_path(relative: str, *, is_directory: bool) -> None:
+    allowed_roots = (
         "product/EasySplat.app",
         "product/EasySplat.app.dSYM",
+        "toolchain/out",
     )
-    if relative == "product" or any(
+    if relative in {"product", "toolchain"} or any(
         relative == prefix or relative.startswith(prefix + "/")
-        for prefix in product_roots
+        for prefix in allowed_roots
     ):
-        return
-    if is_directory and relative in {"toolchain", "toolchain/out"}:
-        return
-    if not is_directory and relative in allowed_toolchain_files(toolchain_version):
         return
     fail(f"prepared release must be data-only; unexpected path: {relative}")
 
 
-def closure_rows(root: Path, toolchain_version: str) -> list[dict[str, object]]:
+def closure_rows(root: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     total_bytes = 0
     folded_paths: set[str] = set()
@@ -206,11 +202,7 @@ def closure_rows(root: Path, toolchain_version: str) -> list[dict[str, object]]:
             if stat.S_ISLNK(metadata.st_mode):
                 fail(f"prepared release contains a symlink: {relative}")
             if stat.S_ISDIR(metadata.st_mode):
-                require_data_only_path(
-                    relative,
-                    is_directory=True,
-                    toolchain_version=toolchain_version,
-                )
+                require_data_only_path(relative, is_directory=True)
                 rows.append({"kind": "directory", "mode": mode, "path": relative})
                 pending.append(path)
                 continue
@@ -218,11 +210,7 @@ def closure_rows(root: Path, toolchain_version: str) -> list[dict[str, object]]:
                 fail(f"prepared release contains a special file: {relative}")
             if metadata.st_nlink != 1:
                 fail(f"prepared release contains a hardlink: {relative}")
-            require_data_only_path(
-                relative,
-                is_directory=False,
-                toolchain_version=toolchain_version,
-            )
+            require_data_only_path(relative, is_directory=False)
             total_bytes += metadata.st_size
             if total_bytes > MAX_TOTAL_BYTES:
                 fail("prepared release exceeds the total byte bound")
@@ -238,21 +226,8 @@ def closure_rows(root: Path, toolchain_version: str) -> list[dict[str, object]]:
             if len(rows) > MAX_FILES:
                 fail("prepared release exceeds the file-count bound")
     rows.sort(key=lambda row: str(row["path"]))
-    required = {
-        "product/EasySplat.app/Contents/MacOS/EasySplatApp",
-        "product/EasySplat.app.dSYM/Contents/Resources/DWARF/EasySplatApp",
-        "toolchain/manifest.json",
-        "toolchain/public_key_ed25519.txt",
-        "toolchain/out/toolchain-release-request.json",
-        "toolchain/out/toolchain-authority-envelope.json",
-        "toolchain/out/toolchain-authority-receipt.json",
-        "toolchain/out/toolchain-benchmark-evidence.json",
-        f"toolchain/out/toolchain-macos-arm64-{toolchain_version}-core.zip",
-        f"toolchain/out/toolchain-geometry-da3-base-{toolchain_version}.zip",
-        f"toolchain/out/toolchain-geometry-da3-small-{toolchain_version}.zip",
-    }
     paths = {str(row["path"]) for row in rows}
-    missing = sorted(required - paths)
+    missing = sorted(set(REQUIRED_PREPARED_FILES) - paths)
     if missing:
         fail(f"prepared release is missing required files: {missing}")
     return rows
@@ -367,7 +342,7 @@ def create(args: argparse.Namespace) -> None:
     if os.path.lexists(manifest):
         fail("prepared release manifest already exists")
     payload = validate_metadata(args)
-    rows = closure_rows(root, args.toolchain_version)
+    rows = closure_rows(root)
     payload["entries"] = rows
     payload["subjects"] = subject_digests(rows)
     write_manifest(manifest, payload)
@@ -440,7 +415,7 @@ def verify(args: argparse.Namespace) -> None:
     if set(payload) != set(expected) | {"entries", "subjects"}:
         fail("prepared release manifest contains unexpected fields")
     rows = payload.get("entries")
-    actual_rows = closure_rows(root, args.toolchain_version)
+    actual_rows = closure_rows(root)
     if not isinstance(rows, list) or rows != actual_rows:
         fail("prepared release closure changed after preparation")
     if payload.get("subjects") != subject_digests(actual_rows):

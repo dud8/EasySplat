@@ -432,22 +432,12 @@ def validate_toolchain_tree(toolchain_dir: Path, expected_version: str) -> Valid
     declared = {path for path in license_paths if archive_for_path(path) == "core"}
     if set(license_bytes) != declared:
         fail(f"license closure is incomplete: {sorted(declared - set(license_bytes))[:5]}")
-    # The receipt that ships has to describe what ships. Keeping the original
-    # bytes would embed a manifest naming components and files the app does not
-    # carry, while its digest, counts, and licence set described the filtered
-    # closure — a document that disagrees with itself.
-    shipped_payload = dict(payload)
-    shipped_payload["components"] = [
-        component
-        for component in payload["components"]
-        if component["id"] in shipped
-    ]
-    shipped_payload["files"] = [
-        row for row in payload["files"] if row["path"] in embedded
-    ]
-    shipped_raw = canonical_json_bytes(shipped_payload)
+    # The supply-chain receipt is signed upstream and shipped verbatim inside the
+    # app, so its bytes are an authority this release restates rather than
+    # rewrites. `components` and `files` below carry the shipped subset, which is
+    # what the SBOM describes; the receipt keeps describing the whole build.
     return ValidatedClosure(
-        shipped_payload, shipped_raw, shipped, embedded, license_bytes, {"core": rows}
+        payload, raw, shipped, embedded, license_bytes, {"core": rows}
     )
 
 
@@ -529,8 +519,8 @@ def build_provenance(
         "supplyChain": {
             "schemaVersion": 1,
             "componentsSHA256": sha256_bytes(closure.raw),
-            "componentCount": len(closure.components),
-            "fileCount": len(closure.files),
+            "componentCount": len(closure.payload["components"]),
+            "fileCount": len(closure.payload["files"]),
         },
         "artifacts": artifacts,
     }

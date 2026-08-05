@@ -1398,8 +1398,12 @@ public enum ProjectArtifactValidator {
               let msplatCommit = msplatRecord.stringFields["source_commit"],
               msplatCommit.count == 40,
               isLowercaseGitCommit(msplatCommit),
-              msplatRecord.stringFields["executable_sha256"]
-                == installation.installedCriticalFileSHA256["bin/easysplat-train"],
+              // Distribution signing rewrites the trainer executable after its
+              // receipt is written; the enclosing signature covers it there. The
+              // metallib is never rewritten, so its digest is checked either way.
+              installation.integrityPolicy != .unsignedDevelopmentTree
+                || msplatRecord.stringFields["executable_sha256"]
+                    == installation.installedCriticalFileSHA256["bin/easysplat-train"],
               msplatRecord.stringFields["metallib_sha256"]
                 == installation.installedCriticalFileSHA256["bin/default.metallib"],
               training.trainerVersion

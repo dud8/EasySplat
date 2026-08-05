@@ -4,7 +4,7 @@ import Foundation
 /// Stat-first detection of a pre-processed dataset input. Pure and
 /// `nonisolated` so selection can classify a dropped URL without hopping the
 /// main actor. Folder probes use `FileManager.fileExists` only; the zip probe
-/// peeks at entry names via `zipinfo` without extracting anything.
+/// reads the central directory in process without extracting anything.
 ///
 /// Precedence is COLMAP > Nerfstudio > Polycam so a folder that carries more
 /// than one format's markers resolves deterministically to the richest one.
@@ -232,8 +232,7 @@ enum DatasetSniffer {
     }
 }
 
-/// Accumulates `zipinfo -1` output (one entry name per line) under a bounded
-/// budget.
+/// Accumulates archive entry names under a bounded budget.
 private final class ZipNameCollector: @unchecked Sendable {
     private static let maximumEntryCount = 50_000
     private static let maximumTotalBytes = 8 * 1_024 * 1_024

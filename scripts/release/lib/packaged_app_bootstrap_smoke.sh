@@ -234,12 +234,11 @@ PY
 }
 
 packaged_app_attestation_snapshot() {
-  if [ "$#" -ne 11 ] || [ -z "${11}" ]; then
+  if [ "$#" -ne 10 ] || [ -z "${10}" ]; then
     echo "Packaged attestation validation requires an input manifest." >&2
     return 1
   fi
   python3 - "$@" <<'PY'
-import base64
 import hashlib
 import json
 import os
@@ -248,19 +247,18 @@ import stat
 import sys
 from pathlib import Path
 
-if len(sys.argv) != 12:
+if len(sys.argv) != 11:
     raise SystemExit("Packaged attestation validation received an invalid contract.")
 attestation_path = Path(sys.argv[1])
 marker_path = Path(sys.argv[2])
-manifest_path = Path(sys.argv[3])
-input_path = Path(sys.argv[4])
-project_path = Path(sys.argv[5])
-executable_path = Path(sys.argv[6])
-expected_app_version = sys.argv[7]
-expected_token_sha256 = sys.argv[8]
-expected_executable_sha256 = sys.argv[9]
-expected_executable_bytes = sys.argv[10]
-input_manifest_path = Path(sys.argv[11])
+input_path = Path(sys.argv[3])
+project_path = Path(sys.argv[4])
+executable_path = Path(sys.argv[5])
+expected_app_version = sys.argv[6]
+expected_token_sha256 = sys.argv[7]
+expected_executable_sha256 = sys.argv[8]
+expected_executable_bytes = sys.argv[9]
+input_manifest_path = Path(sys.argv[10])
 
 identity_fields = (
     "st_dev", "st_ino", "st_uid", "st_mode", "st_nlink", "st_size",
@@ -305,13 +303,11 @@ def stable_read(path, maximum_bytes, private=False):
 
 attestation = stable_read(attestation_path, 1024 * 1024, private=True)
 marker_data = stable_read(marker_path, 64 * 1024, private=True)
-manifest_data = stable_read(manifest_path, 16 * 1024 * 1024)
 metadata_data = stable_read(project_path / "project.json", 16 * 1024 * 1024)
 input_manifest_data = stable_read(input_manifest_path, 64 * 1024)
 try:
     text = attestation.decode("utf-8")
     marker = json.loads(marker_data)
-    manifest = json.loads(manifest_data)
 except (UnicodeDecodeError, json.JSONDecodeError) as error:
     raise SystemExit(f"Packaged attestation is not valid UTF-8/JSON evidence: {error}")
 if not text.endswith("\n") or "\r" in text or "\x00" in text:
@@ -337,20 +333,7 @@ def canonical_path(path):
 def canonical_json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
-components = [row for row in manifest.get("components", []) if row.get("name") == "macos-arm64-core"]
-if len(components) != 1:
-    raise SystemExit("Packaged manifest has no unique native core component.")
-core = components[0]
-canonical_manifest = dict(manifest)
-canonical_manifest["signatureEd25519"] = ""
-canonical_manifest_data = canonical_json(canonical_manifest).encode("utf-8")
 input_manifest_sha256 = digest(input_manifest_data)
-try:
-    signature = base64.b64decode(manifest["signatureEd25519"], validate=True)
-except (KeyError, ValueError) as error:
-    raise SystemExit(f"Packaged manifest signature is invalid: {error}")
-if len(signature) != 64:
-    raise SystemExit("Packaged manifest signature has an invalid size.")
 
 expected = {
     "Schema": "1",
@@ -366,16 +349,11 @@ expected = {
     "Input path SHA-256": digest(canonical_path(input_path).encode("utf-8")),
     "Input manifest SHA-256": input_manifest_sha256,
     "Output path SHA-256": digest(marker["outputPlyPath"].encode("utf-8")),
-    "Expected packaged manifest file SHA-256": digest(manifest_data),
-    "Toolchain version JSON": canonical_json(manifest["version"]),
-    "Toolchain key ID JSON": canonical_json(manifest["keyID"].lower()),
-    "Signed payload SHA-256": digest(canonical_manifest_data),
-    "Toolchain signature SHA-256": digest(signature),
-    "Installed component JSON": canonical_json({
-        "name": "macos-arm64-core",
-        "sha256": core["sha256"].lower(),
-    }),
-    "Installed capabilities JSON": canonical_json(sorted(core["capabilities"])),
+    "Toolchain version JSON": canonical_json(expected_app_version),
+    "Integrity policy": "signedAppBundle",
+    "Installed capabilities JSON": canonical_json(
+        ["geometry.colmap", "runtime.core", "training.msplat"]
+    ),
     "Output bytes": str(marker["outputBytes"]),
     "Output vertices": str(marker["outputVertices"]),
     "Output format": marker["outputFormat"],
@@ -388,9 +366,13 @@ variable_digests = {
     "Installed closure SHA-256",
     "Installation identity SHA-256",
 }
-if set(fields) != set(expected) | variable_digests:
-    missing = sorted((set(expected) | variable_digests) - set(fields))
-    extra = sorted(set(fields) - (set(expected) | variable_digests))
+# The bundled closure digest is computed from the tree, so the attestation must
+# name it consistently rather than repeat a value the shell already knows.
+variable_json = {"Installed component JSON"}
+declared = set(expected) | variable_digests | variable_json
+if set(fields) != declared:
+    missing = sorted(declared - set(fields))
+    extra = sorted(set(fields) - declared)
     raise SystemExit(f"Packaged attestation field closure changed (missing={missing}, extra={extra}).")
 for label, expected_value in expected.items():
     if fields[label] != expected_value:
@@ -398,6 +380,11 @@ for label, expected_value in expected.items():
 for label in variable_digests:
     if re.fullmatch(r"[0-9a-f]{64}", fields[label]) is None:
         raise SystemExit(f"Packaged attestation has an invalid digest for {label!r}.")
+if fields["Installed component JSON"] != canonical_json({
+    "name": "bundled-helpers",
+    "sha256": fields["Installed closure SHA-256"],
+}):
+    raise SystemExit("Packaged attestation does not attest exactly the bundled helper closure.")
 print(digest(attestation))
 PY
 }
@@ -408,73 +395,43 @@ packaged_app_smoke_has_substantive_evidence() {
   [ -e "$root/ReleaseVerificationHome/release-verification-pipeline-passed.json" ] \
     || [ -n "$(find \
       "$root/ReleaseVerificationHome/Documents/EasySplat Projects" \
-      -mindepth 1 -print -quit 2>/dev/null || true)" ] \
-    || [ -n "$(find \
-      "$root/ReleaseVerificationHome/Library/Application Support/EasySplat/Toolchains" \
-      -name .easysplat_toolchain_state.json -print -quit 2>/dev/null || true)" ]
+      -mindepth 1 -print -quit 2>/dev/null || true)" ]
 }
 
 validate_packaged_app_bootstrap_result() {
-  if [ "$#" -ne 10 ] || [ -z "${10}" ]; then
+  if [ "$#" -ne 8 ] || [ -z "${8}" ]; then
     echo "Packaged app bootstrap validation requires an input manifest." >&2
     return 1
   fi
-  local receipt=$1
-  local success_marker=$2
-  local manifest_path=$3
-  local input_path=$4
-  local toolchain_root=$5
-  local project_root=$6
-  local expected_token_sha256=$7
-  local expected_app_version=$8
-  local expected_executable_snapshot=$9
-  local input_manifest_path=${10}
+  local success_marker=$1
+  local app_bundle=$2
+  local input_path=$3
+  local project_root=$4
+  local expected_token_sha256=$5
+  local expected_app_version=$6
+  local expected_executable_snapshot=$7
+  local input_manifest_path=${8}
 
-  if ! python3 - "$receipt" "$success_marker" "$manifest_path" \
-    "$input_path" "$toolchain_root" "$project_root" \
+  if ! python3 - "$success_marker" "$app_bundle" \
+    "$input_path" "$project_root" \
     "$expected_token_sha256" "$expected_app_version" \
     "$expected_executable_snapshot" "$input_manifest_path" <<'PY'
 import hashlib
 import json
-import os
 import stat
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-receipt_path, marker_path, manifest_path, input_path, expected_root, project_root = map(Path, sys.argv[1:7])
-expected_token_sha256 = sys.argv[7]
-expected_app_version = sys.argv[8]
-expected_executable = json.loads(sys.argv[9])
-input_manifest_path = Path(sys.argv[10])
-for label, path in (("receipt", receipt_path), ("marker", marker_path)):
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise SystemExit(f"Packaged app {label} must be an ordinary, non-hardlinked regular file.")
-    if stat.S_IMODE(metadata.st_mode) != 0o600:
-        raise SystemExit(f"Packaged app {label} must use mode 0600.")
-if os.path.commonpath((receipt_path.resolve(), expected_root.resolve())) != str(expected_root.resolve()):
-    raise SystemExit("Packaged app wrote its toolchain receipt outside the isolated toolchain root.")
-state = json.loads(receipt_path.read_text(encoding="utf-8"))
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-if state.get("schemaVersion") != 2:
-    raise SystemExit("Installed-app receipt does not use toolchain schema 2.")
-signed_manifest = state.get("signedManifest") or {}
-receipt_published_at = signed_manifest.pop("publishedAt", None)
-manifest_published_at = manifest.pop("publishedAt", None)
-if not isinstance(receipt_published_at, (int, float)) or not isinstance(manifest_published_at, str):
-    raise SystemExit("Installed-app receipt has an invalid signed-manifest publication date.")
-receipt_date = datetime(2001, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=receipt_published_at)
-manifest_date = datetime.fromisoformat(manifest_published_at.replace("Z", "+00:00"))
-if signed_manifest != manifest or receipt_date != manifest_date:
-    raise SystemExit("Installed-app receipt does not preserve the packaged signed manifest.")
-core = [row for row in signed_manifest.get("components", []) if row.get("name") == "macos-arm64-core"]
-if len(core) != 1:
-    raise SystemExit("Packaged signed manifest has no unique core component.")
-if state.get("installedArtifacts") != {"macos-arm64-core": core[0].get("sha256")}:
-    raise SystemExit("Installed app prepared an artifact other than the packaged signed core.")
-if set(state.get("installedCapabilities", [])) != set(core[0].get("capabilities", [])):
-    raise SystemExit("Installed-app receipt capabilities do not match the packaged signed core.")
+marker_path, app_bundle, input_path, project_root = map(Path, sys.argv[1:5])
+expected_token_sha256 = sys.argv[5]
+expected_app_version = sys.argv[6]
+expected_executable = json.loads(sys.argv[7])
+input_manifest_path = Path(sys.argv[8])
+metadata = marker_path.lstat()
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+    raise SystemExit("Packaged app marker must be an ordinary, non-hardlinked regular file.")
+if stat.S_IMODE(metadata.st_mode) != 0o600:
+    raise SystemExit("Packaged app marker must use mode 0600.")
 marker = json.loads(marker_path.read_text(encoding="utf-8"))
 expected_marker_keys = {
     "schemaVersion",
@@ -506,8 +463,11 @@ if marker.get("executableBytes") != expected_executable.get("byteCount"):
     raise SystemExit("Installed-app marker executable size does not match the supervised executable.")
 if marker.get("executableSHA256") != expected_executable.get("sha256"):
     raise SystemExit("Installed-app marker executable digest does not match the supervised executable.")
-if marker.get("toolchainRoot") != str(receipt_path.parent.resolve()):
-    raise SystemExit("Installed-app marker does not identify the validated toolchain root.")
+# The app must have run the tools sealed inside its own bundle. Any other root
+# means it found tools somewhere a user's install would not have them.
+expected_helpers = (app_bundle / "Contents/Helpers").resolve()
+if marker.get("toolchainRoot") != str(expected_helpers):
+    raise SystemExit("Installed-app marker does not identify the bundled helper root.")
 if marker.get("inputPath") != str(input_path.resolve()):
     raise SystemExit("Installed-app marker does not record the isolated verifier input.")
 expected_input_manifest_sha256 = hashlib.sha256(
@@ -515,8 +475,9 @@ expected_input_manifest_sha256 = hashlib.sha256(
 ).hexdigest()
 if marker.get("inputManifestSHA256") != expected_input_manifest_sha256:
     raise SystemExit("Installed-app marker does not bind the input manifest.")
-if set(marker.get("requestedCapabilities", [])) != set(core[0].get("capabilities", [])):
-    raise SystemExit("Installed-app marker capabilities do not match the packaged signed core.")
+bundled_capabilities = {"runtime.core", "geometry.colmap", "training.msplat"}
+if not set(marker.get("requestedCapabilities", [])) <= bundled_capabilities:
+    raise SystemExit("Installed app requested a capability its bundle does not carry.")
 
 project = Path(marker.get("projectRoot", ""))
 output = Path(marker.get("outputPlyPath", ""))
@@ -558,12 +519,7 @@ PY
   then
     return 1
   fi
-  if ! cached_toolchain_snapshot "$toolchain_root" >/dev/null; then
-    echo "Installed app toolchain files do not match the packaged signed core." >&2
-    return 1
-  fi
 }
-
 run_packaged_app_bootstrap_smoke() {
   local source_input=${1:-}
   local verifier_home="$SMOKE_INSTALL_ROOT/ReleaseVerificationHome"
@@ -571,12 +527,10 @@ run_packaged_app_bootstrap_smoke() {
   local input_path=""
   local staged_input_path=""
   local input_manifest=""
-  local toolchain_root="$verifier_home/Library/Application Support/EasySplat/Toolchains"
   local project_root="$verifier_home/Documents/EasySplat Projects"
   local project=""
   local success_marker="$verifier_home/release-verification-pipeline-passed.json"
   local packaged_attestation="$verifier_home/packaged-app-attestation.md"
-  local receipt=""
   local sandbox_profile=""
   local developer_root=""
   local developer_root_mode=""
@@ -660,7 +614,6 @@ run_packaged_app_bootstrap_smoke() {
     cleanup_packaged_app_verification_processes || true
     return 1
   fi
-  toolchain_root="$verifier_home/Library/Application Support/EasySplat/Toolchains"
   project_root="$verifier_home/Documents/EasySplat Projects"
   project="$project_root/Release Verification.easysplatproj"
   success_marker="$verifier_home/release-verification-pipeline-passed.json"
@@ -1008,42 +961,12 @@ read_filters = [
     *(f"(subpath {json.dumps(path)})" for path in dict.fromkeys(read_subpaths)),
     *(f"(literal {json.dumps(path)})" for path in dict.fromkeys(read_literals)),
 ]
-bootstrap_manifest_path = os.path.join(
-    installed_app,
-    "Contents",
-    "Resources",
-    "ToolchainBootstrap",
-    "manifest.json",
-)
-try:
-    bootstrap_manifest = json.loads(
-        Path(bootstrap_manifest_path).read_text(encoding="utf-8")
-    )
-    toolchain_version = bootstrap_manifest["version"]
-except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
-    raise SystemExit(
-        f"Packaged-app manifest cannot define process rights: {error}"
-    ) from error
-if not isinstance(toolchain_version, str) or not re.fullmatch(
-    r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}", toolchain_version
-):
-    raise SystemExit("Packaged-app toolchain version is unsafe for process rights.")
-toolchain_bin = os.path.join(
-    verifier_home,
-    "Library",
-    "Application Support",
-    "EasySplat",
-    "Toolchains",
-    toolchain_version,
-    "bin",
-)
+toolchain_bin = os.path.join(installed_app, "Contents", "Helpers", "bin")
 process_executables = [
     "/bin/cat",
     "/usr/bin/env",
     "/usr/bin/file",
     "/usr/bin/touch",
-    "/usr/bin/unzip",
-    "/usr/bin/zipinfo",
     executable,
     python_runtime_executable,
     *(os.path.join(toolchain_bin, name)
@@ -1211,8 +1134,6 @@ PY
       EASYSPLAT_ISOLATED_UI_RUNNER=1 \
       EASYSPLAT_RELEASE_VERIFY_TOKEN="$verification_token" \
       EASYSPLAT_PROJECT_HOME_URL=https://release-verifier-poison.invalid/project \
-      EASYSPLAT_TOOLCHAIN_MANIFEST_URL=https://release-verifier-poison.invalid/manifest.json \
-      EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64=release-verifier-poison-public-key \
       EASYSPLAT_LOCAL_TOOLCHAIN_ROOT=/release-verifier-poison/toolchain \
       EASYSPLAT_SKIP_TRAINING=1 \
       EASYSPLAT_STOP_AFTER_STAGE=sfmMapping \
@@ -1233,8 +1154,7 @@ PY
   current_epoch="$(/bin/date +%s)"
   deadline_epoch=$((current_epoch + timeout_seconds))
   while true; do
-    receipt="$(find "$toolchain_root" -type f -name .easysplat_toolchain_state.json -print -quit 2>/dev/null || true)"
-    if [ -n "$receipt" ] && [ -s "$success_marker" ]; then
+    if [ -s "$success_marker" ]; then
       break
     fi
     if ! kill -0 "$APP_WIRING_PID" 2>/dev/null; then
@@ -1250,7 +1170,7 @@ PY
     fi
     sleep 0.25
   done
-  if [ -z "$receipt" ] || [ ! -s "$success_marker" ]; then
+  if [ ! -s "$success_marker" ]; then
     echo "Installed app did not complete its packaged pipeline before the timeout." >&2
     report_packaged_app_verification_failure \
       "Packaged-app wiring smoke failed."
@@ -1310,17 +1230,10 @@ PY
     cleanup_packaged_app_verification_processes || true
     return 1
   fi
-  if ! declare -F cached_toolchain_snapshot >/dev/null; then
-    echo "Packaged-app verification cannot attest the installed toolchain closure." >&2
-    cleanup_packaged_app_verification_processes || true
-    return 1
-  fi
   if ! validate_packaged_app_bootstrap_result \
-    "$receipt" \
     "$success_marker" \
-    "$INSTALLED_APP/Contents/Resources/ToolchainBootstrap/manifest.json" \
+    "$INSTALLED_APP" \
     "$input_path" \
-    "$toolchain_root" \
     "$project_root" \
     "$verification_token_sha256" \
     "$EXPECTED_VERSION" \
@@ -1340,8 +1253,6 @@ PY
     --input-manifest "$input_manifest" \
     --input-root "$input_path" \
     --marker "$success_marker" \
-    --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
-    --expected-manifest "$INSTALLED_APP/Contents/Resources/ToolchainBootstrap/manifest.json" \
     --app-version "$EXPECTED_VERSION" \
     --expected-release-verification-token-sha256 "$verification_token_sha256" \
     --expected-executable "$INSTALLED_EXECUTABLE" \
@@ -1358,7 +1269,6 @@ PY
   if ! initial_packaged_attestation_snapshot="$(
     packaged_app_attestation_snapshot \
       "$packaged_attestation" "$success_marker" \
-      "$INSTALLED_APP/Contents/Resources/ToolchainBootstrap/manifest.json" \
       "$input_path" "$project" "$INSTALLED_EXECUTABLE" \
       "$EXPECTED_VERSION" "$verification_token_sha256" \
       "$expected_executable_sha256" "$expected_executable_bytes" \
@@ -1397,7 +1307,6 @@ PY
   if ! final_packaged_attestation_snapshot="$(
     packaged_app_attestation_snapshot \
       "$packaged_attestation" "$success_marker" \
-      "$INSTALLED_APP/Contents/Resources/ToolchainBootstrap/manifest.json" \
       "$input_path" "$project" "$INSTALLED_EXECUTABLE" \
       "$EXPECTED_VERSION" "$verification_token_sha256" \
       "$expected_executable_sha256" "$expected_executable_bytes" \
@@ -1416,7 +1325,6 @@ PY
       || ! preserved_packaged_attestation_snapshot="$(
         packaged_app_attestation_snapshot \
           "$EVIDENCE_DIR/packaged-app-attestation.md" "$success_marker" \
-          "$INSTALLED_APP/Contents/Resources/ToolchainBootstrap/manifest.json" \
           "$input_path" "$project" "$INSTALLED_EXECUTABLE" \
           "$EXPECTED_VERSION" "$verification_token_sha256" \
           "$expected_executable_sha256" "$expected_executable_bytes" \

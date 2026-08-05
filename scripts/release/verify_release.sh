@@ -32,24 +32,13 @@ RUN_PACKAGED_APP_SMOKE=0
 VERIFY_ARTIFACTS=0
 E2E_FIXTURE=""
 E2E_FIXTURE_MEDIA=""
-TOOLCHAIN_ROOT=""
 E2E_RUNNER=""
-OFFLINE_CACHE_ROOT=""
-OFFLINE_RUNNER=""
-CACHED_CACHE_ROOT=""
-CACHED_RUNNER=""
 EVIDENCE_DIR=""
-MANIFEST_URL=""
-PUBLIC_KEY_FILE=""
-RELEASE_MANIFEST=""
-CORE_ARCHIVE=""
-DA3_BASE_ARCHIVE=""
-DA3_SMALL_ARCHIVE=""
+TOOLCHAIN_DIR=""
 SOURCE_URL=""
 SOURCE_COMMIT=""
 ALLOW_INCOMPLETE=0
 HDIUTIL_BIN="${EASYSPLAT_HDIUTIL_BIN:-hdiutil}"
-CURL_BIN="${EASYSPLAT_CURL_BIN:-/usr/bin/curl}"
 EXPECTED_RELEASE_RUNNER=""
 PACKAGED_PROJECT_VERIFIER=""
 MOUNT_DIR=""
@@ -76,14 +65,8 @@ E2E_VERIFIER_TOKEN=""
 E2E_VERIFIER_SUPERVISOR_PID=""
 # shellcheck disable=SC2034
 E2E_VERIFIER_GROUP_FILE=""
-REMOTE_MANIFEST=""
-MAX_PUBLISHED_MANIFEST_BYTES=8388608
 FINAL_SUCCESS_MESSAGE=""
-EFFECTIVE_MANIFEST_URL=""
-EFFECTIVE_PUBLIC_KEY_FILE=""
-VERIFIED_MANIFEST_SHA256=""
-VERIFIED_TOOLCHAIN_KEY_ID=""
-VERIFIED_TOOLCHAIN_SIGNATURE_SHA256=""
+VERIFIED_TOOLCHAIN_CLOSURE_SHA256=""
 VERIFIED_FIXTURE_ATTESTATION=""
 VERIFIED_FIXTURE_MANIFEST_SHA256=""
 VERIFIED_FIXTURE_GENERATOR_SHA256=""
@@ -91,17 +74,12 @@ VERIFIED_FIXTURE_CLOSURE_SHA256=""
 VERIFIED_EVIDENCE_DIRECTORY_IDENTITY=""
 
 usage() {
-  echo "Usage: verify_release.sh --app <app> --dmg <dmg> --expected-version <semver> [--release-mode development-unsigned|production] [--app-signing-receipt <json> --app-notarization-receipt <json> --dmg-signing-receipt <json> --dmg-notarization-receipt <json>] --artifacts --packaged-app-smoke --source-url <https-url> --source-commit <sha> --fixture <generated-fixture-root> --manifest-url <https-url> --public-key-file <file> --toolchain-root <dir> --e2e-runner <executable> --offline-cache-root <dir> --offline-runner <executable> --cached-cache-root <dir> --cached-runner <executable> --evidence-dir <dir>"
+  echo "Usage: verify_release.sh --app <app> --dmg <dmg> --expected-version <semver> [--release-mode development-unsigned|production] [--app-signing-receipt <json> --app-notarization-receipt <json> --dmg-signing-receipt <json> --dmg-notarization-receipt <json>] --artifacts --packaged-app-smoke --source-url <https-url> --source-commit <sha> --fixture <generated-fixture-root> --e2e-runner <executable> --evidence-dir <dir> [--toolchain-dir <staged-tree>]"
   /bin/cat <<'EOF'
 
-Production artifact closure:
-  --release-manifest <json>   Signed toolchain manifest to verify.
-  --core-archive <zip>        Native core archive named by the manifest.
-  --da3-base-archive <zip>    DA3 Base archive named by the manifest.
-  --da3-small-archive <zip>   DA3 Small archive named by the manifest.
-
-Use these four options with --artifacts to verify exact publication inputs.
-When omitted, the verifier uses the matching paths under Toolchains/.
+The app carries its own toolchain, so verification reconstructs a splat from the
+installed bundle with the network denied. There is nothing to fetch and no
+signed manifest to compare.
 EOF
 }
 
@@ -296,8 +274,7 @@ preserve_release_verification_log() {
   fi
   python3 - "$source" "$EVIDENCE_DIR/$destination_name" "$preservation_mode" \
     "${HOME:-}" "${SMOKE_INSTALL_ROOT:-}" "${E2E_DIR:-}" \
-    "${E2E_FIXTURE:-}" "${TOOLCHAIN_ROOT:-}" "${OFFLINE_CACHE_ROOT:-}" \
-    "${CACHED_CACHE_ROOT:-}" <<'PY'
+    "${E2E_FIXTURE:-}" "${APP_PATH:-}" "${MOUNT_DIR:-}" <<'PY'
 import os
 import re
 import stat
@@ -449,11 +426,8 @@ report_release_verification_log_failure() {
 
 validate_release_verifier_evidence() {
   local evidence=$1
-  local expected_policy=$2
-  local published_output=$3
-  python3 - "$evidence" "$expected_policy" "$published_output" \
-    "$VERIFIED_MANIFEST_SHA256" \
-    "$VERIFIED_TOOLCHAIN_KEY_ID" "$VERIFIED_TOOLCHAIN_SIGNATURE_SHA256" <<'PY'
+  local published_output=$2
+  python3 - "$evidence" "$published_output" <<'PY'
 import hashlib
 import os
 import re
@@ -476,17 +450,14 @@ def exact(prefix):
         raise SystemExit(f"Release-verifier evidence has {len(matches)} values for {prefix!r}.")
     return matches[0]
 
-if exact("Installation policy: ") != sys.argv[2] or exact("Status: ") != "passed":
-    raise SystemExit("Release-verifier evidence does not attest the successful requested policy.")
-if exact("Published manifest file SHA-256: ") != sys.argv[4]:
-    raise SystemExit("Release-verifier evidence is not bound to the verified published manifest file.")
-if exact("Toolchain key ID: ") != sys.argv[5]:
-    raise SystemExit("Release-verifier evidence is not bound to the verified toolchain authority.")
-if exact("Toolchain signature SHA-256: ") != sys.argv[6]:
-    raise SystemExit("Release-verifier evidence is not bound to the verified manifest signature.")
+if exact("Status: ") != "passed":
+    raise SystemExit("Release-verifier evidence does not attest a successful run.")
+# A signed bundle is its own trust anchor. A lane that fell back to an unsigned
+# development tree proves nothing about what ships.
+if exact("Integrity policy: ") != "signedAppBundle":
+    raise SystemExit("Release-verifier evidence did not attest the shipped app bundle.")
 
 for label in (
-    "Signed payload SHA-256: ",
     "Installed closure SHA-256: ",
     "Installation identity SHA-256: ",
     "Output SHA-256: ",
@@ -499,15 +470,15 @@ if exact("Output format: ") not in {"ascii", "binary_little_endian", "binary_big
     raise SystemExit("Release-verifier evidence has an unsupported output format.")
 components = [line for line in lines if line.startswith("Installed component: ")]
 if len(components) != 1 or re.fullmatch(
-    r"Installed component: macos-arm64-core [0-9a-f]{64}", components[0]
+    r"Installed component: bundled-helpers [0-9a-f]{64}", components[0]
 ) is None:
-    raise SystemExit("Release-verifier evidence does not attest exactly the signed native core.")
+    raise SystemExit("Release-verifier evidence does not attest exactly the bundled helper closure.")
 capabilities = set(exact("Installed capabilities: ").split(", "))
 required = {"runtime.core", "geometry.colmap", "training.msplat"}
 if not required.issubset(capabilities):
     raise SystemExit("Release-verifier evidence is missing a required native-core capability.")
 
-output_path = Path(sys.argv[3])
+output_path = Path(sys.argv[2])
 flags = os.O_RDONLY | os.O_NONBLOCK
 flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 descriptor = os.open(output_path, flags)
@@ -612,12 +583,8 @@ run_captured_release_verifier() {
     printf '%s release-verification lane failed. Sanitized evidence was preserved.\n' \
       "$lane" >&2
   else
-    local expected_policy="$lane"
-    if [ "$lane" = "bundled-offline" ]; then
-      expected_policy="bundled-bootstrap-only"
-    fi
     if ! validate_release_verifier_evidence \
-      "$preserved_diagnostic" "$expected_policy" "$published_output"; then
+      "$preserved_diagnostic" "$published_output"; then
       return 1
     fi
     printf '%s release-verification lane passed.\n' "$lane"
@@ -676,8 +643,7 @@ write_release_verification_status() {
   /usr/bin/python3 -I - "$EVIDENCE_DIR" \
     "$VERIFIED_EVIDENCE_DIRECTORY_IDENTITY" \
     "$EXPECTED_VERSION" "$status" "$SOURCE_URL" "$SOURCE_COMMIT" \
-    "$VERIFIED_MANIFEST_SHA256" "$VERIFIED_TOOLCHAIN_KEY_ID" \
-    "$VERIFIED_TOOLCHAIN_SIGNATURE_SHA256" \
+    "$VERIFIED_TOOLCHAIN_CLOSURE_SHA256" \
     "$fixture_manifest_sha256" \
     "$fixture_generator_sha256" \
     "$fixture_closure_sha256" <<'PY'
@@ -715,7 +681,7 @@ if sys.argv[4] not in {"passed", "failed", "incomplete"}:
 if any(
     unicodedata.category(character).startswith("C")
     or unicodedata.category(character) in {"Zl", "Zp"}
-    for value in sys.argv[3:13]
+    for value in sys.argv[3:11]
     for character in value
 ):
     raise SystemExit("Release verification evidence contains a control character.")
@@ -724,24 +690,20 @@ lines = [
     f"Version: {sys.argv[3]}",
     f"Status: {sys.argv[4]}",
 ]
-if sys.argv[4] == "passed" and not all(sys.argv[5:13]):
+if sys.argv[4] == "passed" and not all(sys.argv[5:11]):
     raise SystemExit("Successful release evidence is missing source, toolchain, or fixture provenance.")
 if sys.argv[5]:
     lines.append(f"Source URL: {sys.argv[5]}")
 if sys.argv[6]:
     lines.append(f"Source commit: {sys.argv[6]}")
 if sys.argv[7]:
-    lines.append(f"Published manifest file SHA-256: {sys.argv[7]}")
+    lines.append(f"Bundled toolchain closure SHA-256: {sys.argv[7]}")
 if sys.argv[8]:
-    lines.append(f"Toolchain key ID: {sys.argv[8]}")
+    lines.append(f"Release fixture manifest SHA-256: {sys.argv[8]}")
 if sys.argv[9]:
-    lines.append(f"Toolchain signature SHA-256: {sys.argv[9]}")
+    lines.append(f"Release fixture generator SHA-256: {sys.argv[9]}")
 if sys.argv[10]:
-    lines.append(f"Release fixture manifest SHA-256: {sys.argv[10]}")
-if sys.argv[11]:
-    lines.append(f"Release fixture generator SHA-256: {sys.argv[11]}")
-if sys.argv[12]:
-    lines.append(f"Release fixture closure SHA-256: {sys.argv[12]}")
+    lines.append(f"Release fixture closure SHA-256: {sys.argv[10]}")
 payload = "\n".join(lines) + "\n"
 
 directory_flags = os.O_RDONLY | os.O_DIRECTORY
@@ -999,10 +961,6 @@ cleanup() {
       cleanup_failed=1
     fi
   fi
-  if [ -n "$REMOTE_MANIFEST" ] && ! rm -f "$REMOTE_MANIFEST"; then
-    echo "error: could not remove release verification manifest: $REMOTE_MANIFEST" >&2
-    cleanup_failed=1
-  fi
   if [ "$status" -eq 0 ] && [ "$cleanup_failed" -ne 0 ]; then
     status=1
   fi
@@ -1043,19 +1001,9 @@ while [[ $# -gt 0 ]]; do
     --packaged-app-smoke) RUN_PACKAGED_APP_SMOKE=1; shift ;;
     --skip-packaged-app-smoke) RUN_PACKAGED_APP_SMOKE=0; shift ;;
     --fixture) E2E_FIXTURE="$2"; shift 2 ;;
-    --toolchain-root) TOOLCHAIN_ROOT="$2"; shift 2 ;;
     --e2e-runner) E2E_RUNNER="$2"; shift 2 ;;
-    --offline-cache-root) OFFLINE_CACHE_ROOT="$2"; shift 2 ;;
-    --offline-runner) OFFLINE_RUNNER="$2"; shift 2 ;;
-    --cached-cache-root) CACHED_CACHE_ROOT="$2"; shift 2 ;;
-    --cached-runner) CACHED_RUNNER="$2"; shift 2 ;;
     --evidence-dir) EVIDENCE_DIR="$2"; shift 2 ;;
-    --manifest-url) MANIFEST_URL="$2"; shift 2 ;;
-    --public-key-file) PUBLIC_KEY_FILE="$2"; shift 2 ;;
-    --release-manifest) RELEASE_MANIFEST="$2"; shift 2 ;;
-    --core-archive) CORE_ARCHIVE="$2"; shift 2 ;;
-    --da3-base-archive) DA3_BASE_ARCHIVE="$2"; shift 2 ;;
-    --da3-small-archive) DA3_SMALL_ARCHIVE="$2"; shift 2 ;;
+    --toolchain-dir) TOOLCHAIN_DIR="$2"; shift 2 ;;
     --source-url) SOURCE_URL="$2"; shift 2 ;;
     --source-commit) SOURCE_COMMIT="$2"; shift 2 ;;
     --allow-incomplete) ALLOW_INCOMPLETE=1; shift ;;
@@ -1179,95 +1127,9 @@ if [ -n "$EVIDENCE_DIR" ]; then
   EVIDENCE_DIR="$(canonical_path "$EVIDENCE_DIR")"
 fi
 
-manifest_component_url() {
-  python3 - "$1" "$2" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-matches = [row.get("url") for row in manifest.get("components", []) if row.get("name") == sys.argv[2]]
-if len(matches) != 1 or not isinstance(matches[0], str) or not matches[0]:
-    raise SystemExit(f"Signed manifest has no unique URL for {sys.argv[2]}.")
-if "\n" in matches[0] or "\r" in matches[0]:
-    raise SystemExit(f"Signed manifest URL contains a line break for {sys.argv[2]}.")
-print(matches[0])
-PY
-}
-
-verify_signed_toolchain_closure() {
-  local toolchain_version=$1
-  local core_url
-  local base_url
-  local small_url
-  core_url="$(manifest_component_url "$RELEASE_MANIFEST" macos-arm64-core)"
-  base_url="$(manifest_component_url "$RELEASE_MANIFEST" geometry-da3-base)"
-  small_url="$(manifest_component_url "$RELEASE_MANIFEST" geometry-da3-small)"
-  swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool verify-release \
-    --manifest "$RELEASE_MANIFEST" \
-    --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
-    --toolchain-version "$toolchain_version" \
-    --app-version "$EXPECTED_VERSION" \
-    --core-zip "$CORE_ARCHIVE" \
-    --core-url "$core_url" \
-    --da3-base-zip "$DA3_BASE_ARCHIVE" \
-    --da3-base-url "$base_url" \
-    --da3-small-zip "$DA3_SMALL_ARCHIVE" \
-    --da3-small-url "$small_url"
-}
-
-fetch_and_compare_published_manifest() {
-  local http_status=""
-  local size
-  python3 - "$EFFECTIVE_MANIFEST_URL" <<'PY'
-import sys
-from urllib.parse import urlsplit
-
-url = urlsplit(sys.argv[1])
-if url.scheme.lower() != "https" or not url.hostname or url.username is not None or url.password is not None:
-    raise SystemExit("Published toolchain manifest URL must be credential-free HTTPS.")
-PY
-  REMOTE_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/easysplat-published-manifest.XXXXXX")"
-  if ! http_status="$("$CURL_BIN" --disable \
-    --fail \
-    --silent \
-    --show-error \
-    --location \
-    --proto '=https' \
-    --proto-redir '=https' \
-    --max-redirs 3 \
-    --max-filesize "$MAX_PUBLISHED_MANIFEST_BYTES" \
-    --request GET \
-    --write-out '%{http_code}' \
-    --output "$REMOTE_MANIFEST" \
-    "$EFFECTIVE_MANIFEST_URL")"; then
-    echo "Published toolchain manifest HTTPS GET failed (HTTP ${http_status:-unknown})." >&2
-    return 1
-  fi
-  if [ "$http_status" != "200" ]; then
-    echo "Published toolchain manifest HTTPS GET failed (HTTP $http_status)." >&2
-    return 1
-  fi
-  size="$(wc -c <"$REMOTE_MANIFEST" | tr -d '[:space:]')"
-  if [ "$size" -gt "$MAX_PUBLISHED_MANIFEST_BYTES" ]; then
-    echo "Published toolchain manifest exceeds the 8 MiB release limit." >&2
-    return 1
-  fi
-  if ! cmp -s "$REMOTE_MANIFEST" "$RELEASE_MANIFEST"; then
-    echo "Published toolchain manifest bytes differ from the locally verified signed manifest." >&2
-    return 1
-  fi
-}
-
 if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
-  if [ ! -d "$E2E_FIXTURE" ] || [ ! -d "$TOOLCHAIN_ROOT" ] || [ -z "$E2E_RUNNER" ] \
-    || [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
-    echo "Release verification requires a generated fixture root, installed toolchain, and runner." >&2
-    exit 1
-  fi
-  if [ ! -d "$OFFLINE_CACHE_ROOT" ] || [ -z "$OFFLINE_RUNNER" ] \
-    || [ ! -d "$CACHED_CACHE_ROOT" ] || [ -z "$CACHED_RUNNER" ]; then
-    echo "Release verification requires distinct bundled-offline and cached-only roots and runners." >&2
+  if [ ! -d "$E2E_FIXTURE" ] || [ -z "$E2E_RUNNER" ]; then
+    echo "Release verification requires a generated fixture root and runner." >&2
     exit 1
   fi
 
@@ -1277,24 +1139,13 @@ if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
     echo "Repository-built EasySplatReleaseVerifier is missing after the release build." >&2
     exit 1
   }
-  if [ "$(canonical_path "$E2E_RUNNER")" != "$(canonical_path "$EXPECTED_RELEASE_RUNNER")" ] \
-    || [ "$(canonical_path "$OFFLINE_RUNNER")" != "$(canonical_path "$EXPECTED_RELEASE_RUNNER")" ] \
-    || [ "$(canonical_path "$CACHED_RUNNER")" != "$(canonical_path "$EXPECTED_RELEASE_RUNNER")" ]; then
-    echo "Strict release verification requires the repository-built EasySplatReleaseVerifier for all runs." >&2
+  if [ "$(canonical_path "$E2E_RUNNER")" != "$(canonical_path "$EXPECTED_RELEASE_RUNNER")" ]; then
+    echo "Strict release verification requires the repository-built EasySplatReleaseVerifier." >&2
     exit 1
   fi
-  online_root="$(canonical_path "$TOOLCHAIN_ROOT")"
-  offline_root="$(canonical_path "$OFFLINE_CACHE_ROOT")"
-  cached_root="$(canonical_path "$CACHED_CACHE_ROOT")"
   E2E_FIXTURE="$(canonical_path "$E2E_FIXTURE")"
   bind_release_fixture
-  if [ "$online_root" = "$offline_root" ] || [ "$online_root" = "$cached_root" ] \
-    || [ "$offline_root" = "$cached_root" ]; then
-    echo "Remote, bundled-offline, and cached-only verification must use distinct toolchain roots." >&2
-    exit 1
-  fi
-  if ! python3 - "$EVIDENCE_DIR" "$E2E_FIXTURE" "$APP_PATH" "$ROOT" \
-      "$online_root" "$offline_root" "$cached_root" <<'PY'
+  if ! python3 - "$EVIDENCE_DIR" "$E2E_FIXTURE" "$APP_PATH" "$ROOT" <<'PY'
 import os
 import sys
 
@@ -1305,31 +1156,20 @@ for root in [evidence, *protected]:
     common = os.path.commonpath((fixture, root))
     if common in (fixture, root):
         raise SystemExit(
-            "Generated release fixture must be disjoint from evidence, app, repository, and toolchain roots."
+            "Generated release fixture must be disjoint from evidence, app, and repository roots."
         )
-for toolchain_root in protected[2:]:
-    common = os.path.commonpath((evidence, toolchain_root))
-    if common in (evidence, toolchain_root):
+for app_root in protected:
+    common = os.path.commonpath((evidence, app_root))
+    if common in (evidence, app_root):
         raise SystemExit(
-            "Release-verification evidence must be disjoint from every toolchain root."
+            "Release-verification evidence must be disjoint from the app bundle it attests."
         )
 PY
   then
     exit 1
   fi
-  for root in "$OFFLINE_CACHE_ROOT" "$TOOLCHAIN_ROOT" "$CACHED_CACHE_ROOT"; do
-    if find "$root" -mindepth 1 -print -quit | grep -q .; then
-      echo "Release verification must start with three empty toolchain roots." >&2
-      exit 1
-    fi
-  done
-  TOOLCHAIN_ROOT="$online_root"
-  OFFLINE_CACHE_ROOT="$offline_root"
-  CACHED_CACHE_ROOT="$cached_root"
   EXPECTED_RELEASE_RUNNER="$(canonical_path "$EXPECTED_RELEASE_RUNNER")"
   E2E_RUNNER="$EXPECTED_RELEASE_RUNNER"
-  OFFLINE_RUNNER="$EXPECTED_RELEASE_RUNNER"
-  CACHED_RUNNER="$EXPECTED_RELEASE_RUNNER"
   # Consumed by packaged_app_bootstrap_smoke.sh.
   # shellcheck disable=SC2034
   PACKAGED_PROJECT_VERIFIER="$EXPECTED_RELEASE_RUNNER"
@@ -1438,145 +1278,77 @@ verify_dsym_matches_executable() {
   fi
 }
 
-bundled_app_resource() {
+validate_bundled_toolchain_payload() {
   local app=$1
-  local name=$2
-  local module_bundle="$app/Contents/Resources/EasySplat_EasySplatApp.bundle"
-  local resource_root="$module_bundle"
-  if [ ! -d "$module_bundle" ] || [ -L "$module_bundle" ]; then
-    echo "Bundled SwiftPM resource bundle is missing: $module_bundle" >&2
-    return 1
-  fi
-  if [ -d "$module_bundle/Contents/Resources" ]; then
-    resource_root="$module_bundle/Contents/Resources"
-  fi
-  if [ -L "$resource_root" ]; then
-    echo "Bundled SwiftPM resource directory is not an ordinary directory: $resource_root" >&2
-    return 1
-  fi
-  printf '%s/%s' "$resource_root" "$name"
-}
-
-validate_bundled_toolchain_contract() {
-  local app=$1
-  local manifest_path
-  local public_key_path
-  local bundled_manifest_url
-
-  manifest_path="$(bundled_app_resource "$app" toolchain_manifest_url.txt)"
-  public_key_path="$(bundled_app_resource "$app" public_key_ed25519.txt)"
-  if [ ! -f "$manifest_path" ] || [ -L "$manifest_path" ] || [ ! -s "$manifest_path" ]; then
-    echo "Bundled toolchain manifest URL is missing: $manifest_path" >&2
-    return 1
-  fi
-  if [ ! -f "$public_key_path" ] || [ -L "$public_key_path" ] || [ ! -s "$public_key_path" ]; then
-    echo "Bundled toolchain public key is missing: $public_key_path" >&2
-    return 1
-  fi
-  bundled_manifest_url="$(cat "$manifest_path")"
-  if [ "$bundled_manifest_url" != "$MANIFEST_URL" ]; then
-    echo "Bundled toolchain manifest URL does not match --manifest-url." >&2
-    return 1
-  fi
-  if ! cmp -s "$public_key_path" "$PUBLIC_KEY_FILE"; then
-    echo "Bundled toolchain public key does not match --public-key-file." >&2
-    return 1
-  fi
-}
-
-run_bootstrap_verifier() {
-  local manifest=$1
-  local core_archive=$2
-  local public_key=$3
-  local url_policy=release
-  if [ "$ALLOW_INCOMPLETE" -eq 1 ]; then
-    url_policy=release-or-loopback-development
-  fi
-  local args=(
-    verify-bootstrap
-    --manifest "$manifest"
-    --public-key-file "$public_key"
-    --app-version "$EXPECTED_VERSION"
-    --core-zip "$core_archive"
-    --url-policy "$url_policy"
-  )
-  swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
-}
-
-validate_bundled_bootstrap_contract() {
-  local app=$1
-  local bootstrap_dir="$app/Contents/Resources/ToolchainBootstrap"
-  local bundled_manifest="$bootstrap_dir/manifest.json"
-  local bundled_core="$bootstrap_dir/macos-arm64-core.zip"
-
-  python3 - "$bootstrap_dir" "$bundled_manifest" "$bundled_core" <<'PY'
+  python3 - "$app" <<'PY'
 import os
 import stat
 import sys
 from pathlib import Path
 
-directory = Path(sys.argv[1])
-try:
-    directory_metadata = directory.lstat()
-except FileNotFoundError:
-    raise SystemExit(f"Bundled toolchain bootstrap directory is missing: {directory}")
-if not stat.S_ISDIR(directory_metadata.st_mode):
-    raise SystemExit(f"Bundled toolchain bootstrap path is not an ordinary directory: {directory}")
+app = Path(sys.argv[1])
+helpers = app / "Contents/Helpers"
+payload = app / "Contents/Resources/Toolchain"
 
-expected = {"manifest.json", "macos-arm64-core.zip"}
-actual = {entry.name for entry in os.scandir(directory)}
-if actual != expected:
-    raise SystemExit("Bundled toolchain bootstrap must contain exactly manifest.json and macos-arm64-core.zip.")
+def plain_directory(path, label):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        raise SystemExit(f"Bundled {label} directory is missing: {path}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"Bundled {label} path is not an ordinary directory: {path}")
 
-for label, raw_path in (
-    ("manifest", sys.argv[2]),
-    ("core archive", sys.argv[3]),
-):
-    path = Path(raw_path)
-    metadata = path.lstat()
+def plain_file(path, label, executable):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        raise SystemExit(f"Bundled {label} is missing: {path}")
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise SystemExit(f"Bundled toolchain bootstrap {label} must be an ordinary, non-hardlinked regular file: {path}")
+        raise SystemExit(
+            f"Bundled {label} must be an ordinary, non-hardlinked regular file: {path}"
+        )
     if metadata.st_size == 0:
-        raise SystemExit(f"Bundled toolchain bootstrap {label} must not be empty: {path}")
+        raise SystemExit(f"Bundled {label} must not be empty: {path}")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise SystemExit(f"Bundled {label} must not be group- or world-writable: {path}")
+    if executable and not stat.S_IMODE(metadata.st_mode) & 0o111:
+        raise SystemExit(f"Bundled {label} is not executable: {path}")
+    if not executable and stat.S_IMODE(metadata.st_mode) & 0o111:
+        raise SystemExit(f"Bundled {label} must not be executable: {path}")
+
+plain_directory(helpers, "helper")
+plain_directory(payload, "toolchain payload")
+for relative in ("bin/colmap", "bin/easysplat-train"):
+    plain_file(helpers / relative, f"helper {relative}", True)
+for relative in ("default.metallib", "supply-chain/components.json"):
+    plain_file(payload / relative, f"toolchain payload {relative}", False)
+
+# Code signing seals a bundle by file identity. A link of any kind inside the
+# sealed trees would let the shipped bytes differ from the signed ones.
+for root, label in ((helpers, "helper"), (payload, "toolchain payload")):
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        for name in (*directory_names, *file_names):
+            entry = Path(current) / name
+            metadata = entry.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise SystemExit(
+                    f"Bundled {label} tree contains a symbolic link: {entry}"
+                )
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
+                raise SystemExit(
+                    f"Bundled {label} tree contains a hard link: {entry}"
+                )
+
+# Nothing the app carries may point back at a download it can no longer make.
+resources = app / "Contents/Resources"
+for name in ("public_key_ed25519.txt", "toolchain_manifest_url.txt"):
+    for stale in resources.rglob(name):
+        raise SystemExit(f"Packaged app still carries a download-era resource: {stale}")
+if (resources / "ToolchainBootstrap").exists():
+    raise SystemExit("Packaged app still carries a toolchain bootstrap directory.")
 PY
-
-  local authority_file
-  if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
-    authority_file="$PUBLIC_KEY_FILE"
-  else
-    authority_file="$(bundled_app_resource "$app" public_key_ed25519.txt)"
-    if [ ! -f "$authority_file" ] || [ -L "$authority_file" ] || [ ! -s "$authority_file" ]; then
-      echo "Bundled app public-key authority is missing: $authority_file" >&2
-      return 1
-    fi
-  fi
-  run_bootstrap_verifier "$bundled_manifest" "$bundled_core" "$authority_file"
-
-  if [ -n "$RELEASE_MANIFEST" ] || [ -n "$CORE_ARCHIVE" ]; then
-    if [ -z "$RELEASE_MANIFEST" ] || [ -z "$CORE_ARCHIVE" ]; then
-      echo "Bootstrap byte verification requires --release-manifest and --core-archive together." >&2
-      return 1
-    fi
-    if ! cmp -s "$bundled_manifest" "$RELEASE_MANIFEST"; then
-      echo "Bundled bootstrap manifest bytes differ from the supplied verified release manifest." >&2
-      return 1
-    fi
-    if ! cmp -s "$bundled_core" "$CORE_ARCHIVE"; then
-      echo "Bundled bootstrap core bytes differ from the supplied verified core archive." >&2
-      return 1
-    fi
-  fi
 }
 
-
-VERIFY_BUNDLED_TOOLCHAIN=0
-if [ -n "$MANIFEST_URL" ] || [ -n "$PUBLIC_KEY_FILE" ]; then
-  if [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
-    echo "Packaged toolchain verification requires --manifest-url and --public-key-file together." >&2
-    exit 1
-  fi
-  VERIFY_BUNDLED_TOOLCHAIN=1
-fi
 
 plutil -lint "$INFO_PLIST" >/dev/null
 [ "$(read_plist CFBundleIdentifier)" = "com.easysplat.app" ]
@@ -1607,10 +1379,7 @@ if [ "$RELEASE_MODE" = production ]; then
 else
   [ "$(cat "$APP_PATH/Contents/Resources/release_channel.txt")" = "unsigned developer build" ]
 fi
-validate_bundled_bootstrap_contract "$APP_PATH"
-if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
-  validate_bundled_toolchain_contract "$APP_PATH"
-fi
+validate_bundled_toolchain_payload "$APP_PATH"
 
 "$HDIUTIL_BIN" verify "$DMG_PATH" >/dev/null
 MOUNT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-mount.XXXXXX")"
@@ -1648,14 +1417,7 @@ if [ "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$DISTRIBUTED_INFO_PLIST
   exit 1
 fi
 verify_matching_executable_hashes "$EXECUTABLE" "$DISTRIBUTED_EXECUTABLE"
-EFFECTIVE_MANIFEST_URL=""
-EFFECTIVE_PUBLIC_KEY_FILE=""
-if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
-  validate_bundled_toolchain_contract "$DISTRIBUTED_APP"
-  EFFECTIVE_MANIFEST_URL="$(cat "$(bundled_app_resource "$DISTRIBUTED_APP" toolchain_manifest_url.txt)")"
-  EFFECTIVE_PUBLIC_KEY_FILE="$(bundled_app_resource "$DISTRIBUTED_APP" public_key_ed25519.txt)"
-fi
-validate_bundled_bootstrap_contract "$DISTRIBUTED_APP"
+validate_bundled_toolchain_payload "$DISTRIBUTED_APP"
 
 if [ "$VERIFY_ARTIFACTS" -eq 1 ]; then
   if [ "$RELEASE_MODE" = production ]; then
@@ -1683,16 +1445,14 @@ if not isinstance(value, str) or not value:
 print(value)
 PY
 )"
-  RELEASE_MANIFEST="${RELEASE_MANIFEST:-$ROOT/Toolchains/manifest.json}"
-  CORE_ARCHIVE="${CORE_ARCHIVE:-$ROOT/Toolchains/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip}"
-  DA3_BASE_ARCHIVE="${DA3_BASE_ARCHIVE:-$ROOT/Toolchains/out/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip}"
-  DA3_SMALL_ARCHIVE="${DA3_SMALL_ARCHIVE:-$ROOT/Toolchains/out/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip}"
-  RELEASE_MANIFEST="$(canonical_path "$RELEASE_MANIFEST")"
-  CORE_ARCHIVE="$(canonical_path "$CORE_ARCHIVE")"
-  DA3_BASE_ARCHIVE="$(canonical_path "$DA3_BASE_ARCHIVE")"
-  DA3_SMALL_ARCHIVE="$(canonical_path "$DA3_SMALL_ARCHIVE")"
-  validate_bundled_bootstrap_contract "$APP_PATH"
-  validate_bundled_bootstrap_contract "$DISTRIBUTED_APP"
+  # The release documents describe the closure the app carries, so they are
+  # rebuilt from the staging tree that produced it.
+  TOOLCHAIN_STAGING_DIR="${TOOLCHAIN_DIR:-$ROOT/Toolchains/out}"
+  if [ ! -d "$TOOLCHAIN_STAGING_DIR" ]; then
+    echo "Artifact verification requires the staged toolchain tree: $TOOLCHAIN_STAGING_DIR" >&2
+    exit 1
+  fi
+  TOOLCHAIN_STAGING_DIR="$(canonical_path "$TOOLCHAIN_STAGING_DIR")"
   python3 "$ROOT/scripts/release/generate_release_metadata.py" verify \
     --app-version "$EXPECTED_VERSION" \
     --toolchain-version "$TOOLCHAIN_VERSION" \
@@ -1700,48 +1460,13 @@ PY
     --source-url "$SOURCE_URL" \
     --source-commit "$SOURCE_COMMIT" \
     --dmg "$DMG_PATH" \
-    --manifest "$RELEASE_MANIFEST" \
-    --core "$CORE_ARCHIVE" \
-    --da3-base "$DA3_BASE_ARCHIVE" \
-    --da3-small "$DA3_SMALL_ARCHIVE" \
+    --toolchain-dir "$TOOLCHAIN_STAGING_DIR" \
     --app-license "$ROOT/LICENSE" \
     --notice "$ROOT/NOTICE.md" \
     --viewer-license "$ROOT/ThirdParty/MetalSplatter/LICENSE" \
     --provenance "$PROVENANCE" \
     --spdx "$SBOM" \
     --licenses "$LICENSES"
-  if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
-    verify_signed_toolchain_closure "$TOOLCHAIN_VERSION"
-    fetch_and_compare_published_manifest
-    VERIFIED_MANIFEST_SHA256="$(shasum -a 256 "$RELEASE_MANIFEST" | awk '{print $1}')"
-    VERIFIED_TOOLCHAIN_KEY_ID="$(python3 - "$EFFECTIVE_PUBLIC_KEY_FILE" <<'PY'
-import base64
-import hashlib
-import sys
-from pathlib import Path
-
-encoded = "".join(Path(sys.argv[1]).read_text(encoding="utf-8").split())
-decoded = base64.b64decode(encoded, validate=True)
-if len(decoded) != 32:
-    raise SystemExit("Mounted app has an invalid Ed25519 toolchain authority.")
-print(hashlib.sha256(decoded).hexdigest())
-PY
-)"
-    VERIFIED_TOOLCHAIN_SIGNATURE_SHA256="$(python3 - "$RELEASE_MANIFEST" <<'PY'
-import base64
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-signature = base64.b64decode(manifest.get("signatureEd25519", ""), validate=True)
-if len(signature) != 64:
-    raise SystemExit("Release manifest has an invalid Ed25519 signature.")
-print(hashlib.sha256(signature).hexdigest())
-PY
-)"
-  fi
   unzip -tq "$DSYM" >/dev/null
   if [ "$RELEASE_MODE" = production ]; then
     grep -Fqi 'Developer ID-signed and notarized release' "$RELEASE_NOTES"
@@ -1770,10 +1495,7 @@ if [ "$RUN_PACKAGED_APP_SMOKE" -eq 1 ]; then
   verify_arm64_executable "Installed app" "$INSTALLED_EXECUTABLE"
   verify_distribution_bundle "$INSTALLED_APP"
   verify_matching_executable_hashes "$DISTRIBUTED_EXECUTABLE" "$INSTALLED_EXECUTABLE"
-  if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
-    validate_bundled_toolchain_contract "$INSTALLED_APP"
-  fi
-  validate_bundled_bootstrap_contract "$INSTALLED_APP"
+  validate_bundled_toolchain_payload "$INSTALLED_APP"
   if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
     assert_release_fixture_unchanged
     run_packaged_app_bootstrap_smoke "$E2E_FIXTURE_MEDIA"
@@ -1784,170 +1506,66 @@ else
   echo "INCOMPLETE TEST MODE: packaged-app smoke disabled."
 fi
 
-if [ -n "$E2E_FIXTURE" ] || [ -n "$TOOLCHAIN_ROOT" ] || [ -n "$E2E_RUNNER" ] \
-  || [ -n "$OFFLINE_CACHE_ROOT" ] || [ -n "$OFFLINE_RUNNER" ] \
-  || [ -n "$CACHED_CACHE_ROOT" ] || [ -n "$CACHED_RUNNER" ]; then
+if [ -n "$E2E_FIXTURE" ] || [ -n "$E2E_RUNNER" ]; then
   if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
     [ -x "$EXPECTED_RELEASE_RUNNER" ] || {
       echo "Repository-built EasySplatReleaseVerifier is missing after the release build." >&2
       exit 1
     }
     E2E_RUNNER="$EXPECTED_RELEASE_RUNNER"
-    OFFLINE_RUNNER="$EXPECTED_RELEASE_RUNNER"
-    CACHED_RUNNER="$EXPECTED_RELEASE_RUNNER"
   fi
-  if [ ! -d "$E2E_FIXTURE_MEDIA" ] || [ ! -d "$TOOLCHAIN_ROOT" ] || [ ! -x "$E2E_RUNNER" ] \
-    || [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
-    echo "End-to-end verification requires a fixture, manifest URL, public key, toolchain cache, and executable runner." >&2
+  if [ ! -d "$E2E_FIXTURE_MEDIA" ] || [ ! -x "$E2E_RUNNER" ]; then
+    echo "End-to-end verification requires a generated fixture and an executable runner." >&2
     exit 1
   fi
   E2E_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-e2e.XXXXXX")"
   E2E_INPUT_MANIFEST="$E2E_DIR/release-input-manifest.json"
   printf '%s' '{"photoFolder":"images","schemaVersion":1,"videos":[]}' \
     >"$E2E_INPUT_MANIFEST"
-  OFFLINE_LANE_ROOT="$E2E_DIR/offline"
-  ONLINE_LANE_ROOT="$E2E_DIR/online"
-  CACHED_LANE_ROOT="$E2E_DIR/cached"
-  mkdir -p \
-    "$OFFLINE_LANE_ROOT/home" "$OFFLINE_LANE_ROOT/work" \
-    "$ONLINE_LANE_ROOT/home" "$ONLINE_LANE_ROOT/work" \
-    "$CACHED_LANE_ROOT/home" "$CACHED_LANE_ROOT/work" \
-    "$E2E_DIR/raw-console"
-  BUNDLED_BOOTSTRAP_MANIFEST="$DISTRIBUTED_APP/Contents/Resources/ToolchainBootstrap/manifest.json"
-  BUNDLED_BOOTSTRAP_CORE="$DISTRIBUTED_APP/Contents/Resources/ToolchainBootstrap/macos-arm64-core.zip"
-  EFFECTIVE_PUBLIC_KEY_FILE="$(canonical_path "$EFFECTIVE_PUBLIC_KEY_FILE")"
-  BUNDLED_BOOTSTRAP_MANIFEST="$(canonical_path "$BUNDLED_BOOTSTRAP_MANIFEST")"
-  BUNDLED_BOOTSTRAP_CORE="$(canonical_path "$BUNDLED_BOOTSTRAP_CORE")"
-
-  if [ -n "$OFFLINE_CACHE_ROOT" ] || [ -n "$OFFLINE_RUNNER" ]; then
-    if [ ! -d "$OFFLINE_CACHE_ROOT" ] || [ ! -x "$OFFLINE_RUNNER" ] \
-      || [ ! -d "$E2E_FIXTURE_MEDIA" ] || [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
-      echo "Offline verification requires the fixture, manifest contract, empty bootstrap root, and executable runner." >&2
-      exit 1
-    fi
-    OFFLINE_OUTPUT="$OFFLINE_LANE_ROOT/work/splat.ply"
-    assert_release_fixture_unchanged
-    run_captured_release_verifier bundled-offline "$OFFLINE_LANE_ROOT" "$OFFLINE_OUTPUT" \
-      deny "$OFFLINE_LANE_ROOT/home" "$OFFLINE_LANE_ROOT/work" "$OFFLINE_CACHE_ROOT" \
-      "$OFFLINE_RUNNER" \
-      --input-manifest "$E2E_INPUT_MANIFEST" \
-      --input-root "$E2E_FIXTURE" \
-      --manifest-url "$EFFECTIVE_MANIFEST_URL" \
-      --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
-      --expected-manifest "$RELEASE_MANIFEST" \
-      --expected-manifest-file-sha256 "$VERIFIED_MANIFEST_SHA256" \
-      --bootstrap-manifest "$BUNDLED_BOOTSTRAP_MANIFEST" \
-      --bootstrap-core-archive "$BUNDLED_BOOTSTRAP_CORE" \
-      --cache-root "$OFFLINE_CACHE_ROOT" \
-      --output "$OFFLINE_OUTPUT" \
-      --evidence "$OFFLINE_LANE_ROOT/work/diagnostic.md" \
-      --app-version "$EXPECTED_VERSION" \
-      --installation-policy bundled-bootstrap-only \
-      --offline
-    assert_release_fixture_unchanged
-    [ -s "$OFFLINE_OUTPUT" ]
-    head -n 1 "$OFFLINE_OUTPUT" | grep -qx 'ply'
-    grep -a -m1 -Eq '^element vertex [1-9][0-9]*$' "$OFFLINE_OUTPUT"
-    OFFLINE_TOOLCHAIN_SNAPSHOT="$(cached_toolchain_snapshot "$OFFLINE_CACHE_ROOT")"
-  elif [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
-    echo "Release verification requires a distinct offline bootstrap root and runner." >&2
-    exit 1
-  else
-    :
-  fi
-
-  E2E_OUTPUT="$ONLINE_LANE_ROOT/work/splat.ply"
+  BUNDLED_LANE_ROOT="$E2E_DIR/bundled"
+  mkdir -p "$BUNDLED_LANE_ROOT/home" "$BUNDLED_LANE_ROOT/work" "$E2E_DIR/raw-console"
+  E2E_APP_BUNDLE="$(canonical_path "$DISTRIBUTED_APP")"
+  E2E_OUTPUT="$BUNDLED_LANE_ROOT/work/splat.ply"
   assert_release_fixture_unchanged
-  run_captured_release_verifier remote-only "$ONLINE_LANE_ROOT" "$E2E_OUTPUT" \
-    allow "$ONLINE_LANE_ROOT/home" "$ONLINE_LANE_ROOT/work" "$TOOLCHAIN_ROOT" \
+  # The app carries every tool it runs, so the reconstruction must complete with
+  # the network denied. Nothing here can be satisfied by a download.
+  run_captured_release_verifier bundled "$BUNDLED_LANE_ROOT" "$E2E_OUTPUT" \
+    deny "$BUNDLED_LANE_ROOT/home" "$BUNDLED_LANE_ROOT/work" "$E2E_APP_BUNDLE" \
     "$E2E_RUNNER" \
     --input-manifest "$E2E_INPUT_MANIFEST" \
     --input-root "$E2E_FIXTURE" \
-    --manifest-url "$EFFECTIVE_MANIFEST_URL" \
-    --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
-    --expected-manifest "$RELEASE_MANIFEST" \
-    --expected-manifest-file-sha256 "$VERIFIED_MANIFEST_SHA256" \
-    --cache-root "$TOOLCHAIN_ROOT" \
+    --app-bundle "$E2E_APP_BUNDLE" \
     --output "$E2E_OUTPUT" \
-    --evidence "$ONLINE_LANE_ROOT/work/diagnostic.md" \
-    --app-version "$EXPECTED_VERSION" \
-    --installation-policy remote-only
+    --evidence "$BUNDLED_LANE_ROOT/work/diagnostic.md" \
+    --app-version "$EXPECTED_VERSION"
   assert_release_fixture_unchanged
   [ -s "$E2E_OUTPUT" ]
   head -n 1 "$E2E_OUTPUT" | grep -qx 'ply'
   grep -a -m1 -Eq '^element vertex [1-9][0-9]*$' "$E2E_OUTPUT"
-  ONLINE_TOOLCHAIN_SNAPSHOT="$(cached_toolchain_snapshot "$TOOLCHAIN_ROOT")"
-
-  if [ -n "$CACHED_CACHE_ROOT" ] || [ -n "$CACHED_RUNNER" ]; then
-    if [ ! -d "$CACHED_CACHE_ROOT" ] || [ ! -x "$CACHED_RUNNER" ]; then
-      echo "Cached-only verification requires an empty isolated cache root and executable runner." >&2
-      exit 1
-    fi
-    /usr/bin/ditto "$TOOLCHAIN_ROOT/" "$CACHED_CACHE_ROOT/"
-    python3 - "$TOOLCHAIN_ROOT" "$CACHED_CACHE_ROOT" <<'PY'
+  VERIFIED_TOOLCHAIN_CLOSURE_SHA256="$(
+    /usr/bin/python3 -I - "$EVIDENCE_DIR/bundled-diagnostic.md" <<'PY'
+import re
 import sys
 from pathlib import Path
 
-source_root, cached_root = map(Path, sys.argv[1:])
-source_receipts = list(source_root.rglob(".easysplat_toolchain_state.json"))
-cached_receipts = list(cached_root.rglob(".easysplat_toolchain_state.json"))
-if len(source_receipts) != 1 or len(cached_receipts) != 1:
-    raise SystemExit("Cached-only verification requires one remote-source and one copied receipt.")
-if source_receipts[0].read_bytes() != cached_receipts[0].read_bytes():
-    raise SystemExit("Cached-only verification did not preserve the remote signed receipt exactly.")
+prefix = "Installed closure SHA-256: "
+values = [
+    line[len(prefix):]
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.startswith(prefix)
+]
+if len(values) != 1 or re.fullmatch(r"[0-9a-f]{64}", values[0]) is None:
+    raise SystemExit("Release-verifier evidence has no unique bundled closure digest.")
+print(values[0])
 PY
-    CACHED_TOOLCHAIN_SNAPSHOT="$(cached_toolchain_snapshot "$CACHED_CACHE_ROOT")"
-    CACHED_OUTPUT="$CACHED_LANE_ROOT/work/splat.ply"
-    assert_release_fixture_unchanged
-    run_captured_release_verifier cached-only "$CACHED_LANE_ROOT" "$CACHED_OUTPUT" \
-      deny "$CACHED_LANE_ROOT/home" "$CACHED_LANE_ROOT/work" "$CACHED_CACHE_ROOT" \
-      "$CACHED_RUNNER" \
-      --input-manifest "$E2E_INPUT_MANIFEST" \
-      --input-root "$E2E_FIXTURE" \
-      --manifest-url "https://127.0.0.1:1/easysplat-cached-only-verification.json" \
-      --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
-      --expected-manifest "$RELEASE_MANIFEST" \
-      --expected-manifest-file-sha256 "$VERIFIED_MANIFEST_SHA256" \
-      --cache-root "$CACHED_CACHE_ROOT" \
-      --output "$CACHED_OUTPUT" \
-      --evidence "$CACHED_LANE_ROOT/work/diagnostic.md" \
-      --app-version "$EXPECTED_VERSION" \
-      --installation-policy cached-only \
-      --offline
-    assert_release_fixture_unchanged
-    [ -s "$CACHED_OUTPUT" ]
-    head -n 1 "$CACHED_OUTPUT" | grep -qx 'ply'
-    grep -a -m1 -Eq '^element vertex [1-9][0-9]*$' "$CACHED_OUTPUT"
-    POST_RUN_CACHED_TOOLCHAIN_SNAPSHOT="$(cached_toolchain_snapshot "$CACHED_CACHE_ROOT")"
-    if [ "$POST_RUN_CACHED_TOOLCHAIN_SNAPSHOT" != "$CACHED_TOOLCHAIN_SNAPSHOT" ]; then
-      echo "Cached-only verification mutated or replaced the signed installed toolchain closure." >&2
-      exit 1
-    fi
-    if [ "$(cached_toolchain_snapshot "$OFFLINE_CACHE_ROOT")" != "$OFFLINE_TOOLCHAIN_SNAPSHOT" ]; then
-      echo "A later verification lane mutated the bundled-offline installed closure." >&2
-      exit 1
-    fi
-    if [ "$(cached_toolchain_snapshot "$TOOLCHAIN_ROOT")" != "$ONLINE_TOOLCHAIN_SNAPSHOT" ]; then
-      echo "A later verification lane mutated the remote installed closure." >&2
-      exit 1
-    fi
-    echo "Cached-only offline reconstruction passed with network access denied."
-  elif [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
-    echo "Release verification requires a distinct cached-only root and runner." >&2
-    exit 1
-  fi
+  )"
+  echo "Bundled reconstruction passed with network access denied."
 else
   if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
-    echo "Release verification requires an end-to-end fixture, installed toolchain, and runner." >&2
+    echo "Release verification requires an end-to-end fixture and runner." >&2
     exit 1
   fi
   echo "INCOMPLETE TEST MODE: end-to-end splat not supplied."
-fi
-if [ -z "$OFFLINE_CACHE_ROOT" ] && [ -z "$OFFLINE_RUNNER" ] && [ "$ALLOW_INCOMPLETE" -eq 1 ]; then
-  echo "INCOMPLETE TEST MODE: offline bootstrap run not supplied."
-fi
-if [ -z "$CACHED_CACHE_ROOT" ] && [ -z "$CACHED_RUNNER" ] && [ "$ALLOW_INCOMPLETE" -eq 1 ]; then
-  echo "INCOMPLETE TEST MODE: cached-only offline reuse not supplied."
 fi
 
 if [ "$ALLOW_INCOMPLETE" -eq 1 ]; then

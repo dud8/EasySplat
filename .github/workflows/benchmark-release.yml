@@ -335,7 +335,7 @@ jobs:
             --producer "$HANDOFF/producer" \
             --request "$HANDOFF/request/toolchain-release-request.json" \
             --authority-handoff "$HANDOFF/authority-handoff" \
-            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --public-key "scripts/release/toolchain_authority_public_key.txt" \
             --manifest-out "$MANIFEST" \
             --install-root "$TOOLCHAIN_ROOT" \
             --version "${{ inputs.version }}" \
@@ -369,7 +369,7 @@ jobs:
           VERSION="${{ inputs.version }}"
           swift run --package-path Tools/ManifestTool ManifestTool verify-release \
             --manifest "$MANIFEST" \
-            --public-key-file "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --public-key-file "scripts/release/toolchain_authority_public_key.txt" \
             --toolchain-version "$VERSION" \
             --app-version "${{ inputs.app_version }}" \
             --core-zip "$HANDOFF/producer/toolchain-macos-arm64-$VERSION-core.zip" \
@@ -547,7 +547,7 @@ jobs:
           python3 scripts/release/toolchain_publication.py install \
             --producer "$RUNNER_TEMP/signed-toolchain-closure/producer" \
             --manifest "$RUNNER_TEMP/signed-toolchain-closure/manifest.json" \
-            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --public-key "scripts/release/toolchain_authority_public_key.txt" \
             --version "${{ inputs.version }}" \
             --app-version "${{ inputs.app_version }}" \
             --source-repository "$GITHUB_REPOSITORY" \
@@ -661,7 +661,7 @@ jobs:
           python3 scripts/release/toolchain_publication.py install \
             --producer "$RUNNER_TEMP/signed-toolchain-closure/producer" \
             --manifest "$RUNNER_TEMP/signed-toolchain-closure/manifest.json" \
-            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --public-key "scripts/release/toolchain_authority_public_key.txt" \
             --version "${{ inputs.version }}" \
             --app-version "${{ inputs.app_version }}" \
             --source-repository "$GITHUB_REPOSITORY" \
@@ -775,7 +775,7 @@ jobs:
           python3 scripts/release/toolchain_publication.py install \
             --producer "$RUNNER_TEMP/signed-toolchain-closure/producer" \
             --manifest "$RUNNER_TEMP/signed-toolchain-closure/manifest.json" \
-            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --public-key "scripts/release/toolchain_authority_public_key.txt" \
             --version "${{ inputs.version }}" \
             --app-version "${{ inputs.app_version }}" \
             --source-repository "$GITHUB_REPOSITORY" \
