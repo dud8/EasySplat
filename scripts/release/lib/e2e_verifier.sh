@@ -405,8 +405,6 @@ while index < len(command):
     else:
         raise SystemExit(f"Release-verifier input has an unsupported file type: {option}")
     index += 2
-if "--app-bundle" not in seen_options:
-    raise SystemExit("Release-verifier command does not name the app bundle it attests.")
 
 def unique(values):
     return list(dict.fromkeys(values))

@@ -284,7 +284,7 @@ class ReleasePolicyWorkflowTests(unittest.TestCase):
         self.assertIn(
             '"$GITHUB_WORKSPACE/scripts/release/build_dmg.sh"', credentialed
         )
-        self.assertIn("--manifest-tool-bin", credentialed)
+        self.assertIn('--prepared-release-root "$PREPARED_ROOT"', credentialed)
         self.assertIn("PREPARED_MANIFEST_SHA256", signing)
         self.assertIn(
             '--prepared-manifest-sha256 "$PREPARED_MANIFEST_SHA256"',

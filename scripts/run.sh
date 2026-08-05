@@ -446,6 +446,23 @@ if [ "$NEED_PACKAGE" -eq 1 ]; then
   "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 fi
 
+# The packaged archives are the durable artifact; the tree is derived from them.
+# A root that has no tree yet gets one, whether packaging just ran or the cached
+# archives were reused.
+if ! validate_installed_core "$TOOLCHAIN_ROOT"; then
+  mkdir -p "$TOOLCHAIN_ROOT"
+  for archive in "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"; do
+    if [ -f "$archive" ]; then
+      /usr/bin/ditto -x -k "$archive" "$TOOLCHAIN_ROOT"
+    fi
+  done
+  for executable in bin/colmap bin/easysplat-train; do
+    if [ -f "$TOOLCHAIN_ROOT/$executable" ]; then
+      chmod 755 "$TOOLCHAIN_ROOT/$executable"
+    fi
+  done
+fi
+
 if ! validate_installed_core "$TOOLCHAIN_ROOT"; then
   echo "Toolchain tree is incomplete after packaging: $TOOLCHAIN_ROOT" >&2
   echo "Expected bin/colmap, bin/easysplat-train, lib/libomp.dylib, provenance/, supply-chain/." >&2
