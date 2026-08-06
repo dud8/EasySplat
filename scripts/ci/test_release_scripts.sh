@@ -3018,7 +3018,7 @@ assert_signed_app_override_rejected() {
 
 for signed_override_mode in --production --prepare-release; do
   if [ "$signed_override_mode" = --production ]; then
-    signed_override_error='Production build command overrides are not permitted.'
+    signed_override_error='Signed build command overrides are not permitted.'
     signed_override_label=signed
   else
     signed_override_error='Prepared production build command overrides are not permitted.'
@@ -3690,7 +3690,7 @@ if EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   echo "Production app build accepted a command override." >&2
   exit 1
 fi
-grep -Fqi 'Production build command overrides are not permitted' "$production_error"
+grep -Fqi 'Signed build command overrides are not permitted' "$production_error"
 if [ -e "$production_xcodebuild_log" ]; then
   echo "Production app build executed an overridden xcodebuild binary." >&2
   exit 1
@@ -3746,7 +3746,7 @@ if "$ROOT/scripts/release/build_app.sh" \
   echo "Production app build accepted a missing Developer ID identity." >&2
   exit 1
 fi
-grep -Fqi 'exact 40-hex Developer ID fingerprint' "$missing_signed_identity_error"
+grep -Fqi 'exact 40-hex signing identity fingerprint' "$missing_signed_identity_error"
 
 unsigned_signing_argument_error="$TMP_DIR/unsigned-signing-argument.stderr"
 if "$ROOT/scripts/release/build_app.sh" \

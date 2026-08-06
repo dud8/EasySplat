@@ -2291,7 +2291,7 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
             )
             self.assertNotEqual(app_result.returncode, 0)
             self.assertIn(
-                "Production builds require an exact 40-hex Developer ID fingerprint.",
+                "Signed builds require an exact 40-hex signing identity fingerprint.",
                 app_result.stderr,
             )
             self.assertFalse(app_build.exists())
@@ -2508,10 +2508,18 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
     def test_signed_app_reverifies_exact_identity_before_success(self) -> None:
         source = BUILD_APP_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertEqual(source.count("--verify-only"), 1)
-        exact_verification = source.index("--verify-only")
-        completion = source.index("SIGNED_BUILD_COMPLETE=1")
-        self.assertLess(exact_verification, completion)
+        # Every signed channel re-verifies the artifact it just produced, and
+        # only then calls the build complete.
+        verifications = [
+            match.start() for match in re.finditer(r"--verify-only", source)
+        ]
+        completions = [
+            match.start() for match in re.finditer(r"SIGNED_BUILD_COMPLETE=1", source)
+        ]
+        self.assertTrue(verifications)
+        self.assertEqual(len(verifications), len(completions))
+        for verification, completion in zip(verifications, completions):
+            self.assertLess(verification, completion)
 
     def test_signed_dmg_uses_transactional_publication_helper(self) -> None:
         source = BUILD_DMG_SCRIPT.read_text(encoding="utf-8")

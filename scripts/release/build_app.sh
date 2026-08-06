@@ -18,6 +18,7 @@ XCODEBUILD_BIN="${EASYSPLAT_XCODEBUILD_BIN:-xcodebuild}"
 CODESIGN_BIN="${EASYSPLAT_CODESIGN_BIN:-codesign}"
 XCRUN_BIN="${EASYSPLAT_XCRUN_BIN:-xcrun}"
 INPUT_SNAPSHOT_DIR=""
+PROVISIONING_PROFILE=""
 BUILD_LOCK=""
 BUILD_LOCK_HELD=0
 APP_BUNDLE=""
@@ -34,9 +35,11 @@ cleanup() {
   if [ -n "$INPUT_SNAPSHOT_DIR" ]; then
     rm -rf "$INPUT_SNAPSHOT_DIR"
   fi
-  if [ "$RELEASE_MODE" = production ] && [ "$SIGNED_BUILD_COMPLETE" -ne 1 ]; then
+  if [ "$RELEASE_MODE" = production ] || [ "$RELEASE_MODE" = app-store ]; then
+   if [ "$SIGNED_BUILD_COMPLETE" -ne 1 ]; then
     [ -z "$APP_BUNDLE" ] || rm -rf "$APP_BUNDLE"
     [ -z "$SIGNING_RECEIPT" ] || rm -f "$SIGNING_RECEIPT"
+   fi
   fi
   exit "$status"
 }
@@ -96,6 +99,26 @@ while [[ $# -gt 0 ]]; do
       RELEASE_MODE="prepare-release"
       shift
       ;;
+    --app-store)
+      if [ -n "$RELEASE_MODE" ]; then
+        echo "Choose exactly one release mode." >&2
+        exit 1
+      fi
+      RELEASE_MODE="app-store"
+      shift
+      ;;
+    --provisioning-profile)
+      if [ -n "$PROVISIONING_PROFILE" ]; then
+        echo "--provisioning-profile may be supplied only once." >&2
+        exit 1
+      fi
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--provisioning-profile requires a path." >&2
+        exit 1
+      fi
+      PROVISIONING_PROFILE="$2"
+      shift 2
+      ;;
     --identity-fingerprint)
       if [ "$IDENTITY_FINGERPRINT_SET" -eq 1 ]; then
         echo "--identity-fingerprint may be supplied only once." >&2
@@ -132,22 +155,26 @@ done
 unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
 
 if [ -z "$TOOLCHAIN_DIR" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_app.sh --toolchain-dir <path> --version <semver> [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release | --production --identity-fingerprint <sha1> --team-id <id>)" >&2
+  echo "Usage: build_app.sh --toolchain-dir <path> --version <semver> [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release | --production --identity-fingerprint <sha1> --team-id <id> | --app-store --provisioning-profile <path> --identity-fingerprint <sha1> --team-id <id>)" >&2
   exit 1
 fi
-if [ "$RELEASE_MODE" = production ]; then
+if [ "$RELEASE_MODE" = production ] || [ "$RELEASE_MODE" = app-store ]; then
   if ! [[ "$IDENTITY_FINGERPRINT" =~ ^[0-9A-Fa-f]{40}$ ]]; then
-    echo "Production builds require an exact 40-hex Developer ID fingerprint." >&2
+    echo "Signed builds require an exact 40-hex signing identity fingerprint." >&2
     exit 1
   fi
   if ! [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
-    echo "Production builds require an exact 10-character Team ID." >&2
+    echo "Signed builds require an exact 10-character Team ID." >&2
+    exit 1
+  fi
+  if [ "$RELEASE_MODE" = app-store ] && [ -z "$PROVISIONING_PROFILE" ]; then
+    echo "App Store builds require --provisioning-profile." >&2
     exit 1
   fi
   if [ -n "${EASYSPLAT_XCODEBUILD_BIN:-}" ] \
       || [ -n "${EASYSPLAT_CODESIGN_BIN:-}" ] \
       || [ -n "${EASYSPLAT_SKIP_METAL_TOOLCHAIN_CHECK:-}" ]; then
-    echo "Production build command overrides are not permitted." >&2
+    echo "Signed build command overrides are not permitted." >&2
     exit 1
   fi
   PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -167,7 +194,11 @@ if [ "$RELEASE_MODE" = production ]; then
   CODESIGN_BIN=/usr/bin/codesign
   XCRUN_BIN=/usr/bin/xcrun
 elif [ -n "$IDENTITY_FINGERPRINT" ] || [ -n "$TEAM_ID" ]; then
-  echo "Signing identity arguments require --production." >&2
+  echo "Signing identity arguments require --production or --app-store." >&2
+  exit 1
+fi
+if [ "$RELEASE_MODE" != app-store ] && [ -n "$PROVISIONING_PROFILE" ]; then
+  echo "A provisioning profile is only used by --app-store." >&2
   exit 1
 fi
 if [ "$RELEASE_MODE" = prepare-release ]; then
@@ -510,6 +541,8 @@ printf "%s" "$PROJECT_URL" > "$OVERRIDE_RES_DIR/project_home_url.txt"
 cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/"
 if [ "$RELEASE_MODE" = production ]; then
   printf '%s' 'production release' >"$RES_DIR/release_channel.txt"
+elif [ "$RELEASE_MODE" = app-store ]; then
+  printf '%s' 'app store release' >"$RES_DIR/release_channel.txt"
 elif [ "$RELEASE_MODE" = prepare-release ]; then
   printf '%s' 'prepared release candidate' >"$RES_DIR/release_channel.txt"
 else
@@ -532,7 +565,59 @@ rm -rf "$EXPORTED_DSYM_PATH"
 cp -R "$BUILT_DSYM_PATH" "$EXPORTED_DSYM_PATH"
 
 plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
-if [ "$RELEASE_MODE" = production ]; then
+if [ "$RELEASE_MODE" = app-store ]; then
+  # The store validates the app against the profile sealed beside it, so the
+  # profile has to be staged before the signature covers the bundle.
+  /usr/bin/python3 -I - "$PROVISIONING_PROFILE" <<'PY'
+import os
+import stat
+import sys
+
+profile = sys.argv[1]
+if not os.path.isabs(profile) or os.path.normpath(profile) != profile:
+    raise SystemExit("Provisioning profile path must be absolute and normalized.")
+if os.path.realpath(profile) != profile:
+    raise SystemExit("Provisioning profile path must contain no symlink ancestry.")
+try:
+    metadata = os.lstat(profile)
+except FileNotFoundError:
+    raise SystemExit(f"Provisioning profile does not exist: {profile}")
+if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+    raise SystemExit("Provisioning profile must be an ordinary regular file.")
+if not 0 < metadata.st_size <= 1024 * 1024:
+    raise SystemExit("Provisioning profile has an implausible size.")
+PY
+  install -m 0644 "$PROVISIONING_PROFILE" \
+    "$APP_BUNDLE/Contents/embedded.provisionprofile"
+  ENTITLEMENTS_DIR="$ROOT/scripts/release/entitlements"
+  store_signing_args=(
+    --root "$APP_BUNDLE"
+    --kind app
+    --channel mas
+    --identity-fingerprint "$IDENTITY_FINGERPRINT"
+    --team-id "$TEAM_ID"
+    --receipt "$SIGNING_RECEIPT"
+    --entitlements "Contents/MacOS/EasySplatApp=$ENTITLEMENTS_DIR/mas-app.plist"
+  )
+  for helper in bin/colmap bin/easysplat-train lib/libomp.dylib; do
+    store_signing_args+=(
+      --entitlements
+      "Contents/Helpers/$helper=$ENTITLEMENTS_DIR/mas-helper-inherit.plist"
+    )
+  done
+  /usr/bin/python3 -I "$ROOT/scripts/release/sign_macos_distribution.py" \
+    "${store_signing_args[@]}"
+  /usr/bin/python3 -I "$ROOT/scripts/release/sign_macos_distribution.py" \
+    --verify-only \
+    --bind-receipt-to-current-artifact \
+    --root "$APP_BUNDLE" \
+    --kind app \
+    --channel mas \
+    --identity-fingerprint "$IDENTITY_FINGERPRINT" \
+    --team-id "$TEAM_ID" \
+    --receipt "$SIGNING_RECEIPT"
+  SIGNED_BUILD_COMPLETE=1
+elif [ "$RELEASE_MODE" = production ]; then
   signing_args=(
     --root "$APP_BUNDLE"
     --kind app
