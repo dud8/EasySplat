@@ -1028,17 +1028,26 @@ def validate_entitlements(
         is_top_level = (
             (kind == "tree" and len(parts) == 2 and parts[0] == "bin")
             or (kind == "app" and relative == app_main)
-            # The store sandbox reaches the helpers only if each one is signed
-            # to inherit it, so every sealed Mach-O is a legitimate target.
-            or (store_app and relative.startswith(MAS_HELPER_PREFIX))
+            # The store sandbox reaches a helper only if that helper is signed
+            # to inherit it, so every bundled executable is a legitimate target.
+            or (
+                store_app
+                and relative.startswith(MAS_HELPER_PREFIX)
+                and ((root / relative).lstat().st_mode & stat.S_IXUSR)
+            )
         )
         if not is_top_level:
             fail(f"entitlements target is not a named top-level executable: {relative}")
         validated[relative] = _load_entitlements(source)
     if store_app:
+        # Entitlements describe a process, so codesign seals them onto
+        # executables and silently drops them from libraries. Requiring one on a
+        # dylib would demand something the format cannot carry.
         expected = {app_main or ""} | {
-            relative for relative in available
-            if relative.startswith(MAS_HELPER_PREFIX)
+            _relative_path(path, root)
+            for path in macho_paths
+            if _relative_path(path, root).startswith(MAS_HELPER_PREFIX)
+            and (path.lstat().st_mode & stat.S_IXUSR)
         }
         if set(validated) != expected:
             missing = sorted(expected - set(validated))

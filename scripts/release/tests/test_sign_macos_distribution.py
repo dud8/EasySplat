@@ -2195,6 +2195,48 @@ class StoreChannelTests(unittest.TestCase):
         path.write_bytes(plistlib.dumps(payload))
         return path
 
+    def test_a_bundled_library_is_not_an_entitlement_target(self) -> None:
+        # codesign accepts --entitlements on a dylib and seals nothing, because
+        # entitlements describe a process. Requiring one would be unsatisfiable.
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            app, machos, main = self.make_store_app(root)
+            library = app / "Contents/Helpers/lib/libomp.dylib"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"\xcf\xfa\xed\xfe" + b"library")
+            library.chmod(0o644)
+            machos = machos + [library]
+            app_plist = self.entitlement_file(
+                root, "app.plist", {"com.apple.security.app-sandbox": True}
+            )
+            helper_plist = self.entitlement_file(
+                root,
+                "helper.plist",
+                {
+                    "com.apple.security.app-sandbox": True,
+                    "com.apple.security.inherit": True,
+                },
+            )
+            entitlements = {
+                main: app_plist,
+                "Contents/Helpers/bin/colmap": helper_plist,
+            }
+            validated = MODULE.validate_entitlements(
+                app, "app", machos, entitlements, app_main=main, channel="mas"
+            )
+            self.assertEqual(set(validated), set(entitlements))
+            with self.assertRaisesRegex(
+                MODULE.SigningError, "not a named top-level executable"
+            ):
+                MODULE.validate_entitlements(
+                    app,
+                    "app",
+                    machos,
+                    {**entitlements, "Contents/Helpers/lib/libomp.dylib": helper_plist},
+                    app_main=main,
+                    channel="mas",
+                )
+
     def test_store_app_must_entitle_its_main_executable_and_every_helper(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch).resolve()

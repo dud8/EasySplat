@@ -599,7 +599,9 @@ PY
     --receipt "$SIGNING_RECEIPT"
     --entitlements "Contents/MacOS/EasySplatApp=$ENTITLEMENTS_DIR/mas-app.plist"
   )
-  for helper in bin/colmap bin/easysplat-train lib/libomp.dylib; do
+  # The library is sealed by the bundle signature; only processes take
+  # entitlements.
+  for helper in bin/colmap bin/easysplat-train; do
     store_signing_args+=(
       --entitlements
       "Contents/Helpers/$helper=$ENTITLEMENTS_DIR/mas-helper-inherit.plist"
