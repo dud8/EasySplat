@@ -1276,6 +1276,90 @@ final class PhotoInputAdmissionTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
     }
 
+    /// Staging opened its parent by walking down from the root, opening every
+    /// directory on the way. That needs read permission on each one, which the
+    /// App Sandbox does not give for `/Users` — so a store build could stage
+    /// nothing at all. An ancestor a process may cross but not read reproduces
+    /// exactly that condition without a sandbox.
+    func testStagingWorksWhenAnAncestorCannotBeRead() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let crossable = root.appendingPathComponent("crossable", isDirectory: true)
+        let library = crossable.appendingPathComponent("Projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeRGBJPEG(at: source.appendingPathComponent("capture.jpg"), properties: [:])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o111],
+            ofItemAtPath: crossable.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: crossable.path
+            )
+        }
+
+        let prepared = try await prepareOnePhoto(source: source, library: library)
+        defer { prepared.discard() }
+        XCTAssertEqual(prepared.photos.count, 1)
+    }
+
+    /// A staging parent that is itself a symbolic link is refused outright.
+    func testStagingRefusesAParentThatIsASymbolicLink() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let real = root.appendingPathComponent("real-projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeRGBJPEG(at: source.appendingPathComponent("capture.jpg"), properties: [:])
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: library, withDestinationURL: real)
+
+        do {
+            let prepared = try await prepareOnePhoto(source: source, library: library)
+            prepared.discard()
+            XCTFail("A staging parent that is a link must be refused.")
+        } catch let failure as PhotoInputPreflightFailure {
+            XCTAssertEqual(failure.issue, .stagingUnavailable)
+        }
+    }
+
+    /// A link on the way to the staging parent is resolved once, and staging
+    /// lands on the real directory rather than on the path that led there.
+    func testStagingLandsOnTheResolvedParentWhenAnAncestorIsALink() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let real = root.appendingPathComponent("real", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: real.appendingPathComponent("Projects", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeRGBJPEG(at: source.appendingPathComponent("capture.jpg"), properties: [:])
+        let link = root.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+
+        let prepared = try await prepareOnePhoto(
+            source: source,
+            library: link.appendingPathComponent("Projects", isDirectory: true)
+        )
+        defer { prepared.discard() }
+        XCTAssertEqual(prepared.photos.count, 1)
+        let staged = prepared.stagingRoot.path
+        XCTAssertTrue(
+            staged.contains("/real/Projects/"),
+            "Staging must live under the resolved parent: \(staged)"
+        )
+        XCTAssertFalse(
+            staged.contains("/link/"),
+            "Staging must not record the path that led there: \(staged)"
+        )
+    }
+
     /// A refused read is what the App Sandbox does when the grant that came with
     /// the user's selection has lapsed. Calling that "the source changed" sends
     /// the user hunting for a damaged photo that is fine.

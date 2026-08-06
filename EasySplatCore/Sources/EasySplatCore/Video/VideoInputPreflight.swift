@@ -1986,7 +1986,7 @@ public struct VideoInputPreflight: Sendable {
         }
         defer { free(canonicalPointer) }
         let canonicalParent = URL(fileURLWithPath: String(cString: canonicalPointer))
-        let parentDescriptor = try openDirectoryChain(canonicalParent)
+        let parentDescriptor = try openDirectoryRefusingSymlinks(canonicalParent)
         defer { Darwin.close(parentDescriptor) }
         var parentStatus = stat()
         guard fstat(parentDescriptor, &parentStatus) == 0,
@@ -2026,33 +2026,25 @@ public struct VideoInputPreflight: Sendable {
         return container
     }
 
-    private static func openDirectoryChain(_ url: URL) throws -> Int32 {
+    /// Opens a directory, refusing the whole path if any part of it is a
+    /// symbolic link.
+    ///
+    /// This used to walk from the root a component at a time, opening each one
+    /// with `O_NOFOLLOW`. Inside the App Sandbox that cannot work: the app may
+    /// not open `/Users`, so the walk failed at its first step no matter which
+    /// directory it was asked for, and staging was never created. The kernel
+    /// applies the same rule to the whole path with `O_NOFOLLOW_ANY`, which
+    /// needs no read access to any parent directory.
+    private static func openDirectoryRefusingSymlinks(_ url: URL) throws -> Int32 {
         guard url.isFileURL, url.path.hasPrefix("/") else {
             throw CocoaError(.fileReadUnsupportedScheme)
         }
-        var descriptor = Darwin.open(
-            "/",
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC
         )
         guard descriptor >= 0 else { throw currentPOSIXError() }
-        do {
-            for component in url.pathComponents where component != "/" {
-                let next = component.withCString {
-                    openat(
-                        descriptor,
-                        $0,
-                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-                    )
-                }
-                guard next >= 0 else { throw currentPOSIXError() }
-                Darwin.close(descriptor)
-                descriptor = next
-            }
-            return descriptor
-        } catch {
-            Darwin.close(descriptor)
-            throw error
-        }
+        return descriptor
     }
 
     private static func createStagingRoot(in container: URL) throws -> URL {

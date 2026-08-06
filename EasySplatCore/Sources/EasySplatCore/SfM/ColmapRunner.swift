@@ -74,62 +74,92 @@ private final class StableColmapDirectoryBinding {
 
         var opened: [Component] = []
         do {
-            let rootDescriptor = Darwin.open(
-                "/",
-                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            // Bind the deepest directory first and climb from there.
+            //
+            // This used to start at the root and open one component at a time.
+            // Inside the App Sandbox the app may not open /Users, so that walk
+            // bound nothing at all and reconstruction could not start. Opening
+            // the whole path in one call with O_NOFOLLOW_ANY refuses a symbolic
+            // link anywhere along it — the property the walk was there for —
+            // without reading a single parent directory.
+            let leafDescriptor = Darwin.open(
+                canonicalPath,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC
             )
-            guard rootDescriptor >= 0 else {
+            guard leafDescriptor >= 0 else {
                 throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
             }
-            var rootStatus = stat()
-            guard fstat(rootDescriptor, &rootStatus) == 0,
-                  (rootStatus.st_mode & S_IFMT) == S_IFDIR else {
-                Darwin.close(rootDescriptor)
+            var leafStatus = stat()
+            guard fstat(leafDescriptor, &leafStatus) == 0,
+                  (leafStatus.st_mode & S_IFMT) == S_IFDIR else {
+                Darwin.close(leafDescriptor)
                 throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
             }
+            var boundIndex = pathComponents.count - 1
             opened.append(Component(
-                name: "/",
-                descriptor: rootDescriptor,
-                initialStatus: rootStatus
+                name: pathComponents[boundIndex],
+                descriptor: leafDescriptor,
+                initialStatus: leafStatus
             ))
 
-            for name in pathComponents.dropFirst() {
-                let parentDescriptor = opened[opened.count - 1].descriptor
-                let childDescriptor = name.withCString {
-                    Darwin.openat(
-                        parentDescriptor,
-                        $0,
-                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            // Climbing stops where the process stops being allowed to look, so
+            // every directory the app can observe stays under watch and the ones
+            // it cannot reach are the sandbox's business rather than ours.
+            while boundIndex > 0 {
+                let childDescriptor = opened[opened.count - 1].descriptor
+                var parentDescriptor = Darwin.openat(
+                    childDescriptor,
+                    "..",
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC
+                )
+                while parentDescriptor < 0, errno == EINTR {
+                    parentDescriptor = Darwin.openat(
+                        childDescriptor,
+                        "..",
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC
                     )
                 }
-                guard childDescriptor >= 0 else {
+                if parentDescriptor < 0 {
+                    // The sandbox refuses with EPERM, and that is the one refusal
+                    // worth continuing past — the directories above the container
+                    // are the system's to police. Anything else, an execute-only
+                    // parent above all, means this process could watch the
+                    // directory and did not, so stop rather than bind less than
+                    // the path deserves.
+                    guard errno == EPERM else {
+                        throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
+                    }
+                    break
+                }
+                var parentStatus = stat()
+                guard fstat(parentDescriptor, &parentStatus) == 0,
+                      (parentStatus.st_mode & S_IFMT) == S_IFDIR else {
+                    Darwin.close(parentDescriptor)
                     throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
                 }
-                var childStatus = stat()
                 var pathStatus = stat()
-                let pathResult = name.withCString {
-                    Darwin.fstatat(
-                        parentDescriptor,
-                        $0,
-                        &pathStatus,
-                        AT_SYMLINK_NOFOLLOW
-                    )
+                let pathResult = pathComponents[boundIndex].withCString {
+                    Darwin.fstatat(parentDescriptor, $0, &pathStatus, AT_SYMLINK_NOFOLLOW)
                 }
-                guard fstat(childDescriptor, &childStatus) == 0,
-                      pathResult == 0,
-                      sameStableColmapIdentity(childStatus, pathStatus),
-                      (childStatus.st_mode & S_IFMT) == S_IFDIR else {
-                    Darwin.close(childDescriptor)
+                guard pathResult == 0,
+                      sameStableColmapIdentity(
+                          opened[opened.count - 1].initialStatus,
+                          pathStatus
+                      ) else {
+                    Darwin.close(parentDescriptor)
                     throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
                 }
+                boundIndex -= 1
                 opened.append(Component(
-                    name: name,
-                    descriptor: childDescriptor,
-                    initialStatus: childStatus
+                    name: pathComponents[boundIndex],
+                    descriptor: parentDescriptor,
+                    initialStatus: parentStatus
                 ))
             }
+            opened.reverse()
             try Self.validate(
                 components: opened,
+                canonicalPath: canonicalPath,
                 allowsLeafContentChanges: allowsLeafContentChanges
             )
         } catch {
@@ -155,6 +185,7 @@ private final class StableColmapDirectoryBinding {
         do {
             try Self.validate(
                 components: components,
+                canonicalPath: canonicalPath,
                 allowsLeafContentChanges: allowsLeafContentChanges
             )
         } catch {
@@ -164,8 +195,28 @@ private final class StableColmapDirectoryBinding {
 
     private static func validate(
         components: [Component],
+        canonicalPath: String,
         allowsLeafContentChanges: Bool
     ) throws {
+        // The bound descriptors follow the directories wherever they go, so on
+        // their own they cannot tell that the path now leads somewhere else.
+        // COLMAP is handed the path as a string, so resolve it again and require
+        // it to still arrive at the directory that was bound. This holds however
+        // far the upward walk was allowed to reach.
+        guard let leaf = components.last else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        let resolved = Darwin.open(
+            canonicalPath,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC
+        )
+        guard resolved >= 0 else { throw CocoaError(.fileReadUnknown) }
+        defer { Darwin.close(resolved) }
+        var resolvedStatus = stat()
+        guard fstat(resolved, &resolvedStatus) == 0,
+              sameStableColmapIdentity(leaf.initialStatus, resolvedStatus) else {
+            throw CocoaError(.fileReadUnknown)
+        }
         for index in components.indices {
             let component = components[index]
             var descriptorStatus = stat()

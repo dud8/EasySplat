@@ -2323,6 +2323,54 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
+    /// The binding watches every directory on the way to the model for being
+    /// swapped mid-run. Inside the App Sandbox it cannot climb past the
+    /// container, and that refusal is the system's own, so the walk stops there.
+    /// A directory this process could have watched and was merely not allowed to
+    /// read is a different matter: giving up there would leave the path
+    /// unwatched while COLMAP is still handed it as a string.
+    func testModelConverterRefusesAnAncestorItCannotWatch() throws {
+        let enclosure = try TestFileBuilder.makeTempDir()
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o700)],
+                ofItemAtPath: enclosure.path
+            )
+            try? FileManager.default.removeItem(at: enclosure)
+        }
+        let fixture = try makeModelConversionFixture(enclosedIn: enclosure)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: fixture.executable.path,
+                argsPrefix: ["model_converter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in try self.writeConvertedModel(at: fixture.output) }
+            )
+        ])
+        // Crossable but not readable: the model still resolves, and the walk
+        // upward from it does not.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o111)],
+            ofItemAtPath: enclosure.path
+        )
+
+        XCTAssertThrowsError(
+            try ColmapRunner(runner: runner).runModelConverter(
+                colmapPath: fixture.executable,
+                inputPath: fixture.input,
+                outputPath: fixture.output,
+                environment: [:],
+                recordGeometryWorkerExecution: true,
+                modelConversionContext: fixture.context,
+                onLog: { _, _ in }
+            )
+        ) { error in
+            guard case ColmapRunnerError.executionEvidenceUnavailable = error else {
+                return XCTFail("Expected missing execution evidence, got \(error).")
+            }
+        }
+    }
+
     private typealias ModelConversionFixture = (
         root: URL,
         executable: URL,
@@ -2331,8 +2379,22 @@ final class ColmapRunnerTests: XCTestCase {
         context: ColmapModelConversionWorkerInvocationContext
     )
 
-    private func makeModelConversionFixture() throws -> ModelConversionFixture {
-        let temporaryRoot = try TestFileBuilder.makeTempDir()
+    /// `enclosedIn` nests the fixture so a test can change the permissions of the
+    /// directory holding it, which the shared temporary directory would never
+    /// allow.
+    private func makeModelConversionFixture(
+        enclosedIn enclosure: URL? = nil
+    ) throws -> ModelConversionFixture {
+        let temporaryRoot: URL
+        if let enclosure {
+            temporaryRoot = enclosure.appendingPathComponent("toolchain", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: temporaryRoot,
+                withIntermediateDirectories: true
+            )
+        } else {
+            temporaryRoot = try TestFileBuilder.makeTempDir()
+        }
         let rootPath = try temporaryRoot.path.withCString { path in
             guard let resolved = Darwin.realpath(path, nil) else {
                 throw CocoaError(.fileReadNoSuchFile)
