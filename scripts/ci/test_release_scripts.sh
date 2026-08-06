@@ -1769,7 +1769,10 @@ fi
 import sys
 
 elapsed = (int(sys.argv[2]) - int(sys.argv[1])) / 1_000_000_000
-if not 4 < elapsed < 8:
+# The wait is bounded at 3.5 seconds in monotonic time. The window proves both
+# halves of that: it really waited, and it gave up well before the 12 seconds
+# the supervised process would have taken on its own.
+if not 3.4 < elapsed < 8:
     raise SystemExit(f"Stopped process-supervisor cleanup was not bounded: {elapsed:.3f}s")
 PY
   if [ ! -f "$stopped_supervisor_group.request" ]; then
@@ -1784,6 +1787,48 @@ PY
   easysplat_cleanup_supervised_process_group "" "$stopped_supervisor_group"
   test ! -e "$stopped_supervisor_group"
   test ! -e "$stopped_supervisor_group.request"
+  trap - EXIT
+)
+
+(
+  # O_NOFOLLOW turns away a symbolic link but admits a named pipe, and a
+  # read-only open of one blocks until somebody writes. A state path swapped for
+  # a pipe must be refused, not waited on: without O_NONBLOCK the bounded wait
+  # never returns at all.
+  swapped_supervisor_group="$TMP_DIR/swapped-supervisor.group"
+  easysplat_supervise_process_group \
+    "$swapped_supervisor_group" /bin/sleep 12 2>/dev/null &
+  swapped_supervisor_pid=$!
+  swapped_supervisor_is_stopped=0
+  trap '[ "$swapped_supervisor_is_stopped" -eq 0 ] || kill -CONT "$swapped_supervisor_pid" 2>/dev/null || true; \
+    kill -TERM "$swapped_supervisor_pid" 2>/dev/null || true; \
+    wait "$swapped_supervisor_pid" 2>/dev/null || true' EXIT
+  easysplat_wait_for_supervised_process_group \
+    "$swapped_supervisor_pid" "$swapped_supervisor_group"
+  kill -STOP "$swapped_supervisor_pid"
+  swapped_supervisor_is_stopped=1
+  rm -f "$swapped_supervisor_group"
+  mkfifo -m 0600 "$swapped_supervisor_group"
+  swapped_cleanup_started="$(/usr/bin/python3 -c 'import time; print(time.time_ns())')"
+  if easysplat_cleanup_supervised_process_group \
+      "$swapped_supervisor_pid" "$swapped_supervisor_group" \
+      >/dev/null 2>&1; then
+    echo "Cleanup accepted a process-group state path swapped for a pipe." >&2
+    exit 1
+  fi
+  swapped_cleanup_finished="$(/usr/bin/python3 -c 'import time; print(time.time_ns())')"
+  /usr/bin/python3 - "$swapped_cleanup_started" "$swapped_cleanup_finished" <<'PY'
+import sys
+
+elapsed = (int(sys.argv[2]) - int(sys.argv[1])) / 1_000_000_000
+if elapsed >= 8:
+    raise SystemExit(f"A swapped state path blocked cleanup: {elapsed:.3f}s")
+PY
+  rm -f "$swapped_supervisor_group"
+  kill -CONT "$swapped_supervisor_pid"
+  swapped_supervisor_is_stopped=0
+  kill -TERM "$swapped_supervisor_pid" 2>/dev/null || true
+  wait "$swapped_supervisor_pid" 2>/dev/null || true
   trap - EXIT
 )
 
