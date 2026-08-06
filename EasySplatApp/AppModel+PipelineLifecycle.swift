@@ -638,6 +638,17 @@ extension AppModel {
                 viewState = .processing
                 return nil
             }
+            if case .accessDenied(let relativePath) = failure.issue {
+                let presentation = Self.accessDeniedPresentation(name: relativePath)
+                lastError = presentation.title
+                statusTitle = presentation.title
+                statusDetail = nil
+                errorDetails = presentation.details
+                progress = nil
+                failureRetryAllowed = false
+                viewState = .processing
+                return nil
+            }
             let validationError: RunPlanResolver.ValidationError?
             switch failure.issue {
             case .noValidPhotos:
@@ -738,6 +749,9 @@ extension AppModel {
         }).first {
             return unsupportedSphericalMediaPresentation(issue)
         }
+        if let denied = failure.rejectedVideos.first(where: { $0.issue == .accessDenied }) {
+            return accessDeniedPresentation(name: denied.safeDisplayName)
+        }
         let count = failure.rejectedVideos.count
         let issues = failure.rejectedVideos.map(\.issue)
         let title: String
@@ -763,9 +777,9 @@ extension AppModel {
 
     private static func isVideoSelectionIssue(_ issue: VideoInputPreflightIssue) -> Bool {
         switch issue {
-        case .noVideosSelected, .sourceUnavailable, .symbolicLink, .notRegularFile,
-             .emptyFile, .duplicateSource, .sourceChanged, .tooManyVideos,
-             .totalBytesExceeded, .invalidLimits:
+        case .noVideosSelected, .sourceUnavailable, .accessDenied, .symbolicLink,
+             .notRegularFile, .emptyFile, .duplicateSource, .sourceChanged,
+             .tooManyVideos, .totalBytesExceeded, .invalidLimits:
             return true
         case .unreadableMedia, .noUsableVideoTrack, .decodeFailed,
              .insufficientSpace, .stagingUnavailable, .capacityUnavailable,
@@ -791,6 +805,8 @@ extension AppModel {
             return "no videos were selected"
         case .sourceUnavailable:
             return "the selected file is no longer available"
+        case .accessDenied:
+            return "macOS did not let EasySplat read the file — choose it again"
         case .symbolicLink:
             return "choose the original file instead of an alias"
         case .notRegularFile:
@@ -824,6 +840,18 @@ extension AppModel {
         case .unsupportedSpherical(let issue):
             return "unsupported standardized projection tag \(issue.tag.rawValue)"
         }
+    }
+
+    /// macOS refused the read. The file is where the user left it, so the answer
+    /// is to grant access again rather than to look for a damaged photo.
+    static func accessDeniedPresentation(name: String) -> (title: String, details: String) {
+        (
+            title: "EasySplat can’t read your files",
+            details: """
+            macOS did not let EasySplat read “\(name)”.
+            Choose your photos or video again, then start the splat.
+            """
+        )
     }
 
     static func unsupportedSphericalMediaPresentation(

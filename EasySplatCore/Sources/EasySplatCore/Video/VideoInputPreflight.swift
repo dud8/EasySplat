@@ -34,6 +34,7 @@ public struct VideoInputPreflightLimits: Equatable, Sendable {
 public enum VideoInputPreflightIssue: Equatable, Sendable {
     case noVideosSelected
     case sourceUnavailable
+    case accessDenied
     case symbolicLink
     case notRegularFile
     case emptyFile
@@ -1417,11 +1418,31 @@ public struct VideoInputPreflight: Sendable {
         return sources
     }
 
+    /// Separates a refused read from a file that is gone. `errno` is the only
+    /// evidence that tells them apart, so read it before any other system call.
+    /// The sandbox refuses a source once the grant that came with the user's
+    /// selection lapses, and "the file is no longer available" sends the user
+    /// looking for a missing file that is still where they left it.
+    private static func issueForFailedCall(
+        otherwise fallback: @autoclosure () -> VideoInputPreflightIssue
+    ) -> VideoInputPreflightIssue {
+        let code = errno
+        guard code == EACCES || code == EPERM else { return fallback() }
+        return .accessDenied
+    }
+
     private func inspectSource(_ url: URL, index: Int) throws -> Source {
         let name = Self.safeDisplayName(for: url, fallbackIndex: index)
         var pathStatus = stat()
-        guard url.isFileURL, lstat(url.path, &pathStatus) == 0 else {
+        guard url.isFileURL else {
             throw failure(index: index, name: name, issue: .sourceUnavailable)
+        }
+        guard lstat(url.path, &pathStatus) == 0 else {
+            throw failure(
+                index: index,
+                name: name,
+                issue: Self.issueForFailedCall(otherwise: .sourceUnavailable)
+            )
         }
         if (pathStatus.st_mode & S_IFMT) == S_IFLNK {
             throw failure(index: index, name: name, issue: .symbolicLink)
@@ -1434,7 +1455,11 @@ public struct VideoInputPreflight: Sendable {
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
         guard descriptor >= 0 else {
-            throw failure(index: index, name: name, issue: .sourceUnavailable)
+            throw failure(
+                index: index,
+                name: name,
+                issue: Self.issueForFailedCall(otherwise: .sourceUnavailable)
+            )
         }
         defer { Darwin.close(descriptor) }
         var status = stat()
@@ -1483,7 +1508,11 @@ public struct VideoInputPreflight: Sendable {
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
         guard input >= 0 else {
-            throw failure(index: source.index, name: source.safeDisplayName, issue: .sourceUnavailable)
+            throw failure(
+                index: source.index,
+                name: source.safeDisplayName,
+                issue: Self.issueForFailedCall(otherwise: .sourceUnavailable)
+            )
         }
         defer { Darwin.close(input) }
         var initial = stat()

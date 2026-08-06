@@ -1276,6 +1276,68 @@ final class PhotoInputAdmissionTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
     }
 
+    /// A refused read is what the App Sandbox does when the grant that came with
+    /// the user's selection has lapsed. Calling that "the source changed" sends
+    /// the user hunting for a damaged photo that is fine.
+    func testRefusedPhotoReadReportsAccessDenied() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let photo = source.appendingPathComponent("locked.jpg")
+        try writeRGBJPEG(at: photo, properties: [:])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0],
+            ofItemAtPath: photo.path
+        )
+
+        do {
+            _ = try await PhotoInputPreflight.prepare(
+                photos: [photo],
+                stagingParent: library,
+                photoSelection: .automatic,
+                inputOrdering: .automatic,
+                keyframeBudget: 10,
+                requiredAtomicWorkspaceReserveBytes: 0,
+                limits: .init(minimumFreeSpaceReserveBytes: 0),
+                availableCapacity: { _ in 1_024 * 1_024 },
+                progress: { _, _ in }
+            )
+            XCTFail("A photo the system refuses to read must be rejected.")
+        } catch let failure as PhotoInputPreflightFailure {
+            XCTAssertEqual(failure.issue, .accessDenied(relativePath: "locked.jpg"))
+        }
+    }
+
+    func testRefusedFolderReadReportsAccessDenied() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeRGBJPEG(at: source.appendingPathComponent("capture.jpg"), properties: [:])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0],
+            ofItemAtPath: source.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: source.path
+            )
+        }
+
+        do {
+            _ = try await prepareOnePhoto(source: source, library: library)
+            XCTFail("A folder the system refuses to open must be rejected.")
+        } catch let failure as PhotoInputPreflightFailure {
+            XCTAssertEqual(failure.issue, .accessDenied(relativePath: "Photos"))
+        }
+    }
+
     private func prepareOnePhoto(source: URL, library: URL) async throws -> PreparedPhotoInput {
         try await PhotoInputPreflight.prepare(
             folder: source,

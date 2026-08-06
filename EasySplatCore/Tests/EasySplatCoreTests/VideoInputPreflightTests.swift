@@ -1504,6 +1504,34 @@ final class VideoInputPreflightTests: XCTestCase {
         )
     }
 
+    /// The sandbox refuses the read once the grant that came with the user's
+    /// selection lapses. "No longer available" points at a missing file, which
+    /// is the wrong thing to go looking for.
+    func testRefusedVideoReadReportsAccessDenied() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        let source = root.appendingPathComponent("capture.mov")
+        try Data("synthetic-video-payload".utf8).write(to: source)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0],
+            ofItemAtPath: source.path
+        )
+
+        do {
+            _ = try await makePreflight(capacity: { 1_000_000 }).prepare(
+                videoURLs: [source],
+                stagingParent: library,
+                requiredAtomicWorkspaceReserveBytes: 0,
+                progress: { _, _ in }
+            )
+            XCTFail("A video the system refuses to read must be rejected.")
+        } catch let failure as VideoInputPreflightFailure {
+            XCTAssertEqual(failure.rejectedVideos.first?.issue, .accessDenied)
+        }
+    }
+
     private func makePreflight(
         capacity: @escaping @Sendable () throws -> Int64,
         analyze: @escaping VideoInputPreflight.Analyze = { _, _ in .fixture },

@@ -52,6 +52,7 @@ public struct PhotoInputPreflightLimits: Equatable, Sendable {
 
 public enum PhotoInputPreflightIssue: Equatable, Sendable {
     case folderUnavailable
+    case accessDenied(relativePath: String)
     case symbolicLink(relativePath: String)
     case unreadableEntry(relativePath: String)
     case sourceChanged(relativePath: String)
@@ -74,6 +75,20 @@ public struct PhotoInputPreflightFailure: Error, Equatable, Sendable {
     public init(issue: PhotoInputPreflightIssue) {
         self.issue = issue
     }
+}
+
+/// Classifies the file-system call that just failed. `errno` is the only thing
+/// that separates a refused read from a file that moved or changed underneath
+/// us, and the two need opposite answers: one is fixed by picking the photos
+/// again, the other by leaving them alone. Call this before any other system
+/// call, which would overwrite `errno`.
+private func photoIssueForFailedCall(
+    relativePath: String,
+    otherwise fallback: @autoclosure () -> PhotoInputPreflightIssue
+) -> PhotoInputPreflightIssue {
+    let code = errno
+    guard code == EACCES || code == EPERM else { return fallback() }
+    return .accessDenied(relativePath: relativePath)
 }
 
 private struct PhotoFileEvidence: Equatable, Sendable {
@@ -916,13 +931,24 @@ extension PhotoInputPreflight {
         contentTypeResolver: PhotoContentTypeResolver
     ) throws -> [Source] {
         guard folder.isFileURL else { throw PhotoInputPreflightFailure(issue: .folderUnavailable) }
+        let folderName = folder.lastPathComponent
         var rootStatus = stat()
-        guard lstat(folder.path, &rootStatus) == 0,
-              (rootStatus.st_mode & S_IFMT) == S_IFDIR else {
+        guard lstat(folder.path, &rootStatus) == 0 else {
+            throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                relativePath: folderName,
+                otherwise: .folderUnavailable
+            ))
+        }
+        guard (rootStatus.st_mode & S_IFMT) == S_IFDIR else {
             throw PhotoInputPreflightFailure(issue: .folderUnavailable)
         }
         let rootDescriptor = Darwin.open(folder.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard rootDescriptor >= 0 else { throw PhotoInputPreflightFailure(issue: .folderUnavailable) }
+        guard rootDescriptor >= 0 else {
+            throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                relativePath: folderName,
+                otherwise: .folderUnavailable
+            ))
+        }
         defer { Darwin.close(rootDescriptor) }
         var descriptorStatus = stat()
         guard fstat(rootDescriptor, &descriptorStatus) == 0,
@@ -1004,7 +1030,10 @@ extension PhotoInputPreflight {
             let relativePath = url.lastPathComponent
             var status = stat()
             guard lstat(url.path, &status) == 0 else {
-                throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relativePath))
+                throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                    relativePath: relativePath,
+                    otherwise: .unreadableEntry(relativePath: relativePath)
+                ))
             }
             let kind = status.st_mode & S_IFMT
             if kind == S_IFLNK {
@@ -1110,7 +1139,10 @@ extension PhotoInputPreflight {
             let relative = prefix.isEmpty ? name : "\(prefix)/\(name)"
             var status = stat()
             guard name.withCString({ fstatat(descriptor, $0, &status, AT_SYMLINK_NOFOLLOW) }) == 0 else {
-                throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relative))
+                throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                    relativePath: relative,
+                    otherwise: .unreadableEntry(relativePath: relative)
+                ))
             }
             let kind = status.st_mode & S_IFMT
             if kind == S_IFLNK {
@@ -1121,7 +1153,10 @@ extension PhotoInputPreflight {
                     openat(descriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 }
                 guard child >= 0 else {
-                    throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relative))
+                    throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                        relativePath: relative,
+                        otherwise: .unreadableEntry(relativePath: relative)
+                    ))
                 }
                 var opened = stat()
                 guard fstat(child, &opened) == 0,
@@ -1164,7 +1199,10 @@ extension PhotoInputPreflight {
     ) throws -> String? {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else {
-            throw PhotoInputPreflightFailure(issue: .sourceChanged(relativePath: relativePath))
+            throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                relativePath: relativePath,
+                otherwise: .sourceChanged(relativePath: relativePath)
+            ))
         }
         defer { Darwin.close(descriptor) }
         var opened = stat()
@@ -1206,7 +1244,10 @@ extension PhotoInputPreflight {
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
         guard descriptor >= 0 else {
-            throw PhotoInputPreflightFailure(issue: .sourceChanged(relativePath: source.safeDisplayName))
+            throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                relativePath: source.safeDisplayName,
+                otherwise: .sourceChanged(relativePath: source.safeDisplayName)
+            ))
         }
         defer { Darwin.close(descriptor) }
         guard source.evidence.size > 0 else { return nil }
