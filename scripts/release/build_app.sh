@@ -570,6 +570,18 @@ rm -rf "$EXPORTED_DSYM_PATH"
 cp -R "$BUILT_DSYM_PATH" "$EXPORTED_DSYM_PATH"
 
 plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
+# Nothing in a shipped app may carry quarantine. Finding it after upload costs a
+# round trip through App Store Connect, so the build refuses it here.
+quarantined="$(
+  /usr/bin/find "$APP_BUNDLE" -type f \
+    -exec /usr/bin/xattr -p com.apple.quarantine {} \; -print 2>/dev/null \
+    | /usr/bin/grep "^$APP_BUNDLE" || true
+)"
+if [ -n "$quarantined" ]; then
+  echo "Quarantined files cannot ship; the store rejects the package:" >&2
+  printf '%s\n' "$quarantined" >&2
+  exit 1
+fi
 if [ "$RELEASE_MODE" = app-store ]; then
   # The store validates the app against the profile sealed beside it, so the
   # profile has to be staged before the signature covers the bundle.
@@ -592,8 +604,14 @@ if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
 if not 0 < metadata.st_size <= 1024 * 1024:
     raise SystemExit("Provisioning profile has an implausible size.")
 PY
-  install -m 0644 "$PROVISIONING_PROFILE" \
+  # A profile downloaded through a browser carries com.apple.quarantine, and
+  # the store rejects a package containing any quarantined file (ITMS-91109).
+  # install(1) preserves the attribute; ditto --noqtn does not, and clearing
+  # the rest keeps provenance and where-from metadata out of the bundle too.
+  /usr/bin/ditto --noqtn "$PROVISIONING_PROFILE" \
     "$APP_BUNDLE/Contents/embedded.provisionprofile"
+  /usr/bin/xattr -c "$APP_BUNDLE/Contents/embedded.provisionprofile"
+  chmod 0644 "$APP_BUNDLE/Contents/embedded.provisionprofile"
   ENTITLEMENTS_DIR="$ROOT/scripts/release/entitlements"
   store_signing_args=(
     --root "$APP_BUNDLE"

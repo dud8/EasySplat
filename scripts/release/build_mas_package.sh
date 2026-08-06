@@ -169,6 +169,19 @@ if [ -n "$(sealed_entitlements "$APP/Contents/Helpers/lib/libomp.dylib")" ]; the
 fi
 "$CODESIGN" --verify --deep --strict "$APP"
 
+# The store rejects a package containing any quarantined file (ITMS-91109), and
+# it does so after the upload, so the refusal belongs here.
+quarantined="$(
+  /usr/bin/find "$APP" -type f \
+    -exec /usr/bin/xattr -p com.apple.quarantine {} \; -print 2>/dev/null \
+    | /usr/bin/grep "^$APP" || true
+)"
+if [ -n "$quarantined" ]; then
+  echo "App carries quarantined files, which the store refuses:" >&2
+  printf '%s\n' "$quarantined" >&2
+  exit 1
+fi
+
 mkdir -p "$OUT_DIR"
 PACKAGE="$OUT_DIR/EasySplat-$APP_VERSION.pkg"
 if [ -e "$PACKAGE" ]; then

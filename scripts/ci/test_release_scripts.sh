@@ -2971,6 +2971,28 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :NSPrincipalClass' "$info_plist")" = "
 # The app hashes and verifies signatures and opens no connection, so it declares
 # exempt encryption once rather than answering the store for every build.
 test "$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$info_plist")" = "false"
+# A quarantined file reaches App Store Connect and is rejected there
+# (ITMS-91109), so both the build and the packaging step refuse one first.
+grep -Fq 'com.apple.quarantine' "$ROOT/scripts/release/build_app.sh"
+grep -Fq 'com.apple.quarantine' "$ROOT/scripts/release/build_mas_package.sh"
+# install(1) preserves the attribute a browser download leaves behind.
+grep -Fq '/usr/bin/ditto --noqtn "$PROVISIONING_PROFILE"' \
+  "$ROOT/scripts/release/build_app.sh"
+if grep -Fq 'install -m 0644 "$PROVISIONING_PROFILE"' \
+    "$ROOT/scripts/release/build_app.sh"; then
+  echo "The provisioning profile is staged with a command that keeps quarantine." >&2
+  exit 1
+fi
+built_app_quarantine="$(
+  /usr/bin/find "$app_bundle" -type f \
+    -exec /usr/bin/xattr -p com.apple.quarantine {} \; -print 2>/dev/null \
+    | /usr/bin/grep "^$app_bundle" || true
+)"
+if [ -n "$built_app_quarantine" ]; then
+  echo "The built app carries quarantined files the store would reject." >&2
+  printf '%s\n' "$built_app_quarantine" >&2
+  exit 1
+fi
 if rg -n --glob '!Tools/**' --glob '!*Tests*' \
     'ChaChaPoly|AES\.GCM|SealedBox|SymmetricKey|Curve25519|sharedSecretFromKeyAgreement' \
     "$ROOT/EasySplatApp" "$ROOT/EasySplatCore/Sources" >/dev/null; then
