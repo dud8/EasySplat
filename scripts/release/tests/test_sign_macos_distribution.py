@@ -264,6 +264,9 @@ class FakeCommandRunner:
             "--entitlements",
             "-",
         ]:
+            # Without --xml codesign returns the raw blob, in which the readers
+            # would find no entitlements at all.
+            assert "--xml" in command, "entitlement display must request XML"
             payload = self.signed_entitlements.get(command[-1])
             if payload is None:
                 return subprocess.CompletedProcess(
@@ -2183,7 +2186,11 @@ class StoreChannelTests(unittest.TestCase):
         main = macos / "EasySplatApp"
         helper = helpers / "colmap"
         for path in (main, helper):
-            path.write_bytes(b"\xcf\xfa\xed\xfe" + b"payload")
+            path.write_bytes(
+                b"\xcf\xfa\xed\xfe" + (0x0100000C).to_bytes(4, "little")
+                + (0).to_bytes(4, "little") + (0x2).to_bytes(4, "little")
+                + b"payload"
+            )
             path.chmod(0o755)
         (app / "Contents/Info.plist").write_bytes(
             plistlib.dumps({"CFBundleExecutable": "EasySplatApp"})
@@ -2203,8 +2210,14 @@ class StoreChannelTests(unittest.TestCase):
             app, machos, main = self.make_store_app(root)
             library = app / "Contents/Helpers/lib/libomp.dylib"
             library.parent.mkdir(parents=True)
-            library.write_bytes(b"\xcf\xfa\xed\xfe" + b"library")
-            library.chmod(0o644)
+            # MH_DYLIB, and mode 0755 like packaging installs it: only the
+            # Mach-O file type separates a library from a program.
+            library.write_bytes(
+                b"\xcf\xfa\xed\xfe" + (0x0100000C).to_bytes(4, "little")
+                + (0).to_bytes(4, "little") + (0x6).to_bytes(4, "little")
+                + b"library"
+            )
+            library.chmod(0o755)
             machos = machos + [library]
             app_plist = self.entitlement_file(
                 root, "app.plist", {"com.apple.security.app-sandbox": True}

@@ -74,9 +74,12 @@ CHANNELS: dict[str, dict[str, str]] = {
     },
 }
 DEFAULT_CHANNEL = "developer-id"
-# The store sandboxes the app and its helpers inherit that sandbox, so a store
-# build is the one case where entitlements are required rather than forbidden.
-MAS_HELPER_PREFIX = "Contents/Helpers/"
+# Mach-O file types: a program, versus a library that never becomes a process.
+MH_EXECUTE = 0x2
+# Where the app keeps the executables it spawns. Both channels care: they are
+# run-path roots in either, and in the store channel they are also the
+# executables that must inherit the sandbox.
+BUNDLED_HELPER_PREFIX = "Contents/Helpers/"
 APP_BINARY_POLICY = {
     "architectures": ["arm64"],
     "minimumOS": "15.0",
@@ -1005,6 +1008,31 @@ def _validate_app_main_executable(
     return main
 
 
+def _is_macho_executable(path: Path) -> bool:
+    """True for a program, false for a library.
+
+    The executable bit does not separate them -- packaging installs the bundled
+    library 0755 like everything else beside it -- so this reads the file type
+    out of the Mach-O header, which is the only place the distinction is real.
+    """
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(16)
+    except OSError:
+        return False
+    if len(header) < 16 or header[:4] not in MACHO_MAGICS:
+        return False
+    little_endian = header[:4] in {b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"}
+    if header[:4] in {b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+                      b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}:
+        # A universal binary is rejected elsewhere; nothing here can read it.
+        return False
+    file_type = int.from_bytes(
+        header[12:16], "little" if little_endian else "big"
+    )
+    return file_type == MH_EXECUTE
+
+
 def validate_entitlements(
     root: Path,
     kind: str,
@@ -1032,8 +1060,8 @@ def validate_entitlements(
             # to inherit it, so every bundled executable is a legitimate target.
             or (
                 store_app
-                and relative.startswith(MAS_HELPER_PREFIX)
-                and ((root / relative).lstat().st_mode & stat.S_IXUSR)
+                and relative.startswith(BUNDLED_HELPER_PREFIX)
+                and _is_macho_executable(root / relative)
             )
         )
         if not is_top_level:
@@ -1046,8 +1074,8 @@ def validate_entitlements(
         expected = {app_main or ""} | {
             _relative_path(path, root)
             for path in macho_paths
-            if _relative_path(path, root).startswith(MAS_HELPER_PREFIX)
-            and (path.lstat().st_mode & stat.S_IXUSR)
+            if _relative_path(path, root).startswith(BUNDLED_HELPER_PREFIX)
+            and _is_macho_executable(path)
         }
         if set(validated) != expected:
             missing = sorted(expected - set(validated))
@@ -1106,7 +1134,10 @@ def _extract_embedded_entitlements(
     command_runner: CommandRunner,
 ) -> str:
     result = command_runner(
-        [CODESIGN, "--display", "--entitlements", "-", str(target)]
+        # Without --xml codesign writes the raw entitlement blob, which no
+        # plist reader accepts and in which no XML marker appears -- so an app
+        # that carries entitlements would read as one that carries none.
+        [CODESIGN, "--display", "--entitlements", "-", "--xml", str(target)]
     )
     require_command_success(result, "embedded entitlements inspection")
     output = f"{result.stdout}\n{result.stderr}"
@@ -1128,12 +1159,38 @@ def _extract_embedded_entitlements(
     return digest
 
 
+def _embedded_entitlements_digest(
+    target: Path,
+    command_runner: CommandRunner,
+) -> str | None:
+    """The canonical digest of whatever entitlements are sealed, or None."""
+    result = command_runner(
+        [CODESIGN, "--display", "--entitlements", "-", "--xml", str(target)]
+    )
+    require_command_success(result, "embedded entitlements inspection")
+    output = f"{result.stdout}\n{result.stderr}"
+    start = output.find("<?xml")
+    end = output.find("</plist>", start)
+    if start < 0 or end < 0:
+        return None
+    xml = output[start : end + len("</plist>")].encode("utf-8")
+    try:
+        payload = plistlib.loads(xml)
+    except plistlib.InvalidFileException:
+        fail("codesign returned invalid embedded entitlements")
+    canonical = plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _require_empty_embedded_entitlements(
     target: Path,
     command_runner: CommandRunner,
 ) -> None:
     result = command_runner(
-        [CODESIGN, "--display", "--entitlements", "-", str(target)]
+        # Without --xml codesign writes the raw entitlement blob, which no
+        # plist reader accepts and in which no XML marker appears -- so an app
+        # that carries entitlements would read as one that carries none.
+        [CODESIGN, "--display", "--entitlements", "-", "--xml", str(target)]
     )
     require_command_success(result, "empty entitlement inspection")
     output = f"{result.stdout}\n{result.stderr}"
@@ -1323,7 +1380,20 @@ def validate_macho_dependency_closure(
         for relative, path in discovered.items()
     }
     if main_executable is not None:
-        executable_relatives = [main_executable]
+        # A bundled helper runs as its own process, so its @executable_path is
+        # its own directory rather than the app's. Resolving every image against
+        # the main executable alone would leave a helper's own run path
+        # unresolvable even though it is correct at runtime.
+        executable_relatives = [main_executable] + sorted(
+            (
+                relative
+                for relative, candidate in discovered.items()
+                if relative != main_executable
+                and relative.startswith(BUNDLED_HELPER_PREFIX)
+                and _is_macho_executable(candidate)
+            ),
+            key=os.fsencode,
+        )
     else:
         executable_relatives = sorted(
             (
@@ -1965,29 +2035,33 @@ def validate_signing_receipt(
         ):
             fail("app signing receipt has no shared post-sign artifact digest")
         store_app = payload.get("channel") == "mas"
+        entitled_entries = 0
         for entry in entries:
-            present = entry.get("embeddedEntitlementsPresent")
-            if present is not store_app:
-                fail("app signing receipt disagrees with its channel on entitlements")
-            if store_app:
-                # A store entry proves which entitlements were sealed; a
-                # Developer ID entry proves that none were.
-                if not all(
-                    isinstance(entry.get(field), str)
-                    and re.fullmatch(r"[0-9a-f]{64}", str(entry.get(field)))
-                    for field in (
-                        "embeddedEntitlementsSHA256",
-                        "entitlementsSHA256",
-                        "entitlementsSourceSHA256",
-                    )
-                ):
-                    fail("store signing receipt has no entitlement evidence")
-            elif (
-                entry.get("embeddedEntitlementsSHA256") is not None
-                or entry.get("entitlementsSHA256") is not None
-                or entry.get("entitlementsSourceSHA256") is not None
-            ):
+            digests = [
+                entry.get(field)
+                for field in (
+                    "embeddedEntitlementsSHA256",
+                    "entitlementsSHA256",
+                    "entitlementsSourceSHA256",
+                )
+            ]
+            sealed = [
+                value for value in digests
+                if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            ]
+            # An entry either proves what it sealed or proves it sealed nothing;
+            # a half-populated entry is evidence of neither.
+            if sealed and len(sealed) != len(digests):
+                fail("app signing receipt has partial entitlement evidence")
+            if entry.get("embeddedEntitlementsPresent") is not bool(sealed):
+                fail("app signing receipt disagrees with its own entitlement evidence")
+            if not store_app and sealed:
                 fail("app signing receipt contains forbidden entitlement evidence")
+            entitled_entries += 1 if sealed else 0
+        # A store app is sandboxed and its helpers inherit that sandbox, so the
+        # bundle and at least one executable must carry entitlements.
+        if store_app and entitled_entries < 2:
+            fail("store signing receipt has no entitlement evidence")
             if entry.get("kind") == "machO":
                 macho = entry.get("machO")
                 if (
@@ -2126,8 +2200,11 @@ def verify_distribution_tree(
             path, fingerprint, team_id, run_command, channel=channel
         )
         if kind == "app":
-            if not store_app:
+            if store_app:
+                sealed_digest = _embedded_entitlements_digest(path, run_command)
+            else:
                 _require_empty_embedded_entitlements(path, run_command)
+                sealed_digest = None
             macho_contract = _app_macho_build_contract(path, run_command)
         if _file_binding(path) != binding:
             fail(f"signed Mach-O changed during exact identity verification: {relative}")
@@ -2138,7 +2215,7 @@ def verify_distribution_tree(
                 "codesign": metadata,
             }
         if kind == "app":
-            entry["embeddedEntitlementsPresent"] = store_app
+            entry["embeddedEntitlementsPresent"] = sealed_digest is not None
             entry["machO"] = macho_contract
         entries.append(entry)
         _require_unchanged_root_ancestry(ancestry)
@@ -2147,14 +2224,19 @@ def verify_distribution_tree(
         app_metadata = _codesign_metadata(
             root, fingerprint, team_id, run_command, channel=channel
         )
-        if not store_app:
+        if store_app:
+            app_sealed_digest = _embedded_entitlements_digest(root, run_command)
+            if app_sealed_digest is None:
+                fail("store app bundle carries no sealed entitlements")
+        else:
             _require_empty_embedded_entitlements(root, run_command)
+            app_sealed_digest = None
         entries.append(
             {
                 "kind": "appBundle",
                 "relativePath": ".",
                 "sha256": before.manifest_sha256,
-                "embeddedEntitlementsPresent": store_app,
+                "embeddedEntitlementsPresent": app_sealed_digest is not None,
                 "mainExecutableRelativePath": app_main,
                 "codesign": app_metadata,
             }
@@ -2511,7 +2593,7 @@ def sign_distribution_tree(
                     "codesign": metadata,
                 }
             if kind == "app":
-                entry["embeddedEntitlementsPresent"] = store_app
+                entry["embeddedEntitlementsPresent"] = entitlement is not None
                 entry["machO"] = macho_contract
             entries.append(entry)
             _require_unchanged_root_ancestry(ancestry)
@@ -2542,7 +2624,7 @@ def sign_distribution_tree(
                         app_entitlement.source_sha256 if app_entitlement else None
                     ),
                     "embeddedEntitlementsSHA256": app_embedded_entitlement_digest,
-                    "embeddedEntitlementsPresent": store_app,
+                    "embeddedEntitlementsPresent": app_entitlement is not None,
                     "mainExecutableRelativePath": app_main,
                     "signedAt": "",
                     "codesign": app_metadata,
