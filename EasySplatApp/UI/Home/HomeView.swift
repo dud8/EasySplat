@@ -157,8 +157,7 @@ struct HomeView: View {
 
             if let dataset = model.pendingDataset {
                 inputRow(name: datasetRowName(dataset), systemImage: "cube.transparent") {
-                    model.pendingDataset = nil
-                    model.selectionWarning = nil
+                    model.removeDataset()
                 }
             } else {
                 if !model.pendingPhotoURLs.isEmpty {
@@ -170,7 +169,7 @@ struct HomeView: View {
 
                 ForEach(Array(model.pendingVideoURLs.enumerated()), id: \.element) { index, url in
                     inputRow(name: url.lastPathComponent, systemImage: "film") {
-                        model.pendingVideoURLs.remove(at: index)
+                        model.removeVideo(at: IndexSet(integer: index))
                     }
                 }
             }

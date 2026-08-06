@@ -110,6 +110,10 @@ final class StandaloneSplatWindowPresenter: NSObject, NSWindowDelegate {
     static let shared = StandaloneSplatWindowPresenter()
 
     private var windows: [URL: NSWindow] = [:]
+    /// One grant per open window. The reader loads and reloads the file for as
+    /// long as the window is up, so the sandbox scope the picked URL carries has
+    /// to stay open that whole time rather than only for this call.
+    private var access: [URL: SecurityScopedAccess] = [:]
 
     func present(_ url: URL) {
         let key = url.standardizedFileURL
@@ -118,6 +122,9 @@ final class StandaloneSplatWindowPresenter: NSObject, NSWindowDelegate {
             NSApp.activate()
             return
         }
+
+        let claim = SecurityScopedAccess()
+        claim.claim([url])
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 960, height: 640),
@@ -132,13 +139,18 @@ final class StandaloneSplatWindowPresenter: NSObject, NSWindowDelegate {
         window.center()
         window.delegate = self
         windows[key] = window
+        access[key] = claim
         window.makeKeyAndOrderFront(nil)
         NSApp.activate()
     }
 
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
+        let closed = windows.filter { $0.value === window }.map(\.key)
         windows = windows.filter { $0.value !== window }
+        for key in closed {
+            access.removeValue(forKey: key)?.releaseAll()
+        }
     }
 }
 

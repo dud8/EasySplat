@@ -44,6 +44,15 @@ extension AppModel {
     /// capture folder with both kinds of media brings all of it in. Photos and
     /// videos coming from different folders are merged into one selection.
     func addInputs(urls: [URL]) {
+        // Claim the sandbox grant before anything reads these paths. What arrives
+        // here is what the user picked, and everything downstream — folder
+        // expansion, dataset sniffing, preflight — works on paths derived from
+        // it, which carry no grant of their own. Selection then expands, filters,
+        // and sometimes evicts what it was handed, so what each claim is worth is
+        // only settled once this returns.
+        inputAccess.claim(urls)
+        defer { pruneInputAccess() }
+
         // A splat is a result rather than capture input, but dropping one here is a
         // reasonable thing to expect to work, so it opens in the viewer instead of
         // being refused. Anything else in the same drop still goes through selection.
@@ -402,6 +411,25 @@ extension AppModel {
 
     func removeVideo(at offsets: IndexSet) {
         pendingVideoURLs.remove(atOffsets: offsets)
+        pruneInputAccess()
+    }
+
+    func removeDataset() {
+        pendingDataset = nil
+        selectionWarning = nil
+        pruneInputAccess()
+    }
+
+    /// Gives up the sandbox grants that no longer back anything selected. A
+    /// grant covers what the user picked; removing the last photo, video, or
+    /// dataset that came from one leaves nothing for it to cover.
+    func pruneInputAccess() {
+        // A splat is on its way to the viewer, which takes a grant of its own
+        // when the window opens. Until the request is drained, this one is what
+        // keeps the file readable.
+        var selected = pendingPhotoURLs + pendingVideoURLs + splatOpenRequests
+        if let pendingDataset { selected.append(pendingDataset.sourceURL) }
+        inputAccess.releaseRootsNotCovering(selected)
     }
 
     func clearPendingInputs() {
@@ -409,11 +437,15 @@ extension AppModel {
         pendingPhotoURLs = []
         pendingDataset = nil
         selectionWarning = nil
+        // Nothing pending means nothing left to read from the user's own folders.
+        // A run reaches here only once its inputs are copied into the project.
+        inputAccess.releaseAll()
     }
 
     func removeAllPhotos() {
         pendingPhotoURLs = []
         selectionWarning = nil
+        pruneInputAccess()
     }
 
     func buildInputSpec() -> InputSpec? {

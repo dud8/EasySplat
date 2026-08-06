@@ -157,6 +157,12 @@ final class AppModel: ObservableObject {
     @Published var isShareReady: Bool = false
     @Published var isPreparingShare: Bool = false
 
+    /// The sandbox grant covering the pending selection. Selection expands a
+    /// picked folder into file paths immediately, but the pipeline opens those
+    /// files long after the picker closed, so the grant on what the user chose
+    /// is held here until the inputs are adopted into the project.
+    var inputAccess = SecurityScopedAccess()
+
     let toolchainManager: ToolchainManaging
     let hardwareProfile: HardwareProfile
     let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning

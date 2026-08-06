@@ -107,6 +107,12 @@ extension AppModel {
         to destination: URL,
         publisher: @escaping CurrentSplatPublisher
     ) async throws {
+        // The save panel's grant belongs to the URL it returned, and the write runs
+        // off the main actor after the panel closed. Hold the scope across it so a
+        // sandboxed build can finish the export it was told to make.
+        let destinationAccess = SecurityScopedAccess()
+        destinationAccess.claim([destination])
+        defer { destinationAccess.releaseAll() }
         let worker = Task.detached(priority: .userInitiated) {
             try publisher(source.outputURL, destination, source.expectedIdentity)
         }
