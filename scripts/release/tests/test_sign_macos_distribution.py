@@ -1328,7 +1328,7 @@ class DistributionSigningTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 MODULE.SigningError,
-                "semantic Developer ID requirement",
+                "semantic Developer ID Application requirement",
             ):
                 MODULE.sign_distribution_tree(
                     root,
@@ -2123,6 +2123,146 @@ class DistributionSignatureVerificationTests(unittest.TestCase):
                     team_id=TEAM_ID,
                     run_command=runner,
                 )
+
+
+MAS_COMMON_NAME = f"Apple Distribution: Example ({TEAM_ID})"
+
+
+def mas_identity_output(
+    *,
+    fingerprint: str = FINGERPRINT,
+    team_id: str = TEAM_ID,
+) -> str:
+    return f'  1) {fingerprint} "Apple Distribution: Example ({team_id})"\n'
+
+
+class StoreChannelTests(unittest.TestCase):
+    """The store channel differs from Developer ID in certificate and policy."""
+
+    def test_channels_pin_the_markers_read_from_real_certificates(self) -> None:
+        developer_id = MODULE.CHANNELS["developer-id"]
+        store = MODULE.CHANNELS["mas"]
+        self.assertEqual(developer_id["leafOID"], "1.2.840.113635.100.6.1.13")
+        self.assertEqual(developer_id["intermediateOID"], "1.2.840.113635.100.6.2.6")
+        self.assertEqual(store["leafOID"], "1.2.840.113635.100.6.1.7")
+        self.assertEqual(store["intermediateOID"], "1.2.840.113635.100.6.2.1")
+        self.assertEqual(MODULE.DEFAULT_CHANNEL, "developer-id")
+
+    def test_unknown_channel_is_refused(self) -> None:
+        with self.assertRaisesRegex(MODULE.SigningError, "unknown distribution channel"):
+            MODULE.channel_policy("testflight")
+
+    def test_store_channel_requires_an_apple_distribution_certificate(self) -> None:
+        runner = FakeCommandRunner()
+        with self.assertRaisesRegex(
+            MODULE.SigningError, "not the expected Apple Distribution certificate"
+        ):
+            MODULE.validate_signing_identity(
+                FINGERPRINT, TEAM_ID, runner, channel="mas"
+            )
+
+    def test_developer_id_channel_refuses_an_apple_distribution_certificate(self) -> None:
+        runner = FakeCommandRunner(identity=mas_identity_output())
+        with self.assertRaisesRegex(
+            MODULE.SigningError, "not the expected Developer ID Application certificate"
+        ):
+            MODULE.validate_signing_identity(FINGERPRINT, TEAM_ID, runner)
+
+    def test_identity_reports_the_channel_it_was_checked_against(self) -> None:
+        identity = MODULE.validate_signing_identity(
+            FINGERPRINT, TEAM_ID, FakeCommandRunner()
+        )
+        self.assertEqual(identity["channel"], "developer-id")
+
+    def make_store_app(self, root: Path) -> tuple[Path, list[Path], str]:
+        app = root / "EasySplat.app"
+        macos = app / "Contents/MacOS"
+        helpers = app / "Contents/Helpers/bin"
+        macos.mkdir(parents=True)
+        helpers.mkdir(parents=True)
+        main = macos / "EasySplatApp"
+        helper = helpers / "colmap"
+        for path in (main, helper):
+            path.write_bytes(b"\xcf\xfa\xed\xfe" + b"payload")
+            path.chmod(0o755)
+        (app / "Contents/Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleExecutable": "EasySplatApp"})
+        )
+        return app, [main, helper], "Contents/MacOS/EasySplatApp"
+
+    def entitlement_file(self, root: Path, name: str, payload: dict) -> Path:
+        path = root / name
+        path.write_bytes(plistlib.dumps(payload))
+        return path
+
+    def test_store_app_must_entitle_its_main_executable_and_every_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            app, machos, main = self.make_store_app(root)
+            app_plist = self.entitlement_file(
+                root, "app.plist", {"com.apple.security.app-sandbox": True}
+            )
+            with self.assertRaisesRegex(MODULE.SigningError, "every bundled helper"):
+                MODULE.validate_entitlements(
+                    app, "app", machos, {main: app_plist},
+                    app_main=main, channel="mas",
+                )
+
+    def test_store_app_accepts_helper_entitlements_developer_id_forbids(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            app, machos, main = self.make_store_app(root)
+            app_plist = self.entitlement_file(
+                root, "app.plist", {"com.apple.security.app-sandbox": True}
+            )
+            helper_plist = self.entitlement_file(
+                root,
+                "helper.plist",
+                {
+                    "com.apple.security.app-sandbox": True,
+                    "com.apple.security.inherit": True,
+                },
+            )
+            entitlements = {
+                main: app_plist,
+                "Contents/Helpers/bin/colmap": helper_plist,
+            }
+            validated = MODULE.validate_entitlements(
+                app, "app", machos, entitlements, app_main=main, channel="mas"
+            )
+            self.assertEqual(set(validated), set(entitlements))
+            with self.assertRaisesRegex(
+                MODULE.SigningError, "empty entitlement allowlist"
+            ):
+                MODULE.validate_entitlements(
+                    app, "app", machos, entitlements, app_main=main
+                )
+
+    def test_the_shipped_store_entitlements_satisfy_the_store_rules(self) -> None:
+        entitlements_dir = SCRIPT.parent / "entitlements"
+        app = plistlib.loads((entitlements_dir / "mas-app.plist").read_bytes())
+        helper = plistlib.loads(
+            (entitlements_dir / "mas-helper-inherit.plist").read_bytes()
+        )
+        self.assertTrue(app["com.apple.security.app-sandbox"])
+        self.assertTrue(app["com.apple.security.files.user-selected.read-write"])
+        # The profile issues this identity; an app that does not claim it is
+        # rejected at submission.
+        self.assertRegex(app["com.apple.application-identifier"], r"^[A-Z0-9]{10}\.")
+        self.assertEqual(
+            app["com.apple.developer.team-identifier"],
+            app["com.apple.application-identifier"].split(".", 1)[0],
+        )
+        self.assertEqual(
+            helper,
+            {
+                "com.apple.security.app-sandbox": True,
+                "com.apple.security.inherit": True,
+            },
+        )
+        for forbidden in MODULE.FORBIDDEN_APP_ENTITLEMENTS:
+            self.assertNotIn(forbidden, app)
+            self.assertNotIn(forbidden, helper)
 
 
 class SignedPackagingScriptTrustTests(unittest.TestCase):
