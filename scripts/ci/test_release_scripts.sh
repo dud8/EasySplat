@@ -3016,6 +3016,22 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :NSPrincipalClass' "$info_plist")" = "
 # The app hashes and verifies signatures and opens no connection, so it declares
 # exempt encryption once rather than answering the store for every build.
 test "$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$info_plist")" = "false"
+# App Store Connect refuses a CFBundleVersion it has already accepted, so a
+# second upload of one marketing version needs a build number of its own. The
+# default is the version, which is what the assertion above pins.
+if ! /usr/bin/grep -A1 -F '<key>CFBundleVersion</key>' \
+    "$ROOT/scripts/release/build_app.sh" | /usr/bin/grep -Fq '$BUILD_NUMBER'; then
+  echo "CFBundleVersion is not driven by the build number." >&2
+  exit 1
+fi
+if "$ROOT/scripts/release/build_app.sh" \
+    --toolchain-dir "$toolchain_tree" \
+    --version 0.2.0 \
+    --build-number 1.2.3.4 \
+    --development-unsigned >/dev/null 2>&1; then
+  echo "A build number outside CFBundleVersion's shape was accepted." >&2
+  exit 1
+fi
 # A quarantined file reaches App Store Connect and is rejected there
 # (ITMS-91109), so both the build and the packaging step refuse one first.
 grep -Fq 'com.apple.quarantine' "$ROOT/scripts/release/build_app.sh"

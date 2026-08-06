@@ -8,6 +8,7 @@ source "$ROOT/scripts/release/lib/strict_semver.sh"
 TOOLCHAIN_DIR=""
 PROJECT_URL=""
 VERSION=""
+BUILD_NUMBER=""
 RELEASE_MODE=""
 IDENTITY_FINGERPRINT=""
 TEAM_ID=""
@@ -65,6 +66,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version)
       VERSION="$2"
+      shift 2
+      ;;
+    --build-number)
+      if [ -n "$BUILD_NUMBER" ]; then
+        echo "--build-number may be supplied only once." >&2
+        exit 1
+      fi
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--build-number requires up to three dot-separated integers." >&2
+        exit 1
+      fi
+      BUILD_NUMBER="$2"
       shift 2
       ;;
     --build-root)
@@ -155,7 +168,7 @@ done
 unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
 
 if [ -z "$TOOLCHAIN_DIR" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_app.sh --toolchain-dir <path> --version <semver> [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release | --production --identity-fingerprint <sha1> --team-id <id> | --app-store --provisioning-profile <path> --identity-fingerprint <sha1> --team-id <id>)" >&2
+  echo "Usage: build_app.sh --toolchain-dir <path> --version <semver> [--build-number <n[.n[.n]]>] [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release | --production --identity-fingerprint <sha1> --team-id <id> | --app-store --provisioning-profile <path> --identity-fingerprint <sha1> --team-id <id>)" >&2
   exit 1
 fi
 if [ "$RELEASE_MODE" = production ] || [ "$RELEASE_MODE" = app-store ]; then
@@ -282,6 +295,15 @@ if [ "$RELEASE_MODE" != development-unsigned ] \
   exit 1
 fi
 NUMERIC_VERSION="${VERSION%%-*}"
+# App Store Connect refuses a build whose CFBundleVersion it has already seen,
+# so a second upload of one marketing version needs a build number of its own.
+# Defaulting to the version keeps every other lane's plist exactly as it was.
+if [ -z "$BUILD_NUMBER" ]; then
+  BUILD_NUMBER="$NUMERIC_VERSION"
+elif ! [[ "$BUILD_NUMBER" =~ ^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){0,2}$ ]]; then
+  echo "A build number is up to three dot-separated integers: $BUILD_NUMBER" >&2
+  exit 1
+fi
 
 TOOLCHAIN_DIR="$(/usr/bin/python3 -I - "$TOOLCHAIN_DIR" <<'PY'
 import os
@@ -437,7 +459,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key>
   <string>$NUMERIC_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>$NUMERIC_VERSION</string>
+  <string>$BUILD_NUMBER</string>
   <!-- The app hashes with SHA-256, checks code signatures, and opens no network
        connection; it links no cryptographic library and neither do the tools it
        carries. That is exempt encryption, so the store need not ask per build. -->
