@@ -1793,6 +1793,20 @@ extension PipelineRunner {
         return false
     }
 
+    /// Attributes the system owns, which a sandboxed process is refused
+    /// permission to clear.
+    ///
+    /// macOS stamps quarantine on a file an app-sandboxed process creates, and
+    /// `fremovexattr` on it returns EPERM — deliberately, since an app that
+    /// could clear quarantine could launder anything it downloaded. Treating
+    /// that as a failure stopped every sandboxed run at the first selected
+    /// frame. Neither of these carries anything from the source file, so leaving
+    /// them changes nothing about what the pipeline goes on to read.
+    static let systemOwnedExtendedAttributes: Set<String> = [
+        "com.apple.quarantine",
+        "com.apple.macl",
+    ]
+
     private func removeExtendedAttributes(from descriptor: Int32, path: String) throws {
         let length = flistxattr(descriptor, nil, 0, 0)
         guard length >= 0 else { throw posixFileError(path: path) }
@@ -1816,8 +1830,13 @@ extension PipelineRunner {
                     return
                 }
                 if fremovexattr(descriptor, name, 0) != 0, errno != ENOATTR {
-                    removalError = errno
-                    return
+                    let code = errno
+                    guard code == EPERM,
+                          Self.systemOwnedExtendedAttributes.contains(String(cString: name))
+                    else {
+                        removalError = code
+                        return
+                    }
                 }
                 offset += nameLength + 1
             }
