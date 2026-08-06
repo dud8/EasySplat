@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showInputImporter = false
+    @State private var showFolderImporter = false
     @State private var replaceInputOnImport = false
     @State private var showLowDiskWarning = false
     @State private var optionsExpanded = false
@@ -51,6 +52,18 @@ struct HomeView: View {
                 .frame(height: 180)
                 .focused($isDropZoneFocused)
                 .accessibilityIdentifier("home.chooseInput")
+
+                // A panel that offers files opens a folder rather than choosing
+                // it, so picking a whole capture folder needs a panel of its own.
+                HStack {
+                    Spacer()
+                    Button("Choose Folder…") {
+                        replaceInputOnImport = false
+                        showFolderImporter = true
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier("home.chooseFolder")
+                }
 
                 if hasInput {
                     selectedInputs
@@ -133,6 +146,18 @@ struct HomeView: View {
             }
             model.addInputs(urls: urls)
         }
+        .fileImporter(
+            isPresented: $showFolderImporter,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: true
+        ) { result in
+            defer { replaceInputOnImport = false }
+            guard case let .success(urls) = result else { return }
+            if replaceInputOnImport {
+                model.clearPendingInputs()
+            }
+            model.addInputs(urls: urls)
+        }
         .alert("Low disk space", isPresented: $showLowDiskWarning) {
             Button("Create Anyway") {
                 model.startFromPendingSelection()
@@ -151,6 +176,11 @@ struct HomeView: View {
                 Spacer()
                 Button("Replace Input…") {
                     presentInputImporter(replacing: true)
+                }
+                .buttonStyle(.borderless)
+                Button("Replace with Folder…") {
+                    replaceInputOnImport = true
+                    showFolderImporter = true
                 }
                 .buttonStyle(.borderless)
             }

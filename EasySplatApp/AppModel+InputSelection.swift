@@ -138,6 +138,10 @@ extension AppModel {
                 let expanded = Self.expandFolder(url)
                 expanded.videos.forEach(admitVideo)
                 expanded.images.forEach(admitPhoto)
+                // A folder is chosen for what it holds, so what it holds and
+                // cannot be used is worth saying rather than dropping quietly.
+                ignoredFileCount += expanded.skippedFileCount
+                ignoredSplatCount += expanded.skippedSplatCount
             case .regularFile:
                 if Self.isSupportedVideo(url) {
                     admitVideo(url)
@@ -165,9 +169,15 @@ extension AppModel {
                 warnings.append(
                     "Ignored \(ignoredFileCount) \(splatNoun). EasySplat opens .ply splats."
                 )
-            } else {
+            } else if newVideos.isEmpty, newPhotos.isEmpty {
                 warnings.append(
                     "Ignored \(ignoredFileCount) \(noun). Add photos, a video, or a folder of them."
+                )
+            } else {
+                // Something usable did come in, so telling the reader to add
+                // photos would answer a question they did not ask.
+                warnings.append(
+                    "Skipped \(ignoredFileCount) \(noun) EasySplat can't use as capture input."
                 )
             }
         }
@@ -305,7 +315,15 @@ extension AppModel {
     /// project bundle's own output directories excluded so a re-selected project
     /// doesn't ingest its generated frames. Symlinks are skipped here so photo
     /// admission's fail-closed symlink rejection is never tripped by expansion.
-    private static func expandFolder(_ folder: URL) -> (images: [URL], videos: [URL]) {
+    private struct ExpandedFolder {
+        var images: [URL] = []
+        var videos: [URL] = []
+        /// Regular files the folder holds that cannot be used as capture input.
+        var skippedFileCount = 0
+        var skippedSplatCount = 0
+    }
+
+    private static func expandFolder(_ folder: URL) -> ExpandedFolder {
         let fileManager = FileManager.default
         guard let enumerator = fileManager.enumerator(
             at: folder,
@@ -313,7 +331,7 @@ extension AppModel {
             options: [.skipsHiddenFiles, .skipsPackageDescendants],
             errorHandler: { _, _ in true }
         ) else {
-            return ([], [])
+            return ExpandedFolder()
         }
         let maxDepth = 3
         let maxVisitedEntries = 50_000
@@ -325,8 +343,7 @@ extension AppModel {
             ? ["Frames", "SfM", "Training", "Output", "Logs"]
             : []
 
-        var images: [URL] = []
-        var videos: [URL] = []
+        var expanded = ExpandedFolder()
         var visited = 0
         for case let url as URL in enumerator {
             guard visited < maxVisitedEntries else { break }
@@ -353,12 +370,15 @@ extension AppModel {
             }
             guard values?.isRegularFile == true else { continue }
             if isSupportedVideo(url) {
-                videos.append(url)
+                expanded.videos.append(url)
             } else if isSupportedImage(url) {
-                images.append(url)
+                expanded.images.append(url)
+            } else {
+                expanded.skippedFileCount += 1
+                if SplatFileType.isSplat(url) { expanded.skippedSplatCount += 1 }
             }
         }
-        return (images, videos)
+        return expanded
     }
 
     /// Recommended floor used by the pre-flight check. Phrased as a quality

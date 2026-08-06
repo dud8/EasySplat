@@ -232,6 +232,44 @@ final class AppModelDatasetSelectionTests: XCTestCase {
         XCTAssertTrue(HomeView.hasSelectableInput(hasMedia: false, hasDataset: true))
     }
 
+    /// Choosing a folder means taking what it holds. What it holds and cannot be
+    /// used is worth saying, rather than leaving the reader to wonder why a count
+    /// looks short.
+    func testFolderExpansionReportsWhatItCouldNotUse() throws {
+        let model = makeModel()
+        let folder = base.appendingPathComponent("Capture", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("jpg".utf8).write(to: folder.appendingPathComponent("a.jpg"))
+        try Data("mp4".utf8).write(to: folder.appendingPathComponent("b.mp4"))
+        try Data("ply".utf8).write(to: folder.appendingPathComponent("scene.ply"))
+        try Data("t".utf8).write(to: folder.appendingPathComponent("notes.txt"))
+
+        model.addInputs(urls: [folder])
+
+        XCTAssertEqual(model.pendingPhotoURLs.map(\.lastPathComponent), ["a.jpg"])
+        XCTAssertEqual(model.pendingVideoURLs.map(\.lastPathComponent), ["b.mp4"])
+        XCTAssertEqual(
+            model.selectionWarning,
+            "Skipped 2 files EasySplat can't use as capture input."
+        )
+    }
+
+    func testFolderHoldingOnlySplatsSaysWhatEasySplatDoesWithThem() throws {
+        let model = makeModel()
+        let folder = base.appendingPathComponent("Results", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("ply".utf8).write(to: folder.appendingPathComponent("scene.ply"))
+
+        model.addInputs(urls: [folder])
+
+        XCTAssertTrue(model.pendingPhotoURLs.isEmpty)
+        XCTAssertTrue(model.pendingVideoURLs.isEmpty)
+        XCTAssertEqual(
+            model.selectionWarning,
+            "Ignored 1 splat. EasySplat opens .ply splats."
+        )
+    }
+
     func testIgnoredFilesWarningNamesNoParticularDatasetFormat() throws {
         let model = makeModel()
         let unsupported = base.appendingPathComponent("notes.txt")
