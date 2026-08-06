@@ -2968,6 +2968,15 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$info_plist")" = "
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_plist")" = "0.2.0"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$info_plist")" = "0.2.0"
 test "$(/usr/libexec/PlistBuddy -c 'Print :NSPrincipalClass' "$info_plist")" = "NSApplication"
+# The app hashes and verifies signatures and opens no connection, so it declares
+# exempt encryption once rather than answering the store for every build.
+test "$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$info_plist")" = "false"
+if rg -n --glob '!Tools/**' --glob '!*Tests*' \
+    'ChaChaPoly|AES\.GCM|SealedBox|SymmetricKey|Curve25519|sharedSecretFromKeyAgreement' \
+    "$ROOT/EasySplatApp" "$ROOT/EasySplatCore/Sources" >/dev/null; then
+  echo "The shipped app now uses encryption its export declaration denies." >&2
+  exit 1
+fi
 test "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseChannel' "$info_plist")" = "development-unsigned"
 test -d "$app_dsym"
 test -s "$resources_dir/EasySplatAppIcon.icns"

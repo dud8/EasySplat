@@ -438,6 +438,11 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <string>$NUMERIC_VERSION</string>
   <key>CFBundleVersion</key>
   <string>$NUMERIC_VERSION</string>
+  <!-- The app hashes with SHA-256, checks code signatures, and opens no network
+       connection; it links no cryptographic library and neither do the tools it
+       carries. That is exempt encryption, so the store need not ask per build. -->
+  <key>ITSAppUsesNonExemptEncryption</key>
+  <false/>
   <key>EasySplatReleaseChannel</key>
   <string>$APP_RELEASE_CHANNEL</string>
   <key>EasySplatReleaseVersion</key>
