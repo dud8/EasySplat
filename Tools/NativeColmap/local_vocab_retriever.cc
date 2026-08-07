@@ -329,22 +329,35 @@ private:
   struct timespec change_time_{};
 };
 
+// Opens a directory, refusing the whole path when any part of it is a symbolic
+// link. O_NOFOLLOW_ANY asks the kernel for that in one call, so no parent
+// directory has to be readable — which is what a walk from the root needs and
+// what the App Sandbox does not allow.
+inline FileDescriptor
+OpenDirectoryRefusingSymlinks(const std::filesystem::path &path,
+                              const char *description) {
+  int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+#ifdef O_NOFOLLOW_ANY
+  flags |= O_NOFOLLOW_ANY;
+#else
+  flags |= O_NOFOLLOW;
+#endif
+  int descriptor = -1;
+  do {
+    descriptor = ::open(path.c_str(), flags);
+  } while (descriptor < 0 && errno == EINTR);
+  if (descriptor < 0) {
+    Fail(ErrnoMessage(std::string("could not open ") + description, path));
+  }
+  return FileDescriptor(descriptor);
+}
+
 class OutputPathBinding {
 public:
   explicit OutputPathBinding(const std::filesystem::path &output)
       : output_(output), parent_path_(ValidatedParentPath(output)),
         output_leaf_(output.filename().string()) {
-    const int root_descriptor =
-        ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (root_descriptor < 0) {
-      Fail(ErrnoMessage("could not open filesystem root", "/"));
-    }
-    root_descriptor_ = FileDescriptor(root_descriptor);
-    if (::fstat(root_descriptor_.get(), &root_identity_) != 0) {
-      Fail(ErrnoMessage("could not inspect filesystem root", "/"));
-    }
-
-    int parent_descriptor = root_descriptor_.get();
+    std::vector<std::string> names;
     for (const std::filesystem::path &part : parent_path_.relative_path()) {
       const std::string name = part.string();
       if (name.empty() || name == "." || name == ".." ||
@@ -352,27 +365,74 @@ public:
         Fail("output pair list directory contains an invalid path component: " +
              parent_path_.string());
       }
-      int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
-#ifdef O_RESOLVE_BENEATH
-      flags |= O_RESOLVE_BENEATH;
-#endif
-      const int descriptor = ::openat(parent_descriptor, name.c_str(), flags);
-      if (descriptor < 0) {
-        Fail(ErrnoMessage("could not open output pair list directory component",
-                          part));
+      names.push_back(name);
+    }
+
+    // Bind the deepest directory first, then climb.
+    //
+    // This used to open "/" and walk down a component at a time. A process
+    // under the App Sandbox may not open /Users, so that walk failed at its
+    // first step whatever directory it was asked for, and retrieval could never
+    // write its pair list. OpenDirectoryRefusingSymlinks applies the
+    // no-symbolic-link rule to the whole path in one call and needs no read
+    // access to any parent directory.
+    FileDescriptor deepest =
+        OpenDirectoryRefusingSymlinks(parent_path_, "output pair list directory");
+    struct stat deepest_identity{};
+    if (::fstat(deepest.get(), &deepest_identity) != 0 ||
+        !S_ISDIR(deepest_identity.st_mode)) {
+      Fail(ErrnoMessage("could not inspect output pair list directory",
+                        parent_path_));
+    }
+
+    std::size_t bound_index = names.size();
+    std::vector<DirectoryComponent> bound;
+    bound.push_back(DirectoryComponent{
+        bound_index == 0 ? std::string("/") : names[bound_index - 1],
+        std::move(deepest), deepest_identity});
+
+    // Climbing ends where the process stops being allowed to look. Everything
+    // it can observe stays watched; what it cannot reach is the sandbox's
+    // business. Any other refusal means this process could have watched the
+    // directory and did not, so it fails rather than binding less than the path
+    // deserves.
+    while (bound_index > 0) {
+      int parent_descriptor = -1;
+      do {
+        parent_descriptor = ::openat(bound.back().descriptor.get(), "..",
+                                     O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      } while (parent_descriptor < 0 && errno == EINTR);
+      if (parent_descriptor < 0) {
+        if (errno != EPERM) {
+          Fail(ErrnoMessage(
+              "could not open output pair list directory component",
+              parent_path_));
+        }
+        break;
       }
-      DirectoryComponent component{name, FileDescriptor(descriptor), {}};
+      FileDescriptor parent(parent_descriptor);
+      struct stat parent_identity{};
       struct stat named{};
-      if (::fstat(component.descriptor.get(), &component.identity) != 0 ||
-          ::fstatat(parent_descriptor, component.name.c_str(), &named,
+      if (::fstat(parent.get(), &parent_identity) != 0 ||
+          !S_ISDIR(parent_identity.st_mode) ||
+          ::fstatat(parent.get(), bound.back().name.c_str(), &named,
                     AT_SYMLINK_NOFOLLOW) != 0 ||
-          !S_ISDIR(component.identity.st_mode) || !S_ISDIR(named.st_mode) ||
-          !SameObject(component.identity, named)) {
+          !S_ISDIR(named.st_mode) ||
+          !SameObject(bound.back().identity, named)) {
         Fail("output pair list directory changed while it was opened: " +
              parent_path_.string());
       }
-      parent_descriptor = component.descriptor.get();
-      components_.push_back(std::move(component));
+      --bound_index;
+      bound.push_back(DirectoryComponent{
+          bound_index == 0 ? std::string("/") : names[bound_index - 1],
+          std::move(parent), parent_identity});
+    }
+
+    std::reverse(bound.begin(), bound.end());
+    root_descriptor_ = std::move(bound.front().descriptor);
+    root_identity_ = bound.front().identity;
+    for (std::size_t index = 1; index < bound.size(); ++index) {
+      components_.push_back(std::move(bound[index]));
     }
     ValidateDirectoryChain();
     CaptureInitialOutput();
@@ -561,10 +621,25 @@ private:
   }
 
   void ValidateDirectoryChain() const {
+    // The bound descriptors follow their directories wherever those go, so on
+    // their own they cannot tell that the path now leads somewhere else.
+    // Resolve it again and require it to still arrive at what was bound.
+    FileDescriptor resolved =
+        OpenDirectoryRefusingSymlinks(parent_path_, "output pair list directory");
+    struct stat resolved_identity{};
+    struct stat deepest{};
+    if (::fstat(resolved.get(), &resolved_identity) != 0 ||
+        ::fstat(directory_descriptor(), &deepest) != 0 ||
+        !S_ISDIR(resolved_identity.st_mode) ||
+        !SameObject(resolved_identity, deepest)) {
+      Fail("output pair list directory changed during retrieval: " +
+           parent_path_.string());
+    }
     struct stat root{};
     if (::fstat(root_descriptor_.get(), &root) != 0 || !S_ISDIR(root.st_mode) ||
         !SameObject(root, root_identity_)) {
-      Fail("filesystem root changed during retrieval");
+      Fail("output pair list directory changed during retrieval: " +
+           parent_path_.string());
     }
     int parent_descriptor = root_descriptor_.get();
     for (const DirectoryComponent &component : components_) {
