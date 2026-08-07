@@ -55,6 +55,8 @@ struct HomeView: View {
 
                 // A panel that offers files opens a folder rather than choosing
                 // it, so picking a whole capture folder needs a panel of its own.
+                // It hangs off this row rather than the view the file panel uses:
+                // two importers on one view leave only the last one working.
                 HStack {
                     Spacer()
                     Button("Choose Folder…") {
@@ -63,6 +65,13 @@ struct HomeView: View {
                     }
                     .buttonStyle(.borderless)
                     .accessibilityIdentifier("home.chooseFolder")
+                }
+                .fileImporter(
+                    isPresented: $showFolderImporter,
+                    allowedContentTypes: [.folder],
+                    allowsMultipleSelection: true
+                ) { result in
+                    handleImport(result)
                 }
 
                 if hasInput {
@@ -139,24 +148,7 @@ struct HomeView: View {
             ],
             allowsMultipleSelection: true
         ) { result in
-            defer { replaceInputOnImport = false }
-            guard case let .success(urls) = result else { return }
-            if replaceInputOnImport {
-                model.clearPendingInputs()
-            }
-            model.addInputs(urls: urls)
-        }
-        .fileImporter(
-            isPresented: $showFolderImporter,
-            allowedContentTypes: [.folder],
-            allowsMultipleSelection: true
-        ) { result in
-            defer { replaceInputOnImport = false }
-            guard case let .success(urls) = result else { return }
-            if replaceInputOnImport {
-                model.clearPendingInputs()
-            }
-            model.addInputs(urls: urls)
+            handleImport(result)
         }
         .alert("Low disk space", isPresented: $showLowDiskWarning) {
             Button("Create Anyway") {
@@ -485,6 +477,17 @@ struct HomeView: View {
     private func presentInputImporter(replacing: Bool) {
         replaceInputOnImport = replacing
         showInputImporter = true
+    }
+
+    /// Both panels end the same way, and the file panel and the folder panel are
+    /// attached to different views because only one importer per view works.
+    private func handleImport(_ result: Result<[URL], any Error>) {
+        defer { replaceInputOnImport = false }
+        guard case let .success(urls) = result else { return }
+        if replaceInputOnImport {
+            model.clearPendingInputs()
+        }
+        model.addInputs(urls: urls)
     }
 
     private func start() {
