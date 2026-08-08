@@ -274,6 +274,7 @@ extension AppModel {
         var preparedDatasetInput: PreparedDatasetInput?
         var projectPublication: ProjectPublicationTransaction?
         var emptyMixedPhotoInput = false
+        var runnerStarted = false
         defer { preparedVideoInput?.discard() }
         defer { preparedPhotoInput?.discard() }
         defer { preparedDatasetInput?.discard() }
@@ -571,6 +572,7 @@ extension AppModel {
                 )
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
+            runnerStarted = true
             try await runner.run(
                 resumeFrom: Optional<PipelineStage>.none,
                 freshPublicationAttestation: freshPublication.attestation
@@ -711,11 +713,41 @@ extension AppModel {
             } else {
                 fallbackMessage = "Processing stopped. Try again."
             }
-            let failureMessage = lastError ?? stopFailureCopy?.detail ?? fallbackMessage
+            let metadataFailure = error as? PipelineMetadataPersistenceFailure
+            let failureMessage = metadataFailure?.originalProcessingFailure?.userMessage
+                ?? lastError
+                ?? stopFailureCopy?.detail
+                ?? fallbackMessage
             if lastError == nil {
                 lastError = failureMessage
             }
-            persistProjectFailure(failureMessage, at: currentProjectURL)
+            if let metadataFailure {
+                if !metadataFailure.terminalFailureWasPersisted,
+                   let projectURL = currentProjectURL {
+                    do {
+                        try persistProjectFailureChecked(
+                            failureMessage,
+                            stage: metadataFailure.stage,
+                            at: projectURL
+                        )
+                    } catch {
+                        presentUnsavedProjectState(
+                            pipelineFailure: metadataFailure,
+                            fallbackError: error
+                        )
+                        return nil
+                    }
+                }
+            } else if !runnerStarted,
+                      let projectURL = currentProjectURL,
+                      !persistProjectFailureOrPresentUnsaved(
+                        failureMessage,
+                        stage: nil,
+                        at: projectURL,
+                        primaryFailureDescription: String(reflecting: error)
+                      ) {
+                return nil
+            }
             let envDetails = failureTechnicalDetails(for: error)
             if let existing = errorDetails, !existing.isEmpty {
                 errorDetails = existing + "\n\n" + envDetails
@@ -1080,12 +1112,32 @@ extension AppModel {
             } else {
                 fallbackMessage = "Couldn’t open this project. It was not changed."
             }
-            let failureMessage = lastError ?? stopFailureCopy?.detail ?? fallbackMessage
+            let metadataFailure = error as? PipelineMetadataPersistenceFailure
+            let failureMessage = metadataFailure?.originalProcessingFailure?.userMessage
+                ?? lastError
+                ?? stopFailureCopy?.detail
+                ?? fallbackMessage
             if lastError == nil {
                 lastError = failureMessage
             }
             if runnerStarted {
-                persistProjectFailure(failureMessage, at: currentProjectURL)
+                if let metadataFailure {
+                    if !metadataFailure.terminalFailureWasPersisted {
+                        do {
+                            try persistProjectFailureChecked(
+                                failureMessage,
+                                stage: metadataFailure.stage,
+                                at: url
+                            )
+                        } catch {
+                            presentUnsavedProjectState(
+                                pipelineFailure: metadataFailure,
+                                fallbackError: error
+                            )
+                            return
+                        }
+                    }
+                }
             }
             let envDetails = failureTechnicalDetails(for: error)
             if let existing = errorDetails, !existing.isEmpty {
@@ -1227,17 +1279,29 @@ extension AppModel {
         currentOutputPlyInfo = nil
         currentRunOptions = nil
         currentInput = nil
-        persistProjectFailure(message, at: projectURL)
+        guard persistProjectFailureOrPresentUnsaved(
+            message,
+            stage: nil,
+            at: projectURL,
+            primaryFailureDescription: errorDetails ?? message
+        ) else {
+            return
+        }
         appendLogLine("[err] \(message)", isError: true)
         viewState = .processing
         refreshProjectSummaries()
     }
 
-    private func persistProjectFailure(_ message: String, at projectURL: URL?) {
-        guard let projectURL else { return }
-        mutateProjectMetadata(at: projectURL) { metadata in
+    @discardableResult
+    private func persistProjectFailureChecked(
+        _ message: String,
+        stage: PipelineStage?,
+        at projectURL: URL
+    ) throws -> ProjectMetadata {
+        let metadataURL = ProjectPaths(root: projectURL).metadataURL
+        return try projectMetadataUpdater(metadataURL) { metadata in
             metadata.state = PipelineState(
-                stage: metadata.state.stage,
+                stage: stage ?? metadata.state.stage,
                 lastError: message
             )
             metadata.checkpoint = nil
@@ -1246,20 +1310,76 @@ extension AppModel {
         }
     }
 
+    private func persistProjectFailureOrPresentUnsaved(
+        _ message: String,
+        stage: PipelineStage?,
+        at projectURL: URL,
+        primaryFailureDescription: String
+    ) -> Bool {
+        do {
+            try persistProjectFailureChecked(
+                message,
+                stage: stage,
+                at: projectURL
+            )
+            return true
+        } catch {
+            presentUnsavedProjectState(
+                primaryFailureDescription: primaryFailureDescription,
+                fallbackError: error
+            )
+            return false
+        }
+    }
+
+    private func presentUnsavedProjectState(
+        pipelineFailure: PipelineMetadataPersistenceFailure,
+        fallbackError: Error
+    ) {
+        var details = [
+            "Pipeline metadata failure: \(pipelineFailure.localizedDescription)",
+            "Fallback metadata failure: \(String(reflecting: fallbackError))",
+        ]
+        if let original = pipelineFailure.originalProcessingFailure {
+            details.append("Original processing message: \(original.userMessage)")
+            details.append("Original technical details: \(original.technicalMessage)")
+        }
+        presentUnsavedProjectState(details: details)
+    }
+
+    private func presentUnsavedProjectState(
+        primaryFailureDescription: String,
+        fallbackError: Error
+    ) {
+        presentUnsavedProjectState(details: [
+            "Processing failure: \(primaryFailureDescription)",
+            "Fallback metadata failure: \(String(reflecting: fallbackError))",
+        ])
+    }
+
+    private func presentUnsavedProjectState(details: [String]) {
+        let message = "Project state wasn’t saved. Free up disk space or restore write access, then try again. Work after the last saved stage may repeat."
+        cancelForcedExitIfNeeded()
+        stopAction = nil
+        abortPendingExitAfterStopFailure()
+        lastError = message
+        statusTitle = message
+        statusDetail = nil
+        progress = nil
+        failureRetryAllowed = true
+        errorDetails = details.joined(separator: "\n")
+        viewState = .processing
+    }
+
     @discardableResult
     func mutateProjectMetadata(
         at projectURL: URL,
         mutation: (inout ProjectMetadata) -> Void
     ) -> ProjectMetadata? {
         let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        guard var metadata = try? ProjectMetadataStore.load(from: metadataURL) else {
-            return nil
+        return try? projectMetadataUpdater(metadataURL) { metadata in
+            mutation(&metadata)
         }
-        mutation(&metadata)
-        guard (try? ProjectMetadataStore.save(metadata, to: metadataURL)) != nil else {
-            return nil
-        }
-        return metadata
     }
 
     func pipelineConfig(

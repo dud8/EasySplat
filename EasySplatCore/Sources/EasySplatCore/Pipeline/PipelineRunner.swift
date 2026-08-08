@@ -17,6 +17,7 @@ public final class PipelineRunner: @unchecked Sendable {
             ProjectPaths,
             ResolvedPairingPolicy?
         ) throws -> RuntimeInputSnapshotLease
+        package var metadataWriter: PipelineMetadataWriter
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     msplat: MsplatRunner = MsplatRunner(),
@@ -32,6 +33,12 @@ public final class PipelineRunner: @unchecked Sendable {
             self.prepareRuntimeInputLease = {
                 try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
             }
+            self.metadataWriter = { metadata, metadataURL, _, _ in
+                try ProjectMetadataStore.savePreservingUserEditableFields(
+                    metadata,
+                    to: metadataURL
+                )
+            }
         }
 
         public init(runner: SubprocessRunning) {
@@ -44,6 +51,12 @@ public final class PipelineRunner: @unchecked Sendable {
             self.validateVideoInputs = { try VideoInputReceiptValidator.validateFiles(metadata: $0, paths: $1) }
             self.prepareRuntimeInputLease = {
                 try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
+            }
+            self.metadataWriter = { metadata, metadataURL, _, _ in
+                try ProjectMetadataStore.savePreservingUserEditableFields(
+                    metadata,
+                    to: metadataURL
+                )
             }
         }
 
@@ -63,6 +76,16 @@ public final class PipelineRunner: @unchecked Sendable {
                 ResolvedPairingPolicy?
             ) throws -> RuntimeInputSnapshotLease = {
                 try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
+            },
+            metadataWriter: @escaping PipelineMetadataWriter = {
+                metadata,
+                metadataURL,
+                _,
+                _ in
+                try ProjectMetadataStore.savePreservingUserEditableFields(
+                    metadata,
+                    to: metadataURL
+                )
             }
         ) {
             self.colmap = ColmapRunner(runner: runner)
@@ -73,6 +96,7 @@ public final class PipelineRunner: @unchecked Sendable {
             self.colmapGPUSupport = colmapGPUSupport
             self.validateVideoInputs = validateVideoInputs
             self.prepareRuntimeInputLease = prepareRuntimeInputLease
+            self.metadataWriter = metadataWriter
         }
     }
 
@@ -171,6 +195,12 @@ public final class PipelineRunner: @unchecked Sendable {
         // tool logs for inspection — wiping them on a no-op startup
         // failure would destroy the only evidence of why the prior attempt died.
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        // Terminal persistence must never serialize mutations that did not cross a
+        // required durability boundary. In particular, freshly generated input
+        // receipts can name files owned by a rollback ledger until their boundary
+        // write succeeds.
+        var lastDurableMetadata = metadata
+        let hadRunStartMarkerBeforeThisAttempt = metadata.lastRunStartedAt != nil
         try authenticateStartupVideoInputs(
             metadata: metadata,
             paths: paths,
@@ -198,6 +228,16 @@ public final class PipelineRunner: @unchecked Sendable {
                 seedModel: seedModel
             )
         }
+        metadata.lastRunStartedAt = Date()
+        lastDurableMetadata = try persistRequiredMetadata(
+            metadata,
+            paths: paths,
+            operation: .runStart,
+            stage: .importInput
+        )
+        var currentStage: PipelineStage = .importInput
+        var didEmitFailure = false
+        do {
         // No project directory is created or repaired until the immutable video receipts
         // have been rebound to the exact controlled bytes they describe.
         try paths.ensureDirectories()
@@ -321,7 +361,7 @@ public final class PipelineRunner: @unchecked Sendable {
             || refreshedVideoAnalysis != nil
             || recoveredWorkerExecution
             || invalidatedUnprovenBackendRecovery {
-            try persistResolvedPlanChange(
+            lastDurableMetadata = try persistResolvedPlanChange(
                 resolvedRunPlan,
                 completedBoundary: effectiveLastCompletedStage,
                 metadata: &metadata,
@@ -329,7 +369,12 @@ public final class PipelineRunner: @unchecked Sendable {
             )
         } else if metadata.resolvedRunPlan != resolvedRunPlan {
             metadata.resolvedRunPlan = resolvedRunPlan
-            try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+            lastDurableMetadata = try persistRequiredMetadata(
+                metadata,
+                paths: paths,
+                operation: .runStart,
+                stage: .importInput
+            )
         }
         if let refreshedVideoAnalysis {
             refreshedVideoAnalysis.creationLedger.commit()
@@ -356,9 +401,11 @@ public final class PipelineRunner: @unchecked Sendable {
                     durationSeconds: timing.durationSeconds
                 ))
                 metadata.stageTimings = timings
-                try ProjectMetadataStore.savePreservingUserEditableFields(
+                lastDurableMetadata = try persistRequiredMetadata(
                     metadata,
-                    to: paths.metadataURL
+                    paths: paths,
+                    operation: .stageCompletion,
+                    stage: .importInput
                 )
             }
         }
@@ -396,9 +443,11 @@ public final class PipelineRunner: @unchecked Sendable {
            metadata.geometryRecovery != nil,
            !preserveTerminalPairRecovery {
             metadata.geometryRecovery = nil
-            try ProjectMetadataStore.savePreservingUserEditableFields(
+            lastDurableMetadata = try persistRequiredMetadata(
                 metadata,
-                to: paths.metadataURL
+                paths: paths,
+                operation: .runStart,
+                stage: .sfmMapping
             )
         }
         let metadataForResumeValidation = metadata
@@ -412,8 +461,6 @@ public final class PipelineRunner: @unchecked Sendable {
         }
         defer { tooling.colmap.setWorkerExecutionObserver(nil) }
         let logger = PipelineLogger(eventsURL: paths.eventsLogURL, logURL: paths.pipelineLogURL, emit: events)
-        var currentStage: PipelineStage = .importInput
-        var didEmitFailure = false
         var didRetryWithCpu = false
         var didRetryWithExactMatcher = false
         var pairRecoveryLevel: PairRecoveryLevel = .normal
@@ -430,14 +477,12 @@ public final class PipelineRunner: @unchecked Sendable {
         var latestRejectedInspection: ColmapPairGraphInspection?
         var matchingDurationSeconds = 0.0
         let resumeValidationMode = effectiveLastCompletedStage != nil
-        let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
+        let hasInterruptionEvidence = metadata.checkpoint != nil
+            || hadRunStartMarkerBeforeThisAttempt
         let wasInterrupted = metadata.state.lastError == nil
             && metadata.state.stage != .done
             && hasInterruptionEvidence
         let skipTraining = config.developmentOverrides.skipTraining
-
-        metadata.lastRunStartedAt = Date()
-        try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
 
         if metadata.state.lastError != nil {
             try cleanForRetry(
@@ -499,6 +544,27 @@ public final class PipelineRunner: @unchecked Sendable {
 
         var reranStageBeforeTraining = false
         var runtimeInputReceiptDigest: String?
+        var didWarnAboutCheckpointPersistence = false
+
+        func persistBestEffortCheckpoint(stage: PipelineStage) {
+            do {
+                try tooling.metadataWriter(
+                    metadata,
+                    paths.metadataURL,
+                    .checkpoint,
+                    stage
+                )
+                lastDurableMetadata = metadata
+            } catch {
+                guard !didWarnAboutCheckpointPersistence else { return }
+                didWarnAboutCheckpointPersistence = true
+                emit(.stageLog(
+                    stage: stage,
+                    line: "Project progress could not be saved. EasySplat will retry at the next durable boundary.",
+                    isError: true
+                ))
+            }
+        }
 
         func markStageForRerun(
             _ stage: PipelineStage,
@@ -507,7 +573,7 @@ public final class PipelineRunner: @unchecked Sendable {
             guard stageIndex(stage) < stageIndex(.trainSplat) else { return true }
             guard !reranStageBeforeTraining else { return true }
             reranStageBeforeTraining = true
-            try invalidateAcceptedArtifactsForGeometryRerun(
+            lastDurableMetadata = try invalidateAcceptedArtifactsForGeometryRerun(
                 startingAt: stage,
                 metadata: &metadata,
                 paths: paths
@@ -533,10 +599,11 @@ public final class PipelineRunner: @unchecked Sendable {
                 inputReceiptDigest: runtimeInputReceiptDigest,
                 details: details
             )
-            try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+            persistBestEffortCheckpoint(stage: stage)
         }
 
         func shouldRunStage(_ stage: PipelineStage) throws -> Bool {
+            currentStage = stage
             let validationMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
             if stage == .sfmMapping,
                !reranStageBeforeTraining,
@@ -549,9 +616,11 @@ public final class PipelineRunner: @unchecked Sendable {
                 metadata.geometryRecovery = nil
                 metadata.state = PipelineState(stage: .sfmMapping, lastError: nil)
                 metadata.checkpoint = nil
-                try ProjectMetadataStore.savePreservingUserEditableFields(
+                lastDurableMetadata = try persistRequiredMetadata(
                     metadata,
-                    to: paths.metadataURL
+                    paths: paths,
+                    operation: .stageCompletion,
+                    stage: .sfmMapping
                 )
                 emit(.stageLog(
                     stage: .sfmMapping,
@@ -566,9 +635,24 @@ public final class PipelineRunner: @unchecked Sendable {
                (try? TrainingArtifactStore.load(
                    from: paths.trainingManifestURL,
                    projectPaths: paths
-               ).completionStatus) == .completed {
+                ).completionStatus) == .completed {
                 switch try validateStageOutput(stage, paths: paths, metadata: validationMetadata) {
                 case .valid:
+                    if stageIndex(lastCompletedStage) < stageIndex(stage) {
+                        metadata.state = PipelineState(stage: stage, lastError: nil)
+                        metadata.checkpoint = nil
+                        lastDurableMetadata = try persistRequiredMetadata(
+                            metadata,
+                            paths: paths,
+                            operation: .stageCompletion,
+                            stage: stage
+                        )
+                        emit(.stageLog(
+                            stage: stage,
+                            line: "Recovered the completed splat training result.",
+                            isError: false
+                        ))
+                    }
                     return false
                 case .missing:
                     emit(.stageLog(
@@ -639,32 +723,61 @@ public final class PipelineRunner: @unchecked Sendable {
             }
         }
 
-        func markStageComplete(_ stage: PipelineStage) {
+        func markStageComplete(_ stage: PipelineStage) throws {
+            let durationText = stageTiming.finish(stage)
             recordFinishedStageTiming(stage)
             metadata.state = PipelineState(stage: stage, lastError: nil)
             metadata.checkpoint = nil
-            try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+            lastDurableMetadata = try persistRequiredMetadata(
+                metadata,
+                paths: paths,
+                operation: .stageCompletion,
+                stage: stage
+            )
+            logger.emit(.stageFinished(stage: stage))
+            if let durationText {
+                logger.emit(.stageLog(
+                    stage: stage,
+                    line: "Stage duration: \(durationText)",
+                    isError: false
+                ))
+            }
         }
 
         func stopIfRequested(after stage: PipelineStage) throws {
             guard config.developmentOverrides.stopAfterStage == stage else { return }
-            emit(.stageLog(stage: stage, line: "Stopped after \(stage.displayName) by development override.", isError: false))
             metadata.lastRunStartedAt = nil
-            try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+            lastDurableMetadata = try persistRequiredMetadata(
+                metadata,
+                paths: paths,
+                operation: .developmentStop,
+                stage: stage
+            )
+            emit(.stageLog(stage: stage, line: "Stopped after \(stage.displayName) by development override.", isError: false))
             throw DevelopmentStop()
         }
 
-        func emitFailure(stage: PipelineStage, userMessage: String, debugMessage: String) {
-            didEmitFailure = true
+        func emitFailure(stage: PipelineStage, userMessage: String, debugMessage: String) throws {
             _ = stageTiming.finish(stage)
             recordFinishedStageTiming(stage)
-            metadata.state = PipelineState(stage: stage, lastError: userMessage)
-            metadata.checkpoint = nil
-            metadata.lastRunStartedAt = nil
+            var terminalMetadata = lastDurableMetadata
+            terminalMetadata.state = PipelineState(stage: stage, lastError: userMessage)
+            terminalMetadata.checkpoint = nil
+            terminalMetadata.lastRunStartedAt = nil
             // Keep the actual failure time for diagnostics; a later project open
             // must not make a failed run appear newer than it was.
-            metadata.lastFailureAt = Date()
-            try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+            terminalMetadata.lastFailureAt = Date()
+            lastDurableMetadata = try persistRequiredMetadata(
+                terminalMetadata,
+                paths: paths,
+                operation: .terminalFailure,
+                stage: stage,
+                originalProcessingFailure: PipelinePresentedProcessingFailure(
+                    userMessage: userMessage,
+                    technicalMessage: debugMessage
+                )
+            )
+            didEmitFailure = true
             emit(.pipelineFailed(stage: stage, userMessage: userMessage, debugMessage: debugMessage))
         }
 
@@ -696,8 +809,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 try importInputs(metadata: metadata, paths: paths, progress: { fraction, message in
                     emit(.stageProgress(stage: .importInput, fraction: fraction, message: message))
                 })
-                emit(.stageFinished(stage: .importInput))
-                markStageComplete(.importInput)
+                try markStageComplete(.importInput)
                 try stopIfRequested(after: .importInput)
             }
 
@@ -945,8 +1057,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         paths: paths
                     )
                     try inputLease.validate()
-                    emit(.stageFinished(stage: .extractFrames))
-                    markStageComplete(.extractFrames)
+                    try markStageComplete(.extractFrames)
                     try stopIfRequested(after: .extractFrames)
                 }
             }
@@ -1157,8 +1268,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             manifestPath: try paths.projectRelativePath(for: paths.framesSelectedManifestURL)
                         ))
                     )
-                    emit(.stageFinished(stage: .selectFrames))
-                    markStageComplete(.selectFrames)
+                    try markStageComplete(.selectFrames)
                     try cleanupRawFramesAfterDurableSelection(
                         paths: paths,
                         metadata: metadata
@@ -1240,10 +1350,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     restoredGeometryRecovery = recovery
                 } catch {
                     metadata.geometryRecovery = nil
-                    try ProjectMetadataStore.savePreservingUserEditableFields(
-                        metadata,
-                        to: paths.metadataURL
-                    )
+                    persistBestEffortCheckpoint(stage: .sfmMapping)
                     restoredGeometryRecovery = nil
                     emit(.stageLog(
                         stage: .sfmMapping,
@@ -1397,10 +1504,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 )
                 try state.validate()
                 metadata.geometryRecovery = state
-                try ProjectMetadataStore.savePreservingUserEditableFields(
-                    metadata,
-                    to: paths.metadataURL
-                )
+                persistBestEffortCheckpoint(stage: .sfmMapping)
             }
 
             func beginMappingAttempt(
@@ -1617,8 +1721,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     imageCount: selectedFrames.count
                                 ))
                             )
-                            emit(.stageFinished(stage: .sfmFeatures))
-                            markStageComplete(.sfmFeatures)
+                            try markStageComplete(.sfmFeatures)
                             try stopIfRequested(after: .sfmFeatures)
                         } else if sparseModelFilesExist(at: seedZero) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
                             fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
@@ -1922,8 +2025,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     processedPairs: processedPairs
                                 ))
                             )
-                            emit(.stageFinished(stage: .sfmMatching))
-                            markStageComplete(.sfmMatching)
+                            try markStageComplete(.sfmMatching)
                             try persistGeometryRecovery()
                             try stopIfRequested(after: .sfmMatching)
                         } else {
@@ -2418,7 +2520,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         try ColmapDatabaseDurability.seal(at: paths.colmapDatabaseURL)
                         try restoreAcceptedPairEvidence(completedEvidence)
                         try persistGeometryRecovery()
-                        markStageComplete(.sfmMatching)
+                        try markStageComplete(.sfmMatching)
                         try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
                         recoveredAcceptedExactEvidence = true
                     } else {
@@ -2430,6 +2532,8 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                 } catch is CancellationError {
                     throw CancellationError()
+                } catch let metadataFailure as PipelineMetadataPersistenceFailure {
+                    throw metadataFailure
                 } catch PairGraphRecoveryStoreError.terminalExactRecovery {
                     throw PairGraphRecoveryStoreError.terminalExactRecovery
                 } catch PairGraphRecoveryStoreError.conflictingCompletedEvidence {
@@ -2645,8 +2749,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         featureDatabaseDigest: featureDatabaseDigest
                     ))
                 )
-                emit(.stageFinished(stage: .sfmFeatures))
-                markStageComplete(.sfmFeatures)
+                try markStageComplete(.sfmFeatures)
                 try stopIfRequested(after: .sfmFeatures)
             }
 
@@ -2763,8 +2866,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         processedPairs: inspection.attemptedPairCount
                     ))
                 )
-                emit(.stageFinished(stage: .sfmMatching))
-                markStageComplete(.sfmMatching)
+                try markStageComplete(.sfmMatching)
                 try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
                 try stopIfRequested(after: .sfmMatching)
             }
@@ -3739,7 +3841,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     emit(.stageStarted(stage: .sfmMapping))
                     guard let datasetPoseSeed = metadata.datasetPoseSeed,
                           datasetPoseSeed.route == .adoptDirect else {
-                        emitFailure(
+                        try emitFailure(
                             stage: .sfmMapping,
                             userMessage: "The imported dataset's geometry is missing.",
                             debugMessage: "The adoptDirect route requires metadata.datasetPoseSeed bound to adoptDirect, which was absent at the mapping stage."
@@ -3865,7 +3967,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     currentStage = .sfmMapping
                     emit(.stageStarted(stage: .sfmMapping))
                     guard resolvedRunPlan.datasetGeometryRoute == .seedTriangulate else {
-                        emitFailure(
+                        try emitFailure(
                             stage: .sfmMapping,
                             userMessage: "This dataset's geometry can't be reconstructed.",
                             debugMessage: "The importedPoses backend reached the mapping stage without a recognized dataset geometry route."
@@ -3873,7 +3975,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         throw PipelineError.invalidInput
                     }
                     guard let datasetPoseSeed = metadata.datasetPoseSeed else {
-                        emitFailure(
+                        try emitFailure(
                             stage: .sfmMapping,
                             userMessage: "The imported dataset's pose seed is missing.",
                             debugMessage: "The importedPoses backend requires metadata.datasetPoseSeed, which was absent at the mapping stage."
@@ -4497,7 +4599,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             for: terminalError,
                             stage: .sfmMapping
                         )
-                        emitFailure(
+                        try emitFailure(
                             stage: .sfmMapping,
                             userMessage: message.userMessage,
                             debugMessage: message.debugMessage
@@ -4548,7 +4650,6 @@ public final class PipelineRunner: @unchecked Sendable {
             // Geometry reconciliation is part of the durable mapping boundary even
             // when resume validation skipped the mapper subprocess itself.
             currentStage = .sfmMapping
-            var mappingDurationText: String?
             if acceptedMapper != nil
                 || !FileManager.default.fileExists(atPath: paths.geometryManifestURL.path) {
                 guard let mapper = acceptedMapper else {
@@ -4714,21 +4815,9 @@ public final class PipelineRunner: @unchecked Sendable {
                     plan: resolvedRunPlan
                 )
             }
-            if completedMappingThisAttempt {
-                mappingDurationText = stageTiming.finish(.sfmMapping)
-                recordFinishedStageTiming(.sfmMapping)
-            }
             _ = geometryMemorySampler.stop()
             if completedMappingThisAttempt {
-                logger.emit(.stageFinished(stage: .sfmMapping))
-                if let mappingDurationText {
-                    logger.emit(.stageLog(
-                        stage: .sfmMapping,
-                        line: "Stage duration: \(mappingDurationText)",
-                        isError: false
-                    ))
-                }
-                markStageComplete(.sfmMapping)
+                try markStageComplete(.sfmMapping)
             }
             // Geometry publication seals the worker ledger. Later COLMAP utility
             // calls prepare trainer input and must not mutate that attestation.
@@ -4748,13 +4837,18 @@ public final class PipelineRunner: @unchecked Sendable {
 
             try stopIfRequested(after: .sfmMapping)
             if skipTraining {
+                metadata.lastRunStartedAt = nil
+                lastDurableMetadata = try persistRequiredMetadata(
+                    metadata,
+                    paths: paths,
+                    operation: .skipTrainingCompletion,
+                    stage: .sfmMapping
+                )
                 emit(.stageLog(
                     stage: .sfmMapping,
                     line: "Stopping after geometry by development override.",
                     isError: false
                 ))
-                metadata.lastRunStartedAt = nil
-                try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
                 return
             }
             if try shouldRunStage(.trainSplat) {
@@ -5032,17 +5126,6 @@ public final class PipelineRunner: @unchecked Sendable {
                         ))
                     }
                     metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-                    if FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path) {
-                        do {
-                            try FileManager.default.removeItem(at: paths.msplatCheckpointURL)
-                        } catch {
-                            emit(.stageLog(
-                                stage: .trainSplat,
-                                line: "Could not remove completed training checkpoints: \(error.localizedDescription)",
-                                isError: true
-                            ))
-                        }
-                    }
                     writeCheckpoint(
                         stage: .trainSplat,
                         progress: 1.0,
@@ -5052,9 +5135,19 @@ public final class PipelineRunner: @unchecked Sendable {
                             progressTotal: trainingResult.iterationLimit
                         ))
                     )
-                    emit(.stageFinished(stage: .trainSplat))
-                    markStageComplete(.trainSplat)
+                    try markStageComplete(.trainSplat)
                     try stopIfRequested(after: .trainSplat)
+            }
+            if FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path) {
+                do {
+                    try FileManager.default.removeItem(at: paths.msplatCheckpointURL)
+                } catch {
+                    emit(.stageLog(
+                        stage: .trainSplat,
+                        line: "Could not remove completed training checkpoints: \(error.localizedDescription)",
+                        isError: true
+                    ))
+                }
             }
 
             try Task.checkCancellation()
@@ -5100,13 +5193,20 @@ public final class PipelineRunner: @unchecked Sendable {
                         sizeBytes: sizeBytes
                     ))
                 )
-                emit(.stageFinished(stage: .exportSplat))
-                markStageComplete(.exportSplat)
+                try markStageComplete(.exportSplat)
                 try stopIfRequested(after: .exportSplat)
             }
 
             let canonicalPublication = try Self.promoteMsplatCompletionToPublicOutput(
                 paths: paths
+            )
+            metadata.state = PipelineState(stage: .done, lastError: nil)
+            metadata.lastRunStartedAt = nil
+            lastDurableMetadata = try persistRequiredMetadata(
+                metadata,
+                paths: paths,
+                operation: .finalCompletion,
+                stage: .done
             )
             do {
                 _ = try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
@@ -5124,9 +5224,6 @@ public final class PipelineRunner: @unchecked Sendable {
                     isError: true
                 ))
             }
-            metadata.state = PipelineState(stage: .done, lastError: nil)
-            metadata.lastRunStartedAt = nil
-            try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
 
             do {
                 try removeDisposableCompletedTrainingPayload(paths: paths)
@@ -5144,15 +5241,112 @@ public final class PipelineRunner: @unchecked Sendable {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
+            let metadataFailure = error as? PipelineMetadataPersistenceFailure
+            if let metadataFailure,
+               metadataFailure.operation == .terminalFailure {
+                throw metadataFailure
+            }
             if !didEmitFailure {
-                let message = failureMessages(for: error, stage: currentStage)
-                emitFailure(
-                    stage: currentStage,
+                let failureStage = metadataFailure?.stage ?? currentStage
+                let message: (userMessage: String, debugMessage: String)
+                if let original = metadataFailure?.originalProcessingFailure {
+                    message = (
+                        userMessage: original.userMessage,
+                        debugMessage: original.technicalMessage
+                    )
+                } else {
+                    message = failureMessages(for: error, stage: failureStage)
+                }
+                try emitFailure(
+                    stage: failureStage,
                     userMessage: message.userMessage,
                     debugMessage: message.debugMessage
                 )
             }
+            if let metadataFailure {
+                throw metadataFailure.recordingPersistedTerminalFailure()
+            }
             throw error
+        }
+        } catch is DevelopmentStop {
+            return
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            let metadataFailure = error as? PipelineMetadataPersistenceFailure
+            if didEmitFailure
+                || metadataFailure?.terminalFailureWasPersisted == true {
+                throw error
+            }
+            if let metadataFailure,
+               metadataFailure.operation == .terminalFailure {
+                throw metadataFailure
+            }
+
+            let failureStage = metadataFailure?.stage ?? currentStage
+            let message: (userMessage: String, debugMessage: String)
+            if let original = metadataFailure?.originalProcessingFailure {
+                message = (
+                    userMessage: original.userMessage,
+                    debugMessage: original.technicalMessage
+                )
+            } else {
+                message = failureMessages(for: error, stage: failureStage)
+            }
+            var terminalMetadata = lastDurableMetadata
+            terminalMetadata.state = PipelineState(
+                stage: failureStage,
+                lastError: message.userMessage
+            )
+            terminalMetadata.checkpoint = nil
+            terminalMetadata.lastRunStartedAt = nil
+            terminalMetadata.lastFailureAt = Date()
+            lastDurableMetadata = try persistRequiredMetadata(
+                terminalMetadata,
+                paths: paths,
+                operation: .terminalFailure,
+                stage: failureStage,
+                originalProcessingFailure: PipelinePresentedProcessingFailure(
+                    userMessage: message.userMessage,
+                    technicalMessage: message.debugMessage
+                )
+            )
+            didEmitFailure = true
+            events(.pipelineFailed(
+                stage: failureStage,
+                userMessage: message.userMessage,
+                debugMessage: message.debugMessage
+            ))
+            if let metadataFailure {
+                throw metadataFailure.recordingPersistedTerminalFailure()
+            }
+            throw error
+        }
+    }
+
+    @discardableResult
+    package func persistRequiredMetadata(
+        _ metadata: ProjectMetadata,
+        paths: ProjectPaths,
+        operation: PipelineMetadataWriteOperation,
+        stage: PipelineStage,
+        originalProcessingFailure: PipelinePresentedProcessingFailure? = nil
+    ) throws -> ProjectMetadata {
+        do {
+            try tooling.metadataWriter(
+                metadata,
+                paths.metadataURL,
+                operation,
+                stage
+            )
+            return metadata
+        } catch {
+            throw PipelineMetadataPersistenceFailure(
+                operation: operation,
+                stage: stage,
+                persistenceError: error,
+                originalProcessingFailure: originalProcessingFailure
+            )
         }
     }
 

@@ -1795,7 +1795,10 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(persisted.state.stage, .sfmFeatures)
         XCTAssertNil(persisted.state.lastError)
         XCTAssertNil(persisted.checkpoint)
-        XCTAssertNil(persisted.lastRunStartedAt)
+        XCTAssertNotNil(
+            persisted.lastRunStartedAt,
+            "A plan change occurs inside the active attempt; its run-start marker must remain durable."
+        )
         XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 0)
         XCTAssertEqual(try databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL), 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: sparseSentinel.path))

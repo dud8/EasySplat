@@ -2202,7 +2202,12 @@ extension PipelineRunner {
         )
         // Use the notes-preserving save so a checkpoint written mid-run cannot clobber a note
         // the user edited since this metadata was loaded, matching every other in-run write.
-        try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+        try? tooling.metadataWriter(
+            metadata,
+            paths.metadataURL,
+            .checkpoint,
+            stage
+        )
     }
 
     struct FrameExtractionProfile {

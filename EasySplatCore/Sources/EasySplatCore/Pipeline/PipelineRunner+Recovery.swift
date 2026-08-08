@@ -332,11 +332,12 @@ extension PipelineRunner {
         }
     }
 
+    @discardableResult
     func invalidateAcceptedArtifactsForGeometryRerun(
         startingAt stage: PipelineStage,
         metadata: inout ProjectMetadata,
         paths: ProjectPaths
-    ) throws {
+    ) throws -> ProjectMetadata {
         try removeItemIfPresent(
             paths.colmapRefinementSeedModelURL.deletingLastPathComponent()
         )
@@ -349,9 +350,11 @@ extension PipelineRunner {
         metadata.stageTimings = metadata.stageTimings?.filter { timing in
             (PipelineStage.allCases.firstIndex(of: timing.stage) ?? 0) < rerunIndex
         }
-        try ProjectMetadataStore.savePreservingUserEditableFields(
+        return try persistRequiredMetadata(
             metadata,
-            to: paths.metadataURL
+            paths: paths,
+            operation: .runStart,
+            stage: stage
         )
     }
 
@@ -359,12 +362,13 @@ extension PipelineRunner {
     /// policy is committed. If the process stops during cleanup, project.json still
     /// contains the old policy and resume validation sees the missing output. Once the
     /// save succeeds, the persisted stage boundary is sufficient to resume safely.
+    @discardableResult
     func persistResolvedPlanChange(
         _ resolvedPlan: ResolvedRunPlan,
         completedBoundary: PipelineStage?,
         metadata: inout ProjectMetadata,
         paths: ProjectPaths
-    ) throws {
+    ) throws -> ProjectMetadata {
         let fileManager = FileManager.default
         func removeInvalidatedItem(_ url: URL) throws {
             let isSymlink = (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
@@ -418,10 +422,14 @@ extension PipelineRunner {
         metadata.geometryRecovery = nil
         metadata.state = PipelineState(stage: completedBoundary ?? .importInput, lastError: nil)
         metadata.checkpoint = nil
-        metadata.lastRunStartedAt = nil
         metadata.lastFailureAt = nil
         try paths.ensureDirectories()
-        try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+        return try persistRequiredMetadata(
+            metadata,
+            paths: paths,
+            operation: .runStart,
+            stage: completedBoundary ?? .importInput
+        )
     }
 
     func failureMessages(for error: Error, stage: PipelineStage) -> (userMessage: String, debugMessage: String) {

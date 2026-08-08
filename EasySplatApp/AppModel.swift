@@ -90,6 +90,11 @@ final class AppModel: ObservableObject {
         @Sendable (ProjectPaths) -> IsolationArtifactLoadResult
     typealias SubjectIsolationArtifactRemover =
         @Sendable (ProjectPaths) throws -> Bool
+    typealias ProjectMetadataMutation = (inout ProjectMetadata) throws -> Void
+    typealias ProjectMetadataUpdater = (
+        _ metadataURL: URL,
+        _ mutation: ProjectMetadataMutation
+    ) throws -> ProjectMetadata
 
     enum ViewState: Equatable {
         case home
@@ -212,6 +217,7 @@ final class AppModel: ObservableObject {
     let subjectIsolationArtifactRemover: SubjectIsolationArtifactRemover
     let projectBaseURL: URL?
     let projectTrashHandler: (URL) throws -> Void
+    let projectMetadataUpdater: ProjectMetadataUpdater
     var currentTask: Task<Void, Never>?
     var currentTaskToken: UUID?
     var subjectIsolationTask: Task<Void, Never>?
@@ -514,6 +520,9 @@ final class AppModel: ObservableObject {
             var resultingURL: NSURL?
             try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
         },
+        projectMetadataUpdater: @escaping ProjectMetadataUpdater = { metadataURL, mutation in
+            try ProjectMetadataStore.update(at: metadataURL, mutation)
+        },
         finishedOutputValidator: @escaping FinishedOutputValidator = { projectURL in
             AppModel.readyOutputURLOnDisk(
                 projectURL: projectURL,
@@ -537,6 +546,7 @@ final class AppModel: ObservableObject {
         self.subjectIsolationArtifactLoader = subjectIsolationArtifactLoader
         self.subjectIsolationArtifactRemover = subjectIsolationArtifactRemover
         self.projectTrashHandler = projectTrashHandler
+        self.projectMetadataUpdater = projectMetadataUpdater
         self.pipelineRunnerFactory = pipelineRunnerFactory
         self.powerAssertion = powerAssertion
         if self.hardwareProfile.memoryGB <= 8.5 {
