@@ -314,8 +314,10 @@ extension ToolchainManager {
     func regularFileEvidence(
         root: URL,
         relativePath: String,
-        maximumBytes: UInt64 = UInt64.max
+        maximumBytes: UInt64 = UInt64.max,
+        checkCancellation: () throws -> Void = {}
     ) throws -> (sha256: String, size: Int64, mode: UInt16, identity: String) {
+        try checkCancellation()
         try validateToolchainRelativePath(relativePath)
         let parts = relativePath.split(separator: "/", omittingEmptySubsequences: false)
         guard !parts.isEmpty, parts.allSatisfy({ !$0.isEmpty }) else {
@@ -358,14 +360,17 @@ extension ToolchainManager {
         return try regularFileEvidence(
             descriptor: descriptor,
             finalPath: root.appendingPathComponent(relativePath, isDirectory: false),
-            maximumBytes: maximumBytes
+            maximumBytes: maximumBytes,
+            checkCancellation: checkCancellation
         )
     }
 
     func regularFileEvidence(
         at url: URL,
-        maximumBytes: UInt64 = UInt64.max
+        maximumBytes: UInt64 = UInt64.max,
+        checkCancellation: () throws -> Void = {}
     ) throws -> (sha256: String, size: Int64, mode: UInt16, identity: String) {
+        try checkCancellation()
         let descriptor = Darwin.open(
             url.path,
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
@@ -379,15 +384,18 @@ extension ToolchainManager {
         return try regularFileEvidence(
             descriptor: descriptor,
             finalPath: url,
-            maximumBytes: maximumBytes
+            maximumBytes: maximumBytes,
+            checkCancellation: checkCancellation
         )
     }
 
     private func regularFileEvidence(
         descriptor: Int32,
         finalPath url: URL,
-        maximumBytes: UInt64
+        maximumBytes: UInt64,
+        checkCancellation: () throws -> Void
     ) throws -> (sha256: String, size: Int64, mode: UInt16, identity: String) {
+        try checkCancellation()
         var initial = stat()
         guard fstat(descriptor, &initial) == 0,
               (initial.st_mode & S_IFMT) == S_IFREG,
@@ -415,6 +423,7 @@ extension ToolchainManager {
             if count == 0 { break }
             hasher.update(data: Data(buffer[0..<count]))
             bytesRead += Int64(count)
+            try checkCancellation()
             guard bytesRead >= 0, UInt64(bytesRead) <= maximumBytes else {
                 throw ToolchainError.invalidToolchain(
                     "Toolchain file exceeds its attested size bound: \(url.lastPathComponent)."

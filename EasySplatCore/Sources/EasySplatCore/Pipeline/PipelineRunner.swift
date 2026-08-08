@@ -1272,7 +1272,7 @@ public final class PipelineRunner: @unchecked Sendable {
             func prepareCanonicalTextCandidate(
                 at url: URL,
                 mappingAttemptOrdinal: Int
-            ) throws -> CanonicalModelPublicationArtifact {
+            ) async throws -> CanonicalModelPublicationArtifact {
                 let key = "\(mappingAttemptOrdinal):\(url.standardizedFileURL.path)"
                 if let existing = canonicalPublicationByAttemptAndPath[key] {
                     return existing
@@ -1290,7 +1290,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         checkCancellation: self.tooling.checkCancellation
                     )
                 }
-                let publication = try self.prepareTextSparseModelForCanonicalPublication(
+                let publication = try await self.prepareTextSparseModelForCanonicalPublication(
                     at: url,
                     mappingAttemptOrdinal: mappingAttemptOrdinal,
                     workerExecutionRecorder: workerExecutionRecorder
@@ -1974,7 +1974,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 beginMappingAttempt: { try beginMappingAttempt() },
                                 currentMappingAttemptCount: { mappingAttemptCount },
                                 prepareCanonicalTextCandidate: {
-                                    try prepareCanonicalTextCandidate(
+                                    try await prepareCanonicalTextCandidate(
                                         at: $0,
                                         mappingAttemptOrdinal: $1
                                     )
@@ -3930,7 +3930,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         beginMappingAttempt: { try beginMappingAttempt() },
                         currentMappingAttemptCount: { mappingAttemptCount },
                         prepareCanonicalTextCandidate: {
-                            try prepareCanonicalTextCandidate(
+                            try await prepareCanonicalTextCandidate(
                                 at: $0,
                                 mappingAttemptOrdinal: $1
                             )
@@ -4009,7 +4009,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 guard let membership = membershipByOrder[model.order] else {
                                     throw PipelineError.outputMissing
                                 }
-                                let publication = try prepareCanonicalTextCandidate(
+                                let publication = try await prepareCanonicalTextCandidate(
                                     at: model.url,
                                     mappingAttemptOrdinal: mappingAttemptOrdinal
                                 )
@@ -4519,7 +4519,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         try requireTextSparseModelFiles(at: canonicalSparseModel)
                         convertedCanonicalModel = false
                     } else {
-                        convertedCanonicalModel = try ensureTextSparseModelFiles(
+                        convertedCanonicalModel = try await ensureTextSparseModelFiles(
                             at: canonicalSparseModel
                         )
                     }

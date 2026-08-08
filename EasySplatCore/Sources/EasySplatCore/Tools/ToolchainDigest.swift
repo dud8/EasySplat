@@ -2,8 +2,12 @@ import CryptoKit
 import Foundation
 
 extension ToolchainManager {
-    func sha256Hex(url: URL) throws -> String {
-        try regularFileEvidence(at: url).sha256
+    func sha256Hex(url: URL) async throws -> String {
+        try Task.checkCancellation()
+        return try regularFileEvidence(
+            at: url,
+            checkCancellation: { try Task.checkCancellation() }
+        ).sha256
     }
 
     func sha256Hex(data: Data) -> String {

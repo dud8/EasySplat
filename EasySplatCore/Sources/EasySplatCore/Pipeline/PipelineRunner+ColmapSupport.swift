@@ -35,11 +35,13 @@ enum SparseTextPublicationCheckpoint: Sendable {
     case beforePublishedValidation
 }
 
-private enum SparseModelPublicationError: Error, LocalizedError {
+enum SparseModelPublicationError: Error, LocalizedError {
     case unsafeLayout
     case atomicRenameFailed(Int32)
     case atomicTextPublicationFailed(Int32)
     case atomicTextRollbackFailed(Int32, recoveryDirectory: String)
+    case atomicBinaryPublicationFailed(Int32)
+    case atomicBinaryRollbackFailed(Int32, recoveryDirectory: String)
 
     var errorDescription: String? {
         switch self {
@@ -51,6 +53,10 @@ private enum SparseModelPublicationError: Error, LocalizedError {
             return "Could not publish the COLMAP text model atomically (errno \(code))."
         case .atomicTextRollbackFailed(let code, let recoveryDirectory):
             return "Could not restore the previous COLMAP text model (errno \(code)). The preserved recovery directory is \(recoveryDirectory)."
+        case .atomicBinaryPublicationFailed(let code):
+            return "Could not publish the COLMAP binary model atomically (errno \(code))."
+        case .atomicBinaryRollbackFailed(let code, let recoveryDirectory):
+            return "Could not restore the previous COLMAP binary model (errno \(code)). The preserved recovery directory is \(recoveryDirectory)."
         }
     }
 }
@@ -60,7 +66,8 @@ extension PipelineRunner {
         at url: URL,
         mappingAttemptOrdinal: Int,
         workerExecutionRecorder: GeometryWorkerExecutionRecorder
-    ) throws -> CanonicalModelPublicationArtifact {
+    ) async throws -> CanonicalModelPublicationArtifact {
+        try Task.checkCancellation()
         let binaryNames = ["cameras.bin", "images.bin", "points3D.bin"]
         let textNames = ["cameras.txt", "images.txt", "points3D.txt"]
         let hasBinarySource = binaryNames.allSatisfy {
@@ -70,7 +77,13 @@ extension PipelineRunner {
         }
         let sourceNames = hasBinarySource ? binaryNames : textNames
         let sourceHashes = try Dictionary(uniqueKeysWithValues: sourceNames.map { name in
-            (name, try GeometryArtifactStore.sha256(of: url.appendingPathComponent(name)))
+            (
+                name,
+                try GeometryArtifactStore.sha256(
+                    of: url.appendingPathComponent(name),
+                    shouldCancel: { Task.isCancelled }
+                )
+            )
         })
         let candidateProjectRelativePath = try ProjectPaths(root: projectURL)
             .projectRelativePath(for: url)
@@ -82,7 +95,7 @@ extension PipelineRunner {
             .successfulModelConverterInvocationCount(
                 mappingAttemptOrdinal: mappingAttemptOrdinal
             )
-        let converted = try ensureTextSparseModelFiles(
+        let converted = try await ensureTextSparseModelFiles(
             at: url,
             mappingAttemptOrdinal: mappingAttemptOrdinal,
             candidateProjectRelativePath: candidateProjectRelativePath
@@ -155,7 +168,8 @@ extension PipelineRunner {
         case .unsafeLayout:
             return PipelineError.outputMissing
         case .atomicRenameFailed, .atomicTextPublicationFailed,
-                .atomicTextRollbackFailed:
+            .atomicTextRollbackFailed, .atomicBinaryPublicationFailed,
+            .atomicBinaryRollbackFailed:
             return error
         }
     }
@@ -472,7 +486,7 @@ extension PipelineRunner {
         return SparseFileState(metadata)
     }
 
-    private func synchronizeSparseModelFile(at url: URL) throws {
+    func synchronizeSparseModelFile(at url: URL) throws {
         let descriptor = Darwin.open(
             url.path,
             O_RDONLY | O_NOFOLLOW | O_CLOEXEC
@@ -494,7 +508,7 @@ extension PipelineRunner {
         }
     }
 
-    private func synchronizeSparseModelDirectory(_ descriptor: Int32) throws {
+    func synchronizeSparseModelDirectory(_ descriptor: Int32) throws {
         while Darwin.fsync(descriptor) != 0 {
             let code = errno
             if code == EINTR { continue }
@@ -508,7 +522,8 @@ extension PipelineRunner {
         mappingAttemptOrdinal: Int? = nil,
         candidateProjectRelativePath: String? = nil,
         publicationCheckpoint: (SparseTextPublicationCheckpoint) throws -> Void = { _ in }
-    ) throws -> Bool {
+    ) async throws -> Bool {
+        try Task.checkCancellation()
         let fm = FileManager.default
         let txtFiles = ["cameras.txt", "images.txt", "points3D.txt"]
         let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
@@ -522,6 +537,7 @@ extension PipelineRunner {
                 throw PipelineError.outputMissing
             }
             _ = try captureMappedSparseModel(at: url)
+            try Task.checkCancellation()
             return false
         }
 
@@ -566,7 +582,7 @@ extension PipelineRunner {
         default:
             throw PipelineError.outputMissing
         }
-        try tooling.colmap.runModelConverter(
+        try await tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
             inputPath: binaryInput,
             outputPath: textOutput,
@@ -576,6 +592,7 @@ extension PipelineRunner {
             modelConversionContext: conversionContext,
             onLog: { _, _ in }
         )
+        try Task.checkCancellation()
         for name in txtFiles {
             guard let state = privateRegularFileState(
                 at: textOutput.appendingPathComponent(name)
@@ -659,6 +676,7 @@ extension PipelineRunner {
             }
         }
         try validateMappedSparseModel(replacementSnapshot, at: replacement)
+        try Task.checkCancellation()
         try publicationCheckpoint(.beforeSwap)
         let renameResult = exchangeModels()
         guard renameResult == 0 else {
@@ -666,11 +684,13 @@ extension PipelineRunner {
         }
 
         do {
+            try Task.checkCancellation()
             try publicationCheckpoint(.afterSwap)
             try synchronizeSparseModelDirectory(parentDescriptor)
             try synchronizeSparseModelDirectory(stagingDescriptor)
             try publicationCheckpoint(.beforePublishedValidation)
             try validateMappedSparseModel(replacementSnapshot, at: url)
+            try Task.checkCancellation()
         } catch {
             do {
                 try validateMappedSparseModel(sourceSnapshot, at: replacement)
@@ -856,7 +876,7 @@ extension PipelineRunner {
         scoreLogLabel: String,
         beginMappingAttempt: () throws -> Int,
         currentMappingAttemptCount: () -> Int,
-        prepareCanonicalTextCandidate: (URL, Int) throws -> CanonicalModelPublicationArtifact,
+        prepareCanonicalTextCandidate: (URL, Int) async throws -> CanonicalModelPublicationArtifact,
         emit: (PipelineEvent) -> Void
     ) async throws -> (artifact: MappingArtifact, conditioning: GeometryConditioningAnalysis) {
         let fm = FileManager.default
@@ -916,7 +936,7 @@ extension PipelineRunner {
         }
         removeIfExists(sparseZero)
         try fm.moveItem(at: baOutput, to: sparseZero)
-        let canonicalModelPublication = try prepareCanonicalTextCandidate(
+        let canonicalModelPublication = try await prepareCanonicalTextCandidate(
             sparseZero,
             mappingAttemptOrdinal
         )

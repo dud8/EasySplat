@@ -1,4 +1,11 @@
+import Darwin
 import Foundation
+
+enum SparseBinaryPublicationCheckpoint: Sendable {
+    case beforeSwap
+    case afterSwap
+    case beforePublishedValidation
+}
 
 private struct SelectedTrainingFrameBinding: Equatable {
     let byteCount: UInt64
@@ -54,7 +61,7 @@ extension PipelineRunner {
             )
         } else {
             preparationKind = .direct
-            prepared = try prepareDirectMsplatDataset(
+            prepared = try await prepareDirectMsplatDataset(
                 paths: paths,
                 sourceSparse: sourceSparse,
                 sourceSnapshot: sourceSnapshot,
@@ -227,7 +234,7 @@ extension PipelineRunner {
                 to: undistorterInput.appendingPathComponent(name)
             )
         }
-        _ = try regenerateBinarySparseModelFiles(at: undistorterInput)
+        _ = try await regenerateBinarySparseModelFiles(at: undistorterInput)
         try requireBinarySparseModelFiles(at: undistorterInput)
         try Task.checkCancellation()
         try await tooling.colmap.runImageUndistorter(
@@ -267,13 +274,13 @@ extension PipelineRunner {
         }
         try requireBinarySparseModelFiles(at: candidateSparse)
         if let learnedPointInitializer = geometryArtifact.learnedPointInitializer {
-            _ = try ensureTextSparseModelFiles(at: candidateSparse)
+            _ = try await ensureTextSparseModelFiles(at: candidateSparse)
             try mergeLearnedPointInitializer(
                 learnedPointInitializer,
                 paths: paths,
                 into: candidateSparse.appendingPathComponent("points3D.txt")
             )
-            _ = try regenerateBinarySparseModelFiles(at: candidateSparse)
+            _ = try await regenerateBinarySparseModelFiles(at: candidateSparse)
         }
         for name in ["cameras.txt", "images.txt", "points3D.txt"] {
             let file = candidateSparse.appendingPathComponent(name)
@@ -431,7 +438,7 @@ extension PipelineRunner {
         sourceGeometryManifestSHA256: String,
         selectedFrameSnapshot: SelectedTrainingFrameSnapshot,
         progress: (Double, String) -> Void
-    ) throws -> (
+    ) async throws -> (
         url: URL,
         identity: MsplatDatasetIdentity,
         registeredImageNames: [String]
@@ -497,7 +504,7 @@ extension PipelineRunner {
                 into: sparse.appendingPathComponent("points3D.txt")
             )
         }
-        _ = try regenerateBinarySparseModelFiles(at: sparse)
+        _ = try await regenerateBinarySparseModelFiles(at: sparse)
         try requireBinarySparseModelFiles(at: sparse)
         for name in ["cameras.txt", "images.txt", "points3D.txt"] {
             try fm.removeItem(at: sparse.appendingPathComponent(name))
@@ -661,19 +668,31 @@ extension PipelineRunner {
     /// The geometry manifest authenticates the accepted text model. Always derive the
     /// trainer's binary model from that verified source so stale binaries from an older
     /// training attempt can never bypass the geometry gate.
-    func regenerateBinarySparseModelFiles(at url: URL) throws -> Bool {
+    func regenerateBinarySparseModelFiles(
+        at url: URL,
+        publicationCheckpoint: (SparseBinaryPublicationCheckpoint) throws -> Void = { _ in }
+    ) async throws -> Bool {
+        try Task.checkCancellation()
         try requireTextSparseModelFiles(at: url)
         let fm = FileManager.default
         let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
+        let sourceSnapshot = try captureMappedSparseModel(at: url)
         let stagingRoot = url.deletingLastPathComponent().appendingPathComponent(
             ".binary-model-\(UUID().uuidString)",
             isDirectory: true
         )
         let textInput = stagingRoot.appendingPathComponent("text", isDirectory: true)
         let binaryOutput = stagingRoot.appendingPathComponent("binary", isDirectory: true)
+        let replacement = stagingRoot.appendingPathComponent("replacement", isDirectory: true)
         try fm.createDirectory(at: textInput, withIntermediateDirectories: true)
         try fm.createDirectory(at: binaryOutput, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: stagingRoot) }
+        try fm.createDirectory(at: replacement, withIntermediateDirectories: true)
+        var preserveStaging = false
+        defer {
+            if !preserveStaging {
+                try? fm.removeItem(at: stagingRoot)
+            }
+        }
         for name in ["cameras.txt", "images.txt", "points3D.txt"] {
             try fm.copyItem(
                 at: url.appendingPathComponent(name),
@@ -681,7 +700,7 @@ extension PipelineRunner {
             )
         }
 
-        try tooling.colmap.runModelConverter(
+        try await tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
             inputPath: textInput,
             outputPath: binaryOutput,
@@ -690,6 +709,17 @@ extension PipelineRunner {
             onLog: { _, _ in }
         )
 
+        try Task.checkCancellation()
+        let sourceEntries = try fm.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        for entry in sourceEntries {
+            try fm.copyItem(
+                at: entry,
+                to: replacement.appendingPathComponent(entry.lastPathComponent)
+            )
+        }
         for name in binFiles {
             let source = binaryOutput.appendingPathComponent(name)
             let values = try source.resourceValues(forKeys: [
@@ -702,13 +732,117 @@ extension PipelineRunner {
                   (values.fileSize ?? 0) > 0 else {
                 throw PipelineError.outputMissing
             }
-            let destination = url.appendingPathComponent(name)
+            let destination = replacement.appendingPathComponent(name)
             if fm.fileExists(atPath: destination.path) {
-                _ = try fm.replaceItemAt(destination, withItemAt: source)
-            } else {
-                try fm.moveItem(at: source, to: destination)
+                try fm.removeItem(at: destination)
+            }
+            try fm.moveItem(at: source, to: destination)
+        }
+
+        try validateMappedSparseModel(sourceSnapshot, at: url)
+        let replacementSnapshot = try captureMappedSparseModel(at: replacement)
+        try requireBinarySparseModelFiles(at: replacement)
+        for entry in try fm.contentsOfDirectory(
+            at: replacement,
+            includingPropertiesForKeys: nil
+        ) {
+            try synchronizeSparseModelFile(at: entry)
+        }
+
+        let replacementDescriptor = Darwin.open(
+            replacement.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard replacementDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(replacementDescriptor) }
+        try synchronizeSparseModelDirectory(replacementDescriptor)
+
+        let parent = url.deletingLastPathComponent()
+        let parentDescriptor = Darwin.open(
+            parent.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard parentDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(parentDescriptor) }
+        let stagingDescriptor = Darwin.open(
+            stagingRoot.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard stagingDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(stagingDescriptor) }
+        try synchronizeSparseModelDirectory(stagingDescriptor)
+
+        func exchangeModels() -> Int32 {
+            url.lastPathComponent.withCString { currentName in
+                "replacement".withCString { replacementName in
+                    renameatx_np(
+                        parentDescriptor,
+                        currentName,
+                        stagingDescriptor,
+                        replacementName,
+                        UInt32(RENAME_SWAP)
+                    )
+                }
             }
         }
+
+        try validateMappedSparseModel(replacementSnapshot, at: replacement)
+        try Task.checkCancellation()
+        try publicationCheckpoint(.beforeSwap)
+        let renameResult = exchangeModels()
+        guard renameResult == 0 else {
+            throw SparseModelPublicationError.atomicBinaryPublicationFailed(errno)
+        }
+
+        do {
+            try Task.checkCancellation()
+            try publicationCheckpoint(.afterSwap)
+            try synchronizeSparseModelDirectory(parentDescriptor)
+            try synchronizeSparseModelDirectory(stagingDescriptor)
+            try publicationCheckpoint(.beforePublishedValidation)
+            try validateMappedSparseModel(replacementSnapshot, at: url)
+            try Task.checkCancellation()
+        } catch {
+            do {
+                try validateMappedSparseModel(sourceSnapshot, at: replacement)
+                let rollbackResult = exchangeModels()
+                guard rollbackResult == 0 else {
+                    let rollbackCode = errno
+                    preserveStaging = true
+                    throw SparseModelPublicationError.atomicBinaryRollbackFailed(
+                        rollbackCode,
+                        recoveryDirectory: stagingRoot.path
+                    )
+                }
+                try synchronizeSparseModelDirectory(parentDescriptor)
+                try synchronizeSparseModelDirectory(stagingDescriptor)
+                try validateMappedSparseModel(sourceSnapshot, at: url)
+            } catch let rollbackError as SparseModelPublicationError {
+                if case .atomicBinaryRollbackFailed = rollbackError {
+                    throw rollbackError
+                }
+                preserveStaging = true
+                throw SparseModelPublicationError.atomicBinaryRollbackFailed(
+                    EIO,
+                    recoveryDirectory: stagingRoot.path
+                )
+            } catch {
+                preserveStaging = true
+                throw SparseModelPublicationError.atomicBinaryRollbackFailed(
+                    EIO,
+                    recoveryDirectory: stagingRoot.path
+                )
+            }
+            throw error
+        }
+        try? fm.removeItem(at: replacement)
+        try? synchronizeSparseModelDirectory(stagingDescriptor)
         return true
     }
 

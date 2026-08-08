@@ -24,7 +24,12 @@ private func sameStableColmapIdentity(_ lhs: stat, _ rhs: stat) -> Bool {
         && lhs.st_gid == rhs.st_gid
 }
 
-private func stableColmapSHA256(descriptor: Int32, expected: stat) throws -> String {
+private func stableColmapSHA256(
+    descriptor: Int32,
+    expected: stat,
+    checkCancellation: () throws -> Void = {}
+) throws -> String {
+    try checkCancellation()
     var hasher = SHA256()
     var offset: Int64 = 0
     var buffer = [UInt8](repeating: 0, count: 1_048_576)
@@ -37,6 +42,7 @@ private func stableColmapSHA256(descriptor: Int32, expected: stat) throws -> Str
         guard count > 0 else { throw CocoaError(.fileReadUnknown) }
         hasher.update(data: Data(buffer[0..<count]))
         offset += Int64(count)
+        try checkCancellation()
     }
     guard offset == Int64(expected.st_size) else {
         throw CocoaError(.fileReadUnknown)
@@ -409,8 +415,10 @@ private final class StableColmapRuntimeFileBinding {
     init(
         rootURL: URL,
         componentPath: String,
-        requiresExecutablePermission: Bool
+        requiresExecutablePermission: Bool,
+        checkCancellation: () throws -> Void = {}
     ) throws {
+        try checkCancellation()
         let components = componentPath.split(
             separator: "/",
             omittingEmptySubsequences: false
@@ -454,7 +462,11 @@ private final class StableColmapRuntimeFileBinding {
         }
         let sha256: String
         do {
-            sha256 = try stableColmapSHA256(descriptor: descriptor, expected: file)
+            sha256 = try stableColmapSHA256(
+                descriptor: descriptor,
+                expected: file,
+                checkCancellation: checkCancellation
+            )
             var finalFile = stat()
             var finalPath = stat()
             let finalPathStatus = leafName.withCString {
@@ -467,6 +479,9 @@ private final class StableColmapRuntimeFileBinding {
                 throw CocoaError(.fileReadUnknown)
             }
             try parent.validate()
+        } catch let error as CancellationError {
+            Darwin.close(descriptor)
+            throw error
         } catch {
             Darwin.close(descriptor)
             throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
@@ -511,7 +526,11 @@ private final class StableColmapRuntimeClosureBinding {
     private let executable: StableColmapRuntimeFileBinding
     private let openMPRuntime: StableColmapRuntimeFileBinding
 
-    init(colmapURL: URL) throws {
+    init(
+        colmapURL: URL,
+        checkCancellation: () throws -> Void = {}
+    ) throws {
+        try checkCancellation()
         let binURL = colmapURL.deletingLastPathComponent()
         let rootURL = binURL.deletingLastPathComponent()
         guard colmapURL.lastPathComponent == "colmap",
@@ -522,12 +541,14 @@ private final class StableColmapRuntimeClosureBinding {
         let executable = try StableColmapRuntimeFileBinding(
             rootURL: rootURL,
             componentPath: "bin/colmap",
-            requiresExecutablePermission: true
+            requiresExecutablePermission: true,
+            checkCancellation: checkCancellation
         )
         let openMPRuntime = try StableColmapRuntimeFileBinding(
             rootURL: rootURL,
             componentPath: "lib/libomp.dylib",
-            requiresExecutablePermission: false
+            requiresExecutablePermission: false,
+            checkCancellation: checkCancellation
         )
         guard let evidence = ColmapRuntimeClosureEvidence.canonical(
             executableSHA256: executable.sha256,
@@ -560,7 +581,12 @@ private final class StableColmapModelInputBinding {
     private let directory: StableColmapRelativeDirectoryBinding
     private let members: [Member]
 
-    init(projectRootURL: URL, projectRelativePath: String) throws {
+    init(
+        projectRootURL: URL,
+        projectRelativePath: String,
+        checkCancellation: () throws -> Void = {}
+    ) throws {
+        try checkCancellation()
         let directory = try StableColmapRelativeDirectoryBinding(
             rootURL: projectRootURL,
             relativePath: projectRelativePath,
@@ -603,7 +629,11 @@ private final class StableColmapModelInputBinding {
                 }
                 let digest: String
                 do {
-                    digest = try stableColmapSHA256(descriptor: descriptor, expected: file)
+                    digest = try stableColmapSHA256(
+                        descriptor: descriptor,
+                        expected: file,
+                        checkCancellation: checkCancellation
+                    )
                 } catch {
                     Darwin.close(descriptor)
                     throw error
@@ -615,7 +645,16 @@ private final class StableColmapModelInputBinding {
                     sha256: digest
                 ))
             }
-            try Self.validate(directory: directory, members: members)
+            try Self.validate(
+                directory: directory,
+                members: members,
+                checkCancellation: checkCancellation
+            )
+        } catch let error as CancellationError {
+            for member in members.reversed() {
+                Darwin.close(member.descriptor)
+            }
+            throw error
         } catch {
             for member in members.reversed() {
                 Darwin.close(member.descriptor)
@@ -653,8 +692,10 @@ private final class StableColmapModelInputBinding {
 
     private static func validate(
         directory: StableColmapRelativeDirectoryBinding,
-        members: [Member]
+        members: [Member],
+        checkCancellation: () throws -> Void = {}
     ) throws {
+        try checkCancellation()
         try directory.validate()
         guard try stableColmapDirectoryEntryNames(directory.descriptor)
             == members.map(\.name).sorted() else {
@@ -677,7 +718,8 @@ private final class StableColmapModelInputBinding {
                   sameStableColmapStatus(member.initialStatus, path),
                   try stableColmapSHA256(
                       descriptor: member.descriptor,
-                      expected: member.initialStatus
+                      expected: member.initialStatus,
+                      checkCancellation: checkCancellation
                   ) == member.sha256 else {
                 throw CocoaError(.fileReadUnknown)
             }
@@ -1150,6 +1192,179 @@ public struct ColmapModelConversionWorkerInvocationContext: Sendable, Equatable 
         self.outputProjectRelativePath = outputProjectRelativePath
         self.inputURL = inputURL
         self.outputURL = outputURL
+    }
+}
+
+/// Owns every descriptor-backed model-conversion binding once launch begins.
+/// The termination callback consumes the bindings under a lock exactly once;
+/// no caller or second callback can inspect them concurrently.
+private final class ColmapModelConversionTerminationVerifier: @unchecked Sendable {
+    struct Invocation: Sendable {
+        let launchPath: String
+        let inputPath: String
+        let outputPath: String
+    }
+
+    private struct Bindings {
+        let runtime: StableColmapRuntimeClosureBinding?
+        let input: StableColmapModelInputBinding?
+        let output: StableColmapModelOutputBinding?
+    }
+
+    private struct EvidenceSeed: Sendable {
+        let executableSHA256: String
+        let candidateProjectRelativePath: String
+        let inputProjectRelativePath: String
+        let outputProjectRelativePath: String
+        let sourceModelDigest: String
+        let candidateIdentitySHA256: String
+    }
+
+    let invocation: Invocation
+
+    private let lock = NSLock()
+    private var bindings: Bindings?
+    private let evidenceSeed: EvidenceSeed?
+    private let record: (@Sendable (ColmapModelConversionWorkerEvidence, SubprocessResult) throws -> Void)?
+
+    init(
+        colmapPath: URL,
+        inputPath: URL,
+        outputPath: URL,
+        outputType: String,
+        recordGeometryWorkerExecution: Bool,
+        context: ColmapModelConversionWorkerInvocationContext?,
+        checkCancellation: () throws -> Void,
+        record: @escaping @Sendable (ColmapModelConversionWorkerEvidence, SubprocessResult) throws -> Void
+    ) throws {
+        try checkCancellation()
+        guard recordGeometryWorkerExecution == (context != nil) else {
+            throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
+        }
+
+        if let context {
+            let expectedInput = context.projectRootURL.appendingPathComponent(
+                context.inputProjectRelativePath,
+                isDirectory: true
+            )
+            let expectedOutput = context.projectRootURL.appendingPathComponent(
+                context.outputProjectRelativePath,
+                isDirectory: true
+            )
+            guard inputPath.path == context.inputURL.path,
+                  outputPath.path == context.outputURL.path,
+                  context.inputURL.path == expectedInput.path,
+                  context.outputURL.path == expectedOutput.path,
+                  outputType == "TXT" else {
+                throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
+            }
+
+            let runtime = try StableColmapRuntimeClosureBinding(
+                colmapURL: colmapPath,
+                checkCancellation: checkCancellation
+            )
+            let input = try StableColmapModelInputBinding(
+                projectRootURL: context.projectRootURL,
+                projectRelativePath: context.inputProjectRelativePath,
+                checkCancellation: checkCancellation
+            )
+            let output = try StableColmapModelOutputBinding(
+                projectRootURL: context.projectRootURL,
+                projectRelativePath: context.outputProjectRelativePath
+            )
+            let sourceDigest = input.modelDigest
+            guard let candidateIdentity = GeometryArtifactStore.modelCandidateIdentity(
+                mappingAttemptOrdinal: context.mappingAttemptOrdinal,
+                candidateProjectRelativePath: context.candidateProjectRelativePath,
+                sourceModelDigest: sourceDigest
+            ) else {
+                throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
+            }
+
+            invocation = Invocation(
+                launchPath: runtime.launchPath,
+                inputPath: input.canonicalPath,
+                outputPath: output.canonicalPath
+            )
+            evidenceSeed = EvidenceSeed(
+                executableSHA256: runtime.executableSHA256,
+                candidateProjectRelativePath: context.candidateProjectRelativePath,
+                inputProjectRelativePath: context.inputProjectRelativePath,
+                outputProjectRelativePath: context.outputProjectRelativePath,
+                sourceModelDigest: sourceDigest,
+                candidateIdentitySHA256: candidateIdentity
+            )
+            bindings = Bindings(runtime: runtime, input: input, output: output)
+            self.record = record
+        } else {
+            invocation = Invocation(
+                launchPath: colmapPath.path,
+                inputPath: inputPath.path,
+                outputPath: outputPath.path
+            )
+            evidenceSeed = nil
+            bindings = Bindings(runtime: nil, input: nil, output: nil)
+            self.record = nil
+        }
+    }
+
+    func verify(_ result: SubprocessResult) throws {
+        let ownedBindings: Bindings
+        lock.lock()
+        guard let pending = bindings else {
+            lock.unlock()
+            throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
+        }
+        bindings = nil
+        ownedBindings = pending
+        lock.unlock()
+
+        var postExecutionIntegrityError: Error?
+        do {
+            try ownedBindings.runtime?.validateAfterExecution()
+            try ownedBindings.input?.validateAfterExecution()
+            try ownedBindings.output?.validateAfterExecution()
+        } catch {
+            postExecutionIntegrityError = error
+        }
+
+        if let evidenceSeed, let record {
+            let succeeded = result.exitCode == 0 && result.terminationReason == .exit
+            var convertedDigest: String?
+            if succeeded, postExecutionIntegrityError == nil {
+                do {
+                    convertedDigest = try ownedBindings.output?.modelDigest()
+                    if convertedDigest == nil {
+                        throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
+                    }
+                } catch {
+                    postExecutionIntegrityError = error
+                }
+            }
+            do {
+                try record(
+                    ColmapModelConversionWorkerEvidence(
+                        executableComponentPath: "bin/colmap",
+                        executableSHA256: evidenceSeed.executableSHA256,
+                        candidateProjectRelativePath: evidenceSeed.candidateProjectRelativePath,
+                        inputProjectRelativePath: evidenceSeed.inputProjectRelativePath,
+                        outputProjectRelativePath: evidenceSeed.outputProjectRelativePath,
+                        sourceModelDigest: evidenceSeed.sourceModelDigest,
+                        convertedModelDigest: convertedDigest,
+                        candidateIdentitySHA256: evidenceSeed.candidateIdentitySHA256
+                    ),
+                    result
+                )
+            } catch {
+                if let postExecutionIntegrityError {
+                    throw postExecutionIntegrityError
+                }
+                throw error
+            }
+        }
+        if let postExecutionIntegrityError {
+            throw postExecutionIntegrityError
+        }
     }
 }
 
@@ -1770,118 +1985,48 @@ public final class ColmapRunner: @unchecked Sendable {
         recordGeometryWorkerExecution: Bool = false,
         modelConversionContext: ColmapModelConversionWorkerInvocationContext? = nil,
         onLog: @escaping @Sendable (String, Bool) -> Void
-    ) throws {
-        guard recordGeometryWorkerExecution == (modelConversionContext != nil) else {
-            throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
-        }
-        let runtimeClosureBinding = recordGeometryWorkerExecution
-            ? try StableColmapRuntimeClosureBinding(colmapURL: colmapPath)
-            : nil
-        let inputBinding: StableColmapModelInputBinding?
-        let outputBinding: StableColmapModelOutputBinding?
-        let sourceDigest: String?
-        let candidateIdentity: String?
-        if let context = modelConversionContext {
-            let expectedInput = context.projectRootURL.appendingPathComponent(
-                context.inputProjectRelativePath,
-                isDirectory: true
-            )
-            let expectedOutput = context.projectRootURL.appendingPathComponent(
-                context.outputProjectRelativePath,
-                isDirectory: true
-            )
-            guard inputPath.path == context.inputURL.path,
-                  outputPath.path == context.outputURL.path,
-                  context.inputURL.path == expectedInput.path,
-                  context.outputURL.path == expectedOutput.path,
-                  outputType == "TXT" else {
-                throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
-            }
-            let stableInput = try StableColmapModelInputBinding(
-                projectRootURL: context.projectRootURL,
-                projectRelativePath: context.inputProjectRelativePath
-            )
-            let stableOutput = try StableColmapModelOutputBinding(
-                projectRootURL: context.projectRootURL,
-                projectRelativePath: context.outputProjectRelativePath
-            )
-            inputBinding = stableInput
-            outputBinding = stableOutput
-            sourceDigest = stableInput.modelDigest
-            candidateIdentity = sourceDigest.flatMap {
-                GeometryArtifactStore.modelCandidateIdentity(
-                    mappingAttemptOrdinal: context.mappingAttemptOrdinal,
-                    candidateProjectRelativePath: context.candidateProjectRelativePath,
-                    sourceModelDigest: $0
+    ) async throws {
+        try Task.checkCancellation()
+        let terminationVerifier = try ColmapModelConversionTerminationVerifier(
+            colmapPath: colmapPath,
+            inputPath: inputPath,
+            outputPath: outputPath,
+            outputType: outputType,
+            recordGeometryWorkerExecution: recordGeometryWorkerExecution,
+            context: modelConversionContext,
+            checkCancellation: { try Task.checkCancellation() },
+            record: { [self] modelConversion, result in
+                try recordWorkerExecution(
+                    command: .modelConverter,
+                    threadPolicy: .nativeAuto,
+                    argvWorkerCount: nil,
+                    pairContext: nil,
+                    mapperExecution: nil,
+                    modelConversion: modelConversion,
+                    result: result
                 )
             }
-            guard sourceDigest != nil, candidateIdentity != nil else {
-                throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
-            }
-        } else {
-            inputBinding = nil
-            outputBinding = nil
-            sourceDigest = nil
-            candidateIdentity = nil
-        }
-        let launchPath = runtimeClosureBinding?.launchPath ?? colmapPath.path
-        let invokedInputPath = inputBinding?.canonicalPath ?? inputPath.path
-        let invokedOutputPath = outputBinding?.canonicalPath ?? outputPath.path
+        )
+        let invocation = terminationVerifier.invocation
+        try Task.checkCancellation()
         let args = [
             "model_converter",
-            "--input_path", invokedInputPath,
-            "--output_path", invokedOutputPath,
+            "--input_path", invocation.inputPath,
+            "--output_path", invocation.outputPath,
             "--output_type", outputType
         ]
-        onLog("EasySplat: colmap argv: \(launchPath) \(args.joined(separator: " "))", false)
-        let result = try runner.run(
-            launchPath,
+        onLog("EasySplat: colmap argv: \(invocation.launchPath) \(args.joined(separator: " "))", false)
+        let result = try await runner.runAsync(
+            invocation.launchPath,
             args,
             currentDirectory: nil,
             environment: Self.sanitizedNativeAutoEnvironment(environment),
             removingEnvironmentKeys: Self.inheritedProcessEnvironmentKeys,
+            onTermination: terminationVerifier.verify,
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
-        try runtimeClosureBinding?.validateAfterExecution()
-        try inputBinding?.validateAfterExecution()
-        try outputBinding?.validateAfterExecution()
-        if recordGeometryWorkerExecution {
-            guard let context = modelConversionContext,
-                  let sourceDigest,
-                  let candidateIdentity,
-                  let runtimeClosureBinding else {
-                throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
-            }
-            let succeeded = result.exitCode == 0 && result.terminationReason == .exit
-            let convertedDigest: String?
-            if succeeded {
-                guard let outputBinding else {
-                    throw ColmapRunnerError.executionEvidenceUnavailable("model_converter")
-                }
-                convertedDigest = try outputBinding.modelDigest()
-            } else {
-                convertedDigest = nil
-            }
-            try recordWorkerExecution(
-                command: .modelConverter,
-                threadPolicy: .nativeAuto,
-                argvWorkerCount: nil,
-                pairContext: nil,
-                mapperExecution: nil,
-                modelConversion: ColmapModelConversionWorkerEvidence(
-                    executableComponentPath: "bin/colmap",
-                    executableSHA256: runtimeClosureBinding.executableSHA256,
-                    candidateProjectRelativePath: context.candidateProjectRelativePath,
-                    inputProjectRelativePath: context.inputProjectRelativePath,
-                    outputProjectRelativePath: context.outputProjectRelativePath,
-                    sourceModelDigest: sourceDigest,
-                    convertedModelDigest: convertedDigest,
-                    candidateIdentitySHA256: candidateIdentity
-                ),
-                result: result
-            )
-        }
+        try Task.checkCancellation()
         try checkResult(result, command: "model_converter")
     }
 

@@ -12,17 +12,21 @@ extension ToolchainManager {
         repairExecutablePermissions: Bool = true,
         toolchainIdentity: String,
         integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree
-    ) throws -> ToolchainPaths {
+    ) async throws -> ToolchainPaths {
+        try Task.checkCancellation()
         let payloadRoot = dataRoot ?? root
         let colmap = root.appendingPathComponent("bin/colmap")
         if repairExecutablePermissions { ensureExecutable(at: colmap) }
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
 
-        try requireArm64Binary(at: colmap, label: "colmap")
+        try await requireArm64Binary(at: colmap, label: "colmap")
+        try Task.checkCancellation()
 
         let colmapCheck: SubprocessResult
         do {
-            colmapCheck = try runner.run(colmap.path, ["help"])
+            colmapCheck = try await runner.runAsync(colmap.path, ["help"])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP could not be launched.")
         }
@@ -30,10 +34,13 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
         }
         try validateNativeColmapRoot(colmapCheck)
+        try Task.checkCancellation()
 
         let matchesImporterProbe: SubprocessResult
         do {
-            matchesImporterProbe = try runner.run(colmap.path, ["matches_importer", "-h"])
+            matchesImporterProbe = try await runner.runAsync(colmap.path, ["matches_importer", "-h"])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP matches_importer could not be launched.")
         }
@@ -48,10 +55,13 @@ extension ToolchainManager {
             in: matchesImporterProbe,
             subject: "COLMAP matches_importer"
         )
+        try Task.checkCancellation()
 
         let mapperProbe: SubprocessResult
         do {
-            mapperProbe = try runner.run(colmap.path, ["mapper", "-h"])
+            mapperProbe = try await runner.runAsync(colmap.path, ["mapper", "-h"])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP mapper could not be launched.")
         }
@@ -70,10 +80,13 @@ extension ToolchainManager {
             in: mapperProbe,
             subject: "COLMAP mapper"
         )
+        try Task.checkCancellation()
 
         let vocabularyProbe: SubprocessResult
         do {
-            vocabularyProbe = try runner.run(colmap.path, ["local_vocab_retriever", "-h"])
+            vocabularyProbe = try await runner.runAsync(colmap.path, ["local_vocab_retriever", "-h"])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP local_vocab_retriever could not be launched.")
         }
@@ -93,6 +106,7 @@ extension ToolchainManager {
             in: vocabularyProbe,
             subject: "COLMAP local_vocab_retriever"
         )
+        try Task.checkCancellation()
 
         let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
         let da3SfmTool = da3Root.appendingPathComponent("bin/easysplat_da3_sfm")
@@ -140,11 +154,20 @@ extension ToolchainManager {
                 throw ToolchainError.missingBinary("da3_mps/python/bin/python3")
             }
             try validateBuildInfo(at: da3BuildInfo, expectedToolchainName: "da3_mps")
-            try requireArm64Binary(at: da3Python, label: "da3_mps python")
-            let da3Check = try runner.run(da3SfmTool.path, ["--help"])
+            try await requireArm64Binary(at: da3Python, label: "da3_mps python")
+            try Task.checkCancellation()
+            let da3Check: SubprocessResult
+            do {
+                da3Check = try await runner.runAsync(da3SfmTool.path, ["--help"])
+            } catch let error as CancellationError {
+                throw error
+            } catch {
+                throw ToolchainError.invalidToolchain("da3_mps could not be launched.")
+            }
             guard da3Check.exitCode == 0 else {
                 throw ToolchainError.invalidToolchain("da3_mps failed to launch (exit \(da3Check.exitCode)).")
             }
+            try Task.checkCancellation()
         }
         if needsBase || needsSmall {
             guard fileManager.fileExists(atPath: da3Models.path) else {
@@ -187,6 +210,7 @@ extension ToolchainManager {
         let msplatRoot = payloadRoot.appendingPathComponent("msplat", isDirectory: true)
         let msplatBuildInfo = msplatRoot.appendingPathComponent("build_info.json")
         let msplatLicense = msplatRoot.appendingPathComponent("LICENSE")
+        try Task.checkCancellation()
         try rejectLegacyMsplatFootprint(root: root, dataRoot: payloadRoot)
         guard pathExistsIncludingSymlink(msplat) else {
             throw ToolchainError.missingBinary("bin/easysplat-train")
@@ -201,7 +225,7 @@ extension ToolchainManager {
             throw ToolchainError.missingLibrary("msplat/LICENSE")
         }
 
-        let runtimeVersion = try validateNativeMsplatClosure(
+        let runtimeVersion = try await validateNativeMsplatClosure(
             integrityPolicy: integrityPolicy,
             root: root,
             dataRoot: payloadRoot,
@@ -210,16 +234,19 @@ extension ToolchainManager {
             buildInfo: msplatBuildInfo,
             license: msplatLicense
         )
+        try Task.checkCancellation()
         if repairExecutablePermissions { ensureExecutable(at: msplat) }
         guard fileManager.isExecutableFile(atPath: msplat.path) else {
             throw ToolchainError.missingBinary("bin/easysplat-train")
         }
-        try requireArm64Binary(at: msplat, label: "easysplat-train")
-        try validateMsplatSelfCheck(
+        try await requireArm64Binary(at: msplat, label: "easysplat-train")
+        try Task.checkCancellation()
+        try await validateMsplatSelfCheck(
             executable: msplat,
             metallib: msplatMetallib,
             runtimeVersion: runtimeVersion
         )
+        try Task.checkCancellation()
 
         return ToolchainPaths(
             root: root,
@@ -356,7 +383,8 @@ extension ToolchainManager {
         metallib: URL,
         buildInfo: URL,
         license: URL
-    ) throws -> String {
+    ) async throws -> String {
+        try Task.checkCancellation()
         let msplatRoot = dataRoot.appendingPathComponent("msplat", isDirectory: true)
         let expectedFiles = Set(["LICENSE", "build_info.json"])
 
@@ -433,7 +461,8 @@ extension ToolchainManager {
             }
         }
 
-        return try validateMsplatBuildInfo(
+        try Task.checkCancellation()
+        return try await validateMsplatBuildInfo(
             at: buildInfo,
             executable: executable,
             metallib: metallib,
@@ -446,7 +475,8 @@ extension ToolchainManager {
         executable: URL,
         metallib: URL,
         integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree
-    ) throws -> String {
+    ) async throws -> String {
+        try Task.checkCancellation()
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -656,14 +686,15 @@ extension ToolchainManager {
         }
 
         if integrityPolicy == .unsignedDevelopmentTree {
-            let executableHash = try sha256Hex(url: executable)
+            let executableHash = try await sha256Hex(url: executable)
             guard executableHash == payload["executable_sha256"] as? String else {
                 throw ToolchainError.invalidToolchain(
                     "msplat build_info.json executable_sha256 mismatch."
                 )
             }
         }
-        let metallibHash = try sha256Hex(url: metallib)
+        try Task.checkCancellation()
+        let metallibHash = try await sha256Hex(url: metallib)
         guard metallibHash == payload["metallib_sha256"] as? String else {
             throw ToolchainError.invalidToolchain("msplat build_info.json metallib_sha256 mismatch.")
         }
@@ -672,13 +703,16 @@ extension ToolchainManager {
         return "\(sourceVersion) (git \(sourceCommit.prefix(7)))"
     }
 
-    func validateMsplatSelfCheck(executable: URL, metallib: URL, runtimeVersion: String) throws {
+    func validateMsplatSelfCheck(executable: URL, metallib: URL, runtimeVersion: String) async throws {
+        try Task.checkCancellation()
         let result: SubprocessResult
         do {
-            result = try runner.run(
+            result = try await runner.runAsync(
                 executable.path,
                 ["--self-check", "--events-fd", "1", "--metallib", metallib.path]
             )
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("easysplat-train self-check could not run (\(error.localizedDescription)).")
         }
@@ -781,10 +815,13 @@ extension ToolchainManager {
     /// cannot be executed at all — we'd rather block startup than silently allow a Rosetta build.
     /// Uses `-b` to strip the filename from output so paths containing "arm64" (e.g.
     /// `…/index-build/arm64-apple-macosx/…`) cannot satisfy the substring check on their own.
-    func requireArm64Binary(at url: URL, label: String) throws {
+    func requireArm64Binary(at url: URL, label: String) async throws {
+        try Task.checkCancellation()
         let probe: SubprocessResult
         do {
-            probe = try runner.run("/usr/bin/file", ["-b", url.path])
+            probe = try await runner.runAsync("/usr/bin/file", ["-b", url.path])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain(
                 "\(label) architecture check could not run (\(error.localizedDescription))."

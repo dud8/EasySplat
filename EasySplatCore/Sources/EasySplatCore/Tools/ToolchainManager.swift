@@ -238,22 +238,28 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
+        try Task.checkCancellation()
         guard !request.capabilities.isEmpty else {
             throw ToolchainError.invalidToolchain("No toolchain capabilities were requested.")
         }
         let source = try locator.locate()
+        try Task.checkCancellation()
         if case .appBundle = source, request.capabilities.contains(where: \.isDa3) {
             throw ToolchainError.artifactNotFound
         }
 
         let key = source.root.standardizedFileURL.path
+        try Task.checkCancellation()
         if let cached = memoizedPaths(key: key, satisfying: request.capabilities) {
+            try Task.checkCancellation()
             onProgress(1.0, "Tools ready")
+            try Task.checkCancellation()
             return cached
         }
 
         onProgress(-1.0, "Checking tools")
-        let paths = try validateToolchain(
+        try Task.checkCancellation()
+        let paths = try await validateToolchain(
             root: source.root,
             dataRoot: source.dataRoot,
             metallib: source.metallib,
@@ -262,8 +268,14 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             toolchainIdentity: toolchainIdentity(for: source),
             integrityPolicy: source.integrityPolicy
         )
-        recordValidation(key: key, capabilities: request.capabilities, paths: paths)
+        try Task.checkCancellation()
         onProgress(1.0, "Tools ready")
+        try Task.checkCancellation()
+        recordValidation(
+            key: key,
+            capabilities: request.capabilities,
+            paths: paths
+        )
         return paths
     }
 
@@ -298,6 +310,9 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         memoLock.lock()
         defer { memoLock.unlock() }
         let validated = (memo[key]?.validated ?? []).union(capabilities)
-        memo[key] = ValidatedToolchain(validated: validated, paths: paths)
+        memo[key] = ValidatedToolchain(
+            validated: validated,
+            paths: paths
+        )
     }
 }

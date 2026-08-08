@@ -1064,6 +1064,243 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertEqual(toolchain.toolchainIdentity, "local-\(root.lastPathComponent)")
     }
 
+    func testValidationUsesAsyncRunnerForEveryInteractiveProbe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let runner = AsyncOnlyValidationRunner(backing: makeValidationRunner(root: root))
+        let manager = ToolchainManager(runner: runner)
+
+        let toolchain = try await manager.test_validateToolchain(
+            root: root,
+            requiredCapabilities: [.core, .colmap, .msplat, .da3Base, .da3Small]
+        )
+
+        XCTAssertEqual(toolchain.root, root)
+        XCTAssertEqual(runner.asyncCallCount, 9)
+        XCTAssertEqual(runner.syncCallCount, 0)
+    }
+
+    func testResolveToolchainRethrowsCancellationAndRetriesInsteadOfMemoizing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let runner = CancelFirstValidationRunner(backing: makeValidationRunner(root: root))
+        let manager = ToolchainManager(
+            runner: runner,
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let request = ToolchainCapabilityRequest(
+            capabilities: [.core, .colmap, .msplat]
+        )
+        let progress = LockedToolchainProgress()
+
+        do {
+            _ = try await manager.resolveToolchain(
+                request: request,
+                onProgress: { progress.append($1) }
+            )
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Cancellation is control flow, not an invalid-toolchain diagnosis.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertFalse(progress.messages.contains("Tools ready"))
+
+        let toolchain = try await manager.resolveToolchain(
+            request: request,
+            onProgress: { progress.append($1) }
+        )
+
+        XCTAssertEqual(toolchain.root, root)
+        XCTAssertEqual(runner.cancelledCallCount, 1)
+        XCTAssertGreaterThan(runner.asyncCallCount, 1)
+        XCTAssertEqual(progress.messages.filter { $0 == "Tools ready" }.count, 1)
+    }
+
+    func testConcurrentProgressCancellationCannotRestoreAnOlderMemoEntry() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let backing = makeValidationRunner(root: root, repetitions: 3)
+        let validationGate = OrderedValidationStartRunner(backing: backing)
+        let readyGate = OrderedReadyCancellationGate()
+        let manager = ToolchainManager(
+            runner: validationGate,
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let request = ToolchainCapabilityRequest(
+            capabilities: [.core, .colmap, .msplat]
+        )
+
+        let first = Task {
+            try await manager.resolveToolchain(
+                request: request,
+                onProgress: { _, message in
+                    if message == "Tools ready" {
+                        readyGate.cancelAndWait(.first)
+                    }
+                }
+            )
+        }
+        let firstValidationStarted = await validationGate.waitUntilStarted(.first)
+        XCTAssertTrue(firstValidationStarted)
+
+        let second = Task {
+            try await manager.resolveToolchain(
+                request: request,
+                onProgress: { _, message in
+                    if message == "Tools ready" {
+                        readyGate.cancelAndWait(.second)
+                    }
+                }
+            )
+        }
+        let secondValidationStarted = await validationGate.waitUntilStarted(.second)
+        XCTAssertTrue(secondValidationStarted)
+
+        validationGate.resume(.first)
+        let firstReady = await readyGate.waitUntilReady(.first)
+        XCTAssertTrue(firstReady)
+        validationGate.resume(.second)
+        let secondReady = await readyGate.waitUntilReady(.second)
+        XCTAssertTrue(secondReady)
+
+        readyGate.resume(.first)
+        do {
+            _ = try await first.value
+            XCTFail("Expected the first resolution to be cancelled")
+        } catch is CancellationError {
+            // Expected: cancellation requested by the progress callback.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        readyGate.resume(.second)
+        do {
+            _ = try await second.value
+            XCTFail("Expected the second resolution to be cancelled")
+        } catch is CancellationError {
+            // Expected: cancellation requested by the progress callback.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        let callsBeforeRetry = backing.calls.count
+        let paths = try await manager.resolveToolchain(
+            request: request,
+            onProgress: { _, _ in }
+        )
+
+        XCTAssertEqual(paths.root, root)
+        XCTAssertGreaterThan(
+            backing.calls.count,
+            callsBeforeRetry,
+            "both cancelled resolutions must leave the memo empty"
+        )
+    }
+
+    func testResolveToolchainCancellationTerminatesStubbornValidationDescendant() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let descendantPIDURL = root.appendingPathComponent("validation-descendant.pid")
+        try TestFileBuilder.createExecutable(
+            at: fixture.colmap,
+            script: """
+            #!/bin/sh
+            if [ "${1:-}" = "help" ]; then
+                (
+                    trap '' INT TERM HUP
+                    exec /bin/sleep 60
+                ) &
+                descendant=$!
+                printf '%s\n' "$descendant" > "$EASYSPLAT_TEST_PID_FILE"
+                printf 'ready\n'
+                trap 'exit 23' INT TERM
+                while :; do :; done
+            fi
+            exit 0
+            """
+        )
+        let ready = DispatchSemaphore(value: 0)
+        let runner = StubbornValidationRunner(
+            colmapPath: fixture.colmap.path,
+            descendantPIDURL: descendantPIDURL,
+            ready: ready,
+            backing: makeValidationRunner(root: root)
+        )
+        let manager = ToolchainManager(
+            runner: runner,
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let task = Task {
+            try await manager.resolveToolchain(
+                request: ToolchainCapabilityRequest(
+                    capabilities: [.core, .colmap, .msplat]
+                ),
+                onProgress: { _, _ in }
+            )
+        }
+
+        guard await waitForToolchainSignal(ready, timeout: 2) else {
+            task.cancel()
+            _ = try? await task.value
+            return XCTFail("Validation child did not start through runAsync")
+        }
+        let descendantPID = try await waitForToolchainPID(
+            in: descendantPIDURL,
+            timeout: 2
+        )
+        defer { _ = kill(descendantPID, SIGKILL) }
+
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected after the process tree has been reaped.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        let descendantRemainsAlive = await toolchainProcessRemainsAlive(descendantPID)
+        XCTAssertFalse(descendantRemainsAlive)
+    }
+
+    func testToolchainHashingObservesCancellationDuringChunkedRead() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("large-metallib")
+        let descriptor = Darwin.open(
+            file.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+            mode_t(0o600)
+        )
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        defer { Darwin.close(descriptor) }
+        XCTAssertEqual(Darwin.ftruncate(descriptor, off_t(512 * 1_024 * 1_024)), 0)
+        let started = DispatchSemaphore(value: 0)
+        let task = Task.detached {
+            started.signal()
+            return try await ToolchainManager().test_sha256Hex(url: file)
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+        try await Task.sleep(nanoseconds: 10_000_000)
+
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation during hashing")
+        } catch is CancellationError {
+            // Expected at a bounded hashing chunk.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+    }
+
     func testResolveToolchainUsesSplitAppBundleLayout() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1367,9 +1604,10 @@ final class ToolchainManagerTests: XCTestCase {
         vocabularyTerminationReason: Process.TerminationReason = .exit,
         da3HelpExitCode: Int32 = 0,
         msplatSelfCheckExitCode: Int32 = 0,
-        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
+        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+        repetitions: Int = 1
     ) -> MockSubprocessRunner {
-        MockSubprocessRunner(scripts: [
+        let scripts: [MockSubprocessRunner.Script] = [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["help"], result: .init(exitCode: 0, terminationReason: colmapTerminationReason, stdout: colmapHelpStdout, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["mapper", "-h"], result: .init(exitCode: mapperExitCode, terminationReason: mapperTerminationReason, stdout: mapperStdout, stderr: mapperStderr), onRun: nil),
@@ -1389,8 +1627,356 @@ final class ToolchainManagerTests: XCTestCase {
                 ),
                 onRun: nil
             )
-        ])
+        ]
+        return MockSubprocessRunner(
+            scripts: (0..<repetitions).flatMap { _ in scripts }
+        )
     }
+}
+
+private enum ForbiddenSynchronousValidationProbe: Error {
+    case invoked
+}
+
+private final class LockedToolchainProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var messages: [String] { lock.withLock { storage } }
+
+    func append(_ message: String) {
+        lock.withLock { storage.append(message) }
+    }
+}
+
+private enum OrderedResolutionParticipant {
+    case first
+    case second
+}
+
+private final class OrderedValidationStartRunner: @unchecked Sendable, SubprocessRunning {
+    private let lock = NSLock()
+    private let backing: MockSubprocessRunner
+    private let firstStarted = DispatchSemaphore(value: 0)
+    private let secondStarted = DispatchSemaphore(value: 0)
+    private let resumeFirst = DispatchSemaphore(value: 0)
+    private let resumeSecond = DispatchSemaphore(value: 0)
+    private var coordinatedCallCount = 0
+
+    init(backing: MockSubprocessRunner) {
+        self.backing = backing
+    }
+
+    func waitUntilStarted(_ participant: OrderedResolutionParticipant) async -> Bool {
+        await waitForToolchainSignal(
+            participant == .first ? firstStarted : secondStarted,
+            timeout: 2
+        )
+    }
+
+    func resume(_ participant: OrderedResolutionParticipant) {
+        (participant == .first ? resumeFirst : resumeSecond).signal()
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        let participant: OrderedResolutionParticipant? = lock.withLock {
+            coordinatedCallCount += 1
+            switch coordinatedCallCount {
+            case 1: return .first
+            case 2: return .second
+            default: return nil
+            }
+        }
+        if let participant {
+            let started = participant == .first ? firstStarted : secondStarted
+            let resume = participant == .first ? resumeFirst : resumeSecond
+            started.signal()
+            guard await waitForToolchainSignal(resume, timeout: 2) else {
+                throw CancellationError()
+            }
+        }
+        return try await backing.runAsync(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+}
+
+private final class OrderedReadyCancellationGate: @unchecked Sendable {
+    private let firstReady = DispatchSemaphore(value: 0)
+    private let secondReady = DispatchSemaphore(value: 0)
+    private let resumeFirst = DispatchSemaphore(value: 0)
+    private let resumeSecond = DispatchSemaphore(value: 0)
+
+    func waitUntilReady(_ participant: OrderedResolutionParticipant) async -> Bool {
+        await waitForToolchainSignal(
+            participant == .first ? firstReady : secondReady,
+            timeout: 2
+        )
+    }
+
+    func resume(_ participant: OrderedResolutionParticipant) {
+        (participant == .first ? resumeFirst : resumeSecond).signal()
+    }
+
+    func cancelAndWait(_ participant: OrderedResolutionParticipant) {
+        withUnsafeCurrentTask { task in
+            task?.cancel()
+        }
+        let ready = participant == .first ? firstReady : secondReady
+        let resume = participant == .first ? resumeFirst : resumeSecond
+        ready.signal()
+        _ = resume.wait(timeout: .now() + 2)
+    }
+}
+
+private final class AsyncOnlyValidationRunner: @unchecked Sendable, SubprocessRunning {
+    private let lock = NSLock()
+    private let backing: MockSubprocessRunner
+    private var asyncCalls = 0
+    private var syncCalls = 0
+
+    var asyncCallCount: Int { lock.withLock { asyncCalls } }
+    var syncCallCount: Int { lock.withLock { syncCalls } }
+
+    init(backing: MockSubprocessRunner) {
+        self.backing = backing
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        lock.withLock { syncCalls += 1 }
+        throw ForbiddenSynchronousValidationProbe.invoked
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        lock.withLock { asyncCalls += 1 }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+}
+
+private final class CancelFirstValidationRunner: @unchecked Sendable, SubprocessRunning {
+    private let lock = NSLock()
+    private let backing: MockSubprocessRunner
+    private var shouldCancel = true
+    private var asyncCalls = 0
+    private var cancelledCalls = 0
+
+    var asyncCallCount: Int { lock.withLock { asyncCalls } }
+    var cancelledCallCount: Int { lock.withLock { cancelledCalls } }
+
+    init(backing: MockSubprocessRunner) {
+        self.backing = backing
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        if consumeCancellation() { throw CancellationError() }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        lock.withLock { asyncCalls += 1 }
+        if consumeCancellation() { throw CancellationError() }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    private func consumeCancellation() -> Bool {
+        lock.withLock {
+            guard shouldCancel else { return false }
+            shouldCancel = false
+            cancelledCalls += 1
+            return true
+        }
+    }
+}
+
+private final class StubbornValidationRunner: @unchecked Sendable, SubprocessRunning {
+    private let colmapPath: String
+    private let descendantPIDURL: URL
+    private let ready: DispatchSemaphore
+    private let backing: MockSubprocessRunner
+    private let real = SubprocessRunner()
+
+    init(
+        colmapPath: String,
+        descendantPIDURL: URL,
+        ready: DispatchSemaphore,
+        backing: MockSubprocessRunner
+    ) {
+        self.colmapPath = colmapPath
+        self.descendantPIDURL = descendantPIDURL
+        self.ready = ready
+        self.backing = backing
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        throw ForbiddenSynchronousValidationProbe.invoked
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        if launchPath == colmapPath, arguments == ["help"] {
+            var explicitEnvironment = environment
+            explicitEnvironment["EASYSPLAT_TEST_PID_FILE"] = descendantPIDURL.path
+            return try await real.runAsync(
+                launchPath,
+                arguments,
+                currentDirectory: currentDirectory,
+                environment: explicitEnvironment,
+                removingEnvironmentKeys: removingEnvironmentKeys,
+                onStdout: { [ready] line in
+                    if line == "ready" { ready.signal() }
+                    onStdout(line)
+                },
+                onStderr: onStderr
+            )
+        }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+}
+
+private func waitForToolchainSignal(
+    _ semaphore: DispatchSemaphore,
+    timeout: TimeInterval
+) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(
+                returning: semaphore.wait(timeout: .now() + timeout) == .success
+            )
+        }
+    }
+}
+
+private func waitForToolchainPID(in url: URL, timeout: TimeInterval) async throws -> pid_t {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let contents = try? String(contentsOf: url, encoding: .utf8),
+           let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return pid
+        }
+        try await Task.sleep(nanoseconds: 25_000_000)
+    }
+    throw CocoaError(.fileReadNoSuchFile)
+}
+
+private func toolchainProcessRemainsAlive(_ pid: pid_t) async -> Bool {
+    for _ in 0..<20 {
+        if kill(pid, 0) != 0, errno == ESRCH { return false }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+    }
+    return kill(pid, 0) == 0 || errno != ESRCH
 }
 
 enum NativeColmapHelpFixture {
@@ -1480,7 +2066,7 @@ extension ToolchainManagerTests {
     /// Distribution signing rewrites the helper after its receipt is written, so
     /// the receipt digest and the shipped bytes belong to different domains.
     /// A signed bundle must not compare them; an unsigned tree still must.
-    func testSignedBundlePolicySkipsTheRewrittenExecutableDigest() throws {
+    func testSignedBundlePolicySkipsTheRewrittenExecutableDigest() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
@@ -1494,17 +2080,19 @@ extension ToolchainManagerTests {
 
         let capabilities: Set<ToolchainCapability> = [.core, .colmap, .msplat]
 
-        XCTAssertThrowsError(
-            try ToolchainManager(runner: makeValidationRunner(root: root)).validateToolchain(
+        do {
+            _ = try await ToolchainManager(runner: makeValidationRunner(root: root)).validateToolchain(
                 root: root,
                 requiredCapabilities: capabilities,
                 toolchainIdentity: "local-fixture",
                 integrityPolicy: .unsignedDevelopmentTree
-            ),
-            "an unsigned tree must still match its receipt"
-        )
+            )
+            XCTFail("an unsigned tree must still match its receipt")
+        } catch {
+            XCTAssertTrue(error is ToolchainManager.ToolchainError)
+        }
 
-        let signed = try ToolchainManager(
+        let signed = try await ToolchainManager(
             runner: makeValidationRunner(root: root)
         ).validateToolchain(
             root: root,
@@ -1517,7 +2105,7 @@ extension ToolchainManagerTests {
 
     /// The metallib is not Mach-O and signing leaves it alone, so its digest is
     /// still load-bearing in a signed bundle.
-    func testSignedBundlePolicyStillRejectsATamperedMetallib() throws {
+    func testSignedBundlePolicyStillRejectsATamperedMetallib() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
@@ -1528,13 +2116,16 @@ extension ToolchainManagerTests {
         try handle.write(contentsOf: Data("tampered".utf8))
         try handle.close()
 
-        XCTAssertThrowsError(
-            try ToolchainManager(runner: makeValidationRunner(root: root)).validateToolchain(
+        do {
+            _ = try await ToolchainManager(runner: makeValidationRunner(root: root)).validateToolchain(
                 root: root,
                 requiredCapabilities: [.core, .colmap, .msplat],
                 toolchainIdentity: "0.2.0",
                 integrityPolicy: .signedAppBundle
             )
-        )
+            XCTFail("a signed tree must still match its metallib receipt")
+        } catch {
+            XCTAssertTrue(error is ToolchainManager.ToolchainError)
+        }
     }
 }
