@@ -513,14 +513,21 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.selectionWarning, "Both folders should merge; no folder is discarded.")
     }
 
-    func testAddingSeparateClipsPreservesExplicitContinuousOrdering() {
-        let model = AppModel(toolchainManager: MockToolchainManager())
+    func testAddingSeparateClipsPreservesExplicitContinuousOrdering() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString,
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let first = root.appendingPathComponent("one.mov")
+        let second = root.appendingPathComponent("two.mov")
+        try Data("one".utf8).write(to: first)
+        try Data("two".utf8).write(to: second)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: root)
         model.requestedRunOptions.inputOrdering = .continuous
 
-        model.addInputs(urls: [
-            URL(fileURLWithPath: "/tmp/one.mov"),
-            URL(fileURLWithPath: "/tmp/two.mov"),
-        ])
+        model.addInputs(urls: [first, second])
 
         XCTAssertEqual(model.requestedRunOptions.inputOrdering, .continuous)
         XCTAssertNil(model.selectionWarning)
@@ -2512,7 +2519,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.selectionWarning)
     }
 
-    func testAddInputsDeduplicatesSymlinkAndHardLinkAliasesByFileIdentity() throws {
+    func testAddInputsRejectsSymlinksAndDeduplicatesHardLinksByFileIdentity() throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
@@ -2527,8 +2534,8 @@ final class AppModelTests: XCTestCase {
 
         model.addInputs(urls: [symlink, video, hardLink])
 
-        XCTAssertEqual(model.pendingVideoURLs, [symlink], "The first presentation URL should be preserved.")
-        XCTAssertNil(model.selectionWarning)
+        XCTAssertEqual(model.pendingVideoURLs, [video])
+        XCTAssertEqual(model.selectionWarning, "Skipped 1 file EasySplat can't use as capture input.")
     }
 
     func testAddInputsKeepsDistinctFilesWithTheSameBasenameInUserOrder() throws {
@@ -2571,14 +2578,13 @@ final class AppModelTests: XCTestCase {
         )
     }
 
-    func testAddInputsMergesFolderPhotosAndDeduplicatesAliases() throws {
+    func testAddInputsMergesFolderPhotosAndDeduplicatesEquivalentPaths() throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         let selected = base.appendingPathComponent("Selected", isDirectory: true)
         let nested = selected.appendingPathComponent("nested", isDirectory: true)
-        let alias = base.appendingPathComponent("Selected Alias", isDirectory: true)
         let second = base.appendingPathComponent("Second", isDirectory: true)
         let third = base.appendingPathComponent("Third", isDirectory: true)
         for folder in [nested, second, third] {
@@ -2589,20 +2595,19 @@ final class AppModelTests: XCTestCase {
                 )
             }
         }
-        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: selected)
         let alternateSpelling = URL(fileURLWithPath: selected.path + "/nested/..", isDirectory: true)
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
 
-        // `selected`, its `nested/..` spelling, and the `alias` symlink all resolve
-        // to the same photos, so only their distinct files count once. `second` and
-        // `third` contribute their own. The photos live one level down in `nested`.
-        model.addInputs(urls: [selected, alternateSpelling, alias, second, third])
+        // `selected` and its `nested/..` spelling resolve to the same photos, so
+        // only their distinct files count once. `second` and `third` contribute
+        // their own. The photos live one level down in `nested`.
+        model.addInputs(urls: [selected, alternateSpelling, second, third])
 
         XCTAssertEqual(model.pendingPhotoURLs.count, AppModel.minimumRecommendedPhotos * 3)
         XCTAssertNil(model.selectionWarning, "All folders merge; none is discarded.")
 
         // Re-adding the same sources contributes nothing new.
-        model.addInputs(urls: [alias, second])
+        model.addInputs(urls: [second])
 
         XCTAssertEqual(model.pendingPhotoURLs.count, AppModel.minimumRecommendedPhotos * 3)
         XCTAssertNil(model.selectionWarning)

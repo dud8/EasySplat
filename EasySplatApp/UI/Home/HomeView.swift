@@ -2,11 +2,71 @@ import EasySplatCore
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum InputImporterRequest: Equatable {
+    case addFiles
+    case addFolders
+    case replaceFiles
+    case replaceFolders
+
+    var selectionMode: InputSelectionMode {
+        switch self {
+        case .addFiles, .addFolders: .append
+        case .replaceFiles, .replaceFolders: .replace
+        }
+    }
+
+    var allowedContentTypes: [UTType] {
+        switch self {
+        case .addFolders, .replaceFolders:
+            [.folder]
+        case .addFiles, .replaceFiles:
+            [.image, .movie, .video, .mpeg4Movie, .quickTimeMovie, .zip]
+        }
+    }
+
+    var failureMessage: String {
+        switch self {
+        case .addFolders, .replaceFolders: "Couldn’t choose folder."
+        case .addFiles, .replaceFiles: "Couldn’t choose input"
+        }
+    }
+}
+
+struct InputImporterPresentation {
+    private(set) var request: InputImporterRequest?
+    private(set) var isPresented = false
+
+    mutating func present(_ request: InputImporterRequest) {
+        guard self.request == nil else { return }
+        self.request = request
+        isPresented = true
+    }
+
+    /// SwiftUI can lower the binding before either terminal callback arrives.
+    /// Keep the typed request until completion or cancellation consumes it.
+    mutating func presentationChanged(_ isPresented: Bool) {
+        self.isPresented = isPresented && request != nil
+    }
+
+    mutating func finish() -> InputImporterRequest? {
+        let finishedRequest = request
+        clear()
+        return finishedRequest
+    }
+
+    mutating func cancel() {
+        clear()
+    }
+
+    private mutating func clear() {
+        request = nil
+        isPresented = false
+    }
+}
+
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var showInputImporter = false
-    @State private var showFolderImporter = false
-    @State private var replaceInputOnImport = false
+    @State private var inputImporter = InputImporterPresentation()
     @State private var showLowDiskWarning = false
     @State private var optionsExpanded = false
     @FocusState private var isDropZoneFocused: Bool
@@ -46,32 +106,20 @@ struct HomeView: View {
                 DropZoneView(
                     title: "Choose Input…",
                     subtitle: "or drop videos, photos, folders, or a dataset here",
-                    onChoose: { presentInputImporter(replacing: false) },
-                    onDropURLs: { model.addInputs(urls: $0) }
+                    onChoose: { presentInputImporter(.addFiles) },
+                    onDropBatch: { model.addDroppedInputs($0) }
                 )
                 .frame(height: 180)
                 .focused($isDropZoneFocused)
                 .accessibilityIdentifier("home.chooseInput")
 
-                // A panel that offers files opens a folder rather than choosing
-                // it, so picking a whole capture folder needs a panel of its own.
-                // It hangs off this row rather than the view the file panel uses:
-                // two importers on one view leave only the last one working.
                 HStack {
                     Spacer()
                     Button("Choose Folder…") {
-                        replaceInputOnImport = false
-                        showFolderImporter = true
+                        presentInputImporter(.addFolders)
                     }
                     .buttonStyle(.borderless)
                     .accessibilityIdentifier("home.chooseFolder")
-                }
-                .fileImporter(
-                    isPresented: $showFolderImporter,
-                    allowedContentTypes: [.folder],
-                    allowsMultipleSelection: true
-                ) { result in
-                    handleImport(result)
                 }
 
                 if hasInput {
@@ -136,20 +184,15 @@ struct HomeView: View {
         .pageScrollEdgeEffect()
         .defaultFocus($isDropZoneFocused, true)
         .fileImporter(
-            isPresented: $showInputImporter,
-            allowedContentTypes: [
-                .folder,
-                .image,
-                .movie,
-                .video,
-                .mpeg4Movie,
-                .quickTimeMovie,
-                .zip
-            ],
-            allowsMultipleSelection: true
-        ) { result in
-            handleImport(result)
-        }
+            isPresented: Binding(
+                get: { inputImporter.isPresented },
+                set: { inputImporter.presentationChanged($0) }
+            ),
+            allowedContentTypes: inputImporter.request?.allowedContentTypes ?? [],
+            allowsMultipleSelection: true,
+            onCompletion: { result in handleImport(result) },
+            onCancellation: { inputImporter.cancel() }
+        )
         .alert("Low disk space", isPresented: $showLowDiskWarning) {
             Button("Create Anyway") {
                 model.startFromPendingSelection()
@@ -167,12 +210,11 @@ struct HomeView: View {
                     .font(.headline)
                 Spacer()
                 Button("Replace Input…") {
-                    presentInputImporter(replacing: true)
+                    presentInputImporter(.replaceFiles)
                 }
                 .buttonStyle(.borderless)
                 Button("Replace with Folder…") {
-                    replaceInputOnImport = true
-                    showFolderImporter = true
+                    presentInputImporter(.replaceFolders)
                 }
                 .buttonStyle(.borderless)
             }
@@ -474,20 +516,17 @@ struct HomeView: View {
         }
     }
 
-    private func presentInputImporter(replacing: Bool) {
-        replaceInputOnImport = replacing
-        showInputImporter = true
+    private func presentInputImporter(_ request: InputImporterRequest) {
+        inputImporter.present(request)
     }
 
-    /// Both panels end the same way, and the file panel and the folder panel are
-    /// attached to different views because only one importer per view works.
     private func handleImport(_ result: Result<[URL], any Error>) {
-        defer { replaceInputOnImport = false }
-        guard case let .success(urls) = result else { return }
-        if replaceInputOnImport {
-            model.clearPendingInputs()
-        }
-        model.addInputs(urls: urls)
+        guard let request = inputImporter.finish() else { return }
+        model.handleInputImporterResult(
+            result,
+            mode: request.selectionMode,
+            failureMessage: request.failureMessage
+        )
     }
 
     private func start() {
