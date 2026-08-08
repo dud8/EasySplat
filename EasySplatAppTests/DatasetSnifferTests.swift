@@ -72,14 +72,27 @@ final class DatasetSnifferTests: XCTestCase {
         XCTAssertNil(DatasetSniffer.detect(at: root))
     }
 
+    func testColmapSymlinkedModelMarkerIsNotDetected() throws {
+        let external = root.appendingPathComponent("external-cameras.bin")
+        try Data("camera".utf8).write(to: external)
+        try makeFile("sparse/0/images.bin")
+        try makeFile("images/frame001.jpg")
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("sparse/0/cameras.bin"),
+            withDestinationURL: external
+        )
+
+        XCTAssertNil(DatasetSniffer.detect(at: root))
+    }
+
     func testDetectsNerfstudioTransforms() throws {
         try makeFile("transforms.json", contents: "{}")
         XCTAssertEqual(DatasetSniffer.detect(at: root), .nerfstudio(root: root))
     }
 
-    func testDetectsNerfstudioTransformsTrain() throws {
+    func testTrainOnlyNerfstudioFolderFallsThroughDatasetDetection() throws {
         try makeFile("transforms_train.json", contents: "{}")
-        XCTAssertEqual(DatasetSniffer.detect(at: root), .nerfstudio(root: root))
+        XCTAssertNil(DatasetSniffer.detect(at: root))
     }
 
     func testDetectsPolycamKeyframes() throws {
@@ -119,6 +132,29 @@ final class DatasetSnifferTests: XCTestCase {
         XCTAssertEqual(DatasetSniffer.detect(at: root), .colmap(root: child))
     }
 
+    func testDoesNotDescendIntoSoleSymlinkedChildDirectory() throws {
+        let external = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DatasetSnifferExternal-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: external) }
+        try FileManager.default.createDirectory(
+            at: external.appendingPathComponent("sparse/0", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data("c".utf8).write(to: external.appendingPathComponent("sparse/0/cameras.bin"))
+        try Data("i".utf8).write(to: external.appendingPathComponent("sparse/0/images.bin"))
+        try FileManager.default.createDirectory(
+            at: external.appendingPathComponent("images", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try Data("jpg".utf8).write(to: external.appendingPathComponent("images/frame001.jpg"))
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("export", isDirectory: true),
+            withDestinationURL: external
+        )
+
+        XCTAssertNil(DatasetSniffer.detect(at: root))
+    }
+
     func testSoleChildDescentIgnoresLooseFilesAtRoot() throws {
         try makeColmapFixture(at: "export")
         try makeFile("readme.txt")
@@ -144,6 +180,18 @@ final class DatasetSnifferTests: XCTestCase {
         try makeFile("b.jpg")
         try makeFile("c.heic")
         XCTAssertNil(DatasetSniffer.detect(at: root))
+    }
+
+    func testFolderSniffingStopsAtItsEntryBudget() throws {
+        try makeFile("wrapper/transforms.json", contents: "{}")
+        try makeFile("readme.txt")
+
+        XCTAssertEqual(
+            DatasetSniffer.detect(at: root, maximumEntryCount: 2)?.kind,
+            .nerfstudio
+        )
+        XCTAssertNil(DatasetSniffer.detect(at: root, maximumEntryCount: 1))
+        XCTAssertEqual(DatasetContract.maximumEntryCount, 50_000)
     }
 
     func testMissingFolderIsNotADataset() {
@@ -231,6 +279,15 @@ final class DatasetSnifferTests: XCTestCase {
         XCTAssertEqual(detection?.kind, .nerfstudio)
     }
 
+    func testTrainOnlyNerfstudioZipIsUnsupported() {
+        let detection = detection(forZipEntries: [
+            "scene/",
+            "scene/transforms_train.json",
+            "scene/images/frame001.png",
+        ])
+        XCTAssertNil(detection)
+    }
+
     func testZipDetectsPolycamEntries() {
         let detection = detection(forZipEntries: [
             "keyframes/cameras/0.json",
@@ -255,6 +312,48 @@ final class DatasetSnifferTests: XCTestCase {
 
     func testZipListingFailureIsNotADataset() {
         XCTAssertNil(detection(forZipEntries: [], unreadable: true))
+    }
+
+    func testZipSniffingAcceptsExactly50000EntriesAndRejects50001() {
+        let archive = root.appendingPathComponent("synthetic.zip")
+        var names = [DatasetContract.nerfstudioManifestName]
+        names.append(contentsOf: (1..<50_000).map { "metadata/\($0).txt" })
+
+        XCTAssertEqual(
+            DatasetSniffer.detectInZip(at: archive, entryNameLoader: { _ in names })?.kind,
+            .nerfstudio
+        )
+        names.append("metadata/overflow.txt")
+        XCTAssertNil(
+            DatasetSniffer.detectInZip(at: archive, entryNameLoader: { _ in names })
+        )
+    }
+
+    func testZipSniffingAccepts64ComponentsAndRejects65() {
+        let archive = root.appendingPathComponent("synthetic.zip")
+        let sixtyFour = Array(repeating: "d", count: 63).joined(separator: "/")
+            + "/frame.jpg"
+        let sixtyFive = Array(repeating: "d", count: 64).joined(separator: "/")
+            + "/frame.jpg"
+
+        XCTAssertEqual(
+            DatasetSniffer.detectInZip(
+                at: archive,
+                entryNameLoader: { _ in
+                    [DatasetContract.nerfstudioManifestName, sixtyFour]
+                }
+            )?.kind,
+            .nerfstudio
+        )
+        XCTAssertNil(
+            DatasetSniffer.detectInZip(
+                at: archive,
+                entryNameLoader: { _ in
+                    [DatasetContract.nerfstudioManifestName, sixtyFive]
+                }
+            )
+        )
+        XCTAssertEqual(DatasetContract.maximumRelativePathComponents, 64)
     }
 
     // MARK: - Zip detection (real archive)

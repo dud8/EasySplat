@@ -92,6 +92,71 @@ final class NerfstudioDatasetImporterTests: XCTestCase {
         XCTAssertEqual(plan.model.images.first?.pose.qx ?? 0, 1, accuracy: 1e-12)
     }
 
+    func testDeclaredPathsAccept64ComponentsAndReject65() throws {
+        let sixtyFour = Array(repeating: "d", count: 63).joined(separator: "/")
+            + "/frame.jpg"
+        let sixtyFive = Array(repeating: "d", count: 64).joined(separator: "/")
+            + "/frame.jpg"
+        let base: [String: Any] = [
+            "fl_x": 500.0,
+            "fl_y": 500.0,
+            "cx": 320.0,
+            "cy": 240.0,
+            "w": 640,
+            "h": 480,
+        ]
+        var accepted = base
+        accepted["frames"] = [[
+            "file_path": sixtyFour,
+            "transform_matrix": identityMatrix,
+        ]]
+        XCTAssertEqual(
+            try NerfstudioDatasetImporter.plan(fromTransformsJSON: makeJSON(accepted))
+                .images.map(\.declaredPath),
+            [sixtyFour]
+        )
+
+        var rejected = base
+        rejected["frames"] = [[
+            "file_path": sixtyFive,
+            "transform_matrix": identityMatrix,
+        ]]
+        XCTAssertThrowsError(
+            try NerfstudioDatasetImporter.plan(fromTransformsJSON: makeJSON(rejected))
+        ) { error in
+            XCTAssertEqual(
+                error as? NerfstudioDatasetImporter.ImportError,
+                .invalidFramePath(sixtyFive)
+            )
+        }
+    }
+
+    func testDeclaredPathNormalizationAcceptsOnlyOneLeadingDotComponent() {
+        XCTAssertEqual(
+            DatasetDeclaredPath.normalized("./images/frame.jpg"),
+            "images/frame.jpg"
+        )
+        XCTAssertNil(DatasetDeclaredPath.normalized("././images/frame.jpg"))
+        XCTAssertNil(DatasetDeclaredPath.normalized("./../images/frame.jpg"))
+    }
+
+    func testDeclaredPathDepthGuardRejectsBeforeCanonicalNormalization() {
+        let sixtyFour = Array(repeating: "d", count: 63).joined(separator: "/")
+            + "/frame.jpg"
+        let sixtyFive = Array(repeating: "d", count: 64).joined(separator: "/")
+            + "/frame.jpg"
+
+        XCTAssertEqual(DatasetDeclaredPath.normalized(sixtyFour), sixtyFour)
+        XCTAssertNil(DatasetDeclaredPath.normalized(sixtyFive))
+
+        // A hostile model can fit a very long path inside the bounded metadata
+        // file. Reject its 65th component while scanning the original storage;
+        // do not first build a normalized String or a component array.
+        let hostile = Array(repeating: "./", count: 100_000).joined()
+            + "frame.jpg"
+        XCTAssertNil(DatasetDeclaredPath.normalized(hostile))
+    }
+
     func testRejections() {
         func expectError(_ object: [String: Any], _ expected: NerfstudioDatasetImporter.ImportError, line: UInt = #line) {
             XCTAssertThrowsError(

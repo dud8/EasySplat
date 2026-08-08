@@ -77,6 +77,9 @@ final class ColmapDatasetImporterTests: XCTestCase {
         XCTAssertEqual(plan.kind, .colmap)
         XCTAssertEqual(plan.route, .adoptDirect)
         XCTAssertEqual(plan.images.map(\.declaredPath), ["images/a.jpg", "images/b.jpg"])
+        XCTAssertEqual(plan.images.map(\.entryID), ["images/a.jpg", "images/b.jpg"])
+        XCTAssertEqual(plan.model.images.map(\.name), ["images/a.jpg", "images/b.jpg"])
+        XCTAssertEqual(plan.model.images.map(\.cameraID), [1, 1])
         XCTAssertEqual(plan.model.points.count, ColmapDatasetImporter.minimumDirectAdoptionPoints)
         XCTAssertEqual(plan.model.images.first?.observations.count, 2)
     }
@@ -133,6 +136,133 @@ final class ColmapDatasetImporterTests: XCTestCase {
         }
     }
 
+    func testTextModelRejectsTraversalBeforeImageLookup() throws {
+        try writeTextModel(
+            at: root.appendingPathComponent("sparse/0"),
+            names: ["../outside.jpg"],
+            pointCount: 0,
+            observations: false
+        )
+
+        XCTAssertThrowsError(try ColmapDatasetImporter.plan(datasetRoot: root)) { error in
+            XCTAssertEqual(
+                error as? ColmapModelReader.ReadError,
+                .invalidImagePath("../outside.jpg")
+            )
+        }
+    }
+
+    func testTextModelRejectsBackslashAndControlImagePaths() throws {
+        for (index, path) in ["folder\\a.jpg", "folder/bad\tname.jpg"].enumerated() {
+            let directory = root.appendingPathComponent("unsafe-text-path-\(index)")
+            try writeTextModel(
+                at: directory,
+                names: [path],
+                pointCount: 0,
+                observations: false
+            )
+
+            XCTAssertThrowsError(try ColmapModelReader.readText(modelDirectory: directory)) { error in
+                XCTAssertEqual(
+                    error as? ColmapModelReader.ReadError,
+                    .invalidImagePath(path)
+                )
+            }
+        }
+    }
+
+    func testTextModelKeepsWhitespaceDelimitedFieldsAndSpacesInImageName() throws {
+        let directory = root.appendingPathComponent("tab-delimited-text")
+        try writeTextModel(
+            at: directory,
+            names: ["placeholder.jpg"],
+            pointCount: 0,
+            observations: false
+        )
+        try "1\t1\t0\t0\t0\t0\t0\t0\t1\tb c.jpg\n\n".write(
+            to: directory.appendingPathComponent("images.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let model = try ColmapModelReader.readText(modelDirectory: directory)
+        XCTAssertEqual(model.images.map(\.name), ["b c.jpg"])
+    }
+
+    func testTextModelRejectsTrailingTabInImageName() throws {
+        let directory = root.appendingPathComponent("trailing-tab-text")
+        try writeTextModel(
+            at: directory,
+            names: ["placeholder.jpg"],
+            pointCount: 0,
+            observations: false
+        )
+        try "1 1 0 0 0 0 0 0 1 frame.jpg\t\n\n".write(
+            to: directory.appendingPathComponent("images.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertThrowsError(try ColmapModelReader.readText(modelDirectory: directory)) { error in
+            XCTAssertEqual(
+                error as? ColmapModelReader.ReadError,
+                .invalidImagePath("frame.jpg\t")
+            )
+        }
+    }
+
+    func testTextModelPreservesTrailingSpaceInImageName() throws {
+        let directory = root.appendingPathComponent("trailing-space-text")
+        try writeTextModel(
+            at: directory,
+            names: ["placeholder.jpg"],
+            pointCount: 0,
+            observations: false
+        )
+        try "1 1 0 0 0 0 0 0 1 frame.jpg \n\n".write(
+            to: directory.appendingPathComponent("images.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let model = try ColmapModelReader.readText(modelDirectory: directory)
+        XCTAssertEqual(model.images.map(\.name), ["frame.jpg "])
+    }
+
+    func testTextModelAccepts64PathComponentsAndRejects65() throws {
+        let sixtyFour = Array(repeating: "d", count: 63).joined(separator: "/")
+            + "/frame.jpg"
+        let sixtyFive = Array(repeating: "d", count: 64).joined(separator: "/")
+            + "/frame.jpg"
+        let acceptedDirectory = root.appendingPathComponent("path-depth-64")
+        try writeTextModel(
+            at: acceptedDirectory,
+            names: [sixtyFour],
+            pointCount: 0,
+            observations: false
+        )
+        XCTAssertEqual(
+            try ColmapModelReader.readText(modelDirectory: acceptedDirectory).images.map(\.name),
+            [sixtyFour]
+        )
+
+        let rejectedDirectory = root.appendingPathComponent("path-depth-65")
+        try writeTextModel(
+            at: rejectedDirectory,
+            names: [sixtyFive],
+            pointCount: 0,
+            observations: false
+        )
+        XCTAssertThrowsError(
+            try ColmapModelReader.readText(modelDirectory: rejectedDirectory)
+        ) { error in
+            XCTAssertEqual(
+                error as? ColmapModelReader.ReadError,
+                .invalidImagePath(sixtyFive)
+            )
+        }
+    }
+
     func testUnposedImagesAreExcludedAndNoted() throws {
         try writeTextModel(at: root.appendingPathComponent("sparse/0"), names: ["a.jpg"], pointCount: 0, observations: false)
         try writeImages(named: ["a.jpg", "extra.jpg"])
@@ -165,6 +295,87 @@ final class ColmapDatasetImporterTests: XCTestCase {
         let (binaryModel, format) = try ColmapModelReader.read(modelDirectory: binaryDirectory)
         XCTAssertEqual(format, .binary)
         XCTAssertEqual(binaryModel, textModel)
+    }
+
+    func testBinaryModelRejectsAbsoluteTraversalBackslashAndControlImageNames() throws {
+        let source = root.appendingPathComponent("binary-source")
+        try writeTextModel(at: source, names: ["a.jpg"], pointCount: 0, observations: false)
+        let original = try ColmapModelReader.readText(modelDirectory: source)
+
+        for (index, rawName) in [
+            "/outside.jpg", "../outside.jpg", "folder\\a.jpg", "folder/bad\tname.jpg",
+        ].enumerated() {
+            var model = original
+            model.images[0].name = rawName
+            let directory = root.appendingPathComponent("binary-unsafe-\(index)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try binaryCameras(model.cameras).write(to: directory.appendingPathComponent("cameras.bin"))
+            try binaryImages(model.images).write(to: directory.appendingPathComponent("images.bin"))
+
+            XCTAssertThrowsError(try ColmapModelReader.readBinary(modelDirectory: directory)) { error in
+                XCTAssertEqual(
+                    error as? ColmapModelReader.ReadError,
+                    .invalidImagePath(rawName)
+                )
+            }
+        }
+    }
+
+    func testTextModelRejectsCanonicalCaseAndUnicodeImageCollisions() throws {
+        let cases: [(names: [String], duplicate: String)] = [
+            (["a.jpg", "./a.jpg"], "a.jpg"),
+            (["Frame.jpg", "frame.jpg"], "frame.jpg"),
+            (["caf\u{00E9}.jpg", "cafe\u{0301}.jpg"], "caf\u{00E9}.jpg"),
+        ]
+
+        for (index, testCase) in cases.enumerated() {
+            let directory = root.appendingPathComponent("text-collision-\(index)")
+            try writeTextModel(
+                at: directory,
+                names: testCase.names,
+                pointCount: 0,
+                observations: false
+            )
+            XCTAssertThrowsError(try ColmapModelReader.readText(modelDirectory: directory)) { error in
+                XCTAssertEqual(
+                    error as? ColmapModelReader.ReadError,
+                    .duplicateImagePath(testCase.duplicate)
+                )
+            }
+        }
+    }
+
+    func testBinaryModelRejectsCanonicalCaseAndUnicodeImageCollisions() throws {
+        let source = root.appendingPathComponent("binary-collision-source")
+        try writeTextModel(
+            at: source,
+            names: ["first.jpg", "second.jpg"],
+            pointCount: 0,
+            observations: true
+        )
+        let original = try ColmapModelReader.readText(modelDirectory: source)
+        let cases: [(names: [String], duplicate: String)] = [
+            (["a.jpg", "./a.jpg"], "a.jpg"),
+            (["Frame.jpg", "frame.jpg"], "frame.jpg"),
+            (["caf\u{00E9}.jpg", "cafe\u{0301}.jpg"], "caf\u{00E9}.jpg"),
+        ]
+
+        for (index, testCase) in cases.enumerated() {
+            var model = original
+            model.images[0].name = testCase.names[0]
+            model.images[1].name = testCase.names[1]
+            let directory = root.appendingPathComponent("binary-collision-\(index)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try binaryCameras(model.cameras).write(to: directory.appendingPathComponent("cameras.bin"))
+            try binaryImages(model.images).write(to: directory.appendingPathComponent("images.bin"))
+
+            XCTAssertThrowsError(try ColmapModelReader.readBinary(modelDirectory: directory)) { error in
+                XCTAssertEqual(
+                    error as? ColmapModelReader.ReadError,
+                    .duplicateImagePath(testCase.duplicate)
+                )
+            }
+        }
     }
 
     func testTruncatedBinaryModelIsRejectedNotCrashed() throws {

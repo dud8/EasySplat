@@ -255,6 +255,7 @@ extension AppModel {
     func startProject(
         input: InputSpec,
         photoURLs: [URL]? = nil,
+        datasetInputSource: DatasetInputSource? = nil,
         title: String,
         taskToken: UUID? = nil,
         timingBoundary: RunTimingBoundary? = nil
@@ -304,17 +305,13 @@ extension AppModel {
                 statusTitle = "Checking dataset"
                 statusDetail = nil
                 progress = nil
-                guard let datasetKind = input.datasetKind, let sourcePath = input.photosFolder else {
+                guard let datasetKind = input.datasetKind, let datasetInputSource else {
                     throw DatasetInputError.unreadableDataset
                 }
-                let source = URL(fileURLWithPath: sourcePath)
-                let isZip = source.pathExtension.lowercased() == "zip"
-                let prepared = try await DatasetInputPreflight.prepare(
-                    source: source,
-                    isZip: isZip,
-                    kind: datasetKind,
-                    stagingParent: projectBaseDirectory(),
-                    runner: SubprocessRunner()
+                let prepared = try await datasetInputPreflight(
+                    datasetInputSource,
+                    datasetKind,
+                    projectBaseDirectory()
                 )
                 preparedDatasetInput = prepared
                 // The imported poses fix the geometry route and image count, so

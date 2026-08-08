@@ -143,6 +143,7 @@ extension AppModel {
         guard !hasActiveWork else { return }
         guard let inputSpec = buildInputSpec() else { return }
         let photoURLs = pendingPhotoURLs
+        let datasetInputSource = pendingDataset?.inputSource
         let title = projectTitle(for: inputSpec)
         let token = UUID()
         currentTaskToken = token
@@ -152,6 +153,7 @@ extension AppModel {
             await startProject(
                 input: inputSpec,
                 photoURLs: photoURLs,
+                datasetInputSource: datasetInputSource,
                 title: title,
                 taskToken: token,
                 timingBoundary: timingBoundary

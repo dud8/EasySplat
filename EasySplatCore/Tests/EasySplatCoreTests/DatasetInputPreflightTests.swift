@@ -1,4 +1,5 @@
 import CoreGraphics
+import Darwin
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -133,6 +134,24 @@ final class DatasetInputPreflightTests: XCTestCase {
         )
     }
 
+    private func prepare(
+        source: DatasetInputSource,
+        kind: DatasetKind,
+        stagingParent: URL,
+        runner: SubprocessRunning = SubprocessRunner(),
+        sourceReadObserver: @escaping @Sendable (String) -> Void = { _ in },
+        directoryLimits: DatasetSelectedRootReader.Limits = .datasetPreflight
+    ) async throws -> PreparedDatasetInput {
+        try await DatasetInputPreflight.prepare(
+            source: source,
+            kind: kind,
+            stagingParent: stagingParent,
+            runner: runner,
+            sourceReadObserver: sourceReadObserver,
+            directoryLimits: directoryLimits
+        )
+    }
+
     private func assertThrows(
         _ expected: DatasetInputError,
         file: StaticString = #filePath,
@@ -198,6 +217,363 @@ final class DatasetInputPreflightTests: XCTestCase {
 
         prepared.discard()
         XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.stagingDirectory.path))
+    }
+
+    func testSelectedParentAndSoleResolvedChildPrepareOneWrapperDataset() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let selectedParent = root.appendingPathComponent("selected", isDirectory: true)
+        try TestFileBuilder.createDirectory(selectedParent)
+        let dataset = try makeNerfstudioDataset(in: selectedParent)
+
+        let prepared = try await prepare(
+            source: .directory(selectedURL: selectedParent, resolvedRoot: dataset),
+            kind: .nerfstudio,
+            stagingParent: root
+        )
+        defer { prepared.discard() }
+
+        XCTAssertEqual(prepared.imageCount, 3)
+        XCTAssertTrue(prepared.stagedImages.allSatisfy {
+            $0.url.path.hasPrefix(prepared.stagingDirectory.path + "/")
+        })
+    }
+
+    func testSelectedParentReplacementBySymlinkIsUnsafe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let selectedParent = root.appendingPathComponent("selected", isDirectory: true)
+        try TestFileBuilder.createDirectory(selectedParent)
+        let dataset = try makeNerfstudioDataset(in: selectedParent)
+        let source = DatasetInputSource.directory(
+            selectedURL: selectedParent,
+            resolvedRoot: dataset
+        )
+
+        let detached = root.appendingPathComponent("detached", isDirectory: true)
+        try FileManager.default.moveItem(at: selectedParent, to: detached)
+        let replacementParent = root.appendingPathComponent("replacement", isDirectory: true)
+        _ = try makeNerfstudioDataset(in: replacementParent)
+        try FileManager.default.createSymbolicLink(
+            at: selectedParent,
+            withDestinationURL: replacementParent
+        )
+
+        await assertThrows(.unsafeLayout) {
+            _ = try await self.prepare(
+                source: source,
+                kind: .nerfstudio,
+                stagingParent: root
+            )
+        }
+    }
+
+    func testResolvedRootMoreThanOneChildBelowSelectionIsUnsafe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let selectedParent = root.appendingPathComponent("selected", isDirectory: true)
+        let wrapper = selectedParent.appendingPathComponent("wrapper", isDirectory: true)
+        let dataset = try makeNerfstudioDataset(in: wrapper)
+
+        await assertThrows(.unsafeLayout) {
+            _ = try await self.prepare(
+                source: .directory(selectedURL: selectedParent, resolvedRoot: dataset),
+                kind: .nerfstudio,
+                stagingParent: root
+            )
+        }
+    }
+
+    func testFolderPreflightOwnsImmutableMetadataAndImageSnapshots() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = try makeNerfstudioDataset(in: root)
+
+        let prepared = try await prepare(source: dataset, kind: .nerfstudio, stagingParent: root)
+        defer { prepared.discard() }
+        let stagedImageData = try prepared.stagedImages.map { try Data(contentsOf: $0.url) }
+        let stagedSourceData = try prepared.sourceFileURLs.map { try Data(contentsOf: $0) }
+
+        try FileManager.default.removeItem(at: dataset)
+
+        XCTAssertEqual(
+            try prepared.stagedImages.map { try Data(contentsOf: $0.url) },
+            stagedImageData
+        )
+        XCTAssertEqual(
+            try prepared.sourceFileURLs.map { try Data(contentsOf: $0) },
+            stagedSourceData
+        )
+        XCTAssertTrue(prepared.stagedImages.allSatisfy {
+            $0.url.path.hasPrefix(prepared.stagingDirectory.path + "/")
+        })
+        XCTAssertTrue(prepared.sourceFileURLs.allSatisfy {
+            $0.path.hasPrefix(prepared.stagingDirectory.path + "/")
+        })
+        _ = try ColmapModelReader.read(
+            modelDirectory: prepared.stagingDirectory.appendingPathComponent("seed", isDirectory: true)
+        )
+    }
+
+    func testIntermediateSymlinkedImageDirectoryIsUnsafe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = root.appendingPathComponent("dataset", isDirectory: true)
+        let externalImages = root.appendingPathComponent("external-images", isDirectory: true)
+        try TestFileBuilder.createDirectory(dataset)
+        try writeJPEG(at: externalImages.appendingPathComponent("a.jpg"), value: 20)
+        try writeTransformsJSON(
+            at: dataset.appendingPathComponent(DatasetContract.nerfstudioManifestName),
+            framePaths: ["images/a.jpg"]
+        )
+        try FileManager.default.createSymbolicLink(
+            at: dataset.appendingPathComponent("images", isDirectory: true),
+            withDestinationURL: externalImages
+        )
+
+        do {
+            _ = try await prepare(source: dataset, kind: .nerfstudio, stagingParent: root)
+            XCTFail("Expected unsafe dataset layout.")
+        } catch {
+            XCTAssertEqual(error as? DatasetInputError, .unsafeLayout)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "This dataset contains a linked or out-of-folder file. Re-export it with regular files inside one folder."
+            )
+        }
+    }
+
+    func testLinkedColmapModelDirectoryIsUnsafe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = root.appendingPathComponent("dataset", isDirectory: true)
+        let externalSparse = root.appendingPathComponent("external-sparse", isDirectory: true)
+        try TestFileBuilder.createDirectory(externalSparse.appendingPathComponent("0", isDirectory: true))
+        try TestFileBuilder.createTextFile(
+            at: externalSparse.appendingPathComponent("0/cameras.txt"),
+            text: "1 PINHOLE 8 8 500 500 4 4\n"
+        )
+        try TestFileBuilder.createTextFile(
+            at: externalSparse.appendingPathComponent("0/images.txt"),
+            text: "1 1 0 0 0 0 0 0 1 a.jpg\n\n"
+        )
+        try TestFileBuilder.createTextFile(
+            at: externalSparse.appendingPathComponent("0/points3D.txt"),
+            text: ""
+        )
+        try writeJPEG(at: dataset.appendingPathComponent("images/a.jpg"), value: 30)
+        try FileManager.default.createSymbolicLink(
+            at: dataset.appendingPathComponent("sparse", isDirectory: true),
+            withDestinationURL: externalSparse
+        )
+
+        await assertThrows(.unsafeLayout) {
+            _ = try await self.prepare(source: dataset, kind: .colmap, stagingParent: root)
+        }
+    }
+
+    func testSpecialImageFileIsUnsafe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = root.appendingPathComponent("dataset", isDirectory: true)
+        let fifo = dataset.appendingPathComponent("images/a.jpg")
+        try TestFileBuilder.createDirectory(fifo.deletingLastPathComponent())
+        XCTAssertEqual(mkfifo(fifo.path, S_IRUSR | S_IWUSR), 0)
+        try writeTransformsJSON(
+            at: dataset.appendingPathComponent(DatasetContract.nerfstudioManifestName),
+            framePaths: ["images/a.jpg"]
+        )
+
+        await assertThrows(.unsafeLayout) {
+            _ = try await self.prepare(source: dataset, kind: .nerfstudio, stagingParent: root)
+        }
+    }
+
+    func testSourceReplacementDuringDescriptorBindingIsUnsafe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = try makeNerfstudioDataset(in: root)
+        let manifest = dataset.appendingPathComponent(DatasetContract.nerfstudioManifestName)
+
+        await assertThrows(.unsafeLayout) {
+            _ = try await self.prepare(
+                source: .directory(selectedURL: dataset, resolvedRoot: dataset),
+                kind: .nerfstudio,
+                stagingParent: root,
+                sourceReadObserver: { relativePath in
+                    guard relativePath == DatasetContract.nerfstudioManifestName else { return }
+                    try? FileManager.default.removeItem(at: manifest)
+                    try? Data("{}".utf8).write(to: manifest)
+                }
+            )
+        }
+    }
+
+    func testIntermediateDirectoryReplacementDuringCopyIsUnsafe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = root.appendingPathComponent("dataset", isDirectory: true)
+        let originalImages = dataset.appendingPathComponent("images", isDirectory: true)
+        let detachedImages = root.appendingPathComponent("detached-images", isDirectory: true)
+        let replacementImages = root.appendingPathComponent("replacement-images", isDirectory: true)
+        let framePath = "images/frame.jpg"
+        try writeJPEG(at: dataset.appendingPathComponent(framePath), value: 30)
+        try writeJPEG(at: replacementImages.appendingPathComponent("frame.jpg"), value: 220)
+        try writeTransformsJSON(
+            at: dataset.appendingPathComponent(DatasetContract.nerfstudioManifestName),
+            framePaths: [framePath]
+        )
+
+        await assertThrows(.unsafeLayout) {
+            _ = try await self.prepare(
+                source: .directory(selectedURL: dataset, resolvedRoot: dataset),
+                kind: .nerfstudio,
+                stagingParent: root,
+                sourceReadObserver: { relativePath in
+                    guard relativePath == framePath else { return }
+                    try? FileManager.default.moveItem(at: originalImages, to: detachedImages)
+                    try? FileManager.default.moveItem(at: replacementImages, to: originalImages)
+                }
+            )
+        }
+    }
+
+    func testFolderMaterializationRejectsMoreThan64RelativeComponents() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = root.appendingPathComponent("dataset", isDirectory: true)
+        let framePath = Array(repeating: "d", count: 64).joined(separator: "/") + "/frame.jpg"
+        try writeJPEG(at: dataset.appendingPathComponent(framePath), value: 30)
+        try writeTransformsJSON(
+            at: dataset.appendingPathComponent(DatasetContract.nerfstudioManifestName),
+            framePaths: [framePath]
+        )
+
+        await assertThrows(.unreadableDataset) {
+            _ = try await self.prepare(source: dataset, kind: .nerfstudio, stagingParent: root)
+        }
+    }
+
+    func testFolderMaterializationEnforcesVisitedOperationBudget() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = try makeNerfstudioDataset(in: root)
+
+        await assertThrows(.unreadableDataset) {
+            _ = try await self.prepare(
+                source: .directory(selectedURL: dataset, resolvedRoot: dataset),
+                kind: .nerfstudio,
+                stagingParent: root,
+                directoryLimits: .init(
+                    maximumRelativePathComponents: 64,
+                    maximumVisitedOperations: 1,
+                    maximumAcceptedEntries: 50_000,
+                    maximumTotalCopiedBytes: 64 * 1_024 * 1_024 * 1_024
+                )
+            )
+        }
+    }
+
+    func testFolderMaterializationEnforcesAcceptedEntryBudget() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = try makeNerfstudioDataset(in: root)
+
+        await assertThrows(.unreadableDataset) {
+            _ = try await self.prepare(
+                source: .directory(selectedURL: dataset, resolvedRoot: dataset),
+                kind: .nerfstudio,
+                stagingParent: root,
+                directoryLimits: .init(
+                    maximumRelativePathComponents: 64,
+                    maximumVisitedOperations: 50_000,
+                    maximumAcceptedEntries: 1,
+                    maximumTotalCopiedBytes: 64 * 1_024 * 1_024 * 1_024
+                )
+            )
+        }
+    }
+
+    func testFolderMaterializationEnforcesCumulativeStagingBudget() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = try makeNerfstudioDataset(in: root)
+
+        await assertThrows(.unreadableDataset) {
+            _ = try await self.prepare(
+                source: .directory(selectedURL: dataset, resolvedRoot: dataset),
+                kind: .nerfstudio,
+                stagingParent: root,
+                directoryLimits: .init(
+                    maximumRelativePathComponents: 64,
+                    maximumVisitedOperations: 50_000,
+                    maximumAcceptedEntries: 50_000,
+                    maximumTotalCopiedBytes: 1
+                )
+            )
+        }
+    }
+
+    func testDestinationSyncFailureIsNotReportedAsUnsafeLayout() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = try makeNerfstudioDataset(in: root)
+        let destination = root.appendingPathComponent("destination", isDirectory: true)
+        try TestFileBuilder.createDirectory(destination)
+        let reader = try DatasetSelectedRootReader(
+            selectedURL: dataset,
+            resolvedRoot: dataset,
+            sourceReadObserver: { _ in },
+            destinationSync: { _ in false }
+        )
+
+        XCTAssertThrowsError(
+            try reader.copyRegularFile(
+                at: DatasetContract.nerfstudioManifestName,
+                to: destination,
+                maximumBytes: 64 * 1_024 * 1_024
+            )
+        ) { error in
+            guard case DatasetSelectedRootReader.ReaderError.destinationUnavailable = error else {
+                return XCTFail("Expected destinationUnavailable, got \(error)")
+            }
+        }
+    }
+
+    func testDestinationIntermediateSymlinkCannotEscapeStagingRoot() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = try makeNerfstudioDataset(in: root)
+        let destination = root.appendingPathComponent("destination", isDirectory: true)
+        let outside = root.appendingPathComponent("outside", isDirectory: true)
+        try TestFileBuilder.createDirectory(destination)
+        try TestFileBuilder.createDirectory(outside)
+        try FileManager.default.createSymbolicLink(
+            at: destination.appendingPathComponent("images", isDirectory: true),
+            withDestinationURL: outside
+        )
+        let reader = try DatasetSelectedRootReader(
+            selectedURL: dataset,
+            resolvedRoot: dataset,
+            sourceReadObserver: { _ in }
+        )
+
+        XCTAssertThrowsError(
+            try reader.copyRegularFile(
+                at: "images/frame_0001.jpg",
+                to: destination,
+                maximumBytes: 64 * 1_024 * 1_024
+            )
+        ) { error in
+            guard case DatasetSelectedRootReader.ReaderError.destinationUnavailable = error else {
+                return XCTFail("Expected destinationUnavailable, got \(error)")
+            }
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: outside.appendingPathComponent("frame_0001.jpg").path
+            )
+        )
     }
 
     // MARK: - Polycam folder
@@ -328,6 +704,57 @@ final class DatasetInputPreflightTests: XCTestCase {
                 runner: runner
             )
         }
+    }
+
+    func testTrainOnlyNerfstudioZipIsNotADataset() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archive = try ZipFixtureBuilder.build(
+            at: root.appendingPathComponent("train-only.zip"),
+            entries: [
+                .file(path: "wrapper/transforms_train.json", contents: Data("{}".utf8)),
+                .file(path: "wrapper/images/a.jpg", contents: Data([0xFF, 0xD8, 0xFF])),
+            ]
+        )
+
+        await assertThrows(.archiveNotADataset) {
+            _ = try await self.prepare(
+                source: archive,
+                isZip: true,
+                kind: .nerfstudio,
+                stagingParent: root,
+                runner: MockSubprocessRunner(scripts: [])
+            )
+        }
+    }
+
+    func testDatasetArchiveEntryLimitIsExactly50000() {
+        XCTAssertEqual(DatasetContract.maximumEntryCount, 50_000)
+        XCTAssertEqual(DatasetInputPreflight.extractionLimits.maxEntryCount, 50_000)
+        XCTAssertEqual(
+            DatasetSelectedRootReader.Limits.datasetPreflight.maximumAcceptedEntries,
+            50_000
+        )
+    }
+
+    func testZipDatasetLimitsAcceptExactBoundariesAndRejectOverflow() {
+        let sixtyFour = Array(repeating: "d", count: 63).joined(separator: "/")
+            + "/frame.jpg"
+        let sixtyFive = Array(repeating: "d", count: 64).joined(separator: "/")
+            + "/frame.jpg"
+        XCTAssertTrue(DatasetInputPreflight.archivePathsAreWithinLimits([sixtyFour]))
+        XCTAssertFalse(DatasetInputPreflight.archivePathsAreWithinLimits([sixtyFive]))
+
+        let atEntryLimit = Array(
+            repeating: DatasetContract.nerfstudioManifestName,
+            count: 50_000
+        )
+        XCTAssertTrue(DatasetInputPreflight.archivePathsAreWithinLimits(atEntryLimit))
+        XCTAssertFalse(
+            DatasetInputPreflight.archivePathsAreWithinLimits(
+                atEntryLimit + ["overflow.txt"]
+            )
+        )
     }
 
     // MARK: - Gates
@@ -510,6 +937,21 @@ final class DatasetInputPreflightTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let dataset = root.appendingPathComponent("dataset", isDirectory: true)
         try TestFileBuilder.createDirectory(dataset)
+
+        await assertThrows(.unreadableDataset) {
+            _ = try await self.prepare(source: dataset, kind: .nerfstudio, stagingParent: root)
+        }
+    }
+
+    func testTrainOnlyNerfstudioFolderIsNotAcceptedAsDataset() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dataset = root.appendingPathComponent("dataset", isDirectory: true)
+        try TestFileBuilder.createDirectory(dataset)
+        try TestFileBuilder.createTextFile(
+            at: dataset.appendingPathComponent("transforms_train.json"),
+            text: "{}"
+        )
 
         await assertThrows(.unreadableDataset) {
             _ = try await self.prepare(source: dataset, kind: .nerfstudio, stagingParent: root)

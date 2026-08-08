@@ -14,6 +14,8 @@ public enum ColmapModelReader {
         case malformedBinary(String)
         case unsupportedCameraModel(String)
         case unknownBinaryCameraModel(Int)
+        case invalidImagePath(String)
+        case duplicateImagePath(String)
 
         public var errorDescription: String? {
             switch self {
@@ -29,6 +31,10 @@ public enum ColmapModelReader {
                 return "This dataset uses the camera model \(model), which EasySplat can't read. Re-export with a perspective (pinhole) or fisheye camera."
             case .unknownBinaryCameraModel(let id):
                 return "The COLMAP model uses an unknown camera model ID \(id)."
+            case .invalidImagePath(let path):
+                return "The COLMAP model contains an unsafe image path: \(path)."
+            case .duplicateImagePath(let path):
+                return "The COLMAP model lists a colliding image path: \(path)."
             }
         }
     }
@@ -104,6 +110,7 @@ public enum ColmapModelReader {
         }
 
         var images: [ColmapTextImage] = []
+        var seenImagePaths = Set<String>()
         var index = 0
         while index < imagesLines.count {
             let (number, poseLine) = imagesLines[index]
@@ -125,7 +132,7 @@ public enum ColmapModelReader {
                     id: image.id,
                     pose: image.pose,
                     cameraID: image.cameraID,
-                    name: image.name,
+                    name: try canonicalImagePath(image.name, seen: &seenImagePaths),
                     observations: observations
                 )
             )
@@ -174,20 +181,22 @@ public enum ColmapModelReader {
     }
 
     private static func parsePoseLine(_ line: String, line number: Int) throws -> ParsedPose {
-        var tokens = line.split(separator: " ", omittingEmptySubsequences: true)[...]
-        guard tokens.count >= 10,
-              let id = Int(tokens.popFirst()!),
-              let qw = Double(tokens.popFirst()!),
-              let qx = Double(tokens.popFirst()!),
-              let qy = Double(tokens.popFirst()!),
-              let qz = Double(tokens.popFirst()!),
-              let tx = Double(tokens.popFirst()!),
-              let ty = Double(tokens.popFirst()!),
-              let tz = Double(tokens.popFirst()!),
-              let cameraID = Int(tokens.popFirst()!) else {
+        // Consume only the nine whitespace-delimited numeric fields. The
+        // unsplit tail is the exact declared image name, including spaces or
+        // control characters that the path canonicalizer must inspect rather
+        // than silently rewriting.
+        guard let (tokens, name) = poseFieldsAndName(line),
+              let id = Int(tokens[0]),
+              let qw = Double(tokens[1]),
+              let qx = Double(tokens[2]),
+              let qy = Double(tokens[3]),
+              let qz = Double(tokens[4]),
+              let tx = Double(tokens[5]),
+              let ty = Double(tokens[6]),
+              let tz = Double(tokens[7]),
+              let cameraID = Int(tokens[8]) else {
             throw ReadError.malformedText(file: "images.txt", line: number)
         }
-        let name = tokens.joined(separator: " ")
         guard !name.isEmpty else {
             throw ReadError.malformedText(file: "images.txt", line: number)
         }
@@ -195,8 +204,33 @@ public enum ColmapModelReader {
             id: id,
             pose: DatasetPoseConvention.ColmapPose(qw: qw, qx: qx, qy: qy, qz: qz, tx: tx, ty: ty, tz: tz),
             cameraID: cameraID,
-            name: name
+            name: String(name)
         )
+    }
+
+    private static func poseFieldsAndName(
+        _ line: String
+    ) -> (fields: [Substring], name: Substring)? {
+        var fields: [Substring] = []
+        fields.reserveCapacity(9)
+        var cursor = line.startIndex
+
+        for _ in 0..<9 {
+            while cursor < line.endIndex, line[cursor].isWhitespace {
+                cursor = line.index(after: cursor)
+            }
+            guard cursor < line.endIndex else { return nil }
+            let start = cursor
+            while cursor < line.endIndex, !line[cursor].isWhitespace {
+                cursor = line.index(after: cursor)
+            }
+            fields.append(line[start..<cursor])
+        }
+        while cursor < line.endIndex, line[cursor].isWhitespace {
+            cursor = line.index(after: cursor)
+        }
+        guard cursor < line.endIndex else { return nil }
+        return (fields, line[cursor...])
     }
 
     /// Observation lines are `X Y POINT3D_ID` triples. A line whose token
@@ -236,10 +270,18 @@ public enum ColmapModelReader {
         guard let text = String(data: data, encoding: .utf8) else {
             throw ReadError.malformedText(file: name, line: 1)
         }
+        let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false)
         var result: [(Int, String)] = []
-        for (index, rawLine) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+        for (index, rawSlice) in rawLines.enumerated() {
+            var line = String(rawSlice)
+            // Strip only the CR that belongs to a CRLF terminator. A control
+            // character in an unterminated final image name remains visible to
+            // DatasetDeclaredPath and is rejected instead of rewritten.
+            if index < rawLines.count - 1, line.last == "\r" {
+                line.removeLast()
+            }
+            let classification = line.trimmingCharacters(in: .whitespaces)
+            guard !classification.isEmpty, !classification.hasPrefix("#") else { continue }
             result.append((index + 1, line))
         }
         return result
@@ -287,6 +329,7 @@ public enum ColmapModelReader {
         try reader.requireEnd()
 
         var images: [ColmapTextImage] = []
+        var seenImagePaths = Set<String>()
         reader = BinaryReader(data: imagesData, name: "images.bin")
         let imageCount = try reader.readCount(minimumElementBytes: 4 + 7 * 8 + 4 + 1 + 8)
         for _ in 0..<imageCount {
@@ -299,7 +342,8 @@ public enum ColmapModelReader {
             let ty = try reader.readDouble()
             let tz = try reader.readDouble()
             let cameraID = try reader.readUInt32()
-            let name = try reader.readNullTerminatedString()
+            let rawName = try reader.readNullTerminatedString()
+            let name = try canonicalImagePath(rawName, seen: &seenImagePaths)
             let observationCount = try reader.readCount(minimumElementBytes: 8 + 8 + 8)
             var observations: [ColmapTextObservation] = []
             observations.reserveCapacity(observationCount)
@@ -364,6 +408,23 @@ public enum ColmapModelReader {
         }
 
         return ColmapTextModel(cameras: cameras, images: images, points: points)
+    }
+
+    /// Canonicalizes before any caller can resolve a model name against disk.
+    /// One folded set rejects exact, case-only, and Unicode-normalization
+    /// collisions on both case-sensitive and case-insensitive volumes.
+    private static func canonicalImagePath(
+        _ rawPath: String,
+        seen: inout Set<String>
+    ) throws -> String {
+        guard let path = DatasetDeclaredPath.normalized(rawPath) else {
+            throw ReadError.invalidImagePath(rawPath)
+        }
+        let collisionKey = DatasetDeclaredPath.collisionKey(path)
+        guard seen.insert(collisionKey).inserted else {
+            throw ReadError.duplicateImagePath(path)
+        }
+        return path
     }
 
     private static func boundedContents(of url: URL, name: String) throws -> Data {

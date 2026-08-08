@@ -36,29 +36,40 @@ public enum ColmapDatasetImporter {
 
     public static func plan(datasetRoot: URL) throws -> DatasetImportPlan {
         let modelDirectory = try locateModelDirectory(in: datasetRoot)
-        let (model, format) = try ColmapModelReader.read(modelDirectory: modelDirectory)
-        guard !model.images.isEmpty else { throw ImportError.noPosedImages }
+        let (importedModel, format) = try ColmapModelReader.read(modelDirectory: modelDirectory)
+        guard !importedModel.images.isEmpty else { throw ImportError.noPosedImages }
 
         let imagesDirectory = locateImagesDirectory(in: datasetRoot)
         let imagesPrefix = imagesDirectory.lastPathComponent == "images" ? "images/" : ""
 
         var missing = 0
         var imageRefs: [DatasetImageRef] = []
-        for image in model.images.sorted(by: { $0.name < $1.name }) {
+        for image in importedModel.images.sorted(by: { $0.name < $1.name }) {
             let fileURL = imagesDirectory.appendingPathComponent(image.name)
             var isDirectory: ObjCBool = false
             if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory),
                !isDirectory.boolValue {
+                let declaredPath = imagesPrefix + image.name
                 imageRefs.append(
-                    DatasetImageRef(entryID: image.name, declaredPath: imagesPrefix + image.name)
+                    DatasetImageRef(entryID: declaredPath, declaredPath: declaredPath)
                 )
             } else {
                 missing += 1
             }
         }
         guard missing == 0 else {
-            throw ImportError.missingImageFiles(missing: missing, total: model.images.count)
+            throw ImportError.missingImageFiles(missing: missing, total: importedModel.images.count)
         }
+
+        let model = ColmapTextModel(
+            cameras: importedModel.cameras,
+            images: importedModel.images.map { image in
+                var canonical = image
+                canonical.name = imagesPrefix + image.name
+                return canonical
+            },
+            points: importedModel.points
+        )
 
         let observationCount = model.images.reduce(0) { $0 + $1.observations.count }
         let complete = model.points.count >= minimumDirectAdoptionPoints && observationCount > 0
@@ -68,7 +79,7 @@ public enum ColmapDatasetImporter {
 
         let unposed = unposedImageCount(
             in: imagesDirectory,
-            registeredNames: Set(model.images.map(\.name))
+            registeredNames: Set(importedModel.images.map(\.name))
         )
         if unposed > 0 {
             notes.append("\(unposed) images in the folder have no camera pose and are not used.")

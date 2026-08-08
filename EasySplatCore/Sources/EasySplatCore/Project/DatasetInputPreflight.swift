@@ -72,6 +72,40 @@ public struct PreparedDatasetInput: Sendable {
     }
 }
 
+private extension ColmapModelReader.ReadError {
+    var isUnsafeDatasetPath: Bool {
+        switch self {
+        case .invalidImagePath, .duplicateImagePath:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var exceedsDatasetDepthLimit: Bool {
+        guard case let .invalidImagePath(path) = self else { return false }
+        return path.split(separator: "/", omittingEmptySubsequences: false).count
+            > DatasetContract.maximumRelativePathComponents
+    }
+}
+
+private extension NerfstudioDatasetImporter.ImportError {
+    var isUnsafeDatasetPath: Bool {
+        switch self {
+        case .invalidFramePath, .duplicateFramePath:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var exceedsDatasetDepthLimit: Bool {
+        guard case let .invalidFramePath(path) = self else { return false }
+        return path.split(separator: "/", omittingEmptySubsequences: false).count
+            > DatasetContract.maximumRelativePathComponents
+    }
+}
+
 public enum DatasetInputError: Swift.Error, LocalizedError, Equatable {
     case unreadableDataset
     case noImages
@@ -83,6 +117,7 @@ public enum DatasetInputError: Swift.Error, LocalizedError, Equatable {
     case unsupportedImageFormat
     case calibrationMismatch(image: String, width: Int, height: Int, expectedWidth: Int, expectedHeight: Int)
     case archiveNotADataset
+    case unsafeLayout
 
     public var errorDescription: String? {
         switch self {
@@ -106,6 +141,8 @@ public enum DatasetInputError: Swift.Error, LocalizedError, Equatable {
             return "The image \(image) is \(width)x\(height) but the dataset's camera expects \(expectedWidth)x\(expectedHeight). Re-export the dataset with matching images."
         case .archiveNotADataset:
             return "This archive isn't a COLMAP, Nerfstudio, or Polycam dataset. Choose a supported export, or add photos or videos instead."
+        case .unsafeLayout:
+            return "This dataset contains a linked or out-of-folder file. Re-export it with regular files inside one folder."
         }
     }
 }
@@ -130,7 +167,7 @@ public struct DatasetInputPreflight {
     /// Dataset-tuned extraction ceilings: pose-only exports carry many small files, so the
     /// entry ceiling is generous while per-entry and total sizes stay bounded.
     static let extractionLimits = SafeArchiveExtractor.ExtractionLimits(
-        maxEntryCount: 60_000,
+        maxEntryCount: DatasetContract.maximumEntryCount,
         maxEntryUncompressedBytes: 512 * 1024 * 1024,
         maxTotalUncompressedBytes: 64 * 1024 * 1024 * 1024
     )
@@ -141,6 +178,41 @@ public struct DatasetInputPreflight {
         kind: DatasetKind,
         stagingParent: URL,
         runner: SubprocessRunning
+    ) async throws -> PreparedDatasetInput {
+        try await prepare(
+            source: isZip
+                ? .zip(source)
+                : .directory(selectedURL: source, resolvedRoot: source),
+            kind: kind,
+            stagingParent: stagingParent,
+            runner: runner
+        )
+    }
+
+    package static func prepare(
+        source: DatasetInputSource,
+        kind: DatasetKind,
+        stagingParent: URL,
+        runner: SubprocessRunning,
+        sourceReadObserver: @escaping @Sendable (String) -> Void = { _ in }
+    ) async throws -> PreparedDatasetInput {
+        try await prepare(
+            source: source,
+            kind: kind,
+            stagingParent: stagingParent,
+            runner: runner,
+            sourceReadObserver: sourceReadObserver,
+            directoryLimits: .datasetPreflight
+        )
+    }
+
+    static func prepare(
+        source: DatasetInputSource,
+        kind: DatasetKind,
+        stagingParent: URL,
+        runner: SubprocessRunning,
+        sourceReadObserver: @escaping @Sendable (String) -> Void,
+        directoryLimits: DatasetSelectedRootReader.Limits
     ) async throws -> PreparedDatasetInput {
         try Task.checkCancellation()
         let fileManager = FileManager.default
@@ -163,14 +235,22 @@ public struct DatasetInputPreflight {
         // a. Resolve the dataset root, extracting a ZIP into staging first.
         let datasetRoot = try resolveDatasetRoot(
             source: source,
-            isZip: isZip,
             kind: kind,
             stagingDirectory: stagingDirectory,
-            runner: runner
+            runner: runner,
+            sourceReadObserver: sourceReadObserver,
+            directoryLimits: directoryLimits
         )
 
         // b. Dispatch to the right importer for the converted model and source files.
-        let planned = try buildPlan(kind: kind, datasetRoot: datasetRoot)
+        let planned: (plan: DatasetImportPlan, sourceFileURLs: [URL])
+        do {
+            planned = try buildPlan(kind: kind, datasetRoot: datasetRoot)
+        } catch let error as ColmapModelReader.ReadError where error.isUnsafeDatasetPath {
+            throw DatasetInputError.unsafeLayout
+        } catch let error as NerfstudioDatasetImporter.ImportError where error.isUnsafeDatasetPath {
+            throw DatasetInputError.unsafeLayout
+        }
         let plan = planned.plan
         guard !plan.images.isEmpty else { throw DatasetInputError.noImages }
 
@@ -256,9 +336,8 @@ public struct DatasetInputPreflight {
             expectedDimensionsByName[image.name] = (camera.width, camera.height)
         }
         for entry in measured {
-            // The model image NAME equals the declared path for nerfstudio and
-            // polycam, and the stable entry identity for COLMAP (whose declared
-            // path may carry an `images/` prefix).
+            // Every importer keeps model NAME, entry identity, and declared
+            // path aligned after canonicalization.
             guard let expected = expectedDimensionsByName[entry.ref.declaredPath]
                     ?? expectedDimensionsByName[entry.ref.entryID] else {
                 continue
@@ -330,31 +409,97 @@ public struct DatasetInputPreflight {
     // MARK: - Dataset root
 
     private static func resolveDatasetRoot(
-        source: URL,
-        isZip: Bool,
+        source: DatasetInputSource,
         kind: DatasetKind,
         stagingDirectory: URL,
-        runner: SubprocessRunning
+        runner: SubprocessRunning,
+        sourceReadObserver: @escaping @Sendable (String) -> Void,
+        directoryLimits: DatasetSelectedRootReader.Limits
     ) throws -> URL {
-        guard isZip else {
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue else {
+        _ = runner
+        switch source {
+        case .zip(let archiveURL):
+            let extractionRoot = stagingDirectory.appendingPathComponent("extract", isDirectory: true)
+            let snapshot: ZipArchiveReader.Snapshot
+            do {
+                try Task.checkCancellation()
+                snapshot = try ZipArchiveReader.Snapshot(
+                    opening: archiveURL,
+                    maximumEntryCount: DatasetContract.maximumEntryCount,
+                    maximumNameBytes: DatasetContract.maximumArchiveListingBytes,
+                    shouldCancel: { Task.isCancelled }
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
                 throw DatasetInputError.unreadableDataset
             }
-            return source
+            guard archivePathsAreWithinLimits(snapshot.entries.map(\.path)) else {
+                throw DatasetInputError.unreadableDataset
+            }
+            do {
+                _ = try SafeArchiveExtractor.extract(
+                    snapshot: snapshot,
+                    to: extractionRoot,
+                    limits: extractionLimits,
+                    shouldCancel: { Task.isCancelled }
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw DatasetInputError.unreadableDataset
+            }
+            let root = descendSingleWrapper(extractionRoot)
+            guard datasetAnchorPresent(kind: kind, datasetRoot: root) else {
+                throw DatasetInputError.archiveNotADataset
+            }
+            return root
+        case let .directory(selectedURL, resolvedRoot):
+            let materializedRoot = stagingDirectory.appendingPathComponent(
+                "materialized",
+                isDirectory: true
+            )
+            do {
+                try FileManager.default.createDirectory(
+                    at: materializedRoot,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                let reader = try DatasetSelectedRootReader(
+                    selectedURL: selectedURL,
+                    resolvedRoot: resolvedRoot,
+                    sourceReadObserver: sourceReadObserver,
+                    limits: directoryLimits
+                )
+                try materializeDirectoryDataset(
+                    kind: kind,
+                    reader: reader,
+                    destinationRoot: materializedRoot
+                )
+                return materializedRoot
+            } catch let error as DatasetInputError {
+                throw error
+            } catch let error as DatasetSelectedRootReader.ReaderError {
+                throw datasetError(for: error)
+            } catch let error as ColmapModelReader.ReadError
+                where error.exceedsDatasetDepthLimit {
+                throw DatasetInputError.unreadableDataset
+            } catch let error as NerfstudioDatasetImporter.ImportError
+                where error.exceedsDatasetDepthLimit {
+                throw DatasetInputError.unreadableDataset
+            } catch let error as ColmapModelReader.ReadError where error.isUnsafeDatasetPath {
+                throw DatasetInputError.unsafeLayout
+            } catch let error as NerfstudioDatasetImporter.ImportError where error.isUnsafeDatasetPath {
+                throw DatasetInputError.unsafeLayout
+            } catch {
+                throw DatasetInputError.unreadableDataset
+            }
         }
-        let extractionRoot = stagingDirectory.appendingPathComponent("extract", isDirectory: true)
-        try SafeArchiveExtractor.extract(
-            zipURL: source,
-            to: extractionRoot,
-            limits: extractionLimits
-        )
-        let root = descendSingleWrapper(extractionRoot)
-        guard datasetAnchorPresent(kind: kind, datasetRoot: root) else {
-            throw DatasetInputError.archiveNotADataset
-        }
-        return root
+    }
+
+    static func archivePathsAreWithinLimits(_ paths: [String]) -> Bool {
+        paths.count <= DatasetContract.maximumEntryCount
+            && paths.allSatisfy(DatasetContract.archivePathIsWithinDepthLimit)
     }
 
     /// Many exports zip a single wrapper folder. Descend into it so the dataset root sits
@@ -388,11 +533,252 @@ public struct DatasetInputPreflight {
             ]
             return candidates.contains { ColmapDatasetImporter.containsModel($0) }
         case .nerfstudio:
-            return isRegularFile(datasetRoot.appendingPathComponent("transforms.json"))
+            return isRegularFile(
+                datasetRoot.appendingPathComponent(DatasetContract.nerfstudioManifestName)
+            )
         case .polycam:
             let keyframes = datasetRoot.appendingPathComponent("keyframes", isDirectory: true)
             return isDirectory(keyframes.appendingPathComponent("corrected_cameras", isDirectory: true))
                 || isDirectory(keyframes.appendingPathComponent("cameras", isDirectory: true))
+        }
+    }
+
+    // MARK: - Selected-folder materialization
+
+    private static func materializeDirectoryDataset(
+        kind: DatasetKind,
+        reader: DatasetSelectedRootReader,
+        destinationRoot: URL
+    ) throws {
+        switch kind {
+        case .nerfstudio:
+            let manifestName = DatasetContract.nerfstudioManifestName
+            _ = try reader.copyRegularFile(
+                at: manifestName,
+                to: destinationRoot,
+                maximumBytes: Int64(transformsMaximumBytes)
+            )
+            let manifestURL = destinationRoot.appendingPathComponent(manifestName)
+            let data = try BoundedFileReader.readRegularFile(
+                at: manifestURL,
+                maximumBytes: transformsMaximumBytes
+            )
+            let plan = try NerfstudioDatasetImporter.plan(fromTransformsJSON: data)
+            try enforceImageCount(plan.images.count)
+            try materializeDeclaredImages(
+                plan.images,
+                reader: reader,
+                destinationRoot: destinationRoot
+            )
+
+        case .colmap:
+            let modelPath = try locateColmapModelDirectory(reader: reader)
+            let metadataNames = [
+                "cameras.txt", "cameras.bin",
+                "images.txt", "images.bin",
+                "points3D.txt", "points3D.bin",
+            ]
+            for name in metadataNames {
+                let relativePath = joined(modelPath, name)
+                guard let kind = try reader.entryKind(at: relativePath) else { continue }
+                guard kind == .regularFile else {
+                    throw DatasetSelectedRootReader.ReaderError.unsafeLayout
+                }
+                _ = try reader.copyRegularFile(
+                    at: relativePath,
+                    to: destinationRoot,
+                    maximumBytes: Int64(sourceMetadataMaximumBytes)
+                )
+            }
+            let stagedModelDirectory = modelPath.isEmpty
+                ? destinationRoot
+                : destinationRoot.appendingPathComponent(modelPath, isDirectory: true)
+            let (model, _) = try ColmapModelReader.read(modelDirectory: stagedModelDirectory)
+            try enforceImageCount(model.images.count)
+            let imagesPrefix: String
+            if let imagesKind = try reader.entryKind(at: "images") {
+                guard imagesKind == .directory else {
+                    throw DatasetSelectedRootReader.ReaderError.unsafeLayout
+                }
+                imagesPrefix = "images/"
+            } else {
+                imagesPrefix = ""
+            }
+            try materializeDeclaredImages(
+                model.images.map {
+                    let path = imagesPrefix + $0.name
+                    return DatasetImageRef(entryID: path, declaredPath: path)
+                },
+                reader: reader,
+                destinationRoot: destinationRoot
+            )
+
+        case .polycam:
+            try materializePolycamDataset(reader: reader, destinationRoot: destinationRoot)
+        }
+    }
+
+    private static func locateColmapModelDirectory(
+        reader: DatasetSelectedRootReader
+    ) throws -> String {
+        if try containsColmapModel("sparse/0", reader: reader) {
+            if try containsColmapModel("sparse/1", reader: reader) {
+                throw ColmapDatasetImporter.ImportError.multipleModels
+            }
+            return "sparse/0"
+        }
+        for candidate in ["sparse", "model", ""] {
+            if try containsColmapModel(candidate, reader: reader) {
+                return candidate
+            }
+        }
+        throw ColmapDatasetImporter.ImportError.noModelFound
+    }
+
+    private static func containsColmapModel(
+        _ directory: String,
+        reader: DatasetSelectedRootReader
+    ) throws -> Bool {
+        let cameras = try ["cameras.bin", "cameras.txt"].contains { name in
+            try reader.entryKind(at: joined(directory, name)) == .regularFile
+        }
+        guard cameras else { return false }
+        return try ["images.bin", "images.txt"].contains { name in
+            try reader.entryKind(at: joined(directory, name)) == .regularFile
+        }
+    }
+
+    private static func materializePolycamDataset(
+        reader: DatasetSelectedRootReader,
+        destinationRoot: URL
+    ) throws {
+        let correctedCameraPath = "keyframes/corrected_cameras"
+        let correctedJSONs = try regularFileNames(
+            in: correctedCameraPath,
+            extension: "json",
+            reader: reader
+        )
+        let usedCorrected = !correctedJSONs.isEmpty
+        let cameraPath = usedCorrected ? correctedCameraPath : "keyframes/cameras"
+        let cameraJSONs = usedCorrected
+            ? correctedJSONs
+            : try regularFileNames(in: cameraPath, extension: "json", reader: reader)
+        let imagePath = usedCorrected ? "keyframes/corrected_images" : "keyframes/images"
+        let imageNames = try regularFileNames(
+            in: imagePath,
+            allowedExtensions: supportedImageExtensions,
+            reader: reader
+        )
+        var imageByStem: [String: String] = [:]
+        for name in imageNames {
+            let stem = (name as NSString).deletingPathExtension
+            if imageByStem[stem] == nil { imageByStem[stem] = name }
+        }
+
+        var pairedImages: [DatasetImageRef] = []
+        for cameraName in cameraJSONs {
+            let stem = (cameraName as NSString).deletingPathExtension
+            guard let imageName = imageByStem[stem] else { continue }
+            _ = try reader.copyRegularFile(
+                at: joined(cameraPath, cameraName),
+                to: destinationRoot,
+                maximumBytes: Int64(keyframeJSONMaximumBytes)
+            )
+            let declaredImagePath = joined(imagePath, imageName)
+            pairedImages.append(
+                DatasetImageRef(entryID: stem, declaredPath: declaredImagePath)
+            )
+        }
+        try enforceImageCount(pairedImages.count)
+        try materializeDeclaredImages(
+            pairedImages,
+            reader: reader,
+            destinationRoot: destinationRoot
+        )
+    }
+
+    private static func regularFileNames(
+        in directory: String,
+        extension fileExtension: String,
+        reader: DatasetSelectedRootReader
+    ) throws -> [String] {
+        try regularFileNames(
+            in: directory,
+            allowedExtensions: [fileExtension],
+            reader: reader
+        )
+    }
+
+    private static func regularFileNames(
+        in directory: String,
+        allowedExtensions: Set<String>,
+        reader: DatasetSelectedRootReader
+    ) throws -> [String] {
+        let entries: [DatasetSelectedRootReader.DirectoryEntry]
+        do {
+            entries = try reader.directoryEntries(at: directory)
+        } catch DatasetSelectedRootReader.ReaderError.missing {
+            return []
+        }
+        return entries.compactMap { entry in
+            guard !entry.name.hasPrefix("."), entry.kind == .regularFile,
+                  allowedExtensions.contains(
+                    (entry.name as NSString).pathExtension.lowercased()
+                  ) else {
+                return nil
+            }
+            return entry.name
+        }
+    }
+
+    private static func materializeDeclaredImages(
+        _ images: [DatasetImageRef],
+        reader: DatasetSelectedRootReader,
+        destinationRoot: URL
+    ) throws {
+        var missing = 0
+        for image in images {
+            try Task.checkCancellation()
+            guard DatasetDeclaredPath.normalized(image.declaredPath) == image.declaredPath else {
+                throw DatasetInputError.unsafeLayout
+            }
+            do {
+                _ = try reader.copyRegularFile(
+                    at: image.declaredPath,
+                    to: destinationRoot,
+                    maximumBytes: Int64(extractionLimits.maxEntryUncompressedBytes)
+                )
+            } catch DatasetSelectedRootReader.ReaderError.missing {
+                missing += 1
+            }
+        }
+        guard missing == 0 else {
+            throw DatasetInputError.missingImages(missing: missing, total: images.count)
+        }
+    }
+
+    private static func enforceImageCount(_ count: Int) throws {
+        guard count > 0 else { throw DatasetInputError.noImages }
+        guard count <= RunPlanResolver.maximumDatasetImageCount else {
+            throw DatasetInputError.tooManyImages(
+                count: count,
+                maximum: RunPlanResolver.maximumDatasetImageCount
+            )
+        }
+    }
+
+    private static func joined(_ directory: String, _ leaf: String) -> String {
+        directory.isEmpty ? leaf : "\(directory)/\(leaf)"
+    }
+
+    private static func datasetError(
+        for error: DatasetSelectedRootReader.ReaderError
+    ) -> DatasetInputError {
+        switch error {
+        case .unsafeLayout:
+            return .unsafeLayout
+        case .missing, .unreadable, .destinationUnavailable, .resourceLimitExceeded:
+            return .unreadableDataset
         }
     }
 
@@ -415,7 +801,9 @@ public struct DatasetInputPreflight {
             let plan = try ColmapDatasetImporter.plan(datasetRoot: datasetRoot)
             return (plan, sourceFileURLs)
         case .nerfstudio:
-            let transformsURL = datasetRoot.appendingPathComponent("transforms.json")
+            let transformsURL = datasetRoot.appendingPathComponent(
+                DatasetContract.nerfstudioManifestName
+            )
             let data: Data
             do {
                 data = try BoundedFileReader.readRegularFile(

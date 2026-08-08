@@ -1,14 +1,25 @@
+import Darwin
 import EasySplatCore
 import Foundation
 
 /// Stat-first detection of a pre-processed dataset input. Pure and
 /// `nonisolated` so selection can classify a dropped URL without hopping the
-/// main actor. Folder probes use `FileManager.fileExists` only; the zip probe
-/// reads the central directory in process without extracting anything.
+/// main actor. Folder probes refuse links at the roots they classify; the zip
+/// probe reads the central directory in process without extracting anything.
 ///
 /// Precedence is COLMAP > Nerfstudio > Polycam so a folder that carries more
 /// than one format's markers resolves deterministically to the richest one.
 enum DatasetSniffer {
+    private struct DirectDirectoryEntry {
+        let name: String
+        let mode: mode_t
+    }
+
+    private enum DirectDirectoryScan {
+        case complete([DirectDirectoryEntry])
+        case unavailableOrLimitExceeded
+    }
+
     enum DatasetDetection: Equatable {
         case colmap(root: URL)
         case nerfstudio(root: URL)
@@ -43,10 +54,23 @@ enum DatasetSniffer {
     /// descends once (total depth <= 2); two or more candidate children are
     /// ambiguous and yield nil.
     nonisolated static func detect(at url: URL) -> DatasetDetection? {
+        detect(at: url, maximumEntryCount: DatasetContract.maximumEntryCount)
+    }
+
+    /// Test seam for proving the production entry ceiling with small fixtures.
+    /// The public selection path always supplies DatasetContract's 50,000-entry
+    /// limit.
+    nonisolated static func detect(
+        at url: URL,
+        maximumEntryCount: Int
+    ) -> DatasetDetection? {
         if let detection = probeFolder(url) {
             return detection
         }
-        guard let child = soleVisibleChildDirectory(of: url) else {
+        guard let child = soleVisibleChildDirectory(
+            of: url,
+            maximumEntryCount: maximumEntryCount
+        ) else {
             return nil
         }
         return probeFolder(child)
@@ -81,20 +105,19 @@ enum DatasetSniffer {
     }
 
     private nonisolated static func modelFilesPresent(in directory: URL) -> Bool {
-        let fileManager = FileManager.default
         let hasCameras = ["cameras.bin", "cameras.txt"].contains {
-            fileManager.fileExists(atPath: directory.appendingPathComponent($0).path)
+            isRegularFile(directory.appendingPathComponent($0))
         }
         let hasImages = ["images.bin", "images.txt"].contains {
-            fileManager.fileExists(atPath: directory.appendingPathComponent($0).path)
+            isRegularFile(directory.appendingPathComponent($0))
         }
         return hasCameras && hasImages
     }
 
     private nonisolated static func isNerfstudio(_ root: URL) -> Bool {
-        let fileManager = FileManager.default
-        return fileManager.fileExists(atPath: root.appendingPathComponent("transforms.json").path)
-            || fileManager.fileExists(atPath: root.appendingPathComponent("transforms_train.json").path)
+        isRegularFile(
+            root.appendingPathComponent(DatasetContract.nerfstudioManifestName)
+        )
     }
 
     private nonisolated static func isPolycam(_ root: URL) -> Bool {
@@ -108,42 +131,114 @@ enum DatasetSniffer {
     }
 
     private nonisolated static func isDirectory(_ url: URL) -> Bool {
-        var isDirectory: ObjCBool = false
-        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
-            && isDirectory.boolValue
+        var status = stat()
+        return lstat(url.path, &status) == 0 && (status.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    private nonisolated static func isRegularFile(_ url: URL) -> Bool {
+        var status = stat()
+        return lstat(url.path, &status) == 0 && (status.st_mode & S_IFMT) == S_IFREG
     }
 
     private nonisolated static func hasLooseImages(in root: URL) -> Bool {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
+        guard case let .complete(entries) = directDirectoryEntries(
             at: root,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
+            maximumEntryCount: DatasetContract.maximumEntryCount
         ) else {
             return false
         }
-        return entries.contains { url in
-            imageExtensions.contains(url.pathExtension.lowercased())
-                && (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
+        return entries.contains { entry in
+            (entry.mode & S_IFMT) == S_IFREG
+                && imageExtensions.contains(
+                    (entry.name as NSString).pathExtension.lowercased()
+                )
         }
     }
 
     /// The single visible subdirectory of `url`, or nil when there are none or
     /// several. Files are ignored; only directories count as descent candidates.
-    private nonisolated static func soleVisibleChildDirectory(of url: URL) -> URL? {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
+    private nonisolated static func soleVisibleChildDirectory(
+        of url: URL,
+        maximumEntryCount: Int
+    ) -> URL? {
+        guard case let .complete(entries) = directDirectoryEntries(
             at: url,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
+            maximumEntryCount: maximumEntryCount
         ) else {
             return nil
         }
-        let directories = entries.filter {
-            (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-        }
+        let directories = entries.filter { ($0.mode & S_IFMT) == S_IFDIR }
         guard directories.count == 1, let sole = directories.first else { return nil }
         // Rebuild from the caller's URL so the detected root keeps the path
         // form the user dropped (enumeration may resolve /var to /private/var).
-        return url.appendingPathComponent(sole.lastPathComponent, isDirectory: true)
+        return url.appendingPathComponent(sole.name, isDirectory: true)
+    }
+
+    /// Streams one directory through a descriptor and applies the budget before
+    /// retaining more than the bounded result. Every visited entry counts,
+    /// including hidden entries that are omitted from dataset matching.
+    private nonisolated static func directDirectoryEntries(
+        at url: URL,
+        maximumEntryCount: Int
+    ) -> DirectDirectoryScan {
+        guard maximumEntryCount >= 0 else { return .unavailableOrLimitExceeded }
+        var namedStatus = stat()
+        guard lstat(url.path, &namedStatus) == 0,
+              (namedStatus.st_mode & S_IFMT) == S_IFDIR else {
+            return .unavailableOrLimitExceeded
+        }
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else { return .unavailableOrLimitExceeded }
+        defer { Darwin.close(descriptor) }
+        var openedStatus = stat()
+        guard fstat(descriptor, &openedStatus) == 0,
+              openedStatus.st_dev == namedStatus.st_dev,
+              openedStatus.st_ino == namedStatus.st_ino,
+              (openedStatus.st_mode & S_IFMT) == S_IFDIR else {
+            return .unavailableOrLimitExceeded
+        }
+        let duplicate = dup(descriptor)
+        guard duplicate >= 0, let directory = fdopendir(duplicate) else {
+            if duplicate >= 0 { Darwin.close(duplicate) }
+            return .unavailableOrLimitExceeded
+        }
+        defer { closedir(directory) }
+
+        var visited = 0
+        var output: [DirectDirectoryEntry] = []
+        output.reserveCapacity(min(maximumEntryCount, 1_024))
+        errno = 0
+        while let entry = readdir(directory) {
+            let name = withUnsafePointer(to: entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) {
+                    String(cString: $0)
+                }
+            }
+            guard name != ".", name != ".." else {
+                errno = 0
+                continue
+            }
+            visited += 1
+            guard visited <= maximumEntryCount else {
+                return .unavailableOrLimitExceeded
+            }
+            var status = stat()
+            guard name.withCString({
+                fstatat(descriptor, $0, &status, AT_SYMLINK_NOFOLLOW)
+            }) == 0 else {
+                return .unavailableOrLimitExceeded
+            }
+            let isHidden = name.hasPrefix(".") || (status.st_flags & UInt32(UF_HIDDEN)) != 0
+            if !isHidden {
+                output.append(DirectDirectoryEntry(name: name, mode: status.st_mode))
+            }
+            errno = 0
+        }
+        guard errno == 0 else { return .unavailableOrLimitExceeded }
+        return .complete(output)
     }
 
     // MARK: - Zip detection
@@ -153,7 +248,17 @@ enum DatasetSniffer {
     /// prefix. Returns nil for any zip that fails to list or match, so the
     /// caller can warn. Reads the central directory directly.
     nonisolated static func detectInZip(at url: URL) -> DatasetDetection? {
-        guard let names = try? SafeArchiveExtractor.entryNames(inZipAt: url),
+        detectInZip(at: url, entryNameLoader: DatasetContract.archiveEntryNames)
+    }
+
+    /// Synchronous loader seam keeps exact ceiling/depth tests deterministic.
+    nonisolated static func detectInZip(
+        at url: URL,
+        entryNameLoader: (URL) throws -> [String]
+    ) -> DatasetDetection? {
+        guard let names = try? entryNameLoader(url),
+              names.count <= DatasetContract.maximumEntryCount,
+              names.allSatisfy(DatasetContract.archivePathIsWithinDepthLimit),
               !names.isEmpty else {
             return nil
         }
@@ -213,7 +318,7 @@ enum DatasetSniffer {
     }
 
     private nonisolated static func zipHasNerfstudio(_ paths: Set<String>) -> Bool {
-        paths.contains("transforms.json") || paths.contains("transforms_train.json")
+        paths.contains(DatasetContract.nerfstudioManifestName)
     }
 
     private nonisolated static func zipHasPolycam(_ paths: Set<String>) -> Bool {
@@ -229,44 +334,5 @@ enum DatasetSniffer {
     private nonisolated static func isImagePath(_ path: String) -> Bool {
         guard !path.hasSuffix("/") else { return false }
         return imageExtensions.contains((path as NSString).pathExtension.lowercased())
-    }
-}
-
-/// Accumulates archive entry names under a bounded budget.
-private final class ZipNameCollector: @unchecked Sendable {
-    private static let maximumEntryCount = 50_000
-    private static let maximumTotalBytes = 8 * 1_024 * 1_024
-
-    private let lock = NSLock()
-    private var names: [String] = []
-    private var totalBytes = 0
-    private var overflowed = false
-
-    func append(_ name: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !overflowed else { return }
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        totalBytes += trimmed.utf8.count
-        if names.count >= Self.maximumEntryCount || totalBytes > Self.maximumTotalBytes {
-            overflowed = true
-            return
-        }
-        names.append(trimmed)
-    }
-
-    func paths() -> Set<String> {
-        lock.lock()
-        let collected = names
-        let didOverflow = overflowed
-        lock.unlock()
-        // A truncated listing may have dropped the markers we need; treat it as
-        // undetectable rather than guess from a partial view.
-        guard !didOverflow else { return [] }
-        let cleaned = collected
-            .map { $0.hasPrefix("./") ? String($0.dropFirst(2)) : $0 }
-            .filter { !$0.isEmpty }
-        return Set(cleaned)
     }
 }

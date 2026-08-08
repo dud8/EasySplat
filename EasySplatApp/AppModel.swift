@@ -45,6 +45,42 @@ struct ProjectPublicationCheckpointHook: Sendable {
     }
 }
 
+struct DatasetInputPreflightOperation: Sendable {
+    static let live = DatasetInputPreflightOperation {
+        source, kind, stagingParent in
+        try await DatasetInputPreflight.prepare(
+            source: source,
+            kind: kind,
+            stagingParent: stagingParent,
+            runner: SubprocessRunner()
+        )
+    }
+
+    private let operation: @Sendable (
+        DatasetInputSource,
+        DatasetKind,
+        URL
+    ) async throws -> PreparedDatasetInput
+
+    init(
+        _ operation: @escaping @Sendable (
+            DatasetInputSource,
+            DatasetKind,
+            URL
+        ) async throws -> PreparedDatasetInput
+    ) {
+        self.operation = operation
+    }
+
+    func callAsFunction(
+        _ source: DatasetInputSource,
+        _ kind: DatasetKind,
+        _ stagingParent: URL
+    ) async throws -> PreparedDatasetInput {
+        try await operation(source, kind, stagingParent)
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     typealias FinishedOutputValidator = @Sendable (URL) -> URL?
@@ -169,6 +205,7 @@ final class AppModel: ObservableObject {
     let powerAssertion: PowerAssertionManaging
     let finishedOutputValidator: FinishedOutputValidator
     let videoInputPreflight: VideoInputPreflight
+    let datasetInputPreflight: DatasetInputPreflightOperation
     let projectPublicationCheckpointHook: ProjectPublicationCheckpointHook
     let subjectIsolationCoordinatorFactory: SubjectIsolationCoordinatorFactory
     let subjectIsolationArtifactLoader: SubjectIsolationArtifactLoader
@@ -458,6 +495,7 @@ final class AppModel: ObservableObject {
         projectBaseURL: URL? = nil,
         hardwareProfile: HardwareProfile? = nil,
         videoInputPreflight: VideoInputPreflight = VideoInputPreflight(),
+        datasetInputPreflight: DatasetInputPreflightOperation = .live,
         pipelineRunnerFactory: @escaping (URL, PipelineRunner.PipelineConfig) -> PipelineRunning = { projectURL, config in
             PipelineRunner(projectURL: projectURL, config: config)
         },
@@ -493,6 +531,7 @@ final class AppModel: ObservableObject {
         self.hardwareProfile = hardwareProfile ?? .detect()
         self.finishedOutputValidator = finishedOutputValidator
         self.videoInputPreflight = videoInputPreflight
+        self.datasetInputPreflight = datasetInputPreflight
         self.projectPublicationCheckpointHook = projectPublicationCheckpointHook
         self.subjectIsolationCoordinatorFactory = subjectIsolationCoordinatorFactory
         self.subjectIsolationArtifactLoader = subjectIsolationArtifactLoader
