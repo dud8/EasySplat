@@ -45,10 +45,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         Task.detached(priority: .utility) {
             _ = ShareSnapshotStorage.reclaimStaleSnapshots()
         }
-        let localToolchainRoot = AppConfig.currentDevelopmentOverrides.localToolchainRoot
-        Task.detached(priority: .background) {
-            LegacyToolchainInstalls.removeOnce(developmentOverrideRoot: localToolchainRoot)
-        }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if let configuration = releaseVerificationConfiguration {
