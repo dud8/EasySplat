@@ -1072,7 +1072,7 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
-    func testCancellingShareKeepsValidatedSnapshotReadyForAnotherAttempt() async throws {
+    func testNilPickerSelectionCancelsAndRemovesPreparedSnapshotImmediately() async throws {
         let base = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: base) }
         let projectURL = try makeFinishedProject(
@@ -1084,7 +1084,6 @@ final class ResultWorkspaceTests: XCTestCase {
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base
         )
-        defer { model.cancelSharing() }
         model.currentProjectURL = projectURL
         model.outputPlyURL = ProjectPaths(root: projectURL).outputURL
             .appendingPathComponent("splat.ply")
@@ -1107,13 +1106,437 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertFalse(model.isShareSheetActive)
         XCTAssertNil(model.shareStatusMessage)
         XCTAssertFalse(model.shareStatusIsError)
-        XCTAssertTrue(model.isShareReady)
-        XCTAssertEqual(model.test_preparedShareItem(), preparedBefore)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: preparedBefore.shareURL.path))
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: preparedBefore.shareDirectoryURL.path)
+        )
     }
 
     @MainActor
-    func testTwoConsecutiveShareCancelsReuseOneValidatedSnapshot() async throws {
+    func testPickerCloseQueuesPassiveCancellationUntilTheNextMainActorTurn() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        defer { model.cancelSharing() }
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputURL
+            .appendingPathComponent("splat.ply")
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        var presentedPicker: NSSharingServicePicker?
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { picker, _, _, _ in presentedPicker = picker }
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+
+        try XCTUnwrap(presentedPicker).close()
+
+        XCTAssertTrue(model.activeShareSession === session)
+        XCTAssertTrue(model.isShareSheetActive)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.shareDirectoryURL.path))
+    }
+
+    @MainActor
+    func testLocalMouseDownQueuesCancellationWithoutConsumingTheEvent() async throws {
+        let center = NotificationCenter()
+        let observation = ShareDismissalObservation(
+            notificationCenter: center,
+            application: NSObject()
+        )
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let session = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [URL(fileURLWithPath: "/tmp/share.ply")], from: NSButton())
+        let event = try mouseEvent(.leftMouseDown, at: .zero)
+
+        let returned = observation.handleLocalEvent(event)
+
+        XCTAssertTrue(returned === event)
+        XCTAssertTrue(model.activeShareSession === session)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertFalse(model.isShareSheetActive)
+    }
+
+    @MainActor
+    func testEscapeQueuesCancellationButOtherKeysDoNot() async throws {
+        let observation = ShareDismissalObservation(
+            notificationCenter: NotificationCenter(),
+            application: NSObject()
+        )
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let session = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [URL(fileURLWithPath: "/tmp/share.ply")], from: NSButton())
+
+        _ = observation.handleLocalEvent(try keyEvent(keyCode: 0))
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(model.activeShareSession === session)
+
+        let escape = try keyEvent(keyCode: 53)
+        XCTAssertTrue(observation.handleLocalEvent(escape) === escape)
+        XCTAssertTrue(model.activeShareSession === session)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+    }
+
+    @MainActor
+    func testQueuedDismissalLosesToSelectionAndLateSignalsCannotCancelInFlight() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputSplatURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        let observation = RetainingShareDismissalObservation()
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+        let service = NSSharingService(
+            title: "Selected",
+            image: NSImage(size: NSSize(width: 16, height: 16)),
+            alternateImage: nil,
+            handler: {}
+        )
+
+        observation.emit(at: 0)
+        session.sharingServicePicker(
+            NSSharingServicePicker(items: [prepared.shareURL]),
+            didChoose: service
+        )
+
+        XCTAssertEqual(observation.stopCount, 1)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertEqual(model.test_inFlightShareSessionCount(), 1)
+        observation.emit(at: 0)
+        await Task.yield()
+        await Task.yield()
+        XCTAssertEqual(model.test_inFlightShareSessionCount(), 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prepared.shareURL.path))
+
+        session.sharingService(service, didShareItems: [prepared.shareURL])
+        XCTAssertEqual(model.test_inFlightShareSessionCount(), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.shareDirectoryURL.path))
+    }
+
+    @MainActor
+    func testDuplicateDismissalSignalsAttemptSnapshotCleanupOnlyOnceEvenWhenRefused() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputSplatURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        defer {
+            ShareSnapshotStorage.remove(
+                prepared.shareDirectory,
+                expectedFileLeaf: prepared.shareURL.lastPathComponent
+            )
+        }
+        let observation = RetainingShareDismissalObservation()
+        var removalCount = 0
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { _, _, _, _ in },
+            snapshotRemover: { _ in
+                removalCount += 1
+                return .refused
+            },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+
+        observation.emit(at: 0)
+        observation.emit(at: 0)
+        await waitForShareSessionToClear(model)
+        observation.emit(at: 0)
+        await Task.yield()
+
+        XCTAssertEqual(removalCount, 1)
+        XCTAssertEqual(observation.stopCount, 1)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.shareStatusMessage)
+        XCTAssertFalse(model.shareStatusIsError)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prepared.shareURL.path))
+    }
+
+    @MainActor
+    func testStaleDismissalGenerationCannotCancelANewerSession() async {
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let observation = RetainingShareDismissalObservation()
+        let older = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = older
+        model.isShareSheetActive = true
+        older.present(items: [URL(fileURLWithPath: "/tmp/older.ply")], from: NSButton())
+        model.cancelSharing()
+
+        let newer = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = newer
+        model.isShareSheetActive = true
+        newer.present(items: [URL(fileURLWithPath: "/tmp/newer.ply")], from: NSButton())
+
+        observation.emit(at: 0)
+        await Task.yield()
+        await Task.yield()
+
+        XCTAssertTrue(model.activeShareSession === newer)
+        XCTAssertTrue(model.isShareSheetActive)
+        model.cancelSharing()
+    }
+
+    @MainActor
+    func testAppAndWindowResignOnlyArmDismissalUntilTheirMatchingReturn() async throws {
+        let center = NotificationCenter()
+        let application = NSObject()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let anchor = NSButton()
+        try XCTUnwrap(window.contentView).addSubview(anchor)
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+
+        let appObservation = ShareDismissalObservation(
+            notificationCenter: center,
+            application: application
+        )
+        let appSession = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: appObservation
+        )
+        model.activeShareSession = appSession
+        model.isShareSheetActive = true
+        appSession.present(items: [URL(fileURLWithPath: "/tmp/app.ply")], from: anchor)
+
+        center.post(name: NSApplication.didResignActiveNotification, object: application)
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(model.activeShareSession === appSession)
+        center.post(name: NSApplication.didBecomeActiveNotification, object: application)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+
+        let windowObservation = ShareDismissalObservation(
+            notificationCenter: center,
+            application: application
+        )
+        let windowSession = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: windowObservation
+        )
+        model.activeShareSession = windowSession
+        model.isShareSheetActive = true
+        windowSession.present(items: [URL(fileURLWithPath: "/tmp/window.ply")], from: anchor)
+
+        center.post(name: NSWindow.didResignKeyNotification, object: window)
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(model.activeShareSession === windowSession)
+        center.post(name: NSWindow.didBecomeKeyNotification, object: window)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+    }
+
+    @MainActor
+    func testAnchorWindowCloseAndMinimizeDismissAwaitingPicker() async throws {
+        for notificationName in [
+            NSWindow.willCloseNotification,
+            NSWindow.didMiniaturizeNotification,
+        ] {
+            let center = NotificationCenter()
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            let anchor = NSButton()
+            try XCTUnwrap(window.contentView).addSubview(anchor)
+            let model = AppModel(toolchainManager: ResultTestToolchainManager())
+            let observation = ShareDismissalObservation(
+                notificationCenter: center,
+                application: NSObject()
+            )
+            let session = ShareSession(
+                model: model,
+                presenter: { _, _, _, _ in },
+                dismissalObservation: observation
+            )
+            model.activeShareSession = session
+            model.isShareSheetActive = true
+            session.present(items: [URL(fileURLWithPath: "/tmp/window.ply")], from: anchor)
+
+            center.post(name: notificationName, object: window)
+            await waitForShareSessionToClear(model)
+
+            XCTAssertNil(model.activeShareSession, "Failed for \(notificationName.rawValue)")
+            XCTAssertFalse(model.isShareSheetActive)
+        }
+    }
+
+    @MainActor
+    func testResetCancelsAwaitingSelectionOnceAndIgnoresCleanupRefusal() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputSplatURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        defer {
+            ShareSnapshotStorage.remove(
+                prepared.shareDirectory,
+                expectedFileLeaf: prepared.shareURL.lastPathComponent
+            )
+        }
+        let observation = RetainingShareDismissalObservation()
+        var removalCount = 0
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { _, _, _, _ in },
+            snapshotRemover: { _ in
+                removalCount += 1
+                return .refused
+            },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+
+        model.reset()
+        model.reset()
+
+        XCTAssertEqual(removalCount, 1)
+        XCTAssertEqual(observation.stopCount, 1)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.shareStatusMessage)
+        XCTAssertFalse(model.shareStatusIsError)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prepared.shareURL.path))
+    }
+
+    @MainActor
+    func testNewSplatNavigationCancelsAwaitingSelectionAndDeletesSnapshotSynchronously() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputSplatURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        let observation = RetainingShareDismissalObservation()
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+
+        XCTAssertTrue(model.beginNewSplat())
+
+        XCTAssertEqual(observation.stopCount, 1)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.shareDirectoryURL.path))
+    }
+
+    @MainActor
+    func testNextShareAfterCancellationRevalidatesAndRecopies() async throws {
         let base = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: base) }
         let projectURL = try makeFinishedProject(
@@ -1134,9 +1557,8 @@ final class ResultWorkspaceTests: XCTestCase {
         }
 
         model.requestCurrentSplatShare(from: NSButton(), presenter: presenter)
-        for _ in 0..<300 where model.activeShareSession == nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        let firstRequest = try XCTUnwrap(model.sharePreparationTask)
+        await firstRequest.value
         let firstSession = try XCTUnwrap(model.activeShareSession)
         let firstPrepared = try XCTUnwrap(model.test_preparedShareItem())
         firstSession.sharingServicePicker(
@@ -1145,16 +1567,17 @@ final class ResultWorkspaceTests: XCTestCase {
         )
 
         XCTAssertNil(model.activeShareSession)
-        XCTAssertTrue(model.isShareReady)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: firstPrepared.shareURL.path))
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: firstPrepared.shareDirectoryURL.path)
+        )
 
         model.requestCurrentSplatShare(from: NSButton(), presenter: presenter)
-        for _ in 0..<300 where model.activeShareSession == nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        let secondRequest = try XCTUnwrap(model.sharePreparationTask)
+        await secondRequest.value
         let secondSession = try XCTUnwrap(model.activeShareSession)
         let secondPrepared = try XCTUnwrap(model.test_preparedShareItem())
-        XCTAssertEqual(secondPrepared, firstPrepared)
+        XCTAssertNotEqual(secondPrepared.shareDirectory, firstPrepared.shareDirectory)
         XCTAssertEqual(presentationCount, 2)
         secondSession.sharingServicePicker(
             NSSharingServicePicker(items: [secondPrepared.shareURL]),
@@ -1162,11 +1585,11 @@ final class ResultWorkspaceTests: XCTestCase {
         )
 
         XCTAssertNil(model.activeShareSession)
-        XCTAssertTrue(model.isShareReady)
-        XCTAssertEqual(model.test_preparedShareItem(), firstPrepared)
-
-        model.cancelSharing()
-        XCTAssertFalse(FileManager.default.fileExists(atPath: firstPrepared.shareDirectoryURL.path))
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: secondPrepared.shareDirectoryURL.path)
+        )
     }
 
     @MainActor
@@ -1484,7 +1907,10 @@ final class ResultWorkspaceTests: XCTestCase {
             model: model,
             preparedItem: prepared,
             presenter: { _, _, _, _ in },
-            snapshotRemover: { _ in releaseCount += 1 }
+            snapshotRemover: { _ in
+                releaseCount += 1
+                return .removed
+            }
         )
         model.activeShareSession = session
         model.isShareSheetActive = true
@@ -3680,6 +4106,13 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    private func waitForShareSessionToClear(_ model: AppModel) async {
+        for _ in 0..<50 where model.activeShareSession != nil {
+            await Task.yield()
+        }
+    }
+
+    @MainActor
     private func waitForViewerLoadState(
         _ state: SplatViewerAccessibilityLoadState,
         on view: InteractiveMTKView
@@ -4030,6 +4463,27 @@ final class ResultWorkspaceTests: XCTestCase {
             storedPreference: false,
             workspaceWidth: 1400
         ))
+    }
+}
+
+@MainActor
+private final class RetainingShareDismissalObservation: ShareDismissalObserving {
+    private var candidates: [() -> Void] = []
+    private(set) var stopCount = 0
+
+    func start(
+        anchorView: NSView,
+        onDismissalCandidate: @escaping () -> Void
+    ) {
+        candidates.append(onDismissalCandidate)
+    }
+
+    func stop() {
+        stopCount += 1
+    }
+
+    func emit(at index: Int) {
+        candidates[index]()
     }
 }
 

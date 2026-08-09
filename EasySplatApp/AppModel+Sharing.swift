@@ -1465,10 +1465,19 @@ extension AppModel {
         shareStatusIsError = true
     }
 
-    func shareDidCancel(from session: ShareSession) {
-        guard activeShareSession === session else { return }
-        shareStatusMessage = nil
-        shareStatusIsError = false
+    func shareDismissalCandidate(
+        from session: ShareSession,
+        sessionID: UUID,
+        generation: UInt64
+    ) {
+        guard activeShareSession === session,
+              session.matchesAwaitingSelection(
+                  sessionID: sessionID,
+                  generation: generation
+              ) else {
+            return
+        }
+        clearShareSession(session)
     }
 
     func clearShareSession(_ session: ShareSession) {
@@ -1476,7 +1485,13 @@ extension AppModel {
         session.finish()
         activeShareSession = nil
         isShareSheetActive = false
-        // Keep the validated snapshot reusable. Reset and cancelSharing own its cleanup.
+        if preparedShareItem == session.preparedItem {
+            preparedShareItem = nil
+        }
+        isShareReady = false
+        shareStatusMessage = nil
+        shareStatusIsError = false
+        session.releasePreparedSnapshot()
     }
 
     func cancelSharing() {
@@ -1484,9 +1499,9 @@ extension AppModel {
         sharePreparationTask = nil
         sharePreparationToken = nil
         isPreparingShare = false
-        let session = activeShareSession
-        _ = session?.close()
-        activeShareSession = nil
+        if let activeShareSession {
+            clearShareSession(activeShareSession)
+        }
         latestShareOperationID = nil
         isShareSheetActive = false
         cleanupPreparedShareItem()
@@ -1722,6 +1737,154 @@ extension AppModel {
 }
 
 @MainActor
+protocol ShareDismissalObserving: AnyObject {
+    func start(
+        anchorView: NSView,
+        onDismissalCandidate: @escaping () -> Void
+    )
+
+    func stop()
+}
+
+@MainActor
+final class ShareDismissalObservation: NSObject, ShareDismissalObserving {
+    private let notificationCenter: NotificationCenter
+    private let application: AnyObject
+    private weak var anchorWindow: NSWindow?
+    private var localEventMonitor: Any?
+    private var onDismissalCandidate: (() -> Void)?
+    private var applicationReturnArmed = false
+    private var windowReturnArmed = false
+
+    init(
+        notificationCenter: NotificationCenter = .default,
+        application: AnyObject = NSApplication.shared
+    ) {
+        self.notificationCenter = notificationCenter
+        self.application = application
+        super.init()
+    }
+
+    func start(
+        anchorView: NSView,
+        onDismissalCandidate: @escaping () -> Void
+    ) {
+        stop()
+        self.onDismissalCandidate = onDismissalCandidate
+        anchorWindow = anchorView.window
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]
+        ) { @MainActor [weak self] event in
+            self?.handleLocalEvent(event) ?? event
+        }
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(applicationDidResignActive(_:)),
+            name: NSApplication.didResignActiveNotification,
+            object: application
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive(_:)),
+            name: NSApplication.didBecomeActiveNotification,
+            object: application
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(windowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: nil
+        )
+        if let anchorWindow {
+            notificationCenter.addObserver(
+                self,
+                selector: #selector(anchorWindowDidMiniaturize(_:)),
+                name: NSWindow.didMiniaturizeNotification,
+                object: anchorWindow
+            )
+            notificationCenter.addObserver(
+                self,
+                selector: #selector(anchorWindowDidResignKey(_:)),
+                name: NSWindow.didResignKeyNotification,
+                object: anchorWindow
+            )
+            notificationCenter.addObserver(
+                self,
+                selector: #selector(anchorWindowDidBecomeKey(_:)),
+                name: NSWindow.didBecomeKeyNotification,
+                object: anchorWindow
+            )
+        }
+    }
+
+    func stop() {
+        if let localEventMonitor {
+            NSEvent.removeMonitor(localEventMonitor)
+            self.localEventMonitor = nil
+        }
+        notificationCenter.removeObserver(self)
+        anchorWindow = nil
+        onDismissalCandidate = nil
+        applicationReturnArmed = false
+        windowReturnArmed = false
+    }
+
+    @discardableResult
+    func handleLocalEvent(_ event: NSEvent) -> NSEvent {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            onDismissalCandidate?()
+        case .keyDown where event.keyCode == 53:
+            onDismissalCandidate?()
+        default:
+            break
+        }
+        return event
+    }
+
+    @objc private func applicationDidResignActive(_ notification: Notification) {
+        applicationReturnArmed = true
+    }
+
+    @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        guard applicationReturnArmed else { return }
+        applicationReturnArmed = false
+        onDismissalCandidate?()
+    }
+
+    @objc private func windowWillClose(_ notification: Notification) {
+        onDismissalCandidate?()
+    }
+
+    @objc private func anchorWindowDidMiniaturize(_ notification: Notification) {
+        onDismissalCandidate?()
+    }
+
+    @objc private func anchorWindowDidResignKey(_ notification: Notification) {
+        windowReturnArmed = true
+    }
+
+    @objc private func anchorWindowDidBecomeKey(_ notification: Notification) {
+        guard windowReturnArmed else { return }
+        windowReturnArmed = false
+        onDismissalCandidate?()
+    }
+}
+
+@MainActor
+private final class DismissalAwareSharingServicePicker: NSSharingServicePicker {
+    nonisolated(unsafe) var onClose: (() -> Void)?
+
+    nonisolated override func close() {
+        let pickerDelegate = delegate
+        delegate = nil
+        super.close()
+        delegate = pickerDelegate
+        onClose?()
+    }
+}
+
+@MainActor
 final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelegate, NSSharingServiceDelegate {
     private enum ServiceState: Equatable {
         case awaitingSelection
@@ -1735,16 +1898,20 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
         NSView,
         NSRectEdge
     ) -> Void
-    typealias SnapshotRemover = (PreparedShareItem) -> Void
+    typealias SnapshotRemover = (PreparedShareItem) -> ShareSnapshotRemovalOutcome
 
     private weak var model: AppModel?
     private weak var anchorView: NSView?
-    private var picker: NSSharingServicePicker?
+    private var picker: DismissalAwareSharingServicePicker?
     private var isPickerClosed = false
     private var serviceState: ServiceState = .awaitingSelection
     private var selectedService: NSSharingService?
     private let presenter: Presenter
     private let snapshotRemover: SnapshotRemover
+    private let dismissalObservation: any ShareDismissalObserving
+    private var isDismissalObservationActive = false
+    private var dismissalGeneration: UInt64 = 0
+    private var queuedDismissalGeneration: UInt64?
     private var didReleasePreparedSnapshot = false
 
     let id: UUID
@@ -1766,13 +1933,15 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
                 preparedItem.shareDirectory,
                 expectedFileLeaf: preparedItem.shareURL.lastPathComponent
             )
-        }
+        },
+        dismissalObservation: (any ShareDismissalObserving)? = nil
     ) {
         self.model = model
         self.preparedItem = preparedItem
         self.id = id
         self.presenter = presenter
         self.snapshotRemover = snapshotRemover
+        self.dismissalObservation = dismissalObservation ?? ShareDismissalObservation()
     }
 
     func present(items: [Any], from sourceView: NSView) {
@@ -1781,20 +1950,36 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
               picker == nil else {
             return
         }
-        let picker = NSSharingServicePicker(items: items)
+        dismissalGeneration &+= 1
+        let generation = dismissalGeneration
+        let sessionID = id
+        let picker = DismissalAwareSharingServicePicker(items: items)
         picker.delegate = self
+        picker.onClose = { [weak self] in
+            guard let self else { return }
+            self.isPickerClosed = true
+            self.queueDismissalCandidate(
+                sessionID: sessionID,
+                generation: generation
+            )
+        }
         self.picker = picker
         anchorView = sourceView
+        isDismissalObservationActive = true
+        dismissalObservation.start(anchorView: sourceView) { [weak self] in
+            self?.queueDismissalCandidate(
+                sessionID: sessionID,
+                generation: generation
+            )
+        }
         presenter(picker, sourceView.bounds, sourceView, .minY)
     }
 
     @discardableResult
     func close() -> Bool {
         guard !isPickerClosed else { return false }
-        isPickerClosed = true
-        picker?.delegate = nil
-        picker?.close()
-        picker = nil
+        stopDismissalObservation()
+        closePicker()
         if serviceState == .awaitingSelection {
             serviceState = .terminal
             anchorView = nil
@@ -1805,9 +1990,8 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
     func finish() {
         guard serviceState != .serviceInFlight else { return }
         serviceState = .terminal
-        isPickerClosed = true
-        picker?.delegate = nil
-        picker = nil
+        stopDismissalObservation()
+        closePicker()
         anchorView = nil
         selectedService?.delegate = nil
         selectedService = nil
@@ -1830,30 +2014,25 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
     ) {
         guard serviceState == .awaitingSelection else { return }
         guard let service else {
-            serviceState = .terminal
-            model?.shareDidCancel(from: self)
             model?.clearShareSession(self)
             return
         }
         guard preparedItem != nil else {
-            serviceState = .terminal
-            model?.shareDidCancel(from: self)
             model?.clearShareSession(self)
             return
         }
+        stopDismissalObservation()
+        detachPicker()
         serviceState = .serviceInFlight
         selectedService = service
         service.delegate = self
         guard model?.shareDidStart(from: self) == true else {
             service.delegate = nil
             selectedService = nil
-            serviceState = .terminal
+            serviceState = .awaitingSelection
             model?.clearShareSession(self)
             return
         }
-        isPickerClosed = true
-        picker?.delegate = nil
-        picker = nil
     }
 
     func sharingService(_ sharingService: NSSharingService, didShareItems items: [Any]) {
@@ -1878,20 +2057,82 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
         serviceState = .terminal
         selectedService?.delegate = nil
         selectedService = nil
-        picker?.delegate = nil
-        picker = nil
+        stopDismissalObservation()
+        detachPicker()
         anchorView = nil
         return true
     }
 
-    func releasePreparedSnapshot() {
+    func matchesAwaitingSelection(
+        sessionID: UUID,
+        generation: UInt64
+    ) -> Bool {
+        id == sessionID
+            && dismissalGeneration == generation
+            && serviceState == .awaitingSelection
+    }
+
+    private func queueDismissalCandidate(
+        sessionID: UUID,
+        generation: UInt64
+    ) {
+        guard matchesAwaitingSelection(
+            sessionID: sessionID,
+            generation: generation
+        ), queuedDismissalGeneration != generation else {
+            return
+        }
+        queuedDismissalGeneration = generation
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.queuedDismissalGeneration == generation,
+                  self.matchesAwaitingSelection(
+                      sessionID: sessionID,
+                      generation: generation
+                  ) else {
+                return
+            }
+            self.queuedDismissalGeneration = nil
+            self.model?.shareDismissalCandidate(
+                from: self,
+                sessionID: sessionID,
+                generation: generation
+            )
+        }
+    }
+
+    private func stopDismissalObservation() {
+        dismissalGeneration &+= 1
+        queuedDismissalGeneration = nil
+        guard isDismissalObservationActive else { return }
+        isDismissalObservationActive = false
+        dismissalObservation.stop()
+    }
+
+    private func closePicker() {
+        let picker = self.picker
+        let shouldClose = !isPickerClosed
+        detachPicker()
+        guard shouldClose else { return }
+        picker?.close()
+    }
+
+    private func detachPicker() {
+        isPickerClosed = true
+        picker?.onClose = nil
+        picker?.delegate = nil
+        picker = nil
+    }
+
+    @discardableResult
+    func releasePreparedSnapshot() -> ShareSnapshotRemovalOutcome? {
         guard serviceState == .terminal,
               !didReleasePreparedSnapshot,
               let preparedItem else {
-            return
+            return nil
         }
         didReleasePreparedSnapshot = true
-        snapshotRemover(preparedItem)
+        return snapshotRemover(preparedItem)
     }
 
     func anchoringView(
