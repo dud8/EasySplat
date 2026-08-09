@@ -4994,7 +4994,7 @@ public enum ProjectArtifactValidator {
         throw ProjectArtifactError.invalidOutput(destinationName)
     }
 
-    private static func validatedPlyEvidence(
+    package static func validatedPlyEvidence(
         descriptor: Int32,
         label: String,
         beforeBoundsMeasurement: () throws -> Void = {},

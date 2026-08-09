@@ -224,30 +224,23 @@ final class VnodeMutationMonitor: @unchecked Sendable {
     /// failure observed over the monitor's entire lifetime.
     func poll() -> Snapshot {
         lock.withLock {
-            guard queueDescriptor >= 0 else {
-                recordFailure(.closed)
-                return snapshot()
-            }
-
-            let result: SystemCallResult<[KernelEvent]>
-            while true {
-                let attempt = systemCalls.poll(queueDescriptor, max(watches.count, 1))
-                if case .interrupted = attempt { continue }
-                result = attempt
-                break
-            }
-
-            switch result {
-            case let .success(events):
-                for event in events {
-                    record(event)
-                }
-            case .interrupted:
-                preconditionFailure("EINTR must be retried")
-            case let .failure(errorNumber):
-                recordFailure(.pollingFailed(errno: errorNumber))
-            }
+            pollLocked()
             return snapshot()
+        }
+    }
+
+    /// Acknowledges one explicitly expected mutation generation without
+    /// disarming the kqueue. Events arriving after this zero-timeout poll remain
+    /// queued and will be reported by the next poll.
+    func acknowledgeCurrentSnapshot(
+        where isExpected: (Snapshot) -> Bool
+    ) -> Bool {
+        lock.withLock {
+            pollLocked()
+            let current = snapshot()
+            guard isExpected(current) else { return false }
+            mutationsByDescriptor.removeAll(keepingCapacity: true)
+            return true
         }
     }
 
@@ -284,6 +277,32 @@ final class VnodeMutationMonitor: @unchecked Sendable {
             recordFailure(.eventError(label: label, errno: errorNumber))
         } else if event.eventFlags & UInt16(EV_EOF) != 0 {
             recordFailure(.endOfFile(label: label))
+        }
+    }
+
+    private func pollLocked() {
+        guard queueDescriptor >= 0 else {
+            recordFailure(.closed)
+            return
+        }
+
+        let result: SystemCallResult<[KernelEvent]>
+        while true {
+            let attempt = systemCalls.poll(queueDescriptor, max(watches.count, 1))
+            if case .interrupted = attempt { continue }
+            result = attempt
+            break
+        }
+
+        switch result {
+        case let .success(events):
+            for event in events {
+                record(event)
+            }
+        case .interrupted:
+            preconditionFailure("EINTR must be retried")
+        case let .failure(errorNumber):
+            recordFailure(.pollingFailed(errno: errorNumber))
         }
     }
 

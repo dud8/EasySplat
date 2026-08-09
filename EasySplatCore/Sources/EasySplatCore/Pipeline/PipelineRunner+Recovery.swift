@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import ImageIO
 import SQLite3
@@ -336,7 +337,8 @@ extension PipelineRunner {
     func invalidateAcceptedArtifactsForGeometryRerun(
         startingAt stage: PipelineStage,
         metadata: inout ProjectMetadata,
-        paths: ProjectPaths
+        paths: ProjectPaths,
+        runLease: ProjectRunLease? = nil
     ) throws -> ProjectMetadata {
         try removeItemIfPresent(
             paths.colmapRefinementSeedModelURL.deletingLastPathComponent()
@@ -353,6 +355,7 @@ extension PipelineRunner {
         return try persistRequiredMetadata(
             metadata,
             paths: paths,
+            runLease: runLease,
             operation: .runStart,
             stage: stage
         )
@@ -367,7 +370,8 @@ extension PipelineRunner {
         _ resolvedPlan: ResolvedRunPlan,
         completedBoundary: PipelineStage?,
         metadata: inout ProjectMetadata,
-        paths: ProjectPaths
+        paths: ProjectPaths,
+        runLease: ProjectRunLease? = nil
     ) throws -> ProjectMetadata {
         let fileManager = FileManager.default
         func removeInvalidatedItem(_ url: URL) throws {
@@ -427,6 +431,7 @@ extension PipelineRunner {
         return try persistRequiredMetadata(
             metadata,
             paths: paths,
+            runLease: runLease,
             operation: .runStart,
             stage: completedBoundary ?? .importInput
         )
@@ -1137,7 +1142,7 @@ extension PipelineRunner {
         case .trainSplat:
             let artifact: TrainingArtifact
             do {
-                artifact = try TrainingArtifactStore.load(
+                artifact = try TrainingArtifactStore.loadManifest(
                     from: paths.trainingManifestURL,
                     projectPaths: paths
                 )
@@ -1150,14 +1155,6 @@ extension PipelineRunner {
                 case .checkpointed:
                     return .missing
                 case .completed:
-                    do {
-                        try TrainingArtifactStore.validateArtifact(
-                            artifact,
-                            projectPaths: paths
-                        )
-                    } catch {
-                        return .corrupt(reason: error.localizedDescription)
-                    }
                     guard artifact.detailProfile == metadata.effectiveDetailProfile else {
                         return .corrupt(
                             reason: "completed training profile does not match the requested detail"
@@ -1176,15 +1173,31 @@ extension PipelineRunner {
                     guard let outputPath = artifact.outputPath else {
                         return .corrupt(reason: "completed training manifest has no output path")
                     }
-                    let outputStatus: StageOutputStatus
+                    let outputURL: URL
                     do {
-                        outputStatus = validatePlyFile(
-                            at: try paths.resolveProjectRelativePath(outputPath)
+                        outputURL = try paths.resolveProjectRelativePath(outputPath)
+                    } catch {
+                        return .corrupt(reason: error.localizedDescription)
+                    }
+                    var outputStatus = stat()
+                    if Darwin.lstat(outputURL.path, &outputStatus) != 0 {
+                        let code = errno
+                        if code == ENOENT || code == ENOTDIR {
+                            return .missing
+                        }
+                        return .corrupt(
+                            reason: "completed training output could not be inspected (POSIX \(code))"
+                        )
+                    }
+                    do {
+                        let evidence = try tooling.completedTrainingOutputEvidence(outputURL)
+                        try TrainingArtifactStore.validateCompletedOutput(
+                            artifact,
+                            evidence: evidence
                         )
                     } catch {
                         return .corrupt(reason: error.localizedDescription)
                     }
-                    guard outputStatus == .valid else { return outputStatus }
                     do {
                         guard let plan = metadata.resolvedRunPlan else {
                             return .corrupt(
@@ -1208,6 +1221,14 @@ extension PipelineRunner {
                                 reason: "completed training manifest does not match current input, geometry, or derivation"
                             )
                         }
+                        guard try TrainingArtifactStore.loadManifest(
+                            from: paths.trainingManifestURL,
+                            projectPaths: paths
+                        ) == artifact else {
+                            return .corrupt(
+                                reason: "completed training manifest changed during validation"
+                            )
+                        }
                     } catch {
                         return .corrupt(
                             reason: "completed training identity could not be verified: \(error.localizedDescription)"
@@ -1216,22 +1237,37 @@ extension PipelineRunner {
                     return .valid
             }
         case .exportSplat, .done:
-            let trainingArtifact: TrainingArtifact
             do {
-                trainingArtifact = try TrainingArtifactStore.load(
-                    from: paths.trainingManifestURL,
-                    projectPaths: paths
+                let trainingManifestExists = fm.fileExists(
+                    atPath: paths.trainingManifestURL.path
+                ) || ((try? fm.destinationOfSymbolicLink(
+                    atPath: paths.trainingManifestURL.path
+                )) != nil)
+                guard trainingManifestExists else { return .missing }
+                guard let resolvedRunPlan = metadata.resolvedRunPlan else {
+                    return .corrupt(reason: "published result has no resolved run plan")
+                }
+                _ = try GeometryArtifactStore.load(
+                    from: paths.geometryManifestURL,
+                    projectPaths: paths,
+                    expectedInput: metadata.input
                 )
+                guard try PublishedResultPublisher.resolveCompletedTraining(
+                    metadata: metadata,
+                    resolvedRunPlan: resolvedRunPlan,
+                    paths: paths,
+                    pairOperations: tooling.publishedResultPairOperations
+                ) != nil else {
+                    return .corrupt(
+                        reason: "published PLY and receipt do not match the completed run"
+                    )
+                }
+                return .valid
             } catch where BoundedFileReader.isMissingFileError(error) {
                 return .missing
             } catch {
                 return .corrupt(reason: error.localizedDescription)
             }
-            guard trainingArtifact.completionStatus == .completed,
-                  trainingArtifact.outputPath == "Output/splat.ply" else {
-                return .missing
-            }
-            return validatePlyFile(at: paths.outputSplatURL)
         }
     }
 

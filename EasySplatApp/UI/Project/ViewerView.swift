@@ -897,11 +897,10 @@ struct ViewerView: View {
     private func updateUprightFlip(_ isActive: Bool) {
         guard let projectURL = model.currentProjectURL else { return }
         do {
-            _ = try ProjectMetadataStore.update(
-                at: ProjectPaths(root: projectURL).metadataURL
-            ) { metadata in
-                metadata.viewerPreferences.isUprightFlipActive = isActive
-            }
+            _ = try model.updateViewerUprightFlip(
+                at: projectURL,
+                isActive: isActive
+            )
             requestArtifactLoad(
                 preservingCurrentSnapshot: true,
                 failurePresentation: .alert

@@ -670,6 +670,7 @@ public final class ProjectPublicationTransaction {
             try cleanupEnvelope(disposition: .published, expectedBundle: nil)
             isFinished = true
             closeDescriptors()
+            try pendingAttestation?.publicationCleanupDidComplete()
             let attestation = pendingAttestation
             self.publishedURL = destinationURL
             pendingAttestation = nil

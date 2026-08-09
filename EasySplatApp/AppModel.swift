@@ -1,8 +1,9 @@
+import Darwin
 import Foundation
 import SwiftUI
 import EasySplatCore
 
-enum RunValidationRecovery: Equatable {
+enum RunValidationRecovery: Equatable, Sendable {
     case useUnordered
     case useFast
     case useFastForMemory
@@ -45,6 +46,30 @@ struct ProjectPublicationCheckpointHook: Sendable {
     }
 }
 
+enum ProjectTrashQuarantineCheckpoint: Sendable, Equatable {
+    case canonicalIdentityValidated
+}
+
+struct ProjectTrashQuarantineCheckpointHook: Sendable {
+    static let none = ProjectTrashQuarantineCheckpointHook()
+
+    private let handler: @Sendable (
+        ProjectTrashQuarantineCheckpoint
+    ) throws -> Void
+
+    init(
+        _ handler: @escaping @Sendable (
+            ProjectTrashQuarantineCheckpoint
+        ) throws -> Void = { _ in }
+    ) {
+        self.handler = handler
+    }
+
+    func handle(_ checkpoint: ProjectTrashQuarantineCheckpoint) throws {
+        try handler(checkpoint)
+    }
+}
+
 struct DatasetInputPreflightOperation: Sendable {
     static let live = DatasetInputPreflightOperation {
         source, kind, stagingParent in
@@ -81,6 +106,89 @@ struct DatasetInputPreflightOperation: Sendable {
     }
 }
 
+struct AppProjectRootIdentity: Sendable, Equatable {
+    let device: UInt64
+    let inode: UInt64
+    let generation: UInt32
+    let owner: UInt32
+
+    static func capture(at projectURL: URL) throws -> Self {
+        var status = stat()
+        while Darwin.lstat(projectURL.path, &status) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return try validated(status)
+    }
+
+    static func capture(descriptor: Int32) throws -> Self {
+        var status = stat()
+        while Darwin.fstat(descriptor, &status) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return try validated(status)
+    }
+
+    private static func validated(_ status: stat) throws -> Self {
+        guard status.st_mode & S_IFMT == S_IFDIR,
+              status.st_nlink >= 1 else {
+            throw POSIXError(.ENOTDIR)
+        }
+        return Self(
+            device: UInt64(status.st_dev),
+            inode: UInt64(status.st_ino),
+            generation: UInt32(status.st_gen),
+            owner: UInt32(status.st_uid)
+        )
+    }
+}
+
+/// App-task ownership for one cross-process project mutation lease. The core
+/// owner may lend the lease to exactly one production runner, but this wrapper
+/// retains ownership until the app task has finished validation, fallback
+/// persistence, stop handling, and any requested Trash move.
+final class AppProjectRunLeaseOwner: @unchecked Sendable {
+    private let owner: ProjectRunLeaseOwner
+
+    init(
+        projectURL: URL,
+        acquire: AppModel.ProjectRunLeaseOwnerAcquirer
+    ) throws {
+        owner = try acquire(projectURL)
+    }
+
+    func borrowingLease(
+        in config: PipelineRunner.PipelineConfig
+    ) -> PipelineRunner.PipelineConfig {
+        config.withBorrowedProjectRunLease(owner)
+    }
+
+    func withLockedProjectRootDescriptor<Result>(
+        _ operation: (Int32) throws -> Result
+    ) throws -> Result {
+        try owner.withLockedProjectRootDescriptor(operation)
+    }
+
+    func withValidatedProjectRootDescriptor<Result>(
+        _ operation: (Int32) throws -> Result
+    ) throws -> Result {
+        try owner.withValidatedProjectRootDescriptor(operation)
+    }
+
+    func lockedProjectRootIdentity() throws -> AppProjectRootIdentity {
+        try withLockedProjectRootDescriptor {
+            try AppProjectRootIdentity.capture(descriptor: $0)
+        }
+    }
+
+    func release() {
+        owner.release()
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     typealias FinishedOutputValidator = @Sendable (URL) -> URL?
@@ -90,11 +198,25 @@ final class AppModel: ObservableObject {
         @Sendable (ProjectPaths) -> IsolationArtifactLoadResult
     typealias SubjectIsolationArtifactRemover =
         @Sendable (ProjectPaths) throws -> Bool
-    typealias ProjectMetadataMutation = (inout ProjectMetadata) throws -> Void
-    typealias ProjectMetadataUpdater = (
-        _ metadataURL: URL,
+    typealias ProjectMetadataMutation = @Sendable (inout ProjectMetadata) throws -> Void
+    typealias ProjectMetadataLoader = @Sendable (URL) throws -> ProjectMetadata
+    typealias ProjectMetadataDescriptorLoader = @Sendable (Int32) throws -> ProjectMetadata
+    typealias ProjectMetadataUpdater = @Sendable (
+        _ projectRootDescriptor: Int32,
         _ mutation: ProjectMetadataMutation
     ) throws -> ProjectMetadata
+    typealias ProjectRunLeaseOwnerAcquirer = @Sendable (
+        _ projectURL: URL
+    ) throws -> ProjectRunLeaseOwner
+    typealias ResultViewerTimingReceiptUpdater = @Sendable (
+        _ seconds: TimeInterval,
+        _ expectedPublicationID: UUID,
+        _ expectedGeneration: PublishedResultGeneration?,
+        _ projectPaths: ProjectPaths,
+        _ projectRootDescriptor: Int32?,
+        _ operations: PublishedResultPairOperations,
+        _ shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> ValidatedPublishedResult
 
     enum ViewState: Equatable {
         case home
@@ -217,13 +339,27 @@ final class AppModel: ObservableObject {
     let subjectIsolationArtifactRemover: SubjectIsolationArtifactRemover
     let projectBaseURL: URL?
     let projectTrashHandler: (URL) throws -> Void
+    let projectTrashQuarantineCheckpointHook:
+        ProjectTrashQuarantineCheckpointHook
+    let projectMetadataLoader: ProjectMetadataLoader
+    let projectMetadataDescriptorLoader: ProjectMetadataDescriptorLoader
     let projectMetadataUpdater: ProjectMetadataUpdater
+    let projectRunLeaseOwnerAcquirer: ProjectRunLeaseOwnerAcquirer
+    let resultViewerTimingReceiptUpdater: ResultViewerTimingReceiptUpdater
+    let resultViewerTimingPairOperations: PublishedResultPairOperations
     var currentTask: Task<Void, Never>?
     var currentTaskToken: UUID?
     var subjectIsolationTask: Task<Void, Never>?
     var subjectIsolationTaskToken: UUID?
     var subjectIsolationCancellationRequested = false
     var pendingResultViewerTiming: PendingResultViewerTiming?
+    var resultViewerTimingTask: Task<Void, Never>?
+    /// A short MainActor orchestration task used only when a user mutation must
+    /// wait for the detached viewer-timing worker to release its run lease.
+    /// The timing worker itself is deliberately not active work: read-only
+    /// viewer navigation stays responsive, while the dependent mutation is
+    /// serialized explicitly.
+    var deferredProjectMutationTask: Task<Void, Never>?
     var lastProgressLogAt: Date = .distantPast
     var lastProgressLogMessage: String = ""
     var lastProgressLogStage: PipelineStage? = nil
@@ -303,6 +439,7 @@ final class AppModel: ObservableObject {
 
     var hasActiveWork: Bool {
         isRunActive || isSubjectIsolationActive || isSubjectVersionRemovalActive
+            || deferredProjectMutationTask != nil
     }
 
     var displayedOutputURL: URL? {
@@ -520,9 +657,44 @@ final class AppModel: ObservableObject {
             var resultingURL: NSURL?
             try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
         },
-        projectMetadataUpdater: @escaping ProjectMetadataUpdater = { metadataURL, mutation in
-            try ProjectMetadataStore.update(at: metadataURL, mutation)
+        projectTrashQuarantineCheckpointHook:
+            ProjectTrashQuarantineCheckpointHook = .none,
+        projectMetadataLoader: @escaping ProjectMetadataLoader = { metadataURL in
+            try ProjectMetadataStore.load(from: metadataURL)
         },
+        projectMetadataDescriptorLoader: @escaping ProjectMetadataDescriptorLoader = {
+            try ProjectMetadataStore.load(fromProjectRootDescriptor: $0)
+        },
+        projectMetadataUpdater: @escaping ProjectMetadataUpdater = {
+            projectRootDescriptor,
+            mutation in
+            try ProjectMetadataStore.update(
+                atProjectRootDescriptor: projectRootDescriptor,
+                mutation
+            )
+        },
+        projectRunLeaseOwnerAcquirer: @escaping ProjectRunLeaseOwnerAcquirer = {
+            try ProjectRunLeaseOwner.acquire(projectURL: $0)
+        },
+        resultViewerTimingReceiptUpdater: @escaping ResultViewerTimingReceiptUpdater = {
+            seconds,
+            expectedPublicationID,
+            expectedGeneration,
+            projectPaths,
+            projectRootDescriptor,
+            operations,
+            shouldCancel in
+            try PublishedResultPairStore.recordFirstViewerReadyTiming(
+                seconds,
+                expectedPublicationID: expectedPublicationID,
+                expectedGeneration: expectedGeneration,
+                projectPaths: projectPaths,
+                projectRootDescriptor: projectRootDescriptor,
+                operations: operations,
+                shouldCancel: shouldCancel
+            )
+        },
+        resultViewerTimingPairOperations: PublishedResultPairOperations = .system(),
         finishedOutputValidator: @escaping FinishedOutputValidator = { projectURL in
             AppModel.readyOutputURLOnDisk(
                 projectURL: projectURL,
@@ -546,7 +718,14 @@ final class AppModel: ObservableObject {
         self.subjectIsolationArtifactLoader = subjectIsolationArtifactLoader
         self.subjectIsolationArtifactRemover = subjectIsolationArtifactRemover
         self.projectTrashHandler = projectTrashHandler
+        self.projectTrashQuarantineCheckpointHook =
+            projectTrashQuarantineCheckpointHook
+        self.projectMetadataLoader = projectMetadataLoader
+        self.projectMetadataDescriptorLoader = projectMetadataDescriptorLoader
         self.projectMetadataUpdater = projectMetadataUpdater
+        self.projectRunLeaseOwnerAcquirer = projectRunLeaseOwnerAcquirer
+        self.resultViewerTimingReceiptUpdater = resultViewerTimingReceiptUpdater
+        self.resultViewerTimingPairOperations = resultViewerTimingPairOperations
         self.pipelineRunnerFactory = pipelineRunnerFactory
         self.powerAssertion = powerAssertion
         if self.hardwareProfile.memoryGB <= 8.5 {

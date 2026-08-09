@@ -86,11 +86,14 @@ SfM/colmap/sparse/0
 SfM/geometry_manifest.json
 Training/training_manifest.json
 Output/splat.ply
+Output/splat_receipt.json
 ```
 
 `ProjectPaths` is the layout authority. Stored paths are relative to the project root and must pass the safe resolver before use. Never accept an absolute path, traversal, or escaping symlink from metadata.
 
-Subject isolation is optional and never replaces the canonical result. `Output/splat.ply` remains the only canonical splat. A completed optional result adds `Output/isolated.ply`, `Isolation/isolation_manifest.json`, the validated `Isolation/masks/` files, and private `Isolation/staging/` work.
+Separate from `project.json`, `Output/splat_receipt.json` is the authority for newly published result bytes. `Output/splat.ply` normally requires its matching, fully validated receipt. The sole compatibility exception is a fully validated, successfully completed legacy project created before receipts; it may open only its current result. A bare PLY never establishes previous-result authority after a failed or interrupted retrain.
+
+Subject isolation is optional and never replaces the canonical result. `Output/splat.ply` remains the only canonical splat payload. A completed optional result adds `Output/isolated.ply`, `Isolation/isolation_manifest.json`, the validated `Isolation/masks/` files, and private `Isolation/staging/` work.
 
 The viewer's chosen variant is session-local and starts on the original. Isolation reuses the bundled native filtering binary; a missing, stale, invalid, or failed optional artifact never blocks opening, viewing, sharing, or recovering the canonical project.
 
@@ -106,7 +109,7 @@ The new-project order is deliberate:
 
 A setup failure therefore creates no failed project and keeps input available for Try Again.
 
-EasySplat reads only the project format written by the current build. The project library logs and skips older, newer, malformed, and unsafe bundles without changing or deleting them.
+EasySplat reads project formats 31, 32, and 33. It writes the current format, 33, so saving an accepted older project migrates it forward. The project library logs and skips unsupported older or newer, malformed, and unsafe bundles without changing or deleting them.
 
 ## Durable stages and recovery
 
@@ -115,7 +118,9 @@ The internal pipeline has finer stages than the UI. A checkpoint is useful only 
 - Before training, Stop preserves the last durable geometry/import stage.
 - Native training writes an atomic checkpoint generation with model arrays, optimizer moments, schedule, seed, trainer version, and geometry identity.
 - Resume validates the checkpoint and dataset identity. If native msplat rejects it, EasySplat restarts training honestly.
-- A replacement PLY is written to a temporary path, validated, then atomically promoted. A good previous output is never overwritten by an invalid replacement.
+- Final publication stages a new PLY and receipt under `Output/`, preserves the current validated pair, installs the PLY first, and installs the receipt last as the authority-conferring commit.
+- Pipeline startup reconciles an interrupted publication before inspecting inputs or recording a new attempt. Before receipt commit it restores the prior validated pair; after receipt commit it keeps the new pair only if both files fully validate, otherwise it restores the prior pair.
+- Successful finalization validates the private training output and current geometry, prepares the rebound training manifest and receipt, commits and revalidates the pair, persists and rereads the training manifest, persists `.done`, invalidates stale derived artifacts, and only then removes disposable training data.
 
 Do not call an intermediate file a checkpoint or snapshot unless its complete-state contract is validated.
 

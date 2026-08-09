@@ -22,6 +22,16 @@ final class ProjectMetadataFormatMigrationTests: XCTestCase {
         return try encoder.encode(metadata)
     }
 
+    private func insertingTopLevelMembers(
+        _ members: [String],
+        into data: Data
+    ) throws -> Data {
+        var text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        let openingBrace = try XCTUnwrap(text.firstIndex(of: "{"))
+        text.insert(contentsOf: members.joined(separator: ",") + ",", at: text.index(after: openingBrace))
+        return try XCTUnwrap(text.data(using: .utf8))
+    }
+
     func testFormat31ProjectLoadsAndMigratesOnSave() throws {
         let root = try makeProjectRoot()
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
@@ -31,6 +41,7 @@ final class ProjectMetadataFormatMigrationTests: XCTestCase {
         let loaded = try ProjectMetadataStore.load(from: url)
         XCTAssertEqual(loaded.formatVersion, 31)
         XCTAssertNil(loaded.datasetPoseSeed)
+        XCTAssertNil(loaded.pendingPublicationID)
 
         // Saving is the migration boundary: the file is rewritten as the
         // current format.
@@ -38,12 +49,57 @@ final class ProjectMetadataFormatMigrationTests: XCTestCase {
         let migrated = try ProjectMetadataStore.load(from: url)
         XCTAssertEqual(migrated.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(migrated.title, "Migration fixture")
+        XCTAssertNil(migrated.pendingPublicationID)
+    }
+
+    func testFormat32ProjectLoadsWithoutPendingPublicationAndMigratesOnSave() throws {
+        let root = try makeProjectRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let url = root.appendingPathComponent("project.json")
+        try encodedMetadata(formatVersion: 32).write(to: url, options: .atomic)
+
+        let loaded = try ProjectMetadataStore.load(from: url)
+        XCTAssertEqual(loaded.formatVersion, 32)
+        XCTAssertNil(loaded.pendingPublicationID)
+
+        try ProjectMetadataStore.save(loaded, to: url)
+        let migrated = try ProjectMetadataStore.load(from: url)
+        XCTAssertEqual(migrated.formatVersion, 33)
+        XCTAssertNil(migrated.pendingPublicationID)
+    }
+
+    func testFormat33LoadRejectsPendingPublicationIdentityForSuccessfulCompletion() throws {
+        let root = try makeProjectRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let url = root.appendingPathComponent("project.json")
+        let publicationID = UUID(uuidString: "5D173430-D3C9-47EC-B88E-F4AC706E3ADF")!
+        let metadata = ProjectMetadata(
+            formatVersion: 33,
+            title: "Completed fixture",
+            input: .video(files: []),
+            state: PipelineState(stage: .done, lastError: nil),
+            pendingPublicationID: publicationID
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let staleBytes = try encoder.encode(metadata)
+        let staleObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: staleBytes) as? [String: Any]
+        )
+        XCTAssertEqual(staleObject["pendingPublicationID"] as? String, publicationID.uuidString)
+        try staleBytes.write(to: url, options: .atomic)
+
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidPendingPublicationID = error else {
+                return XCTFail("Expected invalid pending publication identity, got \(error)")
+            }
+        }
     }
 
     func testUnknownFormatVersionsAreRejected() throws {
         let root = try makeProjectRoot()
         defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
-        for version in [30, 33] {
+        for version in [30, 34] {
             let url = root.appendingPathComponent("project-\(version).json")
             try encodedMetadata(formatVersion: version).write(to: url, options: .atomic)
             XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
@@ -51,6 +107,97 @@ final class ProjectMetadataFormatMigrationTests: XCTestCase {
                     return XCTFail("Expected unsupported format, got \(error)")
                 }
                 XCTAssertEqual(found, version)
+            }
+        }
+    }
+
+    func testDuplicateFormatVersionMembersAreRejectedInEitherOrder() throws {
+        let root = try makeProjectRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+
+        let cases = [
+            try insertingTopLevelMembers(
+                ["\"formatVersion\":34"],
+                into: encodedMetadata(formatVersion: 33)
+            ),
+            try insertingTopLevelMembers(
+                ["\"formatVersion\":33"],
+                into: encodedMetadata(formatVersion: 34)
+            ),
+        ]
+        for (index, data) in cases.enumerated() {
+            let url = root.appendingPathComponent("duplicate-format-\(index).json")
+            try data.write(to: url, options: .atomic)
+            XCTAssertThrowsError(try ProjectMetadataStore.load(from: url))
+        }
+    }
+
+    func testDuplicatePendingPublicationMembersAreRejectedAfterEscapeDecoding() throws {
+        let root = try makeProjectRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let publicationID = UUID(uuidString: "5D173430-D3C9-47EC-B88E-F4AC706E3ADF")!
+
+        var bound = ProjectMetadata(
+            title: "Bound fixture",
+            input: .video(files: []),
+            state: PipelineState(stage: .done, lastError: nil),
+            lastRunStartedAt: Date(timeIntervalSince1970: 1_725_000_000),
+            pendingPublicationID: publicationID
+        )
+        bound.formatVersion = 33
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+
+        let cases = [
+            try insertingTopLevelMembers(
+                ["\"pendingPublicationID\":null"],
+                into: encoder.encode(bound)
+            ),
+            try insertingTopLevelMembers(
+                [
+                    "\"pendingPublicationID\":\"\(publicationID.uuidString)\"",
+                    "\"pendingPublication\\u0049D\":null",
+                ],
+                into: encodedMetadata(formatVersion: 33)
+            ),
+        ]
+        for (index, data) in cases.enumerated() {
+            let url = root.appendingPathComponent("duplicate-publication-\(index).json")
+            try data.write(to: url, options: .atomic)
+            XCTAssertThrowsError(try ProjectMetadataStore.load(from: url))
+        }
+    }
+
+    func testPre33PayloadCannotSmugglePendingPublicationIdentity() throws {
+        let root = try makeProjectRoot()
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+
+        for version in [31, 32] {
+            for (caseName, value) in [
+                ("uuid", "5D173430-D3C9-47EC-B88E-F4AC706E3ADF" as Any),
+                ("null", NSNull() as Any),
+            ] {
+                let url = root.appendingPathComponent(
+                    "project-\(version)-\(caseName).json"
+                )
+                var object = try XCTUnwrap(
+                    try JSONSerialization.jsonObject(
+                        with: encodedMetadata(formatVersion: version)
+                    ) as? [String: Any]
+                )
+                object["pendingPublicationID"] = value
+                try JSONSerialization.data(withJSONObject: object).write(
+                    to: url,
+                    options: .atomic
+                )
+
+                XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+                    guard case ProjectMetadataStore.LoadError.unexpectedFields = error else {
+                        return XCTFail(
+                            "Expected format \(version) to reject \(caseName) pending publication state, got \(error)"
+                        )
+                    }
+                }
             }
         }
     }

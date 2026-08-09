@@ -142,13 +142,14 @@ final class ProjectMetadataCurrentVersionTests: XCTestCase {
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 32)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 33)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
             RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         XCTAssertNil(metadata.resolvedRunPlan)
+        XCTAssertNil(metadata.pendingPublicationID)
     }
 }
 

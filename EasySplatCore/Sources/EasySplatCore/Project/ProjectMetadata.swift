@@ -22,6 +22,11 @@ public struct ProjectMetadata: Codable, Sendable {
     public var state: PipelineState
     public var checkpoint: PipelineCheckpoint?
     public var lastRunStartedAt: Date?
+    /// Durable identity allocated at the required run-start boundary and used
+    /// by receipt-last publication. It survives failed/interrupted attempts so
+    /// a committed pair can be adopted exactly once after relaunch.
+    /// Introduced in project format 33.
+    public var pendingPublicationID: UUID?
     public var stageTimings: [StageTimingRecord]?
     /// Monotonic elapsed time from the user's Create action until the first
     /// rendered preview for that run. This is an end-to-end boundary, not a
@@ -48,6 +53,7 @@ public struct ProjectMetadata: Codable, Sendable {
         case state
         case checkpoint
         case lastRunStartedAt
+        case pendingPublicationID
         case stageTimings
         case createToViewerReadySeconds
         case notes
@@ -72,6 +78,7 @@ public struct ProjectMetadata: Codable, Sendable {
         state: PipelineState = PipelineState(stage: .importInput, lastError: nil),
         checkpoint: PipelineCheckpoint? = nil,
         lastRunStartedAt: Date? = nil,
+        pendingPublicationID: UUID? = nil,
         stageTimings: [StageTimingRecord]? = nil,
         createToViewerReadySeconds: Double? = nil,
         notes: String? = nil,
@@ -94,6 +101,7 @@ public struct ProjectMetadata: Codable, Sendable {
         self.state = state
         self.checkpoint = checkpoint
         self.lastRunStartedAt = lastRunStartedAt
+        self.pendingPublicationID = pendingPublicationID
         self.stageTimings = stageTimings
         self.createToViewerReadySeconds = createToViewerReadySeconds
         self.notes = notes

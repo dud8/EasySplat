@@ -1,4 +1,5 @@
 #if canImport(XCTest)
+import CryptoKit
 import Darwin
 import Foundation
 import XCTest
@@ -25,6 +26,7 @@ final class PipelineIntegrationTests: XCTestCase {
         skipTraining: Bool = false,
         stopAfterStage: PipelineStage? = nil,
         resolvedRunPlan: ResolvedRunPlan? = nil,
+        runIntent: PipelineRunner.RunIntent = .resume,
         hardwareProfile: HardwareProfile? = HardwareProfile(
             memoryGB: 48,
             cpuCount: 16,
@@ -39,7 +41,1000 @@ final class PipelineIntegrationTests: XCTestCase {
                 skipTraining: skipTraining
             ),
             hardwareProfile: hardwareProfile,
-            resolvedRunPlan: resolvedRunPlan
+            resolvedRunPlan: resolvedRunPlan,
+            runIntent: runIntent
+        )
+    }
+
+    private func makeFreshAttestedPipelinePublication(
+        baseURL: URL,
+        title: String
+    ) throws -> FreshProjectPublication {
+        let projectID = UUID()
+        let transaction = try ProjectPublicationTransaction.begin(
+            in: baseURL,
+            title: title,
+            projectID: projectID
+        )
+        let paths = ProjectPaths(root: transaction.bundleURL)
+        try paths.ensureDirectories()
+        let input = InputSpec.video(files: ["Originals/video-0000.mov"])
+        let options = RequestedRunOptions(detailProfile: .fast)
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: input,
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none
+        )
+        let videoBytes = Data("fresh-attested-video".utf8)
+        let sourceSHA256 = SHA256.hash(data: videoBytes)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let clipGroupID = try XCTUnwrap(
+            VideoClipIdentityResolver.resolve(
+                sourceSHA256s: [sourceSHA256],
+                pairingPolicy: plan.pairingPolicy
+            ).first?.groupID
+        )
+        let (_, receipt) = try TestFileBuilder.writeControlledVideoReceipt(
+            paths: paths,
+            bytes: videoBytes,
+            analysisPolicy: VideoFrameAnalysisPolicy(resolvedRunPlan: plan),
+            clipGroupID: clipGroupID
+        )
+        let metadata = ProjectMetadata(
+            id: projectID,
+            title: title,
+            input: input,
+            videoInputReceipts: [receipt],
+            requestedRunOptions: options,
+            resolvedRunPlan: plan,
+            lastRunStartedAt: Date()
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try transaction.validateAndSeal(expectedMetadata: metadata)
+        return try transaction.publishWithFreshAttestationForTesting()
+    }
+
+    func testConcurrentRunnerFailsBeforeMetadataOrOutputMutation() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "ConcurrentRunner.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent(
+            "ConcurrentRunnerPhotos",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<4 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try saveFixtureMetadata(
+            ProjectMetadata(
+                title: "Concurrent runner",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            ),
+            paths: paths
+        )
+        let outputMarker = paths.outputURL.appendingPathComponent("keep.bin")
+        try Data("unchanged output".utf8).write(to: outputMarker)
+        let metadataBefore = try Data(contentsOf: paths.metadataURL)
+        let outputBefore = try Data(contentsOf: outputMarker)
+        let toolchain = try makeToolchain(root: temp)
+
+        let blockedWrite = PipelineRunLeaseWriteProbe()
+        var firstTooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: [])
+        )
+        firstTooling.metadataWriter = { _, _, operation, stage in
+            if operation == .runStart && stage == .importInput {
+                try blockedWrite.blockRunStart()
+            }
+            throw PipelineRunLeaseTestError.unexpectedWrite
+        }
+        let firstPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: toolchain),
+            tooling: firstTooling,
+            powerAssertion: RecordingPowerAssertion()
+        )
+        let firstTask = Task.detached {
+            try await firstPipeline.run { _ in }
+        }
+        defer { blockedWrite.releaseRunStart() }
+        XCTAssertEqual(
+            blockedWrite.waitForRunStart(timeout: .now() + 3),
+            .success,
+            "The first runner did not reach its durable run-start boundary."
+        )
+        let interruptedTransactionURL = try PublishedResultPairStore.testCreateTransactionFixture(
+            projectPaths: paths,
+            transactionID: UUID(uuidString: "22222222-3333-4444-8555-666666666666")!,
+            publicationID: UUID(uuidString: "BBBBBBBB-CCCC-4DDD-8EEE-FFFFFFFFFFFF")!,
+            previousPublicationID: nil
+        )
+        let outputEntriesBeforeSecond = try FileManager.default.contentsOfDirectory(
+            atPath: paths.outputURL.path
+        ).sorted()
+
+        let secondPowerAssertion = RecordingPowerAssertion()
+        let secondPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: toolchain),
+            tooling: .init(runner: MockSubprocessRunner(scripts: [])),
+            powerAssertion: secondPowerAssertion
+        )
+        await XCTAssertThrowsErrorAsync({
+            try await secondPipeline.run { _ in }
+        }, errorHandler: { error in
+            XCTAssertEqual(error as? ProjectRunLeaseError, .alreadyRunning)
+        })
+
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), metadataBefore)
+        XCTAssertEqual(try Data(contentsOf: outputMarker), outputBefore)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(
+                atPath: paths.outputURL.path
+            ).sorted(),
+            outputEntriesBeforeSecond
+        )
+        XCTAssertEqual(secondPowerAssertion.begun, 0)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: interruptedTransactionURL.path),
+            "The rejected runner must not reconcile the interrupted publication."
+        )
+        XCTAssertNil(
+            try ProjectMetadataStore.load(from: paths.metadataURL).pendingPublicationID,
+            "The rejected runner must not allocate or persist a publication identity."
+        )
+
+        blockedWrite.releaseRunStart()
+        await XCTAssertThrowsErrorAsync({
+            try await firstTask.value
+        }, errorHandler: { error in
+            guard let failure = error as? PipelineMetadataPersistenceFailure else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(failure.operation, .runStart)
+            XCTAssertEqual(failure.stage, .importInput)
+        })
+
+        let releasedWrite = PipelineMetadataWriteProbe(
+            failures: [.init(operation: .runStart, stage: .importInput)]
+        )
+        var thirdTooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: [])
+        )
+        thirdTooling.metadataWriter = { metadata, url, operation, stage in
+            try releasedWrite.write(
+                metadata,
+                to: url,
+                operation: operation,
+                stage: stage
+            )
+        }
+        let thirdPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: toolchain),
+            tooling: thirdTooling,
+            powerAssertion: RecordingPowerAssertion()
+        )
+        await XCTAssertThrowsErrorAsync({
+            try await thirdPipeline.run { _ in }
+        })
+        XCTAssertEqual(
+            releasedWrite.records,
+            [.init(operation: .runStart, stage: .importInput)],
+            "The run lease must be released on failure unwind."
+        )
+    }
+
+    func testRunnerClaimsOneBorrowWithoutSecondAcquisitionAndOwnerRetainsLease() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "PreacquiredLease.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent(
+            "PreacquiredLeasePhotos",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<4 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try saveFixtureMetadata(
+            ProjectMetadata(
+                title: "Preacquired lease",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            ),
+            paths: paths
+        )
+        let registryURL = temp.appendingPathComponent(
+            "PreacquiredLeaseRegistry",
+            isDirectory: true
+        )
+        let owner = try ProjectRunLeaseOwner.acquire(
+            projectURL: projectURL,
+            registryURL: registryURL
+        )
+        defer { owner.release() }
+        let rootInodeBeforeBorrow = try owner.withLockedProjectRootDescriptor { descriptor in
+            var status = stat()
+            guard Darwin.fstat(descriptor, &status) == 0 else {
+                throw POSIXError(.EIO)
+            }
+            return status.st_ino
+        }
+        XCTAssertEqual(
+            try owner.withValidatedProjectRootDescriptor { descriptor in
+                var status = stat()
+                guard Darwin.fstat(descriptor, &status) == 0 else {
+                    throw POSIXError(.EIO)
+                }
+                return status.st_ino
+            },
+            rootInodeBeforeBorrow
+        )
+        let blockedWrite = PipelineRunLeaseWriteProbe()
+        let acquisitionHook = PipelineRunLeaseHookCounter()
+        var tooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: [])
+        )
+        tooling.projectRunLeaseRegistryURL = {
+            throw PipelineRunLeaseTestError.unexpectedWrite
+        }
+        tooling.projectRunLeaseDidAcquire = {
+            acquisitionHook.record()
+        }
+        tooling.metadataWriter = { _, _, operation, stage in
+            guard operation == .runStart, stage == .importInput else {
+                throw PipelineRunLeaseTestError.unexpectedWrite
+            }
+            try blockedWrite.blockRunStart()
+        }
+        let config = makePipelineConfig(
+            toolchain: try makeToolchain(root: temp)
+        ).withBorrowedProjectRunLease(owner)
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: config,
+            tooling: tooling,
+            powerAssertion: RecordingPowerAssertion()
+        )
+
+        let firstTask = Task.detached {
+            try await pipeline.run { _ in }
+        }
+        defer { blockedWrite.releaseRunStart() }
+        XCTAssertEqual(
+            blockedWrite.waitForRunStart(timeout: .now() + 3),
+            .success,
+            "The borrowed runner did not reach its run-start boundary."
+        )
+        XCTAssertEqual(
+            acquisitionHook.count,
+            0,
+            "A borrowed lease must not report an internal acquisition."
+        )
+        XCTAssertThrowsError(
+            try owner.withLockedProjectRootDescriptor { _ in () }
+        ) { error in
+            XCTAssertEqual(
+                error as? ProjectRunLeaseBorrowError,
+                .alreadyClaimed
+            )
+        }
+        XCTAssertThrowsError(
+            try owner.withValidatedProjectRootDescriptor { _ in () }
+        ) { error in
+            XCTAssertEqual(
+                error as? ProjectRunLeaseBorrowError,
+                .alreadyClaimed
+            )
+        }
+
+        blockedWrite.releaseRunStart()
+        await XCTAssertThrowsErrorAsync({
+            try await firstTask.value
+        }, errorHandler: { error in
+            guard let failure = error as? PipelineMetadataPersistenceFailure else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(failure.operation, .runStart)
+            XCTAssertEqual(failure.stage, .importInput)
+        })
+        let rootInodeAfterBorrow = try owner.withLockedProjectRootDescriptor { descriptor in
+            var status = stat()
+            guard Darwin.fstat(descriptor, &status) == 0 else {
+                throw POSIXError(.EIO)
+            }
+            return status.st_ino
+        }
+        XCTAssertEqual(rootInodeAfterBorrow, rootInodeBeforeBorrow)
+        XCTAssertEqual(
+            try owner.withValidatedProjectRootDescriptor { descriptor in
+                var status = stat()
+                guard Darwin.fstat(descriptor, &status) == 0 else {
+                    throw POSIXError(.EIO)
+                }
+                return status.st_ino
+            },
+            rootInodeBeforeBorrow
+        )
+
+        let secondPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: config,
+            tooling: tooling,
+            powerAssertion: RecordingPowerAssertion()
+        )
+        await XCTAssertThrowsErrorAsync({
+            try await secondPipeline.run { _ in }
+        }, errorHandler: { error in
+            XCTAssertEqual(
+                error as? ProjectRunLeaseBorrowError,
+                .alreadyClaimed
+            )
+        })
+        XCTAssertThrowsError(
+            try ProjectRunLease.acquire(
+                projectURL: projectURL,
+                registryURL: registryURL
+            )
+        ) { error in
+            XCTAssertEqual(error as? ProjectRunLeaseError, .alreadyRunning)
+        }
+
+        owner.release()
+        XCTAssertThrowsError(
+            try owner.withLockedProjectRootDescriptor { _ in () }
+        ) { error in
+            XCTAssertEqual(error as? ProjectRunLeaseBorrowError, .released)
+        }
+        XCTAssertThrowsError(
+            try owner.withValidatedProjectRootDescriptor { _ in () }
+        ) { error in
+            XCTAssertEqual(error as? ProjectRunLeaseBorrowError, .released)
+        }
+        let reacquired = try ProjectRunLease.acquire(
+            projectURL: projectURL,
+            registryURL: registryURL
+        )
+        reacquired.release()
+    }
+
+    func testPreacquiredLeaseForDifferentProjectFailsBeforeMutationAndReleasesOwnership() async throws {
+        let temp = makeTempRoot()
+        let leasedProjectURL = temp.appendingPathComponent(
+            "LeasedProject.easysplatproj",
+            isDirectory: true
+        )
+        let requestedProjectURL = temp.appendingPathComponent(
+            "RequestedProject.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent(
+            "MismatchedLeasePhotos",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<4 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        for projectURL in [leasedProjectURL, requestedProjectURL] {
+            let paths = ProjectPaths(root: projectURL)
+            try paths.ensureDirectories()
+            try saveFixtureMetadata(
+                ProjectMetadata(
+                    title: projectURL.deletingPathExtension().lastPathComponent,
+                    input: .photos(folder: sourcePhotos.path),
+                    requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+                ),
+                paths: paths
+            )
+        }
+        let registryURL = temp.appendingPathComponent(
+            "MismatchedLeaseRegistry",
+            isDirectory: true
+        )
+        let owner = try ProjectRunLeaseOwner.acquire(
+            projectURL: leasedProjectURL,
+            registryURL: registryURL
+        )
+        defer { owner.release() }
+        let metadataBefore = try Data(
+            contentsOf: ProjectPaths(root: requestedProjectURL).metadataURL
+        )
+        let powerAssertion = RecordingPowerAssertion()
+        let config = makePipelineConfig(
+            toolchain: try makeToolchain(root: temp)
+        ).withBorrowedProjectRunLease(owner)
+        let pipeline = PipelineRunner(
+            projectURL: requestedProjectURL,
+            config: config,
+            tooling: .init(runner: MockSubprocessRunner(scripts: [])),
+            powerAssertion: powerAssertion
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            XCTAssertEqual(error as? ProjectRunLeaseError, .unsafeProject)
+        })
+        XCTAssertEqual(powerAssertion.begun, 0)
+        XCTAssertEqual(
+            try Data(contentsOf: ProjectPaths(root: requestedProjectURL).metadataURL),
+            metadataBefore
+        )
+
+        XCTAssertThrowsError(
+            try ProjectRunLease.acquire(
+                projectURL: leasedProjectURL,
+                registryURL: registryURL
+            )
+        ) { error in
+            XCTAssertEqual(error as? ProjectRunLeaseError, .alreadyRunning)
+        }
+        owner.release()
+        let reacquired = try ProjectRunLease.acquire(
+            projectURL: leasedProjectURL,
+            registryURL: registryURL
+        )
+        reacquired.release()
+    }
+
+    func testProjectRunLeaseRejectsPathReplacementBeforeReconciliation() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "DetachedPath.easysplatproj",
+            isDirectory: true
+        )
+        let movedProjectURL = temp.appendingPathComponent(
+            "DetachedPath-moved.easysplatproj",
+            isDirectory: true
+        )
+        let registryURL = temp.appendingPathComponent(
+            "RunLeaseRegistry",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent(
+            "DetachedPathPhotos",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<4 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try saveFixtureMetadata(
+            ProjectMetadata(
+                title: "Detached pathname",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            ),
+            paths: paths
+        )
+        let originalMetadata = try Data(contentsOf: paths.metadataURL)
+        let toolchain = try makeToolchain(root: temp)
+        let acquisition = PipelineRunLeaseAcquisitionProbe()
+        let firstPowerAssertion = RecordingPowerAssertion()
+        var firstTooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: [])
+        )
+        firstTooling.projectRunLeaseRegistryURL = { registryURL }
+        firstTooling.projectRunLeaseDidAcquire = {
+            acquisition.blockAfterAcquisition()
+        }
+        let firstPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: toolchain),
+            tooling: firstTooling,
+            powerAssertion: firstPowerAssertion
+        )
+        let firstTask = Task.detached {
+            try await firstPipeline.run { _ in }
+        }
+        defer { acquisition.release() }
+        XCTAssertEqual(
+            acquisition.waitUntilAcquired(timeout: .now() + 3),
+            .success,
+            "The first runner did not acquire its project lease."
+        )
+
+        try FileManager.default.moveItem(at: projectURL, to: movedProjectURL)
+        try FileManager.default.createDirectory(
+            at: projectURL,
+            withIntermediateDirectories: false
+        )
+        let replacementMarker = projectURL.appendingPathComponent("replacement.bin")
+        let replacementBytes = Data("replacement must remain untouched".utf8)
+        try replacementBytes.write(to: replacementMarker)
+
+        let secondPowerAssertion = RecordingPowerAssertion()
+        var secondTooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: [])
+        )
+        secondTooling.projectRunLeaseRegistryURL = { registryURL }
+        let secondPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: toolchain),
+            tooling: secondTooling,
+            powerAssertion: secondPowerAssertion
+        )
+        await XCTAssertThrowsErrorAsync({
+            try await secondPipeline.run { _ in }
+        }, errorHandler: { error in
+            XCTAssertEqual(error as? ProjectRunLeaseError, .alreadyRunning)
+        })
+        XCTAssertEqual(secondPowerAssertion.begun, 0)
+        XCTAssertEqual(try Data(contentsOf: replacementMarker), replacementBytes)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: projectURL.path),
+            [replacementMarker.lastPathComponent]
+        )
+
+        acquisition.release()
+        await XCTAssertThrowsErrorAsync({
+            try await firstTask.value
+        }, errorHandler: { error in
+            XCTAssertEqual(error as? ProjectRunLeaseError, .unsafeProject)
+        })
+        XCTAssertEqual(
+            firstPowerAssertion.begun,
+            0,
+            "A detached pathname must fail before power assertion or reconciliation."
+        )
+        XCTAssertEqual(
+            try Data(
+                contentsOf: ProjectPaths(root: movedProjectURL).metadataURL
+            ),
+            originalMetadata
+        )
+        XCTAssertEqual(try Data(contentsOf: replacementMarker), replacementBytes)
+
+        let releasedLease = try ProjectRunLease.acquire(
+            projectURL: projectURL,
+            registryURL: registryURL
+        )
+        releasedLease.release()
+    }
+
+    func testProjectRunLeaseRevalidatesDurableBoundaryBeforeMajorWork() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "BoundaryReplacement.easysplatproj",
+            isDirectory: true
+        )
+        let movedProjectURL = temp.appendingPathComponent(
+            "BoundaryReplacement-moved.easysplatproj",
+            isDirectory: true
+        )
+        let registryURL = temp.appendingPathComponent(
+            "BoundaryRunLeaseRegistry",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent(
+            "BoundaryReplacementPhotos",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<4 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try saveFixtureMetadata(
+            ProjectMetadata(
+                title: "Boundary pathname",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            ),
+            paths: paths
+        )
+        let toolchain = try makeToolchain(root: temp)
+        let replacement = PipelineRunLeaseBoundaryReplacementProbe(
+            projectURL: projectURL,
+            movedProjectURL: movedProjectURL
+        )
+        let powerAssertion = RecordingPowerAssertion()
+        var tooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: [])
+        )
+        tooling.projectRunLeaseRegistryURL = { registryURL }
+        tooling.metadataWriter = { metadata, url, operation, stage in
+            try replacement.writeAndReplace(
+                metadata,
+                to: url,
+                operation: operation,
+                stage: stage
+            )
+        }
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: toolchain),
+            tooling: tooling,
+            powerAssertion: powerAssertion
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            guard let failure = error as? PipelineMetadataPersistenceFailure else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(failure.operation, .runStart)
+            XCTAssertEqual(failure.stage, .importInput)
+            XCTAssertTrue(
+                failure.persistenceErrorSummary.contains("not safe to process"),
+                failure.persistenceErrorSummary
+            )
+        })
+
+        XCTAssertEqual(
+            replacement.operations,
+            [.init(operation: .runStart, stage: .importInput)],
+            "Detached state must not receive a terminal or checkpoint write."
+        )
+        XCTAssertEqual(powerAssertion.begun, 1)
+        XCTAssertEqual(powerAssertion.released, 1)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: projectURL.path),
+            [replacement.markerURL.lastPathComponent]
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: replacement.markerURL),
+            replacement.markerBytes
+        )
+
+        let releasedLease = try ProjectRunLease.acquire(
+            projectURL: projectURL,
+            registryURL: registryURL
+        )
+        releasedLease.release()
+    }
+
+    func testProjectRunLeaseReleasesAfterPipelineCancellation() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "CancellationLease.easysplatproj",
+            isDirectory: true
+        )
+        let registryURL = temp.appendingPathComponent(
+            "CancellationRunLeaseRegistry",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent(
+            "CancellationLeasePhotos",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<4 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try saveFixtureMetadata(
+            ProjectMetadata(
+                title: "Cancellation lease",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            ),
+            paths: paths
+        )
+        let powerAssertion = RecordingPowerAssertion()
+        let tooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: []),
+            validateVideoInputs: { _, _ in
+                throw CancellationError()
+            },
+            projectRunLeaseRegistryURL: { registryURL }
+        )
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: try makeToolchain(root: temp)),
+            tooling: tooling,
+            powerAssertion: powerAssertion
+        )
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            XCTAssertTrue(
+                error is CancellationError,
+                "Unexpected cancellation error: \(String(reflecting: error))"
+            )
+        })
+        XCTAssertEqual(powerAssertion.begun, 1)
+        XCTAssertEqual(powerAssertion.released, 1)
+
+        let releasedLease = try ProjectRunLease.acquire(
+            projectURL: projectURL,
+            registryURL: registryURL
+        )
+        releasedLease.release()
+    }
+
+    func testInterruptedPublicationReconcilesBeforeControlledInputValidationFailure() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "PublicationBeforeInputValidation.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let (_, videoReceipt) = try TestFileBuilder.writeControlledVideoReceipt(
+            paths: paths
+        )
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Publication before input validation",
+                input: .video(files: [videoReceipt.projectRelativePath]),
+                videoInputReceipts: [videoReceipt],
+                requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            ),
+            to: paths.metadataURL
+        )
+        let metadataBefore = try Data(contentsOf: paths.metadataURL)
+        let retryArtifact = Data("must survive".utf8)
+        try retryArtifact.write(to: paths.colmapDatabaseURL)
+        let transactionURL = try PublishedResultPairStore.testCreateTransactionFixture(
+            projectPaths: paths,
+            transactionID: UUID(uuidString: "11111111-2222-4333-8444-555555555555")!,
+            publicationID: UUID(uuidString: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE")!,
+            previousPublicationID: nil
+        )
+
+        let startupOrder = PipelinePublicationStartupProbe()
+        var pairOperations = PublishedResultPairOperations.system()
+        pairOperations.didReachCheckpoint = { checkpoint in
+            if checkpoint == .transactionRetired {
+                startupOrder.recordReconciliation()
+            }
+        }
+        var tooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: []),
+            validateVideoInputs: { _, _ in
+                startupOrder.recordControlledInputValidation()
+                throw PipelineStartupTestError.controlledInputValidation
+            }
+        )
+        tooling.publishedResultPairOperations = pairOperations
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: try makeToolchain(root: temp)),
+            tooling: tooling
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            XCTAssertEqual(
+                error as? PipelineStartupTestError,
+                .controlledInputValidation
+            )
+        })
+
+        XCTAssertTrue(startupOrder.controlledInputValidationObservedReconciliation)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: transactionURL.path),
+            "Startup must retire the interrupted publication before surfacing the input error."
+        )
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), metadataBefore)
+        XCTAssertNil(try ProjectMetadataStore.load(from: paths.metadataURL).pendingPublicationID)
+        XCTAssertEqual(try Data(contentsOf: paths.colmapDatabaseURL), retryArtifact)
+        guard !FileManager.default.fileExists(atPath: transactionURL.path) else { return }
+        XCTAssertEqual(
+            try PublishedResultPairStore.resolve(projectPaths: paths),
+            .unavailable(.missingPair)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.outputSplatURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: paths.outputSplatReceiptURL.path
+        ))
+    }
+
+    func testFreshAttestedRunConsumesBeforeStartupReconciliationMutatesTree() async throws {
+        let temp = makeTempRoot()
+        let registryRoot = makeTempRoot()
+        try FileManager.default.createDirectory(
+            at: registryRoot,
+            withIntermediateDirectories: true
+        )
+        let publication = try makeFreshAttestedPipelinePublication(
+            baseURL: temp,
+            title: "Fresh attested startup"
+        )
+        let paths = ProjectPaths(root: publication.projectURL)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: paths.publishedResultLockURL.path),
+            "The sealed fresh project must not contain a publication lock."
+        )
+
+        let writes = PipelineMetadataWriteProbe(
+            failures: [.init(operation: .runStart, stage: .importInput)]
+        )
+        var tooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: [])
+        )
+        tooling.projectRunLeaseRegistryURL = {
+            registryRoot.appendingPathComponent(
+                "FreshRunLeaseRegistry",
+                isDirectory: true
+            )
+        }
+        tooling.metadataWriter = { metadata, url, operation, stage in
+            try writes.write(
+                metadata,
+                to: url,
+                operation: operation,
+                stage: stage
+            )
+        }
+        let pipeline = PipelineRunner(
+            projectURL: publication.projectURL,
+            config: makePipelineConfig(toolchain: try makeToolchain(root: temp)),
+            tooling: tooling,
+            powerAssertion: RecordingPowerAssertion()
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run(
+                freshPublicationAttestation: publication.attestation
+            ) { _ in }
+        }, errorHandler: { error in
+            guard let failure = error as? PipelineMetadataPersistenceFailure else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(failure.operation, .runStart)
+            XCTAssertEqual(failure.stage, .importInput)
+        })
+
+        XCTAssertEqual(
+            writes.records,
+            [.init(operation: .runStart, stage: .importInput)],
+            "Attestation must be consumed before startup is allowed to add its lock."
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: paths.publishedResultLockURL.path),
+            "Existing-project reconciliation may begin only after fresh attestation consumption."
+        )
+    }
+
+    func testConflictingCompletedTrainingCleanupFailsBeforeMetadataMutationOrTrainerLaunch() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "CleanupConflictBeforeMutation.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let sourcePhotos = temp.appendingPathComponent(
+            "CleanupConflictSourcePhotos",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<3 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index * 40)
+            )
+        }
+        try saveFixtureMetadata(
+            ProjectMetadata(
+                title: "Cleanup conflict before mutation",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            ),
+            paths: paths
+        )
+        let metadataBefore = try Data(contentsOf: paths.metadataURL)
+        let privateOutputBefore = Data("completed private output must survive".utf8)
+        let checkpointBefore = Data("completed checkpoint must survive".utf8)
+        let checkpointURL = paths.msplatCheckpointURL.appendingPathComponent("state.bin")
+        try FileManager.default.createDirectory(
+            at: checkpointURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try privateOutputBefore.write(to: paths.msplatOutputURL)
+        try checkpointBefore.write(to: checkpointURL)
+        let malformedJournal = Data("{\"schemaVersion\":1,\"foreign\":true}".utf8)
+        try malformedJournal.write(to: paths.completedTrainingCleanupJournalURL)
+        XCTAssertEqual(
+            Darwin.chmod(paths.completedTrainingCleanupJournalURL.path, mode_t(0o600)),
+            0
+        )
+
+        let subprocess = MockSubprocessRunner(scripts: [])
+        let writes = PipelineMetadataWriteProbe()
+        let tooling = PipelineRunner.Tooling(
+            runner: subprocess,
+            validateVideoInputs: { _, _ in
+                throw PipelineRunLeaseTestError.unexpectedWrite
+            },
+            metadataWriter: { metadata, url, operation, stage in
+                try writes.write(
+                    metadata,
+                    to: url,
+                    operation: operation,
+                    stage: stage
+                )
+            }
+        )
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: try makeToolchain(root: temp),
+                runIntent: .retrain
+            ),
+            tooling: tooling
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            guard case .invalidManifest = error as? TrainingArtifactStoreError else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        })
+
+        XCTAssertTrue(writes.records.isEmpty)
+        XCTAssertTrue(subprocess.calls.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), metadataBefore)
+        XCTAssertEqual(try Data(contentsOf: paths.msplatOutputURL), privateOutputBefore)
+        XCTAssertEqual(try Data(contentsOf: checkpointURL), checkpointBefore)
+        XCTAssertEqual(
+            try Data(contentsOf: paths.completedTrainingCleanupJournalURL),
+            malformedJournal
         )
     }
 
@@ -77,14 +1072,31 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try saveFixtureMetadata(metadata, paths: paths)
         try Data("must survive".utf8).write(to: paths.colmapDatabaseURL)
+        _ = try PublishedResultPairStore.testCreateTransactionFixture(
+            projectPaths: paths,
+            transactionID: UUID(uuidString: "11111111-2222-4333-8444-555555555555")!,
+            publicationID: UUID(uuidString: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE")!,
+            previousPublicationID: nil
+        )
 
         let toolchain = try makeToolchain(root: temp)
         let subprocess = MockSubprocessRunner(scripts: [])
+        let startupOrder = PipelinePublicationStartupProbe()
         let writes = PipelineMetadataWriteProbe(
             failures: [.init(operation: .runStart, stage: .importInput)]
         )
         var tooling = PipelineRunner.Tooling(runner: subprocess)
+        var pairOperations = PublishedResultPairOperations.system()
+        pairOperations.didReachCheckpoint = { checkpoint in
+            if checkpoint == .transactionRetired {
+                startupOrder.recordReconciliation()
+            }
+        }
+        tooling.publishedResultPairOperations = pairOperations
         tooling.metadataWriter = { metadata, url, operation, stage in
+            if operation == .runStart {
+                startupOrder.recordRunStartWrite()
+            }
             try writes.write(metadata, to: url, operation: operation, stage: stage)
         }
         let pipeline = PipelineRunner(
@@ -113,6 +1125,11 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(subprocess.calls.count, 0)
         XCTAssertEqual(try Data(contentsOf: paths.colmapDatabaseURL), Data("must survive".utf8))
         XCTAssertEqual(writes.records, [.init(operation: .runStart, stage: .importInput)])
+        XCTAssertTrue(startupOrder.runStartObservedReconciliation)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: paths.outputURL.path)
+                .contains(where: { $0.hasPrefix(".published-result-tx-") })
+        )
     }
 
     func testPostRunStartPreparationFailurePersistsTerminalStateExactlyOnce() async throws {
@@ -166,7 +1183,95 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(saved.state.stage, .importInput)
         XCTAssertNotNil(saved.state.lastError)
         XCTAssertNil(saved.lastRunStartedAt)
+        XCTAssertNotNil(
+            saved.pendingPublicationID,
+            "Terminal failure must retain the run-start publication identity for retry."
+        )
         XCTAssertNotNil(saved.lastFailureAt)
+    }
+
+    func testBorrowedLeaseRemainsHeldThroughTerminalFailurePersistence() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "BorrowedLeaseTerminalFallback",
+            photoCount: 8
+        )
+        let registryURL = temp.appendingPathComponent(
+            "BorrowedLeaseFallbackRegistry",
+            isDirectory: true
+        )
+        let owner = try ProjectRunLeaseOwner.acquire(
+            projectURL: fixture.projectURL,
+            registryURL: registryURL
+        )
+        defer { owner.release() }
+        let writes = PipelineMetadataWriteProbe()
+        let tooling = PipelineRunner.Tooling(
+            runner: MockSubprocessRunner(scripts: []),
+            prepareRuntimeInputLease: { _, _, _ in
+                throw PipelineRunner.PipelineError.outputMissing
+            },
+            metadataWriter: { metadata, url, operation, stage in
+                if operation == .terminalFailure {
+                    do {
+                        let unexpected = try ProjectRunLease.acquire(
+                            projectURL: fixture.projectURL,
+                            registryURL: registryURL
+                        )
+                        unexpected.release()
+                        XCTFail("Terminal fallback ran after the borrowed lease was released.")
+                    } catch {
+                        XCTAssertEqual(
+                            error as? ProjectRunLeaseError,
+                            .alreadyRunning
+                        )
+                    }
+                }
+                try writes.write(
+                    metadata,
+                    to: url,
+                    operation: operation,
+                    stage: stage
+                )
+            }
+        )
+        let config = makePipelineConfig(
+            toolchain: fixture.toolchain,
+            candidateRoute: .colmap
+        ).withBorrowedProjectRunLease(owner)
+        let pipeline = PipelineRunner(
+            projectURL: fixture.projectURL,
+            config: config,
+            tooling: tooling
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            guard case .outputMissing = error as? PipelineRunner.PipelineError else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        })
+        XCTAssertEqual(writes.records, [
+            .init(operation: .runStart, stage: .importInput),
+            .init(operation: .terminalFailure, stage: .importInput),
+        ])
+        XCTAssertThrowsError(
+            try ProjectRunLease.acquire(
+                projectURL: fixture.projectURL,
+                registryURL: registryURL
+            )
+        ) { error in
+            XCTAssertEqual(error as? ProjectRunLeaseError, .alreadyRunning)
+        }
+
+        owner.release()
+        let reacquired = try ProjectRunLease.acquire(
+            projectURL: fixture.projectURL,
+            registryURL: registryURL
+        )
+        reacquired.release()
     }
 
     func testPostRunStartPreparationCancellationSkipsTerminalPersistence() async throws {
@@ -213,6 +1318,10 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(subprocess.calls.isEmpty)
         let saved = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
         XCTAssertNotNil(saved.lastRunStartedAt)
+        XCTAssertNotNil(
+            saved.pendingPublicationID,
+            "Cancellation must retain the durable publication identity allocated at run start."
+        )
         XCTAssertNil(saved.state.lastError)
     }
 
@@ -7178,7 +8287,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path }))
     }
 
-    func testCanonicalPromotionInvalidatesSubjectOnlyAfterDurableReplacement() throws {
+    func testReceiptPublicationInvalidatesSubjectOnlyAfterDurableReplacement() throws {
         let fixture = try makeSubjectIsolationFixture(maskCount: 1)
         defer { fixture.cleanup() }
         let oldSubject = try fixture.makeArtifact(outputIdentity: UUID())
@@ -7191,6 +8300,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let oldSubjectBytes = try Data(contentsOf: fixture.paths.isolatedOutputURL)
         let oldManifestBytes = try Data(contentsOf: fixture.paths.isolationManifestURL)
         let oldCanonicalBytes = try Data(contentsOf: fixture.paths.outputSplatURL)
+        try FileManager.default.removeItem(at: fixture.paths.outputSplatReceiptURL)
 
         let invalidReplacement = fixture.paths.outputURL.appendingPathComponent("invalid.ply")
         try Data("not a ply".utf8).write(to: invalidReplacement)
@@ -7210,27 +8320,116 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         var replacementTraining = fixture.training
         replacementTraining.trainerVersion = "replacement-trainer"
+        let requestedOptions = RequestedRunOptions(detailProfile: .fast)
+        let input = InputSpec.photos(folder: "Originals/Photos")
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: requestedOptions,
+            input: input,
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none
+        )
+        replacementTraining.detailProfile = requestedOptions.detailProfile
+        replacementTraining.iterationLimit = plan.trainerIterationLimit
+        replacementTraining.plateauWindow = plan.plateauWindow
+        replacementTraining.cameraOrderSeed = plan.runSeed
+        replacementTraining.completedIteration = plan.trainerIterationLimit
+        replacementTraining.memoryBudgetBytes = min(
+            replacementTraining.memoryBudgetBytes,
+            plan.trainerMemoryBudgetBytes
+        )
         replacementTraining.outputPath = "Training/msplat/splat.ply"
         replacementTraining.outputSHA256 = replacementEvidence.sha256
         replacementTraining.outputBytes = Int64(replacementEvidence.byteCount)
         replacementTraining.gaussianCount = replacementEvidence.vertexCount
         replacementTraining.sceneBounds = replacementEvidence.sceneBounds
+        var geometry = makeGeometryArtifact()
+        geometry.residualProvenance = "colmap-text-tracks-v1"
+        geometry.selectedFramesDigest = replacementTraining.datasetDerivation
+            .sourceSelectedFramesDigest
+        geometry.orderedImageNames = replacementTraining.datasetDerivation
+            .registeredImageNames
+        geometry.orderedImageTimestamps = Array(
+            repeating: nil,
+            count: geometry.orderedImageNames.count
+        )
+        let replacementPublicationID = UUID()
+        var metadata = try ProjectMetadataStore.load(
+            from: fixture.paths.metadataURL
+        )
+        metadata.title = "Replacement"
+        metadata.input = input
+        metadata.requestedRunOptions = requestedOptions
+        metadata.resolvedRunPlan = plan
+        metadata.pendingPublicationID = replacementPublicationID
+        let publishedAt = Date(timeIntervalSince1970: 1_767_225_600)
+        metadata.stageTimings = [
+            StageTimingRecord(
+                stage: .trainSplat,
+                startedAt: publishedAt.addingTimeInterval(
+                    -(replacementTraining.elapsedSeconds ?? 0)
+                ),
+                durationSeconds: replacementTraining.elapsedSeconds ?? 0
+            )
+        ]
+        let geometryEncoder = JSONEncoder()
+        geometryEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try geometryEncoder.encode(geometry).write(
+            to: fixture.paths.geometryManifestURL,
+            options: [.atomic]
+        )
+        replacementTraining.datasetDerivation.sourceGeometryManifestSHA256 = try
+            GeometryArtifactStore.manifestDigest(
+                matching: geometry,
+                at: fixture.paths.geometryManifestURL
+            )
+        replacementTraining.datasetDerivation.maximumImageDimension =
+            plan.maximumImageDimension
         try TrainingArtifactStore.persist(replacementTraining, paths: fixture.paths)
+        try ProjectMetadataStore.save(metadata, to: fixture.paths.metadataURL)
+        let persistedMetadataBytes = try Data(
+            contentsOf: fixture.paths.metadataURL
+        )
+        let persistedMetadata = try ProjectMetadataStore.load(
+            from: fixture.paths.metadataURL
+        )
+        XCTAssertEqual(persistedMetadata.id, fixture.projectID)
+        XCTAssertEqual(
+            persistedMetadata.pendingPublicationID,
+            replacementPublicationID
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.paths.metadataURL),
+            persistedMetadataBytes
+        )
 
         XCTAssertThrowsError(
-            try PipelineRunner.promoteMsplatCompletionToPublicOutput(
-                paths: fixture.paths
+            try PublishedResultPublisher.publishCompletedTraining(
+                metadata: persistedMetadata,
+                resolvedRunPlan: plan,
+                geometry: geometry,
+                paths: fixture.paths,
+                publicationID: replacementPublicationID,
+                publishedAt: publishedAt
             )
         )
         XCTAssertEqual(try Data(contentsOf: fixture.paths.outputSplatURL), oldCanonicalBytes)
         XCTAssertEqual(try Data(contentsOf: fixture.paths.isolatedOutputURL), oldSubjectBytes)
         XCTAssertEqual(try Data(contentsOf: fixture.paths.isolationManifestURL), oldManifestBytes)
 
-        try SplatExport.copyIfExists(
-            from: fixture.paths.msplatOutputURL,
-            to: fixture.paths.outputSplatURL
+        try FileManager.default.removeItem(at: fixture.paths.outputSplatURL)
+        _ = try PublishedResultPublisher.publishCompletedTraining(
+            metadata: persistedMetadata,
+            resolvedRunPlan: plan,
+            geometry: geometry,
+            paths: fixture.paths,
+            publicationID: replacementPublicationID,
+            publishedAt: publishedAt
         )
-        let publication = try PipelineRunner.promoteMsplatCompletionToPublicOutput(
+        let publication = try SubjectIsolationArtifactStore.captureCanonicalPublication(
             paths: fixture.paths
         )
         XCTAssertTrue(FileManager.default.fileExists(
@@ -7271,9 +8470,19 @@ final class PipelineIntegrationTests: XCTestCase {
         let previousSubjectManifestBytes = try Data(
             contentsOf: subjectFixture.paths.isolationManifestURL
         )
+        let previousSubjectMaskURL = try subjectFixture.paths.resolveProjectRelativePath(
+            oldSubject.masks[0].relativePath
+        )
+        // This test exercises a first authoritative publication while retaining
+        // an older subject artifact long enough to prove it is invalidated only
+        // after the new result reaches the durable .done boundary.
+        try FileManager.default.removeItem(at: subjectFixture.paths.outputSplatURL)
+        try FileManager.default.removeItem(at: subjectFixture.paths.outputSplatReceiptURL)
 
         let projectURL = subjectFixture.root
         let paths = subjectFixture.paths
+        let completedCheckpointURL = paths.msplatCheckpointURL
+            .appendingPathComponent("checkpoint-state.bin")
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
         for index in 0..<12 {
@@ -7303,7 +8512,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let msplatEvents = """
         {"camera_count":12,"checkpoint_schema":3,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":268435456,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"dropped_intersection_count":0,"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":0,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         var msplatDatasetPath: String?
         let runner = MockSubprocessRunner(scripts: [
@@ -7469,6 +8678,10 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(trainingBoundaryWrites.records.contains(
             .init(operation: .terminalFailure, stage: .trainSplat)
         ))
+        let attemptPublicationID = try XCTUnwrap(
+            ProjectMetadataStore.load(from: paths.metadataURL).pendingPublicationID,
+            "The first durable run start must allocate the publication identity."
+        )
 
         let recoveredTrainingBoundary = PipelineMetadataWriteProbe.Record(
             operation: .stageCompletion,
@@ -7524,9 +8737,149 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(recoveredTrainingRunner.calls.isEmpty)
         XCTAssertFalse(recoveredTrainingEvents.didStart(.exportSplat))
         XCTAssertTrue(FileManager.default.fileExists(
-            atPath: paths.msplatCheckpointURL
-                .appendingPathComponent("checkpoint-state.bin").path
+            atPath: completedCheckpointURL.path
         ))
+
+        var pairFailureOperations = PublishedResultPairOperations.system()
+        pairFailureOperations.write = { _, _, _ in
+            errno = ENOSPC
+            return -1
+        }
+        let pairFailureRunner = MockSubprocessRunner(scripts: [])
+        var pairFailureTooling = PipelineRunner.Tooling(
+            runner: pairFailureRunner,
+            trainingResourceObserver: TestTrainingResourceObserver()
+        )
+        pairFailureTooling.publishedResultPairOperations = pairFailureOperations
+        let pairFailurePipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap
+            ),
+            tooling: pairFailureTooling
+        )
+        await XCTAssertThrowsErrorAsync({
+            try await pairFailurePipeline.run(resumeFrom: .sfmMapping) { _ in }
+        }, errorHandler: { error in
+            guard let failure = error as? PublishedResultPairError,
+                  case .persistence(_, let code) = failure else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(code, ENOSPC)
+        })
+        XCTAssertTrue(pairFailureRunner.calls.isEmpty)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: completedCheckpointURL.path),
+            "A pair-publication failure must retain the completed checkpoint."
+        )
+
+        let manifestFailureRunner = MockSubprocessRunner(scripts: [])
+        var manifestFailureTooling = PipelineRunner.Tooling(
+            runner: manifestFailureRunner,
+            trainingResourceObserver: TestTrainingResourceObserver()
+        )
+        manifestFailureTooling.persistPreparedTrainingManifest = { _, _, _, _, _, _ in
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+        }
+        let manifestFailurePipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap
+            ),
+            tooling: manifestFailureTooling
+        )
+        await XCTAssertThrowsErrorAsync({
+            try await manifestFailurePipeline.run(resumeFrom: .sfmMapping) { _ in }
+        }, errorHandler: { error in
+            let failure = error as NSError
+            XCTAssertEqual(failure.domain, NSPOSIXErrorDomain)
+            XCTAssertEqual(failure.code, Int(ENOSPC))
+        })
+        XCTAssertTrue(manifestFailureRunner.calls.isEmpty)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: completedCheckpointURL.path),
+            "A training-manifest persistence failure must retain the completed checkpoint."
+        )
+        if case .available = try PublishedResultPairStore.resolve(projectPaths: paths) {
+            // Expected: receipt installation precedes exact-manifest persistence.
+        } else {
+            XCTFail("Manifest persistence failure must retain the committed result pair")
+        }
+        XCTAssertEqual(
+            try TrainingArtifactStore.load(
+                from: paths.trainingManifestURL,
+                projectPaths: paths
+            ).outputPath,
+            "Training/msplat/splat.ply"
+        )
+
+        let adoptionMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let adoptionPlan = try XCTUnwrap(adoptionMetadata.resolvedRunPlan)
+        let adoptionGeometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths,
+            expectedInput: adoptionMetadata.input
+        )
+        let adoptionGeometryManifestDigest = try GeometryArtifactStore.manifestDigest(
+            matching: adoptionGeometry,
+            at: paths.geometryManifestURL
+        )
+        let adoptionTraining = try TrainingArtifactStore.loadManifest(
+            from: paths.trainingManifestURL,
+            projectPaths: paths
+        )
+        var adoptionReboundTraining = adoptionTraining
+        adoptionReboundTraining.outputPath = PublishedSplatReceipt.canonicalOutputPath
+        let adoptionManifest = try TrainingArtifactStore.encodedManifestData(
+            adoptionReboundTraining,
+            projectPaths: paths
+        )
+        guard case .available(let adoptionPublication) = try PublishedResultPairStore.resolve(
+            projectPaths: paths
+        ) else {
+            return XCTFail("Expected the receipt-committed publication before retry.")
+        }
+        XCTAssertEqual(adoptionMetadata.pendingPublicationID, attemptPublicationID)
+        XCTAssertEqual(adoptionMetadata.resolvedRunPlan, adoptionPlan)
+        XCTAssertTrue(
+            adoptionReboundTraining.matchesResolvedTrainingPlan(
+                adoptionPlan,
+                resourcePolicy: adoptionMetadata.requestedRunOptions.resourcePolicy
+            )
+        )
+        XCTAssertEqual(
+            adoptionReboundTraining.outputSHA256,
+            adoptionPublication.outputEvidence.sha256
+        )
+        XCTAssertEqual(
+            adoptionReboundTraining.datasetDerivation.sourceGeometryManifestSHA256,
+            adoptionGeometryManifestDigest
+        )
+        XCTAssertEqual(
+            adoptionReboundTraining.datasetDerivation.datasetGeometryDigest,
+            adoptionReboundTraining.geometryDigest
+        )
+        XCTAssertNotEqual(
+            adoptionGeometryManifestDigest,
+            adoptionReboundTraining.geometryDigest,
+            "The source geometry-manifest digest and sparse-model digest are separate authorities."
+        )
+        XCTAssertNoThrow(
+            try PublishedSplatReceiptFactory.make(
+                metadata: adoptionMetadata,
+                resolvedRunPlan: adoptionPlan,
+                geometry: adoptionGeometry,
+                geometryManifestDigest: adoptionGeometryManifestDigest,
+                reboundTraining: adoptionReboundTraining,
+                reboundTrainingManifestData: adoptionManifest,
+                outputEvidence: adoptionPublication.outputEvidence,
+                projectPaths: paths,
+                publicationID: attemptPublicationID,
+                publishedAt: adoptionPublication.receipt.publishedAt
+            )
+        )
 
         let exportBoundary = PipelineMetadataWriteProbe.Record(
             operation: .stageCompletion,
@@ -7577,15 +8930,35 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(exportBoundaryEvents.didFinish(.exportSplat))
         XCTAssertFalse(exportBoundaryEvents.didFinish(.done))
         XCTAssertTrue(FileManager.default.fileExists(atPath: paths.outputSplatURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: paths.outputSplatReceiptURL.path
+        ))
+        if case .available = try PublishedResultPairStore.resolve(projectPaths: paths) {
+            // Expected: receipt installation is the publication commit.
+        } else {
+            XCTFail("Export metadata failure must retain the validated published pair")
+        }
+        XCTAssertEqual(
+            try TrainingArtifactStore.load(
+                from: paths.trainingManifestURL,
+                projectPaths: paths
+            ).outputPath,
+            PublishedSplatReceipt.canonicalOutputPath
+        )
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: paths.msplatOutputURL.path),
             "Private training output must remain until final completion is durable."
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: completedCheckpointURL.path),
+            "An export metadata failure must retain the completed checkpoint."
         )
         let exportFailureMetadata = try ProjectMetadataStore.load(
             from: paths.metadataURL
         )
         XCTAssertEqual(exportFailureMetadata.state.stage, .exportSplat)
         XCTAssertNotNil(exportFailureMetadata.state.lastError)
+        XCTAssertEqual(exportFailureMetadata.pendingPublicationID, attemptPublicationID)
 
         let finalCompletionWrites = PipelineMetadataWriteProbe(
             failures: [
@@ -7634,14 +9007,25 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(finalCompletionWrites.records.contains(
             .init(operation: .stageCompletion, stage: .trainSplat)
         ))
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: paths.msplatCheckpointURL
-                .appendingPathComponent("checkpoint-state.bin").path
-        ))
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: completedCheckpointURL.path),
+            "A failed .done write must retain the completed checkpoint for retry."
+        )
         XCTAssertTrue(FileManager.default.fileExists(atPath: paths.outputSplatURL.path))
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: paths.msplatOutputURL.path),
             "Disposable private output must survive until .done is durable."
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: paths.completedTrainingCleanupJournalURL.path
+            ),
+            "A failed .done boundary must not create cleanup authority."
+        )
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: paths.trainingURL.path)
+                .contains(where: { $0.hasPrefix(".completed-training-cleanup.") }),
+            "A failed .done boundary must not quarantine completed training roots."
         )
         XCTAssertTrue(
             FileManager.default.fileExists(
@@ -7661,34 +9045,74 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(finalCompletionWrites.records.contains(
             .init(operation: .terminalFailure, stage: .done)
         ))
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: paths.metadataURL).pendingPublicationID,
+            attemptPublicationID,
+            "A failed final boundary must leave the committed pair adoptable on retry."
+        )
 
-        let retryRunner = MockSubprocessRunner(scripts: [])
-        let retryPipeline = PipelineRunner(
+        let invalidationFailureProbe = SubjectInvalidationFailureProbe(
+            maskURL: previousSubjectMaskURL
+        )
+        let completedResumePairValidations = PipelinePlyValidationCounter()
+        let invalidationFailureRunner = MockSubprocessRunner(scripts: [])
+        var invalidationFailureTooling = PipelineRunner.Tooling(
+            runner: invalidationFailureRunner,
+            trainingResourceObserver: TestTrainingResourceObserver()
+        )
+        var completedResumePairOperations = PublishedResultPairOperations.system()
+        completedResumePairOperations.willValidatePly = {
+            completedResumePairValidations.record($0)
+        }
+        invalidationFailureTooling.publishedResultPairOperations =
+            completedResumePairOperations
+        invalidationFailureTooling.metadataWriter = {
+            metadata,
+            url,
+            operation,
+            stage in
+            try invalidationFailureProbe.write(
+                metadata,
+                to: url,
+                operation: operation,
+                stage: stage
+            )
+        }
+        let invalidationFailurePipeline = PipelineRunner(
             projectURL: projectURL,
             config: makePipelineConfig(
                 toolchain: toolchain,
                 candidateRoute: .colmap
             ),
-            tooling: .init(
-                runner: retryRunner,
-                trainingResourceObserver: TestTrainingResourceObserver()
-            )
+            tooling: invalidationFailureTooling
         )
-        try await retryPipeline.run(resumeFrom: .exportSplat) { _ in }
-        XCTAssertTrue(
-            retryRunner.calls.isEmpty,
-            "A final-metadata retry must use the already-completed private output."
+        try await invalidationFailurePipeline.run(resumeFrom: .exportSplat) { _ in }
+        XCTAssertEqual(
+            completedResumePairValidations.labels,
+            ["splat.ply"],
+            "A completed export resume must defer its one authoritative PLY scan to the unconditional publisher decision."
         )
-        XCTAssertFalse(FileManager.default.fileExists(
+        XCTAssertTrue(invalidationFailureProbe.didRemoveMask)
+        XCTAssertTrue(invalidationFailureRunner.calls.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.msplatOutputURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(
             atPath: paths.isolatedOutputURL.path
         ))
-        XCTAssertFalse(FileManager.default.fileExists(
+        XCTAssertTrue(FileManager.default.fileExists(
             atPath: paths.isolationManifestURL.path
         ))
+        let postCleanupMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(postCleanupMetadata.state.stage, .done)
+        XCTAssertNil(postCleanupMetadata.state.lastError)
+        XCTAssertNil(postCleanupMetadata.pendingPublicationID)
 
         let completedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertEqual(completedMetadata.state.stage, .done)
         XCTAssertNil(completedMetadata.state.lastError)
+        XCTAssertNil(
+            completedMetadata.pendingPublicationID,
+            "Only a durable .done boundary retires the attempt publication identity."
+        )
         let plan = try XCTUnwrap(completedMetadata.resolvedRunPlan)
         let trainingArtifact = try TrainingArtifactStore.load(
             from: paths.trainingManifestURL,
@@ -7701,13 +9125,25 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(trainingArtifact.droppedIntersectionCount, 0)
         XCTAssertEqual(trainingArtifact.trainerBuildDigest, trainerDigest)
         XCTAssertEqual(trainingArtifact.outputPath, "Output/splat.ply")
+        guard case .available(let publishedResult) = try PublishedResultPairStore.resolve(
+            projectPaths: paths
+        ) else {
+            return XCTFail("A completed project must retain its validated publication receipt")
+        }
+        XCTAssertEqual(publishedResult.receipt.projectID, completedMetadata.id)
+        XCTAssertEqual(publishedResult.receipt.publicationID, attemptPublicationID)
+        XCTAssertEqual(publishedResult.outputEvidence.sha256, trainingArtifact.outputSHA256)
         XCTAssertEqual(trainingArtifact.iterationLimit, plan.trainerIterationLimit)
         XCTAssertEqual(trainingArtifact.plateauWindow, plan.plateauWindow)
         XCTAssertEqual(trainingArtifact.cameraOrderSeed, plan.runSeed)
         XCTAssertEqual(trainingArtifact.peakMemoryBytes, 536_870_912)
+        let survivingCheckpointEntries = (try? FileManager.default.contentsOfDirectory(
+            atPath: paths.msplatCheckpointURL.path
+        )) ?? []
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path),
-            "No completed checkpoint payload may survive its durable training boundary."
+            "No completed checkpoint payload may survive its durable training boundary. "
+                + "Entries: \(survivingCheckpointEntries)"
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.msplatOutputURL.path))
         XCTAssertTrue(
@@ -7722,6 +9158,155 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             trainingArtifact
         )
+
+        let firstPublicationID = publishedResult.receipt.publicationID
+        let retrainSizeProbe = temp.appendingPathComponent(
+            "msplat-retrain-size-probe.ply"
+        )
+        try TestFileBuilder.writeMinimalPly(
+            at: retrainSizeProbe,
+            vertexCount: 1_900
+        )
+        let retrainOutputBytes = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(
+                atPath: retrainSizeProbe.path
+            )[.size] as? NSNumber)?.int64Value
+        )
+        try FileManager.default.removeItem(at: retrainSizeProbe)
+        let retrainEvents = msplatEvents
+            .replacingOccurrences(
+                of: "\"gaussian_count\":1800",
+                with: "\"gaussian_count\":1900"
+            )
+            .replacingOccurrences(
+                of: "\"output_bytes\":\(msplatOutputBytes)",
+                with: "\"output_bytes\":\(retrainOutputBytes)"
+            )
+        let retrainRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_converter"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: ""
+                ),
+                onRun: { args in
+                    guard let outputPath = self.value(
+                        for: "--output_path",
+                        in: args
+                    ) else { return }
+                    try? self.writeMinimalColmapBinaryModel(
+                        at: URL(fileURLWithPath: outputPath, isDirectory: true),
+                        imageNames: (0..<12).map {
+                            String(format: "frame_%06d.jpg", $0)
+                        }
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.msplat.path,
+                argsPrefix: ["--dataset"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: ""
+                ),
+                stdoutLinesProvider: { args in
+                    guard let datasetArg = args.dropFirst().first else { return [] }
+                    let dataset = URL(
+                        fileURLWithPath: datasetArg,
+                        isDirectory: true
+                    )
+                    guard let identity = try? MsplatDatasetIdentity.compute(
+                        imageDirectory: dataset.appendingPathComponent(
+                            "images",
+                            isDirectory: true
+                        ),
+                        sparseDirectory: dataset.appendingPathComponent(
+                            "sparse/0",
+                            isDirectory: true
+                        )
+                    ) else { return [] }
+                    return retrainEvents
+                        .replacingOccurrences(
+                            of: inputDigest,
+                            with: identity.inputDigest
+                        )
+                        .replacingOccurrences(
+                            of: geometryDigest,
+                            with: identity.geometryDigest
+                        )
+                        .split(separator: "\n")
+                        .map(String.init)
+                },
+                onRun: { args in
+                    guard let outputArg = self.value(for: "--output", in: args),
+                          let checkpointArg = self.value(
+                            for: "--checkpoint",
+                            in: args
+                          ) else { return }
+                    XCTAssertNil(
+                        self.value(for: "--resume", in: args),
+                        "An explicit retrain must not reuse prior optimizer state."
+                    )
+                    try? TestFileBuilder.writeMinimalPly(
+                        at: URL(fileURLWithPath: outputArg),
+                        vertexCount: 1_900
+                    )
+                    try? FileManager.default.createDirectory(
+                        at: URL(
+                            fileURLWithPath: checkpointArg,
+                            isDirectory: true
+                        ),
+                        withIntermediateDirectories: true
+                    )
+                }
+            ),
+        ])
+        let retrainPublicationID = UUID(
+            uuidString: "BBBBBBBB-CCCC-4DDD-8EEE-FFFFFFFFFFFF"
+        )!
+        var retrainTooling = PipelineRunner.Tooling(
+            runner: retrainRunner,
+            trainingResourceObserver: TestTrainingResourceObserver()
+        )
+        retrainTooling.makePublicationID = { retrainPublicationID }
+        let retrainPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                runIntent: .retrain
+            ),
+            tooling: retrainTooling
+        )
+
+        try await retrainPipeline.run(resumeFrom: .sfmMapping) { _ in }
+
+        XCTAssertEqual(
+            retrainRunner.calls.filter { $0.0 == toolchain.msplat.path }.count,
+            1,
+            "A same-profile explicit retrain must execute msplat."
+        )
+        guard case .available(let retrainedResult) = try PublishedResultPairStore.resolve(
+            projectPaths: paths
+        ) else {
+            return XCTFail("The retrain must publish a validated result pair.")
+        }
+        XCTAssertNotEqual(retrainPublicationID, firstPublicationID)
+        XCTAssertEqual(retrainedResult.receipt.publicationID, retrainPublicationID)
+        XCTAssertEqual(retrainedResult.outputEvidence.vertexCount, 1_900)
+        XCTAssertNotEqual(
+            retrainedResult.outputEvidence.sha256,
+            publishedResult.outputEvidence.sha256
+        )
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: paths.metadataURL).state.stage,
+            .done
+        )
     }
 
     func testCompletedTrainingCleanupRejectsSymlinkedTrainingParent() throws {
@@ -7733,13 +9318,23 @@ final class PipelineIntegrationTests: XCTestCase {
         let externalTraining = temp.appendingPathComponent("ExternalTraining", isDirectory: true)
         let externalDataset = externalTraining.appendingPathComponent("msplat_dataset", isDirectory: true)
         let externalOutput = externalTraining.appendingPathComponent("msplat/splat.ply")
+        let externalCheckpoint = externalTraining.appendingPathComponent(
+            "checkpoints/msplat",
+            isDirectory: true
+        )
         try FileManager.default.createDirectory(at: externalDataset, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: externalCheckpoint,
+            withIntermediateDirectories: true
+        )
         try FileManager.default.createDirectory(
             at: externalOutput.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
         let marker = externalDataset.appendingPathComponent("keep.txt")
+        let checkpointMarker = externalCheckpoint.appendingPathComponent("keep.bin")
         try Data("outside project".utf8).write(to: marker)
+        try Data("outside checkpoint".utf8).write(to: checkpointMarker)
         try TestFileBuilder.writeMinimalPly(at: externalOutput)
 
         try FileManager.default.removeItem(at: paths.trainingURL)
@@ -7748,17 +9343,15 @@ final class PipelineIntegrationTests: XCTestCase {
             withDestinationURL: externalTraining
         )
 
-        let toolchain = try makeToolchain(root: temp)
-        let pipeline = PipelineRunner(
-            projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain)
-        )
-
         XCTAssertThrowsError(
-            try pipeline.removeDisposableCompletedTrainingPayload(paths: paths)
+            try TrainingArtifactStore.reconcileDisposableCompletedPayload(
+                paths: paths,
+                authorization: .unavailable
+            )
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: externalOutput.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: checkpointMarker.path))
     }
 
     func testPipelineCancellationRestartsFreshWhenNativeRejectsCheckpoint() async throws {
@@ -7918,7 +9511,7 @@ final class PipelineIntegrationTests: XCTestCase {
         {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":3000,"iteration_limit":3000,"iterations_per_second":1600,"schema_version":2,"sequence":3}
-        {"dropped_intersection_count":0,"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(outputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":0,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(outputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         let secondRunner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["model_converter"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
@@ -8206,8 +9799,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let resumedEvents = """
         {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":500,"iteration_limit":30000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":2000,"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"resumed":true,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","dropped_intersection_count":0,"event":"checkpoint_loaded","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":500,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-        {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":30000,"iteration_limit":30000,"iterations_per_second":1600,"schema_version":2,"sequence":3}
-        {"dropped_intersection_count":0,"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":30000,"iteration_limit":30000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(outputBytes),"peak_memory_bytes":805306368,"plateau_window":2000,"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":0,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":30000,"iteration_limit":30000,"iterations_per_second":1600,"schema_version":2,"sequence":3}
+        {"dropped_intersection_count":0,"elapsed_seconds":0,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":30000,"iteration_limit":30000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(outputBytes),"peak_memory_bytes":805306368,"plateau_window":2000,"profile":"balanced","raster_exact_buffer_bytes_added":\(receipt.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(receipt.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(receipt.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(receipt.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(receipt.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(receipt.rasterReplayElapsedSeconds),"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         let retryRunner = MockSubprocessRunner(scripts: [
             converterScript(),
@@ -9296,7 +10889,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let msplatEvents = """
         {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":268435456,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"dropped_intersection_count":0,"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":0,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
 
         var msplatDatasetPath: String?
@@ -9444,7 +11037,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let msplatEvents = """
         {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":268435456,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"dropped_intersection_count":0,"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":0,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"scene_center":[0,0,0],"scene_radius":2.5,"schema_version":2,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
 
         let runner = MockSubprocessRunner(scripts: [
@@ -9727,6 +11320,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try await seedPipeline.run { _ in }
 
         let resumeRunner = MockSubprocessRunner(scripts: [])
+        let events = PipelineEventSink()
         let resumedPipeline = PipelineRunner(
             projectURL: projectURL,
             config: makePipelineConfig(
@@ -9736,10 +11330,13 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             tooling: .init(
                 runner: resumeRunner,
-                checkCancellation: { throw CancellationError() }
+                checkCancellation: {
+                    if events.didStart(.sfmMapping) {
+                        throw CancellationError()
+                    }
+                }
             )
         )
-        let events = PipelineEventSink()
 
         await XCTAssertThrowsErrorAsync({
             try await resumedPipeline.run(resumeFrom: .sfmMatching) { events.append($0) }
@@ -13879,7 +15476,217 @@ private final class PipelineMetadataWriteProbe: @unchecked Sendable {
                 ]
             )
         }
-        try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: url)
+        _ = metadata
+        _ = url
+    }
+}
+
+private final class SubjectInvalidationFailureProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maskURL: URL
+    private var removedMask = false
+
+    init(maskURL: URL) {
+        self.maskURL = maskURL
+    }
+
+    var didRemoveMask: Bool {
+        lock.withLock { removedMask }
+    }
+
+    func write(
+        _ metadata: ProjectMetadata,
+        to url: URL,
+        operation: PipelineMetadataWriteOperation,
+        stage: PipelineStage
+    ) throws {
+        _ = metadata
+        _ = url
+        let shouldRemove = lock.withLock { () -> Bool in
+            guard operation == .finalCompletion,
+                  stage == .done,
+                  !removedMask else {
+                return false
+            }
+            removedMask = true
+            return true
+        }
+        if shouldRemove {
+            try FileManager.default.removeItem(at: maskURL)
+        }
+    }
+}
+
+private final class PipelinePlyValidationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var labels: [String] {
+        lock.withLock { storage }
+    }
+
+    func record(_ label: String) {
+        lock.withLock { storage.append(label) }
+    }
+}
+
+private final class PipelinePublicationStartupProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reconciled = false
+    private var runStartSawReconciliation = false
+    private var controlledInputValidationSawReconciliation = false
+
+    var runStartObservedReconciliation: Bool {
+        lock.withLock { runStartSawReconciliation }
+    }
+
+    var controlledInputValidationObservedReconciliation: Bool {
+        lock.withLock { controlledInputValidationSawReconciliation }
+    }
+
+    func recordReconciliation() {
+        lock.withLock { reconciled = true }
+    }
+
+    func recordRunStartWrite() {
+        lock.withLock { runStartSawReconciliation = reconciled }
+    }
+
+    func recordControlledInputValidation() {
+        lock.withLock {
+            controlledInputValidationSawReconciliation = reconciled
+        }
+    }
+}
+
+private enum PipelineStartupTestError: Error, Equatable {
+    case controlledInputValidation
+}
+
+private enum PipelineRunLeaseTestError: Error, Equatable {
+    case blockedRunStart
+    case unexpectedWrite
+}
+
+private final class PipelineRunLeaseWriteProbe: @unchecked Sendable {
+    private let enteredRunStart = DispatchSemaphore(value: 0)
+    private let continueRunStart = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didEnter = false
+    private var didRelease = false
+
+    func blockRunStart() throws {
+        lock.withLock {
+            guard !didEnter else { return }
+            didEnter = true
+            enteredRunStart.signal()
+        }
+        continueRunStart.wait()
+        throw PipelineRunLeaseTestError.blockedRunStart
+    }
+
+    func waitForRunStart(timeout: DispatchTime) -> DispatchTimeoutResult {
+        enteredRunStart.wait(timeout: timeout)
+    }
+
+    func releaseRunStart() {
+        let shouldSignal = lock.withLock { () -> Bool in
+            guard !didRelease else { return false }
+            didRelease = true
+            return true
+        }
+        if shouldSignal {
+            continueRunStart.signal()
+        }
+    }
+}
+
+private final class PipelineRunLeaseAcquisitionProbe: @unchecked Sendable {
+    private let acquired = DispatchSemaphore(value: 0)
+    private let resume = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didAcquire = false
+    private var didRelease = false
+
+    func blockAfterAcquisition() {
+        lock.withLock {
+            guard !didAcquire else { return }
+            didAcquire = true
+            acquired.signal()
+        }
+        resume.wait()
+    }
+
+    func waitUntilAcquired(timeout: DispatchTime) -> DispatchTimeoutResult {
+        acquired.wait(timeout: timeout)
+    }
+
+    func release() {
+        let shouldSignal = lock.withLock { () -> Bool in
+            guard !didRelease else { return false }
+            didRelease = true
+            return true
+        }
+        if shouldSignal {
+            resume.signal()
+        }
+    }
+}
+
+private final class PipelineRunLeaseHookCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var count: Int {
+        lock.withLock { storage }
+    }
+
+    func record() {
+        lock.withLock { storage += 1 }
+    }
+}
+
+private final class PipelineRunLeaseBoundaryReplacementProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let projectURL: URL
+    private let movedProjectURL: URL
+    private var records: [PipelineMetadataWriteProbe.Record] = []
+    let markerURL: URL
+    let markerBytes = Data("replacement must remain untouched".utf8)
+
+    init(projectURL: URL, movedProjectURL: URL) {
+        self.projectURL = projectURL
+        self.movedProjectURL = movedProjectURL
+        self.markerURL = projectURL.appendingPathComponent("replacement.bin")
+    }
+
+    var operations: [PipelineMetadataWriteProbe.Record] {
+        lock.withLock { records }
+    }
+
+    func writeAndReplace(
+        _ metadata: ProjectMetadata,
+        to url: URL,
+        operation: PipelineMetadataWriteOperation,
+        stage: PipelineStage
+    ) throws {
+        let isFirstRunStart = lock.withLock { () -> Bool in
+            records.append(.init(operation: operation, stage: stage))
+            return records.count == 1
+                && operation == .runStart
+                && stage == .importInput
+        }
+        guard isFirstRunStart else {
+            throw PipelineRunLeaseTestError.unexpectedWrite
+        }
+        _ = metadata
+        _ = url
+        try FileManager.default.moveItem(at: projectURL, to: movedProjectURL)
+        try FileManager.default.createDirectory(
+            at: projectURL,
+            withIntermediateDirectories: false
+        )
+        try markerBytes.write(to: markerURL)
     }
 }
 

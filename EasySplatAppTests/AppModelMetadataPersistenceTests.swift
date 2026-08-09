@@ -21,8 +21,11 @@ final class AppModelMetadataPersistenceTests: XCTestCase {
             pipelineRunnerFactory: { _, _ in
                 MetadataFailurePipelineRunner(failure: coreFailure)
             },
-            projectMetadataUpdater: { metadataURL, mutation in
-                let updated = try ProjectMetadataStore.update(at: metadataURL, mutation)
+            projectMetadataUpdater: { projectRootDescriptor, mutation in
+                let updated = try ProjectMetadataStore.update(
+                    atProjectRootDescriptor: projectRootDescriptor,
+                    mutation
+                )
                 updateProbe.record(updated)
                 return updated
             }
@@ -141,9 +144,12 @@ final class AppModelMetadataPersistenceTests: XCTestCase {
             pipelineRunnerFactory: { _, _ in
                 MetadataFailurePipelineRunner(failure: coreFailure)
             },
-            projectMetadataUpdater: { metadataURL, mutation in
+            projectMetadataUpdater: { projectRootDescriptor, mutation in
                 updateProbe.recordAttempt()
-                return try ProjectMetadataStore.update(at: metadataURL, mutation)
+                return try ProjectMetadataStore.update(
+                    atProjectRootDescriptor: projectRootDescriptor,
+                    mutation
+                )
             }
         )
 
@@ -188,9 +194,12 @@ final class AppModelMetadataPersistenceTests: XCTestCase {
             pipelineRunnerFactory: { _, _ in
                 MetadataFailurePipelineRunner(failure: runnerError)
             },
-            projectMetadataUpdater: { metadataURL, mutation in
+            projectMetadataUpdater: { projectRootDescriptor, mutation in
                 updateProbe.recordAttempt()
-                return try ProjectMetadataStore.update(at: metadataURL, mutation)
+                return try ProjectMetadataStore.update(
+                    atProjectRootDescriptor: projectRootDescriptor,
+                    mutation
+                )
             }
         )
 
@@ -323,17 +332,28 @@ private final class MetadataFailurePipelineRunner: PipelineRunning {
     }
 }
 
-private final class MetadataUpdateProbe {
-    private(set) var callCount = 0
-    private(set) var lastMetadata: ProjectMetadata?
+private final class MetadataUpdateProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+    private var metadata: ProjectMetadata?
+
+    var callCount: Int {
+        lock.withLock { calls }
+    }
+
+    var lastMetadata: ProjectMetadata? {
+        lock.withLock { metadata }
+    }
 
     func record(_ metadata: ProjectMetadata) {
-        callCount += 1
-        lastMetadata = metadata
+        lock.withLock {
+            calls += 1
+            self.metadata = metadata
+        }
     }
 
     func recordAttempt() {
-        callCount += 1
+        lock.withLock { calls += 1 }
     }
 }
 

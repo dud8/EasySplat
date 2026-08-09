@@ -18,6 +18,53 @@ private struct SelectedTrainingFrameSnapshot: Equatable {
     let bindingsByName: [String: SelectedTrainingFrameBinding]
 }
 
+/// The canonical lineage that a completed training manifest claims. Publication
+/// captures it immediately before the manifest CAS and rederives it at both CAS
+/// boundaries, so a geometry replacement cannot be blessed by installing
+/// otherwise valid rebound manifest bytes. The training side is bound separately
+/// by the descriptor-and-bytes CAS in `TrainingArtifactStore`.
+package struct MsplatPublicationLineageSnapshot: Sendable, Equatable {
+    package let geometryArtifact: GeometryArtifact
+    package let geometryManifestSHA256: String
+
+    package static func capture(
+        matching training: TrainingArtifact,
+        paths: ProjectPaths
+    ) throws -> MsplatPublicationLineageSnapshot {
+        let geometry = try GeometryArtifactStore.loadManifest(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        let geometryManifestSHA256 = try GeometryArtifactStore.manifestDigest(
+            matching: geometry,
+            at: paths.geometryManifestURL
+        )
+        let derivation = training.datasetDerivation
+        guard training.completionStatus == .completed,
+              derivation.sourceGeometryManifestSHA256 == geometryManifestSHA256,
+              derivation.sourceSelectedFramesDigest == geometry.selectedFramesDigest else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch(
+                "training publication lineage"
+            )
+        }
+        return MsplatPublicationLineageSnapshot(
+            geometryArtifact: geometry,
+            geometryManifestSHA256: geometryManifestSHA256
+        )
+    }
+
+    package func revalidate(
+        matching training: TrainingArtifact,
+        paths: ProjectPaths
+    ) throws {
+        guard try Self.capture(matching: training, paths: paths) == self else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch(
+                "training publication lineage"
+            )
+        }
+    }
+}
+
 extension PipelineRunner {
     func prepareMsplatDataset(
         paths: ProjectPaths,
@@ -1032,97 +1079,47 @@ extension PipelineRunner {
         return artifact
     }
 
-    /// Rebinds a completed training receipt to the validated public PLY. The trainer's
-    /// private output remains available until the run is durably marked done, so a
-    /// crash during export can still resume without retraining.
-    static func promoteMsplatCompletionToPublicOutput(
-        paths: ProjectPaths
-    ) throws -> CanonicalSplatPublication {
-        guard var artifact = try? TrainingArtifactStore.load(
-            from: paths.trainingManifestURL,
-            projectPaths: paths
-        ), artifact.completionStatus == .completed else {
-            throw PipelineError.outputMissing
-        }
-        if artifact.outputPath == "Output/splat.ply" {
-            try TrainingArtifactStore.validateCompletedOutput(
-                artifact,
-                at: paths.outputURL.appendingPathComponent("splat.ply")
-            )
-            return try SubjectIsolationArtifactStore.captureCanonicalPublication(
-                paths: paths
-            )
-        }
-        guard artifact.outputPath == "Training/msplat/splat.ply" else {
-            throw PipelineError.outputMissing
-        }
-
-        artifact.outputPath = "Output/splat.ply"
-        try TrainingArtifactStore.persist(artifact, paths: paths)
-        return try SubjectIsolationArtifactStore.captureCanonicalPublication(
-            paths: paths
-        )
-    }
-
     /// Finished projects retain the exact dataset consumed by the trainer so release
     /// verification can independently recompute its input and geometry identities.
     /// Only the trainer-private duplicate PLY is disposable after public output is
     /// durably authenticated.
-    func removeDisposableCompletedTrainingPayload(paths: ProjectPaths) throws {
-        let fileManager = FileManager.default
-        let disposableOutput = try paths.resolveProjectRelativePath(
-            "Training/msplat/splat.ply"
+    func removeDisposableCompletedTrainingPayload(
+        paths: ProjectPaths,
+        publishedResult: ValidatedPublishedResult,
+        operations: TrainingFilesystemOperations = .live
+    ) throws {
+        try TrainingArtifactStore.removeDisposableCompletedPayload(
+            paths: paths,
+            publishedResult: publishedResult,
+            operations: operations
         )
-        if fileManager.fileExists(atPath: disposableOutput.path)
-            || (try? fileManager.destinationOfSymbolicLink(atPath: disposableOutput.path)) != nil {
-            try fileManager.removeItem(at: disposableOutput)
-        }
-        try removeTrainingPreviewPayload(paths: paths)
+    }
+
+    func removeDisposableCompletedTrainingPayload(
+        paths: ProjectPaths,
+        projectRootDescriptor: Int32,
+        publishedResult: ValidatedPublishedResult,
+        operations: TrainingFilesystemOperations = .live
+    ) throws {
+        try TrainingArtifactStore.removeDisposableCompletedPayload(
+            paths: paths,
+            projectRootDescriptor: projectRootDescriptor,
+            publishedResult: publishedResult,
+            operations: operations
+        )
     }
 
     /// Removes the preview and any temporary a crashed publication left behind.
     /// The preview is a display cache tied to a live run: keeping ~26 MB per
     /// finished project to describe a model that has since been superseded is pure
     /// accumulation. Safe to call when nothing is present.
-    func removeTrainingPreviewPayload(paths: ProjectPaths) throws {
-        let fileManager = FileManager.default
-        let preview = try paths.resolveProjectRelativePath("Training/msplat/preview.ply")
-        try removeRegularFileIfPresent(preview)
-
-        // Publication temporaries are ".preview.ply.preview.tmp.<pid>.ply" beside the
-        // preview. A crash between create and rename strands one, and the next run
-        // only replaces the canonical name.
-        let directory = preview.deletingLastPathComponent()
-        let prefix = ".\(preview.lastPathComponent).preview.tmp."
-        guard let entries = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
-        ) else {
-            return
-        }
-        for entry in entries {
-            let name = entry.lastPathComponent
-            guard name.hasPrefix(prefix), name.hasSuffix(".ply") else { continue }
-            // The producer writes exactly one decimal pid between the fixed affixes.
-            // Anything else in that slot is not ours to delete.
-            let pid = name.dropFirst(prefix.count).dropLast(".ply".count)
-            guard !pid.isEmpty, pid.allSatisfy({ $0.isASCII && $0.isNumber }) else { continue }
-            // Resolve through the project's own containment check so a symlinked
-            // entry cannot walk the delete outside the bundle.
-            guard let relative = try? paths.projectRelativePath(for: entry),
-                  let resolved = try? paths.resolveProjectRelativePath(relative) else {
-                continue
-            }
-            try? removeRegularFileIfPresent(resolved)
-        }
-    }
-
-    /// Deletes only an ordinary file. `removeItem` is recursive, so a directory or
-    /// symlink wearing a preview's name would otherwise take its contents with it.
-    private func removeRegularFileIfPresent(_ url: URL) throws {
-        var status = stat()
-        guard lstat(url.path, &status) == 0 else { return }
-        guard status.st_mode & S_IFMT == S_IFREG else { return }
-        try FileManager.default.removeItem(at: url)
+    func removeTrainingPreviewPayload(
+        paths: ProjectPaths,
+        operations: TrainingFilesystemOperations = .live
+    ) throws {
+        try TrainingArtifactStore.removePreviewPayload(
+            paths: paths,
+            operations: operations
+        )
     }
 }

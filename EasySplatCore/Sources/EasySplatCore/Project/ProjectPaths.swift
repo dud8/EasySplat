@@ -72,8 +72,20 @@ public struct ProjectPaths: Sendable {
     /// Live training preview. Deliberately outside the checkpoint tree: this is a
     /// display cache with no bearing on resume, and its presence grants no authority.
     public var msplatPreviewURL: URL { trainingURL.appendingPathComponent("msplat/preview.ply") }
+    package var completedTrainingCleanupJournalURL: URL {
+        trainingURL.appendingPathComponent(".completed-training-cleanup.json")
+    }
+    package var checkpointDiscardCleanupJournalURL: URL {
+        trainingURL.appendingPathComponent(".checkpoint-discard-cleanup.json")
+    }
     public var outputURL: URL { root.appendingPathComponent("Output", isDirectory: true) }
     public var outputSplatURL: URL { outputURL.appendingPathComponent("splat.ply") }
+    public var outputSplatReceiptURL: URL {
+        outputURL.appendingPathComponent("splat_receipt.json")
+    }
+    package var publishedResultLockURL: URL {
+        outputURL.appendingPathComponent(".published-result.lock")
+    }
     public var isolatedOutputURL: URL { outputURL.appendingPathComponent("isolated.ply") }
     public var isolationURL: URL { root.appendingPathComponent("Isolation", isDirectory: true) }
     public var isolationManifestURL: URL {

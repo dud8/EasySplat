@@ -1,8 +1,228 @@
 import Foundation
 import Dispatch
+import Darwin
+
+package enum ProjectRunLeaseBorrowError: Error, Equatable {
+    case alreadyClaimed
+    case released
+}
+
+/// Task-scoped ownership of a run lease acquired before retrain metadata changes.
+/// A runner may claim one borrow, but never owns or releases the underlying lease;
+/// the app task retains this owner through post-run validation and cleanup.
+package final class ProjectRunLeaseOwner: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lease: ProjectRunLease?
+    private var wasClaimed = false
+    private var borrowIsActive = false
+    private var descriptorOperationCount = 0
+    private var releaseWasRequested = false
+
+    private init(lease: ProjectRunLease) {
+        self.lease = lease
+    }
+
+    deinit {
+        discard()
+    }
+
+    package static func acquire(projectURL: URL) throws -> ProjectRunLeaseOwner {
+        ProjectRunLeaseOwner(
+            lease: try ProjectRunLease.acquire(projectURL: projectURL)
+        )
+    }
+
+    package static func acquire(
+        projectURL: URL,
+        registryURL: URL
+    ) throws -> ProjectRunLeaseOwner {
+        ProjectRunLeaseOwner(
+            lease: try ProjectRunLease.acquire(
+                projectURL: projectURL,
+                registryURL: registryURL
+            )
+        )
+    }
+
+    fileprivate func claimBorrow(for projectURL: URL) throws -> ProjectRunLeaseBorrow {
+        let ownedLease: ProjectRunLease = try lock.withLock {
+            guard let lease else {
+                throw ProjectRunLeaseBorrowError.released
+            }
+            guard !releaseWasRequested else {
+                throw ProjectRunLeaseBorrowError.released
+            }
+            guard !wasClaimed else {
+                throw ProjectRunLeaseBorrowError.alreadyClaimed
+            }
+            guard descriptorOperationCount == 0 else {
+                throw ProjectRunLeaseBorrowError.alreadyClaimed
+            }
+            wasClaimed = true
+            borrowIsActive = true
+            return lease
+        }
+        do {
+            try ownedLease.withLockedProjectRootDescriptor { descriptor in
+                var held = stat()
+                var named = stat()
+                guard Darwin.fstat(descriptor, &held) == 0,
+                      Darwin.lstat(projectURL.path, &named) == 0,
+                      held.st_mode & S_IFMT == S_IFDIR,
+                      named.st_mode & S_IFMT == S_IFDIR,
+                      held.st_dev == named.st_dev,
+                      held.st_ino == named.st_ino,
+                      held.st_uid == named.st_uid else {
+                    throw ProjectRunLeaseError.unsafeProject
+                }
+            }
+            return ProjectRunLeaseBorrow(owner: self, lease: ownedLease)
+        } catch {
+            endBorrow()
+            throw error
+        }
+    }
+
+    /// Performs one descriptor-relative operation before the runner claims its
+    /// borrow or after that borrow has ended. The owner keeps the lease alive for
+    /// the complete operation without exposing either the lease or its release.
+    package func withLockedProjectRootDescriptor<Result>(
+        _ operation: (Int32) throws -> Result
+    ) throws -> Result {
+        let ownedLease: ProjectRunLease = try lock.withLock {
+            guard let lease, !releaseWasRequested else {
+                throw ProjectRunLeaseBorrowError.released
+            }
+            guard !borrowIsActive else {
+                throw ProjectRunLeaseBorrowError.alreadyClaimed
+            }
+            descriptorOperationCount += 1
+            return lease
+        }
+        defer { endDescriptorOperation() }
+        return try ownedLease.withLockedProjectRootDescriptor(operation)
+    }
+
+    /// Loans the held root to work that may wait on a publication or subject
+    /// lock. Neither the owner lock nor the lease state lock remains held while
+    /// the operation runs.
+    package func withValidatedProjectRootDescriptor<Result>(
+        _ operation: (Int32) throws -> Result
+    ) throws -> Result {
+        let ownedLease: ProjectRunLease = try lock.withLock {
+            guard let lease, !releaseWasRequested else {
+                throw ProjectRunLeaseBorrowError.released
+            }
+            guard !borrowIsActive else {
+                throw ProjectRunLeaseBorrowError.alreadyClaimed
+            }
+            descriptorOperationCount += 1
+            return lease
+        }
+        defer { endDescriptorOperation() }
+        return try ownedLease.withValidatedProjectRootDescriptor(operation)
+    }
+
+    package func discard() {
+        let ownedLease: ProjectRunLease? = lock.withLock {
+            guard let lease else { return nil }
+            if borrowIsActive || descriptorOperationCount > 0 {
+                releaseWasRequested = true
+                return nil
+            }
+            self.lease = nil
+            return lease
+        }
+        ownedLease?.release()
+    }
+
+    package func release() {
+        discard()
+    }
+
+    fileprivate func endBorrow() {
+        let ownedLease: ProjectRunLease? = lock.withLock {
+            guard borrowIsActive else { return nil }
+            borrowIsActive = false
+            guard releaseWasRequested,
+                  descriptorOperationCount == 0,
+                  let lease else { return nil }
+            self.lease = nil
+            return lease
+        }
+        ownedLease?.release()
+    }
+
+    private func endDescriptorOperation() {
+        let ownedLease: ProjectRunLease? = lock.withLock {
+            precondition(descriptorOperationCount > 0)
+            descriptorOperationCount -= 1
+            guard descriptorOperationCount == 0,
+                  !borrowIsActive,
+                  releaseWasRequested,
+                  let lease else { return nil }
+            self.lease = nil
+            return lease
+        }
+        ownedLease?.release()
+    }
+}
+
+private final class ProjectRunLeaseBorrow {
+    fileprivate let lease: ProjectRunLease
+    private let owner: ProjectRunLeaseOwner
+    private let lock = NSLock()
+    private var ended = false
+
+    fileprivate init(owner: ProjectRunLeaseOwner, lease: ProjectRunLease) {
+        self.owner = owner
+        self.lease = lease
+    }
+
+    deinit {
+        end()
+    }
+
+    fileprivate func end() {
+        let shouldEnd = lock.withLock { () -> Bool in
+            guard !ended else { return false }
+            ended = true
+            return true
+        }
+        if shouldEnd {
+            owner.endBorrow()
+        }
+    }
+}
+
+private enum PipelineRunLeaseHandle {
+    case owned(ProjectRunLease)
+    case borrowed(ProjectRunLeaseBorrow)
+
+    var lease: ProjectRunLease {
+        switch self {
+        case .owned(let lease): return lease
+        case .borrowed(let borrow): return borrow.lease
+        }
+    }
+
+    func finish() {
+        switch self {
+        case .owned(let lease): lease.release()
+        case .borrowed(let borrow): borrow.end()
+        }
+    }
+}
+
 public final class PipelineRunner: @unchecked Sendable {
 
     private struct DevelopmentStop: Error {}
+
+    private struct PreparedCompletedPublication {
+        let geometry: GeometryArtifact
+        let training: TrainingArtifact
+        let datasetDerivation: MsplatDatasetDerivationArtifact
+    }
 
     public struct Tooling {
         public var colmap: ColmapRunner
@@ -18,6 +238,17 @@ public final class PipelineRunner: @unchecked Sendable {
             ResolvedPairingPolicy?
         ) throws -> RuntimeInputSnapshotLease
         package var metadataWriter: PipelineMetadataWriter
+        package var publishedResultPairOperations: PublishedResultPairOperations
+        package var makePublicationID: @Sendable () -> UUID
+        package var publicationDate: @Sendable () -> Date
+        package var persistPreparedTrainingManifest:
+            DescriptorBoundPreparedTrainingManifestPersistence
+        package var completedTrainingOutputEvidence: @Sendable (
+            URL
+        ) throws -> ValidatedPlyArtifactEvidence
+        package var trainingFilesystemOperations: TrainingFilesystemOperations
+        package var projectRunLeaseRegistryURL: @Sendable () throws -> URL
+        package var projectRunLeaseDidAcquire: @Sendable () -> Void
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     msplat: MsplatRunner = MsplatRunner(),
@@ -33,12 +264,32 @@ public final class PipelineRunner: @unchecked Sendable {
             self.prepareRuntimeInputLease = {
                 try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
             }
-            self.metadataWriter = { metadata, metadataURL, _, _ in
-                try ProjectMetadataStore.savePreservingUserEditableFields(
-                    metadata,
-                    to: metadataURL
+            self.metadataWriter = { _, _, _, _ in }
+            self.publishedResultPairOperations = .system()
+            self.makePublicationID = UUID.init
+            self.publicationDate = Date.init
+            self.persistPreparedTrainingManifest = {
+                data,
+                artifact,
+                evidence,
+                expectedSourceIdentity,
+                paths,
+                projectRootDescriptor in
+                try TrainingArtifactStore.persistPreparedManifest(
+                    data,
+                    artifact: artifact,
+                    validatedOutputEvidence: evidence,
+                    expectedSourceIdentity: expectedSourceIdentity,
+                    paths: paths,
+                    projectRootDescriptor: projectRootDescriptor
                 )
             }
+            self.completedTrainingOutputEvidence = {
+                try ProjectArtifactValidator.validatedPlyEvidence(at: $0)
+            }
+            self.trainingFilesystemOperations = .live
+            self.projectRunLeaseRegistryURL = ProjectRunLease.defaultRegistryURL
+            self.projectRunLeaseDidAcquire = {}
         }
 
         public init(runner: SubprocessRunning) {
@@ -52,12 +303,32 @@ public final class PipelineRunner: @unchecked Sendable {
             self.prepareRuntimeInputLease = {
                 try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
             }
-            self.metadataWriter = { metadata, metadataURL, _, _ in
-                try ProjectMetadataStore.savePreservingUserEditableFields(
-                    metadata,
-                    to: metadataURL
+            self.metadataWriter = { _, _, _, _ in }
+            self.publishedResultPairOperations = .system()
+            self.makePublicationID = UUID.init
+            self.publicationDate = Date.init
+            self.persistPreparedTrainingManifest = {
+                data,
+                artifact,
+                evidence,
+                expectedSourceIdentity,
+                paths,
+                projectRootDescriptor in
+                try TrainingArtifactStore.persistPreparedManifest(
+                    data,
+                    artifact: artifact,
+                    validatedOutputEvidence: evidence,
+                    expectedSourceIdentity: expectedSourceIdentity,
+                    paths: paths,
+                    projectRootDescriptor: projectRootDescriptor
                 )
             }
+            self.completedTrainingOutputEvidence = {
+                try ProjectArtifactValidator.validatedPlyEvidence(at: $0)
+            }
+            self.trainingFilesystemOperations = .live
+            self.projectRunLeaseRegistryURL = ProjectRunLease.defaultRegistryURL
+            self.projectRunLeaseDidAcquire = {}
         }
 
         init(
@@ -77,16 +348,36 @@ public final class PipelineRunner: @unchecked Sendable {
             ) throws -> RuntimeInputSnapshotLease = {
                 try RuntimeInputSnapshotLease.prepare(metadata: $0, paths: $1, pairingPolicy: $2)
             },
-            metadataWriter: @escaping PipelineMetadataWriter = {
-                metadata,
-                metadataURL,
-                _,
-                _ in
-                try ProjectMetadataStore.savePreservingUserEditableFields(
-                    metadata,
-                    to: metadataURL
+            metadataWriter: @escaping PipelineMetadataWriter = { _, _, _, _ in },
+            publishedResultPairOperations: PublishedResultPairOperations = .system(),
+            makePublicationID: @escaping @Sendable () -> UUID = UUID.init,
+            publicationDate: @escaping @Sendable () -> Date = Date.init,
+            persistPreparedTrainingManifest:
+                @escaping DescriptorBoundPreparedTrainingManifestPersistence = {
+                data,
+                artifact,
+                evidence,
+                expectedSourceIdentity,
+                paths,
+                projectRootDescriptor in
+                try TrainingArtifactStore.persistPreparedManifest(
+                    data,
+                    artifact: artifact,
+                    validatedOutputEvidence: evidence,
+                    expectedSourceIdentity: expectedSourceIdentity,
+                    paths: paths,
+                    projectRootDescriptor: projectRootDescriptor
                 )
-            }
+            },
+            completedTrainingOutputEvidence: @escaping @Sendable (
+                URL
+            ) throws -> ValidatedPlyArtifactEvidence = {
+                try ProjectArtifactValidator.validatedPlyEvidence(at: $0)
+            },
+            trainingFilesystemOperations: TrainingFilesystemOperations = .live,
+            projectRunLeaseRegistryURL: @escaping @Sendable () throws -> URL =
+                ProjectRunLease.defaultRegistryURL,
+            projectRunLeaseDidAcquire: @escaping @Sendable () -> Void = {}
         ) {
             self.colmap = ColmapRunner(runner: runner)
             self.msplat = MsplatRunner(runner: runner)
@@ -97,6 +388,14 @@ public final class PipelineRunner: @unchecked Sendable {
             self.validateVideoInputs = validateVideoInputs
             self.prepareRuntimeInputLease = prepareRuntimeInputLease
             self.metadataWriter = metadataWriter
+            self.publishedResultPairOperations = publishedResultPairOperations
+            self.makePublicationID = makePublicationID
+            self.publicationDate = publicationDate
+            self.persistPreparedTrainingManifest = persistPreparedTrainingManifest
+            self.completedTrainingOutputEvidence = completedTrainingOutputEvidence
+            self.trainingFilesystemOperations = trainingFilesystemOperations
+            self.projectRunLeaseRegistryURL = projectRunLeaseRegistryURL
+            self.projectRunLeaseDidAcquire = projectRunLeaseDidAcquire
         }
     }
 
@@ -108,6 +407,11 @@ public final class PipelineRunner: @unchecked Sendable {
         case enabled
     }
 
+    public enum RunIntent: String, Sendable, Equatable {
+        case resume
+        case retrain
+    }
+
     public struct PipelineConfig: Sendable {
         public var toolchain: ToolchainPaths
         public var developmentOverrides: DevelopmentOverrides
@@ -116,6 +420,8 @@ public final class PipelineRunner: @unchecked Sendable {
         public var prePipelineDurationSeconds: TimeInterval
         public var prePipelineStartedAt: Date?
         public var trainingPreviewPolicy: TrainingPreviewPolicy
+        public var runIntent: RunIntent
+        package var borrowedProjectRunLeaseOwner: ProjectRunLeaseOwner?
 
         public init(
             toolchain: ToolchainPaths,
@@ -124,7 +430,8 @@ public final class PipelineRunner: @unchecked Sendable {
             resolvedRunPlan: ResolvedRunPlan? = nil,
             prePipelineDurationSeconds: TimeInterval = 0,
             prePipelineStartedAt: Date? = nil,
-            trainingPreviewPolicy: TrainingPreviewPolicy = .disabled
+            trainingPreviewPolicy: TrainingPreviewPolicy = .disabled,
+            runIntent: RunIntent = .resume
         ) {
             self.toolchain = toolchain
             self.developmentOverrides = developmentOverrides
@@ -133,6 +440,18 @@ public final class PipelineRunner: @unchecked Sendable {
             self.prePipelineDurationSeconds = prePipelineDurationSeconds
             self.prePipelineStartedAt = prePipelineStartedAt
             self.trainingPreviewPolicy = trainingPreviewPolicy
+            self.runIntent = runIntent
+            self.borrowedProjectRunLeaseOwner = nil
+        }
+
+        /// Borrows an app-task-owned lease for exactly one runner. Copies share
+        /// the same one-shot claim, and the runner never releases the owner.
+        package func withBorrowedProjectRunLease(
+            _ owner: ProjectRunLeaseOwner
+        ) -> PipelineConfig {
+            var copy = self
+            copy.borrowedProjectRunLeaseOwner = owner
+            return copy
         }
     }
 
@@ -178,7 +497,20 @@ public final class PipelineRunner: @unchecked Sendable {
         freshPublicationAttestation: FreshProjectPublicationAttestation?,
         events: @escaping @Sendable (PipelineEvent) -> Void
     ) async throws {
-        defer { freshPublicationAttestation?.discard() }
+        let runLeaseHandle: PipelineRunLeaseHandle
+        do {
+            runLeaseHandle = try acquireProjectRunLease()
+        } catch {
+            freshPublicationAttestation?.discard()
+            throw error
+        }
+        let runLease = runLeaseHandle.lease
+        defer {
+            freshPublicationAttestation?.discard()
+            runLeaseHandle.finish()
+        }
+        try freshPublicationAttestation?.projectRunLeaseDidAcquire()
+        try runLease.revalidateProjectRoot()
         // Keep the Mac awake while work is active. Display sleep remains available, and
         // the assertion is released on every exit — success, failure, stop, or cancellation.
         let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is processing a project")
@@ -194,18 +526,17 @@ public final class PipelineRunner: @unchecked Sendable {
         // or from a future build, we want the user to keep the previous run's diagnostic
         // tool logs for inspection — wiping them on a no-op startup
         // failure would destroy the only evidence of why the prior attempt died.
-        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        var metadata = try loadAuthenticatedStartupMetadata(
+            paths: paths,
+            runLease: runLease,
+            freshPublicationAttestation: freshPublicationAttestation
+        )
         // Terminal persistence must never serialize mutations that did not cross a
         // required durability boundary. In particular, freshly generated input
         // receipts can name files owned by a rollback ledger until their boundary
         // write succeeds.
         var lastDurableMetadata = metadata
         let hadRunStartMarkerBeforeThisAttempt = metadata.lastRunStartedAt != nil
-        try authenticateStartupVideoInputs(
-            metadata: metadata,
-            paths: paths,
-            freshPublicationAttestation: freshPublicationAttestation
-        )
         try PhotoInputReceiptValidator.validateFiles(metadata: metadata, paths: paths)
         // Dataset projects rebind the persisted pose seed the same way photo and
         // video receipts are rebound: no run starts against drifted seed bytes.
@@ -228,10 +559,22 @@ public final class PipelineRunner: @unchecked Sendable {
                 seedModel: seedModel
             )
         }
+        // Resume must retain the generation that may already own an interrupted
+        // publication. An explicit retrain is a new publication attempt even when
+        // the previous attempt committed its pair before the final metadata write.
+        if config.runIntent == .retrain || metadata.pendingPublicationID == nil {
+            metadata.pendingPublicationID = tooling.makePublicationID()
+        }
+        if config.runIntent == .retrain {
+            // The previous publication keeps its historical timing in its receipt.
+            // A new publication must earn a new viewer-ready measurement.
+            metadata.createToViewerReadySeconds = nil
+        }
         metadata.lastRunStartedAt = Date()
-        lastDurableMetadata = try persistRequiredMetadata(
+        lastDurableMetadata = try persistBoundMetadata(
             metadata,
             paths: paths,
+            runLease: runLease,
             operation: .runStart,
             stage: .importInput
         )
@@ -240,6 +583,7 @@ public final class PipelineRunner: @unchecked Sendable {
         do {
         // No project directory is created or repaired until the immutable video receipts
         // have been rebound to the exact controlled bytes they describe.
+        try runLease.revalidateProjectRoot()
         try paths.ensureDirectories()
         let detectedHardwareProfile = config.hardwareProfile ?? .detect()
         let requestedOptions = metadata.requestedRunOptions
@@ -310,6 +654,7 @@ public final class PipelineRunner: @unchecked Sendable {
         if videoAnalysisRequiresRefresh {
             effectiveLastCompletedStage = .importInput
         }
+        try runLease.revalidateProjectRoot()
         let refreshedVideoAnalysis = try await refreshVideoFrameAnalysisIfNeeded(
             metadata: metadata,
             currentPlan: resolvedRunPlan,
@@ -337,6 +682,7 @@ public final class PipelineRunner: @unchecked Sendable {
         let initialColmapRuntimeClosure = try tooling.colmap.captureRuntimeClosure(
             colmapPath: config.toolchain.colmap
         )
+        try runLease.revalidateProjectRoot()
         let workerExecutionRecorder = try GeometryWorkerExecutionRecorder(
             paths: paths,
             budget: resolvedRunPlan.geometryWorkerBudget,
@@ -361,17 +707,21 @@ public final class PipelineRunner: @unchecked Sendable {
             || refreshedVideoAnalysis != nil
             || recoveredWorkerExecution
             || invalidatedUnprovenBackendRecovery {
+            try runLease.revalidateProjectRoot()
             lastDurableMetadata = try persistResolvedPlanChange(
                 resolvedRunPlan,
                 completedBoundary: effectiveLastCompletedStage,
                 metadata: &metadata,
-                paths: paths
+                paths: paths,
+                runLease: runLease
             )
+            try runLease.revalidateProjectRoot()
         } else if metadata.resolvedRunPlan != resolvedRunPlan {
             metadata.resolvedRunPlan = resolvedRunPlan
-            lastDurableMetadata = try persistRequiredMetadata(
+            lastDurableMetadata = try persistBoundMetadata(
                 metadata,
                 paths: paths,
+                runLease: runLease,
                 operation: .runStart,
                 stage: .importInput
             )
@@ -401,15 +751,18 @@ public final class PipelineRunner: @unchecked Sendable {
                     durationSeconds: timing.durationSeconds
                 ))
                 metadata.stageTimings = timings
-                lastDurableMetadata = try persistRequiredMetadata(
+                lastDurableMetadata = try persistBoundMetadata(
                     metadata,
                     paths: paths,
+                    runLease: runLease,
                     operation: .stageCompletion,
                     stage: .importInput
                 )
             }
         }
+        try runLease.revalidateProjectRoot()
         try workerExecutionRecorder.commitRecoveryBaseline()
+        try runLease.revalidateProjectRoot()
         var trainingManifestWarning: String?
         let trainingManifestExists = FileManager.default.fileExists(
             atPath: paths.trainingManifestURL.path
@@ -418,7 +771,7 @@ public final class PipelineRunner: @unchecked Sendable {
         )) != nil)
         if trainingManifestExists {
             do {
-                _ = try TrainingArtifactStore.load(
+                _ = try TrainingArtifactStore.loadManifest(
                     from: paths.trainingManifestURL,
                     projectPaths: paths
                 )
@@ -443,9 +796,10 @@ public final class PipelineRunner: @unchecked Sendable {
            metadata.geometryRecovery != nil,
            !preserveTerminalPairRecovery {
             metadata.geometryRecovery = nil
-            lastDurableMetadata = try persistRequiredMetadata(
+            lastDurableMetadata = try persistBoundMetadata(
                 metadata,
                 paths: paths,
+                runLease: runLease,
                 operation: .runStart,
                 stage: .sfmMapping
             )
@@ -455,6 +809,7 @@ public final class PipelineRunner: @unchecked Sendable {
         // Now we've committed to a new run: reset per-tool logs so users see only the
         // current attempt. ToolLogWriter is now an appender (so multiple stages within
         // one run share a file cleanly); the orchestrator owns the cross-run truncation.
+        try runLease.revalidateProjectRoot()
         Self.resetPerRunToolLogs(at: paths)
         tooling.colmap.setWorkerExecutionObserver { invocation in
             try workerExecutionRecorder.record(invocation)
@@ -485,6 +840,7 @@ public final class PipelineRunner: @unchecked Sendable {
         let skipTraining = config.developmentOverrides.skipTraining
 
         if metadata.state.lastError != nil {
+            try runLease.revalidateProjectRoot()
             try cleanForRetry(
                 failedStage: metadata.state.stage,
                 paths: paths,
@@ -543,19 +899,30 @@ public final class PipelineRunner: @unchecked Sendable {
         }
 
         var reranStageBeforeTraining = false
+        var preparedExplicitRetrain = false
         var runtimeInputReceiptDigest: String?
         var didWarnAboutCheckpointPersistence = false
 
-        func persistBestEffortCheckpoint(stage: PipelineStage) {
+        func persistBestEffortCheckpoint(stage: PipelineStage) throws {
             do {
+                try runLease.revalidateProjectRoot()
                 try tooling.metadataWriter(
                     metadata,
                     paths.metadataURL,
                     .checkpoint,
                     stage
                 )
+                try runLease.withLockedProjectRootDescriptor { descriptor in
+                    try ProjectMetadataStore.savePreservingUserEditableFields(
+                        metadata,
+                        toProjectRootDescriptor: descriptor
+                    )
+                }
                 lastDurableMetadata = metadata
+            } catch let leaseError as ProjectRunLeaseError {
+                throw leaseError
             } catch {
+                try runLease.revalidateProjectRoot()
                 guard !didWarnAboutCheckpointPersistence else { return }
                 didWarnAboutCheckpointPersistence = true
                 emit(.stageLog(
@@ -572,12 +939,15 @@ public final class PipelineRunner: @unchecked Sendable {
         ) throws -> Bool {
             guard stageIndex(stage) < stageIndex(.trainSplat) else { return true }
             guard !reranStageBeforeTraining else { return true }
+            try runLease.revalidateProjectRoot()
             reranStageBeforeTraining = true
             lastDurableMetadata = try invalidateAcceptedArtifactsForGeometryRerun(
                 startingAt: stage,
                 metadata: &metadata,
-                paths: paths
+                paths: paths,
+                runLease: runLease
             )
+            try runLease.revalidateProjectRoot()
             if discardWorkerEvidence {
                 try workerExecutionRecorder.invalidate(startingAt: stage)
             }
@@ -590,7 +960,7 @@ public final class PipelineRunner: @unchecked Sendable {
             progress: Double? = nil,
             message: String? = nil,
             details: PipelineCheckpointDetails? = nil
-        ) {
+        ) throws {
             metadata.checkpoint = PipelineCheckpoint(
                 stage: stage,
                 updatedAt: Date(),
@@ -599,10 +969,11 @@ public final class PipelineRunner: @unchecked Sendable {
                 inputReceiptDigest: runtimeInputReceiptDigest,
                 details: details
             )
-            persistBestEffortCheckpoint(stage: stage)
+            try persistBestEffortCheckpoint(stage: stage)
         }
 
         func shouldRunStage(_ stage: PipelineStage) throws -> Bool {
+            try runLease.revalidateProjectRoot()
             currentStage = stage
             let validationMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
             if stage == .sfmMapping,
@@ -616,9 +987,10 @@ public final class PipelineRunner: @unchecked Sendable {
                 metadata.geometryRecovery = nil
                 metadata.state = PipelineState(stage: .sfmMapping, lastError: nil)
                 metadata.checkpoint = nil
-                lastDurableMetadata = try persistRequiredMetadata(
+                lastDurableMetadata = try persistBoundMetadata(
                     metadata,
                     paths: paths,
+                    runLease: runLease,
                     operation: .stageCompletion,
                     stage: .sfmMapping
                 )
@@ -629,10 +1001,31 @@ public final class PipelineRunner: @unchecked Sendable {
                 ))
                 return false
             }
+            if stage == .trainSplat, config.runIntent == .retrain {
+                if !preparedExplicitRetrain {
+                    try prepareCompletedTrainingRestart(
+                        metadata: &metadata,
+                        lastDurableMetadata: &lastDurableMetadata,
+                        paths: paths,
+                        runLease: runLease
+                    )
+                    try runLease.revalidateProjectRoot()
+                    try paths.ensureDirectories()
+                    preparedExplicitRetrain = true
+                }
+                return true
+            }
             guard let lastCompletedStage = effectiveLastCompletedStage else { return true }
+            if stage == .exportSplat {
+                // Publication immediately below is unconditional. It resolves or
+                // republishes the authoritative pair under the pair lock, so a
+                // separate completed-stage resolution here would hash the same
+                // canonical PLY and then discard that evidence.
+                return stageIndex(stage) > stageIndex(lastCompletedStage)
+            }
             if stage == .trainSplat,
                !reranStageBeforeTraining,
-               (try? TrainingArtifactStore.load(
+               (try? TrainingArtifactStore.loadManifest(
                    from: paths.trainingManifestURL,
                    projectPaths: paths
                 ).completionStatus) == .completed {
@@ -641,9 +1034,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     if stageIndex(lastCompletedStage) < stageIndex(stage) {
                         metadata.state = PipelineState(stage: stage, lastError: nil)
                         metadata.checkpoint = nil
-                        lastDurableMetadata = try persistRequiredMetadata(
+                        lastDurableMetadata = try persistBoundMetadata(
                             metadata,
                             paths: paths,
+                            runLease: runLease,
                             operation: .stageCompletion,
                             stage: stage
                         )
@@ -667,10 +1061,13 @@ public final class PipelineRunner: @unchecked Sendable {
                         isError: true
                     ))
                 }
-                try TrainingArtifactStore.discardCompletedArtifact(
+                try prepareCompletedTrainingRestart(
                     metadata: &metadata,
-                    paths: paths
+                    lastDurableMetadata: &lastDurableMetadata,
+                    paths: paths,
+                    runLease: runLease
                 )
+                try runLease.revalidateProjectRoot()
                 try paths.ensureDirectories()
                 return true
             }
@@ -723,14 +1120,22 @@ public final class PipelineRunner: @unchecked Sendable {
             }
         }
 
-        func markStageComplete(_ stage: PipelineStage) throws {
+        func finishStageTiming(_ stage: PipelineStage) -> String? {
             let durationText = stageTiming.finish(stage)
             recordFinishedStageTiming(stage)
+            return durationText
+        }
+
+        func persistFinishedStage(
+            _ stage: PipelineStage,
+            durationText: String?
+        ) throws {
             metadata.state = PipelineState(stage: stage, lastError: nil)
             metadata.checkpoint = nil
-            lastDurableMetadata = try persistRequiredMetadata(
+            lastDurableMetadata = try persistBoundMetadata(
                 metadata,
                 paths: paths,
+                runLease: runLease,
                 operation: .stageCompletion,
                 stage: stage
             )
@@ -744,12 +1149,20 @@ public final class PipelineRunner: @unchecked Sendable {
             }
         }
 
+        func markStageComplete(_ stage: PipelineStage) throws {
+            try persistFinishedStage(
+                stage,
+                durationText: finishStageTiming(stage)
+            )
+        }
+
         func stopIfRequested(after stage: PipelineStage) throws {
             guard config.developmentOverrides.stopAfterStage == stage else { return }
             metadata.lastRunStartedAt = nil
-            lastDurableMetadata = try persistRequiredMetadata(
+            lastDurableMetadata = try persistBoundMetadata(
                 metadata,
                 paths: paths,
+                runLease: runLease,
                 operation: .developmentStop,
                 stage: stage
             )
@@ -767,9 +1180,10 @@ public final class PipelineRunner: @unchecked Sendable {
             // Keep the actual failure time for diagnostics; a later project open
             // must not make a failed run appear newer than it was.
             terminalMetadata.lastFailureAt = Date()
-            lastDurableMetadata = try persistRequiredMetadata(
+            lastDurableMetadata = try persistBoundMetadata(
                 terminalMetadata,
                 paths: paths,
+                runLease: runLease,
                 operation: .terminalFailure,
                 stage: stage,
                 originalProcessingFailure: PipelinePresentedProcessingFailure(
@@ -805,7 +1219,7 @@ public final class PipelineRunner: @unchecked Sendable {
             if try shouldRunStage(.importInput) {
                 currentStage = .importInput
                 emit(.stageStarted(stage: .importInput))
-                writeCheckpoint(stage: .importInput, progress: 0, message: "Import started")
+                try writeCheckpoint(stage: .importInput, progress: 0, message: "Import started")
                 try importInputs(metadata: metadata, paths: paths, progress: { fraction, message in
                     emit(.stageProgress(stage: .importInput, fraction: fraction, message: message))
                 })
@@ -848,7 +1262,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 if try shouldRunStage(.extractFrames) {
                     currentStage = .extractFrames
                     emit(.stageStarted(stage: .extractFrames))
-                    writeCheckpoint(stage: .extractFrames, progress: 0, message: "Frame extraction started")
+                    try writeCheckpoint(stage: .extractFrames, progress: 0, message: "Frame extraction started")
                     emit(.stageLog(
                         stage: .extractFrames,
                         line: "Detail frame ceiling: \(targetFrames).",
@@ -881,6 +1295,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             line: "Inspecting \(sourceName).",
                             isError: false
                         ))
+                        try runLease.revalidateProjectRoot()
                         sources.append(try await extractor.inspect(importedVideos[index]))
                     }
                     inspectedVideoSources = sources
@@ -993,6 +1408,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     extractedGroups.reserveCapacity(analyses.count)
                     for (index, analysis) in analyses.enumerated() {
                         try Task.checkCancellation()
+                        try runLease.revalidateProjectRoot()
                         let perVideoTarget = targets[index]
                         guard perVideoTarget > 0 else {
                             throw PipelineError.videoFrameBudgetTooSmall(
@@ -1012,6 +1428,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         outputOptions.targetCount = perVideoTarget
                         let progressStartDuration = cumulativeDurations[index]
                         let progressClipDuration = sources[index].durationSeconds
+                        try runLease.revalidateProjectRoot()
                         let extracted = try await extractor.extractFrameOutputs(
                             from: analysis,
                             targetCount: perVideoTarget,
@@ -1031,7 +1448,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             line: "Wrote \(extracted.count) extracted frame(s) from \(sourceName).",
                             isError: false
                         ))
-                        writeCheckpoint(
+                        try writeCheckpoint(
                             stage: .extractFrames,
                             progress: 0.1
                                 + 0.9 * cumulativeDurations[index + 1] / totalVideoDuration,
@@ -1066,7 +1483,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 if try shouldRunStage(.selectFrames) {
                     currentStage = .selectFrames
                     emit(.stageStarted(stage: .selectFrames))
-                    writeCheckpoint(stage: .selectFrames, progress: 0, message: "Frame selection started")
+                    try writeCheckpoint(stage: .selectFrames, progress: 0, message: "Frame selection started")
                     try self.resetDirectory(paths.framesSelectedURL)
                     self.removeIfExists(paths.framesSelectedManifestURL)
                     var groups: [SelectedFrameGroup] = []
@@ -1102,6 +1519,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             var inspected: [FrameExtractionSource] = []
                             inspected.reserveCapacity(importedVideos.count)
                             for video in importedVideos {
+                                try runLease.revalidateProjectRoot()
                                 inspected.append(try await extractor.inspect(video))
                             }
                             inspectedVideoSources = inspected
@@ -1258,7 +1676,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             isError: false
                         ))
                     }
-                    writeCheckpoint(
+                    try writeCheckpoint(
                         stage: .selectFrames,
                         progress: 1.0,
                         message: "Selected \(selection.frames.count) frames",
@@ -1350,7 +1768,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     restoredGeometryRecovery = recovery
                 } catch {
                     metadata.geometryRecovery = nil
-                    persistBestEffortCheckpoint(stage: .sfmMapping)
+                    try persistBestEffortCheckpoint(stage: .sfmMapping)
                     restoredGeometryRecovery = nil
                     emit(.stageLog(
                         stage: .sfmMapping,
@@ -1380,6 +1798,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 at url: URL,
                 mappingAttemptOrdinal: Int
             ) async throws -> CanonicalModelPublicationArtifact {
+                try runLease.revalidateProjectRoot()
                 let key = "\(mappingAttemptOrdinal):\(url.standardizedFileURL.path)"
                 if let existing = canonicalPublicationByAttemptAndPath[key] {
                     return existing
@@ -1504,7 +1923,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 )
                 try state.validate()
                 metadata.geometryRecovery = state
-                persistBestEffortCheckpoint(stage: .sfmMapping)
+                try persistBestEffortCheckpoint(stage: .sfmMapping)
             }
 
             func beginMappingAttempt(
@@ -1643,7 +2062,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         if try shouldRunStage(.sfmFeatures) {
                             currentStage = .sfmFeatures
                             emit(.stageStarted(stage: .sfmFeatures))
-                            writeCheckpoint(
+                            try writeCheckpoint(
                                 stage: .sfmFeatures,
                                 progress: 0,
                                 message: "Depth Anything 3 SfM started",
@@ -1697,6 +2116,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
 
                             emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting DA3 single-batch seed (\(selectedFrames.count) images)…"))
+                            try runLease.revalidateProjectRoot()
                             try await self.tooling.da3Sfm.run(
                                 toolchain: self.config.toolchain.da3,
                                 images: paths.framesSelectedURL,
@@ -1712,7 +2132,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                             }
 
-                            writeCheckpoint(
+                            try writeCheckpoint(
                                 stage: .sfmFeatures,
                                 progress: 1.0,
                                 message: "DA3 aligned pose seed ready",
@@ -1800,7 +2220,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         } else if try shouldRunStage(.sfmMatching) {
                             currentStage = .sfmMatching
                             emit(.stageStarted(stage: .sfmMatching))
-                            writeCheckpoint(
+                            try writeCheckpoint(
                                 stage: .sfmMatching,
                                 progress: 0,
                                 message: "DA3 refinement matching started",
@@ -1865,6 +2285,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     fraction: 0.02,
                                     message: "Extracting local features…"
                                 ))
+                                try runLease.revalidateProjectRoot()
                                 try await self.tooling.colmap.runFeatureExtractor(
                                     colmapPath: self.config.toolchain.colmap,
                                     database: paths.colmapDatabaseURL,
@@ -1942,6 +2363,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             var effectiveDa3MatchOptions =
                                 da3ColmapMatchOptions
                             effectiveDa3MatchOptions.descriptorMatcher = .faiss
+                            try runLease.revalidateProjectRoot()
                             let matchingExecution = try await self
                                 .runDa3MatchesImporterWithOneShotExactRecovery(
                                 database: paths.colmapDatabaseURL,
@@ -2015,7 +2437,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             let expectedPairs = pairPlan.pairs.count
                             let processedPairs = matchingExecution
                                 .acceptedInspection.attemptedPairCount
-                            writeCheckpoint(
+                            try writeCheckpoint(
                                 stage: .sfmMatching,
                                 progress: 1.0,
                                 message: "DA3 refinement matching completed",
@@ -2053,11 +2475,12 @@ public final class PipelineRunner: @unchecked Sendable {
                                     isError: false
                                 ))
                             }
-                            writeCheckpoint(
+                            try writeCheckpoint(
                                 stage: .sfmMapping,
                                 progress: 0,
                                 message: "DA3 refinement started"
                             )
+                            try runLease.revalidateProjectRoot()
                             let acceptance = try await runSeededTriangulationMapping(
                                 seedModelURL: refinementSeed,
                                 paths: paths,
@@ -2073,7 +2496,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                 toolLogSectionTitle: "da3_refinement",
                                 refinementLogNoun: "DA3 refinement",
                                 scoreLogLabel: "DA3 score",
-                                beginMappingAttempt: { try beginMappingAttempt() },
+                                beginMappingAttempt: {
+                                    try runLease.revalidateProjectRoot()
+                                    return try beginMappingAttempt()
+                                },
                                 currentMappingAttemptCount: { mappingAttemptCount },
                                 prepareCanonicalTextCandidate: {
                                     try await prepareCanonicalTextCandidate(
@@ -2629,6 +3055,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 // cleanly (no stageStarted), like a photo project skips frame
                 // extraction.
                 if resolvedRunPlan.datasetGeometryRoute == .adoptDirect { return }
+                try runLease.revalidateProjectRoot()
                 guard try (force || shouldRunStage(.sfmFeatures)) else { return }
                 currentStage = .sfmFeatures
                 emit(.stageStarted(stage: .sfmFeatures))
@@ -2637,7 +3064,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     line: "SfM backend: COLMAP mapper.",
                     isError: false
                 ))
-                writeCheckpoint(
+                try writeCheckpoint(
                     stage: .sfmFeatures,
                     progress: 0,
                     message: "COLMAP feature extraction started",
@@ -2692,6 +3119,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     line: colmapExtractOptions.useGPU ? "Using GPU for COLMAP feature extraction." : "Using CPU for COLMAP feature extraction.",
                     isError: false
                 ))
+                try runLease.revalidateProjectRoot()
                 try await self.tooling.colmap.runFeatureExtractor(
                     colmapPath: self.config.toolchain.colmap,
                     database: paths.colmapDatabaseURL,
@@ -2737,7 +3165,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     projectPaths: paths
                 )
                 self.logKeypointStats(database: paths.colmapDatabaseURL, emit: emit)
-                writeCheckpoint(
+                try writeCheckpoint(
                     stage: .sfmFeatures,
                     progress: 1.0,
                     message: "COLMAP feature extraction completed",
@@ -2854,7 +3282,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 acceptedPairGraphEvidence = evidence
                 activeMapperGraphContext = try evidence.mapperWorkerInvocationContext()
                 try persistGeometryRecovery()
-                writeCheckpoint(
+                try writeCheckpoint(
                     stage: .sfmMatching,
                     progress: 1,
                     message: "Image matching completed",
@@ -2875,6 +3303,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 // The adoptDirect route skips matching for the same reason it
                 // skips feature extraction: there is no pair graph to solve.
                 if resolvedRunPlan.datasetGeometryRoute == .adoptDirect { return }
+                try runLease.revalidateProjectRoot()
                 if recoveredAcceptedExactEvidence {
                     recoveredAcceptedExactEvidence = false
                     return
@@ -2892,7 +3321,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 restartingAfterInvalidRecoveryState = false
                 currentStage = .sfmMatching
                 emit(.stageStarted(stage: .sfmMatching))
-                writeCheckpoint(
+                try writeCheckpoint(
                     stage: .sfmMatching,
                     progress: 0,
                     message: "COLMAP matching started",
@@ -3082,6 +3511,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             imageGroupListDigest: request.imageGroupContract?.digest
                         )
                     func invokeVocabularyRetriever() async throws {
+                        try runLease.revalidateProjectRoot()
                         try await self.tooling.colmap.runLocalVocabularyRetriever(
                             colmapPath: self.config.toolchain.colmap,
                             database: paths.colmapDatabaseURL,
@@ -3379,6 +3809,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 let inspection: ColmapPairGraphInspection
                 do {
                     if !reuseCompletedExactMatcher {
+                        try runLease.revalidateProjectRoot()
                         try await self.runColmapMatcherAttempt(
                             stage: .sfmMatching,
                             paths: paths,
@@ -3388,6 +3819,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             progressSpan: 1,
                             blockMessageFallback: "Matching views",
                             invokeMatcher: { onLog in
+                                try runLease.revalidateProjectRoot()
                                 try await self.tooling.colmap.runMatchesImporter(
                                     colmapPath: self.config.toolchain.colmap,
                                     database: paths.colmapDatabaseURL,
@@ -3877,7 +4309,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     )
                     try FileManager.default.moveItem(at: stagedSeedModel, to: sparseZero)
                     self.removeIfExists(stagedSeedModel.deletingLastPathComponent())
-                    writeCheckpoint(
+                    try writeCheckpoint(
                         stage: .sfmMapping,
                         progress: 0.5,
                         message: "Adopting imported geometry"
@@ -3950,7 +4382,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             stageTiming.elapsedSeconds(.sfmMapping)
                         }
                     )
-                    writeCheckpoint(
+                    try writeCheckpoint(
                         stage: .sfmMapping,
                         progress: 1.0,
                         message: "Imported geometry adopted"
@@ -4008,11 +4440,12 @@ public final class PipelineRunner: @unchecked Sendable {
                             isError: false
                         ))
                     }
-                    writeCheckpoint(
+                    try writeCheckpoint(
                         stage: .sfmMapping,
                         progress: 0,
                         message: "Imported pose refinement started"
                     )
+                    try runLease.revalidateProjectRoot()
                     let acceptance = try await runSeededTriangulationMapping(
                         seedModelURL: refinementSeed,
                         paths: paths,
@@ -4029,7 +4462,10 @@ public final class PipelineRunner: @unchecked Sendable {
                         toolLogSectionTitle: "imported_pose_refinement",
                         refinementLogNoun: "imported-pose refinement",
                         scoreLogLabel: "Imported-pose score",
-                        beginMappingAttempt: { try beginMappingAttempt() },
+                        beginMappingAttempt: {
+                            try runLease.revalidateProjectRoot()
+                            return try beginMappingAttempt()
+                        },
                         currentMappingAttemptCount: { mappingAttemptCount },
                         prepareCanonicalTextCandidate: {
                             try await prepareCanonicalTextCandidate(
@@ -4052,7 +4488,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     currentStage = .sfmMapping
                     emit(.stageStarted(stage: .sfmMapping))
                     try self.resetDirectory(paths.colmapSparseURL)
-                    writeCheckpoint(
+                    try writeCheckpoint(
                         stage: .sfmMapping,
                         progress: 0,
                         message: "Camera mapping started"
@@ -4084,6 +4520,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         cadence: IncrementalMappingCadenceArtifact,
                         permitViablePartialRegistration: Bool = false
                     ) async throws -> Bool {
+                        try runLease.revalidateProjectRoot()
                         let modelDirectories = try self.mappedSparseModelDirectories(
                             in: paths.colmapSparseURL
                         )
@@ -4122,6 +4559,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     requireStrongObservationCoverage: false
                                 )
                                 let snapshot = try self.captureMappedSparseModel(at: model.url)
+                                try runLease.revalidateProjectRoot()
                                 let report = try await self.tooling.colmap.runModelAnalyzer(
                                     colmapPath: self.config.toolchain.colmap,
                                     modelPath: model.url,
@@ -4385,6 +4823,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         let mappingAttemptOrdinal = try beginMappingAttempt()
                         try self.resetDirectory(paths.colmapSparseURL)
                         do {
+                            try runLease.revalidateProjectRoot()
                             try await self.tooling.colmap.runMapper(
                                 colmapPath: self.config.toolchain.colmap,
                                 database: paths.colmapDatabaseURL,
@@ -4621,6 +5060,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         try requireTextSparseModelFiles(at: canonicalSparseModel)
                         convertedCanonicalModel = false
                     } else {
+                        try runLease.revalidateProjectRoot()
                         convertedCanonicalModel = try await ensureTextSparseModelFiles(
                             at: canonicalSparseModel
                         )
@@ -4800,7 +5240,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         stageTiming.elapsedSeconds(.sfmMapping)
                     }
                 )
-                writeCheckpoint(
+                try writeCheckpoint(
                     stage: .sfmMapping,
                     progress: 1.0,
                     message: "Camera mapping completed"
@@ -4838,9 +5278,10 @@ public final class PipelineRunner: @unchecked Sendable {
             try stopIfRequested(after: .sfmMapping)
             if skipTraining {
                 metadata.lastRunStartedAt = nil
-                lastDurableMetadata = try persistRequiredMetadata(
+                lastDurableMetadata = try persistBoundMetadata(
                     metadata,
                     paths: paths,
+                    runLease: runLease,
                     operation: .skipTrainingCompletion,
                     stage: .sfmMapping
                 )
@@ -4859,7 +5300,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     iterationLimit: resolvedRunPlan.trainerIterationLimit,
                     plateauWindow: resolvedRunPlan.plateauWindow
                 )
-                writeCheckpoint(
+                try writeCheckpoint(
                     stage: .trainSplat,
                     progress: 0,
                     message: "Splat training started",
@@ -4874,6 +5315,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         projectPaths: paths,
                         expectedInput: metadata.input
                     )
+                    try runLease.revalidateProjectRoot()
                     let preparedDataset = try await prepareMsplatDataset(
                         paths: paths,
                         maxImageSize: resolvedRunPlan.maximumImageDimension,
@@ -4916,11 +5358,14 @@ public final class PipelineRunner: @unchecked Sendable {
                             line: "Saved training state could not be validated; restarting from reconstructed cameras. \(validationError.localizedDescription)",
                             isError: true
                         ))
-                        var persistedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-                        try TrainingArtifactStore.discardCheckpointedArtifact(
-                            metadata: &persistedMetadata,
-                            paths: paths
-                        )
+                        let persistedMetadata = try loadBoundMetadata(runLease: runLease)
+                        try runLease.withLockedProjectRootDescriptor { descriptor in
+                            try TrainingArtifactStore.discardCheckpointedPayload(
+                                paths: paths,
+                                projectRootDescriptor: descriptor,
+                                operations: tooling.trainingFilesystemOperations
+                            )
+                        }
                         metadata = persistedMetadata
                         resumeURL = nil
                     }
@@ -4980,6 +5425,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         try? self.removeTrainingPreviewPayload(paths: paths)
 
                         do {
+                            try runLease.revalidateProjectRoot()
                             let result = try await self.tooling.msplat.runTrain(
                                 msplatPath: msplatPath,
                                 metallibPath: msplatMetallibPath,
@@ -5066,11 +5512,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                 line: "Saved training state no longer matches this run; restarting from reconstructed cameras. \(rejection.localizedDescription)",
                                 isError: true
                             ))
-                            var persistedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-                            try TrainingArtifactStore.discardCheckpointedArtifact(
-                                metadata: &persistedMetadata,
-                                paths: paths
-                            )
+                            let persistedMetadata = try loadBoundMetadata(runLease: runLease)
+                            try runLease.withLockedProjectRootDescriptor { descriptor in
+                                try TrainingArtifactStore.discardCheckpointedPayload(
+                                    paths: paths,
+                                    projectRootDescriptor: descriptor,
+                                    operations: tooling.trainingFilesystemOperations
+                                )
+                            }
                             metadata = persistedMetadata
                             activeResumeURL = nil
                         } catch let interruption as MsplatTrainingInterrupted {
@@ -5084,7 +5533,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 datasetDerivation: datasetDerivation,
                                 paths: paths
                             )
-                            metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+                            metadata = try loadBoundMetadata(runLease: runLease)
                             throw CancellationError()
                         }
                     }
@@ -5125,8 +5574,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             isError: false
                         ))
                     }
-                    metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-                    writeCheckpoint(
+                    metadata = try loadBoundMetadata(runLease: runLease)
+                    try writeCheckpoint(
                         stage: .trainSplat,
                         progress: 1.0,
                         message: "msplat training completed",
@@ -5138,102 +5587,73 @@ public final class PipelineRunner: @unchecked Sendable {
                     try markStageComplete(.trainSplat)
                     try stopIfRequested(after: .trainSplat)
             }
-            if FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path) {
-                do {
-                    try FileManager.default.removeItem(at: paths.msplatCheckpointURL)
-                } catch {
-                    emit(.stageLog(
-                        stage: .trainSplat,
-                        line: "Could not remove completed training checkpoints: \(error.localizedDescription)",
-                        isError: true
-                    ))
-                }
-            }
-
             try Task.checkCancellation()
-            if try shouldRunStage(.exportSplat) {
+            let didRunExportStage = try shouldRunStage(.exportSplat)
+            var exportDurationText: String?
+            if didRunExportStage {
                 currentStage = .exportSplat
                 emit(.stageStarted(stage: .exportSplat))
-                writeCheckpoint(stage: .exportSplat, progress: 0, message: "Export started")
-                let ply = paths.msplatOutputURL
-                guard ProjectArtifactValidator.validatePlyFile(at: ply) == .valid else {
-                    throw PipelineError.outputMissing
-                }
-                let geometryArtifact = try GeometryArtifactStore.load(
-                    from: paths.geometryManifestURL,
-                    projectPaths: paths,
-                    expectedInput: metadata.input
+                try writeCheckpoint(stage: .exportSplat, progress: 0, message: "Export started")
+            }
+
+            let publicationInputs: PreparedCompletedPublication = try
+                prepareCompletedPublication(
+                    metadata: metadata,
+                    resolvedRunPlan: resolvedRunPlan,
+                    paths: paths
                 )
-                let trainingArtifact = try TrainingArtifactStore.load(
-                    from: paths.trainingManifestURL,
-                    projectPaths: paths
+            var publishedResult: ValidatedPublishedResult = try
+                publishCompletedTrainingResult(
+                metadata: metadata,
+                resolvedRunPlan: resolvedRunPlan,
+                inputs: publicationInputs,
+                paths: paths,
+                runLease: runLease
                 )
-                guard try currentMsplatDatasetDerivation(
-                        paths: paths,
-                        geometryArtifact: geometryArtifact,
-                        maxImageSize: resolvedRunPlan.maximumImageDimension
-                      ) == trainingArtifact.datasetDerivation else {
-                    throw GeometryArtifactStore.Error.artifactDigestMismatch("training dataset")
+            if didRunExportStage {
+                exportDurationText = finishStageTiming(.exportSplat)
+                var completedTimings = metadata.stageTimings ?? []
+                for receiptTiming in publishedResult.receipt.presentation.stageTimings {
+                    completedTimings.removeAll { $0.stage == receiptTiming.stage }
+                    completedTimings.append(receiptTiming)
                 }
-                let outputDirectory = try paths.resolveProjectRelativePath("Output")
-                try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
-                let outputPly = paths.outputSplatURL
-                try SplatExport.copyIfExists(from: ply, to: outputPly)
-                guard ProjectArtifactValidator.validatePlyFile(at: outputPly) == .valid else {
-                    throw PipelineError.outputMissing
+                completedTimings.sort {
+                    (PipelineStage.allCases.firstIndex(of: $0.stage) ?? .max)
+                        < (PipelineStage.allCases.firstIndex(of: $1.stage) ?? .max)
                 }
-                let sizeBytes = (try? FileManager.default.attributesOfItem(atPath: outputPly.path)[.size] as? NSNumber)?.int64Value ?? 0
-                writeCheckpoint(
+                metadata.stageTimings = completedTimings
+                publishedResult = try recordPublishedStageTimings(
+                    completedTimings,
+                    publishedResult: publishedResult,
+                    paths: paths,
+                    runLease: runLease
+                )
+                try writeCheckpoint(
                     stage: .exportSplat,
                     progress: 1.0,
                     message: "Exported splat.ply",
                     details: .exportSplat(ExportSplatCheckpoint(
-                        outputPath: try paths.projectRelativePath(for: outputPly),
-                        sourcePath: try paths.projectRelativePath(for: ply),
-                        sizeBytes: sizeBytes
+                        outputPath: PublishedSplatReceipt.canonicalOutputPath,
+                        sourcePath: publicationInputs.training.outputPath
+                            ?? "Training/msplat/splat.ply",
+                        sizeBytes: Int64(publishedResult.outputEvidence.byteCount)
                     ))
                 )
-                try markStageComplete(.exportSplat)
+                try persistFinishedStage(
+                    .exportSplat,
+                    durationText: exportDurationText
+                )
                 try stopIfRequested(after: .exportSplat)
             }
 
-            let canonicalPublication = try Self.promoteMsplatCompletionToPublicOutput(
-                paths: paths
-            )
-            metadata.state = PipelineState(stage: .done, lastError: nil)
-            metadata.lastRunStartedAt = nil
-            lastDurableMetadata = try persistRequiredMetadata(
-                metadata,
+            currentStage = .done
+            lastDurableMetadata = try finalizePublishedResult(
+                metadata: &metadata,
+                publishedResult: publishedResult,
                 paths: paths,
-                operation: .finalCompletion,
-                stage: .done
+                runLease: runLease,
+                emit: emit
             )
-            do {
-                _ = try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
-                    paths: paths,
-                    publication: canonicalPublication
-                )
-            } catch SubjectIsolationArtifactStoreError.canonicalPublicationUnchanged {
-                // A completed resume can legitimately re-promote the same canonical
-                // publication. Its matching subject artifact remains current.
-            } catch {
-                emit(.stageLog(
-                    stage: .done,
-                    line: "Could not retire the previous subject isolation: "
-                        + error.localizedDescription,
-                    isError: true
-                ))
-            }
-
-            do {
-                try removeDisposableCompletedTrainingPayload(paths: paths)
-            } catch {
-                emit(.stageLog(
-                    stage: .done,
-                    line: "Could not remove disposable training files: \(error.localizedDescription)",
-                    isError: true
-                ))
-            }
 
             emit(.stageFinished(stage: .done))
         } catch is DevelopmentStop {
@@ -5301,9 +5721,10 @@ public final class PipelineRunner: @unchecked Sendable {
             terminalMetadata.checkpoint = nil
             terminalMetadata.lastRunStartedAt = nil
             terminalMetadata.lastFailureAt = Date()
-            lastDurableMetadata = try persistRequiredMetadata(
+            lastDurableMetadata = try persistBoundMetadata(
                 terminalMetadata,
                 paths: paths,
+                runLease: runLease,
                 operation: .terminalFailure,
                 stage: failureStage,
                 originalProcessingFailure: PipelinePresentedProcessingFailure(
@@ -5324,21 +5745,435 @@ public final class PipelineRunner: @unchecked Sendable {
         }
     }
 
+    private func acquireProjectRunLease() throws -> PipelineRunLeaseHandle {
+        if let owner = config.borrowedProjectRunLeaseOwner {
+            return .borrowed(try owner.claimBorrow(for: projectURL))
+        }
+        let lease = try ProjectRunLease.acquire(
+            projectURL: projectURL,
+            registryURL: tooling.projectRunLeaseRegistryURL()
+        )
+        tooling.projectRunLeaseDidAcquire()
+        return .owned(lease)
+    }
+
+    private func prepareCompletedPublication(
+        metadata: ProjectMetadata,
+        resolvedRunPlan: ResolvedRunPlan,
+        paths: ProjectPaths
+    ) throws -> PreparedCompletedPublication {
+        let geometry: GeometryArtifact = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths,
+            expectedInput: metadata.input
+        )
+        let training: TrainingArtifact = try TrainingArtifactStore.loadManifest(
+            from: paths.trainingManifestURL,
+            projectPaths: paths
+        )
+        let derivation: MsplatDatasetDerivationArtifact = try
+            currentMsplatDatasetDerivation(
+                paths: paths,
+                geometryArtifact: geometry,
+                maxImageSize: resolvedRunPlan.maximumImageDimension
+            )
+        guard derivation == training.datasetDerivation else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch("training dataset")
+        }
+        return PreparedCompletedPublication(
+            geometry: geometry,
+            training: training,
+            datasetDerivation: derivation
+        )
+    }
+
+    private func publishCompletedTrainingResult(
+        metadata: ProjectMetadata,
+        resolvedRunPlan: ResolvedRunPlan,
+        inputs: PreparedCompletedPublication,
+        paths: ProjectPaths,
+        runLease: ProjectRunLease
+    ) throws -> ValidatedPublishedResult {
+        guard let publicationID: UUID = metadata.pendingPublicationID else {
+            throw PublishedResultPairError.publicationConflict(
+                "the current run has no durable publication identity"
+            )
+        }
+        let cancellationCheck: @Sendable () throws -> Void = tooling.checkCancellation
+        let shouldCancel: @Sendable () -> Bool = {
+            do {
+                try cancellationCheck()
+                return false
+            } catch {
+                return true
+            }
+        }
+        return try runLease.withValidatedProjectRootDescriptor { descriptor in
+            try PublishedResultPublisher.publishCompletedTraining(
+                metadata: metadata,
+                resolvedRunPlan: resolvedRunPlan,
+                geometry: inputs.geometry,
+                paths: paths,
+                projectRootDescriptor: descriptor,
+                publicationID: publicationID,
+                publishedAt: tooling.publicationDate(),
+                expectedDatasetDerivation: inputs.datasetDerivation,
+                pairOperations: tooling.publishedResultPairOperations,
+                shouldCancel: shouldCancel,
+                persistPreparedManifest: tooling.persistPreparedTrainingManifest
+            )
+        }
+    }
+
+    private func recordPublishedStageTimings(
+        _ stageTimings: [StageTimingRecord],
+        publishedResult: ValidatedPublishedResult,
+        paths: ProjectPaths,
+        runLease: ProjectRunLease
+    ) throws -> ValidatedPublishedResult {
+        guard let generation = publishedResult.generation else {
+            throw PublishedResultPairError.publicationConflict(
+                "the validated result has no bound publication generation"
+            )
+        }
+        let cancellationCheck: @Sendable () throws -> Void = tooling.checkCancellation
+        let shouldCancel: @Sendable () -> Bool = {
+            do {
+                try cancellationCheck()
+                return false
+            } catch {
+                return true
+            }
+        }
+        return try runLease.withValidatedProjectRootDescriptor { descriptor in
+            try PublishedResultPairStore.recordStageTimings(
+                stageTimings,
+                expectedGeneration: generation,
+                projectPaths: paths,
+                projectRootDescriptor: descriptor,
+                operations: tooling.publishedResultPairOperations,
+                shouldCancel: shouldCancel
+            )
+        }
+    }
+
+    private func finalizePublishedResult(
+        metadata: inout ProjectMetadata,
+        publishedResult: ValidatedPublishedResult,
+        paths: ProjectPaths,
+        runLease: ProjectRunLease,
+        emit: @Sendable (PipelineEvent) -> Void
+    ) throws -> ProjectMetadata {
+        let canonicalPublication: CanonicalSplatPublication = try
+            runLease.withValidatedProjectRootDescriptor { descriptor in
+                try SubjectIsolationArtifactStore.captureCanonicalPublication(
+                    paths: paths,
+                    projectRootDescriptor: descriptor,
+                    publishedResult: publishedResult,
+                    expectedPublicationID: publishedResult.receipt.publicationID
+                )
+            }
+        metadata.state = PipelineState(stage: .done, lastError: nil)
+        metadata.lastRunStartedAt = nil
+        metadata.pendingPublicationID = nil
+        let persisted: ProjectMetadata = try
+            persistFinalMetadataForCurrentPublishedResult(
+                metadata,
+                expected: publishedResult,
+                paths: paths,
+                runLease: runLease
+            )
+        do {
+            _ = try runLease.withValidatedProjectRootDescriptor { descriptor in
+                try SubjectIsolationArtifactStore.invalidateAfterCanonicalRetraining(
+                    paths: paths,
+                    projectRootDescriptor: descriptor,
+                    publication: canonicalPublication
+                )
+            }
+        } catch SubjectIsolationArtifactStoreError.canonicalPublicationUnchanged {
+            // A completed resume can re-promote the same canonical publication.
+        } catch let leaseError as ProjectRunLeaseError {
+            throw leaseError
+        } catch {
+            emit(.stageLog(
+                stage: .done,
+                line: "Could not retire the previous subject isolation: "
+                    + error.localizedDescription,
+                isError: true
+            ))
+        }
+        do {
+            try retireCompletedTrainingForCurrentPublication(
+                paths: paths,
+                publishedResult: publishedResult,
+                projectID: persisted.id,
+                runLease: runLease
+            )
+        } catch let leaseError as ProjectRunLeaseError {
+            throw leaseError
+        } catch {
+            emit(.stageLog(
+                stage: .done,
+                line: "Could not remove disposable training files: \(error.localizedDescription)",
+                isError: true
+            ))
+        }
+        return persisted
+    }
+
+    private func persistFinalMetadataForCurrentPublishedResult(
+        _ metadata: ProjectMetadata,
+        expected: ValidatedPublishedResult,
+        paths: ProjectPaths,
+        runLease: ProjectRunLease
+    ) throws -> ProjectMetadata {
+        let cancellationCheck: @Sendable () throws -> Void = tooling.checkCancellation
+        let shouldCancel: @Sendable () -> Bool = {
+            do {
+                try cancellationCheck()
+                return false
+            } catch {
+                return true
+            }
+        }
+        guard let generation = expected.generation else {
+            throw PublishedResultPairError.publicationConflict(
+                "the validated result has no bound publication generation"
+            )
+        }
+        var persistedMetadata: ProjectMetadata?
+        let committed: Bool = try
+            runLease.withValidatedProjectRootDescriptor { descriptor in
+                try PublishedResultPairStore.commitReceiptBoundStateIf(
+                    projectPaths: paths,
+                    projectRootDescriptor: descriptor,
+                    expectedGeneration: generation,
+                    operations: tooling.publishedResultPairOperations,
+                    shouldCancel: shouldCancel,
+                    afterValidation: {
+                        persistedMetadata = try persistBoundMetadata(
+                            metadata,
+                            paths: paths,
+                            runLease: runLease,
+                            operation: .finalCompletion,
+                            stage: .done
+                        )
+                    }
+                )
+            }
+        guard committed,
+              let persistedMetadata else {
+            throw PublishedResultPairError.publicationConflict(
+                "the canonical result changed before final completion"
+            )
+        }
+        return persistedMetadata
+    }
+
+    private func retireCompletedTrainingForCurrentPublication(
+        paths: ProjectPaths,
+        publishedResult: ValidatedPublishedResult,
+        projectID: UUID,
+        runLease: ProjectRunLease
+    ) throws {
+        guard publishedResult.receipt.projectID == projectID,
+              let generation = publishedResult.generation else {
+            throw PublishedResultPairError.publicationConflict(
+                "the validated result has no bound publication generation"
+            )
+        }
+        let committed: Bool = try
+            runLease.withValidatedProjectRootDescriptor { descriptor in
+                try PublishedResultPairStore.commitReceiptBoundStateIf(
+                    projectPaths: paths,
+                    projectRootDescriptor: descriptor,
+                    expectedGeneration: generation,
+                    operations: tooling.publishedResultPairOperations,
+                    shouldCancel: { false },
+                    afterValidation: {
+                        try removeDisposableCompletedTrainingPayload(
+                            paths: paths,
+                            projectRootDescriptor: descriptor,
+                            publishedResult: publishedResult,
+                            operations: tooling.trainingFilesystemOperations
+                        )
+                    }
+                )
+            }
+        guard committed else {
+            throw PublishedResultPairError.publicationConflict(
+                "the canonical result changed before training cleanup"
+            )
+        }
+    }
+
+    private func reconcilePipelineStartupArtifacts(
+        paths: ProjectPaths,
+        runLease: ProjectRunLease
+    ) throws {
+        let cancellationCheck: @Sendable () throws -> Void = tooling.checkCancellation
+        let shouldCancel: @Sendable () -> Bool = {
+            do {
+                try cancellationCheck()
+                return false
+            } catch {
+                return true
+            }
+        }
+        let cleanup: CompletedTrainingCleanupReconciliation = try
+            runLease.withValidatedProjectRootDescriptor { descriptor in
+                // Repair an interrupted receipt-last publication before
+                // inspecting controlled inputs or recording a new attempt.
+                try PublishedResultPairStore.reconcileIfPresent(
+                    projectPaths: paths,
+                    projectRootDescriptor: descriptor,
+                    operations: tooling.publishedResultPairOperations,
+                    shouldCancel: shouldCancel
+                )
+                return try TrainingArtifactStore
+                    .reconcileDisposableCompletedPayloadForPipelineStartup(
+                        paths: paths,
+                        projectRootDescriptor: descriptor,
+                        publishedResultOperations: tooling.publishedResultPairOperations,
+                        trainingOperations: tooling.trainingFilesystemOperations,
+                        shouldCancel: shouldCancel
+                    )
+            }
+        switch cleanup {
+        case .noTraining, .noJournal, .completed:
+            break
+        case .requiresPublishedResult, .deferredConflict:
+            throw TrainingArtifactStoreError.invalidManifest
+        }
+    }
+
+    private func loadAuthenticatedStartupMetadata(
+        paths: ProjectPaths,
+        runLease: ProjectRunLease,
+        freshPublicationAttestation: FreshProjectPublicationAttestation?
+    ) throws -> ProjectMetadata {
+        if let freshPublicationAttestation {
+            // A fresh attestation describes the exact sealed tree. Even creating
+            // Output's pair lock before consumption invalidates it, so perform
+            // only read-only loading and attestation consumption first.
+            let metadata = try loadBoundMetadata(runLease: runLease)
+            try freshPublicationAttestation.consume(
+                projectURL: projectURL,
+                metadata: metadata
+            )
+            try reconcilePipelineStartupArtifacts(paths: paths, runLease: runLease)
+            return metadata
+        }
+
+        // Existing projects may contain interrupted publication or cleanup state;
+        // reconcile it before trusting metadata or starting any new attempt.
+        try reconcilePipelineStartupArtifacts(paths: paths, runLease: runLease)
+        let metadata = try loadBoundMetadata(runLease: runLease)
+        try tooling.validateVideoInputs(metadata, paths)
+        return metadata
+    }
+
     @discardableResult
-    package func persistRequiredMetadata(
+    private func persistBoundMetadata(
         _ metadata: ProjectMetadata,
         paths: ProjectPaths,
+        runLease: ProjectRunLease,
         operation: PipelineMetadataWriteOperation,
         stage: PipelineStage,
         originalProcessingFailure: PipelinePresentedProcessingFailure? = nil
     ) throws -> ProjectMetadata {
+        let persisted: ProjectMetadata = try persistRequiredMetadata(
+            metadata,
+            paths: paths,
+            runLease: runLease,
+            operation: operation,
+            stage: stage,
+            originalProcessingFailure: originalProcessingFailure
+        )
+        return persisted
+    }
+
+    private func loadBoundMetadata(
+        runLease: ProjectRunLease
+    ) throws -> ProjectMetadata {
+        try runLease.withLockedProjectRootDescriptor { descriptor in
+            try ProjectMetadataStore.load(
+                fromProjectRootDescriptor: descriptor
+            )
+        }
+    }
+
+    private func prepareCompletedTrainingRestart(
+        metadata: inout ProjectMetadata,
+        lastDurableMetadata: inout ProjectMetadata,
+        paths: ProjectPaths,
+        runLease: ProjectRunLease
+    ) throws {
+        // Make the loss of the private completed-training tree authoritative
+        // before deleting it. If cleanup then fails, terminal persistence starts
+        // from metadata that no longer claims the deleted training boundary.
+        metadata.state = PipelineState(stage: .trainSplat, lastError: nil)
+        metadata.checkpoint = nil
+        lastDurableMetadata = try persistBoundMetadata(
+            metadata,
+            paths: paths,
+            runLease: runLease,
+            operation: .runStart,
+            stage: .trainSplat
+        )
+        try runLease.withLockedProjectRootDescriptor { descriptor in
+            try TrainingArtifactStore.discardCompletedPayload(
+                paths: paths,
+                projectRootDescriptor: descriptor,
+                operations: tooling.trainingFilesystemOperations
+            )
+        }
+    }
+
+    @discardableResult
+    package func persistRequiredMetadata(
+        _ metadata: ProjectMetadata,
+        paths: ProjectPaths,
+        runLease: ProjectRunLease? = nil,
+        operation: PipelineMetadataWriteOperation,
+        stage: PipelineStage,
+        originalProcessingFailure: PipelinePresentedProcessingFailure? = nil,
+        beforeCommit: () throws -> Void = {}
+    ) throws -> ProjectMetadata {
         do {
+            // Tooling supplies deterministic observation/fault injection only.
+            // The runner retains the authoritative write so it can revalidate a
+            // held project lease after a callback and immediately before commit.
             try tooling.metadataWriter(
                 metadata,
                 paths.metadataURL,
                 operation,
                 stage
             )
+        } catch {
+            throw PipelineMetadataPersistenceFailure(
+                operation: operation,
+                stage: stage,
+                persistenceError: error,
+                originalProcessingFailure: originalProcessingFailure
+            )
+        }
+        try beforeCommit()
+        do {
+            if let runLease {
+                try runLease.withLockedProjectRootDescriptor { descriptor in
+                    try ProjectMetadataStore.savePreservingUserEditableFields(
+                        metadata,
+                        toProjectRootDescriptor: descriptor
+                    )
+                }
+            } else {
+                try ProjectMetadataStore.savePreservingUserEditableFields(
+                    metadata,
+                    to: paths.metadataURL
+                )
+            }
             return metadata
         } catch {
             throw PipelineMetadataPersistenceFailure(

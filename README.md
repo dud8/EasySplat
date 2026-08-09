@@ -84,7 +84,10 @@ SfM/colmap/sparse/0
 SfM/geometry_manifest.json
 Training/training_manifest.json
 Output/splat.ply
+Output/splat_receipt.json
 ```
+
+Separate from `project.json`, `Output/splat_receipt.json` is the authority for newly published result bytes: `Output/splat.ply` is usable when both files validate as one published pair. The sole compatibility exception is a fully validated, successfully completed legacy project created before receipts; it may open only its current result. A bare PLY never authorizes a previous result after a failed or interrupted retrain. Publication preserves the current validated pair, installs the new PLY first, and commits by installing its receipt last. Pipeline startup reconciles any interrupted publication before beginning new work.
 
 Stored artifact paths are project-relative and resolved through the safe project-path resolver.
 
@@ -136,7 +139,7 @@ input
   → bounded COLMAP feature matching and camera reconstruction
   → canonical COLMAP model
   → native msplat Metal training
-  → validated Output/splat.ply
+  → validated Output/splat.ply + Output/splat_receipt.json pair
 ```
 
 COLMAP is the automatic geometry route in `0.2.0`. It is not a user-facing backend choice. A single-batch DA3 initializer remains available only to the typed benchmark override until it clears the full quality corpus. MetalSplatter is the native result viewer.

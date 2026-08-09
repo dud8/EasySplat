@@ -61,7 +61,7 @@ final class ProjectMetadataValidationTests: XCTestCase {
     }
 
     func testLoadRejectsPreviousFormatBeforeDecodingCanonicalGeometryState() throws {
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 32)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 33)
         // Format 31 is still readable (dataset-input migration); the retired
         // generation starts below the accepted floor.
         let retiredFormatVersion = (ProjectMetadataStore.acceptedFormatVersions.min() ?? 31) - 1
@@ -87,6 +87,152 @@ final class ProjectMetadataValidationTests: XCTestCase {
                 return XCTFail("Expected envelope-first unsupported format, got \(error)")
             }
             XCTAssertEqual(version, retiredFormatVersion)
+        }
+    }
+
+    func testCurrentFormatRoundTripsPendingPublicationIdentityForUnfinishedAttempt() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let publicationID = UUID(uuidString: "5D173430-D3C9-47EC-B88E-F4AC706E3ADF")!
+        let metadata = ProjectMetadata(
+            title: "Pending publication",
+            input: .video(files: []),
+            state: PipelineState(stage: .exportSplat, lastError: nil),
+            lastRunStartedAt: Date(timeIntervalSince1970: 1_725_000_000),
+            pendingPublicationID: publicationID
+        )
+
+        try ProjectMetadataStore.save(metadata, to: url)
+        let firstBytes = try Data(contentsOf: url)
+        let loaded = try ProjectMetadataStore.load(from: url)
+        try ProjectMetadataStore.save(loaded, to: url)
+
+        XCTAssertEqual(loaded.pendingPublicationID, publicationID)
+        XCTAssertEqual(try Data(contentsOf: url), firstBytes)
+    }
+
+    func testSaveRejectsPendingPublicationIdentityForSuccessfulCompletion() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let publicationID = UUID(uuidString: "5D173430-D3C9-47EC-B88E-F4AC706E3ADF")!
+        let metadata = ProjectMetadata(
+            title: "Completed publication",
+            input: .video(files: []),
+            state: PipelineState(stage: .done, lastError: nil),
+            pendingPublicationID: publicationID
+        )
+
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidPendingPublicationID = error else {
+                return XCTFail("Expected invalid pending publication identity, got \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
+    func testDoneRetrainAttemptsRetainPendingPublicationIdentity() throws {
+        let publicationID = UUID(uuidString: "5D173430-D3C9-47EC-B88E-F4AC706E3ADF")!
+        let cases: [(name: String, state: PipelineState, lastRunStartedAt: Date?)] = [
+            (
+                name: "interrupted",
+                state: PipelineState(stage: .done, lastError: nil),
+                lastRunStartedAt: Date(timeIntervalSince1970: 1_725_000_000)
+            ),
+            (
+                name: "failed",
+                state: PipelineState(stage: .done, lastError: "Publication failed."),
+                lastRunStartedAt: nil
+            ),
+        ]
+
+        for testCase in cases {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let url = root.appendingPathComponent("project.json")
+            let metadata = ProjectMetadata(
+                title: "\(testCase.name.capitalized) retrain",
+                input: .video(files: []),
+                state: testCase.state,
+                lastRunStartedAt: testCase.lastRunStartedAt,
+                pendingPublicationID: publicationID
+            )
+
+            try ProjectMetadataStore.save(metadata, to: url)
+            let firstBytes = try Data(contentsOf: url)
+            let loaded = try ProjectMetadataStore.load(from: url)
+            XCTAssertEqual(
+                loaded.pendingPublicationID,
+                publicationID,
+                "\(testCase.name) retrain lost its retry publication identity"
+            )
+
+            try ProjectMetadataStore.save(loaded, to: url)
+            XCTAssertEqual(
+                try Data(contentsOf: url),
+                firstBytes,
+                "\(testCase.name) retrain did not round-trip deterministically"
+            )
+        }
+    }
+
+    func testLoadAndSaveRejectAllZeroPendingPublicationIdentity() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let metadata = ProjectMetadata(
+            title: "Invalid publication",
+            input: .video(files: []),
+            state: PipelineState(stage: .done, lastError: nil),
+            lastRunStartedAt: Date(timeIntervalSince1970: 1_725_000_000),
+            pendingPublicationID: UUID(
+                uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            )
+        )
+
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidPendingPublicationID = error else {
+                return XCTFail("Expected invalid pending publication identity, got \(error)")
+            }
+        }
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(metadata).write(to: url, options: .atomic)
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidPendingPublicationID = error else {
+                return XCTFail("Expected invalid pending publication identity, got \(error)")
+            }
+        }
+    }
+
+    func testLoadAndSaveRejectAllZeroProjectIdentity() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let metadata = ProjectMetadata(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!,
+            title: "Invalid project identity",
+            input: .video(files: [])
+        )
+
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Project metadata contains an invalid project identity."
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(metadata).write(to: url, options: .atomic)
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Project metadata contains an invalid project identity."
+            )
         }
     }
 

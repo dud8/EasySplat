@@ -30,6 +30,7 @@ public struct ValidatedSplatOutput: Sendable, Equatable {
 }
 
 public struct CanonicalSplatPublication: Sendable, Equatable {
+    public let publicationID: UUID
     public let outputEvidence: ValidatedPlyArtifactEvidence
     public let trainingManifestSHA256: String
     public let trainingInputDigest: String
@@ -38,6 +39,7 @@ public struct CanonicalSplatPublication: Sendable, Equatable {
     public let selectedImageOrder: [String]
 
     init(
+        publicationID: UUID,
         outputEvidence: ValidatedPlyArtifactEvidence,
         trainingManifestSHA256: String,
         trainingInputDigest: String,
@@ -45,6 +47,7 @@ public struct CanonicalSplatPublication: Sendable, Equatable {
         selectedFramesDigest: String,
         selectedImageOrder: [String]
     ) {
+        self.publicationID = publicationID
         self.outputEvidence = outputEvidence
         self.trainingManifestSHA256 = trainingManifestSHA256
         self.trainingInputDigest = trainingInputDigest
@@ -147,7 +150,7 @@ public enum SubjectIsolationOutcome: Sendable, Equatable {
 }
 
 public struct IsolationArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
     public static let maximumMaskCount = 24
     public static let maximumMaskDimension = 4_096
     public static let maximumDecodedMaskPixelCount = 16_777_216
@@ -272,6 +275,7 @@ public struct IsolationArtifact: Codable, Sendable, Equatable {
     }
 
     public var schemaVersion: Int
+    public var sourcePublicationID: UUID?
     public var sourcePlySHA256: String
     public var trainingManifestSHA256: String
     public var dataset: DatasetIdentity
@@ -288,6 +292,7 @@ public struct IsolationArtifact: Codable, Sendable, Equatable {
 
     public init(
         schemaVersion: Int = currentSchemaVersion,
+        sourcePublicationID: UUID? = nil,
         sourcePlySHA256: String,
         trainingManifestSHA256: String,
         dataset: DatasetIdentity,
@@ -303,6 +308,7 @@ public struct IsolationArtifact: Codable, Sendable, Equatable {
         output: OutputIdentity
     ) {
         self.schemaVersion = schemaVersion
+        self.sourcePublicationID = sourcePublicationID
         self.sourcePlySHA256 = sourcePlySHA256
         self.trainingManifestSHA256 = trainingManifestSHA256
         self.dataset = dataset

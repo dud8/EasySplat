@@ -1,6 +1,65 @@
 import AppKit
+import Darwin
 import EasySplatCore
 import Foundation
+
+private struct BoundResultViewerTimingAuthority: Sendable {
+    let publicationID: UUID
+    let generation: PublishedResultGeneration
+    let projectRootIdentity: AppProjectRootIdentity
+    let elapsedSeconds: TimeInterval?
+}
+
+private enum ProjectTrashDisposition {
+    case completed
+    case scheduled
+    case failed
+}
+
+private enum ProjectTrashLeafState {
+    case absent
+    case directory(AppProjectRootIdentity)
+    case other
+
+    func matches(_ identity: AppProjectRootIdentity) -> Bool {
+        guard case .directory(let candidate) = self else { return false }
+        return candidate == identity
+    }
+}
+
+private enum ProjectTrashQuarantineError: LocalizedError {
+    case invalidProjectPath
+    case system(operation: String, code: Int32)
+    case handlerFailure(Error)
+    case handlerDidNotMove
+    case identityConflict(String)
+
+    var isIdentityConflict: Bool {
+        if case .identityConflict = self { return true }
+        return false
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidProjectPath:
+            "The project path is not safe to move."
+        case .system(let operation, let code):
+            "\(operation) failed: \(String(cString: strerror(code)))"
+        case .handlerFailure(let error):
+            error.localizedDescription
+        case .handlerDidNotMove:
+            "Finder did not move the project."
+        case .identityConflict(let details):
+            details
+        }
+    }
+}
+
+private enum ProjectTrashHandlerOutcome {
+    case completed
+    case restored
+    case conflict
+}
 
 extension AppModel {
     func isCurrentTaskToken(_ taskToken: UUID?) -> Bool {
@@ -33,9 +92,12 @@ extension AppModel {
 
         guard currentTask != nil else {
             if deleteProject, let projectURL = currentProjectURL {
-                if moveProjectToTrash(at: projectURL) {
+                switch requestProjectTrashMove(at: projectURL) {
+                case .completed:
                     finalizeExitIfNeeded()
-                } else {
+                case .scheduled:
+                    break
+                case .failed:
                     abortPendingExitAfterStopFailure()
                 }
                 return
@@ -73,32 +135,509 @@ extension AppModel {
 
     @discardableResult
     func moveProjectToTrash(at projectURL: URL) -> Bool {
-        guard !hasActiveWork else { return false }
+        switch requestProjectTrashMove(at: projectURL) {
+        case .completed, .scheduled:
+            true
+        case .failed:
+            false
+        }
+    }
+
+    private func requestProjectTrashMove(
+        at projectURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) -> ProjectTrashDisposition {
+        guard !hasActiveWork else { return .failed }
+        if let timingTask = cancelResultViewerTiming() {
+            // A detached timing worker may be inside the publication lock or
+            // the post-commit metadata retry. Let it release the exact root
+            // lease before Finder can move that root. A supplied long-run
+            // owner belongs to the finishing run task and must not escape it;
+            // the deferred move acquires its own short owner after the wait.
+            deferredProjectMutationTask = Task { [weak self, timingTask] in
+                await timingTask.value
+                guard let self else { return }
+                self.deferredProjectMutationTask = nil
+                let moved = self.moveProjectToTrashNow(
+                    at: projectURL,
+                    projectRunLeaseOwner: nil
+                )
+                guard self.exitIntent != .none else { return }
+                if moved {
+                    self.finalizeExitIfNeeded()
+                } else {
+                    self.abortPendingExitAfterStopFailure()
+                }
+            }
+            return .scheduled
+        }
+        return moveProjectToTrashNow(
+            at: projectURL,
+            projectRunLeaseOwner: projectRunLeaseOwner
+        ) ? .completed : .failed
+    }
+
+    @discardableResult
+    private func moveProjectToTrashNow(
+        at projectURL: URL,
+        projectRunLeaseOwner suppliedProjectRunLeaseOwner:
+            AppProjectRunLeaseOwner?
+    ) -> Bool {
         actionFailure = nil
+        let acquiredProjectRunLeaseOwner: AppProjectRunLeaseOwner?
+        do {
+            if suppliedProjectRunLeaseOwner == nil {
+                acquiredProjectRunLeaseOwner = try acquireAppProjectRunLeaseOwner(
+                    at: projectURL
+                )
+            } else {
+                acquiredProjectRunLeaseOwner = nil
+            }
+        } catch {
+            statusTitle = error.localizedDescription
+            statusDetail = "The project stayed in place. Try again when processing finishes."
+            lastError = statusTitle
+            errorDetails = String(reflecting: error)
+            progress = nil
+            presentPendingNotesSaveFailureIfNeeded(at: projectURL)
+            return false
+        }
+        defer { acquiredProjectRunLeaseOwner?.release() }
+        let projectRunLeaseOwner = suppliedProjectRunLeaseOwner
+            ?? acquiredProjectRunLeaseOwner
+        let leasedProjectRootIdentity: AppProjectRootIdentity
+        do {
+            guard let projectRunLeaseOwner else {
+                throw ProjectRunLeaseError.unsafeProject
+            }
+            leasedProjectRootIdentity = try projectRunLeaseOwner
+                .lockedProjectRootIdentity()
+        } catch {
+            statusTitle = error.localizedDescription
+            statusDetail = "The project stayed in place. Try again when processing finishes."
+            lastError = statusTitle
+            errorDetails = String(reflecting: error)
+            progress = nil
+            presentPendingNotesSaveFailureIfNeeded(at: projectURL)
+            return false
+        }
         if ProjectSummary.hasSameLocation(currentProjectURL, projectURL) {
-            guard flushPendingNotesSave() else { return false }
+            guard flushPendingNotesSave(
+                projectRunLeaseOwner: projectRunLeaseOwner
+            ) else { return false }
         }
         do {
-            try projectTrashHandler(projectURL)
+            try moveIdentityBoundProjectToTrash(
+                at: projectURL,
+                leasedProjectRootIdentity: leasedProjectRootIdentity
+            )
         } catch {
+            let quarantineError = error as? ProjectTrashQuarantineError
+            let message: String
+            if quarantineError?.isIdentityConflict == true {
+                message = "The project folder changed while it was being moved. Every item was preserved. Check Finder and try again."
+            } else {
+                message = "The project stayed in place. Check Finder permissions and try again."
+            }
             statusTitle = "Couldn’t move project to Trash"
-            statusDetail = "The project stayed in place. Check Finder permissions and try again."
+            statusDetail = message
             lastError = statusTitle
             errorDetails = String(reflecting: error)
             progress = nil
             actionFailure = ActionFailurePresentation(
                 title: "Couldn’t move project to Trash",
-                message: "The project stayed in place. Check Finder permissions and try again."
+                message: message
             )
             refreshProjectSummaries()
             return false
         }
         if ProjectSummary.hasSameLocation(currentProjectURL, projectURL) {
-            reset()
+            reset(projectRunLeaseOwner: projectRunLeaseOwner)
             viewState = .home
         }
         refreshProjectSummaries()
         return true
+    }
+
+    private func moveIdentityBoundProjectToTrash(
+        at requestedProjectURL: URL,
+        leasedProjectRootIdentity: AppProjectRootIdentity
+    ) throws {
+        let projectURL = requestedProjectURL.standardizedFileURL
+        let parentURL = projectURL.deletingLastPathComponent()
+            .standardizedFileURL
+        let projectLeaf = projectURL.lastPathComponent
+        guard Self.isSafeTrashLeaf(projectLeaf),
+              parentURL.appendingPathComponent(
+                projectLeaf,
+                isDirectory: true
+              ).standardizedFileURL.path == projectURL.path else {
+            throw ProjectTrashQuarantineError.invalidProjectPath
+        }
+
+        let parentDescriptor = Darwin.open(
+            parentURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard parentDescriptor >= 0 else {
+            throw ProjectTrashQuarantineError.system(
+                operation: "Opening the project folder",
+                code: errno
+            )
+        }
+        defer { Darwin.close(parentDescriptor) }
+        let parentIdentity = try AppProjectRootIdentity.capture(
+            descriptor: parentDescriptor
+        )
+        guard try AppProjectRootIdentity.capture(at: parentURL)
+                == parentIdentity,
+              try Self.trashLeafState(
+                parentDescriptor: parentDescriptor,
+                leaf: projectLeaf
+              ).matches(leasedProjectRootIdentity) else {
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The selected project path no longer names the leased project."
+            )
+        }
+
+        try projectTrashQuarantineCheckpointHook.handle(
+            .canonicalIdentityValidated
+        )
+
+        let quarantineLeaf = ".easysplat-trash-\(UUID().uuidString.lowercased())"
+        try Self.renameTrashLeaf(
+            parentDescriptor: parentDescriptor,
+            sourceLeaf: projectLeaf,
+            destinationLeaf: quarantineLeaf
+        )
+        do {
+            try Self.syncTrashParent(parentDescriptor)
+        } catch {
+            _ = try? Self.restoreTrashLeafIfCanonicalAbsent(
+                parentDescriptor: parentDescriptor,
+                quarantineLeaf: quarantineLeaf,
+                canonicalLeaf: projectLeaf
+            )
+            throw error
+        }
+
+        let quarantineState = try Self.trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        guard quarantineState.matches(leasedProjectRootIdentity) else {
+            _ = try? Self.restoreTrashLeafIfCanonicalAbsent(
+                parentDescriptor: parentDescriptor,
+                quarantineLeaf: quarantineLeaf,
+                canonicalLeaf: projectLeaf
+            )
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The project leaf changed before it could be quarantined."
+            )
+        }
+
+        let quarantineDescriptor = quarantineLeaf.withCString {
+            Darwin.openat(
+                parentDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard quarantineDescriptor >= 0 else {
+            _ = try? Self.restoreTrashLeafIfCanonicalAbsent(
+                parentDescriptor: parentDescriptor,
+                quarantineLeaf: quarantineLeaf,
+                canonicalLeaf: projectLeaf
+            )
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The quarantined project could not be reopened safely."
+            )
+        }
+        defer { Darwin.close(quarantineDescriptor) }
+
+        guard try AppProjectRootIdentity.capture(
+            descriptor: quarantineDescriptor
+        ) == leasedProjectRootIdentity,
+        try AppProjectRootIdentity.capture(at: parentURL) == parentIdentity,
+        case .absent = try Self.trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: projectLeaf
+        ) else {
+            _ = try? Self.restoreTrashLeafIfCanonicalAbsent(
+                parentDescriptor: parentDescriptor,
+                quarantineLeaf: quarantineLeaf,
+                canonicalLeaf: projectLeaf
+            )
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The project namespace changed before the Trash operation."
+            )
+        }
+
+        let quarantineURL = parentURL.appendingPathComponent(
+            quarantineLeaf,
+            isDirectory: true
+        )
+        do {
+            try projectTrashHandler(quarantineURL)
+        } catch {
+            try Self.syncTrashParent(parentDescriptor)
+            let outcome = try Self.reconcileTrashHandlerFailure(
+                parentDescriptor: parentDescriptor,
+                canonicalLeaf: projectLeaf,
+                quarantineLeaf: quarantineLeaf,
+                expectedIdentity: leasedProjectRootIdentity
+            )
+            switch outcome {
+            case .completed:
+                return
+            case .restored:
+                throw ProjectTrashQuarantineError.handlerFailure(error)
+            case .conflict:
+                throw ProjectTrashQuarantineError.identityConflict(
+                    "The Trash handler failed after the project namespace changed."
+                )
+            }
+        }
+        try Self.syncTrashParent(parentDescriptor)
+
+        let outcome = try Self.reconcileSuccessfulTrashHandler(
+            parentDescriptor: parentDescriptor,
+            canonicalLeaf: projectLeaf,
+            quarantineLeaf: quarantineLeaf,
+            expectedIdentity: leasedProjectRootIdentity
+        )
+        switch outcome {
+        case .completed:
+            return
+        case .restored:
+            throw ProjectTrashQuarantineError.handlerDidNotMove
+        case .conflict:
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The Trash handler returned after the project namespace changed."
+            )
+        }
+    }
+
+    private static func reconcileTrashHandlerFailure(
+        parentDescriptor: Int32,
+        canonicalLeaf: String,
+        quarantineLeaf: String,
+        expectedIdentity: AppProjectRootIdentity
+    ) throws -> ProjectTrashHandlerOutcome {
+        let canonicalState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        )
+        let quarantineState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        if case .absent = quarantineState {
+            if canonicalState.matches(expectedIdentity) {
+                return .restored
+            }
+            if case .absent = canonicalState {
+                return .completed
+            }
+            return .conflict
+        }
+        guard quarantineState.matches(expectedIdentity) else {
+            return .conflict
+        }
+        if canonicalState.matches(expectedIdentity) {
+            return .restored
+        }
+        guard case .absent = canonicalState else {
+            return .conflict
+        }
+        guard try restoreTrashLeafIfCanonicalAbsent(
+            parentDescriptor: parentDescriptor,
+            quarantineLeaf: quarantineLeaf,
+            canonicalLeaf: canonicalLeaf
+        ) else {
+            return .conflict
+        }
+        let restoredCanonicalState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        )
+        let restoredQuarantineState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        guard restoredCanonicalState.matches(expectedIdentity),
+              case .absent = restoredQuarantineState else {
+            return .conflict
+        }
+        return .restored
+    }
+
+    private static func reconcileSuccessfulTrashHandler(
+        parentDescriptor: Int32,
+        canonicalLeaf: String,
+        quarantineLeaf: String,
+        expectedIdentity: AppProjectRootIdentity
+    ) throws -> ProjectTrashHandlerOutcome {
+        let canonicalState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        )
+        let quarantineState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        if case .absent = quarantineState {
+            return canonicalState.matches(expectedIdentity)
+                ? .restored
+                : .completed
+        }
+        guard quarantineState.matches(expectedIdentity) else {
+            return .conflict
+        }
+        guard case .absent = canonicalState else {
+            return .conflict
+        }
+        guard try restoreTrashLeafIfCanonicalAbsent(
+            parentDescriptor: parentDescriptor,
+            quarantineLeaf: quarantineLeaf,
+            canonicalLeaf: canonicalLeaf
+        ) else {
+            return .conflict
+        }
+        let restoredCanonicalState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        )
+        let restoredQuarantineState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        guard restoredCanonicalState.matches(expectedIdentity),
+              case .absent = restoredQuarantineState else {
+            return .conflict
+        }
+        return .restored
+    }
+
+    private static func restoreTrashLeafIfCanonicalAbsent(
+        parentDescriptor: Int32,
+        quarantineLeaf: String,
+        canonicalLeaf: String
+    ) throws -> Bool {
+        guard case .absent = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        ) else {
+            return false
+        }
+        do {
+            try renameTrashLeaf(
+                parentDescriptor: parentDescriptor,
+                sourceLeaf: quarantineLeaf,
+                destinationLeaf: canonicalLeaf
+            )
+        } catch let error as ProjectTrashQuarantineError {
+            if case .system(_, let code) = error,
+               code == EEXIST || code == ENOTEMPTY {
+                return false
+            }
+            throw error
+        }
+        try syncTrashParent(parentDescriptor)
+        return true
+    }
+
+    private static func trashLeafState(
+        parentDescriptor: Int32,
+        leaf: String
+    ) throws -> ProjectTrashLeafState {
+        var status = stat()
+        let statusResult = leaf.withCString {
+            Darwin.fstatat(
+                parentDescriptor,
+                $0,
+                &status,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        if statusResult != 0 {
+            let code = errno
+            if code == ENOENT { return .absent }
+            throw ProjectTrashQuarantineError.system(
+                operation: "Inspecting the project namespace",
+                code: code
+            )
+        }
+        guard status.st_mode & S_IFMT == S_IFDIR else { return .other }
+        let descriptor = leaf.withCString {
+            Darwin.openat(
+                parentDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard descriptor >= 0 else { return .other }
+        defer { Darwin.close(descriptor) }
+        return .directory(
+            try AppProjectRootIdentity.capture(descriptor: descriptor)
+        )
+    }
+
+    private static func renameTrashLeaf(
+        parentDescriptor: Int32,
+        sourceLeaf: String,
+        destinationLeaf: String
+    ) throws {
+        let result = sourceLeaf.withCString { sourcePointer in
+            destinationLeaf.withCString { destinationPointer in
+                Darwin.renameatx_np(
+                    parentDescriptor,
+                    sourcePointer,
+                    parentDescriptor,
+                    destinationPointer,
+                    UInt32(RENAME_EXCL | RENAME_NOFOLLOW_ANY)
+                )
+            }
+        }
+        guard result == 0 else {
+            throw ProjectTrashQuarantineError.system(
+                operation: "Renaming the project",
+                code: errno
+            )
+        }
+    }
+
+    private static func syncTrashParent(_ descriptor: Int32) throws {
+        while Darwin.fcntl(descriptor, F_FULLFSYNC) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            if code != EINVAL && code != ENOTSUP {
+                throw ProjectTrashQuarantineError.system(
+                    operation: "Saving the project folder change",
+                    code: code
+                )
+            }
+            break
+        }
+        while Darwin.fsync(descriptor) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw ProjectTrashQuarantineError.system(
+                operation: "Saving the project folder change",
+                code: code
+            )
+        }
+    }
+
+    private static func isSafeTrashLeaf(_ leaf: String) -> Bool {
+        !leaf.isEmpty
+            && leaf != "."
+            && leaf != ".."
+            && !leaf.contains("/")
+            && !leaf.contains("\\")
+            && !leaf.unicodeScalars.contains(where: {
+                CharacterSet.controlCharacters.contains($0)
+            })
     }
 
     func elapsedSinceStageStart(now: Date) -> TimeInterval? {
@@ -262,8 +801,15 @@ extension AppModel {
     ) async -> ToolchainPaths? {
         guard isCurrentTaskToken(taskToken) else { return nil }
         let timingBoundary = timingBoundary ?? .capture()
-        defer { finishRun(taskToken: taskToken) }
-        reset()
+        var projectRunLeaseOwner: AppProjectRunLeaseOwner?
+        defer { projectRunLeaseOwner?.release() }
+        defer {
+            finishRun(
+                taskToken: taskToken,
+                projectRunLeaseOwner: projectRunLeaseOwner
+            )
+        }
+        reset(projectRunLeaseOwner: projectRunLeaseOwner)
         viewState = .processing
         phaseStartedAt = Date()
         statusTitle = "Preparing project"
@@ -549,6 +1095,9 @@ extension AppModel {
             defer { freshPublication.attestation.discard() }
             let projectURL = freshPublication.projectURL
             projectPublication = nil
+            projectRunLeaseOwner = try acquireAppProjectRunLeaseOwner(
+                at: projectURL
+            )
             currentProjectURL = projectURL
             currentRunOptions = requestedOptions
             currentInput = inputAdoption.input
@@ -568,7 +1117,8 @@ extension AppModel {
                     resolvedRunPlan: resolvedRunPlan,
                     developmentOverrides: developmentOverrides,
                     prePipelineDurationSeconds: timingBoundary.elapsedSeconds(),
-                    prePipelineStartedAt: timingBoundary.startedAt
+                    prePipelineStartedAt: timingBoundary.startedAt,
+                    projectRunLeaseOwner: projectRunLeaseOwner
                 )
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
@@ -582,7 +1132,10 @@ extension AppModel {
             guard isCurrentTaskToken(taskToken) else { return nil }
 
             guard let outputURL = try await validatedFinishedOutputURL(projectURL: projectURL) else {
-                presentOutputMissingFailure(projectURL: projectURL)
+                presentOutputMissingFailure(
+                    projectURL: projectURL,
+                    projectRunLeaseOwner: projectRunLeaseOwner
+                )
                 return nil
             }
             outputPlyURL = outputURL
@@ -600,12 +1153,38 @@ extension AppModel {
             }
             currentProjectNotes = loadProjectNotes(projectURL: projectURL)
             markProjectOpened(at: projectURL)
-            prepareResultViewerTiming(
-                projectID: projectID,
-                projectURL: projectURL,
-                outputURL: outputURL,
-                boundary: timingBoundary
-            )
+            let viewerTimingAuthority: BoundResultViewerTimingAuthority?
+            do {
+                viewerTimingAuthority = try await resolveBoundViewerTimingAuthority(
+                    projectID: projectID,
+                    projectURL: projectURL,
+                    outputURL: outputURL,
+                    projectRunLeaseOwner: projectRunLeaseOwner
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                viewerTimingAuthority = nil
+            }
+            guard isCurrentTaskToken(taskToken) else { return nil }
+            if let viewerTimingAuthority {
+                prepareResultViewerTiming(
+                    projectID: projectID,
+                    projectURL: projectURL,
+                    outputURL: outputURL,
+                    expectedPublicationID:
+                        viewerTimingAuthority.publicationID,
+                    expectedGeneration: viewerTimingAuthority.generation,
+                    projectRootIdentity:
+                        viewerTimingAuthority.projectRootIdentity,
+                    boundary: timingBoundary
+                )
+            } else {
+                // A validated legacy output may still open, but without a
+                // receipt UUID there is no authority to update. Keep the
+                // healthy viewer available and skip this optional timing.
+                cancelResultViewerTiming()
+            }
             await reloadSubjectIsolationArtifact(for: projectURL)
             guard isCurrentTaskToken(taskToken) else { return nil }
             viewState = .viewer
@@ -728,7 +1307,8 @@ extension AppModel {
                         try persistProjectFailureChecked(
                             failureMessage,
                             stage: metadataFailure.stage,
-                            at: projectURL
+                            at: projectURL,
+                            projectRunLeaseOwner: projectRunLeaseOwner
                         )
                     } catch {
                         presentUnsavedProjectState(
@@ -744,6 +1324,7 @@ extension AppModel {
                         failureMessage,
                         stage: nil,
                         at: projectURL,
+                        projectRunLeaseOwner: projectRunLeaseOwner,
                         primaryFailureDescription: String(reflecting: error)
                       ) {
                 return nil
@@ -895,11 +1476,24 @@ extension AppModel {
     func resumeProjectTask(
         at url: URL,
         taskToken: UUID? = nil,
-        bypassFinishedOutput: Bool = false
+        bypassFinishedOutput: Bool = false,
+        projectRunLeaseOwner suppliedProjectRunLeaseOwner:
+            AppProjectRunLeaseOwner? = nil,
+        timingBoundary: RunTimingBoundary? = nil
     ) async {
+        var projectRunLeaseOwner = suppliedProjectRunLeaseOwner
+        // Registered before finishRun so the app's terminal handling, fallback
+        // persistence, and optional Trash move all execute while ownership is
+        // still held. Swift runs defers in reverse order.
+        defer { projectRunLeaseOwner?.release() }
         guard isCurrentTaskToken(taskToken) else { return }
-        defer { finishRun(taskToken: taskToken) }
-        reset()
+        defer {
+            finishRun(
+                taskToken: taskToken,
+                projectRunLeaseOwner: projectRunLeaseOwner
+            )
+        }
+        reset(projectRunLeaseOwner: projectRunLeaseOwner)
         // Immediately after reset, before any suspension: the opened project
         // must stay current across the whole task so selection and the
         // sidebar's lock never see a run with no project.
@@ -913,12 +1507,16 @@ extension AppModel {
 
         do {
             let paths = ProjectPaths(root: url)
-            let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+            let openedProjectRootIdentity = try AppProjectRootIdentity.capture(
+                at: url
+            )
+            var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
             if metadata.input.hasVideos {
                 statusDetail = "Checking saved videos"
+                let metadataSnapshot = metadata
                 try await Task.detached(priority: .userInitiated) {
                     try VideoInputReceiptValidator.validateFiles(
-                        metadata: metadata,
+                        metadata: metadataSnapshot,
                         paths: paths
                     )
                 }.value
@@ -935,10 +1533,46 @@ extension AppModel {
                     )
                 }.value
             }
+            var resumeTimingAuthority: BoundResultViewerTimingAuthority?
+            if !bypassFinishedOutput,
+               metadata.createToViewerReadySeconds == nil {
+                do {
+                    resumeTimingAuthority = try await
+                        resolveResumeViewerTimingAuthority(
+                            projectID: metadata.id,
+                            projectURL: url,
+                            outputURL: paths.outputSplatURL,
+                            openedProjectRootIdentity:
+                                openedProjectRootIdentity,
+                            projectRunLeaseOwner: projectRunLeaseOwner
+                        )
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // Healing is optional. A concurrent processor owns the
+                    // right to mutate this project, while the validated
+                    // result remains safe to open read-only.
+                    resumeTimingAuthority = nil
+                }
+                guard isCurrentTaskToken(taskToken) else { return }
+            }
+            let finishedOutputURL: URL?
+            if bypassFinishedOutput {
+                finishedOutputURL = nil
+            } else if resumeTimingAuthority != nil {
+                // The authority resolver has already descriptor-validated the
+                // exact canonical PLY/receipt pair. Do not hash it again in a
+                // second pathname-based result decision.
+                finishedOutputURL = paths.outputSplatURL
+            } else {
+                finishedOutputURL = try await validatedFinishedOutputURL(
+                    projectURL: url
+                )
+            }
             currentRunOptions = metadata.requestedRunOptions
             currentInput = metadata.input
             if !bypassFinishedOutput,
-               let outputURL = try await validatedFinishedOutputURL(projectURL: url) {
+               let outputURL = finishedOutputURL {
                 guard isCurrentTaskToken(taskToken) else { return }
                 outputPlyURL = outputURL
                 currentStageTimings = metadata.stageTimings ?? []
@@ -946,6 +1580,19 @@ extension AppModel {
                 currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
                 currentProjectNotes = metadata.notes ?? ""
                 markProjectOpened(at: url)
+                if let authority = resumeTimingAuthority,
+                   let elapsedSeconds = authority.elapsedSeconds {
+                    prepareResultViewerTimingMetadataHealing(
+                        projectID: metadata.id,
+                        projectURL: url,
+                        outputURL: outputURL,
+                        expectedPublicationID: authority.publicationID,
+                        expectedGeneration: authority.generation,
+                        elapsedSeconds: elapsedSeconds,
+                        projectRootIdentity:
+                            authority.projectRootIdentity
+                    )
+                }
                 await reloadSubjectIsolationArtifact(for: url)
                 guard isCurrentTaskToken(taskToken) else { return }
                 viewState = .viewer
@@ -953,6 +1600,38 @@ extension AppModel {
                 return
             }
             // No validated finished output, so this resume re-runs the pipeline.
+            if projectRunLeaseOwner == nil {
+                projectRunLeaseOwner = try acquireAppProjectRunLeaseOwner(at: url)
+            }
+            guard let projectRunLeaseOwner else {
+                throw ProjectRunLeaseBorrowError.released
+            }
+            metadata = try projectRunLeaseOwner
+                .withLockedProjectRootDescriptor {
+                    try ProjectMetadataStore.load(
+                        fromProjectRootDescriptor: $0
+                    )
+                }
+            if metadata.input.hasVideos {
+                let metadataSnapshot = metadata
+                try await Task.detached(priority: .userInitiated) {
+                    try VideoInputReceiptValidator.validateFiles(
+                        metadata: metadataSnapshot,
+                        paths: paths
+                    )
+                }.value
+            }
+            if metadata.input.isDataset,
+               let datasetPoseSeed = metadata.datasetPoseSeed {
+                try await Task.detached(priority: .userInitiated) {
+                    try DatasetPoseSeedReceiptValidator.validateFiles(
+                        receipt: datasetPoseSeed,
+                        projectRoot: url
+                    )
+                }.value
+            }
+            currentRunOptions = metadata.requestedRunOptions
+            currentInput = metadata.input
             viewState = .processing
             refreshProjectSummaries()
             let developmentOverrides = AppConfig.currentDevelopmentOverrides
@@ -1033,12 +1712,17 @@ extension AppModel {
                 pipelineConfig(
                     toolchain: toolchain,
                     resolvedRunPlan: resolvedRunPlan,
-                    developmentOverrides: developmentOverrides
+                    developmentOverrides: developmentOverrides,
+                    runIntent: bypassFinishedOutput ? .retrain : .resume,
+                    projectRunLeaseOwner: projectRunLeaseOwner
                 )
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
+            let requestedResumeBoundary: PipelineStage? = bypassFinishedOutput
+                ? .sfmMapping
+                : resumeStage(from: metadata)
             let stageToResume = RunPlanResolver.safeResumeStage(
-                resumeStage(from: metadata),
+                requestedResumeBoundary,
                 input: metadata.input,
                 previousPlan: metadata.resolvedRunPlan,
                 currentPlan: resolvedRunPlan
@@ -1050,7 +1734,10 @@ extension AppModel {
             guard isCurrentTaskToken(taskToken) else { return }
 
             guard let outputURL = try await validatedFinishedOutputURL(projectURL: url) else {
-                presentOutputMissingFailure(projectURL: url)
+                presentOutputMissingFailure(
+                    projectURL: url,
+                    projectRunLeaseOwner: projectRunLeaseOwner
+                )
                 return
             }
             outputPlyURL = outputURL
@@ -1066,6 +1753,36 @@ extension AppModel {
             }
             currentProjectNotes = loadProjectNotes(projectURL: url)
             markProjectOpened(at: url)
+            if let timingBoundary {
+                let viewerTimingAuthority: BoundResultViewerTimingAuthority?
+                do {
+                    viewerTimingAuthority = try await
+                        resolveBoundViewerTimingAuthority(
+                            projectID: metadata.id,
+                            projectURL: url,
+                            outputURL: outputURL,
+                            projectRunLeaseOwner: projectRunLeaseOwner
+                        )
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    viewerTimingAuthority = nil
+                }
+                guard isCurrentTaskToken(taskToken) else { return }
+                if let viewerTimingAuthority {
+                    prepareResultViewerTiming(
+                        projectID: metadata.id,
+                        projectURL: url,
+                        outputURL: outputURL,
+                        expectedPublicationID:
+                            viewerTimingAuthority.publicationID,
+                        expectedGeneration: viewerTimingAuthority.generation,
+                        projectRootIdentity:
+                            viewerTimingAuthority.projectRootIdentity,
+                        boundary: timingBoundary
+                    )
+                }
+            }
             refreshFreeDiskSpace()
             await reloadSubjectIsolationArtifact(for: url)
             guard isCurrentTaskToken(taskToken) else { return }
@@ -1092,6 +1809,16 @@ extension AppModel {
             errorDetails = error.localizedDescription
             progress = nil
             failureRetryAllowed = false
+            viewState = .processing
+            refreshProjectSummaries()
+        } catch let error as ProjectRunLeaseError {
+            guard isCurrentTaskToken(taskToken) else { return }
+            presentProjectMutationFailure(
+                error,
+                fallbackTitle: "Couldn’t resume this project"
+            )
+            errorDetails = String(reflecting: error)
+            progress = nil
             viewState = .processing
             refreshProjectSummaries()
         } catch {
@@ -1127,7 +1854,8 @@ extension AppModel {
                             try persistProjectFailureChecked(
                                 failureMessage,
                                 stage: metadataFailure.stage,
-                                at: url
+                                at: url,
+                                projectRunLeaseOwner: projectRunLeaseOwner
                             )
                         } catch {
                             presentUnsavedProjectState(
@@ -1178,8 +1906,11 @@ extension AppModel {
         return lines.joined(separator: "\n")
     }
 
-    func reset() {
+    func reset(
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) {
         cancelForcedExitIfNeeded()
+        cancelResultViewerTiming()
         stage = nil
         progress = nil
         statusTitle = "Ready"
@@ -1207,7 +1938,9 @@ extension AppModel {
         // Flush any pending notes save before tearing down so the user's last
         // edit isn't lost when they start or resume a different project (or
         // when reset() runs as part of app teardown).
-        let notesSaved = flushPendingNotesSave()
+        let notesSaved = flushPendingNotesSave(
+            projectRunLeaseOwner: projectRunLeaseOwner
+        )
         outputPlyURL = nil
         clearTrainingPreview()
         currentStageTimings = []
@@ -1217,7 +1950,6 @@ extension AppModel {
         currentInput = nil
         currentProjectNotes = ""
         currentProjectURL = nil
-        pendingResultViewerTiming = nil
         stopAction = nil
         cancelSharing()
         clearSubjectIsolationSession()
@@ -1256,19 +1988,25 @@ extension AppModel {
         )
     }
 
-    private func finishRun(taskToken: UUID?) {
+    func finishRun(
+        taskToken: UUID?,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner?
+    ) {
         guard currentTaskToken == taskToken else { return }
         currentTask = nil
         currentTaskToken = nil
         isRunActive = false
         if stopAction != nil {
-            completeStop()
+            completeStop(projectRunLeaseOwner: projectRunLeaseOwner)
         } else {
             refreshProjectSummaries()
         }
     }
 
-    func presentOutputMissingFailure(projectURL: URL) {
+    func presentOutputMissingFailure(
+        projectURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) {
         let message = "Processing failed. Expected outputs were missing."
         lastError = message
         statusTitle = message
@@ -1283,6 +2021,7 @@ extension AppModel {
             message,
             stage: nil,
             at: projectURL,
+            projectRunLeaseOwner: projectRunLeaseOwner,
             primaryFailureDescription: errorDetails ?? message
         ) else {
             return
@@ -1296,10 +2035,13 @@ extension AppModel {
     private func persistProjectFailureChecked(
         _ message: String,
         stage: PipelineStage?,
-        at projectURL: URL
+        at projectURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
     ) throws -> ProjectMetadata {
-        let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        return try projectMetadataUpdater(metadataURL) { metadata in
+        try updateProjectMetadata(
+            at: projectURL,
+            leaseOwner: projectRunLeaseOwner
+        ) { metadata in
             metadata.state = PipelineState(
                 stage: stage ?? metadata.state.stage,
                 lastError: message
@@ -1314,13 +2056,15 @@ extension AppModel {
         _ message: String,
         stage: PipelineStage?,
         at projectURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil,
         primaryFailureDescription: String
     ) -> Bool {
         do {
             try persistProjectFailureChecked(
                 message,
                 stage: stage,
-                at: projectURL
+                at: projectURL,
+                projectRunLeaseOwner: projectRunLeaseOwner
             )
             return true
         } catch {
@@ -1371,15 +2115,52 @@ extension AppModel {
         viewState = .processing
     }
 
+    func acquireAppProjectRunLeaseOwner(
+        at projectURL: URL
+    ) throws -> AppProjectRunLeaseOwner {
+        try AppProjectRunLeaseOwner(
+            projectURL: projectURL,
+            acquire: projectRunLeaseOwnerAcquirer
+        )
+    }
+
     @discardableResult
-    func mutateProjectMetadata(
+    func updateProjectMetadata(
         at projectURL: URL,
-        mutation: (inout ProjectMetadata) -> Void
-    ) -> ProjectMetadata? {
-        let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        return try? projectMetadataUpdater(metadataURL) { metadata in
-            mutation(&metadata)
+        leaseOwner suppliedLeaseOwner: AppProjectRunLeaseOwner? = nil,
+        mutation: @escaping ProjectMetadataMutation
+    ) throws -> ProjectMetadata {
+        let acquiredLeaseOwner: AppProjectRunLeaseOwner?
+        if suppliedLeaseOwner == nil {
+            acquiredLeaseOwner = try acquireAppProjectRunLeaseOwner(
+                at: projectURL
+            )
+        } else {
+            acquiredLeaseOwner = nil
         }
+        defer { acquiredLeaseOwner?.release() }
+        let leaseOwner = suppliedLeaseOwner ?? acquiredLeaseOwner
+        guard let leaseOwner else {
+            throw ProjectRunLeaseBorrowError.released
+        }
+        return try leaseOwner.withLockedProjectRootDescriptor {
+            projectRootDescriptor in
+            try projectMetadataUpdater(projectRootDescriptor, mutation)
+        }
+    }
+
+    func presentProjectMutationFailure(
+        _ error: Error?,
+        fallbackTitle: String
+    ) {
+        if let leaseError = error as? ProjectRunLeaseError {
+            statusTitle = leaseError.localizedDescription
+            statusDetail = "The project was not changed. Try again when processing finishes."
+        } else {
+            statusTitle = fallbackTitle
+            statusDetail = "The project was not changed. Check folder permissions and try again."
+        }
+        lastError = statusTitle
     }
 
     func pipelineConfig(
@@ -1387,9 +2168,11 @@ extension AppModel {
         resolvedRunPlan: ResolvedRunPlan? = nil,
         developmentOverrides: DevelopmentOverrides = AppConfig.currentDevelopmentOverrides,
         prePipelineDurationSeconds: TimeInterval = 0,
-        prePipelineStartedAt: Date? = nil
+        prePipelineStartedAt: Date? = nil,
+        runIntent: PipelineRunner.RunIntent = .resume,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
     ) -> PipelineRunner.PipelineConfig {
-        PipelineRunner.PipelineConfig(
+        let config = PipelineRunner.PipelineConfig(
             toolchain: toolchain,
             developmentOverrides: developmentOverrides,
             hardwareProfile: hardwareProfile,
@@ -1401,24 +2184,154 @@ extension AppModel {
             // them made Show Preview inert for any run started while hidden, and the
             // publication itself is the cheap half. Admission still decides whether
             // any preview is produced at all.
-            trainingPreviewPolicy: .enabled
+            trainingPreviewPolicy: .enabled,
+            runIntent: runIntent
         )
+        guard let projectRunLeaseOwner else { return config }
+        return projectRunLeaseOwner.borrowingLease(in: config)
     }
 
-    func completeStop() {
+    private func resolveBoundViewerTimingAuthority(
+        projectID: UUID,
+        projectURL: URL,
+        outputURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner?
+    ) async throws -> BoundResultViewerTimingAuthority? {
+        guard let projectRunLeaseOwner else { return nil }
+        let pairOperations = resultViewerTimingPairOperations
+        let worker = Task.detached(priority: .utility) {
+            try Self.resolveBoundViewerTimingAuthority(
+                projectID: projectID,
+                projectURL: projectURL,
+                outputURL: outputURL,
+                projectRunLeaseOwner: projectRunLeaseOwner,
+                pairOperations: pairOperations
+            )
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    private func resolveResumeViewerTimingAuthority(
+        projectID: UUID,
+        projectURL: URL,
+        outputURL: URL,
+        openedProjectRootIdentity: AppProjectRootIdentity,
+        projectRunLeaseOwner suppliedProjectRunLeaseOwner:
+            AppProjectRunLeaseOwner?
+    ) async throws -> BoundResultViewerTimingAuthority? {
+        try Task.checkCancellation()
+        let acquiredProjectRunLeaseOwner: AppProjectRunLeaseOwner?
+        do {
+            if suppliedProjectRunLeaseOwner == nil {
+                acquiredProjectRunLeaseOwner = try acquireAppProjectRunLeaseOwner(
+                    at: projectURL
+                )
+            } else {
+                acquiredProjectRunLeaseOwner = nil
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            return nil
+        }
+        defer { acquiredProjectRunLeaseOwner?.release() }
+        guard let projectRunLeaseOwner = suppliedProjectRunLeaseOwner
+                ?? acquiredProjectRunLeaseOwner,
+              try projectRunLeaseOwner.lockedProjectRootIdentity()
+                == openedProjectRootIdentity else {
+            return nil
+        }
+        let authority = try await resolveBoundViewerTimingAuthority(
+            projectID: projectID,
+            projectURL: projectURL,
+            outputURL: outputURL,
+            projectRunLeaseOwner: projectRunLeaseOwner
+        )
+        try Task.checkCancellation()
+        return authority
+    }
+
+    nonisolated private static func resolveBoundViewerTimingAuthority(
+        projectID: UUID,
+        projectURL: URL,
+        outputURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner,
+        pairOperations: PublishedResultPairOperations
+    ) throws -> BoundResultViewerTimingAuthority? {
+        let paths = ProjectPaths(root: projectURL)
+        guard outputURL.standardizedFileURL.path
+                == paths.outputSplatURL.standardizedFileURL.path else {
+            return nil
+        }
+        return try projectRunLeaseOwner.withValidatedProjectRootDescriptor {
+            projectRootDescriptor in
+            try Task.checkCancellation()
+            let projectRootIdentity = try AppProjectRootIdentity.capture(
+                descriptor: projectRootDescriptor
+            )
+            let metadata = try ProjectMetadataStore.load(
+                fromProjectRootDescriptor: projectRootDescriptor
+            )
+            guard metadata.id == projectID,
+                  metadata.state.stage == .done,
+                  metadata.state.lastError == nil,
+                  metadata.checkpoint == nil,
+                  metadata.lastRunStartedAt == nil,
+                  metadata.pendingPublicationID == nil,
+                  let resolvedRunPlan = metadata.resolvedRunPlan,
+                  let result = try PublishedResultPublisher
+                    .resolveCompletedTraining(
+                        metadata: metadata,
+                        resolvedRunPlan: resolvedRunPlan,
+                        paths: paths,
+                        projectRootDescriptor: projectRootDescriptor,
+                        pairOperations: pairOperations,
+                        shouldCancel: { Task.isCancelled }
+                    ),
+                  result.receipt.projectID == projectID,
+                  let generation = result.generation,
+                  result.outputURL.standardizedFileURL.path
+                    == outputURL.standardizedFileURL.path else {
+                return nil
+            }
+            try Task.checkCancellation()
+            return BoundResultViewerTimingAuthority(
+                publicationID: result.receipt.publicationID,
+                generation: generation,
+                projectRootIdentity: projectRootIdentity,
+                elapsedSeconds: result.receipt.presentation
+                    .createToViewerReadySeconds
+            )
+        }
+    }
+
+    func completeStop(
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) {
         let action = stopAction
         stopAction = nil
 
         let projectURL = currentProjectURL
         if action == .deleteProject, let projectURL {
-            if moveProjectToTrash(at: projectURL) {
+            switch requestProjectTrashMove(
+                at: projectURL,
+                projectRunLeaseOwner: projectRunLeaseOwner
+            ) {
+            case .completed:
                 finalizeExitIfNeeded()
-            } else {
+            case .scheduled:
+                break
+            case .failed:
                 abortPendingExitAfterStopFailure()
             }
             return
         }
-        reset()
+        reset(projectRunLeaseOwner: projectRunLeaseOwner)
         viewState = .home
         refreshProjectSummaries()
         finalizeExitIfNeeded()
