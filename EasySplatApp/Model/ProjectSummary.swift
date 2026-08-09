@@ -7,6 +7,7 @@ struct ProjectSummary: Identifiable, Sendable {
     let url: URL
     let createdAt: Date
     let status: ProjectStatus
+    let hasPreviousResultHint: Bool
     let isActive: Bool
     let isInterrupted: Bool
     let checkpointUpdatedAt: Date?

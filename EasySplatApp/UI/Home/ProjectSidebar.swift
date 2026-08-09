@@ -182,7 +182,10 @@ struct ProjectSidebar: View {
             }
 
             if !isRunActive,
-               let actionTitle = Self.rowActionTitle(status: project.status) {
+               let actionTitle = Self.rowActionTitle(
+                status: project.status,
+                hasPreviousResultHint: project.hasPreviousResultHint
+               ) {
                 Button(actionTitle) {
                     open(project)
                 }
@@ -210,7 +213,8 @@ struct ProjectSidebar: View {
 
             let caption = Self.rowCaption(
                 status: project.status,
-                isInterrupted: project.isInterrupted
+                isInterrupted: project.isInterrupted,
+                hasPreviousResultHint: project.hasPreviousResultHint
             )
             let date = project.lastActivityAt.formatted(date: .abbreviated, time: .omitted)
             // At tight widths the date yields rather than truncating both.
@@ -241,6 +245,13 @@ struct ProjectSidebar: View {
             open(project)
         }
         .disabled(isRunActive)
+
+        if project.status == .failed, project.hasPreviousResultHint {
+            Button("Try Again") {
+                _ = model.resumeProject(at: project.url)
+            }
+            .disabled(isRunActive)
+        }
 
         Button("Rename…") {
             renameDraft = project.title
@@ -287,6 +298,9 @@ struct ProjectSidebar: View {
 
     private func beginOpening(_ project: ProjectSummary) -> Bool {
         guard !isRunActive else { return false }
+        if project.status == .failed, project.hasPreviousResultHint {
+            return model.viewPreviousResult(at: project.url)
+        }
         return model.resumeProject(at: project.url)
     }
 
@@ -302,30 +316,47 @@ struct ProjectSidebar: View {
     }
 
     private func statusText(for project: ProjectSummary) -> String {
-        Self.rowCaption(status: project.status, isInterrupted: project.isInterrupted) ?? "Ready"
+        Self.rowCaption(
+            status: project.status,
+            isInterrupted: project.isInterrupted,
+            hasPreviousResultHint: project.hasPreviousResultHint
+        ) ?? "Ready"
     }
 
     /// Visible status caption for a row; ready rows carry none. The full
     /// status stays in the row's accessibility label.
-    nonisolated static func rowCaption(status: ProjectStatus, isInterrupted: Bool) -> String? {
+    nonisolated static func rowCaption(
+        status: ProjectStatus,
+        isInterrupted: Bool,
+        hasPreviousResultHint: Bool = false
+    ) -> String? {
         if isInterrupted { return "Unfinished" }
         switch status {
         case .ready: return nil
         case .inProgress: return "In Progress"
-        case .failed: return "Failed"
+        case .failed:
+            return hasPreviousResultHint
+                ? "Failed · Previous result available"
+                : "Failed"
         }
     }
 
     private func openActionTitle(for project: ProjectSummary) -> String {
         switch project.status {
         case .ready: return "Open"
-        case .failed: return "Try Again"
+        case .failed:
+            return project.hasPreviousResultHint
+                ? "View Previous Result"
+                : "Try Again"
         case .inProgress: return "Resume"
         }
     }
 
-    nonisolated static func opensOnSelection(status: ProjectStatus) -> Bool {
-        status == .ready
+    nonisolated static func opensOnSelection(
+        status: ProjectStatus,
+        hasPreviousResultHint: Bool = false
+    ) -> Bool {
+        status == .ready || (status == .failed && hasPreviousResultHint)
     }
 
     /// While a run is active every other project is inert; the selection
@@ -338,10 +369,14 @@ struct ProjectSidebar: View {
         isRunActive && !isActiveProject
     }
 
-    nonisolated static func rowActionTitle(status: ProjectStatus) -> String? {
+    nonisolated static func rowActionTitle(
+        status: ProjectStatus,
+        hasPreviousResultHint: Bool = false
+    ) -> String? {
         switch status {
         case .inProgress: return "Resume"
-        case .failed: return "Try Again"
+        case .failed:
+            return hasPreviousResultHint ? "View Previous Result" : "Try Again"
         case .ready: return nil
         }
     }
@@ -373,7 +408,10 @@ struct ProjectSidebar: View {
     ) -> URL? {
         guard let requestedSelection,
               let project = project(forSelectionID: requestedSelection, in: projects),
-              opensOnSelection(status: project.status) else {
+              opensOnSelection(
+                status: project.status,
+                hasPreviousResultHint: project.hasPreviousResultHint
+              ) else {
             return current
         }
         return selectionID(for: project)

@@ -3,13 +3,6 @@ import Darwin
 import EasySplatCore
 import Foundation
 
-private struct BoundResultViewerTimingAuthority: Sendable {
-    let publicationID: UUID
-    let generation: PublishedResultGeneration
-    let projectRootIdentity: AppProjectRootIdentity
-    let elapsedSeconds: TimeInterval?
-}
-
 private enum ProjectTrashDisposition {
     case completed
     case scheduled
@@ -1131,60 +1124,30 @@ extension AppModel {
             }
             guard isCurrentTaskToken(taskToken) else { return nil }
 
-            guard let outputURL = try await validatedFinishedOutputURL(projectURL: projectURL) else {
-                presentOutputMissingFailure(
-                    projectURL: projectURL,
-                    projectRunLeaseOwner: projectRunLeaseOwner
-                )
-                return nil
-            }
-            outputPlyURL = outputURL
-            currentStageTimings = loadStageTimings(projectURL: projectURL)
-            currentCreateToViewerReadySeconds = loadCreateToViewerReadySeconds(
-                projectURL: projectURL
-            )
-            currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
-            if let config = loadProjectConfig(projectURL: projectURL) {
-                currentRunOptions = config.options
-                currentInput = config.input
-            } else {
-                currentRunOptions = nil
-                currentInput = nil
-            }
-            currentProjectNotes = loadProjectNotes(projectURL: projectURL)
-            markProjectOpened(at: projectURL)
-            let viewerTimingAuthority: BoundResultViewerTimingAuthority?
+            let installedResult: InstalledCurrentPublishedResult
             do {
-                viewerTimingAuthority = try await resolveBoundViewerTimingAuthority(
-                    projectID: projectID,
-                    projectURL: projectURL,
-                    outputURL: outputURL,
-                    projectRunLeaseOwner: projectRunLeaseOwner
+                installedResult = try await resolveAndInstallCurrentPublishedResult(
+                    at: projectURL
                 )
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                viewerTimingAuthority = nil
+                presentOutputMissingFailure(
+                    projectURL: projectURL,
+                    projectRunLeaseOwner: projectRunLeaseOwner
+                )
+                await refreshPreviousResultAvailability(at: projectURL)
+                return nil
             }
             guard isCurrentTaskToken(taskToken) else { return nil }
-            if let viewerTimingAuthority {
-                prepareResultViewerTiming(
-                    projectID: projectID,
-                    projectURL: projectURL,
-                    outputURL: outputURL,
-                    expectedPublicationID:
-                        viewerTimingAuthority.publicationID,
-                    expectedGeneration: viewerTimingAuthority.generation,
-                    projectRootIdentity:
-                        viewerTimingAuthority.projectRootIdentity,
-                    boundary: timingBoundary
-                )
-            } else {
-                // A validated legacy output may still open, but without a
-                // receipt UUID there is no authority to update. Keep the
-                // healthy viewer available and skip this optional timing.
-                cancelResultViewerTiming()
-            }
+            markProjectOpened(at: projectURL)
+            prepareViewerTiming(
+                for: installedResult,
+                projectURL: projectURL,
+                projectRootIdentity: try? projectRunLeaseOwner?
+                    .lockedProjectRootIdentity(),
+                boundary: timingBoundary
+            )
             await reloadSubjectIsolationArtifact(for: projectURL)
             guard isCurrentTaskToken(taskToken) else { return nil }
             viewState = .viewer
@@ -1533,65 +1496,55 @@ extension AppModel {
                     )
                 }.value
             }
-            var resumeTimingAuthority: BoundResultViewerTimingAuthority?
-            if !bypassFinishedOutput,
-               metadata.createToViewerReadySeconds == nil {
-                do {
-                    resumeTimingAuthority = try await
-                        resolveResumeViewerTimingAuthority(
-                            projectID: metadata.id,
-                            projectURL: url,
-                            outputURL: paths.outputSplatURL,
-                            openedProjectRootIdentity:
-                                openedProjectRootIdentity,
-                            projectRunLeaseOwner: projectRunLeaseOwner
-                        )
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    // Healing is optional. A concurrent processor owns the
-                    // right to mutate this project, while the validated
-                    // result remains safe to open read-only.
-                    resumeTimingAuthority = nil
-                }
-                guard isCurrentTaskToken(taskToken) else { return }
-            }
-            let finishedOutputURL: URL?
-            if bypassFinishedOutput {
-                finishedOutputURL = nil
-            } else if resumeTimingAuthority != nil {
-                // The authority resolver has already descriptor-validated the
-                // exact canonical PLY/receipt pair. Do not hash it again in a
-                // second pathname-based result decision.
-                finishedOutputURL = paths.outputSplatURL
-            } else {
-                finishedOutputURL = try await validatedFinishedOutputURL(
-                    projectURL: url
-                )
-            }
             currentRunOptions = metadata.requestedRunOptions
             currentInput = metadata.input
-            if !bypassFinishedOutput,
-               let outputURL = finishedOutputURL {
+            let resolvedResult: ResolvedPublishedResult? = if bypassFinishedOutput {
+                nil
+            } else {
+                try await resolvePublishedResult(at: url)
+            }
+            if let resolvedResult,
+               case .current = resolvedResult,
+               installResolvedPublishedResult(
+                resolvedResult,
+                projectURL: url,
+                latestMetadata: metadata
+               ),
+               let outputURL = outputPlyURL {
                 guard isCurrentTaskToken(taskToken) else { return }
-                outputPlyURL = outputURL
-                currentStageTimings = metadata.stageTimings ?? []
-                currentCreateToViewerReadySeconds = metadata.createToViewerReadySeconds
-                currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
-                currentProjectNotes = metadata.notes ?? ""
                 markProjectOpened(at: url)
-                if let authority = resumeTimingAuthority,
-                   let elapsedSeconds = authority.elapsedSeconds {
-                    prepareResultViewerTimingMetadataHealing(
-                        projectID: metadata.id,
-                        projectURL: url,
-                        outputURL: outputURL,
-                        expectedPublicationID: authority.publicationID,
-                        expectedGeneration: authority.generation,
-                        elapsedSeconds: elapsedSeconds,
-                        projectRootIdentity:
-                            authority.projectRootIdentity
-                    )
+                if case .current(.receiptBound(let current)) = resolvedResult,
+                   let generation = current.publishedResult.generation {
+                    if let elapsedSeconds = current.presentation
+                        .createToViewerReadySeconds {
+                        if metadata.createToViewerReadySeconds
+                            != elapsedSeconds {
+                            prepareResultViewerTimingMetadataHealing(
+                                projectID: metadata.id,
+                                projectURL: url,
+                                outputURL: outputURL,
+                                expectedPublicationID: current.publishedResult
+                                    .receipt.publicationID,
+                                expectedGeneration: generation,
+                                elapsedSeconds: elapsedSeconds,
+                                projectRootIdentity:
+                                    openedProjectRootIdentity
+                            )
+                        }
+                    } else if let timingBoundary {
+                        prepareResultViewerTiming(
+                            projectID: metadata.id,
+                            projectURL: url,
+                            outputURL: outputURL,
+                            expectedPublicationID: current.publishedResult
+                                .receipt.publicationID,
+                            expectedGeneration: generation,
+                            projectRootIdentity: openedProjectRootIdentity,
+                            boundary: timingBoundary
+                        )
+                    }
+                } else {
+                    cancelResultViewerTiming()
                 }
                 await reloadSubjectIsolationArtifact(for: url)
                 guard isCurrentTaskToken(taskToken) else { return }
@@ -1733,56 +1686,29 @@ extension AppModel {
             }
             guard isCurrentTaskToken(taskToken) else { return }
 
-            guard let outputURL = try await validatedFinishedOutputURL(projectURL: url) else {
+            let installedResult: InstalledCurrentPublishedResult
+            do {
+                installedResult = try await resolveAndInstallCurrentPublishedResult(
+                    at: url
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
                 presentOutputMissingFailure(
                     projectURL: url,
                     projectRunLeaseOwner: projectRunLeaseOwner
                 )
+                await refreshPreviousResultAvailability(at: url)
                 return
             }
-            outputPlyURL = outputURL
-            currentStageTimings = loadStageTimings(projectURL: url)
-            currentCreateToViewerReadySeconds = loadCreateToViewerReadySeconds(projectURL: url)
-            currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
-            if let config = loadProjectConfig(projectURL: url) {
-                currentRunOptions = config.options
-                currentInput = config.input
-            } else {
-                currentRunOptions = nil
-                currentInput = nil
-            }
-            currentProjectNotes = loadProjectNotes(projectURL: url)
+            guard isCurrentTaskToken(taskToken) else { return }
             markProjectOpened(at: url)
-            if let timingBoundary {
-                let viewerTimingAuthority: BoundResultViewerTimingAuthority?
-                do {
-                    viewerTimingAuthority = try await
-                        resolveBoundViewerTimingAuthority(
-                            projectID: metadata.id,
-                            projectURL: url,
-                            outputURL: outputURL,
-                            projectRunLeaseOwner: projectRunLeaseOwner
-                        )
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    viewerTimingAuthority = nil
-                }
-                guard isCurrentTaskToken(taskToken) else { return }
-                if let viewerTimingAuthority {
-                    prepareResultViewerTiming(
-                        projectID: metadata.id,
-                        projectURL: url,
-                        outputURL: outputURL,
-                        expectedPublicationID:
-                            viewerTimingAuthority.publicationID,
-                        expectedGeneration: viewerTimingAuthority.generation,
-                        projectRootIdentity:
-                            viewerTimingAuthority.projectRootIdentity,
-                        boundary: timingBoundary
-                    )
-                }
-            }
+            prepareViewerTiming(
+                for: installedResult,
+                projectURL: url,
+                projectRootIdentity: openedProjectRootIdentity,
+                boundary: timingBoundary
+            )
             refreshFreeDiskSpace()
             await reloadSubjectIsolationArtifact(for: url)
             guard isCurrentTaskToken(taskToken) else { return }
@@ -1799,6 +1725,11 @@ extension AppModel {
             statusDetail = "The saved project and its checkpoint are unchanged."
             errorDetails = "Resume preflight stopped before preparing tools or changing project files."
             progress = nil
+            await refreshPreviousResultAvailability(
+                at: url,
+                expectedTaskToken: taskToken
+            )
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .processing
             refreshProjectSummaries()
         } catch let error as VideoInputReceiptValidationError {
@@ -1809,6 +1740,11 @@ extension AppModel {
             errorDetails = error.localizedDescription
             progress = nil
             failureRetryAllowed = false
+            await refreshPreviousResultAvailability(
+                at: url,
+                expectedTaskToken: taskToken
+            )
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .processing
             refreshProjectSummaries()
         } catch let error as ProjectRunLeaseError {
@@ -1819,6 +1755,11 @@ extension AppModel {
             )
             errorDetails = String(reflecting: error)
             progress = nil
+            await refreshPreviousResultAvailability(
+                at: url,
+                expectedTaskToken: taskToken
+            )
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .processing
             refreshProjectSummaries()
         } catch {
@@ -1884,6 +1825,11 @@ extension AppModel {
                     : "The saved project and its checkpoint are unchanged."
                 progress = nil
             }
+            await refreshPreviousResultAvailability(
+                at: url,
+                expectedTaskToken: taskToken
+            )
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .processing
             refreshProjectSummaries()
         }
@@ -1949,6 +1895,7 @@ extension AppModel {
         currentRunOptions = nil
         currentInput = nil
         currentProjectNotes = ""
+        clearResolvedPublishedResult()
         currentProjectURL = nil
         stopAction = nil
         cancelSharing()
@@ -2189,125 +2136,6 @@ extension AppModel {
         )
         guard let projectRunLeaseOwner else { return config }
         return projectRunLeaseOwner.borrowingLease(in: config)
-    }
-
-    private func resolveBoundViewerTimingAuthority(
-        projectID: UUID,
-        projectURL: URL,
-        outputURL: URL,
-        projectRunLeaseOwner: AppProjectRunLeaseOwner?
-    ) async throws -> BoundResultViewerTimingAuthority? {
-        guard let projectRunLeaseOwner else { return nil }
-        let pairOperations = resultViewerTimingPairOperations
-        let worker = Task.detached(priority: .utility) {
-            try Self.resolveBoundViewerTimingAuthority(
-                projectID: projectID,
-                projectURL: projectURL,
-                outputURL: outputURL,
-                projectRunLeaseOwner: projectRunLeaseOwner,
-                pairOperations: pairOperations
-            )
-        }
-        return try await withTaskCancellationHandler {
-            try await worker.value
-        } onCancel: {
-            worker.cancel()
-        }
-    }
-
-    private func resolveResumeViewerTimingAuthority(
-        projectID: UUID,
-        projectURL: URL,
-        outputURL: URL,
-        openedProjectRootIdentity: AppProjectRootIdentity,
-        projectRunLeaseOwner suppliedProjectRunLeaseOwner:
-            AppProjectRunLeaseOwner?
-    ) async throws -> BoundResultViewerTimingAuthority? {
-        try Task.checkCancellation()
-        let acquiredProjectRunLeaseOwner: AppProjectRunLeaseOwner?
-        do {
-            if suppliedProjectRunLeaseOwner == nil {
-                acquiredProjectRunLeaseOwner = try acquireAppProjectRunLeaseOwner(
-                    at: projectURL
-                )
-            } else {
-                acquiredProjectRunLeaseOwner = nil
-            }
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            try Task.checkCancellation()
-            return nil
-        }
-        defer { acquiredProjectRunLeaseOwner?.release() }
-        guard let projectRunLeaseOwner = suppliedProjectRunLeaseOwner
-                ?? acquiredProjectRunLeaseOwner,
-              try projectRunLeaseOwner.lockedProjectRootIdentity()
-                == openedProjectRootIdentity else {
-            return nil
-        }
-        let authority = try await resolveBoundViewerTimingAuthority(
-            projectID: projectID,
-            projectURL: projectURL,
-            outputURL: outputURL,
-            projectRunLeaseOwner: projectRunLeaseOwner
-        )
-        try Task.checkCancellation()
-        return authority
-    }
-
-    nonisolated private static func resolveBoundViewerTimingAuthority(
-        projectID: UUID,
-        projectURL: URL,
-        outputURL: URL,
-        projectRunLeaseOwner: AppProjectRunLeaseOwner,
-        pairOperations: PublishedResultPairOperations
-    ) throws -> BoundResultViewerTimingAuthority? {
-        let paths = ProjectPaths(root: projectURL)
-        guard outputURL.standardizedFileURL.path
-                == paths.outputSplatURL.standardizedFileURL.path else {
-            return nil
-        }
-        return try projectRunLeaseOwner.withValidatedProjectRootDescriptor {
-            projectRootDescriptor in
-            try Task.checkCancellation()
-            let projectRootIdentity = try AppProjectRootIdentity.capture(
-                descriptor: projectRootDescriptor
-            )
-            let metadata = try ProjectMetadataStore.load(
-                fromProjectRootDescriptor: projectRootDescriptor
-            )
-            guard metadata.id == projectID,
-                  metadata.state.stage == .done,
-                  metadata.state.lastError == nil,
-                  metadata.checkpoint == nil,
-                  metadata.lastRunStartedAt == nil,
-                  metadata.pendingPublicationID == nil,
-                  let resolvedRunPlan = metadata.resolvedRunPlan,
-                  let result = try PublishedResultPublisher
-                    .resolveCompletedTraining(
-                        metadata: metadata,
-                        resolvedRunPlan: resolvedRunPlan,
-                        paths: paths,
-                        projectRootDescriptor: projectRootDescriptor,
-                        pairOperations: pairOperations,
-                        shouldCancel: { Task.isCancelled }
-                    ),
-                  result.receipt.projectID == projectID,
-                  let generation = result.generation,
-                  result.outputURL.standardizedFileURL.path
-                    == outputURL.standardizedFileURL.path else {
-                return nil
-            }
-            try Task.checkCancellation()
-            return BoundResultViewerTimingAuthority(
-                publicationID: result.receipt.publicationID,
-                generation: generation,
-                projectRootIdentity: projectRootIdentity,
-                elapsedSeconds: result.receipt.presentation
-                    .createToViewerReadySeconds
-            )
-        }
     }
 
     func completeStop(

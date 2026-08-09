@@ -395,18 +395,36 @@ struct ProcessingView: View {
                 Text(Self.failureMessage(model.lastError))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                if model.hasValidatedPreviousResult {
+                    Text(Self.previousResultAvailableMessage)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier(
+                            "processing.previousResultAvailable"
+                        )
+                }
             }
             .accessibilityElement(children: .combine)
 
             HStack(spacing: 12) {
-                if model.failureRetryAllowed {
-                    Button(Self.failureActionTitle(recovery: model.validationRecovery)) {
-                        model.retryAfterFailure()
+                if model.hasValidatedPreviousResult,
+                   let projectURL = model.currentProjectURL {
+                    Button("View Previous Result") {
+                        _ = model.viewPreviousResult(at: projectURL)
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!canTryAgain || model.isStopping || model.isRunActive)
-                    .accessibilityIdentifier("processing.tryAgain")
+                    .disabled(model.isStopping || model.isRunActive)
+                    .accessibilityIdentifier("processing.viewPreviousResult")
+                }
+                if model.failureRetryAllowed {
+                    if model.hasValidatedPreviousResult {
+                        failureRetryButton
+                    } else {
+                        failureRetryButton
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
+                    }
                 }
 
                 Button("Back to Projects") {
@@ -434,6 +452,14 @@ struct ProcessingView: View {
                 }
             }
         }
+    }
+
+    private var failureRetryButton: some View {
+        Button(Self.failureActionTitle(recovery: model.validationRecovery)) {
+            model.retryAfterFailure()
+        }
+        .disabled(!canTryAgain || model.isStopping || model.isRunActive)
+        .accessibilityIdentifier("processing.tryAgain")
     }
 
     private var technicalDetails: some View {
@@ -495,6 +521,9 @@ struct ProcessingView: View {
         let trimmed = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? "No error details were reported." : trimmed
     }
+
+    nonisolated static let previousResultAvailableMessage =
+        "Your previous splat is still available."
 
     nonisolated static func phaseProgress(stage: PipelineStage?, progress: Double?) -> Double? {
         guard let progress, let stage else { return nil }

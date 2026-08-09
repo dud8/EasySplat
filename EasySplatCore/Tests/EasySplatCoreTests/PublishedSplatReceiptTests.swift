@@ -765,7 +765,7 @@ final class PublishedSplatReceiptTests: XCTestCase {
         }
     }
 
-    func testReceiptRequiresExactFrozenTrainerBudgetForProfileAndMemoryTier() throws {
+    func testReceiptRequiresCurrentOrSanctionedLegacyTrainerBudget() throws {
         let input = InputSpec.photos(folder: "Inputs/photos")
         let cases: [(
             detail: DetailProfile,
@@ -820,6 +820,23 @@ final class PublishedSplatReceiptTests: XCTestCase {
         )
         XCTAssertEqual(balancedPerformancePlan.trainerIterationLimit, 30_000)
 
+        var legacyBalancedPlan = balancedPerformancePlan
+        legacyBalancedPlan.trainerIterationLimit = 7_000
+        legacyBalancedPlan.plateauWindow = 800
+        XCTAssertNoThrow(try PublishedSplatReceiptStore.encode(makeReceipt(
+            requestedRunOptions: balancedOptions,
+            resolvedRunPlan: legacyBalancedPlan
+        )))
+
+        var mixedLegacyBudget = legacyBalancedPlan
+        mixedLegacyBudget.plateauWindow = 1_600
+        XCTAssertThrowsError(try PublishedSplatReceiptStore.encode(makeReceipt(
+            requestedRunOptions: balancedOptions,
+            resolvedRunPlan: mixedLegacyBudget
+        ))) {
+            XCTAssertEqual($0 as? PublishedSplatReceiptStoreError, .invalidReceipt)
+        }
+
         var wrongIterationLimit = balancedPerformancePlan
         wrongIterationLimit.trainerIterationLimit = 20_000
         XCTAssertThrowsError(try PublishedSplatReceiptStore.encode(makeReceipt(
@@ -846,6 +863,23 @@ final class PublishedSplatReceiptTests: XCTestCase {
         ))) {
             XCTAssertEqual($0 as? PublishedSplatReceiptStoreError, .invalidReceipt)
         }
+
+        var legacyHighDetailPlan = RunPlanResolver.resolve(
+            requestedOptions: highDetailOptions,
+            input: input,
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none
+        )
+        legacyHighDetailPlan.trainerIterationLimit = 15_000
+        legacyHighDetailPlan.plateauWindow = 1_500
+        XCTAssertNoThrow(try PublishedSplatReceiptStore.encode(makeReceipt(
+            requestedRunOptions: highDetailOptions,
+            resolvedRunPlan: legacyHighDetailPlan
+        )))
     }
 
     func testReceiptRequiresExactFrozenPairingPolicyAndTuple() throws {

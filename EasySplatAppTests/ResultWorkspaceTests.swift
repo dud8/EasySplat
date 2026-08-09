@@ -2220,10 +2220,12 @@ final class ResultWorkspaceTests: XCTestCase {
         let model = AppModel(
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base,
-            finishedOutputValidator: { _ in
+            publishedResultResolver: { projectURL in
                 validationStarted.signal()
                 _ = allowValidationToFinish.wait(timeout: .now() + 2)
-                return firstOutput
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
             }
         )
         model.currentProjectURL = firstProject
@@ -2257,11 +2259,13 @@ final class ResultWorkspaceTests: XCTestCase {
         let model = AppModel(
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base,
-            finishedOutputValidator: { _ in
+            publishedResultResolver: { projectURL in
                 validationThread.record(isMainThread: Thread.isMainThread)
                 validationStarted.signal()
                 _ = allowValidationToFinish.wait(timeout: .now() + 2)
-                return outputURL
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
             }
         )
         model.currentProjectURL = projectURL
@@ -2307,10 +2311,12 @@ final class ResultWorkspaceTests: XCTestCase {
         let model = AppModel(
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base,
-            finishedOutputValidator: { _ in
+            publishedResultResolver: { projectURL in
                 validationStarted.signal()
                 _ = allowValidationToFinish.wait(timeout: .now() + 2)
-                return firstOutput
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
             }
         )
         model.currentProjectURL = firstProject
@@ -3318,6 +3324,148 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    func testFailedRetrainPreviousResultRemainsExportableAndShareable() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fixture = try makeFailedRetrainPreviousResult(in: base)
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        defer { model.cancelSharing() }
+        model.currentProjectURL = fixture.projectURL
+        model.outputPlyURL = fixture.result.outputURL
+
+        let exportURL = try await model.validatedCurrentSplatForExport()
+        XCTAssertEqual(
+            exportURL.standardizedFileURL,
+            fixture.result.outputURL.standardizedFileURL
+        )
+
+        await model.prepareCurrentSplatForSharing()
+
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        XCTAssertTrue(model.isShareReady)
+        XCTAssertEqual(
+            prepared.source.publicationID,
+            fixture.result.receipt.publicationID
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: prepared.shareURL),
+            try Data(contentsOf: fixture.result.outputURL)
+        )
+        guard case .previous(let resolved) = try PublishedResultResolver.resolve(
+            projectURL: fixture.projectURL
+        ) else {
+            return XCTFail("Expected the failed retrain to retain previous-result authority")
+        }
+        XCTAssertEqual(
+            resolved.publishedResult.receipt.publicationID,
+            fixture.result.receipt.publicationID
+        )
+    }
+
+    @MainActor
+    func testPreviousResultExportAndShareRejectTamperedCanonicalPly() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fixture = try makeFailedRetrainPreviousResult(in: base)
+        let original = try Data(contentsOf: fixture.result.outputURL)
+        let handle = try FileHandle(forWritingTo: fixture.result.outputURL)
+        try handle.seek(toOffset: UInt64(original.count - 1))
+        try handle.write(contentsOf: Data([(try XCTUnwrap(original.last)) ^ 0xff]))
+        try handle.close()
+
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = fixture.projectURL
+        model.outputPlyURL = fixture.result.outputURL
+
+        do {
+            _ = try await model.validatedCurrentSplatForExport()
+            XCTFail("Tampered previous output must not be exportable")
+        } catch {
+            // Expected: every action performs a fresh authoritative resolution.
+        }
+
+        await model.prepareCurrentSplatForSharing()
+
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareReady)
+    }
+
+    @MainActor
+    func testPreparedPreviousShareSurvivesTimingOnlyReceiptUpdate() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fixture = try makeFailedRetrainPreviousResult(in: base)
+        let paths = ProjectPaths(root: fixture.projectURL)
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        defer { model.cancelSharing() }
+        model.currentProjectURL = fixture.projectURL
+        model.outputPlyURL = fixture.result.outputURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+
+        let updated = try PublishedResultPairStore.recordFirstViewerReadyTiming(
+            4.25,
+            expectedPublicationID: fixture.result.receipt.publicationID,
+            expectedGeneration: fixture.result.generation,
+            projectPaths: paths
+        )
+        XCTAssertEqual(
+            updated.receipt.publicationID,
+            fixture.result.receipt.publicationID
+        )
+        XCTAssertNotEqual(updated.generation, fixture.result.generation)
+
+        var presentationCount = 0
+        await model.presentPreparedShare(
+            from: NSButton(),
+            presenter: { _, _, _, _ in presentationCount += 1 }
+        )
+
+        XCTAssertEqual(presentationCount, 1)
+        XCTAssertNotNil(model.activeShareSession)
+        XCTAssertEqual(model.test_preparedShareItem(), prepared)
+        XCTAssertNil(model.shareStatusMessage)
+    }
+
+    @MainActor
+    func testProjectSummaryRefreshDropsStalePreviousResultHintAfterReceiptTamper() throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fixture = try makeFailedRetrainPreviousResult(in: base)
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+
+        model.refreshProjectSummaries()
+
+        var summary = try XCTUnwrap(model.projectSummaries.first)
+        XCTAssertEqual(summary.status, .failed)
+        XCTAssertTrue(summary.hasPreviousResultHint)
+        XCTAssertTrue(ProjectListFilter.failed.matches(summary))
+
+        try Data(#"{"schemaVersion":2,"future":"untouched"}"#.utf8).write(
+            to: ProjectPaths(root: fixture.projectURL).outputSplatReceiptURL,
+            options: .atomic
+        )
+        model.refreshProjectSummaries()
+
+        summary = try XCTUnwrap(model.projectSummaries.first)
+        XCTAssertEqual(summary.status, .failed)
+        XCTAssertFalse(summary.hasPreviousResultHint)
+        XCTAssertTrue(ProjectListFilter.failed.matches(summary))
+    }
+
+    @MainActor
     func testCancellingExportCancelsDetachedPublicationAndPreservesDestination() async throws {
         let base = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: base) }
@@ -3433,11 +3581,11 @@ final class ResultWorkspaceTests: XCTestCase {
         let model = AppModel(
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base,
-            finishedOutputValidator: { requestedProjectURL in
+            publishedResultResolver: { requestedProjectURL in
                 observation.record(isMainThread: Thread.isMainThread)
-                return requestedProjectURL.standardizedFileURL == projectURL.standardizedFileURL
-                    ? outputURL
-                    : nil
+                return try PublishedResultResolver.resolve(
+                    projectURL: requestedProjectURL
+                )
             }
         )
         model.currentProjectURL = projectURL
@@ -3702,6 +3850,51 @@ final class ResultWorkspaceTests: XCTestCase {
         return projectURL
     }
 
+    private struct FailedRetrainPreviousResultFixture {
+        let projectURL: URL
+        let result: ValidatedPublishedResult
+    }
+
+    private func makeFailedRetrainPreviousResult(
+        in base: URL
+    ) throws -> FailedRetrainPreviousResultFixture {
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let sourceURL = paths.trainingURL.appendingPathComponent(
+            "previous-result-source.ply",
+            isDirectory: false
+        )
+        try FileManager.default.copyItem(at: paths.outputSplatURL, to: sourceURL)
+        try FileManager.default.removeItem(at: paths.outputSplatURL)
+        let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let result = try publishAppTestResultFixture(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: UUID(
+                uuidString: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            )!
+        )
+        _ = try ProjectMetadataStore.update(at: paths.metadataURL) { latest in
+            latest.requestedRunOptions.detailProfile = .highDetail
+            latest.state = PipelineState(
+                stage: .trainSplat,
+                lastError: "The retrain failed."
+            )
+            latest.pendingPublicationID = UUID()
+            latest.lastRunStartedAt = nil
+            latest.lastFailureAt = Date(timeIntervalSince1970: 1_767_225_700)
+        }
+        return FailedRetrainPreviousResultFixture(
+            projectURL: projectURL,
+            result: result
+        )
+    }
+
     private func writeResultPly(to url: URL) throws {
         let text = """
         ply
@@ -3725,6 +3918,9 @@ final class ResultWorkspaceTests: XCTestCase {
         0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0
         """
         try text.write(to: url, atomically: true, encoding: .utf8)
+        guard Darwin.chmod(url.path, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     @MainActor

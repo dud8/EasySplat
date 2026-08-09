@@ -30,6 +30,11 @@ enum RunValidationRecovery: Equatable, Sendable {
     }
 }
 
+enum PreviousResultAttemptOutcome: Equatable, Sendable {
+    case failed
+    case interrupted
+}
+
 struct ProjectPublicationCheckpointHook: Sendable {
     static let none = ProjectPublicationCheckpointHook()
 
@@ -192,6 +197,12 @@ final class AppProjectRunLeaseOwner: @unchecked Sendable {
 @MainActor
 final class AppModel: ObservableObject {
     typealias FinishedOutputValidator = @Sendable (URL) -> URL?
+    typealias PublishedResultResolverOperation = @Sendable (
+        URL
+    ) throws -> ResolvedPublishedResult
+    typealias PublishedResultPreservationOperation = @Sendable (
+        URL
+    ) throws -> ValidatedPublishedResult
     typealias SubjectIsolationCoordinatorFactory =
         @Sendable () -> any SubjectIsolationCoordinating
     typealias SubjectIsolationArtifactLoader =
@@ -254,6 +265,10 @@ final class AppModel: ObservableObject {
     @Published var currentRunOptions: RequestedRunOptions? = nil
     @Published var currentInput: InputSpec? = nil
     @Published var currentProjectNotes: String = ""
+    @Published var currentViewerPreferences = ViewerPreferences()
+    @Published var resolvedPublishedResult: ResolvedPublishedResult? = nil
+    @Published var hasValidatedPreviousResult = false
+    @Published var previousResultAttemptOutcome: PreviousResultAttemptOutcome?
     @Published var notesSaveState: NotesSaveState = .idle
     @Published var currentProjectURL: URL? = nil
     @Published var stopAction: StopAction? = nil
@@ -331,6 +346,8 @@ final class AppModel: ObservableObject {
     let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
     let powerAssertion: PowerAssertionManaging
     let finishedOutputValidator: FinishedOutputValidator
+    let publishedResultResolver: PublishedResultResolverOperation
+    let publishedResultPreserver: PublishedResultPreservationOperation
     let videoInputPreflight: VideoInputPreflight
     let datasetInputPreflight: DatasetInputPreflightOperation
     let projectPublicationCheckpointHook: ProjectPublicationCheckpointHook
@@ -467,7 +484,78 @@ final class AppModel: ObservableObject {
     }
 
     var displayedOutputSceneBounds: SplatSceneBounds? {
-        selectedSplatOutputVariant == .subject ? subjectOutput?.sceneBounds : nil
+        if selectedSplatOutputVariant == .subject {
+            return subjectOutput?.sceneBounds
+        }
+        return displayedPublishedResult?.outputEvidence.sceneBounds
+    }
+
+    var displayedPublishedResult: ValidatedPublishedResult? {
+        switch resolvedPublishedResult {
+        case .current(.receiptBound(let current)):
+            current.publishedResult
+        case .previous(let previous):
+            previous.publishedResult
+        case .current(.legacy), .unavailable, nil:
+            nil
+        }
+    }
+
+    var displayedResultSnapshot: ProjectArtifactSnapshot? {
+        switch resolvedPublishedResult {
+        case .current(.receiptBound(let current)):
+            current.snapshot
+        case .current(.legacy(let legacy)):
+            legacy.snapshot
+        case .previous, .unavailable, nil:
+            nil
+        }
+    }
+
+    var displayedResultPresentation: PublishedResultPresentation? {
+        switch resolvedPublishedResult {
+        case .current(.receiptBound(let current)):
+            current.presentation
+        case .previous(let previous):
+            previous.presentation
+        case .current(.legacy), .unavailable, nil:
+            nil
+        }
+    }
+
+    var displayedResultLiveProject: PublishedResultLiveProject? {
+        switch resolvedPublishedResult {
+        case .current(.receiptBound(let current)):
+            current.liveProject
+        case .current(.legacy(let legacy)):
+            legacy.liveProject
+        case .previous(let previous):
+            previous.liveProject
+        case .unavailable, nil:
+            nil
+        }
+    }
+
+    var isShowingPreviousResult: Bool {
+        if case .previous = resolvedPublishedResult { return true }
+        return false
+    }
+
+    var displayedPublicationID: UUID? {
+        displayedPublishedResult?.receipt.publicationID
+    }
+
+    var displayedPublicationGeneration: PublishedResultGeneration? {
+        displayedPublishedResult?.generation
+    }
+
+    var hasResolvedViewerPresentation: Bool {
+        switch resolvedPublishedResult {
+        case .current, .previous:
+            true
+        case .unavailable, nil:
+            false
+        }
     }
 
     var isTrainingStageActive: Bool {
@@ -695,6 +783,15 @@ final class AppModel: ObservableObject {
             )
         },
         resultViewerTimingPairOperations: PublishedResultPairOperations = .system(),
+        publishedResultResolver: @escaping PublishedResultResolverOperation = {
+            try PublishedResultResolver.resolve(projectURL: $0)
+        },
+        publishedResultPreserver:
+            @escaping PublishedResultPreservationOperation = {
+                try PublishedResultResolver.preserveCurrentResultForRetraining(
+                    projectURL: $0
+                )
+            },
         finishedOutputValidator: @escaping FinishedOutputValidator = { projectURL in
             AppModel.readyOutputURLOnDisk(
                 projectURL: projectURL,
@@ -711,6 +808,8 @@ final class AppModel: ObservableObject {
         self.projectBaseURL = projectBaseURL
         self.hardwareProfile = hardwareProfile ?? .detect()
         self.finishedOutputValidator = finishedOutputValidator
+        self.publishedResultResolver = publishedResultResolver
+        self.publishedResultPreserver = publishedResultPreserver
         self.videoInputPreflight = videoInputPreflight
         self.datasetInputPreflight = datasetInputPreflight
         self.projectPublicationCheckpointHook = projectPublicationCheckpointHook

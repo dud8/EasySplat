@@ -176,6 +176,7 @@ extension AppModel {
 
     func resultViewerDidBecomeReady(projectURL: URL, outputURL: URL) {
         guard viewState == .viewer,
+              !isShowingPreviousResult,
               ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
               ProjectSummary.hasSameLocation(outputPlyURL, outputURL),
               var pending = pendingResultViewerTiming,
@@ -625,32 +626,25 @@ extension AppModel {
         do {
             let acquired = try acquireAppProjectRunLeaseOwner(at: url)
             leaseOwner = acquired
-            _ = try updateProjectMetadata(
-                at: url,
-                leaseOwner: acquired
-            ) { metadata in
-                metadata.requestedRunOptions.detailProfile = profile
-            }
         } catch {
             presentProjectMutationFailure(
                 error,
-                fallbackTitle: "Couldn’t update project options"
+                fallbackTitle: "Couldn’t start re-training"
             )
             return false
         }
         guard let leaseOwner else { return false }
-        clearSubjectIsolationSession()
         let token = UUID()
         currentTaskToken = token
         currentRunOrigin = .retrain
         isRunActive = true
         currentProjectURL = url
         currentTask = Task { [self, leaseOwner] in
-            await resumeProjectTask(
+            await beginRetrainWithLease(
                 at: url,
+                profile: profile,
                 taskToken: token,
-                bypassFinishedOutput: true,
-                projectRunLeaseOwner: leaseOwner,
+                leaseOwner: leaseOwner,
                 timingBoundary: timingBoundary
             )
         }
@@ -674,13 +668,63 @@ extension AppModel {
         do {
             let acquired = try acquireAppProjectRunLeaseOwner(at: url)
             leaseOwner = acquired
+        } catch {
+            presentProjectMutationFailure(
+                error,
+                fallbackTitle: "Couldn’t start re-training"
+            )
+            finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
+            return
+        }
+        guard let leaseOwner, isCurrentTaskToken(taskToken) else { return }
+        currentProjectURL = url
+        leaseOwnershipTransferred = true
+        await beginRetrainWithLease(
+            at: url,
+            profile: profile,
+            taskToken: taskToken,
+            leaseOwner: leaseOwner,
+            timingBoundary: timingBoundary
+        )
+    }
+
+    private func beginRetrainWithLease(
+        at url: URL,
+        profile: DetailProfile,
+        taskToken: UUID,
+        leaseOwner: AppProjectRunLeaseOwner,
+        timingBoundary: RunTimingBoundary
+    ) async {
+        do {
+            _ = try await preservePublishedResultForRetraining(at: url)
+            try Task.checkCancellation()
+            guard isCurrentTaskToken(taskToken) else {
+                leaseOwner.release()
+                return
+            }
+        } catch is CancellationError {
+            leaseOwner.release()
+            finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
+            return
+        } catch {
+            leaseOwner.release()
+            actionFailure = ActionFailurePresentation(
+                title: "Couldn’t start re-training",
+                message: "EasySplat couldn’t preserve the current splat for retraining. The existing result is unchanged."
+            )
+            finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
+            return
+        }
+
+        do {
             _ = try updateProjectMetadata(
                 at: url,
-                leaseOwner: acquired
+                leaseOwner: leaseOwner
             ) { metadata in
                 metadata.requestedRunOptions.detailProfile = profile
             }
         } catch {
+            leaseOwner.release()
             presentProjectMutationFailure(
                 error,
                 fallbackTitle: "Couldn’t update project options"
@@ -688,10 +732,12 @@ extension AppModel {
             finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
             return
         }
-        guard let leaseOwner, isCurrentTaskToken(taskToken) else { return }
+        guard isCurrentTaskToken(taskToken) else {
+            leaseOwner.release()
+            return
+        }
         clearSubjectIsolationSession()
         currentProjectURL = url
-        leaseOwnershipTransferred = true
         await resumeProjectTask(
             at: url,
             taskToken: taskToken,
@@ -1162,6 +1208,11 @@ extension AppModel {
             } else {
                 status = .inProgress
             }
+            let hasPreviousResultHint = PublishedResultResolver
+                .hasQuickPreviousResultHint(
+                    projectURL: url,
+                    metadata: metadata
+                )
             let sidecarOpened = LastOpenedSidecar.load(from: ProjectPaths(root: url).lastOpenedSidecarURL)
             summaries.append(ProjectSummary(
                 id: metadata.id,
@@ -1169,6 +1220,7 @@ extension AppModel {
                 url: url,
                 createdAt: metadata.createdAt,
                 status: status,
+                hasPreviousResultHint: hasPreviousResultHint,
                 isActive: isActive,
                 isInterrupted: isInterrupted,
                 checkpointUpdatedAt: metadata.checkpoint?.updatedAt,

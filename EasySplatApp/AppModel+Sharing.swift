@@ -1338,13 +1338,13 @@ extension AppModel {
         let token = UUID()
         sharePreparationToken = token
         isPreparingShare = true
-        let validator = finishedOutputValidator
+        let resolver = publishedResultResolver
         let subjectLoader = subjectIsolationArtifactLoader
         let validation = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try Self.isPreparedShareItemCurrent(
                 preparedItem,
-                validator: validator,
+                resolver: resolver,
                 subjectLoader: subjectLoader
             )
         }
@@ -1493,48 +1493,73 @@ extension AppModel {
         isShareReady = false
     }
 
-    private nonisolated static func currentShareArtifactStillMatches(
-        _ preparedItem: PreparedShareItem,
-        projectURL: URL
-    ) -> Bool {
-        guard preparedItem.source.variant == .original else {
-            return false
-        }
-        guard let snapshot = try? ProjectArtifactSnapshotStore.load(projectURL: projectURL) else {
-            return false
-        }
-        guard let trainingArtifact = snapshot.trainingArtifact,
-              let identity = expectedPlyIdentity(from: trainingArtifact) else {
-            return false
-        }
-        return identity == preparedItem.source.expectedIdentity
-    }
-
     private nonisolated static func isPreparedShareItemCurrent(
         _ preparedItem: PreparedShareItem,
-        validator: FinishedOutputValidator,
+        resolver: PublishedResultResolverOperation,
         subjectLoader: SubjectIsolationArtifactLoader
     ) throws -> Bool {
+        let resolvedResult = try resolver(preparedItem.projectURL)
         let currentOutputURL: URL
+        let verifiedOutputSHA256: String
         switch preparedItem.source.variant {
         case .original:
-            guard let validatedOutputURL = validator(preparedItem.projectURL),
+            let resolvedOutputURL: URL
+            let identity: ExpectedPlyArtifactIdentity
+            let publicationID: UUID?
+            switch resolvedResult {
+            case .current(.receiptBound(let current)):
+                resolvedOutputURL = current.publishedResult.outputURL
+                identity = expectedPlyIdentity(
+                    from: current.publishedResult.outputEvidence
+                )
+                publicationID = current.publishedResult.receipt.publicationID
+            case .current(.legacy(let legacy)):
+                guard let legacyIdentity = expectedPlyIdentity(
+                    from: legacy.snapshot.trainingArtifact
+                ) else {
+                    return false
+                }
+                resolvedOutputURL = legacy.outputURL
+                identity = legacyIdentity
+                publicationID = nil
+            case .previous(let previous):
+                resolvedOutputURL = previous.publishedResult.outputURL
+                identity = expectedPlyIdentity(
+                    from: previous.publishedResult.outputEvidence
+                )
+                publicationID = previous.publishedResult.receipt.publicationID
+            case .unavailable:
+                return false
+            }
+            guard publicationID == preparedItem.source.publicationID,
+                  identity == preparedItem.source.expectedIdentity,
                   ProjectSummary.hasSameLocation(
-                      validatedOutputURL,
-                      preparedItem.outputURL
-                  ),
-                  currentShareArtifactStillMatches(
-                      preparedItem,
-                      projectURL: preparedItem.projectURL
+                    resolvedOutputURL,
+                    preparedItem.outputURL
                   ) else {
                 return false
             }
-            currentOutputURL = validatedOutputURL
+            currentOutputURL = resolvedOutputURL
+            verifiedOutputSHA256 = identity.sha256
 
         case .subject:
-            guard case .valid(_, let output) = subjectLoader(
+            let currentPublicationID: UUID?
+            switch resolvedResult {
+            case .current(.receiptBound(let current)):
+                currentPublicationID = current.publishedResult.receipt.publicationID
+            case .current(.legacy):
+                currentPublicationID = nil
+            case .previous(let previous):
+                currentPublicationID = previous.publishedResult.receipt.publicationID
+            case .unavailable:
+                return false
+            }
+            guard currentPublicationID == preparedItem.source.publicationID,
+                  case .valid(let artifact, let output) = subjectLoader(
                 ProjectPaths(root: preparedItem.projectURL)
             ),
+            currentPublicationID == nil
+                || artifact.sourcePublicationID == currentPublicationID,
             output.variant == .subject,
             ProjectSummary.hasSameLocation(
                 output.url,
@@ -1545,11 +1570,12 @@ extension AppModel {
                 return false
             }
             currentOutputURL = output.url
+            verifiedOutputSHA256 = output.sha256
         }
 
-        guard try ShareFileSnapshot.capture(
+        guard ShareFileSnapshot.captureIdentity(
             at: currentOutputURL,
-            shouldCancel: { Task.isCancelled }
+            verifiedSHA256: verifiedOutputSHA256
         ) == preparedItem.outputSnapshot,
         try ShareFileSnapshot.capture(
             at: preparedItem.shareURL,

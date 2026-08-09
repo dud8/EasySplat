@@ -506,14 +506,6 @@ final class SubjectIsolationAppModelTests: XCTestCase {
     func testReadyProjectReopenLoadsValidSubjectButDefaultsToOriginal() async throws {
         let fixture = try makeViewerFixture()
         defer { fixture.cleanup() }
-        try ProjectMetadataStore.save(
-            ProjectMetadata(
-                title: "Viewer",
-                input: .video(files: []),
-                state: PipelineState(stage: .done, lastError: nil)
-            ),
-            to: fixture.paths.metadataURL
-        )
         let model = AppModel(
             toolchainManager: RecordingIsolationToolchainManager(
                 paths: makeIsolationToolchainPaths()
@@ -521,11 +513,13 @@ final class SubjectIsolationAppModelTests: XCTestCase {
             projectBaseURL: fixture.base,
             subjectIsolationArtifactLoader: { _ in
                 .valid(
-                    makeIsolationArtifact(output: fixture.subjectOutput),
+                    makeIsolationArtifact(
+                        output: fixture.subjectOutput,
+                        sourcePublicationID: fixture.publicationID
+                    ),
                     fixture.subjectOutput
                 )
-            },
-            finishedOutputValidator: { _ in fixture.originalURL }
+            }
         )
 
         XCTAssertTrue(model.resumeProject(at: fixture.projectURL))
@@ -539,17 +533,90 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         XCTAssertEqual(model.displayedOutputURL, fixture.originalURL)
     }
 
+    func testPreviousResultLoadsSubjectBoundToSamePublication() async throws {
+        let fixture = try makeViewerFixture()
+        defer { fixture.cleanup() }
+        _ = try ProjectMetadataStore.update(at: fixture.paths.metadataURL) {
+            metadata in
+            metadata.state = PipelineState(
+                stage: .trainSplat,
+                lastError: "The retrain failed."
+            )
+            metadata.pendingPublicationID = UUID()
+            metadata.lastFailureAt = Date(timeIntervalSince1970: 1_767_225_900)
+        }
+        let operation = RecordingSubjectIsolationCoordinator(outcome: .noSubject)
+        let model = AppModel(
+            toolchainManager: RecordingIsolationToolchainManager(
+                paths: makeIsolationToolchainPaths()
+            ),
+            projectBaseURL: fixture.base,
+            subjectIsolationCoordinatorFactory: { operation },
+            subjectIsolationArtifactLoader: { _ in
+                .valid(
+                    makeIsolationArtifact(
+                        output: fixture.subjectOutput,
+                        sourcePublicationID: fixture.publicationID
+                    ),
+                    fixture.subjectOutput
+                )
+            }
+        )
+
+        XCTAssertTrue(model.viewPreviousResult(at: fixture.projectURL))
+        try await waitUntil {
+            model.viewState == .viewer && !model.isRunActive
+        }
+
+        XCTAssertTrue(model.isShowingPreviousResult)
+        XCTAssertEqual(model.subjectOutput, fixture.subjectOutput)
+        XCTAssertEqual(model.selectedSplatOutputVariant, .original)
+        XCTAssertTrue(model.startSubjectIsolation())
+        try await waitUntil { !model.isSubjectIsolationActive }
+    }
+
+    func testPreviousResultRejectsSubjectBoundToDifferentPublication() async throws {
+        let fixture = try makeViewerFixture()
+        defer { fixture.cleanup() }
+        _ = try ProjectMetadataStore.update(at: fixture.paths.metadataURL) {
+            metadata in
+            metadata.state = PipelineState(
+                stage: .trainSplat,
+                lastError: "The retrain failed."
+            )
+            metadata.pendingPublicationID = UUID()
+            metadata.lastFailureAt = Date(timeIntervalSince1970: 1_767_225_900)
+        }
+        let model = AppModel(
+            toolchainManager: RecordingIsolationToolchainManager(
+                paths: makeIsolationToolchainPaths()
+            ),
+            projectBaseURL: fixture.base,
+            subjectIsolationArtifactLoader: { _ in
+                .valid(
+                    makeIsolationArtifact(
+                        output: fixture.subjectOutput,
+                        sourcePublicationID: UUID()
+                    ),
+                    fixture.subjectOutput
+                )
+            }
+        )
+
+        XCTAssertTrue(model.viewPreviousResult(at: fixture.projectURL))
+        try await waitUntil {
+            model.viewState == .viewer && !model.isRunActive
+        }
+
+        XCTAssertTrue(model.isShowingPreviousResult)
+        XCTAssertNil(model.subjectOutput)
+        XCTAssertEqual(model.selectedSplatOutputVariant, .original)
+        XCTAssertFalse(model.startSubjectIsolation())
+    }
+
     func testRetrainClearsSessionSubjectBeforeStartingAndReloadsAfterCompletion() async throws {
         let fixture = try makeViewerFixture()
         defer { fixture.cleanup() }
-        try ProjectMetadataStore.save(
-            ProjectMetadata(
-                title: "Viewer",
-                input: .video(files: []),
-                state: PipelineState(stage: .done, lastError: nil)
-            ),
-            to: fixture.paths.metadataURL
-        )
         let model = AppModel(
             toolchainManager: RecordingIsolationToolchainManager(
                 paths: makeIsolationToolchainPaths()
@@ -561,8 +628,7 @@ final class SubjectIsolationAppModelTests: XCTestCase {
                 gpuWorkingSetGB: 36
             ),
             pipelineRunnerFactory: { _, _ in InstantPipelineRunner() },
-            subjectIsolationArtifactLoader: { _ in .noArtifact },
-            finishedOutputValidator: { _ in fixture.originalURL }
+            subjectIsolationArtifactLoader: { _ in .noArtifact }
         )
         model.viewState = .viewer
         model.currentProjectURL = fixture.projectURL
@@ -573,8 +639,10 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         XCTAssertTrue(
             model.retrainProject(at: fixture.projectURL, profile: .balanced)
         )
-        XCTAssertNil(model.subjectOutput)
-        XCTAssertEqual(model.selectedSplatOutputVariant, .original)
+        try await waitUntil {
+            model.subjectOutput == nil
+                && model.selectedSplatOutputVariant == .original
+        }
         try await waitUntil {
             model.viewState == .viewer && !model.isRunActive
         }
@@ -582,14 +650,21 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         XCTAssertEqual(model.outputPlyURL, fixture.originalURL)
     }
 
-    func testFailedRetrainKeepsValidSessionSubjectAvailable() throws {
+    func testFailedRetrainKeepsValidSessionSubjectAvailable() async throws {
+        enum PreservationFailure: Error {
+            case injected
+        }
+
         let fixture = try makeViewerFixture()
         defer { fixture.cleanup() }
         let model = AppModel(
             toolchainManager: RecordingIsolationToolchainManager(
                 paths: makeIsolationToolchainPaths()
             ),
-            projectBaseURL: fixture.base
+            projectBaseURL: fixture.base,
+            publishedResultPreserver: { _ in
+                throw PreservationFailure.injected
+            }
         )
         model.viewState = .viewer
         model.currentProjectURL = fixture.projectURL
@@ -597,13 +672,21 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         model.subjectOutput = fixture.subjectOutput
         model.selectedSplatOutputVariant = .subject
 
-        XCTAssertFalse(
+        XCTAssertTrue(
             model.retrainProject(at: fixture.projectURL, profile: .balanced)
         )
+        try await waitUntil { !model.isRunActive }
         XCTAssertEqual(model.subjectOutput, fixture.subjectOutput)
         XCTAssertEqual(model.selectedSplatOutputVariant, .subject)
         XCTAssertEqual(model.displayedOutputURL, fixture.subjectOutput.url)
         XCTAssertFalse(model.isRunActive)
+        XCTAssertEqual(
+            model.actionFailure,
+            AppModel.ActionFailurePresentation(
+                title: "Couldn’t start re-training",
+                message: "EasySplat couldn’t preserve the current splat for retraining. The existing result is unchanged."
+            )
+        )
     }
 
     private func temporaryDirectory() throws -> URL {
@@ -626,7 +709,35 @@ final class SubjectIsolationAppModelTests: XCTestCase {
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
-        try Data("original".utf8).write(to: paths.outputSplatURL)
+        var metadata = ProjectMetadata(
+            title: "Viewer",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let sourceURL = paths.trainingURL.appendingPathComponent(
+            "subject-app-test-source.ply"
+        )
+        try writeSubjectAppTestPly(at: sourceURL)
+        let publishedResult = try publishAppTestResultFixture(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata
+        )
         try Data("subject".utf8).write(to: paths.isolatedOutputURL)
         let output = ValidatedSplatOutput(
             variant: .subject,
@@ -644,7 +755,8 @@ final class SubjectIsolationAppModelTests: XCTestCase {
             projectURL: projectURL,
             paths: paths,
             originalURL: paths.outputSplatURL,
-            subjectOutput: output
+            subjectOutput: output,
+            publicationID: publishedResult.receipt.publicationID
         )
     }
 
@@ -706,6 +818,7 @@ private struct ViewerFixture {
     let paths: ProjectPaths
     let originalURL: URL
     let subjectOutput: ValidatedSplatOutput
+    let publicationID: UUID
 
     func cleanup() {
         try? FileManager.default.removeItem(at: base)
@@ -729,9 +842,11 @@ private func makeChoiceRequest(in paths: ProjectPaths) -> SubjectChoiceRequest {
 }
 
 private func makeIsolationArtifact(
-    output: ValidatedSplatOutput
+    output: ValidatedSplatOutput,
+    sourcePublicationID: UUID? = nil
 ) -> IsolationArtifact {
     IsolationArtifact(
+        sourcePublicationID: sourcePublicationID,
         sourcePlySHA256: String(repeating: "1", count: 64),
         trainingManifestSHA256: String(repeating: "2", count: 64),
         dataset: .init(
@@ -771,6 +886,31 @@ private func makeIsolationArtifact(
             sceneBounds: output.sceneBounds
         )
     )
+}
+
+private func writeSubjectAppTestPly(at url: URL) throws {
+    let text = """
+    ply
+    format ascii 1.0
+    element vertex 1
+    property float x
+    property float y
+    property float z
+    property float f_dc_0
+    property float f_dc_1
+    property float f_dc_2
+    property float opacity
+    property float scale_0
+    property float scale_1
+    property float scale_2
+    property float rot_0
+    property float rot_1
+    property float rot_2
+    property float rot_3
+    end_header
+    0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0
+    """
+    try Data(text.utf8).write(to: url)
 }
 
 private func makeIsolationToolchainPaths() -> ToolchainPaths {

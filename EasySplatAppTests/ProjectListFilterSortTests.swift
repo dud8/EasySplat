@@ -20,6 +20,7 @@ final class ProjectListFilterSortTests: XCTestCase {
             url: url ?? URL(fileURLWithPath: "/tmp/\(id.uuidString).easysplatproj"),
             createdAt: createdAt,
             status: status,
+            hasPreviousResultHint: false,
             isActive: false,
             isInterrupted: false,
             checkpointUpdatedAt: nil,
@@ -337,6 +338,14 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertNil(ProjectSidebar.rowCaption(status: .ready, isInterrupted: false))
         XCTAssertEqual(ProjectSidebar.rowCaption(status: .inProgress, isInterrupted: false), "In Progress")
         XCTAssertEqual(ProjectSidebar.rowCaption(status: .failed, isInterrupted: false), "Failed")
+        XCTAssertEqual(
+            ProjectSidebar.rowCaption(
+                status: .failed,
+                isInterrupted: false,
+                hasPreviousResultHint: true
+            ),
+            "Failed · Previous result available"
+        )
         XCTAssertEqual(ProjectSidebar.rowCaption(status: .ready, isInterrupted: true), "Unfinished")
         XCTAssertEqual(ProjectSidebar.rowCaption(status: .inProgress, isInterrupted: true), "Unfinished")
     }

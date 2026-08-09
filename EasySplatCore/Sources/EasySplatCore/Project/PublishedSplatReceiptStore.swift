@@ -1168,11 +1168,23 @@ private extension PublishedSplatReceiptStore {
         ) else {
             throw PublishedSplatReceiptStoreError.invalidReceipt
         }
+        let trainerBudgetIsCurrent =
+            plan.trainerIterationLimit == expectedTrainerBudget.iterations
+            && plan.plateauWindow == expectedTrainerBudget.plateau
+        let trainerBudgetIsSanctionedLegacy: Bool = switch requested.detailProfile {
+        case .fast:
+            false
+        case .balanced:
+            plan.trainerIterationLimit == 7_000
+                && plan.plateauWindow == 800
+        case .highDetail:
+            plan.trainerIterationLimit == 15_000
+                && plan.plateauWindow == 1_500
+        }
         let expectedPairing = v1PairingConfiguration(for: plan.pairingPolicy)
 
         guard requested.lensProjection == plan.lensProjection,
-              plan.trainerIterationLimit == expectedTrainerBudget.iterations,
-              plan.plateauWindow == expectedTrainerBudget.plateau,
+              trainerBudgetIsCurrent || trainerBudgetIsSanctionedLegacy,
               requested.resourcePolicy != .conserveMemory
                 || plan.memoryTier == "constrained",
               plan.temporalPairing == expectedPairing.temporalPairing,
@@ -1383,9 +1395,11 @@ private extension PublishedSplatReceiptStore {
         }
     }
 
-    /// Frozen schema-v1 copy of the trainer schedule emitted by the resolver
-    /// when schema v1 was introduced. Runtime tuning changes must not broaden
-    /// or reinterpret an already-published receipt.
+    /// Frozen schema-v1 copy of the tiered trainer schedule emitted when the
+    /// receipt was introduced. `validateRequestedResolution` additionally
+    /// recognizes the two fixed pre-tier schedules so a fully validated legacy
+    /// result can receive its one-time authority receipt without rewriting its
+    /// historical run facts. No arbitrary cross-tier schedule is accepted.
     static func v1TrainerBudget(
         detail: DetailProfile,
         memoryTier: String

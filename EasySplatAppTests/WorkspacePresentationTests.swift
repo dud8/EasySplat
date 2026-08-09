@@ -15,9 +15,39 @@ final class WorkspacePresentationTests: XCTestCase {
         XCTAssertTrue(ProjectSidebar.opensOnSelection(status: .ready))
         XCTAssertFalse(ProjectSidebar.opensOnSelection(status: .inProgress))
         XCTAssertFalse(ProjectSidebar.opensOnSelection(status: .failed))
+        XCTAssertTrue(ProjectSidebar.opensOnSelection(
+            status: .failed,
+            hasPreviousResultHint: true
+        ))
         XCTAssertEqual(ProjectSidebar.rowActionTitle(status: .inProgress), "Resume")
         XCTAssertEqual(ProjectSidebar.rowActionTitle(status: .failed), "Try Again")
+        XCTAssertEqual(
+            ProjectSidebar.rowActionTitle(
+                status: .failed,
+                hasPreviousResultHint: true
+            ),
+            "View Previous Result"
+        )
         XCTAssertNil(ProjectSidebar.rowActionTitle(status: .ready))
+    }
+
+    func testFailedRetrainCopySeparatesPreviousResultFromRetry() {
+        XCTAssertEqual(
+            ProcessingView.previousResultAvailableMessage,
+            "Your previous splat is still available."
+        )
+        XCTAssertEqual(
+            ViewerView.previousResultBanner,
+            "Retrain failed — showing the previous result."
+        )
+        XCTAssertEqual(
+            ViewerView.previousResultBanner(for: .interrupted),
+            "Run interrupted — showing the previous result."
+        )
+        XCTAssertEqual(
+            ViewerView.retrainPreservationMessage,
+            "Your current splat stays available unless the new one finishes."
+        )
     }
 
     func testSetupStopCopyDoesNotPromiseAProjectOrCheckpoint() {

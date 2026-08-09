@@ -1253,6 +1253,304 @@ package enum PublishedResultPairStore {
         }
     }
 
+    /// Adds authority to a fully validated legacy canonical PLY without
+    /// replacing, truncating, or relinking that PLY. This deliberately is a
+    /// one-way compatibility bridge: callers must first prove that the latest
+    /// attempt is a valid finished project, and a bare PLY from a failed attempt
+    /// is never eligible.
+    package static func backfillLegacyReceipt(
+        projectPaths: ProjectPaths,
+        projectRootDescriptor: Int32? = nil,
+        operations: PublishedResultPairOperations = .system(),
+        shouldCancel: @escaping @Sendable () -> Bool = { Task.isCancelled },
+        makeReceipt: (
+            ValidatedPlyArtifactEvidence,
+            PublishedSplatReceipt?
+        ) throws -> PublishedSplatReceipt,
+        beforeCommit: () throws -> Void
+    ) throws -> ValidatedPublishedResult {
+        try checkCancellation(shouldCancel)
+        let output = try BoundOutput.acquire(
+            projectPaths: projectPaths,
+            projectRootDescriptor: projectRootDescriptor,
+            operations: operations,
+            shouldCancel: shouldCancel
+        )
+        let reconciled = try reconcileLocked(
+            output: output,
+            operations: operations,
+            shouldCancel: shouldCancel
+        )
+        let initial = try reconciled ?? resolveCanonicalPair(
+            output: output,
+            operations: operations,
+            shouldCancel: shouldCancel
+        )
+        switch initial {
+        case .available:
+            throw PublishedResultPairError.publicationConflict(
+                "a receipt appeared while legacy authority was being prepared"
+            )
+        case .missing:
+            throw PublishedResultPairError.invalidSource
+        case .unavailable(let reason):
+            guard reason == .incompletePair,
+                  entryPresence(
+                    parent: output.descriptor,
+                    name: Names.canonicalPly
+                  ) == .present,
+                  entryPresence(
+                    parent: output.descriptor,
+                    name: Names.canonicalReceipt
+                  ) == .missing else {
+                throw PublishedResultPairError.publicationConflict(
+                    "the legacy canonical output is not eligible for receipt backfill"
+                )
+            }
+        }
+
+        let source = try BoundSource.open(
+            projectRelativePath: "Output/\(Names.canonicalPly)",
+            output: output,
+            operations: operations,
+            shouldCancel: shouldCancel
+        )
+        let canonicalPlyIdentity = try namedFileIdentity(
+            parent: output.descriptor,
+            name: Names.canonicalPly,
+            exactMode: 0o600
+        )
+        guard canonicalPlyIdentity.sameUnchangedFile(as: source.identity) else {
+            throw PublishedResultPairError.invalidSource
+        }
+
+        let recoveredStage = try legacyBackfillStage(output: output)
+        let receipt = try makeReceipt(source.evidence, recoveredStage?.receipt)
+        guard receipt.outputPath == PublishedSplatReceipt.canonicalOutputPath,
+              receipt.outputEvidence == source.evidence else {
+            throw PublishedResultPairError.invalidSource
+        }
+        let receiptData: Data
+        do {
+            receiptData = try PublishedSplatReceiptStore.encode(receipt)
+        } catch {
+            throw PublishedResultPairError.invalidSource
+        }
+        if let recoveredStage {
+            guard recoveredStage.receipt == receipt,
+                  recoveredStage.data == receiptData else {
+                throw PublishedResultPairError.publicationConflict(
+                    "the interrupted legacy receipt belongs to another project state"
+                )
+            }
+        }
+        try source.revalidatePath()
+        try checkCancellation(shouldCancel)
+
+        let stagedName = Names.legacyBackfillPrefix
+            + receipt.publicationID.uuidString.lowercased()
+            + ".json"
+        let stagedIdentity: FileIdentity
+        if let recoveredStage {
+            guard recoveredStage.finalName == stagedName else {
+                throw PublishedResultPairError.publicationConflict(
+                    "the interrupted legacy receipt has the wrong identity"
+                )
+            }
+            stagedIdentity = try promoteLegacyBackfillStageIfNeeded(
+                recoveredStage,
+                output: output,
+                operations: operations
+            )
+        } else {
+            stagedIdentity = try writeOutputPrivateFile(
+                parent: output.descriptor,
+                pendingName: stagedName + ".pending",
+                finalName: stagedName,
+                data: receiptData,
+                operations: operations,
+                operation: "stage legacy result receipt"
+            )
+        }
+        let recoveredStageWasUsed = recoveredStage != nil
+        var installed = false
+        var committed = false
+        defer {
+            if !committed, !recoveredStageWasUsed {
+                let name = installed ? Names.canonicalReceipt : stagedName
+                if let current = try? namedFileIdentity(
+                    parent: output.descriptor,
+                    name: name,
+                    exactMode: 0o600
+                ), current.sameInode(as: stagedIdentity) {
+                    try? quarantineAndRemoveOwnedEntry(
+                        parent: output.descriptor,
+                        name: name,
+                        expected: current,
+                        operations: operations,
+                        operation: "discard legacy result receipt"
+                    )
+                }
+            }
+        }
+
+        do {
+            try source.revalidatePath()
+            try beforeCommit()
+            try source.revalidatePath()
+            guard try namedFileIdentity(
+                parent: output.descriptor,
+                name: Names.canonicalPly,
+                exactMode: 0o600
+            ).sameUnchangedFile(as: canonicalPlyIdentity),
+                  entryPresence(
+                    parent: output.descriptor,
+                    name: Names.canonicalReceipt
+                  ) == .missing else {
+                throw PublishedResultPairError.publicationConflict(
+                    "the legacy result changed before receipt commit"
+                )
+            }
+            try checkCancellation(shouldCancel)
+            guard operations.renameExclusive(
+                output.descriptor,
+                stagedName,
+                output.descriptor,
+                Names.canonicalReceipt
+            ) == 0 else {
+                throw PublishedResultPairError.persistence(
+                    operation: "install legacy result receipt",
+                    code: errno
+                )
+            }
+            installed = true
+
+            // Receipt installation is authority-conferring. From this point
+            // onward finish validation or rollback without surfacing a late
+            // cancellation as a failed migration.
+            try syncDirectory(
+                output.descriptor,
+                operations: operations,
+                operation: "install legacy result receipt"
+            )
+            try source.revalidatePath()
+            let finalPly = try namedFileIdentity(
+                parent: output.descriptor,
+                name: Names.canonicalPly,
+                exactMode: 0o600
+            )
+            let finalReceipt = try namedFileIdentity(
+                parent: output.descriptor,
+                name: Names.canonicalReceipt,
+                exactMode: 0o600
+            )
+            guard finalPly.sameUnchangedFile(as: canonicalPlyIdentity),
+                  finalReceipt.sameObject(as: stagedIdentity) else {
+                throw PublishedResultPairError.publicationConflict(
+                    "the backfilled canonical pair changed during commit"
+                )
+            }
+            let receiptDescriptor = openReadOnly(
+                parent: output.descriptor,
+                name: Names.canonicalReceipt
+            )
+            guard receiptDescriptor >= 0 else {
+                throw PublishedResultPairError.publicationConflict(
+                    "the backfilled receipt could not be reopened"
+                )
+            }
+            defer { Darwin.close(receiptDescriptor) }
+            let committedData = try readBoundFile(
+                descriptor: receiptDescriptor,
+                identity: finalReceipt,
+                maximumBytes: PublishedSplatReceiptStore.maximumBytes
+            )
+            let committedReceipt = try PublishedSplatReceiptStore.decode(
+                committedData
+            )
+            guard committedData == receiptData,
+                  try namedFileIdentity(
+                    parent: output.descriptor,
+                    name: Names.canonicalReceipt,
+                    exactMode: 0o600
+                  ).sameUnchangedFile(as: finalReceipt),
+                  try namedFileIdentity(
+                    parent: output.descriptor,
+                    name: Names.canonicalPly,
+                    exactMode: 0o600
+                  ).sameUnchangedFile(as: finalPly) else {
+                throw PublishedResultPairError.publicationConflict(
+                    "the backfilled receipt did not revalidate"
+                )
+            }
+            let validated = ValidatedPublishedResult(
+                receipt: committedReceipt,
+                outputURL: projectPaths.outputSplatURL,
+                outputEvidence: source.evidence,
+                generation: generation(
+                    receipt: committedReceipt,
+                    outputEvidence: source.evidence,
+                    plyIdentity: finalPly,
+                    receiptIdentity: finalReceipt,
+                    receiptData: committedData
+                )
+            )
+            committed = true
+            return validated
+        } catch {
+            if installed,
+               let current = try? namedFileIdentity(
+                parent: output.descriptor,
+                name: Names.canonicalReceipt,
+                exactMode: 0o600
+               ), current.sameInode(as: stagedIdentity) {
+                do {
+                    if recoveredStageWasUsed {
+                        guard operations.renameExclusive(
+                            output.descriptor,
+                            Names.canonicalReceipt,
+                            output.descriptor,
+                            stagedName
+                        ) == 0 else {
+                            throw PublishedResultPairError.persistence(
+                                operation: "restore interrupted legacy receipt",
+                                code: errno
+                            )
+                        }
+                        try syncDirectory(
+                            output.descriptor,
+                            operations: operations,
+                            operation: "restore interrupted legacy receipt"
+                        )
+                        guard try namedFileIdentity(
+                            parent: output.descriptor,
+                            name: stagedName,
+                            exactMode: 0o600
+                        ).sameObject(as: stagedIdentity) else {
+                            throw PublishedResultPairError.publicationConflict(
+                                "the interrupted legacy receipt changed during rollback"
+                            )
+                        }
+                    } else {
+                        try quarantineAndRemoveOwnedEntry(
+                            parent: output.descriptor,
+                            name: Names.canonicalReceipt,
+                            expected: current,
+                            operations: operations,
+                            operation: "roll back legacy result receipt"
+                        )
+                    }
+                    installed = false
+                } catch {
+                    throw PublishedResultPairError.publicationConflict(
+                        "the legacy receipt commit could not be rolled back"
+                    )
+                }
+            }
+            throw error
+        }
+    }
+
     /// Commits the first-viewer timing by replacing only the authority receipt.
     /// The publication lock covers the predecessor check, PLY validation, and
     /// receipt swap, so stale or conflicting callbacks cannot roll a generation
@@ -1782,6 +2080,7 @@ private extension PublishedResultPairStore {
         static let receiptCandidate = "next-receipt.json"
         static let receiptCleanupStaged = "parent-cleanup-authority.json"
         static let receiptDisplacedIdentity = "displaced-receipt-identity"
+        static let legacyBackfillPrefix = ".published-result-backfill-"
         static let newPly = "new.ply"
         static let newReceipt = "new-receipt.json"
         static let oldPly = "old.ply"
@@ -1805,6 +2104,182 @@ private extension PublishedResultPairStore {
                 return .unavailable(reason)
             }
         }
+    }
+
+    struct LegacyBackfillStage {
+        let currentName: String
+        let finalName: String
+        let receipt: PublishedSplatReceipt
+        let data: Data
+        let identity: FileIdentity
+
+        var isPending: Bool { currentName != finalName }
+    }
+
+    static func legacyBackfillStage(
+        output: BoundOutput
+    ) throws -> LegacyBackfillStage? {
+        let candidates = try directoryNames(
+            descriptor: output.descriptor,
+            maximumCount: 50_000
+        ).filter {
+            hasReservedNamespacePrefix(
+                $0,
+                prefix: Names.legacyBackfillPrefix,
+                output: output
+            )
+        }
+        guard candidates.count <= 1 else {
+            throw PublishedResultPairError.publicationConflict(
+                "multiple interrupted legacy receipts are present"
+            )
+        }
+        guard let currentName = candidates.first else { return nil }
+
+        let pendingSuffix = ".pending"
+        let finalName = currentName.hasSuffix(pendingSuffix)
+            ? String(currentName.dropLast(pendingSuffix.count))
+            : currentName
+        guard finalName.hasPrefix(Names.legacyBackfillPrefix),
+              finalName.hasSuffix(".json") else {
+            throw PublishedResultPairError.publicationConflict(
+                "the interrupted legacy receipt name is malformed"
+            )
+        }
+        let uuidText = String(
+            finalName
+                .dropFirst(Names.legacyBackfillPrefix.count)
+                .dropLast(".json".count)
+        )
+        guard let publicationID = UUID(uuidString: uuidText),
+              uuidText == publicationID.uuidString.lowercased(),
+              finalName == Names.legacyBackfillPrefix + uuidText + ".json",
+              currentName == finalName
+                || currentName == finalName + pendingSuffix else {
+            throw PublishedResultPairError.publicationConflict(
+                "the interrupted legacy receipt identity is malformed"
+            )
+        }
+
+        let descriptor = openReadOnly(
+            parent: output.descriptor,
+            name: currentName
+        )
+        guard descriptor >= 0 else {
+            throw PublishedResultPairError.publicationConflict(
+                "the interrupted legacy receipt is unsafe"
+            )
+        }
+        defer { Darwin.close(descriptor) }
+        do {
+            let identity = try requireBoundFile(
+                descriptor: descriptor,
+                parent: output.descriptor,
+                name: currentName,
+                exactMode: 0o600
+            )
+            let data = try readBoundFile(
+                descriptor: descriptor,
+                identity: identity,
+                maximumBytes: PublishedSplatReceiptStore.maximumBytes
+            )
+            let receipt = try PublishedSplatReceiptStore.decode(data)
+            guard receipt.publicationID == publicationID,
+                  try PublishedSplatReceiptStore.encode(receipt) == data,
+                  try namedFileIdentity(
+                    parent: output.descriptor,
+                    name: currentName,
+                    exactMode: 0o600
+                  ).sameUnchangedFile(as: identity) else {
+                throw PublishedResultPairError.publicationConflict(
+                    "the interrupted legacy receipt is not canonical"
+                )
+            }
+            return LegacyBackfillStage(
+                currentName: currentName,
+                finalName: finalName,
+                receipt: receipt,
+                data: data,
+                identity: identity
+            )
+        } catch let error as PublishedResultPairError {
+            throw error
+        } catch {
+            throw PublishedResultPairError.publicationConflict(
+                "the interrupted legacy receipt is invalid"
+            )
+        }
+    }
+
+    static func promoteLegacyBackfillStageIfNeeded(
+        _ stage: LegacyBackfillStage,
+        output: BoundOutput,
+        operations: PublishedResultPairOperations
+    ) throws -> FileIdentity {
+        guard stage.isPending else { return stage.identity }
+        let descriptor = stage.currentName.withCString {
+            Darwin.openat(
+                output.descriptor,
+                $0,
+                O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard descriptor >= 0 else {
+            throw PublishedResultPairError.publicationConflict(
+                "the interrupted legacy receipt cannot be reopened"
+            )
+        }
+        defer { Darwin.close(descriptor) }
+        let before = try requireBoundFile(
+            descriptor: descriptor,
+            parent: output.descriptor,
+            name: stage.currentName,
+            exactMode: 0o600
+        )
+        guard before.sameUnchangedFile(as: stage.identity) else {
+            throw PublishedResultPairError.publicationConflict(
+                "the interrupted legacy receipt changed before recovery"
+            )
+        }
+        try syncFile(
+            descriptor,
+            operations: operations,
+            operation: "recover interrupted legacy receipt"
+        )
+        guard try requireBoundFile(
+            descriptor: descriptor,
+            parent: output.descriptor,
+            name: stage.currentName,
+            exactMode: 0o600
+        ).sameUnchangedFile(as: stage.identity),
+              operations.renameExclusive(
+                output.descriptor,
+                stage.currentName,
+                output.descriptor,
+                stage.finalName
+              ) == 0 else {
+            throw PublishedResultPairError.publicationConflict(
+                "the interrupted legacy receipt could not be recovered"
+            )
+        }
+        try syncDirectory(
+            output.descriptor,
+            operations: operations,
+            operation: "recover interrupted legacy receipt"
+        )
+        let finalIdentity = try namedFileIdentity(
+            parent: output.descriptor,
+            name: stage.finalName,
+            exactMode: 0o600
+        )
+        // Renaming a file changes ctime on APFS even though the file's bytes,
+        // mode, owner, link count, and modification time are unchanged.
+        guard finalIdentity.sameObject(as: stage.identity) else {
+            throw PublishedResultPairError.publicationConflict(
+                "the recovered legacy receipt changed identity"
+            )
+        }
+        return finalIdentity
     }
 
     struct BoundPair {
@@ -1903,11 +2378,11 @@ private extension PublishedResultPairStore {
         }
 
         static var unboundIntent: Self {
-            Self(device: 0, inode: 0, owner: getuid(), mode: 0)
+            Self(device: 0, inode: 0, owner: geteuid(), mode: 0)
         }
 
         var isUnboundIntent: Bool {
-            device == 0 && inode == 0 && owner == getuid() && mode == 0
+            device == 0 && inode == 0 && owner == geteuid() && mode == 0
         }
 
         init(_ identity: DirectoryIdentity) {
@@ -2779,7 +3254,7 @@ private extension PublishedResultPairStore {
                 ] {
                     let identity = recorded.identity
                     guard identity.byteCount > 0,
-                          identity.owner == getuid(),
+                          identity.owner == geteuid(),
                           identity.linkCount == 1,
                           identity.mode & S_IFMT == S_IFREG,
                           identity.mode & 0o7777 == 0o600 else {
@@ -2851,7 +3326,7 @@ private extension PublishedResultPairStore {
             for document in documents {
                 for (name, recorded) in document.ownedFiles {
                     guard ownedNames.contains(name), recorded.identity.byteCount >= 0,
-                          recorded.identity.owner == getuid(),
+                          recorded.identity.owner == geteuid(),
                           recorded.identity.linkCount == 1,
                           recorded.identity.mode & S_IFMT == S_IFREG,
                           recorded.identity.mode & 0o7777 == 0o600 else {
@@ -2864,7 +3339,7 @@ private extension PublishedResultPairStore {
             if let cleanupAuthorization {
                 for (name, recorded) in cleanupAuthorization.ownedFiles {
                     guard ownedNames.contains(name), recorded.identity.byteCount >= 0,
-                          recorded.identity.owner == getuid(),
+                          recorded.identity.owner == geteuid(),
                           recorded.identity.linkCount == 1,
                           recorded.identity.mode & S_IFMT == S_IFREG,
                           recorded.identity.mode & 0o7777 == 0o600 else {
@@ -3120,7 +3595,7 @@ private extension PublishedResultPairStore {
             var history: [String: [FileIdentity]] = [:]
             for (name, recorded) in authorization.ownedFiles {
                 let expected = recorded.identity
-                guard logicalNames.contains(name), expected.owner == getuid(),
+                guard logicalNames.contains(name), expected.owner == geteuid(),
                       expected.linkCount == 1,
                       expected.mode & S_IFMT == S_IFREG,
                       expected.mode & 0o7777 == 0o600 else {
@@ -4563,7 +5038,7 @@ private extension PublishedResultPairStore {
             }
             for recorded in authorization.ownedFiles.values {
                 let identity = recorded.identity
-                guard identity.owner == getuid(), identity.linkCount == 1,
+                guard identity.owner == geteuid(), identity.linkCount == 1,
                       identity.mode & S_IFMT == S_IFREG,
                       identity.mode & 0o7777 == 0o600 else {
                     throw PublishedResultPairError.publicationConflict(
@@ -5484,16 +5959,16 @@ private extension PublishedResultPairStore {
                     return false
                 }
             }
-            return document.plyIdentity.identity.owner == getuid()
+            return document.plyIdentity.identity.owner == geteuid()
                 && document.plyIdentity.identity.linkCount == 1
-                && document.oldReceiptIdentity.identity.owner == getuid()
+                && document.oldReceiptIdentity.identity.owner == geteuid()
                 && document.oldReceiptIdentity.identity.linkCount == 1
-                && document.cleanupAuthorizationIdentity.identity.owner == getuid()
+                && document.cleanupAuthorizationIdentity.identity.owner == geteuid()
                 && document.cleanupAuthorizationIdentity.identity.linkCount == 1
                 && document.cleanupAuthorizationIdentity.identity.mode & S_IFMT == S_IFREG
                 && document.cleanupAuthorizationIdentity.identity.mode & 0o7777 == 0o600
                 && document.newReceiptIdentity.map {
-                    $0.identity.owner == getuid() && $0.identity.linkCount == 1
+                    $0.identity.owner == geteuid() && $0.identity.linkCount == 1
                 } ?? true
         }
     }
@@ -6193,7 +6668,7 @@ private extension PublishedResultPairStore {
         }
         for (name, recorded) in authorization.ownedFiles {
             let expected = recorded.identity
-            guard parentOwnedNames.contains(name), expected.owner == getuid(),
+            guard parentOwnedNames.contains(name), expected.owner == geteuid(),
                   expected.linkCount == 1,
                   expected.mode & S_IFMT == S_IFREG,
                   expected.mode & 0o7777 == 0o600 else {
@@ -8145,14 +8620,14 @@ private extension PublishedResultPairStore {
 
     static func safeDirectory(_ status: stat, exactMode: mode_t?) -> Bool {
         guard (status.st_mode & S_IFMT) == S_IFDIR,
-              status.st_uid == getuid(),
+              status.st_uid == geteuid(),
               (status.st_mode & 0o022) == 0 else { return false }
         return exactMode.map { status.st_mode & 0o7777 == $0 } ?? true
     }
 
     static func safeRegular(_ status: stat, exactMode: mode_t?) -> Bool {
         guard (status.st_mode & S_IFMT) == S_IFREG,
-              status.st_uid == getuid(),
+              status.st_uid == geteuid(),
               status.st_nlink == 1,
               (status.st_mode & 0o022) == 0 else { return false }
         return exactMode.map { status.st_mode & 0o7777 == $0 } ?? true
@@ -8657,6 +9132,7 @@ private extension PublishedResultPairStore {
             Names.receiptTransactionBuildAuthorityPrefix,
             Names.receiptRetiredPrefix,
             Names.receiptCleanupPrefix,
+            Names.legacyBackfillPrefix,
         ].contains {
             hasReservedNamespacePrefix(name, prefix: $0, output: output)
         }

@@ -19,6 +19,7 @@ extension AppModel {
     private func startSubjectIsolation(anchor: SubjectAnchor?) -> Bool {
         guard !hasActiveWork,
               viewState == .viewer,
+              !isShowingPreviousResult || subjectOutput != nil,
               let projectURL = currentProjectURL,
               let outputPlyURL,
               ProjectSummary.hasSameLocation(
@@ -85,7 +86,9 @@ extension AppModel {
               ) else {
             return
         }
-        guard case .valid(_, let output) = result,
+        guard case .valid(let artifact, let output) = result,
+              displayedPublicationID == nil
+                || artifact.sourcePublicationID == displayedPublicationID,
               output.variant == .subject,
               ProjectSummary.hasSameLocation(
                   output.url,

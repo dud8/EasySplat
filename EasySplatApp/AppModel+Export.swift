@@ -27,6 +27,8 @@ extension AppModel {
         let variant: SplatOutputVariant
         let outputURL: URL
         let expectedIdentity: ExpectedPlyArtifactIdentity
+        let publicationID: UUID?
+        let publicationGeneration: PublishedResultGeneration?
         let defaultFilename: String
     }
 
@@ -40,14 +42,15 @@ extension AppModel {
         }
         let variant = selectedSplatOutputVariant
         let selectedSubjectOutput = subjectOutput
-        let validator = finishedOutputValidator
+        let resolver = publishedResultResolver
         let subjectLoader = subjectIsolationArtifactLoader
         let validation = Task.detached(priority: .userInitiated) {
-            try Self.publicationSource(
+            let resolvedResult = try resolver(projectURL)
+            return try Self.publicationSource(
                 projectURL: projectURL,
                 variant: variant,
                 selectedSubjectOutput: selectedSubjectOutput,
-                finishedOutputValidator: validator,
+                resolvedResult: resolvedResult,
                 subjectArtifactLoader: subjectLoader
             )
         }
@@ -128,7 +131,7 @@ extension AppModel {
         projectURL: URL,
         variant: SplatOutputVariant,
         selectedSubjectOutput: ValidatedSplatOutput?,
-        finishedOutputValidator: FinishedOutputValidator,
+        resolvedResult: ResolvedPublishedResult,
         subjectArtifactLoader: SubjectIsolationArtifactLoader
     ) throws -> CurrentSplatPublicationSource {
         try Task.checkCancellation()
@@ -136,36 +139,68 @@ extension AppModel {
         let title: String
         let outputURL: URL
         let expectedIdentity: ExpectedPlyArtifactIdentity
+        let publicationID: UUID?
+        let publicationGeneration: PublishedResultGeneration?
 
         switch variant {
         case .original:
-            guard let validatedOutputURL = finishedOutputValidator(projectURL),
-                  ProjectSummary.hasSameLocation(
-                      validatedOutputURL,
-                      paths.outputSplatURL
-                  ) else {
-                throw CurrentSplatExportError.noFinishedOutput
-            }
-            try Task.checkCancellation()
-            let snapshot: ProjectArtifactSnapshot
-            do {
-                snapshot = try ProjectArtifactSnapshotStore.load(
-                    projectURL: projectURL
+            switch resolvedResult {
+            case .current(.receiptBound(let current)):
+                title = current.liveProject.title
+                outputURL = current.publishedResult.outputURL
+                expectedIdentity = expectedPlyIdentity(
+                    from: current.publishedResult.outputEvidence
                 )
-            } catch {
+                publicationID = current.publishedResult.receipt.publicationID
+                publicationGeneration = current.publishedResult.generation
+            case .current(.legacy(let legacy)):
+                guard let training = legacy.snapshot.trainingArtifact,
+                      training.completionStatus == .completed,
+                      training.outputPath == "Output/splat.ply",
+                      let identity = expectedPlyIdentity(from: training) else {
+                    throw CurrentSplatExportError.noFinishedOutput
+                }
+                title = legacy.liveProject.title
+                outputURL = legacy.outputURL
+                expectedIdentity = identity
+                publicationID = nil
+                publicationGeneration = nil
+            case .previous(let previous):
+                title = previous.liveProject.title
+                outputURL = previous.publishedResult.outputURL
+                expectedIdentity = expectedPlyIdentity(
+                    from: previous.publishedResult.outputEvidence
+                )
+                publicationID = previous.publishedResult.receipt.publicationID
+                publicationGeneration = previous.publishedResult.generation
+            case .unavailable:
                 throw CurrentSplatExportError.noFinishedOutput
             }
-            guard let training = snapshot.trainingArtifact,
-                  training.completionStatus == .completed,
-                  training.outputPath == "Output/splat.ply",
-                  let identity = expectedPlyIdentity(from: training) else {
+            guard ProjectSummary.hasSameLocation(outputURL, paths.outputSplatURL)
+            else {
                 throw CurrentSplatExportError.noFinishedOutput
             }
-            title = snapshot.metadata.title
-            outputURL = validatedOutputURL
-            expectedIdentity = identity
 
         case .subject:
+            let resolvedTitle: String
+            let resolvedPublicationID: UUID?
+            let resolvedGeneration: PublishedResultGeneration?
+            switch resolvedResult {
+            case .current(.receiptBound(let current)):
+                resolvedTitle = current.liveProject.title
+                resolvedPublicationID = current.publishedResult.receipt.publicationID
+                resolvedGeneration = current.publishedResult.generation
+            case .current(.legacy(let legacy)):
+                resolvedTitle = legacy.liveProject.title
+                resolvedPublicationID = nil
+                resolvedGeneration = nil
+            case .previous(let previous):
+                resolvedTitle = previous.liveProject.title
+                resolvedPublicationID = previous.publishedResult.receipt.publicationID
+                resolvedGeneration = previous.publishedResult.generation
+            case .unavailable:
+                throw CurrentSplatExportError.noValidSubjectOutput
+            }
             guard let selectedSubjectOutput,
                   selectedSubjectOutput.variant == .subject,
                   ProjectSummary.hasSameLocation(
@@ -175,8 +210,10 @@ extension AppModel {
                   let selectedIdentity = expectedPlyIdentity(
                       from: selectedSubjectOutput
                   ),
-                  case .valid(_, let validatedOutput) =
+                  case .valid(let artifact, let validatedOutput) =
                     subjectArtifactLoader(paths),
+                  resolvedPublicationID == nil
+                    || artifact.sourcePublicationID == resolvedPublicationID,
                   validatedOutput.variant == .subject,
                   ProjectSummary.hasSameLocation(
                       validatedOutput.url,
@@ -192,15 +229,11 @@ extension AppModel {
                   validatedIdentity == selectedIdentity else {
                 throw CurrentSplatExportError.noValidSubjectOutput
             }
-            do {
-                title = try ProjectMetadataStore.load(
-                    from: paths.metadataURL
-                ).title
-            } catch {
-                throw CurrentSplatExportError.noValidSubjectOutput
-            }
+            title = resolvedTitle
             outputURL = validatedOutput.url
             expectedIdentity = validatedIdentity
+            publicationID = resolvedPublicationID
+            publicationGeneration = resolvedGeneration
         }
         try Task.checkCancellation()
         return CurrentSplatPublicationSource(
@@ -208,6 +241,8 @@ extension AppModel {
             variant: variant,
             outputURL: outputURL.standardizedFileURL,
             expectedIdentity: expectedIdentity,
+            publicationID: publicationID,
+            publicationGeneration: publicationGeneration,
             defaultFilename: publicationFilename(title: title, variant: variant)
         )
     }
@@ -240,6 +275,16 @@ extension AppModel {
                 destinationKind: .userSelected
             )
         }
+    }
+
+    nonisolated static func expectedPlyIdentity(
+        from evidence: ValidatedPlyArtifactEvidence
+    ) -> ExpectedPlyArtifactIdentity {
+        ExpectedPlyArtifactIdentity(
+            byteCount: evidence.byteCount,
+            vertexCount: evidence.vertexCount,
+            sha256: evidence.sha256
+        )
     }
 
     nonisolated static func expectedPlyIdentity(
