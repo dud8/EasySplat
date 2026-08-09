@@ -35,6 +35,22 @@ public class SplatPLYSceneReader: SplatSceneReader {
         )
     }
 
+    /// Reads bytes supplied by a caller that has already bound the source,
+    /// avoiding a second pathname open for sandboxed or race-sensitive inputs.
+    public convenience init(
+        sourceLabel: URL,
+        validatesRenderEncoding: Bool = true,
+        read: @escaping (
+            _ buffer: UnsafeMutablePointer<UInt8>,
+            _ maximumLength: Int
+        ) -> Int
+    ) {
+        self.init(
+            PLYReader(sourceLabel: sourceLabel, read: read),
+            validatesRenderEncoding: validatesRenderEncoding
+        )
+    }
+
     /// Set `validatesRenderEncoding` to `false` only when the delegate encodes every
     /// point with ``SplatRenderEncodingValidator`` before retaining or publishing it.
     public init(_ ply: PLYReader, validatesRenderEncoding: Bool = true) {

@@ -210,6 +210,131 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         )
     }
 
+    func testDescriptorEvidenceUsesBoundReaderForEveryValidationPhase() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let openedURL = root.appendingPathComponent("opened.ply")
+        let boundBytesURL = root.appendingPathComponent("bound-bytes.ply")
+        try TestFileBuilder.writeMinimalPly(at: openedURL, vertexCount: 3)
+
+        let openedBytes = try Data(contentsOf: openedURL)
+        let reboundText = try XCTUnwrap(String(data: openedBytes, encoding: .utf8))
+            .replacingOccurrences(of: "0 0 0 1 1 1", with: "9 0 0 1 1 1")
+        let reboundBytes = Data(reboundText.utf8)
+        XCTAssertEqual(reboundBytes.count, openedBytes.count)
+        try reboundBytes.write(to: boundBytesURL)
+        let expected = try ProjectArtifactValidator.validatedPlyEvidence(at: boundBytesURL)
+
+        let descriptor = Darwin.open(
+            openedURL.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { if descriptor >= 0 { Darwin.close(descriptor) } }
+
+        let actual = try ProjectArtifactValidator.validatedPlyEvidence(
+            descriptor: descriptor,
+            label: openedURL.lastPathComponent,
+            readAt: { _, destination, requested, offset in
+                guard offset >= 0,
+                      let destination,
+                      Int(offset) < reboundBytes.count else {
+                    return 0
+                }
+                let count = min(
+                    requested,
+                    7,
+                    reboundBytes.count - Int(offset)
+                )
+                reboundBytes.withUnsafeBytes { bytes in
+                    guard let source = bytes.baseAddress else { return }
+                    memcpy(destination, source.advanced(by: Int(offset)), count)
+                }
+                return count
+            }
+        )
+
+        XCTAssertEqual(actual, expected)
+    }
+
+    func testValidatedPlyEvidenceRejectsAListPropertyInTheVertexElement() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("vertex-list.ply")
+        try TestFileBuilder.writeMinimalPly(at: output)
+        let original = try String(contentsOf: output, encoding: .utf8)
+        let withList = original
+            .replacingOccurrences(
+                of: "property float rot_3\nend_header",
+                with: "property float rot_3\nproperty list uchar int neighbors\nend_header"
+            )
+            .replacingOccurrences(
+                of: "0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0",
+                with: "0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0 0"
+            )
+        try withList.write(to: output, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(
+            try ProjectArtifactValidator.validatedPlyEvidence(at: output)
+        )
+    }
+
+    func testDescriptorEvidenceStopsReadingAnOversizedASCIIDataRow() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("oversized-row.ply")
+        var bytes = Data("""
+        ply
+        format ascii 1.0
+        element vertex 1
+        property float x
+        property float y
+        property float z
+        property float f_dc_0
+        property float f_dc_1
+        property float f_dc_2
+        property float scale_0
+        property float scale_1
+        property float scale_2
+        property float opacity
+        property float rot_0
+        property float rot_1
+        property float rot_2
+        property float rot_3
+        end_header
+
+        """.utf8)
+        bytes.append(Data(repeating: Character("1").asciiValue!, count: 2_000_000))
+        try bytes.write(to: output)
+
+        let descriptor = Darwin.open(
+            output.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { if descriptor >= 0 { Darwin.close(descriptor) } }
+
+        var phase = 0
+        var previousOffset: off_t = -1
+        var maximumBoundsOffset: off_t = 0
+        XCTAssertThrowsError(
+            try ProjectArtifactValidator.validatedPlyEvidence(
+                descriptor: descriptor,
+                label: output.lastPathComponent,
+                readAt: { descriptor, destination, count, offset in
+                    if offset < previousOffset { phase += 1 }
+                    previousOffset = offset
+                    if phase >= 2 {
+                        maximumBoundsOffset = max(maximumBoundsOffset, offset)
+                    }
+                    return Darwin.pread(descriptor, destination, count, offset)
+                }
+            )
+        )
+        XCTAssertGreaterThanOrEqual(phase, 2)
+        XCTAssertLessThan(maximumBoundsOffset, off_t(bytes.count - 64 * 1024))
+    }
+
     func testValidatedPlyBoundsAreInvariantToInputRowOrder() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

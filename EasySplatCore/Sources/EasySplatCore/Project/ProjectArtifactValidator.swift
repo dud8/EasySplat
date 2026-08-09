@@ -23,6 +23,98 @@ private final class ViewerPlyCompatibilityProbe: SplatSceneReaderDelegate {
     }
 }
 
+private final class BoundPlyReadCursor {
+    typealias ReadAt = (
+        Int32,
+        UnsafeMutableRawPointer?,
+        Int,
+        off_t
+    ) -> Int
+
+    private let descriptor: Int32
+    private let byteCount: Int64
+    private let readAt: ReadAt
+    private let asciiBodyStart: Int64?
+    private let maximumASCIIRowBytes: Int?
+    private var offset: Int64 = 0
+    private var asciiRowByteCount = 0
+
+    init(
+        descriptor: Int32,
+        byteCount: Int64,
+        readAt: @escaping ReadAt,
+        asciiBodyStart: Int64? = nil,
+        maximumASCIIRowBytes: Int? = nil
+    ) {
+        self.descriptor = descriptor
+        self.byteCount = byteCount
+        self.readAt = readAt
+        self.asciiBodyStart = asciiBodyStart
+        self.maximumASCIIRowBytes = maximumASCIIRowBytes
+    }
+
+    func read(_ buffer: UnsafeMutablePointer<UInt8>, maximumLength: Int) -> Int {
+        guard maximumLength > 0 else { return 0 }
+        guard offset < byteCount else { return 0 }
+        let requested = min(maximumLength, Int(byteCount - offset))
+        while true {
+            let readOffset = offset
+            let count = readAt(
+                descriptor,
+                UnsafeMutableRawPointer(buffer),
+                requested,
+                off_t(readOffset)
+            )
+            if count < 0, errno == EINTR { continue }
+            guard count >= 0, count <= requested else { return -1 }
+            if count > 0,
+               let asciiBodyStart,
+               let maximumASCIIRowBytes {
+                let firstBodyIndex = max(0, Int(asciiBodyStart - readOffset))
+                if firstBodyIndex < count {
+                    for index in firstBodyIndex..<count {
+                        if buffer[index] == 10 || buffer[index] == 13 {
+                            asciiRowByteCount = 0
+                        } else {
+                            asciiRowByteCount += 1
+                            if asciiRowByteCount > maximumASCIIRowBytes {
+                                errno = EFBIG
+                                return -1
+                            }
+                        }
+                    }
+                }
+            }
+            offset += Int64(count)
+            return count
+        }
+    }
+
+    func readData(
+        upTo maximumLength: Int,
+        shouldCancel: () -> Bool
+    ) throws -> Data? {
+        guard maximumLength > 0 else { return Data() }
+        var result = Data()
+        var buffer = [UInt8](
+            repeating: 0,
+            count: min(8 * 1024, maximumLength)
+        )
+        while result.count < maximumLength {
+            if shouldCancel() { throw CancellationError() }
+            let requested = min(buffer.count, maximumLength - result.count)
+            let count = buffer.withUnsafeMutableBufferPointer { bytes in
+                guard let baseAddress = bytes.baseAddress else { return -1 }
+                return read(baseAddress, maximumLength: requested)
+            }
+            guard count >= 0 else { return nil }
+            if count == 0 { break }
+            result.append(contentsOf: buffer[0..<count])
+        }
+        return result
+    }
+}
+
 public enum ProjectArtifactStatus: Equatable, Sendable {
     case valid
     case missing
@@ -160,8 +252,10 @@ public enum FinishedProjectArtifactValidationError: Error, LocalizedError, Equat
 /// The hardened path opens the destination's directory and creates a temporary
 /// sibling before renaming it into place. Under App Sandbox a save panel grants
 /// the chosen file, not its directory, so that sequence cannot run for somewhere
-/// the user picked. Project-owned writes keep it; user-chosen writes swap in the
-/// system's own replace primitive, which is what the grant covers.
+/// the user picked. Project-owned writes keep it; user-chosen writes clone an
+/// app-owned descriptor into an absent selected path or use Foundation's
+/// safe-save replacement for an existing selected file, then reconcile that
+/// exact path without opening its parent as publication authority.
 public enum PlyPublicationDestination: Sendable, Equatable {
     case projectOwned
     case userSelected
@@ -209,6 +303,201 @@ struct PlyPublicationSystemCalls {
     }
 }
 
+struct UserSelectedPlyPublicationFileOperations {
+    var createReplacementDirectory: (URL) throws -> URL
+    var openExactFile: (URL, Int32) -> Int32
+    var cloneAbsent: (Int32, URL) throws -> Void
+    var moveAbsent: (URL, URL) throws -> Void
+    var replaceExisting: (URL, URL) throws -> URL?
+    var cleanupStaging: (UserSelectedPlyPublicationStagingCleanupContext) throws -> Void
+    var beforeCommit: () throws -> Void
+    var beforeStagingCleanup: (URL) throws -> Void
+
+    static func system(fileManager: FileManager = .default) -> Self {
+        Self(
+            createReplacementDirectory: { destination in
+                try fileManager.url(
+                    for: .itemReplacementDirectory,
+                    in: .userDomainMask,
+                    appropriateFor: destination,
+                    create: true
+                )
+            },
+            openExactFile: { url, flags in
+                Darwin.open(url.path, flags)
+            },
+            cloneAbsent: { candidateDescriptor, destination in
+                let exactPath = try exactUserSelectedPublicationDestinationPath(
+                    destination
+                )
+                let result = exactPath.withCString {
+                    Darwin.fclonefileat(
+                        candidateDescriptor,
+                        AT_FDCWD,
+                        $0,
+                        UInt32(CLONE_NOFOLLOW_ANY)
+                    )
+                }
+                guard result == 0 else {
+                    throw currentUserSelectedPublicationPOSIXError()
+                }
+            },
+            moveAbsent: { candidate, destination in
+                try fileManager.moveItem(at: candidate, to: destination)
+            },
+            replaceExisting: { destination, candidate in
+                try fileManager.replaceItemAt(
+                    destination,
+                    withItemAt: candidate,
+                    backupItemName: nil,
+                    options: []
+                )
+            },
+            cleanupStaging: cleanupUserSelectedPlyPublicationStaging,
+            beforeCommit: {},
+            beforeStagingCleanup: { _ in }
+        )
+    }
+}
+
+private func exactUserSelectedPublicationDestinationPath(
+    _ destination: URL
+) throws -> String {
+    let leaf = destination.lastPathComponent
+    guard destination.isFileURL,
+          !leaf.isEmpty,
+          leaf != ".",
+          leaf != "..",
+          !leaf.contains("/") else {
+        throw currentUserSelectedPublicationPOSIXError()
+    }
+    // `CLONE_NOFOLLOW_ANY` intentionally rejects `/var`'s system symlink.
+    // Resolve only the already-existing parent first, then clone to the exact
+    // selected leaf under that canonical path. Reconciliation still opens the
+    // selected URL itself and never treats a parent descriptor as authority.
+    var resolvedParent = [CChar](repeating: 0, count: Int(PATH_MAX))
+    let parentPath = destination.deletingLastPathComponent().path
+    guard parentPath.withCString({ realpath($0, &resolvedParent) }) != nil else {
+        throw currentUserSelectedPublicationPOSIXError()
+    }
+    let canonicalParent = resolvedParent.withUnsafeBufferPointer {
+        String(cString: $0.baseAddress!)
+    }
+    return URL(
+        fileURLWithPath: canonicalParent,
+        isDirectory: true
+    )
+    .appendingPathComponent(leaf, isDirectory: false)
+    .path
+}
+
+struct UserSelectedPlyPublicationStagingCleanupContext {
+    let stagingURL: URL
+    let stagingDescriptor: Int32
+    let stagingIdentity: stat
+    let candidateDescriptor: Int32?
+    let candidateIdentity: stat?
+    let candidateName: String
+}
+
+private func cleanupUserSelectedPlyPublicationStaging(
+    _ context: UserSelectedPlyPublicationStagingCleanupContext
+) throws {
+    var openedDirectory = stat()
+    var namedDirectory = stat()
+    guard fstat(context.stagingDescriptor, &openedDirectory) == 0,
+          lstat(context.stagingURL.path, &namedDirectory) == 0,
+          sameUserSelectedPublicationDirectory(
+            context.stagingIdentity,
+            openedDirectory
+          ),
+          sameUserSelectedPublicationDirectory(
+            openedDirectory,
+            namedDirectory
+          ) else {
+        return
+    }
+
+    var namedCandidate = stat()
+    let candidateStatus = context.candidateName.withCString {
+        fstatat(
+            context.stagingDescriptor,
+            $0,
+            &namedCandidate,
+            AT_SYMLINK_NOFOLLOW
+        )
+    }
+    if candidateStatus == 0 {
+        guard let candidateDescriptor = context.candidateDescriptor,
+              let candidateIdentity = context.candidateIdentity else {
+            return
+        }
+        var openedCandidate = stat()
+        guard fstat(candidateDescriptor, &openedCandidate) == 0,
+              (openedCandidate.st_mode & S_IFMT) == S_IFREG,
+              openedCandidate.st_uid == geteuid(),
+              openedCandidate.st_nlink == 1,
+              (namedCandidate.st_mode & S_IFMT) == S_IFREG,
+              namedCandidate.st_uid == geteuid(),
+              namedCandidate.st_nlink == 1,
+              sameUserSelectedPublicationNode(
+                candidateIdentity,
+                openedCandidate
+              ),
+              sameUserSelectedPublicationNode(
+                openedCandidate,
+                namedCandidate
+              ) else {
+            return
+        }
+        let removeResult = context.candidateName.withCString {
+            unlinkat(context.stagingDescriptor, $0, 0)
+        }
+        guard removeResult == 0 else { return }
+    } else if errno != ENOENT {
+        return
+    }
+
+    // The replacement directory was created exclusively for this export. Only
+    // remove the exact still-bound empty directory; a swapped or populated
+    // path is foreign state and remains untouched.
+    guard fstat(context.stagingDescriptor, &openedDirectory) == 0,
+          lstat(context.stagingURL.path, &namedDirectory) == 0,
+          sameUserSelectedPublicationDirectory(
+            context.stagingIdentity,
+            openedDirectory
+          ),
+          sameUserSelectedPublicationDirectory(
+            openedDirectory,
+            namedDirectory
+          ) else {
+        return
+    }
+    _ = Darwin.rmdir(context.stagingURL.path)
+}
+
+private func sameUserSelectedPublicationNode(_ lhs: stat, _ rhs: stat) -> Bool {
+    lhs.st_dev == rhs.st_dev
+        && lhs.st_ino == rhs.st_ino
+        && (lhs.st_mode & S_IFMT) == (rhs.st_mode & S_IFMT)
+}
+
+private func sameUserSelectedPublicationDirectory(_ lhs: stat, _ rhs: stat) -> Bool {
+    (lhs.st_mode & S_IFMT) == S_IFDIR
+        && (rhs.st_mode & S_IFMT) == S_IFDIR
+        && sameUserSelectedPublicationNode(lhs, rhs)
+}
+
+private func currentUserSelectedPublicationPOSIXError() -> NSError {
+    NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+}
+
+private func isUnsupportedUserSelectedCloneError(_ error: Error) -> Bool {
+    let failure = error as NSError
+    guard failure.domain == NSPOSIXErrorDomain else { return false }
+    return [Int(ENOTSUP), Int(EOPNOTSUPP), Int(EXDEV)].contains(failure.code)
+}
+
 public enum ProjectArtifactValidator {
     private static let maxHeaderBytes = 64 * 1024
     private static let maxAsciiVertexRowBytes = 1024 * 1024
@@ -233,6 +522,10 @@ public enum ProjectArtifactValidator {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         let data = (try? handle.read(upToCount: maxHeaderBytes)) ?? Data()
+        return plyHeaderInfo(in: data)
+    }
+
+    private static func plyHeaderInfo(in data: Data) -> PlyHeaderInfo? {
         guard !data.isEmpty, let bounds = plyHeaderBounds(in: data) else { return nil }
         guard let header = String(data: data.prefix(bounds.headerEnd), encoding: .utf8) else { return nil }
         let lines = header.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map(String.init)
@@ -249,6 +542,89 @@ public enum ProjectArtifactValidator {
             .map(String.init)?
             .lowercased() ?? ""
         return PlyHeaderInfo(vertexCount: vertexCount, format: format)
+    }
+
+    private static func validatedArtifactPlyHeader(
+        in data: Data
+    ) -> (info: PlyHeaderInfo, bodyStart: Int)? {
+        guard !data.isEmpty,
+              let bounds = plyHeaderBounds(in: data),
+              let header = String(
+                  data: data.prefix(bounds.headerEnd),
+                  encoding: .utf8
+              ) else {
+            return nil
+        }
+        let lines = header
+            .split(whereSeparator: { $0 == "\n" || $0 == "\r" })
+            .map(String.init)
+        guard lines.first?.trimmingCharacters(in: .whitespaces).lowercased() == "ply",
+              let format = lines
+                  .first(where: { $0.lowercased().hasPrefix("format ") })?
+                  .split(separator: " ")
+                  .dropFirst()
+                  .first
+                  .map(String.init)?
+                  .lowercased(),
+              ["ascii", "binary_little_endian", "binary_big_endian"].contains(format)
+        else {
+            return nil
+        }
+
+        var vertexCount: Int?
+        var vertexProperties: [String] = []
+        var isReadingVertexProperties = false
+        for line in lines {
+            let parts = line.split(separator: " ")
+            guard let keyword = parts.first?.lowercased() else { continue }
+            if keyword == "element" {
+                isReadingVertexProperties = false
+                guard parts.count >= 3,
+                      parts[1].lowercased() == "vertex" else {
+                    continue
+                }
+                guard vertexCount == nil,
+                      let count = Int(parts[2]),
+                      count > 0 else {
+                    return nil
+                }
+                vertexCount = count
+                isReadingVertexProperties = true
+                continue
+            }
+            guard isReadingVertexProperties, keyword == "property" else {
+                continue
+            }
+            guard parts.count >= 3,
+                  parts[1].lowercased() != "list",
+                  let name = parts.last?.lowercased() else {
+                return nil
+            }
+            vertexProperties.append(String(name))
+        }
+
+        guard let vertexCount,
+              Set(vertexProperties).count == vertexProperties.count else {
+            return nil
+        }
+        let properties = Set(vertexProperties)
+        let requiredGeometry = [
+            "x", "y", "z", "scale_0", "scale_1", "scale_2", "opacity",
+            "rot_0", "rot_1", "rot_2", "rot_3",
+        ]
+        guard requiredGeometry.allSatisfy(properties.contains) else {
+            return nil
+        }
+        let hasSHColor = ["f_dc_0", "f_dc_1", "f_dc_2"]
+            .allSatisfy(properties.contains)
+        let hasRGBColor = ["red", "green", "blue"]
+            .allSatisfy(properties.contains)
+        guard hasSHColor || hasRGBColor else { return nil }
+
+        return (
+            PlyHeaderInfo(vertexCount: vertexCount, format: format),
+            bounds.bodyStart
+        )
     }
 
     public static func resolveValidatedOutputPly(paths: ProjectPaths, relativePath: String) throws -> URL {
@@ -4271,6 +4647,7 @@ public enum ProjectArtifactValidator {
         expected: ExpectedPlyArtifactIdentity?,
         destinationKind: PlyPublicationDestination = .projectOwned,
         systemCalls: PlyPublicationSystemCalls,
+        fileOperations: UserSelectedPlyPublicationFileOperations = .system(),
         shouldCancel: @escaping @Sendable () -> Bool = { Task.isCancelled }
     ) throws -> ValidatedPlyArtifactEvidence {
         try throwIfCancellationRequested(shouldCancel)
@@ -4297,11 +4674,16 @@ public enum ProjectArtifactValidator {
             }
         }
         if destinationKind == .userSelected {
+            if source.standardizedFileURL == destination.standardizedFileURL {
+                return sourceEvidence
+            }
             return try publishValidatedPlyToUserSelectedDestination(
                 sourceDescriptor: sourceDescriptor,
+                sourceLabel: source.lastPathComponent,
                 sourceEvidence: sourceEvidence,
                 destination: destination,
                 systemCalls: systemCalls,
+                fileOperations: fileOperations,
                 shouldCancel: shouldCancel
             )
         }
@@ -4998,7 +5380,12 @@ public enum ProjectArtifactValidator {
         descriptor: Int32,
         label: String,
         beforeBoundsMeasurement: () throws -> Void = {},
-        readAt: (Int32, UnsafeMutableRawPointer?, Int, off_t) -> Int = {
+        readAt: @escaping (
+            Int32,
+            UnsafeMutableRawPointer?,
+            Int,
+            off_t
+        ) -> Int = {
             Darwin.pread($0, $1, $2, $3)
         },
         shouldCancel: @escaping @Sendable () -> Bool = { false }
@@ -5008,20 +5395,19 @@ public enum ProjectArtifactValidator {
         guard fstat(descriptor, &initial) == 0,
               (initial.st_mode & S_IFMT) == S_IFREG,
               initial.st_nlink == 1,
-              initial.st_size > 0,
-              lseek(descriptor, 0, SEEK_SET) == 0 else {
+              initial.st_size > 0 else {
             throw ProjectArtifactError.invalidOutput(label)
         }
-        let descriptorURL = URL(fileURLWithPath: "/dev/fd/\(descriptor)")
-        guard try validatePlyFile(
-            at: descriptorURL,
-            depth: .full,
+        let headerCursor = BoundPlyReadCursor(
+            descriptor: descriptor,
+            byteCount: Int64(initial.st_size),
+            readAt: readAt
+        )
+        guard let headerData = try headerCursor.readData(
+            upTo: min(maxHeaderBytes, Int(initial.st_size)),
             shouldCancel: shouldCancel
-        ) == .valid else {
-            throw ProjectArtifactError.invalidOutput(label)
-        }
-        guard lseek(descriptor, 0, SEEK_SET) == 0,
-              let header = readPlyHeader(at: descriptorURL) else {
+        ),
+              let header = validatedArtifactPlyHeader(in: headerData) else {
             throw ProjectArtifactError.invalidOutput(label)
         }
 
@@ -5044,11 +5430,26 @@ public enum ProjectArtifactValidator {
 
         try throwIfCancellationRequested(shouldCancel)
         try beforeBoundsMeasurement()
-        guard lseek(descriptor, 0, SEEK_SET) == 0,
-              let sceneBounds = try SplatSceneBoundsCalculator.compute(
-                at: descriptorURL,
-                shouldCancel: shouldCancel
-              ) else {
+        let boundsCursor = BoundPlyReadCursor(
+            descriptor: descriptor,
+            byteCount: Int64(initial.st_size),
+            readAt: readAt,
+            asciiBodyStart: header.info.format == "ascii"
+                ? Int64(header.bodyStart)
+                : nil,
+            maximumASCIIRowBytes: maxAsciiVertexRowBytes
+        )
+        let sceneReader = SplatPLYSceneReader(
+            sourceLabel: URL(fileURLWithPath: label),
+            read: { buffer, maximumLength in
+                boundsCursor.read(buffer, maximumLength: maximumLength)
+            }
+        )
+        guard let measurement = try SplatSceneBoundsCalculator.measure(
+            using: sceneReader,
+            shouldCancel: shouldCancel
+        ),
+              measurement.pointCount == header.info.vertexCount else {
             throw ProjectArtifactError.invalidOutput(label)
         }
         try throwIfCancellationRequested(shouldCancel)
@@ -5069,10 +5470,10 @@ public enum ProjectArtifactValidator {
         }
         return ValidatedPlyArtifactEvidence(
             byteCount: UInt64(initial.st_size),
-            vertexCount: header.vertexCount,
-            format: header.format,
+            vertexCount: header.info.vertexCount,
+            format: header.info.format,
             sha256: hasher.finalize().map { String(format: "%02x", $0) }.joined(),
-            sceneBounds: sceneBounds
+            sceneBounds: measurement.bounds
         )
     }
 
@@ -5496,8 +5897,9 @@ private enum ProjectArtifactValidationInternalError: Error {
     case unsupportedType
 }
 
-public enum ProjectArtifactError: Error, LocalizedError, Equatable {
+public enum ProjectArtifactError: Error, LocalizedError, Equatable, Sendable {
     case invalidOutput(String)
+    case publicationFailed(String)
     case publicationConflict(String)
     case publicationConflictPreservingPrevious(String, String)
     case publicationConflictPreservingFiles(String, [String])
@@ -5506,6 +5908,8 @@ public enum ProjectArtifactError: Error, LocalizedError, Equatable {
         switch self {
         case .invalidOutput(let path):
             return "Invalid project output: \(path)"
+        case .publicationFailed(let path):
+            return "Could not publish the selected destination: \(path)"
         case .publicationConflict(let path):
             return "The destination changed while EasySplat was publishing: \(path)"
         case .publicationConflictPreservingPrevious(let path, let recoveredPath):
@@ -5519,123 +5923,565 @@ public enum ProjectArtifactError: Error, LocalizedError, Equatable {
 extension ProjectArtifactValidator {
     /// Publish to somewhere the user picked.
     ///
-    /// A save-panel grant covers the chosen item, not its directory, so the
-    /// descriptor-bound sequence used for project-owned writes has nothing to
-    /// open. `replaceItemAt` is the system's own primitive for exactly this and
-    /// is what the grant admits. Losing the directory descriptor loses the
-    /// swap-under-us protections with it, so the published file is re-opened and
-    /// re-measured before the write is reported as good.
+    /// A save-panel grant covers the chosen item, not its directory. The source
+    /// side of each commit is therefore bound to an app-owned staging-directory
+    /// descriptor. Darwin clones that descriptor exclusively into an absent
+    /// selected path; Foundation performs the supported safe-save operation for
+    /// an existing selected file. The exact selected path is then reopened and
+    /// measured without treating its parent as authority.
     static func publishValidatedPlyToUserSelectedDestination(
         sourceDescriptor: Int32,
+        sourceLabel: String,
         sourceEvidence: ValidatedPlyArtifactEvidence,
         destination: URL,
         systemCalls: PlyPublicationSystemCalls,
+        fileOperations: UserSelectedPlyPublicationFileOperations,
         shouldCancel: @escaping @Sendable () -> Bool
     ) throws -> ValidatedPlyArtifactEvidence {
         try throwIfCancellationRequested(shouldCancel)
         let staging: URL
         do {
-            staging = try FileManager.default.url(
-                for: .itemReplacementDirectory,
-                in: .userDomainMask,
-                appropriateFor: destination,
-                create: true
-            )
+            staging = try fileOperations.createReplacementDirectory(destination)
         } catch {
-            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
         }
-        defer { try? FileManager.default.removeItem(at: staging) }
+
+        var stagingPathIdentity = stat()
+        guard lstat(staging.path, &stagingPathIdentity) == 0,
+              (stagingPathIdentity.st_mode & S_IFMT) == S_IFDIR else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+        let stagingDescriptor = Darwin.open(
+            staging.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard stagingDescriptor >= 0 else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+        defer { Darwin.close(stagingDescriptor) }
+        var stagingIdentity = stat()
+        guard fstat(stagingDescriptor, &stagingIdentity) == 0,
+              sameUserSelectedPublicationDirectory(stagingPathIdentity, stagingIdentity) else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+
+        let candidateName = ".easysplat-export-\(UUID().uuidString).tmp"
+        var candidateDescriptor: Int32 = -1
+        var createdCandidateIdentity: stat?
+        defer {
+            do {
+                try fileOperations.beforeStagingCleanup(staging)
+                try fileOperations.cleanupStaging(
+                    UserSelectedPlyPublicationStagingCleanupContext(
+                        stagingURL: staging,
+                        stagingDescriptor: stagingDescriptor,
+                        stagingIdentity: stagingIdentity,
+                        candidateDescriptor: candidateDescriptor >= 0
+                            ? candidateDescriptor
+                            : nil,
+                        candidateIdentity: createdCandidateIdentity,
+                        candidateName: candidateName
+                    )
+                )
+            } catch {
+                // Publication has already been reconciled. Cleanup is best effort
+                // and ambiguity intentionally leaves staging names in place.
+            }
+            if candidateDescriptor >= 0 { Darwin.close(candidateDescriptor) }
+        }
 
         // A validated splat can be gigabytes, so it is streamed rather than held.
-        let candidate = staging.appendingPathComponent(destination.lastPathComponent)
-        guard FileManager.default.createFile(atPath: candidate.path, contents: nil) else {
-            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+        candidateDescriptor = candidateName.withCString {
+            Darwin.openat(
+                stagingDescriptor,
+                $0,
+                O_RDWR | O_CREAT | O_EXCL | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW_ANY,
+                mode_t(S_IRUSR | S_IWUSR)
+            )
         }
-        let candidateDescriptor = Darwin.open(
-            candidate.path,
-            O_WRONLY | O_NOFOLLOW | O_CLOEXEC
-        )
         guard candidateDescriptor >= 0 else {
-            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
         }
+        guard fchmod(candidateDescriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+        var createdCandidate = stat()
+        var namedCreatedCandidate = stat()
+        guard fstat(candidateDescriptor, &createdCandidate) == 0,
+              candidateName.withCString({
+                  fstatat(stagingDescriptor, $0, &namedCreatedCandidate, AT_SYMLINK_NOFOLLOW)
+              }) == 0,
+              (createdCandidate.st_mode & S_IFMT) == S_IFREG,
+              createdCandidate.st_nlink == 1,
+              samePublishedFile(createdCandidate, namedCreatedCandidate) else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+        createdCandidateIdentity = createdCandidate
+
         var copied: Int64 = 0
         var buffer = [UInt8](repeating: 0, count: 1024 * 1024)
-        do {
-            while copied < Int64(sourceEvidence.byteCount) {
-                try throwIfCancellationRequested(shouldCancel)
-                let requested = min(
-                    buffer.count,
-                    Int(sourceEvidence.byteCount - UInt64(copied))
+        while copied < Int64(sourceEvidence.byteCount) {
+            try throwIfCancellationRequested(shouldCancel)
+            let requested = min(
+                buffer.count,
+                Int(sourceEvidence.byteCount - UInt64(copied))
+            )
+            let read = buffer.withUnsafeMutableBytes { bytes in
+                systemCalls.readAt(
+                    sourceDescriptor,
+                    bytes.baseAddress,
+                    requested,
+                    off_t(copied)
                 )
-                let read = buffer.withUnsafeMutableBytes { bytes in
-                    systemCalls.readAt(
-                        sourceDescriptor,
-                        bytes.baseAddress,
-                        requested,
-                        off_t(copied)
+            }
+            if read < 0 && errno == EINTR { continue }
+            guard read > 0, read <= requested else {
+                throw ProjectArtifactError.invalidOutput(sourceLabel)
+            }
+            var written = 0
+            while written < read {
+                try throwIfCancellationRequested(shouldCancel)
+                let result = buffer.withUnsafeBytes { bytes in
+                    systemCalls.write(
+                        candidateDescriptor,
+                        bytes.baseAddress?.advanced(by: written),
+                        read - written
                     )
                 }
-                if read < 0 && errno == EINTR { continue }
-                guard read > 0, read <= requested else {
-                    throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+                if result < 0 && errno == EINTR { continue }
+                guard result > 0, result <= read - written else {
+                    throw ProjectArtifactError.publicationFailed(
+                        destination.lastPathComponent
+                    )
                 }
-                var written = 0
-                while written < read {
-                    let result = buffer.withUnsafeBytes { bytes in
-                        systemCalls.write(
-                            candidateDescriptor,
-                            bytes.baseAddress?.advanced(by: written),
-                            read - written
-                        )
-                    }
-                    if result < 0 && errno == EINTR { continue }
-                    guard result > 0, result <= read - written else {
-                        throw ProjectArtifactError.invalidOutput(
-                            destination.lastPathComponent
-                        )
-                    }
-                    written += result
-                }
-                copied += Int64(read)
+                written += result
             }
+            copied += Int64(read)
+        }
+        try throwIfCancellationRequested(shouldCancel)
+        do {
             try synchronize(
                 candidateDescriptor,
                 label: destination.lastPathComponent,
                 systemCalls: systemCalls
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
-            Darwin.close(candidateDescriptor)
-            throw error
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
         }
-        Darwin.close(candidateDescriptor)
 
+        let candidateEvidence: ValidatedPlyArtifactEvidence
         do {
-            _ = try FileManager.default.replaceItemAt(
+            candidateEvidence = try validatedPlyEvidence(
+                descriptor: candidateDescriptor,
+                label: destination.lastPathComponent,
+                readAt: systemCalls.readAt,
+                shouldCancel: shouldCancel
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+        guard candidateEvidence == sourceEvidence else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+
+        let finalSourceEvidence = try validatedPlyEvidence(
+            descriptor: sourceDescriptor,
+            label: sourceLabel,
+            readAt: systemCalls.readAt,
+            shouldCancel: shouldCancel
+        )
+        guard finalSourceEvidence == sourceEvidence else {
+            throw ProjectArtifactError.invalidOutput(sourceLabel)
+        }
+
+        var candidateIdentity = stat()
+        var namedCandidateIdentity = stat()
+        guard fstat(candidateDescriptor, &candidateIdentity) == 0,
+              candidateName.withCString({
+                  fstatat(stagingDescriptor, $0, &namedCandidateIdentity, AT_SYMLINK_NOFOLLOW)
+              }) == 0,
+              (candidateIdentity.st_mode & S_IFMT) == S_IFREG,
+              candidateIdentity.st_nlink == 1,
+              samePublishedFile(candidateIdentity, namedCandidateIdentity) else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+        createdCandidateIdentity = candidateIdentity
+
+        let snapshot = try snapshotUserSelectedDestination(
+            destination,
+            fileOperations: fileOperations
+        )
+        try throwIfCancellationRequested(shouldCancel)
+
+        let outcome: UserSelectedPublicationOutcome
+        do {
+            try fileOperations.beforeCommit()
+            var commitCandidateIdentity = stat()
+            guard fstat(candidateDescriptor, &commitCandidateIdentity) == 0 else {
+                throw ProjectArtifactError.publicationFailed(
+                    destination.lastPathComponent
+                )
+            }
+            if !samePublishedFile(candidateIdentity, commitCandidateIdentity) {
+                guard samePublishedFileIgnoringChangeTime(
+                    candidateIdentity,
+                    commitCandidateIdentity
+                ) else {
+                    throw ProjectArtifactError.publicationFailed(
+                        destination.lastPathComponent
+                    )
+                }
+                let reboundEvidence = try validatedPlyEvidence(
+                    descriptor: candidateDescriptor,
+                    label: destination.lastPathComponent,
+                    readAt: systemCalls.readAt,
+                    shouldCancel: shouldCancel
+                )
+                guard reboundEvidence == sourceEvidence else {
+                    throw ProjectArtifactError.publicationFailed(
+                        destination.lastPathComponent
+                    )
+                }
+            }
+            try verifyUserSelectedDestinationBeforeCommit(
                 destination,
-                withItemAt: candidate,
-                backupItemName: nil,
-                options: [.usingNewMetadataOnly]
+                snapshot: snapshot,
+                fileOperations: fileOperations
+            )
+            try verifyUserSelectedCandidateBeforeCommit(
+                candidateDescriptor: candidateDescriptor,
+                expectedIdentity: commitCandidateIdentity,
+                stagingURL: staging,
+                stagingDescriptor: stagingDescriptor,
+                stagingIdentity: stagingIdentity,
+                candidateName: candidateName,
+                requireNamedPath: {
+                    if case .existing = snapshot { return true }
+                    return false
+                }(),
+                destination: destination
+            )
+            try throwIfCancellationRequested(shouldCancel)
+            switch snapshot {
+            case .absent:
+                do {
+                    try fileOperations.cloneAbsent(
+                        candidateDescriptor,
+                        destination
+                    )
+                } catch {
+                    guard isUnsupportedUserSelectedCloneError(error) else {
+                        throw error
+                    }
+                    try verifyUserSelectedCandidateBeforeCommit(
+                        candidateDescriptor: candidateDescriptor,
+                        expectedIdentity: commitCandidateIdentity,
+                        stagingURL: staging,
+                        stagingDescriptor: stagingDescriptor,
+                        stagingIdentity: stagingIdentity,
+                        candidateName: candidateName,
+                        requireNamedPath: true,
+                        destination: destination
+                    )
+                    try throwIfCancellationRequested(shouldCancel)
+                    try fileOperations.moveAbsent(
+                        staging.appendingPathComponent(
+                            candidateName,
+                            isDirectory: false
+                        ),
+                        destination
+                    )
+                }
+                outcome = .committed
+            case .existing:
+                _ = try fileOperations.replaceExisting(
+                    destination,
+                    staging.appendingPathComponent(
+                        candidateName,
+                        isDirectory: false
+                    )
+                )
+                outcome = .committed
+            }
+        } catch {
+            outcome = .threw(error)
+        }
+
+        // The selected URL is the only path covered by the save-panel grant
+        // and the only path reconciled.
+        return try reconcileUserSelectedPublication(
+            destination: destination,
+            sourceEvidence: sourceEvidence,
+            snapshot: snapshot,
+            outcome: outcome,
+            systemCalls: systemCalls,
+            fileOperations: fileOperations
+        )
+    }
+
+    private enum UserSelectedDestinationSnapshot {
+        case absent
+        case existing(stat)
+    }
+
+    private enum UserSelectedPublicationOutcome {
+        case committed
+        case threw(Error)
+
+        var error: Error? {
+            if case .threw(let error) = self { return error }
+            return nil
+        }
+    }
+
+    private static func snapshotUserSelectedDestination(
+        _ destination: URL,
+        fileOperations: UserSelectedPlyPublicationFileOperations
+    ) throws -> UserSelectedDestinationSnapshot {
+        let descriptor = fileOperations.openExactFile(
+            destination,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        let openError = errno
+        guard descriptor >= 0 else {
+            var pathIdentity = stat()
+            if openError == ENOENT {
+                guard lstat(destination.path, &pathIdentity) != 0, errno == ENOENT else {
+                    throw ProjectArtifactError.publicationConflict(
+                        destination.lastPathComponent
+                    )
+                }
+                return .absent
+            }
+            if openError == ELOOP {
+                guard lstat(destination.path, &pathIdentity) == 0,
+                      (pathIdentity.st_mode & S_IFMT) == S_IFLNK else {
+                    throw ProjectArtifactError.publicationConflict(
+                        destination.lastPathComponent
+                    )
+                }
+            }
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+        defer { Darwin.close(descriptor) }
+
+        var before = stat()
+        guard fstat(descriptor, &before) == 0 else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+
+        var pathBefore = stat()
+        guard lstat(destination.path, &pathBefore) == 0,
+              samePublishedFile(before, pathBefore) else {
+            throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+        }
+        guard (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_nlink == 1 else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+
+        var after = stat()
+        var pathAfter = stat()
+        guard fstat(descriptor, &after) == 0,
+              lstat(destination.path, &pathAfter) == 0,
+              samePublishedFile(before, after),
+              samePublishedFile(before, pathAfter) else {
+            throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+        }
+        return .existing(after)
+    }
+
+    private static func verifyUserSelectedDestinationBeforeCommit(
+        _ destination: URL,
+        snapshot: UserSelectedDestinationSnapshot,
+        fileOperations: UserSelectedPlyPublicationFileOperations
+    ) throws {
+        let descriptor = fileOperations.openExactFile(
+            destination,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        let openError = errno
+        switch snapshot {
+        case .absent:
+            if descriptor >= 0 {
+                Darwin.close(descriptor)
+                throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+            }
+            guard openError == ENOENT else {
+                throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+            }
+            var pathIdentity = stat()
+            guard lstat(destination.path, &pathIdentity) != 0, errno == ENOENT else {
+                throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+            }
+
+        case .existing(let expected):
+            guard descriptor >= 0 else {
+                throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+            }
+            defer { Darwin.close(descriptor) }
+            var before = stat()
+            var pathBefore = stat()
+            var after = stat()
+            var pathAfter = stat()
+            guard fstat(descriptor, &before) == 0,
+                  lstat(destination.path, &pathBefore) == 0,
+                  (before.st_mode & S_IFMT) == S_IFREG,
+                  before.st_nlink == 1,
+                  samePublishedFile(expected, before),
+                  samePublishedFile(expected, pathBefore),
+                  fstat(descriptor, &after) == 0,
+                  lstat(destination.path, &pathAfter) == 0,
+                  samePublishedFile(expected, after),
+                  samePublishedFile(expected, pathAfter) else {
+                throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+            }
+        }
+    }
+
+    private static func verifyUserSelectedCandidateBeforeCommit(
+        candidateDescriptor: Int32,
+        expectedIdentity: stat,
+        stagingURL: URL,
+        stagingDescriptor: Int32,
+        stagingIdentity: stat,
+        candidateName: String,
+        requireNamedPath: Bool,
+        destination: URL
+    ) throws {
+        var descriptorIdentity = stat()
+        guard fstat(candidateDescriptor, &descriptorIdentity) == 0,
+              (descriptorIdentity.st_mode & S_IFMT) == S_IFREG,
+              descriptorIdentity.st_nlink == 1,
+              samePublishedFile(expectedIdentity, descriptorIdentity) else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+        guard requireNamedPath else { return }
+
+        var openedDirectory = stat()
+        var namedDirectory = stat()
+        var namedCandidate = stat()
+        guard fstat(stagingDescriptor, &openedDirectory) == 0,
+              lstat(stagingURL.path, &namedDirectory) == 0,
+              sameUserSelectedPublicationDirectory(
+                stagingIdentity,
+                openedDirectory
+              ),
+              sameUserSelectedPublicationDirectory(
+                openedDirectory,
+                namedDirectory
+              ),
+              candidateName.withCString({
+                  fstatat(
+                    stagingDescriptor,
+                    $0,
+                    &namedCandidate,
+                    AT_SYMLINK_NOFOLLOW
+                  )
+              }) == 0,
+              samePublishedFile(descriptorIdentity, namedCandidate) else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+
+        let candidateURL = stagingURL.appendingPathComponent(
+            candidateName,
+            isDirectory: false
+        )
+        var pathCandidate = stat()
+        guard lstat(candidateURL.path, &pathCandidate) == 0,
+              samePublishedFile(descriptorIdentity, pathCandidate) else {
+            throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
+        }
+    }
+
+    private static func reconcileUserSelectedPublication(
+        destination: URL,
+        sourceEvidence: ValidatedPlyArtifactEvidence,
+        snapshot: UserSelectedDestinationSnapshot,
+        outcome: UserSelectedPublicationOutcome,
+        systemCalls: PlyPublicationSystemCalls,
+        fileOperations: UserSelectedPlyPublicationFileOperations
+    ) throws -> ValidatedPlyArtifactEvidence {
+        let descriptor = fileOperations.openExactFile(
+            destination,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        let openError = errno
+        guard descriptor >= 0 else {
+            if case .absent = snapshot, openError == ENOENT {
+                try throwOrdinaryUserSelectedPublicationFailure(
+                    outcome.error,
+                    destination: destination
+                )
+            }
+            throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+        }
+        defer { Darwin.close(descriptor) }
+
+        var before = stat()
+        var pathBefore = stat()
+        guard fstat(descriptor, &before) == 0,
+              lstat(destination.path, &pathBefore) == 0,
+              samePublishedFile(before, pathBefore),
+              (before.st_mode & S_IFMT) == S_IFREG,
+              before.st_nlink == 1 else {
+            throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+        }
+
+        let published: ValidatedPlyArtifactEvidence?
+        do {
+            published = try validatedPlyEvidence(
+                descriptor: descriptor,
+                label: destination.lastPathComponent,
+                readAt: systemCalls.readAt,
+                shouldCancel: { false }
             )
         } catch {
-            // replaceItemAt needs the destination to exist on some volumes; a
-            // first export has nothing to replace.
-            do {
-                try FileManager.default.removeItem(at: destination)
-            } catch CocoaError.fileNoSuchFile {
-            } catch {
-                throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
-            }
-            do {
-                try FileManager.default.moveItem(at: candidate, to: destination)
-            } catch {
-                throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
-            }
+            published = nil
         }
 
-        let published = try validatedPlyEvidence(at: destination)
-        guard published == sourceEvidence else {
-            throw ProjectArtifactError.invalidOutput(destination.lastPathComponent)
+        var after = stat()
+        var pathAfter = stat()
+        guard fstat(descriptor, &after) == 0,
+              lstat(destination.path, &pathAfter) == 0,
+              samePublishedFile(before, after),
+              samePublishedFile(before, pathAfter) else {
+            throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
         }
-        return published
+
+        // The exact selected path is the publication authority. If its stable,
+        // descriptor-validated evidence is already the requested artifact, the
+        // user's outcome is complete even when creation threw or another actor
+        // independently wrote identical bytes.
+        if published == sourceEvidence {
+            return sourceEvidence
+        }
+
+        if case .existing(let original) = snapshot,
+           samePublishedFile(original, after) {
+            try throwOrdinaryUserSelectedPublicationFailure(
+                outcome.error,
+                destination: destination
+            )
+        }
+        throw ProjectArtifactError.publicationConflict(destination.lastPathComponent)
+    }
+
+    private static func throwOrdinaryUserSelectedPublicationFailure(
+        _ error: Error?,
+        destination: URL
+    ) throws -> Never {
+        if let error, error is CancellationError {
+            throw CancellationError()
+        }
+        if let artifactError = error as? ProjectArtifactError,
+           case .publicationConflict = artifactError {
+            throw artifactError
+        }
+        throw ProjectArtifactError.publicationFailed(destination.lastPathComponent)
     }
 }

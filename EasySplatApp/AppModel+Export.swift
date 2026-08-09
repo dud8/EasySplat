@@ -1,9 +1,11 @@
 import EasySplatCore
 import Foundation
 
-enum CurrentSplatExportError: LocalizedError {
+enum CurrentSplatExportError: LocalizedError, Equatable, Sendable {
     case noFinishedOutput
     case noValidSubjectOutput
+    case destinationPublicationFailed
+    case destinationPublicationConflict
 
     var errorDescription: String? {
         switch self {
@@ -11,6 +13,10 @@ enum CurrentSplatExportError: LocalizedError {
             return "This project does not have a valid finished splat to export."
         case .noValidSubjectOutput:
             return "This project does not have a valid Subject splat to export."
+        case .destinationPublicationFailed:
+            return "EasySplat couldn’t write the selected file. Any existing file was left unchanged."
+        case .destinationPublicationConflict:
+            return "The selected file changed while EasySplat was exporting. EasySplat left it untouched."
         }
     }
 }
@@ -110,21 +116,59 @@ extension AppModel {
         to destination: URL,
         publisher: @escaping CurrentSplatPublisher
     ) async throws {
+        try await exportCurrentSplat(
+            source,
+            to: destination,
+            publisher: publisher,
+            destinationAccess: SecurityScopedAccess()
+        )
+    }
+
+    func exportCurrentSplat(
+        _ source: CurrentSplatPublicationSource,
+        to destination: URL,
+        publisher: @escaping CurrentSplatPublisher,
+        destinationAccess: SecurityScopedAccess
+    ) async throws {
         // The save panel's grant belongs to the URL it returned, and the write runs
-        // off the main actor after the panel closed. Hold the scope across it so a
-        // sandboxed build can finish the export it was told to make.
-        let destinationAccess = SecurityScopedAccess()
+        // off the main actor after the panel closed. Claim before creating that
+        // worker and hold the scope until its non-cancellable reconciliation has
+        // returned, even when the caller requests cancellation in the meantime.
         destinationAccess.claim([destination])
         defer { destinationAccess.releaseAll() }
         let worker = Task.detached(priority: .userInitiated) {
             try publisher(source.outputURL, destination, source.expectedIdentity)
         }
-        try await withTaskCancellationHandler {
-            try await worker.value
-        } onCancel: {
-            worker.cancel()
+        do {
+            try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+        } catch {
+            throw Self.currentSplatExportError(for: error, variant: source.variant)
         }
-        try Task.checkCancellation()
+    }
+
+    private nonisolated static func currentSplatExportError(
+        for error: Error,
+        variant: SplatOutputVariant
+    ) -> Error {
+        guard let artifactError = error as? ProjectArtifactError else {
+            return error
+        }
+        switch artifactError {
+        case .invalidOutput:
+            return variant == .subject
+                ? CurrentSplatExportError.noValidSubjectOutput
+                : CurrentSplatExportError.noFinishedOutput
+        case .publicationFailed:
+            return CurrentSplatExportError.destinationPublicationFailed
+        case .publicationConflict,
+             .publicationConflictPreservingPrevious,
+             .publicationConflictPreservingFiles:
+            return CurrentSplatExportError.destinationPublicationConflict
+        }
     }
 
     private nonisolated static func publicationSource(
@@ -256,9 +300,6 @@ extension AppModel {
         to destination: URL,
         expected: ExpectedPlyArtifactIdentity?
     ) throws {
-        if source.standardizedFileURL == destination.standardizedFileURL {
-            return
-        }
         // The destination came from a save panel, so the sandbox grants the file
         // itself and not the directory around it.
         if let expected {
