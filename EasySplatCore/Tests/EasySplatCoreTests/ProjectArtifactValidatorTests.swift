@@ -335,6 +335,45 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         XCTAssertLessThan(maximumBoundsOffset, off_t(bytes.count - 64 * 1024))
     }
 
+    func testReleaseReliabilityValidatesReferenceSizePlyWithExactEvidence() throws {
+        let fixture = try ReleaseReliabilityFixtureSupport.load(
+            workload: "ply-validation-139.6mib"
+        )
+        XCTAssertEqual(fixture.manifest.ply.targetMiB, 139.6)
+        let source = fixture.fixtureRoot.appendingPathComponent("splat.ply")
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let evidence = try ProjectArtifactValidator.validatedPlyEvidence(at: source)
+        let elapsed = started.duration(to: clock.now)
+
+        XCTAssertEqual(evidence.byteCount, fixture.manifest.ply.byteCount)
+        XCTAssertEqual(evidence.vertexCount, fixture.manifest.ply.gaussianCount)
+        XCTAssertEqual(evidence.format, fixture.manifest.ply.format)
+        XCTAssertEqual(evidence.sha256, fixture.manifest.ply.sha256)
+        XCTAssertEqual(
+            evidence.sceneBounds.center.x,
+            fixture.manifest.ply.sceneBounds.center.x,
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(
+            evidence.sceneBounds.center.y,
+            fixture.manifest.ply.sceneBounds.center.y,
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(
+            evidence.sceneBounds.center.z,
+            fixture.manifest.ply.sceneBounds.center.z,
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(
+            evidence.sceneBounds.radius,
+            fixture.manifest.ply.sceneBounds.radius,
+            accuracy: 1e-9
+        )
+        try fixture.recordSuccess(elapsed: elapsed)
+    }
+
     func testValidatedPlyBoundsAreInvariantToInputRowOrder() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

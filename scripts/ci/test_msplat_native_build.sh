@@ -192,7 +192,7 @@ require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT
 require_json_hash "overlay_sha256" "$OVERLAY" "$VALIDATOR"
 require_contains '"patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$VALIDATOR"
 require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$VALIDATOR"
-require_contains 'RASTER_TEST_SHA256="2f9b7c7241accbae20dd3c93ff2a5c13934a391b75438328e5fa9725ea2bdb5a"' "$BUILD_SCRIPT"
+require_contains 'RASTER_TEST_SHA256="a7066c5ce8eff0a1ebb0586c83b77ac235446bd500e465fc3bb0e68d88c4ac2e"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 for source_contract in \
   "ISOLATION_HEADER:$ISOLATION_HEADER" \
@@ -571,6 +571,9 @@ require_contains '::mkstemp' "$RASTER_TEST_SOURCE"
 require_contains 'geometry_adam_checkpoint_resume' "$RASTER_TEST_SOURCE"
 require_contains 'geometry_adam_fusion_parity' "$RASTER_TEST_SOURCE"
 require_contains 'verifyGeometryAdamFusionParity(argv[2]);' "$RASTER_TEST_SOURCE"
+require_contains 'void verifyGeometryAdamMultiSIMDParity' "$RASTER_TEST_SOURCE"
+require_contains 'requireModelNear("geometry_adam_multisimd", legacy, fused)' "$RASTER_TEST_SOURCE"
+require_contains 'verifyGeometryAdamMultiSIMDParity(dataset);' "$RASTER_TEST_SOURCE"
 require_contains '--geometry-adam-benchmark' "$RASTER_TEST_SOURCE"
 # Performance sampling is an opt-in diagnostic. CI gates numerical parity and dispatch contracts.
 require_absent '--geometry-adam-benchmark' "$BUILD_SCRIPT"
@@ -648,7 +651,7 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_json_hash "isolation_mask_test_sha256" "$ISOLATION_MASK_TEST_SOURCE" "$contract_file"
   require_json_hash "isolation_patch_sha256" "$ISOLATION_PATCH" "$contract_file"
   require_contains '"source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb"' "$contract_file"
-  require_contains '"raster_test_sha256": "2f9b7c7241accbae20dd3c93ff2a5c13934a391b75438328e5fa9725ea2bdb5a"' "$contract_file"
+  require_contains '"raster_test_sha256": "a7066c5ce8eff0a1ebb0586c83b77ac235446bd500e465fc3bb0e68d88c4ac2e"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
   require_contains '"allocation_pressure_patch_sha256": "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8"' "$contract_file"
   require_contains '"exact_prefix_hardening_patch_sha256": "510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb"' "$contract_file"
@@ -697,7 +700,6 @@ require_contains '"$PROMOTER_RUNTIME_INODE"' "$BUILD_SCRIPT"
 require_contains 'PROMOTER_RUNTIME_READY=1' "$BUILD_SCRIPT"
 require_contains 'prepare_private_promoter' "$BUILD_SCRIPT"
 require_contains 'snapshot_build_inputs' "$BUILD_SCRIPT"
-require_contains 'BUILD_INPUT_SNAPSHOT_READY=1' "$BUILD_SCRIPT"
 require_absent '"$PYTHON_BIN" "$PROMOTER_SOURCE"' "$BUILD_SCRIPT"
 require_absent '/usr/bin/xattr -c' "$BUILD_SCRIPT"
 
@@ -1859,9 +1861,12 @@ set -e
 [ "$parser_fd1_status" = 1 ] && [ ! -s "$negative_dir/isolation-parser-fd1.stdout" ] \
   && [ ! -s "$negative_dir/isolation-parser-fd1.stderr" ] \
   || fail "fd1 parser diagnostics escaped isolation suppression"
-[ "$parser_ordinary_status" = 1 ] && [ ! -s "$negative_dir/parser-ordinary.stdout" ] \
-  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-ordinary.stderr" \
-  || fail "ordinary parser diagnostics did not preserve stderr behavior"
+if ! [ "$parser_ordinary_status" = 1 ] \
+    || [ -s "$negative_dir/parser-ordinary.stdout" ] \
+    || ! grep -Fq -- '--unknown-isolation-option' \
+      "$negative_dir/parser-ordinary.stderr"; then
+  fail "ordinary parser diagnostics did not preserve stderr behavior"
+fi
 
 set +e
 "$BIN" -- --isolate \
@@ -1889,21 +1894,29 @@ parser_nonstandard_fd3_status=$?
   2>"$negative_dir/parser-duplicate-fd3.stderr"
 parser_duplicate_fd3_status=$?
 set -e
-[ "$parser_terminator_status" = 1 ] && [ ! -s "$negative_dir/parser-terminator.stdout" ] \
-  && grep -Fq -- '--isolate' "$negative_dir/parser-terminator.stderr" \
-  || fail "argument terminator did not preserve ordinary parser diagnostics"
-[ "$parser_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-fd3.stdout" ] \
-  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-fd3.stderr" \
-  || fail "fd3 parser diagnostics were unnecessarily suppressed"
+if ! [ "$parser_terminator_status" = 1 ] \
+    || [ -s "$negative_dir/parser-terminator.stdout" ] \
+    || ! grep -Fq -- '--isolate' "$negative_dir/parser-terminator.stderr"; then
+  fail "argument terminator did not preserve ordinary parser diagnostics"
+fi
+if ! [ "$parser_fd3_status" = 1 ] \
+    || [ -s "$negative_dir/parser-fd3.stdout" ] \
+    || ! grep -Fq -- '--unknown-isolation-option' \
+      "$negative_dir/parser-fd3.stderr"; then
+  fail "fd3 parser diagnostics were unnecessarily suppressed"
+fi
 [ "$parser_invalid_fd_status" = 1 ] && [ ! -s "$negative_dir/parser-invalid-fd.stdout" ] \
   && [ -s "$negative_dir/parser-invalid-fd.stderr" ] \
   || fail "invalid non-stdio descriptor diagnostics were unnecessarily suppressed"
 [ "$parser_overflow_fd_status" = 1 ] && [ ! -s "$negative_dir/parser-overflow-fd.stdout" ] \
   && [ -s "$negative_dir/parser-overflow-fd.stderr" ] \
   || fail "overflow descriptor diagnostics were unnecessarily suppressed"
-[ "$parser_nonstandard_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-nonstandard-fd3.stdout" ] \
-  && grep -Fq -- '--unknown-isolation-option' "$negative_dir/parser-nonstandard-fd3.stderr" \
-  || fail "nonstandard fd3 diagnostics were unnecessarily suppressed"
+if ! [ "$parser_nonstandard_fd3_status" = 1 ] \
+    || [ -s "$negative_dir/parser-nonstandard-fd3.stdout" ] \
+    || ! grep -Fq -- '--unknown-isolation-option' \
+      "$negative_dir/parser-nonstandard-fd3.stderr"; then
+  fail "nonstandard fd3 diagnostics were unnecessarily suppressed"
+fi
 [ "$parser_duplicate_fd3_status" = 1 ] && [ ! -s "$negative_dir/parser-duplicate-fd3.stdout" ] \
   && [ -s "$negative_dir/parser-duplicate-fd3.stderr" ] \
   || fail "duplicate fd3+ diagnostics were unnecessarily suppressed"
@@ -2792,7 +2805,7 @@ mixed = [
 ]
 if len(mixed) != 1 or mixed[0].get("dataset") != "14-mixed-resolution-500":
     raise SystemExit("sparse fixtures must contain the mixed-resolution growth case")
-if mixed[0].get("resolution") != [[32, 32], [320, 180]]:
+if mixed[0].get("resolution") != [[4, 4], [320, 180]]:
     raise SystemExit("mixed-resolution fixture contract changed")
 PY
 

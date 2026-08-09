@@ -122,6 +122,18 @@ def valid_snapshot():
             **copy.deepcopy(environment),
             "name": "release-publication",
         },
+        "testflight_signing_environment": {
+            **copy.deepcopy(environment),
+            "name": "testflight-signing",
+        },
+        "testflight_submission_environment": {
+            **copy.deepcopy(environment),
+            "name": "testflight-submission",
+        },
+        "testflight_dogfood_environment": {
+            **copy.deepcopy(environment),
+            "name": "testflight-dogfood",
+        },
         "authority": {"login": AUTHORITY, "type": "User"},
         "collaborators": [
             {
@@ -154,6 +166,21 @@ def valid_snapshot():
         "workflows": {
             ".github/workflows/ci.yml": "permissions:\n  contents: read\n",
             ".github/workflows/release-app.yml": "permissions:\n  contents: read\n",
+            ".github/workflows/release-testflight.yml": (
+                "permissions:\n"
+                "  contents: read\n"
+                "jobs:\n"
+                "  sign:\n"
+                "    environment: testflight-signing\n"
+                "    env:\n"
+                "      PROFILE: ${{ secrets.EASYSPLAT_MAS_PROVISIONING_PROFILE_BASE64 }}\n"
+                "  submit:\n"
+                "    environment: testflight-submission\n"
+                "    env:\n"
+                "      KEY: ${{ secrets.EASYSPLAT_ASC_PRIVATE_KEY_BASE64 }}\n"
+                "  dogfood:\n"
+                "    environment: testflight-dogfood\n"
+            ),
         },
         "check_runs": [
             successful_check_run(identifier, name)
@@ -294,6 +321,27 @@ class ReleasePolicyWorkflowTests(unittest.TestCase):
         self.assertNotIn("$PREPARED_ROOT/product/ManifestTool", credentialed)
         self.assertIn('test ! -e "$PREPARED_ROOT/product/ManifestTool"', signing)
         self.assertNotIn("$SOURCE_ROOT/scripts/", credentialed)
+
+    def test_prepare_release_stages_toolchain_outside_the_checkout(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        prepare = workflow.split("  prepare-release:\n", 1)[1].split(
+            "  sign-and-notarize:\n", 1
+        )[0]
+        staging = prepare.split(
+            "      - name: Stage the toolchain tree the app will carry\n", 1
+        )[1].split(
+            "      - name: Prepare data-only uncredentialed app handoff\n", 1
+        )[0]
+        handoff = prepare.split(
+            "      - name: Prepare data-only uncredentialed app handoff\n", 1
+        )[1]
+
+        self.assertIn('TOOLCHAIN_DOWNLOAD="$RUNNER_TEMP/', staging)
+        self.assertIn('TOOLCHAIN_OUT="$RUNNER_TEMP/', staging)
+        self.assertNotIn("Toolchains/download", staging)
+        self.assertNotIn("Toolchains/out", staging)
+        self.assertIn('git status --porcelain', staging)
+        self.assertIn('"$TOOLCHAIN_OUT"', handoff)
 
     def test_stale_review_policy_fails(self):
         snapshot = valid_snapshot()
@@ -450,6 +498,39 @@ class ReleasePolicyWorkflowTests(unittest.TestCase):
         )
         self.run_snapshot(snapshot, False)
 
+    def test_testflight_secret_in_another_workflow_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["workflows"][".github/workflows/ci.yml"] = (
+            "env:\n"
+            "  KEY: ${{ secrets.EASYSPLAT_ASC_PRIVATE_KEY_BASE64 }}\n"
+        )
+        self.run_snapshot(snapshot, False)
+
+    def test_testflight_environment_in_another_workflow_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["workflows"][".github/workflows/ci.yml"] = (
+            "jobs:\n"
+            "  submit:\n"
+            "    environment: testflight-submission\n"
+        )
+        self.run_snapshot(snapshot, False)
+
+    def test_release_secret_in_testflight_workflow_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["workflows"][".github/workflows/release-testflight.yml"] = (
+            "env:\n"
+            "  TOKEN: ${{ secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN }}\n"
+        )
+        self.run_snapshot(snapshot, False)
+
+    def test_testflight_secret_in_release_workflow_fails(self):
+        snapshot = valid_snapshot()
+        snapshot["workflows"][".github/workflows/release-app.yml"] = (
+            "env:\n"
+            "  KEY: ${{ secrets.EASYSPLAT_ASC_PRIVATE_KEY_BASE64 }}\n"
+        )
+        self.run_snapshot(snapshot, False)
+
     def test_release_admin_secret_bracket_expression_fails(self):
         snapshot = valid_snapshot()
         snapshot["workflows"][".github/workflows/ci.yml"] = (
@@ -554,6 +635,11 @@ class ReleasePolicyWorkflowTests(unittest.TestCase):
     def test_signing_authority_cannot_review_its_own_environment(self):
         snapshot = valid_snapshot()
         snapshot["signing_environment"]["protection_rules"][0]["reviewers"][0]["reviewer"]["login"] = AUTHORITY
+        self.run_snapshot(snapshot, False)
+
+    def test_testflight_environment_must_be_protected(self):
+        snapshot = valid_snapshot()
+        snapshot["testflight_submission_environment"]["can_admins_bypass"] = True
         self.run_snapshot(snapshot, False)
 
 if __name__ == "__main__":

@@ -1142,6 +1142,8 @@ final class ResultWorkspaceTests: XCTestCase {
         model.isShareSheetActive = true
         session.present(items: [prepared.shareURL], from: NSButton())
 
+        let dismissalClock = ContinuousClock()
+        let dismissalStarted = dismissalClock.now
         try XCTUnwrap(presentedPicker).close()
 
         XCTAssertTrue(model.activeShareSession === session)
@@ -1151,6 +1153,10 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertFalse(model.isShareSheetActive)
         XCTAssertFalse(model.isShareReady)
         XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.shareDirectoryURL.path))
+        try ReleaseReliabilityFixtureSupport.recordRequiredTimingCheck(
+            workload: "passive-share-cleanup-under-one-second",
+            elapsed: dismissalStarted.duration(to: dismissalClock.now)
+        )
     }
 
     @MainActor
@@ -1442,6 +1448,44 @@ final class ResultWorkspaceTests: XCTestCase {
             XCTAssertNil(model.activeShareSession, "Failed for \(notificationName.rawValue)")
             XCTAssertFalse(model.isShareSheetActive)
         }
+    }
+
+    @MainActor
+    func testTransientPickerWindowCloseDismissesAwaitingSession() async throws {
+        let center = NotificationCenter()
+        let anchorWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let pickerWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        let anchor = NSButton()
+        try XCTUnwrap(anchorWindow.contentView).addSubview(anchor)
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let observation = ShareDismissalObservation(
+            notificationCenter: center,
+            application: NSObject()
+        )
+        let session = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [URL(fileURLWithPath: "/tmp/share.ply")], from: anchor)
+
+        center.post(name: NSWindow.willCloseNotification, object: pickerWindow)
+        await waitForShareSessionToClear(model)
+
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertFalse(model.isShareSheetActive)
     }
 
     @MainActor

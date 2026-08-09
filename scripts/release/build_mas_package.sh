@@ -4,6 +4,7 @@
 # The app must already be signed for the store: this step only wraps it, so it
 # refuses anything it cannot prove is a store artifact rather than producing a
 # package that fails on submission.
+# shellcheck source-path=SCRIPTDIR
 set -euo pipefail
 
 ROOT="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -11,9 +12,12 @@ ROOT="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/scripts/release/lib/strict_semver.sh"
 
 APP=""
+APP_SIGNING_RECEIPT=""
 APP_VERSION=""
+APP_BUILD=""
 IDENTITY_FINGERPRINT=""
 TEAM_ID=""
+SOURCE_COMMIT=""
 OUT_DIR="$ROOT/release/MAS"
 
 PRODUCTBUILD=/usr/bin/productbuild
@@ -26,8 +30,16 @@ while [[ $# -gt 0 ]]; do
       APP="$2"
       shift 2
       ;;
+    --app-signing-receipt)
+      APP_SIGNING_RECEIPT="$2"
+      shift 2
+      ;;
     --app-version)
       APP_VERSION="$2"
+      shift 2
+      ;;
+    --app-build)
+      APP_BUILD="$2"
       shift 2
       ;;
     --identity-fingerprint)
@@ -36,6 +48,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --team-id)
       TEAM_ID="$2"
+      shift 2
+      ;;
+    --source-commit)
+      SOURCE_COMMIT="$2"
       shift 2
       ;;
     --output-dir)
@@ -49,9 +65,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [ -z "$APP" ] || [ -z "$APP_VERSION" ] || [ -z "$IDENTITY_FINGERPRINT" ] \
-    || [ -z "$TEAM_ID" ]; then
-  echo "Usage: build_mas_package.sh --app <EasySplat.app> --app-version <semver> --identity-fingerprint <sha1> --team-id <id> [--output-dir <absolute-path>]" >&2
+if [ -z "$APP" ] || [ -z "$APP_VERSION" ] \
+    || [ -z "$IDENTITY_FINGERPRINT" ] || [ -z "$TEAM_ID" ]; then
+  echo "Usage: build_mas_package.sh --app <EasySplat.app> [--app-signing-receipt <json>] --app-version <semver> [--app-build <n[.n[.n]]>] --identity-fingerprint <sha1> --team-id <id> [--source-commit <40-hex>] [--output-dir <absolute-path>]" >&2
   exit 1
 fi
 if ! [[ "$IDENTITY_FINGERPRINT" =~ ^[0-9A-Fa-f]{40}$ ]]; then
@@ -64,6 +80,15 @@ if ! [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
 fi
 if ! easysplat_is_strict_semver_stable "$APP_VERSION"; then
   echo "Store packaging requires a stable semantic version: $APP_VERSION" >&2
+  exit 1
+fi
+if [ -n "$APP_BUILD" ] \
+    && ! [[ "$APP_BUILD" =~ ^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){0,2}$ ]]; then
+  echo "Store packaging requires a build number of up to three dot-separated integers." >&2
+  exit 1
+fi
+if [ -n "$SOURCE_COMMIT" ] && ! [[ "$SOURCE_COMMIT" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+  echo "Reviewed source commit must be exactly 40 hexadecimal characters." >&2
   exit 1
 fi
 # Every check below reads the app through these commands, so a caller-supplied
@@ -110,6 +135,14 @@ print(app)
 PY
 )" || exit 1
 
+if [ -z "$APP_SIGNING_RECEIPT" ]; then
+  APP_SIGNING_RECEIPT="${APP}-signing.json"
+fi
+if [ ! -f "$APP_SIGNING_RECEIPT" ] || [ -L "$APP_SIGNING_RECEIPT" ]; then
+  echo "Store packaging requires the app signing receipt: $APP_SIGNING_RECEIPT" >&2
+  exit 1
+fi
+
 OUT_DIR="$(/usr/bin/python3 -I - "$OUT_DIR" <<'PY'
 import os
 import sys
@@ -117,6 +150,8 @@ import sys
 out = sys.argv[1]
 if not os.path.isabs(out) or os.path.normpath(out) != out:
     raise SystemExit("Output directory must be absolute and normalized.")
+if os.path.realpath(out) != out:
+    raise SystemExit("Output directory path must contain no symlink ancestry.")
 print(out)
 PY
 )" || exit 1
@@ -125,7 +160,30 @@ PY
 # that is not what is inside the signature, the package would be rejected after
 # upload rather than here.
 SEALED_ENTITLEMENTS="$(/usr/bin/mktemp -t easysplat-sealed-entitlements)"
-trap 'rm -f "$SEALED_ENTITLEMENTS"' EXIT
+PREPARED_EVIDENCE_DIRECTORY=""
+PREPARED_EVIDENCE=""
+STAGED_PACKAGE=""
+STAGED_EVIDENCE=""
+STAGED_CHECKSUM=""
+cleanup() {
+  local status=$?
+  trap - EXIT
+  /bin/rm -f -- "$SEALED_ENTITLEMENTS"
+  if [ -n "$PREPARED_EVIDENCE_DIRECTORY" ]; then
+    for staged in \
+      "$PREPARED_EVIDENCE" "$STAGED_PACKAGE" "$STAGED_EVIDENCE" "$STAGED_CHECKSUM"; do
+      if [ -n "$staged" ] && [ -f "$staged" ] && [ ! -L "$staged" ]; then
+        /bin/rm -f -- "$staged"
+      fi
+    done
+    if [ -d "$PREPARED_EVIDENCE_DIRECTORY" ] \
+        && ! /bin/rmdir -- "$PREPARED_EVIDENCE_DIRECTORY" 2>/dev/null; then
+      echo "Retained non-empty MAS staging directory: $PREPARED_EVIDENCE_DIRECTORY" >&2
+    fi
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
 sealed_entitlements() {
   "$CODESIGN" -d --entitlements - --xml "$1" 2>/dev/null || true
 }
@@ -184,27 +242,78 @@ fi
 
 mkdir -p "$OUT_DIR"
 PACKAGE="$OUT_DIR/EasySplat-$APP_VERSION.pkg"
-if [ -e "$PACKAGE" ]; then
-  echo "Refusing to replace an existing package: $PACKAGE" >&2
+PACKAGE_SHA256="$PACKAGE.sha256"
+EVIDENCE="$PACKAGE.provenance.json"
+if [ -e "$PACKAGE" ] || [ -L "$PACKAGE" ] \
+    || [ -e "$PACKAGE_SHA256" ] || [ -L "$PACKAGE_SHA256" ] \
+    || [ -e "$EVIDENCE" ] || [ -L "$EVIDENCE" ]; then
+  echo "Refusing to replace existing MAS package output." >&2
   exit 1
 fi
+
+PREPARED_EVIDENCE_DIRECTORY="$(
+  /usr/bin/mktemp -d "$OUT_DIR/.easysplat-mas-package.XXXXXX"
+)"
+/bin/chmod 0700 "$PREPARED_EVIDENCE_DIRECTORY"
+PREPARED_EVIDENCE_DIRECTORY="$(
+  cd "$PREPARED_EVIDENCE_DIRECTORY" && pwd -P
+)"
+PREPARED_EVIDENCE="$PREPARED_EVIDENCE_DIRECTORY/prepared.json"
+STAGED_PACKAGE="$PREPARED_EVIDENCE_DIRECTORY/EasySplat.pkg"
+STAGED_EVIDENCE="$PREPARED_EVIDENCE_DIRECTORY/EasySplat.pkg.provenance.json"
+STAGED_CHECKSUM="$PREPARED_EVIDENCE_DIRECTORY/EasySplat.pkg.sha256"
+source_commit_arguments=()
+if [ -n "$SOURCE_COMMIT" ]; then
+  source_commit_arguments+=(--source-commit "$SOURCE_COMMIT")
+fi
+app_build_arguments=()
+if [ -n "$APP_BUILD" ]; then
+  app_build_arguments+=(--expected-build "$APP_BUILD")
+fi
+/usr/bin/python3 -I "$ROOT/scripts/release/mas_release_evidence.py" prepare \
+  --repository "$ROOT" \
+  --app "$APP" \
+  --app-signing-receipt "$APP_SIGNING_RECEIPT" \
+  --expected-version "$APP_VERSION" \
+  "${app_build_arguments[@]}" \
+  --expected-bundle-id com.easysplat.app \
+  --expected-team-id "$TEAM_ID" \
+  "${source_commit_arguments[@]}" \
+  --output "$PREPARED_EVIDENCE"
 
 "$PRODUCTBUILD" \
   --component "$APP" /Applications \
   --sign "$IDENTITY_FINGERPRINT" \
-  "$PACKAGE"
+  "$STAGED_PACKAGE"
+/bin/chmod 0600 "$STAGED_PACKAGE"
 
-if ! "$PKGUTIL" --check-signature "$PACKAGE" \
-  | /usr/bin/grep -Fq "3rd Party Mac Developer Installer:"; then
-  rm -f "$PACKAGE"
+if ! "$PKGUTIL" --check-signature "$STAGED_PACKAGE" \
+  | /usr/bin/grep -Eq '(3rd Party Mac Developer Installer|Mac Installer Distribution):'; then
   echo "Package was not signed by a Mac Installer Distribution certificate." >&2
   exit 1
 fi
-if ! "$PKGUTIL" --check-signature "$PACKAGE" | /usr/bin/grep -Fq "$TEAM_ID"; then
-  rm -f "$PACKAGE"
+if ! "$PKGUTIL" --check-signature "$STAGED_PACKAGE" | /usr/bin/grep -Fq "$TEAM_ID"; then
   echo "Package installer certificate does not carry the expected Team ID." >&2
   exit 1
 fi
 
-/usr/bin/shasum -a 256 "$PACKAGE" | /usr/bin/awk '{print $1}' >"$PACKAGE.sha256"
+/usr/bin/python3 -I "$ROOT/scripts/release/mas_release_evidence.py" finalize \
+  --repository "$ROOT" \
+  --app "$APP" \
+  --app-signing-receipt "$APP_SIGNING_RECEIPT" \
+  --package "$STAGED_PACKAGE" \
+  --prepared "$PREPARED_EVIDENCE" \
+  --expected-team-id "$TEAM_ID" \
+  --output "$STAGED_EVIDENCE"
+/usr/bin/python3 -I "$ROOT/scripts/release/mas_release_evidence.py" publish-checksum \
+  --package "$STAGED_PACKAGE" \
+  --output "$STAGED_CHECKSUM" >/dev/null
+/bin/rm -f -- "$PREPARED_EVIDENCE"
+PREPARED_EVIDENCE=""
+/usr/bin/python3 -I "$ROOT/scripts/release/mas_release_evidence.py" publish-release-set \
+  --staging-directory "$PREPARED_EVIDENCE_DIRECTORY" \
+  --package-output "$PACKAGE" \
+  --evidence-output "$EVIDENCE" \
+  --checksum-output "$PACKAGE_SHA256"
 echo "Store package ready: $PACKAGE"
+echo "Store package evidence ready: $EVIDENCE"

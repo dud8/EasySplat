@@ -6,6 +6,45 @@ import XCTest
 
 @MainActor
 final class UserSelectedExportPublicationTests: XCTestCase {
+    func testReleaseReliabilityExportsReferenceSizePlyToAnAbsentDestination() throws {
+        let fixture = try ReleaseReliabilityFixtureSupport.load(
+            workload: "ply-export-139.6mib"
+        )
+        XCTAssertEqual(fixture.manifest.ply.targetMiB, 139.6)
+        let source = fixture.fixtureRoot.appendingPathComponent("splat.ply")
+        let destination = fixture.outputRoot.appendingPathComponent("Selected.ply")
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let expected = ExpectedPlyArtifactIdentity(
+            byteCount: fixture.manifest.ply.byteCount,
+            vertexCount: fixture.manifest.ply.gaussianCount,
+            sha256: fixture.manifest.ply.sha256
+        )
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        try AppModel.exportValidatedSplat(
+            from: source,
+            to: destination,
+            expected: expected
+        )
+        let elapsed = started.duration(to: clock.now)
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+        XCTAssertEqual(
+            (attributes[.size] as? NSNumber)?.uint64Value,
+            fixture.manifest.ply.byteCount
+        )
+        XCTAssertEqual(
+            ProjectArtifactValidator.readPlyHeader(at: destination)?.vertexCount,
+            fixture.manifest.ply.gaussianCount
+        )
+        XCTAssertEqual(
+            try GeometryArtifactStore.sha256(of: destination),
+            fixture.manifest.ply.sha256
+        )
+        try fixture.recordSuccess(elapsed: elapsed)
+    }
+
     func testSecurityScopeStartsBeforeDetachedPublicationAndEndsAfterLateCancelledSuccess() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

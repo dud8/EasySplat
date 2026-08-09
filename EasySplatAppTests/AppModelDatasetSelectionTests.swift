@@ -975,6 +975,27 @@ final class AppModelDatasetSelectionTests: XCTestCase {
         XCTAssertNil(model.selectionWarning)
     }
 
+    func testReleaseReliabilityFolderAdmissionTraversesTenThousandRealFiles() throws {
+        let fixture = try ReleaseReliabilityFixtureSupport.load(
+            workload: "folder-admission-10000"
+        )
+        XCTAssertEqual(fixture.manifest.entryCount, 10_000)
+        let model = makeModel()
+        let folder = fixture.fixtureRoot.appendingPathComponent("folder", isDirectory: true)
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        model.addInputs(urls: [folder])
+        let elapsed = started.duration(to: clock.now)
+
+        XCTAssertNil(model.pendingDataset)
+        XCTAssertNil(model.selectionWarning)
+        XCTAssertEqual(model.pendingPhotoURLs.count, 10_000)
+        XCTAssertEqual(model.pendingPhotoURLs.first?.lastPathComponent, "frame-00000.jpg")
+        XCTAssertEqual(model.pendingPhotoURLs.last?.lastPathComponent, "frame-09999.jpg")
+        try fixture.recordSuccess(elapsed: elapsed)
+    }
+
     func testFolderTraversalRejectsFiftyThousandAndOneVisitedEntries() throws {
         let model = makeModel()
         let folder = base.appendingPathComponent("Capture", isDirectory: true)

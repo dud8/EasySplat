@@ -28,7 +28,6 @@ BUILD_INPUT_SNAPSHOT_DIR=""
 BUILD_INPUT_SNAPSHOT_DEVICE=""
 BUILD_INPUT_SNAPSHOT_INODE=""
 BUILD_INPUT_SNAPSHOT_OWNED=0
-BUILD_INPUT_SNAPSHOT_READY=0
 DEFERRED_BUILD_SIGNAL=0
 CLEANUP_DEFERRED_SIGNAL=0
 PYTHON_BIN="/usr/bin/python3"
@@ -39,7 +38,7 @@ INSTALL_STAGE_INODE=""
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 OVERLAY_SHA256="a7c9ccd00e697c820b6f1335653922e114350b97141443adcda2175b161ddbbf"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="2f9b7c7241accbae20dd3c93ff2a5c13934a391b75438328e5fa9725ea2bdb5a"
+RASTER_TEST_SHA256="a7066c5ce8eff0a1ebb0586c83b77ac235446bd500e465fc3bb0e68d88c4ac2e"
 ISOLATION_HEADER="$ROOT/Tools/MsplatNative/isolation.hpp"
 ISOLATION_HEADER_SHA256="ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8"
 ISOLATION_SOURCE="$ROOT/Tools/MsplatNative/isolation.cpp"
@@ -368,7 +367,6 @@ PY
 
 run_build_lock_probe() {
   local probe_dir="${EASYSPLAT_MSPLAT_BUILD_LOCK_PROBE_DIR:-}"
-  local iteration
   [ -n "$probe_dir" ] || return 1
   "$PYTHON_BIN" - "$probe_dir" <<'PY'
 import os
@@ -396,7 +394,7 @@ descriptor = os.open(
 )
 os.close(descriptor)
 PY
-  for iteration in {1..200}; do
+  for _ in {1..200}; do
     if [ -f "$probe_dir/release" ] && [ ! -L "$probe_dir/release" ]; then
       return 0
     fi
@@ -1015,7 +1013,6 @@ PY
   ALPHA_CAP_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-alpha-cap-transmittance.patch"
   PROJECTION_ORACLE_PATCH="$BUILD_INPUT_SNAPSHOT_DIR/patches/msplat-1.1.3-projection-vjp-oracle.patch"
   TILE_SPAN_TEST_ROOT="$BUILD_INPUT_SNAPSHOT_DIR/tile"
-  BUILD_INPUT_SNAPSHOT_READY=1
 }
 
 revalidate_snapshotted_pins() {

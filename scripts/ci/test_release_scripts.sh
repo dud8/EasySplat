@@ -459,9 +459,18 @@ python3 "$ROOT/scripts/toolchain/tests/test_local_launcher.py"
 /usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_native_colmap_retriever.py" SourceContractTests
 python3 "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
 python3 "$ROOT/scripts/release/tests/test_release_policy_workflow.py"
+python3 "$ROOT/scripts/release/tests/test_testflight_workflow.py"
+/usr/bin/python3 -I \
+  "$ROOT/scripts/release/tests/test_testflight_dogfood_evidence.py"
 python3 "$ROOT/scripts/release/tests/test_finalize_signed_toolchain.py"
 python3 "$ROOT/scripts/release/tests/test_notarize_artifact.py"
+/usr/bin/python3 -I "$ROOT/scripts/release/tests/test_export_reviewed_source.py"
+/usr/bin/python3 -I "$ROOT/scripts/release/tests/test_mas_release_evidence.py"
+/usr/bin/python3 -I \
+  "$ROOT/scripts/release/tests/test_validate_mas_provisioning_profile.py"
 python3 "$ROOT/scripts/release/tests/test_upload_mas_package.py"
+/usr/bin/python3 -I \
+  "$ROOT/scripts/release/tests/test_release_reliability_fixtures.py"
 python3 "$ROOT/scripts/release/tests/test_toolchain_authority_handoff.py"
 python3 "$ROOT/scripts/release/tests/test_toolchain_publication.py"
 python3 "$ROOT/scripts/release/tests/test_toolchain_benchmark_workflow.py"
@@ -572,7 +581,6 @@ toolchain_tree="$toolchain_fixture_root/core"
 for required in bin/colmap bin/easysplat-train bin/default.metallib lib/libomp.dylib; do
   test -f "$toolchain_tree/$required"
 done
-toolchain_args=(--toolchain-dir "$toolchain_tree")
 
 if rg -n 'EASYSPLAT_MANIFEST_TOOL_BIN|MANIFEST_TOOL_BIN=' \
   "$ROOT/scripts/release/build_app.sh" "$ROOT/scripts/release/verify_release.sh" >/dev/null; then
@@ -587,6 +595,12 @@ fi
 test "$(grep -Fc 'EASYSPLAT_NOTARY_TEST_MODE=0' "$ROOT/scripts/release/build_dmg.sh")" -eq 2
 grep -Fq 'INPUT_SNAPSHOT_DIR=' "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'TOOLCHAIN_DIR' "$ROOT/scripts/release/build_app.sh"
+grep -Fq 'export_reviewed_source.py' "$ROOT/scripts/release/build_app.sh"
+grep -Fq 'cd "$BUILD_SOURCE_ROOT"' "$ROOT/scripts/release/build_app.sh"
+grep -Fq 'validate_mas_provisioning_profile.py' \
+  "$ROOT/scripts/release/build_app.sh"
+grep -Fq 'PROVISIONING_PROFILE="$VALIDATED_PROVISIONING_PROFILE"' \
+  "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'BundledToolchainLocator(bundleURL: arguments.appBundle)' \
   "$ROOT/Tools/ReleaseVerifier/main.swift"
 grep -Fq '"--input-manifest", "--input-root"' \
@@ -3073,6 +3087,7 @@ test "$(cat "$resources_dir/release_channel.txt")" = "unsigned developer build"
 
 signed_fingerprint="0123456789ABCDEF0123456789ABCDEF01234567"
 signed_team_id="A1B2C3D4E5"
+test_source_commit="$(git -C "$ROOT" rev-parse HEAD)"
 assert_signed_app_override_rejected() {
   local mode_flag="$1"
   local expected_error="$2"
@@ -3081,16 +3096,16 @@ assert_signed_app_override_rejected() {
   local fixture_label="$5"
   local override_root="$TMP_DIR/${fixture_label}-root"
   local override_error="$TMP_DIR/${fixture_label}.stderr"
-  local mode_args=()
+  local mode_args=(--source-commit "$test_source_commit")
 
   if [ "$mode_flag" = --production ]; then
-    mode_args=(
+    mode_args+=(
       --production
       --identity-fingerprint "$signed_fingerprint"
       --team-id "$signed_team_id"
     )
   else
-    mode_args=(--prepare-release)
+    mode_args+=(--prepare-release)
   fi
 
   if env "$override_name=$override_value" \
@@ -3776,6 +3791,7 @@ if EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   --toolchain-dir "$toolchain_tree" \
   --project-url "$project_url" \
   --version "1.0.0" \
+  --source-commit "$test_source_commit" \
   --identity-fingerprint "$signed_fingerprint" \
   --team-id "$signed_team_id" \
   --production >/dev/null 2>"$production_error"; then
@@ -3834,6 +3850,7 @@ if "$ROOT/scripts/release/build_app.sh" \
   --build-root "$release_test_build_root" \
   --toolchain-dir "$toolchain_tree" \
   --version "0.2.0" \
+  --source-commit "$test_source_commit" \
   --production >/dev/null 2>"$missing_signed_identity_error"; then
   echo "Production app build accepted a missing Developer ID identity." >&2
   exit 1

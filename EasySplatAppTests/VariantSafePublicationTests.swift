@@ -310,6 +310,10 @@ final class VariantSafePublicationTests: XCTestCase {
         \(rows)
         """
         try text.write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
     }
 }
 

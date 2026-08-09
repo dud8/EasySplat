@@ -2557,6 +2557,26 @@ void verifyGeometryAdamFusionParity(const std::string &dataset) {
     std::cout << "geometry_adam_fusion_parity passed\n";
 }
 
+void verifyGeometryAdamMultiSIMDParity(const std::string &dataset) {
+    constexpr int lastStep = 8;
+    const ModelSnapshot legacy = runGeometryAdamWindow(
+        dataset, false, false, 1, lastStep
+    );
+    const ModelSnapshot fused = runGeometryAdamWindow(
+        dataset, true, false, 1, lastStep
+    );
+    constexpr std::size_t channels = 3;
+    constexpr std::size_t simdWidth = 32;
+    if (legacy.rendered.size() <= channels * simdWidth ||
+        fused.rendered.size() != legacy.rendered.size()) {
+        throw std::runtime_error(
+            "geometry-Adam multi-SIMD fixture did not span multiple SIMD groups"
+        );
+    }
+    requireModelNear("geometry_adam_multisimd", legacy, fused);
+    std::cout << "geometry_adam_multisimd_parity passed\n";
+}
+
 double benchmarkCommonPath(const std::string &dataset, bool exactDispatchEnabled) {
     cleanup_msplat_metal();
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
@@ -3774,6 +3794,7 @@ int main(int argc, char **argv) {
             throw std::runtime_error("zero-group exact dispatch materially slowed the common path");
         }
         verifyGeometryAdamFusionParity(argv[2]);
+        verifyGeometryAdamMultiSIMDParity(dataset);
         verifyDensificationScratchLifecycle(dataset);
         verifyCapacityCeilingBoundsGrowth(dataset);
         verifyCeilingCullKeepsOrdinaryGeometry(dataset);

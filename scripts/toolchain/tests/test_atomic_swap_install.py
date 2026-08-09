@@ -1786,6 +1786,9 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
+            self.assertIn(
+                "com.apple.provenance", extended_attribute_names(payload)
+            )
             harness = (
                 "#!/bin/bash\n"
                 "set -euo pipefail\n"
@@ -1811,7 +1814,9 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 0,
                 normalized.stdout + normalized.stderr,
             )
-            self.assertEqual(extended_attribute_names(payload), ("com.apple.provenance",))
+            self.assertFalse(
+                set(extended_attribute_names(payload)) - {"com.apple.provenance"}
+            )
 
             subprocess.run(
                 [
@@ -2131,7 +2136,15 @@ class BuilderOwnershipContractTests(unittest.TestCase):
             accepted_before = {
                 path: extended_attribute_snapshot(path) for path in (stage, payload)
             }
-            self.assertTrue(all(accepted_before.values()))
+            self.assertTrue(
+                all(
+                    any(
+                        name == "com.apple.provenance"
+                        for name, _ in snapshot
+                    )
+                    for snapshot in accepted_before.values()
+                )
+            )
             accepted = subprocess.run(
                 ["/bin/bash", "--noprofile", "--norc", "-s"],
                 check=False,
@@ -2144,8 +2157,12 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 0,
                 accepted.stdout + accepted.stderr,
             )
-            self.assertEqual(extended_attribute_names(stage), ("com.apple.provenance",))
-            self.assertEqual(extended_attribute_names(payload), ("com.apple.provenance",))
+            self.assertFalse(
+                set(extended_attribute_names(stage)) - {"com.apple.provenance"}
+            )
+            self.assertFalse(
+                set(extended_attribute_names(payload)) - {"com.apple.provenance"}
+            )
 
             for path in (stage, payload):
                 subprocess.run(

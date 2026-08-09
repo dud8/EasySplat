@@ -108,6 +108,41 @@ final class SafeArchiveExtractorTests: XCTestCase {
         XCTAssertEqual(fileMode.intValue & 0o777, 0o600)
     }
 
+    func testReleaseReliabilityExtractsTenThousandEntryArchiveWithLargePayload() throws {
+        let fixture = try ReleaseReliabilityFixtureSupport.load(
+            workload: "zip-extraction-10000"
+        )
+        XCTAssertEqual(fixture.manifest.entryCount, 10_000)
+        XCTAssertEqual(fixture.manifest.zip.entryCount, 10_000)
+        let zip = fixture.fixtureRoot.appendingPathComponent("archive.zip")
+        let destinationURL = fixture.outputRoot.appendingPathComponent(
+            "extracted",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: destinationURL) }
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let inventory = try SafeArchiveExtractor.extract(zipURL: zip, to: destinationURL)
+        let elapsed = started.duration(to: clock.now)
+
+        XCTAssertEqual(inventory.entries.count, 10_000)
+        XCTAssertEqual(inventory.totalBytes, fixture.manifest.zip.uncompressedByteCount)
+        XCTAssertEqual(inventory.entries.first?.relativePath, "capture/frame-00000.jpg")
+        XCTAssertEqual(
+            inventory.entries.last?.relativePath,
+            fixture.manifest.zip.largeEntryPath
+        )
+        let largeOutput = destinationURL.appendingPathComponent(
+            fixture.manifest.zip.largeEntryPath
+        )
+        let largeSize = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: largeOutput.path)[.size] as? NSNumber
+        )
+        XCTAssertEqual(largeSize.uint64Value, fixture.manifest.ply.byteCount)
+        try fixture.recordSuccess(elapsed: elapsed)
+    }
+
     func testExtractsARealPathWithExactly64Components() throws {
         let directories = (0..<63).map { "d\($0)" }
         let path = (directories + ["frame.jpg"]).joined(separator: "/")
