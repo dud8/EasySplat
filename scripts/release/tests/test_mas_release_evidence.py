@@ -1907,6 +1907,67 @@ test ! -e "$4"
                 processing,
             )
 
+    def test_upload_receipt_accepts_current_altool_delivery_uuid_schema(self) -> None:
+        module = self.load_module()
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            repository, _ = self.make_repository(root)
+            app = self.make_app(root, repository)
+            runner = FixtureCommandRunner()
+            package, evidence = self.finalize_fixture(
+                module,
+                root=root,
+                repository=repository,
+                app=app,
+                runner=runner,
+            )
+            upload_response = root / "upload-response.json"
+            upload_response.write_text(
+                json.dumps(
+                    {
+                        "details": {
+                            "delivery-uuid": "8b7fd37b-6faf-4c4a-8f32-f20c114d347b",
+                            "transferred": "17874678 bytes in 1.867 seconds",
+                        },
+                        "success-message": "No errors uploading archive.",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            upload_receipt = root / "EasySplat.pkg.upload.json"
+
+            upload = module.record_upload_submission(
+                repository=repository,
+                package=package,
+                evidence=evidence,
+                apple_id="1234567890",
+                expected_version=APP_VERSION,
+                expected_build=APP_BUILD,
+                altool_version="26.40.1 (174001)",
+                response=upload_response,
+                output=upload_receipt,
+                command_runner=runner,
+            )
+
+            self.assertEqual(
+                upload["deliveryID"],
+                "8b7fd37b-6faf-4c4a-8f32-f20c114d347b",
+            )
+
+    def test_upload_receipt_rejects_conflicting_delivery_identifiers(self) -> None:
+        module = self.load_module()
+        response = {
+            "delivery-id": "be9c5d83-4150-40cb-91a1-739cf69a6f35",
+            "details": {
+                "delivery-uuid": "8b7fd37b-6faf-4c4a-8f32-f20c114d347b",
+            },
+            "success-message": "Upload accepted.",
+        }
+
+        with self.assertRaisesRegex(module.ReleaseEvidenceError, "delivery"):
+            module._upload_delivery_id(response)
+
     def test_upload_attempt_recovers_and_cleans_only_after_a_durable_receipt(self) -> None:
         module = self.load_module()
         with tempfile.TemporaryDirectory() as scratch:
