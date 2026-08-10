@@ -41,6 +41,16 @@ make_owned_tree_writable() {
   /bin/chmod -R u+rwX "$target"
 }
 
+normalize_distribution_bundle_permissions() {
+  local target="$1"
+  if [ -z "$target" ] || [ -L "$target" ] || [ ! -d "$target" ]; then
+    echo "Refusing to normalize an invalid distribution bundle: $target" >&2
+    return 1
+  fi
+  /usr/bin/chflags -R nouchg "$target"
+  /bin/chmod -R u+rwX,go+rX,go-w "$target"
+}
+
 cleanup() {
   local status=$?
   trap - EXIT
@@ -704,6 +714,9 @@ fi
 # No copied source or toolchain flag may make the staged app resistant to
 # validation, signing, or failure cleanup.
 make_owned_tree_writable "$APP_BUNDLE"
+# Store validation and runtime signature checks must be able to traverse and
+# read every staged bundle entry without granting group or world write access.
+normalize_distribution_bundle_permissions "$APP_BUNDLE"
 
 if [ "$RELEASE_MODE" != development-unsigned ]; then
   /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/mas_release_evidence.py" seal-source \
