@@ -471,6 +471,7 @@ xcodebuild_arguments=(
   CLANG_COVERAGE_MAPPING_LINKER_ARGS=NO
   DEBUG_INFORMATION_FORMAT=dwarf-with-dsym
   MACOSX_DEPLOYMENT_TARGET=15.0
+  SDK_STAT_CACHE_ENABLE=NO
   SDKROOT=macosx
 )
 if [ "$RELEASE_MODE" != development-unsigned ]; then

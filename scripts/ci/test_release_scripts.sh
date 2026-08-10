@@ -2987,6 +2987,7 @@ grep -Eq '(^| )ENABLE_CODE_COVERAGE=NO( |$)' "$xcodebuild_log"
 grep -Eq '(^| )CLANG_ENABLE_CODE_COVERAGE=NO( |$)' "$xcodebuild_log"
 grep -Eq '(^| )CLANG_COVERAGE_MAPPING=NO( |$)' "$xcodebuild_log"
 grep -Eq '(^| )CLANG_COVERAGE_MAPPING_LINKER_ARGS=NO( |$)' "$xcodebuild_log"
+grep -Eq '(^| )SDK_STAT_CACHE_ENABLE=NO( |$)' "$xcodebuild_log"
 
 app_bundle="$release_test_build_root/Export/EasySplat.app"
 app_dsym="$release_test_build_root/Export/EasySplat.app.dSYM"
