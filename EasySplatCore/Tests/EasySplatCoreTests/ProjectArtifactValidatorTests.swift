@@ -210,6 +210,170 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         )
     }
 
+    func testDescriptorEvidenceUsesBoundReaderForEveryValidationPhase() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let openedURL = root.appendingPathComponent("opened.ply")
+        let boundBytesURL = root.appendingPathComponent("bound-bytes.ply")
+        try TestFileBuilder.writeMinimalPly(at: openedURL, vertexCount: 3)
+
+        let openedBytes = try Data(contentsOf: openedURL)
+        let reboundText = try XCTUnwrap(String(data: openedBytes, encoding: .utf8))
+            .replacingOccurrences(of: "0 0 0 1 1 1", with: "9 0 0 1 1 1")
+        let reboundBytes = Data(reboundText.utf8)
+        XCTAssertEqual(reboundBytes.count, openedBytes.count)
+        try reboundBytes.write(to: boundBytesURL)
+        let expected = try ProjectArtifactValidator.validatedPlyEvidence(at: boundBytesURL)
+
+        let descriptor = Darwin.open(
+            openedURL.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { if descriptor >= 0 { Darwin.close(descriptor) } }
+
+        let actual = try ProjectArtifactValidator.validatedPlyEvidence(
+            descriptor: descriptor,
+            label: openedURL.lastPathComponent,
+            readAt: { _, destination, requested, offset in
+                guard offset >= 0,
+                      let destination,
+                      Int(offset) < reboundBytes.count else {
+                    return 0
+                }
+                let count = min(
+                    requested,
+                    7,
+                    reboundBytes.count - Int(offset)
+                )
+                reboundBytes.withUnsafeBytes { bytes in
+                    guard let source = bytes.baseAddress else { return }
+                    memcpy(destination, source.advanced(by: Int(offset)), count)
+                }
+                return count
+            }
+        )
+
+        XCTAssertEqual(actual, expected)
+    }
+
+    func testValidatedPlyEvidenceRejectsAListPropertyInTheVertexElement() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("vertex-list.ply")
+        try TestFileBuilder.writeMinimalPly(at: output)
+        let original = try String(contentsOf: output, encoding: .utf8)
+        let withList = original
+            .replacingOccurrences(
+                of: "property float rot_3\nend_header",
+                with: "property float rot_3\nproperty list uchar int neighbors\nend_header"
+            )
+            .replacingOccurrences(
+                of: "0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0",
+                with: "0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0 0"
+            )
+        try withList.write(to: output, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(
+            try ProjectArtifactValidator.validatedPlyEvidence(at: output)
+        )
+    }
+
+    func testDescriptorEvidenceStopsReadingAnOversizedASCIIDataRow() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("oversized-row.ply")
+        var bytes = Data("""
+        ply
+        format ascii 1.0
+        element vertex 1
+        property float x
+        property float y
+        property float z
+        property float f_dc_0
+        property float f_dc_1
+        property float f_dc_2
+        property float scale_0
+        property float scale_1
+        property float scale_2
+        property float opacity
+        property float rot_0
+        property float rot_1
+        property float rot_2
+        property float rot_3
+        end_header
+
+        """.utf8)
+        bytes.append(Data(repeating: Character("1").asciiValue!, count: 2_000_000))
+        try bytes.write(to: output)
+
+        let descriptor = Darwin.open(
+            output.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { if descriptor >= 0 { Darwin.close(descriptor) } }
+
+        var phase = 0
+        var previousOffset: off_t = -1
+        var maximumBoundsOffset: off_t = 0
+        XCTAssertThrowsError(
+            try ProjectArtifactValidator.validatedPlyEvidence(
+                descriptor: descriptor,
+                label: output.lastPathComponent,
+                readAt: { descriptor, destination, count, offset in
+                    if offset < previousOffset { phase += 1 }
+                    previousOffset = offset
+                    if phase >= 2 {
+                        maximumBoundsOffset = max(maximumBoundsOffset, offset)
+                    }
+                    return Darwin.pread(descriptor, destination, count, offset)
+                }
+            )
+        )
+        XCTAssertGreaterThanOrEqual(phase, 2)
+        XCTAssertLessThan(maximumBoundsOffset, off_t(bytes.count - 64 * 1024))
+    }
+
+    func testReleaseReliabilityValidatesReferenceSizePlyWithExactEvidence() throws {
+        let fixture = try ReleaseReliabilityFixtureSupport.load(
+            workload: "ply-validation-139.6mib"
+        )
+        XCTAssertEqual(fixture.manifest.ply.targetMiB, 139.6)
+        let source = fixture.fixtureRoot.appendingPathComponent("splat.ply")
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let evidence = try ProjectArtifactValidator.validatedPlyEvidence(at: source)
+        let elapsed = started.duration(to: clock.now)
+
+        XCTAssertEqual(evidence.byteCount, fixture.manifest.ply.byteCount)
+        XCTAssertEqual(evidence.vertexCount, fixture.manifest.ply.gaussianCount)
+        XCTAssertEqual(evidence.format, fixture.manifest.ply.format)
+        XCTAssertEqual(evidence.sha256, fixture.manifest.ply.sha256)
+        XCTAssertEqual(
+            evidence.sceneBounds.center.x,
+            fixture.manifest.ply.sceneBounds.center.x,
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(
+            evidence.sceneBounds.center.y,
+            fixture.manifest.ply.sceneBounds.center.y,
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(
+            evidence.sceneBounds.center.z,
+            fixture.manifest.ply.sceneBounds.center.z,
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(
+            evidence.sceneBounds.radius,
+            fixture.manifest.ply.sceneBounds.radius,
+            accuracy: 1e-9
+        )
+        try fixture.recordSuccess(elapsed: elapsed)
+    }
+
     func testValidatedPlyBoundsAreInvariantToInputRowOrder() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2407,6 +2571,64 @@ final class ProjectArtifactValidatorTests: XCTestCase {
                 )
             )
         }
+    }
+
+    func testSignedBundleAcceptsRewrittenHelpersButStillPinsTheMetallib() throws {
+        let fixture = try makeFinishedProjectFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let finished = try ProjectArtifactValidator.validateFinishedProject(
+            at: fixture.paths.root,
+            expectedInput: .photoFolder(fixture.input),
+            context: fixture.validationContext
+        )
+        let colmapSHA256 = try XCTUnwrap(
+            fixture.geometry.workerExecution.colmapRuntimeClosure.sha256(
+                for: "bin/colmap"
+            )
+        )
+        let rewrittenTrainer = String(repeating: "7", count: 64)
+
+        // Distribution signing rewrote the trainer, so its build receipt records
+        // bytes that no longer exist. The bundle signature covers it instead.
+        XCTAssertNoThrow(
+            try ProjectArtifactValidator.validateToolchainBinding(
+                finishedProject: finished,
+                installation: makeToolchainEvidence(
+                    toolchainVersion: fixture.geometry.provenance.toolchainVersion,
+                    colmapSHA256: colmapSHA256,
+                    trainerBuildDigest: fixture.training.trainerBuildDigest,
+                    integrityPolicy: .signedAppBundle,
+                    installedTrainerSHA256: rewrittenTrainer
+                )
+            )
+        )
+
+        // An unsigned tree has no such cover, so the same tree must be rejected.
+        XCTAssertThrowsError(
+            try ProjectArtifactValidator.validateToolchainBinding(
+                finishedProject: finished,
+                installation: makeToolchainEvidence(
+                    toolchainVersion: fixture.geometry.provenance.toolchainVersion,
+                    colmapSHA256: colmapSHA256,
+                    trainerBuildDigest: fixture.training.trainerBuildDigest,
+                    installedTrainerSHA256: rewrittenTrainer
+                )
+            )
+        )
+
+        // Signing never touches the metallib, so its digest stays enforced.
+        XCTAssertThrowsError(
+            try ProjectArtifactValidator.validateToolchainBinding(
+                finishedProject: finished,
+                installation: makeToolchainEvidence(
+                    toolchainVersion: fixture.geometry.provenance.toolchainVersion,
+                    colmapSHA256: colmapSHA256,
+                    trainerBuildDigest: fixture.training.trainerBuildDigest,
+                    integrityPolicy: .signedAppBundle,
+                    installedMetallibSHA256: String(repeating: "8", count: 64)
+                )
+            )
+        )
     }
 
     func testToolchainBindingRejectsClassicalArtifactRelabeledAsDa3() throws {
@@ -5619,7 +5841,10 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         colmapSourceVersion: String = "4.1.1",
         duplicateColmapProvenance: Bool = false,
         omitOpenMPFromCriticalFiles: Bool = false,
-        omitOpenMPFromDeclaredContents: Bool = false
+        omitOpenMPFromDeclaredContents: Bool = false,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree,
+        installedTrainerSHA256: String = String(repeating: "b", count: 64),
+        installedMetallibSHA256: String = String(repeating: "c", count: 64)
     ) -> ToolchainInstallationEvidence {
         let colmapRecord = ToolchainInstallationEvidence.ProvenanceRecord(
             path: "provenance/colmap.json",
@@ -5634,8 +5859,8 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         )
         var criticalFiles = [
             "bin/colmap": colmapSHA256,
-            "bin/easysplat-train": String(repeating: "b", count: 64),
-            "bin/default.metallib": String(repeating: "c", count: 64),
+            "bin/easysplat-train": installedTrainerSHA256,
+            "bin/default.metallib": installedMetallibSHA256,
             "provenance/colmap.json": String(repeating: "d", count: 64),
             "msplat/build_info.json": String(repeating: "e", count: 64),
         ]
@@ -5654,6 +5879,7 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         }
         return ToolchainInstallationEvidence(
             toolchainVersion: toolchainVersion,
+            integrityPolicy: integrityPolicy,
             keyID: String(repeating: "5", count: 64),
             canonicalManifestSHA256: String(repeating: "6", count: 64),
             signatureSHA256: String(repeating: "7", count: 64),

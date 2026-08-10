@@ -1,8 +1,9 @@
+import Darwin
 import Foundation
 import SwiftUI
 import EasySplatCore
 
-enum RunValidationRecovery: Equatable {
+enum RunValidationRecovery: Equatable, Sendable {
     case useUnordered
     case useFast
     case useFastForMemory
@@ -29,6 +30,11 @@ enum RunValidationRecovery: Equatable {
     }
 }
 
+enum PreviousResultAttemptOutcome: Equatable, Sendable {
+    case failed
+    case interrupted
+}
+
 struct ProjectPublicationCheckpointHook: Sendable {
     static let none = ProjectPublicationCheckpointHook()
 
@@ -45,12 +51,187 @@ struct ProjectPublicationCheckpointHook: Sendable {
     }
 }
 
+enum ProjectTrashQuarantineCheckpoint: Sendable, Equatable {
+    case canonicalIdentityValidated
+}
+
+struct ProjectTrashQuarantineCheckpointHook: Sendable {
+    static let none = ProjectTrashQuarantineCheckpointHook()
+
+    private let handler: @Sendable (
+        ProjectTrashQuarantineCheckpoint
+    ) throws -> Void
+
+    init(
+        _ handler: @escaping @Sendable (
+            ProjectTrashQuarantineCheckpoint
+        ) throws -> Void = { _ in }
+    ) {
+        self.handler = handler
+    }
+
+    func handle(_ checkpoint: ProjectTrashQuarantineCheckpoint) throws {
+        try handler(checkpoint)
+    }
+}
+
+struct DatasetInputPreflightOperation: Sendable {
+    static let live = DatasetInputPreflightOperation {
+        source, kind, stagingParent in
+        try await DatasetInputPreflight.prepare(
+            source: source,
+            kind: kind,
+            stagingParent: stagingParent,
+            runner: SubprocessRunner()
+        )
+    }
+
+    private let operation: @Sendable (
+        DatasetInputSource,
+        DatasetKind,
+        URL
+    ) async throws -> PreparedDatasetInput
+
+    init(
+        _ operation: @escaping @Sendable (
+            DatasetInputSource,
+            DatasetKind,
+            URL
+        ) async throws -> PreparedDatasetInput
+    ) {
+        self.operation = operation
+    }
+
+    func callAsFunction(
+        _ source: DatasetInputSource,
+        _ kind: DatasetKind,
+        _ stagingParent: URL
+    ) async throws -> PreparedDatasetInput {
+        try await operation(source, kind, stagingParent)
+    }
+}
+
+struct AppProjectRootIdentity: Sendable, Equatable {
+    let device: UInt64
+    let inode: UInt64
+    let generation: UInt32
+    let owner: UInt32
+
+    static func capture(at projectURL: URL) throws -> Self {
+        var status = stat()
+        while Darwin.lstat(projectURL.path, &status) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return try validated(status)
+    }
+
+    static func capture(descriptor: Int32) throws -> Self {
+        var status = stat()
+        while Darwin.fstat(descriptor, &status) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return try validated(status)
+    }
+
+    private static func validated(_ status: stat) throws -> Self {
+        guard status.st_mode & S_IFMT == S_IFDIR,
+              status.st_nlink >= 1 else {
+            throw POSIXError(.ENOTDIR)
+        }
+        return Self(
+            device: UInt64(status.st_dev),
+            inode: UInt64(status.st_ino),
+            generation: UInt32(status.st_gen),
+            owner: UInt32(status.st_uid)
+        )
+    }
+}
+
+/// App-task ownership for one cross-process project mutation lease. The core
+/// owner may lend the lease to exactly one production runner, but this wrapper
+/// retains ownership until the app task has finished validation, fallback
+/// persistence, stop handling, and any requested Trash move.
+final class AppProjectRunLeaseOwner: @unchecked Sendable {
+    private let owner: ProjectRunLeaseOwner
+
+    init(
+        projectURL: URL,
+        acquire: AppModel.ProjectRunLeaseOwnerAcquirer
+    ) throws {
+        owner = try acquire(projectURL)
+    }
+
+    func borrowingLease(
+        in config: PipelineRunner.PipelineConfig
+    ) -> PipelineRunner.PipelineConfig {
+        config.withBorrowedProjectRunLease(owner)
+    }
+
+    func withLockedProjectRootDescriptor<Result>(
+        _ operation: (Int32) throws -> Result
+    ) throws -> Result {
+        try owner.withLockedProjectRootDescriptor(operation)
+    }
+
+    func withValidatedProjectRootDescriptor<Result>(
+        _ operation: (Int32) throws -> Result
+    ) throws -> Result {
+        try owner.withValidatedProjectRootDescriptor(operation)
+    }
+
+    func lockedProjectRootIdentity() throws -> AppProjectRootIdentity {
+        try withLockedProjectRootDescriptor {
+            try AppProjectRootIdentity.capture(descriptor: $0)
+        }
+    }
+
+    func release() {
+        owner.release()
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     typealias FinishedOutputValidator = @Sendable (URL) -> URL?
+    typealias PublishedResultResolverOperation = @Sendable (
+        URL
+    ) throws -> ResolvedPublishedResult
+    typealias PublishedResultPreservationOperation = @Sendable (
+        URL
+    ) throws -> ValidatedPublishedResult
+    typealias SubjectIsolationCoordinatorFactory =
+        @Sendable () -> any SubjectIsolationCoordinating
+    typealias SubjectIsolationArtifactLoader =
+        @Sendable (ProjectPaths) -> IsolationArtifactLoadResult
+    typealias SubjectIsolationArtifactRemover =
+        @Sendable (ProjectPaths) throws -> Bool
+    typealias ProjectMetadataMutation = @Sendable (inout ProjectMetadata) throws -> Void
+    typealias ProjectMetadataLoader = @Sendable (URL) throws -> ProjectMetadata
+    typealias ProjectMetadataDescriptorLoader = @Sendable (Int32) throws -> ProjectMetadata
+    typealias ProjectMetadataUpdater = @Sendable (
+        _ projectRootDescriptor: Int32,
+        _ mutation: ProjectMetadataMutation
+    ) throws -> ProjectMetadata
+    typealias ProjectRunLeaseOwnerAcquirer = @Sendable (
+        _ projectURL: URL
+    ) throws -> ProjectRunLeaseOwner
+    typealias ResultViewerTimingReceiptUpdater = @Sendable (
+        _ seconds: TimeInterval,
+        _ expectedPublicationID: UUID,
+        _ expectedGeneration: PublishedResultGeneration?,
+        _ projectPaths: ProjectPaths,
+        _ projectRootDescriptor: Int32?,
+        _ operations: PublishedResultPairOperations,
+        _ shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> ValidatedPublishedResult
 
     enum ViewState: Equatable {
         case home
+        case opening
         case processing
         case viewer
     }
@@ -70,42 +251,132 @@ final class AppModel: ObservableObject {
     @Published var validationRecovery: RunValidationRecovery? = nil
     @Published var failureRetryAllowed = true
     @Published var outputPlyURL: URL? = nil
+    @Published var isSubjectIsolationActive = false
+    @Published var subjectIsolationProgress: SubjectIsolationProgress?
+    @Published var subjectChoiceRequest: SubjectChoiceRequest?
+    @Published var subjectOutput: ValidatedSplatOutput?
+    @Published var selectedSplatOutputVariant: SplatOutputVariant = .original
+    @Published var subjectIsolationStatusMessage: String?
+    @Published var subjectIsolationStatusIsError = false
+    @Published var isSubjectVersionRemovalActive = false
     @Published var currentStageTimings: [StageTimingRecord] = []
     @Published var currentCreateToViewerReadySeconds: TimeInterval? = nil
     @Published var currentOutputPlyInfo: OutputPlyInfo? = nil
     @Published var currentRunOptions: RequestedRunOptions? = nil
     @Published var currentInput: InputSpec? = nil
     @Published var currentProjectNotes: String = ""
+    @Published var currentViewerPreferences = ViewerPreferences()
+    @Published var resolvedPublishedResult: ResolvedPublishedResult? = nil
+    @Published var hasValidatedPreviousResult = false
+    @Published var previousResultAttemptOutcome: PreviousResultAttemptOutcome?
     @Published var notesSaveState: NotesSaveState = .idle
     @Published var currentProjectURL: URL? = nil
     @Published var stopAction: StopAction? = nil
     @Published var isRunActive = false
     @Published var actionFailure: ActionFailurePresentation?
 
+    /// Live training preview. `trainingPreviewPublication` is the reload token: the
+    /// URL is republished in place, so identity has to come from the counter rather
+    /// than the path.
+    @Published var trainingPreviewURL: URL? = nil
+    @Published var trainingPreviewIteration: Int = 0
+    @Published var trainingPreviewPublication: Int = 0
+    @Published var trainingPreviewSceneBounds: SplatSceneBounds? = nil
+    /// Latched once memory pressure has been seen to leave normal during a run.
+    /// The permit granted before launch describes one instant; the preview is the
+    /// expendable party, so it stays down for the rest of the run rather than
+    /// flapping back in and bidding against the trainer again.
+    @Published private(set) var isTrainingPreviewMemoryRefused = false
+    let memoryPressureProbe: @Sendable () -> MemoryPressureState
+    var trainingPreviewMemoryWatch: (any DispatchSourceMemoryPressure)?
+    /// User's display preference. Independent of whether a preview exists: the run
+    /// may have been refused a preview, and the user may hide one that does.
+    @Published var isTrainingPreviewShown = AppModel.storedTrainingPreviewPreference()
+
+    /// How the active run was started. Fresh runs are the only ones the
+    /// historical duration estimate describes; resumes and retrains skip
+    /// stages and would make it misleading.
+    enum RunOrigin {
+        case fresh
+        case resume
+        case retrain
+    }
+
+    var currentRunOrigin: RunOrigin = .fresh
+
+    /// Bumped by the File > Export… menu command; the result workspace owns
+    /// the save-panel flow and observes this token.
+    @Published var exportMenuRequestCount = 0
+
+    /// Result inspector visibility, shared by the View menu, the toolbar
+    /// button, and the result workspace.
+    @Published var isResultInspectorPresented = false
+
+    /// Last settled workspace width, kept current by WorkspaceView.
+    var workspaceWidthHint: CGFloat = 0
+
     @Published var cachedFreeDiskBytes: Int64? = nil
     @Published var requestedRunOptions = RequestedRunOptions()
     @Published var pendingVideoURLs: [URL] = []
-    @Published var pendingPhotosFolderURL: URL? = nil
+    @Published var pendingPhotoURLs: [URL] = []
+    /// A pre-processed dataset selection. Exclusive with `pendingVideoURLs`
+    /// and `pendingPhotoURLs`: setting it clears any pending media, and while
+    /// it is set new media selections are rejected.
+    @Published var pendingDataset: PendingDataset? = nil
     @Published var projectSummaries: [ProjectSummary] = []
     @Published var selectionWarning: String? = nil
+    /// Splats dropped where capture input was expected. Opening one is what the user
+    /// meant, so the drop is routed to the viewer rather than refused. Drained by the
+    /// view that presents the window.
+    @Published var splatOpenRequests: [URL] = []
     @Published var shareStatusMessage: String? = nil
     @Published var shareStatusIsError: Bool = false
     @Published var isShareSheetActive: Bool = false
     @Published var isShareReady: Bool = false
     @Published var isPreparingShare: Bool = false
 
+    /// The sandbox grant covering the pending selection. Selection expands a
+    /// picked folder into file paths immediately, but the pipeline opens those
+    /// files long after the picker closed, so the grant on what the user chose
+    /// is held here until the inputs are adopted into the project.
+    var inputAccess = SecurityScopedAccess()
+
     let toolchainManager: ToolchainManaging
     let hardwareProfile: HardwareProfile
     let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
     let powerAssertion: PowerAssertionManaging
     let finishedOutputValidator: FinishedOutputValidator
+    let publishedResultResolver: PublishedResultResolverOperation
+    let publishedResultPreserver: PublishedResultPreservationOperation
     let videoInputPreflight: VideoInputPreflight
+    let datasetInputPreflight: DatasetInputPreflightOperation
     let projectPublicationCheckpointHook: ProjectPublicationCheckpointHook
+    let subjectIsolationCoordinatorFactory: SubjectIsolationCoordinatorFactory
+    let subjectIsolationArtifactLoader: SubjectIsolationArtifactLoader
+    let subjectIsolationArtifactRemover: SubjectIsolationArtifactRemover
     let projectBaseURL: URL?
     let projectTrashHandler: (URL) throws -> Void
+    let projectTrashQuarantineCheckpointHook:
+        ProjectTrashQuarantineCheckpointHook
+    let projectMetadataLoader: ProjectMetadataLoader
+    let projectMetadataDescriptorLoader: ProjectMetadataDescriptorLoader
+    let projectMetadataUpdater: ProjectMetadataUpdater
+    let projectRunLeaseOwnerAcquirer: ProjectRunLeaseOwnerAcquirer
+    let resultViewerTimingReceiptUpdater: ResultViewerTimingReceiptUpdater
+    let resultViewerTimingPairOperations: PublishedResultPairOperations
     var currentTask: Task<Void, Never>?
     var currentTaskToken: UUID?
+    var subjectIsolationTask: Task<Void, Never>?
+    var subjectIsolationTaskToken: UUID?
+    var subjectIsolationCancellationRequested = false
     var pendingResultViewerTiming: PendingResultViewerTiming?
+    var resultViewerTimingTask: Task<Void, Never>?
+    /// A short MainActor orchestration task used only when a user mutation must
+    /// wait for the detached viewer-timing worker to release its run lease.
+    /// The timing worker itself is deliberately not active work: read-only
+    /// viewer navigation stays responsive, while the dependent mutation is
+    /// serialized explicitly.
+    var deferredProjectMutationTask: Task<Void, Never>?
     var lastProgressLogAt: Date = .distantPast
     var lastProgressLogMessage: String = ""
     var lastProgressLogStage: PipelineStage? = nil
@@ -122,10 +393,10 @@ final class AppModel: ObservableObject {
     var notesSaveTask: Task<Void, Never>?
     var projectSummaryRefreshTask: Task<Void, Never>?
     var pendingNotesSave: (url: URL, text: String)?
-    var photoFolderCountTask: Task<Void, Never>?
     var exitIntent: ExitIntent = .none
     weak var pendingCloseWindow: NSWindow?
     var allowNextWindowClose = false
+    var exitDecisionOverride: (() -> ExitDecision)?
     var replyToTerminationRequest: (Bool) -> Void = { shouldTerminate in
         NSApp.reply(toApplicationShouldTerminate: shouldTerminate)
     }
@@ -183,8 +454,200 @@ final class AppModel: ObservableObject {
         stopAction != nil
     }
 
+    var hasActiveWork: Bool {
+        isRunActive || isSubjectIsolationActive || isSubjectVersionRemovalActive
+            || deferredProjectMutationTask != nil
+    }
+
+    var displayedOutputURL: URL? {
+        switch selectedSplatOutputVariant {
+        case .original:
+            outputPlyURL
+        case .subject:
+            subjectOutput?.url
+        }
+    }
+
+    var displayedOutputPlyInfo: OutputPlyInfo? {
+        switch selectedSplatOutputVariant {
+        case .original:
+            currentOutputPlyInfo
+        case .subject:
+            subjectOutput.map {
+                OutputPlyInfo(
+                    vertexCount: $0.gaussianCount,
+                    sizeBytes: Int64(clamping: $0.byteCount),
+                    format: ""
+                )
+            }
+        }
+    }
+
+    var displayedOutputSceneBounds: SplatSceneBounds? {
+        if selectedSplatOutputVariant == .subject {
+            return subjectOutput?.sceneBounds
+        }
+        return displayedPublishedResult?.outputEvidence.sceneBounds
+    }
+
+    var displayedPublishedResult: ValidatedPublishedResult? {
+        switch resolvedPublishedResult {
+        case .current(.receiptBound(let current)):
+            current.publishedResult
+        case .previous(let previous):
+            previous.publishedResult
+        case .current(.legacy), .unavailable, nil:
+            nil
+        }
+    }
+
+    var displayedResultSnapshot: ProjectArtifactSnapshot? {
+        switch resolvedPublishedResult {
+        case .current(.receiptBound(let current)):
+            current.snapshot
+        case .current(.legacy(let legacy)):
+            legacy.snapshot
+        case .previous, .unavailable, nil:
+            nil
+        }
+    }
+
+    var displayedResultPresentation: PublishedResultPresentation? {
+        switch resolvedPublishedResult {
+        case .current(.receiptBound(let current)):
+            current.presentation
+        case .previous(let previous):
+            previous.presentation
+        case .current(.legacy), .unavailable, nil:
+            nil
+        }
+    }
+
+    var displayedResultLiveProject: PublishedResultLiveProject? {
+        switch resolvedPublishedResult {
+        case .current(.receiptBound(let current)):
+            current.liveProject
+        case .current(.legacy(let legacy)):
+            legacy.liveProject
+        case .previous(let previous):
+            previous.liveProject
+        case .unavailable, nil:
+            nil
+        }
+    }
+
+    var isShowingPreviousResult: Bool {
+        if case .previous = resolvedPublishedResult { return true }
+        return false
+    }
+
+    var displayedPublicationID: UUID? {
+        displayedPublishedResult?.receipt.publicationID
+    }
+
+    var displayedPublicationGeneration: PublishedResultGeneration? {
+        displayedPublishedResult?.generation
+    }
+
+    var hasResolvedViewerPresentation: Bool {
+        switch resolvedPublishedResult {
+        case .current, .previous:
+            true
+        case .unavailable, nil:
+            false
+        }
+    }
+
     var isTrainingStageActive: Bool {
         stage == .trainSplat
+    }
+
+    /// A preview is only worth showing while the model it depicts is still being
+    /// trained; once the run leaves training the real result takes over.
+    var isTrainingPreviewVisible: Bool {
+        isTrainingPreviewAvailable && isTrainingPreviewShown
+    }
+
+    /// Whether this run has a preview to show at all. A run can be refused one for
+    /// memory, or release it after a failed load, and the control must not offer to
+    /// show something that does not exist.
+    var isTrainingPreviewAvailable: Bool {
+        isTrainingStageActive && trainingPreviewURL != nil
+            && trainingPreviewSceneBounds != nil && lastError == nil
+    }
+
+    nonisolated static let trainingPreviewPreferenceKey = "EasySplatTrainingPreviewShown"
+
+    /// Defaults to on: a user who has never chosen benefits most from seeing the
+    /// splat form, and the run withholds the preview on its own when it cannot
+    /// afford one.
+    nonisolated static func storedTrainingPreviewPreference() -> Bool {
+        UserDefaults.standard.object(forKey: trainingPreviewPreferenceKey) as? Bool ?? true
+    }
+
+    func setTrainingPreviewShown(_ shown: Bool) {
+        isTrainingPreviewShown = shown
+        UserDefaults.standard.set(shown, forKey: Self.trainingPreviewPreferenceKey)
+    }
+
+    /// Drops the preview identity so a stale file from a previous run can never be
+    /// mounted against the next one. The display preference deliberately survives.
+    func clearTrainingPreview() {
+        stopTrainingPreviewMemoryWatch()
+        trainingPreviewURL = nil
+        trainingPreviewIteration = 0
+        trainingPreviewPublication = 0
+        trainingPreviewSceneBounds = nil
+        isTrainingPreviewMemoryRefused = false
+    }
+
+    /// Re-tests memory pressure before a new preview generation is mounted, and
+    /// unmounts the resident one the first time pressure leaves normal. Returns
+    /// whether the publication may be shown.
+    @discardableResult
+    func acceptTrainingPreviewUnderCurrentMemoryPressure() -> Bool {
+        guard !isTrainingPreviewMemoryRefused else { return false }
+        guard memoryPressureProbe() == .normal else {
+            releaseTrainingPreview(reason: "memory pressure")
+            return false
+        }
+        return true
+    }
+
+    /// Takes the preview down for the rest of the run and returns the workspace to
+    /// the ordinary processing screen. Latched rather than retried: a preview that
+    /// failed to load or cost memory under pressure has already shown it is the
+    /// expendable party, and retrying it competes with training again.
+    func releaseTrainingPreview(reason: String) {
+        guard trainingPreviewURL != nil || !isTrainingPreviewMemoryRefused else { return }
+        isTrainingPreviewMemoryRefused = true
+        trainingPreviewURL = nil
+        trainingPreviewSceneBounds = nil
+        appendLogLine("[Training] Live preview released (\(reason)); training is unaffected.")
+    }
+
+    /// Installs a run-scoped memory-pressure watch so the preview is released the
+    /// moment the system reports strain, not at the next publication — which may
+    /// never arrive if the trainer has stalled or stopped publishing.
+    func startTrainingPreviewMemoryWatch() {
+        stopTrainingPreviewMemoryWatch()
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            MainActor.assumeIsolated {
+                self.releaseTrainingPreview(reason: "memory pressure")
+            }
+        }
+        source.resume()
+        trainingPreviewMemoryWatch = source
+    }
+
+    func stopTrainingPreviewMemoryWatch() {
+        trainingPreviewMemoryWatch?.cancel()
+        trainingPreviewMemoryWatch = nil
     }
 
     func stopFailurePresentation(for action: StopAction) -> StopFailurePresentation {
@@ -212,23 +675,32 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// How many log lines the live Technical Details pane renders. The full
+    /// buffers stay available through `errorDetailsText` for Copy Details and
+    /// failure forensics; re-laying-out the whole log on every pipeline event
+    /// is what froze the UI during heavy training.
+    static let technicalLogTailLimit = 300
+
+    /// Recoverable errors must stay visible in the live pane even after they
+    /// scroll out of the general tail, so they get their own bounded section.
+    static let technicalErrorTailLimit = 20
+
     var processingDetailsText: String? {
-        if lastError != nil {
-            if let details = errorDetails, !details.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return details
-            }
-            return statusDetail
+        var parts: [String] = []
+        if let statusDetail, !statusDetail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parts.append(statusDetail)
         }
-        if let liveErrors = liveErrorDetailsText {
-            if let detail = statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return "\(detail)\n\nRecent Error Output:\n\(liveErrors)"
-            }
-            return "Recent Error Output:\n\(liveErrors)"
+        if !errorLogLines.isEmpty {
+            parts.append(
+                "Recent Error Output:\n"
+                    + errorLogLines.suffix(Self.technicalErrorTailLimit).joined(separator: "\n")
+            )
         }
-        if let detail = statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return detail
+        if !logLines.isEmpty {
+            parts.append(logLines.suffix(Self.technicalLogTailLimit).joined(separator: "\n"))
         }
-        return nil
+        let combined = parts.joined(separator: "\n\n")
+        return combined.isEmpty ? nil : combined
     }
 
     var errorDetailsText: String? {
@@ -249,41 +721,110 @@ final class AppModel: ObservableObject {
         return combined.isEmpty ? nil : combined
     }
 
-    private var liveErrorDetailsText: String? {
-        guard !errorLogLines.isEmpty else { return nil }
-        let tail = errorLogLines.suffix(300)
-        let text = tail.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
-    }
-
     init(
         toolchainManager: ToolchainManaging = AppModel.makeDefaultToolchainManager(),
         projectBaseURL: URL? = nil,
         hardwareProfile: HardwareProfile? = nil,
         videoInputPreflight: VideoInputPreflight = VideoInputPreflight(),
+        datasetInputPreflight: DatasetInputPreflightOperation = .live,
         pipelineRunnerFactory: @escaping (URL, PipelineRunner.PipelineConfig) -> PipelineRunning = { projectURL, config in
             PipelineRunner(projectURL: projectURL, config: config)
         },
         projectPublicationCheckpointHook: ProjectPublicationCheckpointHook = .none,
         powerAssertion: PowerAssertionManaging = SystemPowerAssertion(),
+        subjectIsolationCoordinatorFactory: @escaping SubjectIsolationCoordinatorFactory = {
+            SubjectIsolationCoordinator()
+        },
+        subjectIsolationArtifactLoader: @escaping SubjectIsolationArtifactLoader = {
+            SubjectIsolationArtifactStore.load(paths: $0)
+        },
+        subjectIsolationArtifactRemover: @escaping SubjectIsolationArtifactRemover = {
+            try SubjectIsolationArtifactStore.removeValidatedSubject(paths: $0)
+        },
         projectTrashHandler: @escaping (URL) throws -> Void = { url in
             var resultingURL: NSURL?
             try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
         },
+        projectTrashQuarantineCheckpointHook:
+            ProjectTrashQuarantineCheckpointHook = .none,
+        projectMetadataLoader: @escaping ProjectMetadataLoader = { metadataURL in
+            try ProjectMetadataStore.load(from: metadataURL)
+        },
+        projectMetadataDescriptorLoader: @escaping ProjectMetadataDescriptorLoader = {
+            try ProjectMetadataStore.load(fromProjectRootDescriptor: $0)
+        },
+        projectMetadataUpdater: @escaping ProjectMetadataUpdater = {
+            projectRootDescriptor,
+            mutation in
+            try ProjectMetadataStore.update(
+                atProjectRootDescriptor: projectRootDescriptor,
+                mutation
+            )
+        },
+        projectRunLeaseOwnerAcquirer: @escaping ProjectRunLeaseOwnerAcquirer = {
+            try ProjectRunLeaseOwner.acquire(projectURL: $0)
+        },
+        resultViewerTimingReceiptUpdater: @escaping ResultViewerTimingReceiptUpdater = {
+            seconds,
+            expectedPublicationID,
+            expectedGeneration,
+            projectPaths,
+            projectRootDescriptor,
+            operations,
+            shouldCancel in
+            try PublishedResultPairStore.recordFirstViewerReadyTiming(
+                seconds,
+                expectedPublicationID: expectedPublicationID,
+                expectedGeneration: expectedGeneration,
+                projectPaths: projectPaths,
+                projectRootDescriptor: projectRootDescriptor,
+                operations: operations,
+                shouldCancel: shouldCancel
+            )
+        },
+        resultViewerTimingPairOperations: PublishedResultPairOperations = .system(),
+        publishedResultResolver: @escaping PublishedResultResolverOperation = {
+            try PublishedResultResolver.resolve(projectURL: $0)
+        },
+        publishedResultPreserver:
+            @escaping PublishedResultPreservationOperation = {
+                try PublishedResultResolver.preserveCurrentResultForRetraining(
+                    projectURL: $0
+                )
+            },
         finishedOutputValidator: @escaping FinishedOutputValidator = { projectURL in
             AppModel.readyOutputURLOnDisk(
                 projectURL: projectURL,
                 validationDepth: .full
             )
+        },
+        memoryPressureProbe: @escaping @Sendable () -> MemoryPressureState = {
+            // A failed observation is not evidence of calm.
+            (try? LiveTrainingResourceObserver().observe())?.memoryPressure ?? .unknown
         }
     ) {
+        self.memoryPressureProbe = memoryPressureProbe
         self.toolchainManager = toolchainManager
         self.projectBaseURL = projectBaseURL
         self.hardwareProfile = hardwareProfile ?? .detect()
         self.finishedOutputValidator = finishedOutputValidator
+        self.publishedResultResolver = publishedResultResolver
+        self.publishedResultPreserver = publishedResultPreserver
         self.videoInputPreflight = videoInputPreflight
+        self.datasetInputPreflight = datasetInputPreflight
         self.projectPublicationCheckpointHook = projectPublicationCheckpointHook
+        self.subjectIsolationCoordinatorFactory = subjectIsolationCoordinatorFactory
+        self.subjectIsolationArtifactLoader = subjectIsolationArtifactLoader
+        self.subjectIsolationArtifactRemover = subjectIsolationArtifactRemover
         self.projectTrashHandler = projectTrashHandler
+        self.projectTrashQuarantineCheckpointHook =
+            projectTrashQuarantineCheckpointHook
+        self.projectMetadataLoader = projectMetadataLoader
+        self.projectMetadataDescriptorLoader = projectMetadataDescriptorLoader
+        self.projectMetadataUpdater = projectMetadataUpdater
+        self.projectRunLeaseOwnerAcquirer = projectRunLeaseOwnerAcquirer
+        self.resultViewerTimingReceiptUpdater = resultViewerTimingReceiptUpdater
+        self.resultViewerTimingPairOperations = resultViewerTimingPairOperations
         self.pipelineRunnerFactory = pipelineRunnerFactory
         self.powerAssertion = powerAssertion
         if self.hardwareProfile.memoryGB <= 8.5 {
@@ -296,29 +837,13 @@ final class AppModel: ObservableObject {
     }
 
     static func makeDefaultToolchainManager(
-        bundledBootstrap: ToolchainBootstrap? = AppConfig.bundledToolchainBootstrap,
-        sourcePolicy: ToolchainSourcePolicy = AppModel.defaultToolchainSourcePolicy(),
         developmentOverrides: DevelopmentOverrides = AppConfig.currentDevelopmentOverrides,
-        factory: (ToolchainBootstrap?, ToolchainSourcePolicy, URL?) -> ToolchainManaging = {
-            bundledBootstrap,
-            sourcePolicy,
-            localToolchainRoot in
+        factory: (URL?) -> ToolchainManaging = { overrideRoot in
             ToolchainManager(
-                appVersion: EasySplatReleaseIdentity.version(),
-                localToolchainRoot: localToolchainRoot,
-                allowInsecureLoopbackHTTP: AppConfig.allowInsecureLoopbackToolchainHTTP,
-                bundledBootstrap: bundledBootstrap,
-                sourcePolicy: sourcePolicy
+                locator: BundledToolchainLocator(developmentOverrideRoot: overrideRoot)
             )
         }
     ) -> ToolchainManaging {
-        factory(bundledBootstrap, sourcePolicy, developmentOverrides.localToolchainRoot)
-    }
-
-    static func defaultToolchainSourcePolicy(
-        releaseVerificationConfiguration: AppConfig.ReleaseVerificationConfiguration?
-            = AppConfig.releaseVerificationConfiguration
-    ) -> ToolchainSourcePolicy {
-        releaseVerificationConfiguration == nil ? .automatic : .bundledBootstrapOnly
+        factory(developmentOverrides.localToolchainRoot)
     }
 }

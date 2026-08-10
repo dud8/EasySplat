@@ -185,7 +185,11 @@ def write_overflow_points(path: Path, count: int) -> None:
 
 
 def write_mixed_cameras(path: Path) -> None:
-    cameras = ((1, 32, 32), (2, 320, 180))
+    # Geometry-Adam parity trains on the first camera. Keep its active pixels in
+    # one SIMD group so unordered floating-point gradient atomics cannot turn a
+    # near-zero cancellation into a different Adam step between test arms. The
+    # second camera still forces the intended large mixed-resolution growth.
+    cameras = ((1, 4, 4), (2, 320, 180))
     with path.open("wb") as output:
         output.write(struct.pack("<Q", len(cameras)))
         for camera_id, width, height in cameras:
@@ -331,7 +335,7 @@ def generate(root: Path) -> None:
     mixed_sparse = mixed_dataset / "sparse" / "0"
     mixed_images.mkdir(parents=True)
     mixed_sparse.mkdir(parents=True)
-    write_png(mixed_images / "0000.png", 32, 32, 300)
+    write_png(mixed_images / "0000.png", 4, 4, 300)
     write_png(mixed_images / "0001.png", 320, 180, 301)
     write_mixed_cameras(mixed_sparse / "cameras.bin")
     write_images(mixed_sparse / "images.bin", [1, 2])
@@ -347,7 +351,7 @@ def generate(root: Path) -> None:
             "point_count": 500,
             "raster_overflow_stress": False,
             "mixed_resolution_stress": True,
-            "resolution": [[32, 32], [320, 180]],
+            "resolution": [[4, 4], [320, 180]],
         }
     )
 

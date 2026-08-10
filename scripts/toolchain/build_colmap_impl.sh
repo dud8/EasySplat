@@ -1879,7 +1879,10 @@ try:
             raise OSError(error, os.strerror(error), label)
     for record in records:
         verify_record(record)
-        if attributes(record[1]):
+        unexpected = tuple(
+            name for name in attributes(record[1]) if name != SYSTEM_PROVENANCE
+        )
+        if unexpected:
             raise SystemExit(
                 "native COLMAP system metadata normalization was incomplete: "
                 f"{record[0]}"
@@ -1936,13 +1939,31 @@ listxattr.argtypes = (
 listxattr.restype = ctypes.c_ssize_t
 
 
-def has_extended_attributes(path: Path) -> bool:
+SYSTEM_PROVENANCE = "com.apple.provenance"
+
+
+def extended_attribute_names(path: Path) -> tuple[str, ...]:
+    encoded = os.fsencode(path)
     ctypes.set_errno(0)
-    size = listxattr(os.fsencode(path), None, 0, XATTR_NOFOLLOW)
-    if size >= 0:
-        return size > 0
-    error = ctypes.get_errno()
-    raise OSError(error, os.strerror(error), path)
+    size = listxattr(encoded, None, 0, XATTR_NOFOLLOW)
+    if size < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    if size == 0:
+        return ()
+    buffer = ctypes.create_string_buffer(size)
+    ctypes.set_errno(0)
+    actual = listxattr(encoded, buffer, size, XATTR_NOFOLLOW)
+    if actual < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    return tuple(
+        sorted(
+            os.fsdecode(name)
+            for name in bytes(buffer.raw[:actual]).split(b"\0")
+            if name
+        )
+    )
 
 
 def has_extended_acl(path: Path) -> bool:
@@ -1973,7 +1994,10 @@ for path in paths:
     if has_extended_acl(path):
         raise SystemExit(f"native COLMAP install has an extended ACL: {path}")
 for path in paths:
-    if has_extended_attributes(path):
+    unexpected = tuple(
+        name for name in extended_attribute_names(path) if name != SYSTEM_PROVENANCE
+    )
+    if unexpected:
         raise SystemExit(
             f"native COLMAP install has extended attributes: {path}"
         )

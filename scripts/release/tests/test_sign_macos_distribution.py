@@ -22,6 +22,7 @@ assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 BUILD_DMG_SCRIPT = SCRIPT.parent / "build_dmg.sh"
+TOOLCHAIN_DIR = SCRIPT.parent.parent.parent / "Toolchains/out"
 BUILD_APP_SCRIPT = SCRIPT.parent / "build_app.sh"
 CREATE_DMG_SCRIPT = SCRIPT.parent / "create_dmg.sh"
 NOTARIZE_SCRIPT = SCRIPT.parent / "notarize_artifact.sh"
@@ -263,6 +264,9 @@ class FakeCommandRunner:
             "--entitlements",
             "-",
         ]:
+            # Without --xml codesign returns the raw blob, in which the readers
+            # would find no entitlements at all.
+            assert "--xml" in command, "entitlement display must request XML"
             payload = self.signed_entitlements.get(command[-1])
             if payload is None:
                 return subprocess.CompletedProcess(
@@ -1327,7 +1331,7 @@ class DistributionSigningTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 MODULE.SigningError,
-                "semantic Developer ID requirement",
+                "semantic Developer ID Application requirement",
             ):
                 MODULE.sign_distribution_tree(
                     root,
@@ -2124,6 +2128,198 @@ class DistributionSignatureVerificationTests(unittest.TestCase):
                 )
 
 
+MAS_COMMON_NAME = f"Apple Distribution: Example ({TEAM_ID})"
+
+
+def mas_identity_output(
+    *,
+    fingerprint: str = FINGERPRINT,
+    team_id: str = TEAM_ID,
+) -> str:
+    return f'  1) {fingerprint} "Apple Distribution: Example ({team_id})"\n'
+
+
+class StoreChannelTests(unittest.TestCase):
+    """The store channel differs from Developer ID in certificate and policy."""
+
+    def test_channels_pin_the_markers_read_from_real_certificates(self) -> None:
+        developer_id = MODULE.CHANNELS["developer-id"]
+        store = MODULE.CHANNELS["mas"]
+        self.assertEqual(developer_id["leafOID"], "1.2.840.113635.100.6.1.13")
+        self.assertEqual(developer_id["intermediateOID"], "1.2.840.113635.100.6.2.6")
+        self.assertEqual(store["leafOID"], "1.2.840.113635.100.6.1.7")
+        self.assertEqual(store["intermediateOID"], "1.2.840.113635.100.6.2.1")
+        self.assertEqual(MODULE.DEFAULT_CHANNEL, "developer-id")
+
+    def test_unknown_channel_is_refused(self) -> None:
+        with self.assertRaisesRegex(MODULE.SigningError, "unknown distribution channel"):
+            MODULE.channel_policy("testflight")
+
+    def test_store_channel_requires_an_apple_distribution_certificate(self) -> None:
+        runner = FakeCommandRunner()
+        with self.assertRaisesRegex(
+            MODULE.SigningError, "not the expected Apple Distribution certificate"
+        ):
+            MODULE.validate_signing_identity(
+                FINGERPRINT, TEAM_ID, runner, channel="mas"
+            )
+
+    def test_developer_id_channel_refuses_an_apple_distribution_certificate(self) -> None:
+        runner = FakeCommandRunner(identity=mas_identity_output())
+        with self.assertRaisesRegex(
+            MODULE.SigningError, "not the expected Developer ID Application certificate"
+        ):
+            MODULE.validate_signing_identity(FINGERPRINT, TEAM_ID, runner)
+
+    def test_identity_reports_the_channel_it_was_checked_against(self) -> None:
+        identity = MODULE.validate_signing_identity(
+            FINGERPRINT, TEAM_ID, FakeCommandRunner()
+        )
+        self.assertEqual(identity["channel"], "developer-id")
+
+    def make_store_app(self, root: Path) -> tuple[Path, list[Path], str]:
+        app = root / "EasySplat.app"
+        macos = app / "Contents/MacOS"
+        helpers = app / "Contents/Helpers/bin"
+        macos.mkdir(parents=True)
+        helpers.mkdir(parents=True)
+        main = macos / "EasySplatApp"
+        helper = helpers / "colmap"
+        for path in (main, helper):
+            path.write_bytes(
+                b"\xcf\xfa\xed\xfe" + (0x0100000C).to_bytes(4, "little")
+                + (0).to_bytes(4, "little") + (0x2).to_bytes(4, "little")
+                + b"payload"
+            )
+            path.chmod(0o755)
+        (app / "Contents/Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleExecutable": "EasySplatApp"})
+        )
+        return app, [main, helper], "Contents/MacOS/EasySplatApp"
+
+    def entitlement_file(self, root: Path, name: str, payload: dict) -> Path:
+        path = root / name
+        path.write_bytes(plistlib.dumps(payload))
+        return path
+
+    def test_a_bundled_library_is_not_an_entitlement_target(self) -> None:
+        # codesign accepts --entitlements on a dylib and seals nothing, because
+        # entitlements describe a process. Requiring one would be unsatisfiable.
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            app, machos, main = self.make_store_app(root)
+            library = app / "Contents/Helpers/lib/libomp.dylib"
+            library.parent.mkdir(parents=True)
+            # MH_DYLIB, and mode 0755 like packaging installs it: only the
+            # Mach-O file type separates a library from a program.
+            library.write_bytes(
+                b"\xcf\xfa\xed\xfe" + (0x0100000C).to_bytes(4, "little")
+                + (0).to_bytes(4, "little") + (0x6).to_bytes(4, "little")
+                + b"library"
+            )
+            library.chmod(0o755)
+            machos = machos + [library]
+            app_plist = self.entitlement_file(
+                root, "app.plist", {"com.apple.security.app-sandbox": True}
+            )
+            helper_plist = self.entitlement_file(
+                root,
+                "helper.plist",
+                {
+                    "com.apple.security.app-sandbox": True,
+                    "com.apple.security.inherit": True,
+                },
+            )
+            entitlements = {
+                main: app_plist,
+                "Contents/Helpers/bin/colmap": helper_plist,
+            }
+            validated = MODULE.validate_entitlements(
+                app, "app", machos, entitlements, app_main=main, channel="mas"
+            )
+            self.assertEqual(set(validated), set(entitlements))
+            with self.assertRaisesRegex(
+                MODULE.SigningError, "not a named top-level executable"
+            ):
+                MODULE.validate_entitlements(
+                    app,
+                    "app",
+                    machos,
+                    {**entitlements, "Contents/Helpers/lib/libomp.dylib": helper_plist},
+                    app_main=main,
+                    channel="mas",
+                )
+
+    def test_store_app_must_entitle_its_main_executable_and_every_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            app, machos, main = self.make_store_app(root)
+            app_plist = self.entitlement_file(
+                root, "app.plist", {"com.apple.security.app-sandbox": True}
+            )
+            with self.assertRaisesRegex(MODULE.SigningError, "every bundled helper"):
+                MODULE.validate_entitlements(
+                    app, "app", machos, {main: app_plist},
+                    app_main=main, channel="mas",
+                )
+
+    def test_store_app_accepts_helper_entitlements_developer_id_forbids(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            app, machos, main = self.make_store_app(root)
+            app_plist = self.entitlement_file(
+                root, "app.plist", {"com.apple.security.app-sandbox": True}
+            )
+            helper_plist = self.entitlement_file(
+                root,
+                "helper.plist",
+                {
+                    "com.apple.security.app-sandbox": True,
+                    "com.apple.security.inherit": True,
+                },
+            )
+            entitlements = {
+                main: app_plist,
+                "Contents/Helpers/bin/colmap": helper_plist,
+            }
+            validated = MODULE.validate_entitlements(
+                app, "app", machos, entitlements, app_main=main, channel="mas"
+            )
+            self.assertEqual(set(validated), set(entitlements))
+            with self.assertRaisesRegex(
+                MODULE.SigningError, "empty entitlement allowlist"
+            ):
+                MODULE.validate_entitlements(
+                    app, "app", machos, entitlements, app_main=main
+                )
+
+    def test_the_shipped_store_entitlements_satisfy_the_store_rules(self) -> None:
+        entitlements_dir = SCRIPT.parent / "entitlements"
+        app = plistlib.loads((entitlements_dir / "mas-app.plist").read_bytes())
+        helper = plistlib.loads(
+            (entitlements_dir / "mas-helper-inherit.plist").read_bytes()
+        )
+        self.assertTrue(app["com.apple.security.app-sandbox"])
+        self.assertTrue(app["com.apple.security.files.user-selected.read-write"])
+        # The profile issues this identity; an app that does not claim it is
+        # rejected at submission.
+        self.assertRegex(app["com.apple.application-identifier"], r"^[A-Z0-9]{10}\.")
+        self.assertEqual(
+            app["com.apple.developer.team-identifier"],
+            app["com.apple.application-identifier"].split(".", 1)[0],
+        )
+        self.assertEqual(
+            helper,
+            {
+                "com.apple.security.app-sandbox": True,
+                "com.apple.security.inherit": True,
+            },
+        )
+        for forbidden in MODULE.FORBIDDEN_APP_ENTITLEMENTS:
+            self.assertNotIn(forbidden, app)
+            self.assertNotIn(forbidden, helper)
+
+
 class SignedPackagingScriptTrustTests(unittest.TestCase):
     def test_production_mode_requires_distribution_identity_before_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2135,16 +2331,10 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
             app_result = subprocess.run(
                 [
                     str(BUILD_APP_SCRIPT),
-                    "--manifest-url",
-                    "https://example.test/manifest.json",
-                    "--public-key-path",
-                    "/tmp/missing-public-key",
+                    "--toolchain-dir",
+                    os.fspath(TOOLCHAIN_DIR),
                     "--version",
                     "0.2.0",
-                    "--bootstrap-manifest",
-                    "/tmp/missing-manifest",
-                    "--bootstrap-core-archive",
-                    "/tmp/missing-core.zip",
                     "--build-root",
                     str(app_build),
                     "--production",
@@ -2156,7 +2346,7 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
             )
             self.assertNotEqual(app_result.returncode, 0)
             self.assertIn(
-                "Production builds require an exact 40-hex Developer ID fingerprint.",
+                "Signed builds require an exact 40-hex signing identity fingerprint.",
                 app_result.stderr,
             )
             self.assertFalse(app_build.exists())
@@ -2168,15 +2358,8 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
                     "0.2.0",
                     "--toolchain-version",
                     "2.0.0",
-                    "--manifest-url",
-                    "https://example.test/manifest.json",
-                    "--core-artifact-url",
-                    "https://example.test/core.zip",
-                    "--da3-base-artifact-url",
-                    "https://example.test/base.zip",
-                    "--da3-small-artifact-url",
-                    "https://example.test/small.zip",
-                    "--use-existing-toolchain",
+                    "--toolchain-dir",
+                    os.fspath(TOOLCHAIN_DIR),
                     "--build-root",
                     str(dmg_build),
                     "--output-dir",
@@ -2203,7 +2386,6 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
         self.assertIn("MACOSX_DEPLOYMENT_TARGET=15.0", source)
         self.assertIn("SDKROOT=macosx", source)
         self.assertIn("XCRUN_BIN=/usr/bin/xcrun", source)
-        self.assertIn("/usr/bin/swift run", source)
         self.assertNotIn("if ! xcrun -sdk macosx metal", source)
 
         dmg_source = BUILD_DMG_SCRIPT.read_text(encoding="utf-8")
@@ -2256,16 +2438,10 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
         app_result = subprocess.run(
             [
                 str(BUILD_APP_SCRIPT),
-                "--manifest-url",
-                "https://example.test/manifest.json",
-                "--public-key-path",
-                "/tmp/missing-public-key",
+                    "--toolchain-dir",
+                    os.fspath(TOOLCHAIN_DIR),
                 "--version",
                 "0.2.0",
-                "--bootstrap-manifest",
-                "/tmp/missing-manifest",
-                "--bootstrap-core-archive",
-                "/tmp/missing-core.zip",
                 "--production",
                 "--identity-fingerprint",
                 FINGERPRINT,
@@ -2291,15 +2467,8 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
                 "0.2.0",
                 "--toolchain-version",
                 "2.0.0",
-                "--manifest-url",
-                "https://example.test/manifest.json",
-                "--core-artifact-url",
-                "https://example.test/core.zip",
-                "--da3-base-artifact-url",
-                "https://example.test/base.zip",
-                "--da3-small-artifact-url",
-                "https://example.test/small.zip",
-                "--use-existing-toolchain",
+                    "--toolchain-dir",
+                    os.fspath(TOOLCHAIN_DIR),
                 "--production",
                 "--identity-fingerprint",
                 FINGERPRINT,
@@ -2358,7 +2527,7 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
             '/usr/bin/python3 -I '
             '"$ROOT/scripts/release/generate_release_metadata.py"'
         )
-        self.assertEqual(dmg_source.count(trusted_invocation), 2)
+        self.assertEqual(dmg_source.count(trusted_invocation), 1)
         self.assertNotIn(
             'python3 "$ROOT/scripts/release/generate_release_metadata.py"',
             dmg_source.replace(trusted_invocation, ""),
@@ -2394,10 +2563,18 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
     def test_signed_app_reverifies_exact_identity_before_success(self) -> None:
         source = BUILD_APP_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertEqual(source.count("--verify-only"), 1)
-        exact_verification = source.index("--verify-only")
-        completion = source.index("SIGNED_BUILD_COMPLETE=1")
-        self.assertLess(exact_verification, completion)
+        # Every signed channel re-verifies the artifact it just produced, and
+        # only then calls the build complete.
+        verifications = [
+            match.start() for match in re.finditer(r"--verify-only", source)
+        ]
+        completions = [
+            match.start() for match in re.finditer(r"SIGNED_BUILD_COMPLETE=1", source)
+        ]
+        self.assertTrue(verifications)
+        self.assertEqual(len(verifications), len(completions))
+        for verification, completion in zip(verifications, completions):
+            self.assertLess(verification, completion)
 
     def test_signed_dmg_uses_transactional_publication_helper(self) -> None:
         source = BUILD_DMG_SCRIPT.read_text(encoding="utf-8")
@@ -2424,15 +2601,7 @@ class SignedPackagingScriptTrustTests(unittest.TestCase):
         self.assertIn("--prepared-release-root", source)
         self.assertIn('PREPARED_APP="$PREPARED_RELEASE_ROOT/product/EasySplat.app"', source)
         self.assertIn('PREPARED_DSYM="$PREPARED_RELEASE_ROOT/product/EasySplat.app.dSYM"', source)
-        self.assertIn('--manifest-tool-bin', source)
-        self.assertIn('manifest_tool=("$MANIFEST_TOOL_BIN")', source)
-        self.assertIn(
-            'Trusted ManifestTool must be outside the prepared artifact.', source
-        )
-        self.assertNotIn(
-            'PREPARED_MANIFEST_TOOL="$PREPARED_RELEASE_ROOT/product/ManifestTool"',
-            source,
-        )
+        self.assertNotIn("ManifestTool", source)
         self.assertIn('if [ -n "$PREPARED_RELEASE_ROOT" ]; then', source)
         self.assertIn('SOURCE_COMMIT="$SOURCE_COMMIT_OVERRIDE"', source)
         self.assertIn(

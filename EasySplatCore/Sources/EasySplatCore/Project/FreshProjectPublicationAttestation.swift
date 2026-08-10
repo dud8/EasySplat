@@ -225,6 +225,42 @@ public final class FreshProjectPublicationAttestation {
         }
     }
 
+    /// Advances the parent-directory monitor past the transaction's own durable
+    /// envelope cleanup without disarming it. Project-root and file watches must
+    /// remain untouched, and any later library mutation is still sticky.
+    func publicationCleanupDidComplete() throws {
+        try lock.withLock {
+            guard state == .published else {
+                throw FreshProjectPublicationAttestationError.discarded
+            }
+            do {
+                try acknowledgeControlledProjectLibraryChurn()
+            } catch {
+                state = .discarded
+                closeEvidence()
+                throw error
+            }
+        }
+    }
+
+    /// The descriptor-held project run lease can produce parent-directory
+    /// NOTE_WRITE/NOTE_LINK bookkeeping on APFS. Advance past only that exact
+    /// generation after proving the project root and every sealed file stayed put.
+    func projectRunLeaseDidAcquire() throws {
+        try lock.withLock {
+            guard state == .published else {
+                throw FreshProjectPublicationAttestationError.discarded
+            }
+            do {
+                try acknowledgeControlledProjectLibraryChurn()
+            } catch {
+                state = .discarded
+                closeEvidence()
+                throw error
+            }
+        }
+    }
+
     /// Burns the one-shot capability before checking any caller-controlled value.
     /// Pipeline startup must call `completeConsumption()` after the runtime input
     /// lease has sealed its own content-hashed copy.
@@ -364,23 +400,54 @@ public final class FreshProjectPublicationAttestation {
         _ snapshot: VnodeMutationMonitor.Snapshot
     ) -> Bool {
         guard snapshot.failure == nil else { return false }
+        return snapshot.mutations.allSatisfy(validatedFileAttributeMutation)
+    }
+
+    private func controlledProjectLibrarySnapshotIsExpected(
+        _ snapshot: VnodeMutationMonitor.Snapshot
+    ) -> Bool {
+        guard snapshot.failure == nil else { return false }
+        let cleanupFlags: VnodeMutationMonitor.MutationFlags = [.write, .link]
         return snapshot.mutations.allSatisfy { mutation in
-            guard mutation.flags == [.attribute],
-                  let entry = expectedManifest.first(where: {
-                    $0.relativePath == mutation.label && !$0.isDirectory
-                  }) else {
-                return false
+            if mutation.label == "project-library" {
+                return !mutation.flags.isEmpty
+                    && mutation.flags.subtracting(cleanupFlags).isEmpty
             }
-            var status = stat()
-            let result = entry.relativePath.withCString {
-                fstatat(bundleDescriptor, $0, &status, AT_SYMLINK_NOFOLLOW)
-            }
-            // APFS may report NOTE_ATTRIB when a read advances access-time state.
-            // Publication evidence intentionally excludes atime. Attribute churn is
-            // accepted only for a file whose identity, mode, link count, size, mtime,
-            // and ctime still exactly match the durable publication manifest.
-            return result == 0 && entry.matches(status)
+            return validatedFileAttributeMutation(mutation)
         }
+    }
+
+    private func acknowledgeControlledProjectLibraryChurn() throws {
+        try validatePublishedPathAndManifest(requiresExactTree: true)
+        try validateMetadataBytes()
+        guard preConsumptionRootMonitor?.poll().isTrustworthy == true,
+              publishedMonitor?.acknowledgeCurrentSnapshot(
+                where: controlledProjectLibrarySnapshotIsExpected
+              ) == true else {
+            throw FreshProjectPublicationAttestationError.filesystemChanged
+        }
+        try validatePublishedPathAndManifest(requiresExactTree: true)
+        try validateMetadataBytes()
+    }
+
+    private func validatedFileAttributeMutation(
+        _ mutation: VnodeMutationMonitor.Mutation
+    ) -> Bool {
+        guard mutation.flags == [.attribute],
+              let entry = expectedManifest.first(where: {
+                $0.relativePath == mutation.label && !$0.isDirectory
+              }) else {
+            return false
+        }
+        var status = stat()
+        let result = entry.relativePath.withCString {
+            fstatat(bundleDescriptor, $0, &status, AT_SYMLINK_NOFOLLOW)
+        }
+        // APFS may report NOTE_ATTRIB when a read advances access-time state.
+        // Publication evidence intentionally excludes atime. Attribute churn is
+        // accepted only for a file whose identity, mode, link count, size, mtime,
+        // and ctime still exactly match the durable publication manifest.
+        return result == 0 && entry.matches(status)
     }
 
     private func closeEvidence() {

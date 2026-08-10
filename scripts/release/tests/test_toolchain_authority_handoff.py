@@ -98,7 +98,7 @@ class ToolchainAuthorityHandoffTests(unittest.TestCase):
             "--authority-payload-artifact-id",
             "--authority-receipt-artifact-id",
             "scripts/release/toolchain_publication.py verify",
-            "EasySplatApp/Resources/public_key_ed25519.txt",
+            "scripts/release/toolchain_authority_public_key.txt",
         ):
             self.assertIn(required, verifier)
         self.assertNotRegex(

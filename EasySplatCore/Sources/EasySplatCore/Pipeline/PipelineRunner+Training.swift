@@ -1,4 +1,11 @@
+import Darwin
 import Foundation
+
+enum SparseBinaryPublicationCheckpoint: Sendable {
+    case beforeSwap
+    case afterSwap
+    case beforePublishedValidation
+}
 
 private struct SelectedTrainingFrameBinding: Equatable {
     let byteCount: UInt64
@@ -9,6 +16,53 @@ private struct SelectedTrainingFrameBinding: Equatable {
 private struct SelectedTrainingFrameSnapshot: Equatable {
     let digest: String
     let bindingsByName: [String: SelectedTrainingFrameBinding]
+}
+
+/// The canonical lineage that a completed training manifest claims. Publication
+/// captures it immediately before the manifest CAS and rederives it at both CAS
+/// boundaries, so a geometry replacement cannot be blessed by installing
+/// otherwise valid rebound manifest bytes. The training side is bound separately
+/// by the descriptor-and-bytes CAS in `TrainingArtifactStore`.
+package struct MsplatPublicationLineageSnapshot: Sendable, Equatable {
+    package let geometryArtifact: GeometryArtifact
+    package let geometryManifestSHA256: String
+
+    package static func capture(
+        matching training: TrainingArtifact,
+        paths: ProjectPaths
+    ) throws -> MsplatPublicationLineageSnapshot {
+        let geometry = try GeometryArtifactStore.loadManifest(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        let geometryManifestSHA256 = try GeometryArtifactStore.manifestDigest(
+            matching: geometry,
+            at: paths.geometryManifestURL
+        )
+        let derivation = training.datasetDerivation
+        guard training.completionStatus == .completed,
+              derivation.sourceGeometryManifestSHA256 == geometryManifestSHA256,
+              derivation.sourceSelectedFramesDigest == geometry.selectedFramesDigest else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch(
+                "training publication lineage"
+            )
+        }
+        return MsplatPublicationLineageSnapshot(
+            geometryArtifact: geometry,
+            geometryManifestSHA256: geometryManifestSHA256
+        )
+    }
+
+    package func revalidate(
+        matching training: TrainingArtifact,
+        paths: ProjectPaths
+    ) throws {
+        guard try Self.capture(matching: training, paths: paths) == self else {
+            throw GeometryArtifactStore.Error.artifactDigestMismatch(
+                "training publication lineage"
+            )
+        }
+    }
 }
 
 extension PipelineRunner {
@@ -54,7 +108,7 @@ extension PipelineRunner {
             )
         } else {
             preparationKind = .direct
-            prepared = try prepareDirectMsplatDataset(
+            prepared = try await prepareDirectMsplatDataset(
                 paths: paths,
                 sourceSparse: sourceSparse,
                 sourceSnapshot: sourceSnapshot,
@@ -227,7 +281,7 @@ extension PipelineRunner {
                 to: undistorterInput.appendingPathComponent(name)
             )
         }
-        _ = try regenerateBinarySparseModelFiles(at: undistorterInput)
+        _ = try await regenerateBinarySparseModelFiles(at: undistorterInput)
         try requireBinarySparseModelFiles(at: undistorterInput)
         try Task.checkCancellation()
         try await tooling.colmap.runImageUndistorter(
@@ -267,13 +321,13 @@ extension PipelineRunner {
         }
         try requireBinarySparseModelFiles(at: candidateSparse)
         if let learnedPointInitializer = geometryArtifact.learnedPointInitializer {
-            _ = try ensureTextSparseModelFiles(at: candidateSparse)
+            _ = try await ensureTextSparseModelFiles(at: candidateSparse)
             try mergeLearnedPointInitializer(
                 learnedPointInitializer,
                 paths: paths,
                 into: candidateSparse.appendingPathComponent("points3D.txt")
             )
-            _ = try regenerateBinarySparseModelFiles(at: candidateSparse)
+            _ = try await regenerateBinarySparseModelFiles(at: candidateSparse)
         }
         for name in ["cameras.txt", "images.txt", "points3D.txt"] {
             let file = candidateSparse.appendingPathComponent(name)
@@ -431,7 +485,7 @@ extension PipelineRunner {
         sourceGeometryManifestSHA256: String,
         selectedFrameSnapshot: SelectedTrainingFrameSnapshot,
         progress: (Double, String) -> Void
-    ) throws -> (
+    ) async throws -> (
         url: URL,
         identity: MsplatDatasetIdentity,
         registeredImageNames: [String]
@@ -497,7 +551,7 @@ extension PipelineRunner {
                 into: sparse.appendingPathComponent("points3D.txt")
             )
         }
-        _ = try regenerateBinarySparseModelFiles(at: sparse)
+        _ = try await regenerateBinarySparseModelFiles(at: sparse)
         try requireBinarySparseModelFiles(at: sparse)
         for name in ["cameras.txt", "images.txt", "points3D.txt"] {
             try fm.removeItem(at: sparse.appendingPathComponent(name))
@@ -547,7 +601,15 @@ extension PipelineRunner {
         sparseDirectory: URL,
         geometryArtifact: GeometryArtifact
     ) throws -> [String] {
-        try ColmapSparseModelMembershipReader(
+        // Imported geometry has no COLMAP feature database to attest membership
+        // against; the registered images are read directly from the adopted
+        // model (text or binary), which the caller cross-checks against the
+        // canonical analysis of the source model.
+        if geometryArtifact.resolvedSource == .imported {
+            let (model, _) = try ColmapModelReader.read(modelDirectory: sparseDirectory)
+            return model.images.map(\.name).sorted()
+        }
+        return try ColmapSparseModelMembershipReader(
             databaseURL: paths.colmapDatabaseURL,
             selectedImageNames: geometryArtifact.orderedImageNames
         ).registeredImageNames(
@@ -653,19 +715,31 @@ extension PipelineRunner {
     /// The geometry manifest authenticates the accepted text model. Always derive the
     /// trainer's binary model from that verified source so stale binaries from an older
     /// training attempt can never bypass the geometry gate.
-    func regenerateBinarySparseModelFiles(at url: URL) throws -> Bool {
+    func regenerateBinarySparseModelFiles(
+        at url: URL,
+        publicationCheckpoint: (SparseBinaryPublicationCheckpoint) throws -> Void = { _ in }
+    ) async throws -> Bool {
+        try Task.checkCancellation()
         try requireTextSparseModelFiles(at: url)
         let fm = FileManager.default
         let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
+        let sourceSnapshot = try captureMappedSparseModel(at: url)
         let stagingRoot = url.deletingLastPathComponent().appendingPathComponent(
             ".binary-model-\(UUID().uuidString)",
             isDirectory: true
         )
         let textInput = stagingRoot.appendingPathComponent("text", isDirectory: true)
         let binaryOutput = stagingRoot.appendingPathComponent("binary", isDirectory: true)
+        let replacement = stagingRoot.appendingPathComponent("replacement", isDirectory: true)
         try fm.createDirectory(at: textInput, withIntermediateDirectories: true)
         try fm.createDirectory(at: binaryOutput, withIntermediateDirectories: true)
-        defer { try? fm.removeItem(at: stagingRoot) }
+        try fm.createDirectory(at: replacement, withIntermediateDirectories: true)
+        var preserveStaging = false
+        defer {
+            if !preserveStaging {
+                try? fm.removeItem(at: stagingRoot)
+            }
+        }
         for name in ["cameras.txt", "images.txt", "points3D.txt"] {
             try fm.copyItem(
                 at: url.appendingPathComponent(name),
@@ -673,7 +747,7 @@ extension PipelineRunner {
             )
         }
 
-        try tooling.colmap.runModelConverter(
+        try await tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
             inputPath: textInput,
             outputPath: binaryOutput,
@@ -682,6 +756,17 @@ extension PipelineRunner {
             onLog: { _, _ in }
         )
 
+        try Task.checkCancellation()
+        let sourceEntries = try fm.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        for entry in sourceEntries {
+            try fm.copyItem(
+                at: entry,
+                to: replacement.appendingPathComponent(entry.lastPathComponent)
+            )
+        }
         for name in binFiles {
             let source = binaryOutput.appendingPathComponent(name)
             let values = try source.resourceValues(forKeys: [
@@ -694,18 +779,126 @@ extension PipelineRunner {
                   (values.fileSize ?? 0) > 0 else {
                 throw PipelineError.outputMissing
             }
-            let destination = url.appendingPathComponent(name)
+            let destination = replacement.appendingPathComponent(name)
             if fm.fileExists(atPath: destination.path) {
-                _ = try fm.replaceItemAt(destination, withItemAt: source)
-            } else {
-                try fm.moveItem(at: source, to: destination)
+                try fm.removeItem(at: destination)
+            }
+            try fm.moveItem(at: source, to: destination)
+        }
+
+        try validateMappedSparseModel(sourceSnapshot, at: url)
+        let replacementSnapshot = try captureMappedSparseModel(at: replacement)
+        try requireBinarySparseModelFiles(at: replacement)
+        for entry in try fm.contentsOfDirectory(
+            at: replacement,
+            includingPropertiesForKeys: nil
+        ) {
+            try synchronizeSparseModelFile(at: entry)
+        }
+
+        let replacementDescriptor = Darwin.open(
+            replacement.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard replacementDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(replacementDescriptor) }
+        try synchronizeSparseModelDirectory(replacementDescriptor)
+
+        let parent = url.deletingLastPathComponent()
+        let parentDescriptor = Darwin.open(
+            parent.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard parentDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(parentDescriptor) }
+        let stagingDescriptor = Darwin.open(
+            stagingRoot.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard stagingDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(stagingDescriptor) }
+        try synchronizeSparseModelDirectory(stagingDescriptor)
+
+        func exchangeModels() -> Int32 {
+            url.lastPathComponent.withCString { currentName in
+                "replacement".withCString { replacementName in
+                    renameatx_np(
+                        parentDescriptor,
+                        currentName,
+                        stagingDescriptor,
+                        replacementName,
+                        UInt32(RENAME_SWAP)
+                    )
+                }
             }
         }
+
+        try validateMappedSparseModel(replacementSnapshot, at: replacement)
+        try Task.checkCancellation()
+        try publicationCheckpoint(.beforeSwap)
+        let renameResult = exchangeModels()
+        guard renameResult == 0 else {
+            throw SparseModelPublicationError.atomicBinaryPublicationFailed(errno)
+        }
+
+        do {
+            try Task.checkCancellation()
+            try publicationCheckpoint(.afterSwap)
+            try synchronizeSparseModelDirectory(parentDescriptor)
+            try synchronizeSparseModelDirectory(stagingDescriptor)
+            try publicationCheckpoint(.beforePublishedValidation)
+            try validateMappedSparseModel(replacementSnapshot, at: url)
+            try Task.checkCancellation()
+        } catch {
+            do {
+                try validateMappedSparseModel(sourceSnapshot, at: replacement)
+                let rollbackResult = exchangeModels()
+                guard rollbackResult == 0 else {
+                    let rollbackCode = errno
+                    preserveStaging = true
+                    throw SparseModelPublicationError.atomicBinaryRollbackFailed(
+                        rollbackCode,
+                        recoveryDirectory: stagingRoot.path
+                    )
+                }
+                try synchronizeSparseModelDirectory(parentDescriptor)
+                try synchronizeSparseModelDirectory(stagingDescriptor)
+                try validateMappedSparseModel(sourceSnapshot, at: url)
+            } catch let rollbackError as SparseModelPublicationError {
+                if case .atomicBinaryRollbackFailed = rollbackError {
+                    throw rollbackError
+                }
+                preserveStaging = true
+                throw SparseModelPublicationError.atomicBinaryRollbackFailed(
+                    EIO,
+                    recoveryDirectory: stagingRoot.path
+                )
+            } catch {
+                preserveStaging = true
+                throw SparseModelPublicationError.atomicBinaryRollbackFailed(
+                    EIO,
+                    recoveryDirectory: stagingRoot.path
+                )
+            }
+            throw error
+        }
+        try? fm.removeItem(at: replacement)
+        try? synchronizeSparseModelDirectory(stagingDescriptor)
         return true
     }
 
     func msplatToolPath() -> URL {
         config.toolchain.msplat
+    }
+
+    func msplatMetallibPath() -> URL {
+        config.toolchain.metallib
     }
 
     func msplatResumeURL(
@@ -886,44 +1079,47 @@ extension PipelineRunner {
         return artifact
     }
 
-    /// Rebinds a completed training receipt to the validated public PLY. The trainer's
-    /// private output remains available until the run is durably marked done, so a
-    /// crash during export can still resume without retraining.
-    func promoteMsplatCompletionToPublicOutput(paths: ProjectPaths) throws -> TrainingArtifact {
-        guard var artifact = try? TrainingArtifactStore.load(
-            from: paths.trainingManifestURL,
-            projectPaths: paths
-        ), artifact.completionStatus == .completed else {
-            throw PipelineError.outputMissing
-        }
-        if artifact.outputPath == "Output/splat.ply" {
-            try TrainingArtifactStore.validateCompletedOutput(
-                artifact,
-                at: paths.outputURL.appendingPathComponent("splat.ply")
-            )
-            return artifact
-        }
-        guard artifact.outputPath == "Training/msplat/splat.ply" else {
-            throw PipelineError.outputMissing
-        }
-
-        artifact.outputPath = "Output/splat.ply"
-        try TrainingArtifactStore.persist(artifact, paths: paths)
-        return artifact
-    }
-
     /// Finished projects retain the exact dataset consumed by the trainer so release
     /// verification can independently recompute its input and geometry identities.
     /// Only the trainer-private duplicate PLY is disposable after public output is
     /// durably authenticated.
-    func removeDisposableCompletedTrainingPayload(paths: ProjectPaths) throws {
-        let fileManager = FileManager.default
-        let disposableOutput = try paths.resolveProjectRelativePath(
-            "Training/msplat/splat.ply"
+    func removeDisposableCompletedTrainingPayload(
+        paths: ProjectPaths,
+        publishedResult: ValidatedPublishedResult,
+        operations: TrainingFilesystemOperations = .live
+    ) throws {
+        try TrainingArtifactStore.removeDisposableCompletedPayload(
+            paths: paths,
+            publishedResult: publishedResult,
+            operations: operations
         )
-        if fileManager.fileExists(atPath: disposableOutput.path)
-            || (try? fileManager.destinationOfSymbolicLink(atPath: disposableOutput.path)) != nil {
-            try fileManager.removeItem(at: disposableOutput)
-        }
+    }
+
+    func removeDisposableCompletedTrainingPayload(
+        paths: ProjectPaths,
+        projectRootDescriptor: Int32,
+        publishedResult: ValidatedPublishedResult,
+        operations: TrainingFilesystemOperations = .live
+    ) throws {
+        try TrainingArtifactStore.removeDisposableCompletedPayload(
+            paths: paths,
+            projectRootDescriptor: projectRootDescriptor,
+            publishedResult: publishedResult,
+            operations: operations
+        )
+    }
+
+    /// Removes the preview and any temporary a crashed publication left behind.
+    /// The preview is a display cache tied to a live run: keeping ~26 MB per
+    /// finished project to describe a model that has since been superseded is pure
+    /// accumulation. Safe to call when nothing is present.
+    func removeTrainingPreviewPayload(
+        paths: ProjectPaths,
+        operations: TrainingFilesystemOperations = .live
+    ) throws {
+        try TrainingArtifactStore.removePreviewPayload(
+            paths: paths,
+            operations: operations
+        )
     }
 }

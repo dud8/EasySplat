@@ -23,7 +23,7 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
         XCTAssertNil(rgbRenderer.sphericalHarmonicCoefficientBuffer)
         XCTAssertEqual(rgbRenderer.sphericalHarmonicDegree, .sh0)
 
-        assertLegacyStoredLinear(
+        assertStoredColor(
             shRenderer.splatBuffer.values[0].color,
             expectedSRGB: simd_max(shC0 * rawDC + SIMD3<Float>(repeating: 0.5), .zero)
         )
@@ -33,11 +33,11 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
         XCTAssertEqual(Float(sh.values[0].y), Float(Float16(rawDC.y)))
         XCTAssertEqual(Float(sh.values[0].z), Float(Float16(rawDC.z)))
 
-        assertLegacyStoredLinear(
+        assertStoredColor(
             rgbRenderer.splatBuffer.values[0].color,
             expectedSRGB: SIMD3<Float>(64, 128, 224) / 255
         )
-        assertLegacyStoredLinear(
+        assertStoredColor(
             rgbRenderer.splatBuffer.values[1].color,
             expectedSRGB: SIMD3<Float>(64.5, 128.25, 224.75) / 255
         )
@@ -243,8 +243,7 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
         XCTAssertNil(renderer.sphericalHarmonicCoefficientBuffer)
         XCTAssertEqual(renderer.sphericalHarmonicDegree, .sh0)
         let actual = try renderCenterPixel(renderer: renderer, direction: SIMD3<Float>(0, 0, 1))
-        let srgb = SIMD3<Float>(64, 128, 224) / 255
-        let expected = SIMD3<Float>(pow(srgb.x, 2.2), pow(srgb.y, 2.2), pow(srgb.z, 2.2))
+        let expected = SIMD3<Float>(64, 128, 224) / 255
         assertEqual(actual, expected, accuracy: 0.002)
     }
 
@@ -378,19 +377,21 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
         XCTAssertEqual(first, second)
     }
 
-    func testSH0RGBMatchesLegacyBGRA8WithinOneCodeValueAcrossUInt8Range() throws {
-        let renderer = try makeRenderer(colorFormat: .bgra8Unorm_srgb)
+    // An opaque splat covering the sampled pixel must come back out as the code value
+    // that went in. Any conversion reintroduced on either the encode or the attachment
+    // side breaks this, which is what made the viewer diverge from the trainer.
+    func testSH0RGBRoundTripsUInt8CodeValuesExactly() throws {
+        let renderer = try makeRenderer(colorFormat: .bgra8Unorm)
         var maximumDifference = 0
 
         for value in UInt8.min...UInt8.max {
             renderer.reset()
             try renderer.add(makePoint(color: .linearUInt8(value, value, value)))
             let actual = try renderBGRA8CenterPixel(renderer: renderer)
-            let expected = legacyBGRA8CodeValue(value)
             for channel in 0..<3 {
                 maximumDifference = max(
                     maximumDifference,
-                    abs(Int(actual[channel]) - Int(expected))
+                    abs(Int(actual[channel]) - Int(value))
                 )
             }
         }
@@ -447,7 +448,8 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
             stencilFormat: .invalid,
             sampleCount: 1,
             maxViewCount: maxViewCount,
-            maxSimultaneousRenders: 1
+            maxSimultaneousRenders: 1,
+            sortOrdering: .cameraForwardDepth
         )
     }
 
@@ -462,16 +464,17 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
         )
     }
 
-    private func assertLegacyStoredLinear(
+    /// Splat storage holds the sRGB code values the trainer fitted, quantized to half.
+    private func assertStoredColor(
         _ stored: SplatRenderer.PackedRGBHalf4,
         expectedSRGB: SIMD3<Float>,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
         let expected = SIMD3<Float>(
-            Float(Float16(pow(expectedSRGB.x, 2.2))),
-            Float(Float16(pow(expectedSRGB.y, 2.2))),
-            Float(Float16(pow(expectedSRGB.z, 2.2)))
+            Float(Float16(expectedSRGB.x)),
+            Float(Float16(expectedSRGB.y)),
+            Float(Float16(expectedSRGB.z))
         )
         let actual = SIMD3<Float>(Float(stored.r), Float(stored.g), Float(stored.b))
         assertEqual(actual, expected, accuracy: 0, file: file, line: line)
@@ -569,7 +572,7 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
         let device = renderer.splatBuffer.device
         let queue = try XCTUnwrap(device.makeCommandQueue())
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm_srgb,
+            pixelFormat: .bgra8Unorm,
             width: width,
             height: width,
             mipmapped: false
@@ -600,18 +603,6 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
             )
         }
         return pixel
-    }
-
-    private func legacyBGRA8CodeValue(_ value: UInt8) -> UInt8 {
-        let srgb = Float(value) / 255
-        let legacyStoredLinear = Float(Float16(pow(srgb, 2.2)))
-        let encoded: Float
-        if legacyStoredLinear <= 0.003_130_8 {
-            encoded = 12.92 * legacyStoredLinear
-        } else {
-            encoded = 1.055 * pow(legacyStoredLinear, 1 / 2.4) - 0.055
-        }
-        return UInt8(max(0, min(255, Int((encoded * 255).rounded()))))
     }
 
     private func centerPixel(from image: [UInt16], width: Int, xOffset: Int = 0) -> SIMD3<Float> {
@@ -809,8 +800,7 @@ final class SplatRendererSphericalHarmonicsTests: XCTestCase {
         result += -0.4570457994644658 * x * fourZZMinusXXYY * sh[12]
         result += 1.445305721320277 * z * (xx - yy) * sh[13]
         result += -0.5900435899266435 * x * (xx - 3 * yy) * sh[14]
-        let srgb = simd_max(result + SIMD3<Float>(repeating: 0.5), .zero)
-        return SIMD3<Float>(pow(srgb.x, 2.2), pow(srgb.y, 2.2), pow(srgb.z, 2.2))
+        return simd_max(result + SIMD3<Float>(repeating: 0.5), .zero)
     }
 
     private func assertEqual(

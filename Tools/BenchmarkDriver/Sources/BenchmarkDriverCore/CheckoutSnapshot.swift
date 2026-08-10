@@ -28,6 +28,22 @@ public struct CheckoutSnapshot: Equatable, Sendable {
         return CheckoutSnapshot(root: resolvedRoot, commit: commit)
     }
 
+    /// The commit and cleanliness of a checkout, without the refusal `capture` performs.
+    ///
+    /// Release evidence may only come from a clean tree, which is why `capture` throws. A
+    /// research measurement is often the whole point of an uncommitted change, so it records
+    /// the dirty flag and lets the comparison decide: statistics from a dirty tree are
+    /// readable, an acceptance from one is not.
+    public static func describe(root: URL) throws -> (commit: String, dirty: Bool) {
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
+        let commit = try git(["rev-parse", "HEAD"], root: resolvedRoot)
+        guard BenchmarkRenderJob.isCommit(commit) else {
+            throw BenchmarkDriverError.invalidJob("A benchmark checkout commit is invalid.")
+        }
+        let status = try git(["status", "--porcelain", "--untracked-files=normal"], root: resolvedRoot)
+        return (commit, !status.isEmpty)
+    }
+
     public func verifyUnchanged() throws {
         let currentCommit = try Self.git(["rev-parse", "HEAD"], root: root)
         let status = try Self.git(["status", "--porcelain", "--untracked-files=normal"], root: root)

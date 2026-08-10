@@ -55,6 +55,31 @@ FORBIDDEN_APP_ENTITLEMENTS = (
     "com.apple.security.cs.disable-library-validation",
     "com.apple.security.get-task-allow",
 )
+# Read from the team's own leaf certificates rather than a published table:
+# Developer ID Application carries 6.1.13 under the 6.2.6 intermediate, while
+# Apple Distribution -- the current Mac App Store application certificate --
+# carries 6.1.7 under the WWDR 6.2.1 intermediate that G3, G5 and G6 all share.
+CHANNELS: dict[str, dict[str, str]] = {
+    "developer-id": {
+        "commonNamePrefix": "Developer ID Application:",
+        "label": "Developer ID Application",
+        "intermediateOID": "1.2.840.113635.100.6.2.6",
+        "leafOID": "1.2.840.113635.100.6.1.13",
+    },
+    "mas": {
+        "commonNamePrefix": "Apple Distribution:",
+        "label": "Apple Distribution",
+        "intermediateOID": "1.2.840.113635.100.6.2.1",
+        "leafOID": "1.2.840.113635.100.6.1.7",
+    },
+}
+DEFAULT_CHANNEL = "developer-id"
+# Mach-O file types: a program, versus a library that never becomes a process.
+MH_EXECUTE = 0x2
+# Where the app keeps the executables it spawns. Both channels care: they are
+# run-path roots in either, and in the store channel they are also the
+# executables that must inherit the sandbox.
+BUNDLED_HELPER_PREFIX = "Contents/Helpers/"
 APP_BINARY_POLICY = {
     "architectures": ["arm64"],
     "minimumOS": "15.0",
@@ -179,11 +204,21 @@ def require_command_success(
         fail(f"{label} failed with exit status {result.returncode}")
 
 
+def channel_policy(channel: str) -> dict[str, str]:
+    policy = CHANNELS.get(channel)
+    if policy is None:
+        fail(f"unknown distribution channel: {channel}")
+    return policy
+
+
 def validate_signing_identity(
     fingerprint: str,
     team_id: str,
     command_runner: CommandRunner = run_command,
+    *,
+    channel: str = DEFAULT_CHANNEL,
 ) -> dict[str, str]:
+    policy = channel_policy(channel)
     if not SHA1.fullmatch(fingerprint):
         fail("signing identity fingerprint must be exactly 40 hexadecimal characters")
     if not TEAM_ID.fullmatch(team_id):
@@ -213,15 +248,19 @@ def validate_signing_identity(
         fail("the exact fingerprint is not exactly one valid identity")
 
     common_name = matches[0][0]
-    if not common_name.startswith("Developer ID Application:"):
-        fail("the selected identity is not a Developer ID Application certificate")
+    if not common_name.startswith(policy["commonNamePrefix"]):
+        fail(f"the selected identity is not the expected {policy['label']} certificate")
     common_name_team = re.search(r"\(([A-Z0-9]{10})\)\s*$", common_name)
     if common_name_team is None or common_name_team.group(1) != team_id:
-        fail("the Developer ID Application identity has the wrong Team ID")
+        fail(f"the {policy['label']} identity has the wrong Team ID")
     _verify_identity_certificate(
         normalized_fingerprint, common_name, command_runner
     )
-    return {"fingerprint": normalized_fingerprint, "teamID": team_id}
+    return {
+        "fingerprint": normalized_fingerprint,
+        "teamID": team_id,
+        "channel": channel,
+    }
 
 
 def _verify_identity_certificate(
@@ -969,14 +1008,42 @@ def _validate_app_main_executable(
     return main
 
 
+def _is_macho_executable(path: Path) -> bool:
+    """True for a program, false for a library.
+
+    The executable bit does not separate them -- packaging installs the bundled
+    library 0755 like everything else beside it -- so this reads the file type
+    out of the Mach-O header, which is the only place the distinction is real.
+    """
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(16)
+    except OSError:
+        return False
+    if len(header) < 16 or header[:4] not in MACHO_MAGICS:
+        return False
+    little_endian = header[:4] in {b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"}
+    if header[:4] in {b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+                      b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}:
+        # A universal binary is rejected elsewhere; nothing here can read it.
+        return False
+    file_type = int.from_bytes(
+        header[12:16], "little" if little_endian else "big"
+    )
+    return file_type == MH_EXECUTE
+
+
 def validate_entitlements(
     root: Path,
     kind: str,
     macho_paths: list[Path],
     entitlements: dict[str, Path],
     app_main: str | None = None,
+    channel: str = DEFAULT_CHANNEL,
 ) -> dict[str, EntitlementInput]:
-    if kind == "app" and entitlements:
+    channel_policy(channel)
+    store_app = kind == "app" and channel == "mas"
+    if kind == "app" and not store_app and entitlements:
         fail("the distribution app uses an empty entitlement allowlist")
     available = {_relative_path(path, root) for path in macho_paths}
     if kind == "app" and app_main is None:
@@ -989,10 +1056,33 @@ def validate_entitlements(
         is_top_level = (
             (kind == "tree" and len(parts) == 2 and parts[0] == "bin")
             or (kind == "app" and relative == app_main)
+            # The store sandbox reaches a helper only if that helper is signed
+            # to inherit it, so every bundled executable is a legitimate target.
+            or (
+                store_app
+                and relative.startswith(BUNDLED_HELPER_PREFIX)
+                and _is_macho_executable(root / relative)
+            )
         )
         if not is_top_level:
             fail(f"entitlements target is not a named top-level executable: {relative}")
         validated[relative] = _load_entitlements(source)
+    if store_app:
+        # Entitlements describe a process, so codesign seals them onto
+        # executables and silently drops them from libraries. Requiring one on a
+        # dylib would demand something the format cannot carry.
+        expected = {app_main or ""} | {
+            _relative_path(path, root)
+            for path in macho_paths
+            if _relative_path(path, root).startswith(BUNDLED_HELPER_PREFIX)
+            and _is_macho_executable(path)
+        }
+        if set(validated) != expected:
+            missing = sorted(expected - set(validated))
+            fail(
+                "a store app must carry entitlements on its main executable and "
+                f"every bundled helper; missing: {missing[:5]}"
+            )
     return validated
 
 
@@ -1044,7 +1134,10 @@ def _extract_embedded_entitlements(
     command_runner: CommandRunner,
 ) -> str:
     result = command_runner(
-        [CODESIGN, "--display", "--entitlements", "-", str(target)]
+        # Without --xml codesign writes the raw entitlement blob, which no
+        # plist reader accepts and in which no XML marker appears -- so an app
+        # that carries entitlements would read as one that carries none.
+        [CODESIGN, "--display", "--entitlements", "-", "--xml", str(target)]
     )
     require_command_success(result, "embedded entitlements inspection")
     output = f"{result.stdout}\n{result.stderr}"
@@ -1066,12 +1159,38 @@ def _extract_embedded_entitlements(
     return digest
 
 
+def _embedded_entitlements_digest(
+    target: Path,
+    command_runner: CommandRunner,
+) -> str | None:
+    """The canonical digest of whatever entitlements are sealed, or None."""
+    result = command_runner(
+        [CODESIGN, "--display", "--entitlements", "-", "--xml", str(target)]
+    )
+    require_command_success(result, "embedded entitlements inspection")
+    output = f"{result.stdout}\n{result.stderr}"
+    start = output.find("<?xml")
+    end = output.find("</plist>", start)
+    if start < 0 or end < 0:
+        return None
+    xml = output[start : end + len("</plist>")].encode("utf-8")
+    try:
+        payload = plistlib.loads(xml)
+    except plistlib.InvalidFileException:
+        fail("codesign returned invalid embedded entitlements")
+    canonical = plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _require_empty_embedded_entitlements(
     target: Path,
     command_runner: CommandRunner,
 ) -> None:
     result = command_runner(
-        [CODESIGN, "--display", "--entitlements", "-", str(target)]
+        # Without --xml codesign writes the raw entitlement blob, which no
+        # plist reader accepts and in which no XML marker appears -- so an app
+        # that carries entitlements would read as one that carries none.
+        [CODESIGN, "--display", "--entitlements", "-", "--xml", str(target)]
     )
     require_command_success(result, "empty entitlement inspection")
     output = f"{result.stdout}\n{result.stderr}"
@@ -1261,7 +1380,20 @@ def validate_macho_dependency_closure(
         for relative, path in discovered.items()
     }
     if main_executable is not None:
-        executable_relatives = [main_executable]
+        # A bundled helper runs as its own process, so its @executable_path is
+        # its own directory rather than the app's. Resolving every image against
+        # the main executable alone would leave a helper's own run path
+        # unresolvable even though it is correct at runtime.
+        executable_relatives = [main_executable] + sorted(
+            (
+                relative
+                for relative, candidate in discovered.items()
+                if relative != main_executable
+                and relative.startswith(BUNDLED_HELPER_PREFIX)
+                and _is_macho_executable(candidate)
+            ),
+            key=os.fsencode,
+        )
     else:
         executable_relatives = sorted(
             (
@@ -1460,11 +1592,13 @@ def _codesign_metadata(
     command_runner: CommandRunner,
     *,
     require_hardened_runtime: bool = True,
+    channel: str = DEFAULT_CHANNEL,
 ) -> dict[str, object]:
+    policy = channel_policy(channel)
     developer_id_requirement = (
         "=anchor apple generic and "
-        "certificate 1[field.1.2.840.113635.100.6.2.6] and "
-        "certificate leaf[field.1.2.840.113635.100.6.1.13] and "
+        f"certificate 1[field.{policy['intermediateOID']}] and "
+        f"certificate leaf[field.{policy['leafOID']}] and "
         f'certificate leaf[subject.OU] = "{expected_team_id}"'
     )
     verification = command_runner(
@@ -1480,7 +1614,7 @@ def _codesign_metadata(
     )
     require_command_success(
         verification,
-        "semantic Developer ID requirement verification",
+        f"semantic {policy['label']} requirement verification",
     )
     with tempfile.TemporaryDirectory(prefix="easysplat-signing-certificate-") as directory:
         certificate_prefix = Path(directory) / "certificate"
@@ -1851,6 +1985,7 @@ def validate_signing_receipt(
     if (
         payload.get("schemaVersion") != 1
         or payload.get("rootKind") != kind
+        or payload.get("channel", DEFAULT_CHANNEL) not in CHANNELS
         or payload.get("identityFingerprintSHA1") != fingerprint
         or payload.get("teamID") != team_id
     ):
@@ -1899,14 +2034,34 @@ def validate_signing_receipt(
             is None
         ):
             fail("app signing receipt has no shared post-sign artifact digest")
+        store_app = payload.get("channel") == "mas"
+        entitled_entries = 0
         for entry in entries:
-            if (
-                entry.get("embeddedEntitlementsPresent") is not False
-                or entry.get("embeddedEntitlementsSHA256") is not None
-                or entry.get("entitlementsSHA256") is not None
-                or entry.get("entitlementsSourceSHA256") is not None
-            ):
+            digests = [
+                entry.get(field)
+                for field in (
+                    "embeddedEntitlementsSHA256",
+                    "entitlementsSHA256",
+                    "entitlementsSourceSHA256",
+                )
+            ]
+            sealed = [
+                value for value in digests
+                if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            ]
+            # An entry either proves what it sealed or proves it sealed nothing;
+            # a half-populated entry is evidence of neither.
+            if sealed and len(sealed) != len(digests):
+                fail("app signing receipt has partial entitlement evidence")
+            if entry.get("embeddedEntitlementsPresent") is not bool(sealed):
+                fail("app signing receipt disagrees with its own entitlement evidence")
+            if not store_app and sealed:
                 fail("app signing receipt contains forbidden entitlement evidence")
+            entitled_entries += 1 if sealed else 0
+        # A store app is sandboxed and its helpers inherit that sandbox, so the
+        # bundle and at least one executable must carry entitlements.
+        if store_app and entitled_entries < 2:
+            fail("store signing receipt has no entitlement evidence")
             if entry.get("kind") == "machO":
                 macho = entry.get("machO")
                 if (
@@ -2011,7 +2166,9 @@ def verify_distribution_tree(
     identity_fingerprint: str,
     team_id: str,
     run_command: CommandRunner = run_command,
+    channel: str = DEFAULT_CHANNEL,
 ) -> dict[str, object]:
+    store_app = kind == "app" and channel == "mas"
     fingerprint, team_id = _normalized_expected_identity(
         identity_fingerprint, team_id
     )
@@ -2040,10 +2197,14 @@ def verify_distribution_tree(
         relative = _relative_path(path, root)
         binding = _file_binding(path)
         metadata = _codesign_metadata(
-            path, fingerprint, team_id, run_command
+            path, fingerprint, team_id, run_command, channel=channel
         )
         if kind == "app":
-            _require_empty_embedded_entitlements(path, run_command)
+            if store_app:
+                sealed_digest = _embedded_entitlements_digest(path, run_command)
+            else:
+                _require_empty_embedded_entitlements(path, run_command)
+                sealed_digest = None
             macho_contract = _app_macho_build_contract(path, run_command)
         if _file_binding(path) != binding:
             fail(f"signed Mach-O changed during exact identity verification: {relative}")
@@ -2054,22 +2215,28 @@ def verify_distribution_tree(
                 "codesign": metadata,
             }
         if kind == "app":
-            entry["embeddedEntitlementsPresent"] = False
+            entry["embeddedEntitlementsPresent"] = sealed_digest is not None
             entry["machO"] = macho_contract
         entries.append(entry)
         _require_unchanged_root_ancestry(ancestry)
 
     if kind == "app":
         app_metadata = _codesign_metadata(
-            root, fingerprint, team_id, run_command
+            root, fingerprint, team_id, run_command, channel=channel
         )
-        _require_empty_embedded_entitlements(root, run_command)
+        if store_app:
+            app_sealed_digest = _embedded_entitlements_digest(root, run_command)
+            if app_sealed_digest is None:
+                fail("store app bundle carries no sealed entitlements")
+        else:
+            _require_empty_embedded_entitlements(root, run_command)
+            app_sealed_digest = None
         entries.append(
             {
                 "kind": "appBundle",
                 "relativePath": ".",
                 "sha256": before.manifest_sha256,
-                "embeddedEntitlementsPresent": False,
+                "embeddedEntitlementsPresent": app_sealed_digest is not None,
                 "mainExecutableRelativePath": app_main,
                 "codesign": app_metadata,
             }
@@ -2082,6 +2249,7 @@ def verify_distribution_tree(
     payload: dict[str, object] = {
         "schemaVersion": 1,
         "rootKind": kind,
+        "channel": channel,
         "identityFingerprintSHA1": fingerprint,
         "teamID": team_id,
         "treeManifestSHA256": before.manifest_sha256,
@@ -2272,12 +2440,16 @@ def sign_distribution_tree(
     entitlements: dict[str, Path] | None = None,
     run_command: CommandRunner = run_command,
     signing_time: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    channel: str = DEFAULT_CHANNEL,
 ) -> dict[str, object]:
+    store_app = kind == "app" and channel == "mas"
     root = validate_signing_root(root, kind)
     ancestry = _snapshot_root_ancestry(root)
     _validate_receipt_destination(receipt_path, root)
     pre_tree = snapshot_tree(root)
-    identity = validate_signing_identity(identity_fingerprint, team_id, run_command)
+    identity = validate_signing_identity(
+        identity_fingerprint, team_id, run_command, channel=channel
+    )
     _require_unchanged_root_ancestry(ancestry)
     if snapshot_tree(root).entries != pre_tree.entries:
         fail("signing tree changed before signing began")
@@ -2318,6 +2490,7 @@ def sign_distribution_tree(
         macho_paths,
         entitlements or {},
         app_main=app_main,
+        channel=channel,
     )
     snapshot_directory = tempfile.TemporaryDirectory(
         prefix="easysplat-entitlements-"
@@ -2388,9 +2561,12 @@ def sign_distribution_tree(
             original = pre_tree.entries[relative]
             entitlement = entitlement_map.get(relative)
             before_verification = _file_binding(path)
-            metadata = _codesign_metadata(path, fingerprint, team_id, run_command)
+            metadata = _codesign_metadata(
+                path, fingerprint, team_id, run_command, channel=channel
+            )
             if kind == "app":
-                _require_empty_embedded_entitlements(path, run_command)
+                if not store_app:
+                    _require_empty_embedded_entitlements(path, run_command)
                 macho_contract = _app_macho_build_contract(path, run_command)
                 if macho_contract != pre_sign_macho_contracts[relative]:
                     fail(f"Mach-O deployment contract changed while signing: {relative}")
@@ -2417,7 +2593,7 @@ def sign_distribution_tree(
                     "codesign": metadata,
                 }
             if kind == "app":
-                entry["embeddedEntitlementsPresent"] = False
+                entry["embeddedEntitlementsPresent"] = entitlement is not None
                 entry["machO"] = macho_contract
             entries.append(entry)
             _require_unchanged_root_ancestry(ancestry)
@@ -2427,9 +2603,10 @@ def sign_distribution_tree(
             app_entitlement = entitlement_map.get(app_main or "")
             before_app_verification = snapshot_tree(root)
             app_metadata = _codesign_metadata(
-                root, fingerprint, team_id, run_command
+                root, fingerprint, team_id, run_command, channel=channel
             )
-            _require_empty_embedded_entitlements(root, run_command)
+            if not store_app:
+                _require_empty_embedded_entitlements(root, run_command)
             verified_app_tree = snapshot_tree(root)
             if before_app_verification.entries != verified_app_tree.entries:
                 fail("signed app changed during signature verification")
@@ -2447,7 +2624,7 @@ def sign_distribution_tree(
                         app_entitlement.source_sha256 if app_entitlement else None
                     ),
                     "embeddedEntitlementsSHA256": app_embedded_entitlement_digest,
-                    "embeddedEntitlementsPresent": False,
+                    "embeddedEntitlementsPresent": app_entitlement is not None,
                     "mainExecutableRelativePath": app_main,
                     "signedAt": "",
                     "codesign": app_metadata,
@@ -2495,6 +2672,7 @@ def sign_distribution_tree(
         payload: dict[str, object] = {
             "schemaVersion": 1,
             "rootKind": kind,
+            "channel": channel,
             "identityFingerprintSHA1": fingerprint,
             "teamID": team_id,
             "signedAt": signed_at,
@@ -2554,6 +2732,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--kind", required=True, choices=("app", "tree", "dmg"))
+    parser.add_argument(
+        "--channel", default=DEFAULT_CHANNEL, choices=tuple(CHANNELS)
+    )
     parser.add_argument("--identity-fingerprint", required=True)
     parser.add_argument("--team-id", required=True)
     parser.add_argument("--receipt", type=Path)
@@ -2600,6 +2781,7 @@ def main(argv: list[str]) -> int:
                     kind=args.kind,
                     identity_fingerprint=args.identity_fingerprint,
                     team_id=args.team_id,
+                    channel=args.channel,
                 )
             if args.receipt is not None and validate_signing_receipt(
                 args.receipt,
@@ -2611,15 +2793,17 @@ def main(argv: list[str]) -> int:
                 ),
             ) != receipt_payload:
                 fail("signing receipt changed during exact identity verification")
-            print("Developer ID artifact identity verified.")
+            print(f"{channel_policy(args.channel)['label']} artifact identity verified.")
             return 0
         if args.receipt is None:
-            fail("Developer ID signing requires --receipt")
+            fail("distribution signing requires --receipt")
         if args.bind_receipt_to_current_artifact:
             fail("receipt binding is only valid with --verify-only")
         if args.kind == "dmg":
             if entitlements:
                 fail("disk images do not accept executable entitlements")
+            if args.channel != DEFAULT_CHANNEL:
+                fail("disk images ship outside the store and use Developer ID")
             sign_distribution_dmg(
                 args.root,
                 identity_fingerprint=args.identity_fingerprint,
@@ -2634,11 +2818,12 @@ def main(argv: list[str]) -> int:
                 team_id=args.team_id,
                 receipt_path=args.receipt,
                 entitlements=entitlements,
+                channel=args.channel,
             )
     except SigningError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    print("Developer ID signing receipt written.")
+    print(f"{channel_policy(args.channel)['label']} signing receipt written.")
     return 0
 
 

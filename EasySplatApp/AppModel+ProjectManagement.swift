@@ -7,6 +7,23 @@ private let projectLibraryLogger = Logger(
     category: "ProjectLibrary"
 )
 
+private final class SynchronizedAppValue<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: Value
+
+    init(_ value: Value) {
+        storedValue = value
+    }
+
+    var value: Value {
+        lock.withLock { storedValue }
+    }
+
+    func set(_ value: Value) {
+        lock.withLock { storedValue = value }
+    }
+}
+
 struct RunTimingBoundary: Sendable {
     struct Sample: Sendable, Equatable {
         let wallClock: Date
@@ -47,11 +64,46 @@ struct RunTimingBoundary: Sendable {
 }
 
 struct PendingResultViewerTiming: Sendable {
+    enum Phase: Sendable, Equatable {
+        case awaitingViewerReady
+        case updatingReceipt
+    }
+
+    let generationID: UUID
     let projectID: UUID
     let projectURL: URL
     let outputURL: URL
-    let boundary: RunTimingBoundary
+    let projectRootIdentity: AppProjectRootIdentity
+    let expectedPublicationID: UUID
+    let expectedGeneration: PublishedResultGeneration?
+    let boundary: RunTimingBoundary?
     var firstReadyElapsedSeconds: TimeInterval?
+    var phase: Phase
+
+    var isReceiptUpdateInFlight: Bool {
+        phase == .updatingReceipt
+    }
+}
+
+private struct ResultViewerTimingCommitRequest: Sendable {
+    let generationID: UUID
+    let projectID: UUID
+    let projectURL: URL
+    let outputURL: URL
+    let projectRootIdentity: AppProjectRootIdentity
+    let expectedPublicationID: UUID
+    let expectedGeneration: PublishedResultGeneration?
+    let elapsedSeconds: TimeInterval
+    let isMetadataHealing: Bool
+}
+
+private enum ResultViewerTimingWorkerResult: Sendable {
+    case recorded(ProjectMetadata)
+    case retired
+}
+
+private enum ResultViewerTimingCommitError: Error {
+    case invalidProjectState
 }
 
 extension AppModel {
@@ -59,79 +111,408 @@ extension AppModel {
         projectID: UUID,
         projectURL: URL,
         outputURL: URL,
+        expectedPublicationID: UUID? = nil,
+        expectedGeneration: PublishedResultGeneration? = nil,
+        projectRootIdentity suppliedProjectRootIdentity:
+            AppProjectRootIdentity? = nil,
         boundary: RunTimingBoundary
     ) {
+        cancelResultViewerTiming()
+        guard let expectedPublicationID,
+              outputURL.standardizedFileURL.path
+                == ProjectPaths(root: projectURL).outputSplatURL
+                    .standardizedFileURL.path,
+              let projectRootIdentity = suppliedProjectRootIdentity
+                ?? (try? AppProjectRootIdentity.capture(at: projectURL)) else {
+            return
+        }
         pendingResultViewerTiming = PendingResultViewerTiming(
+            generationID: UUID(),
             projectID: projectID,
             projectURL: projectURL,
             outputURL: outputURL,
+            projectRootIdentity: projectRootIdentity,
+            expectedPublicationID: expectedPublicationID,
+            expectedGeneration: expectedGeneration,
             boundary: boundary,
-            firstReadyElapsedSeconds: nil
+            firstReadyElapsedSeconds: nil,
+            phase: .awaitingViewerReady
+        )
+    }
+
+    func prepareResultViewerTimingMetadataHealing(
+        projectID: UUID,
+        projectURL: URL,
+        outputURL: URL,
+        expectedPublicationID: UUID,
+        expectedGeneration: PublishedResultGeneration? = nil,
+        elapsedSeconds: TimeInterval,
+        projectRootIdentity suppliedProjectRootIdentity:
+            AppProjectRootIdentity? = nil
+    ) {
+        guard elapsedSeconds.isFinite,
+              elapsedSeconds >= 0,
+              outputURL.standardizedFileURL.path
+                == ProjectPaths(root: projectURL).outputSplatURL
+                    .standardizedFileURL.path,
+              let projectRootIdentity = suppliedProjectRootIdentity
+                ?? (try? AppProjectRootIdentity.capture(at: projectURL)) else {
+            return
+        }
+        cancelResultViewerTiming()
+        pendingResultViewerTiming = PendingResultViewerTiming(
+            generationID: UUID(),
+            projectID: projectID,
+            projectURL: projectURL,
+            outputURL: outputURL,
+            projectRootIdentity: projectRootIdentity,
+            expectedPublicationID: expectedPublicationID,
+            expectedGeneration: expectedGeneration,
+            boundary: nil,
+            firstReadyElapsedSeconds: elapsedSeconds,
+            phase: .awaitingViewerReady
         )
     }
 
     func resultViewerDidBecomeReady(projectURL: URL, outputURL: URL) {
         guard viewState == .viewer,
+              !isShowingPreviousResult,
               ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
               ProjectSummary.hasSameLocation(outputPlyURL, outputURL),
               var pending = pendingResultViewerTiming,
               ProjectSummary.hasSameLocation(pending.projectURL, projectURL),
-              ProjectSummary.hasSameLocation(pending.outputURL, outputURL) else {
+              ProjectSummary.hasSameLocation(pending.outputURL, outputURL),
+              pending.phase == .awaitingViewerReady,
+              resultViewerTimingTask == nil else {
             return
         }
-
-        if pending.firstReadyElapsedSeconds == nil {
-            pending.firstReadyElapsedSeconds = pending.boundary.elapsedSeconds()
-            pendingResultViewerTiming = pending
-        }
-        let elapsedSeconds = pending.firstReadyElapsedSeconds ?? 0
-        let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        do {
-            let snapshot = try ProjectMetadataStore.load(from: metadataURL)
-            guard snapshot.id == pending.projectID else {
-                pendingResultViewerTiming = nil
-                return
-            }
-            guard snapshot.createToViewerReadySeconds == nil else {
-                pendingResultViewerTiming = nil
-                return
-            }
-            var didRecord = false
-            let metadata = try ProjectMetadataStore.update(at: metadataURL) { metadata in
-                guard metadata.id == pending.projectID,
-                      metadata.createToViewerReadySeconds == nil else {
-                    return
-                }
-                metadata.createToViewerReadySeconds = elapsedSeconds
-                didRecord = true
-            }
-            guard didRecord
-                    || (metadata.id == pending.projectID
-                        && metadata.createToViewerReadySeconds != nil) else {
-                return
-            }
-            currentCreateToViewerReadySeconds = metadata.createToViewerReadySeconds
+        let elapsedSeconds: TimeInterval
+        if let recorded = pending.firstReadyElapsedSeconds {
+            elapsedSeconds = recorded
+        } else if let boundary = pending.boundary {
+            elapsedSeconds = boundary.elapsedSeconds()
+            pending.firstReadyElapsedSeconds = elapsedSeconds
+        } else {
             pendingResultViewerTiming = nil
-            refreshProjectSummaries()
-        } catch {
-            // Keep the pending boundary so a later ready notification can retry
-            // after a transient metadata write failure.
+            return
         }
+        pending.phase = .updatingReceipt
+        pendingResultViewerTiming = pending
+
+        let request = ResultViewerTimingCommitRequest(
+            generationID: pending.generationID,
+            projectID: pending.projectID,
+            projectURL: pending.projectURL,
+            outputURL: pending.outputURL,
+            projectRootIdentity: pending.projectRootIdentity,
+            expectedPublicationID: pending.expectedPublicationID,
+            expectedGeneration: pending.expectedGeneration,
+            elapsedSeconds: elapsedSeconds,
+            isMetadataHealing: pending.boundary == nil
+        )
+        let metadataLoader = projectMetadataDescriptorLoader
+        let metadataUpdater = projectMetadataUpdater
+        let leaseAcquirer = projectRunLeaseOwnerAcquirer
+        let receiptUpdater = resultViewerTimingReceiptUpdater
+        let pairOperations = resultViewerTimingPairOperations
+        let task = Task.detached(priority: .utility) { [weak self] in
+            let result = Self.performResultViewerTimingCommit(
+                request: request,
+                metadataLoader: metadataLoader,
+                metadataUpdater: metadataUpdater,
+                leaseAcquirer: leaseAcquirer,
+                receiptUpdater: receiptUpdater,
+                pairOperations: pairOperations
+            )
+            await self?.finishResultViewerTimingCommit(
+                result,
+                generationID: request.generationID
+            )
+        }
+        resultViewerTimingTask = task
+    }
+
+    nonisolated private static func performResultViewerTimingCommit(
+        request: ResultViewerTimingCommitRequest,
+        metadataLoader: ProjectMetadataDescriptorLoader,
+        metadataUpdater: ProjectMetadataUpdater,
+        leaseAcquirer: ProjectRunLeaseOwnerAcquirer,
+        receiptUpdater: ResultViewerTimingReceiptUpdater,
+        pairOperations: PublishedResultPairOperations
+    ) -> ResultViewerTimingWorkerResult {
+        do {
+            let leaseOwner = try AppProjectRunLeaseOwner(
+                projectURL: request.projectURL,
+                acquire: leaseAcquirer
+            )
+            defer { leaseOwner.release() }
+            return try leaseOwner.withValidatedProjectRootDescriptor {
+                projectRootDescriptor in
+                guard try AppProjectRootIdentity.capture(
+                    descriptor: projectRootDescriptor
+                ) == request.projectRootIdentity,
+                request.outputURL.standardizedFileURL.path
+                    == ProjectPaths(root: request.projectURL).outputSplatURL
+                        .standardizedFileURL.path else {
+                    return .retired
+                }
+                let metadata: ProjectMetadata
+                do {
+                    metadata = try loadResultViewerTimingMetadata(
+                        descriptor: projectRootDescriptor,
+                        loader: metadataLoader
+                    )
+                } catch {
+                    return .retired
+                }
+                guard isCurrentResultViewerTimingMetadata(
+                    metadata,
+                    projectID: request.projectID
+                ), let resolvedRunPlan = metadata.resolvedRunPlan else {
+                    return .retired
+                }
+
+                if let recorded = metadata.createToViewerReadySeconds,
+                   recorded != request.elapsedSeconds {
+                    return .retired
+                }
+                let elapsedSeconds = request.elapsedSeconds
+                guard elapsedSeconds.isFinite, elapsedSeconds >= 0 else {
+                    return .retired
+                }
+                let projectPaths = ProjectPaths(root: request.projectURL)
+                let committedGeneration: PublishedResultGeneration
+                var allowingFirstViewerTimingTransition = false
+                if request.isMetadataHealing {
+                    guard !Task.isCancelled else { return .retired }
+                    if let expectedGeneration = request.expectedGeneration {
+                        let committed = try PublishedResultPairStore
+                            .commitReceiptBoundStateIf(
+                                projectPaths: projectPaths,
+                                projectRootDescriptor: projectRootDescriptor,
+                                expectedGeneration: expectedGeneration,
+                                expectedViewerReadySeconds: elapsedSeconds,
+                                operations: pairOperations,
+                                shouldCancel: { Task.isCancelled },
+                                afterValidation: {}
+                            )
+                        guard committed else { return .retired }
+                        committedGeneration = expectedGeneration
+                    } else {
+                        guard let result = try PublishedResultPublisher
+                            .resolveCompletedTraining(
+                                metadata: metadata,
+                                resolvedRunPlan: resolvedRunPlan,
+                                paths: projectPaths,
+                                projectRootDescriptor: projectRootDescriptor,
+                                pairOperations: pairOperations,
+                                shouldCancel: { Task.isCancelled }
+                            ),
+                            !Task.isCancelled,
+                            result.receipt.projectID == request.projectID,
+                            result.receipt.publicationID
+                                == request.expectedPublicationID,
+                            result.receipt.presentation
+                                .createToViewerReadySeconds == elapsedSeconds,
+                            let generation = result.generation else {
+                            return .retired
+                        }
+                        committedGeneration = generation
+                    }
+                } else {
+                    do {
+                        let result = try receiptUpdater(
+                            elapsedSeconds,
+                            request.expectedPublicationID,
+                            request.expectedGeneration,
+                            projectPaths,
+                            projectRootDescriptor,
+                            pairOperations,
+                            { Task.isCancelled }
+                        )
+                        guard result.receipt.projectID == request.projectID,
+                              result.receipt.publicationID
+                                == request.expectedPublicationID,
+                              result.receipt.presentation
+                                .createToViewerReadySeconds == elapsedSeconds,
+                              let generation = result.generation else {
+                            return .retired
+                        }
+                        committedGeneration = generation
+                    } catch is CancellationError {
+                        guard let predecessor = request.expectedGeneration else {
+                            return .retired
+                        }
+                        let committed = try PublishedResultPairStore
+                            .commitReceiptBoundStateIf(
+                                projectPaths: projectPaths,
+                                projectRootDescriptor: projectRootDescriptor,
+                                expectedGeneration: predecessor,
+                                expectedViewerReadySeconds: elapsedSeconds,
+                                allowingFirstViewerTimingTransition: true,
+                                operations: pairOperations,
+                                shouldCancel: { false },
+                                afterValidation: {}
+                            )
+                        guard committed else { return .retired }
+                        committedGeneration = predecessor
+                        allowingFirstViewerTimingTransition = true
+                    } catch {
+                        return .retired
+                    }
+                }
+
+                // Receipt authority is now known to be committed. Cancellation
+                // may retire UI state, but it cannot leave project.json stale.
+                for attempt in 0..<2 {
+                    do {
+                        let committedMetadata =
+                            SynchronizedAppValue<ProjectMetadata?>(nil)
+                        let committed = try PublishedResultPairStore
+                            .commitReceiptBoundStateIf(
+                                projectPaths: projectPaths,
+                                projectRootDescriptor: projectRootDescriptor,
+                                expectedGeneration: committedGeneration,
+                                expectedViewerReadySeconds: elapsedSeconds,
+                                allowingFirstViewerTimingTransition:
+                                    allowingFirstViewerTimingTransition,
+                                operations: pairOperations,
+                                shouldCancel: { false },
+                                afterValidation: {
+                                    committedMetadata.set(
+                                        try metadataUpdater(
+                                            projectRootDescriptor
+                                        ) { current in
+                                            guard isCurrentResultViewerTimingMetadata(
+                                                current,
+                                                projectID: request.projectID
+                                            ) else {
+                                                throw ResultViewerTimingCommitError
+                                                    .invalidProjectState
+                                            }
+                                            if let recorded = current
+                                                .createToViewerReadySeconds {
+                                                guard recorded == elapsedSeconds else {
+                                                    throw ResultViewerTimingCommitError
+                                                        .invalidProjectState
+                                                }
+                                            } else {
+                                                current.createToViewerReadySeconds =
+                                                    elapsedSeconds
+                                            }
+                                        }
+                                    )
+                                }
+                            )
+                        guard committed,
+                              let committedMetadata = committedMetadata.value,
+                              isCurrentResultViewerTimingMetadata(
+                                committedMetadata,
+                                projectID: request.projectID
+                              ),
+                              committedMetadata.createToViewerReadySeconds
+                                == elapsedSeconds else {
+                            return .retired
+                        }
+                        return .recorded(committedMetadata)
+                    } catch ResultViewerTimingCommitError.invalidProjectState {
+                        return .retired
+                    } catch {
+                        if attempt == 1 { return .retired }
+                    }
+                }
+                return .retired
+            }
+        } catch {
+            return .retired
+        }
+    }
+
+    nonisolated private static func loadResultViewerTimingMetadata(
+        descriptor: Int32,
+        loader: ProjectMetadataDescriptorLoader
+    ) throws -> ProjectMetadata {
+        do {
+            if Task.isCancelled { throw CancellationError() }
+            return try loader(descriptor)
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            return try loader(descriptor)
+        }
+    }
+
+    nonisolated private static func isCurrentResultViewerTimingMetadata(
+        _ metadata: ProjectMetadata,
+        projectID: UUID
+    ) -> Bool {
+        metadata.id == projectID
+            && metadata.state.stage == .done
+            && metadata.state.lastError == nil
+            && metadata.checkpoint == nil
+            && metadata.lastRunStartedAt == nil
+            && metadata.pendingPublicationID == nil
+    }
+
+    private func finishResultViewerTimingCommit(
+        _ result: ResultViewerTimingWorkerResult,
+        generationID: UUID
+    ) {
+        guard pendingResultViewerTiming?.generationID == generationID else {
+            return
+        }
+        resultViewerTimingTask = nil
+        pendingResultViewerTiming = nil
+        if case .recorded(let metadata) = result {
+            currentCreateToViewerReadySeconds =
+                metadata.createToViewerReadySeconds
+            refreshProjectSummaries()
+        }
+    }
+
+    @discardableResult
+    func cancelResultViewerTiming() -> Task<Void, Never>? {
+        let task = resultViewerTimingTask
+        task?.cancel()
+        resultViewerTimingTask = nil
+        pendingResultViewerTiming = nil
+        return task
+    }
+
+    /// Returns to a clean new-splat workspace. Backs the File > New Splat
+    /// menu command and the sidebar toolbar button.
+    @discardableResult
+    func beginNewSplat() -> Bool {
+        guard !hasActiveWork else { return false }
+        guard flushPendingNotesSave() else { return false }
+        reset()
+        clearPendingInputs()
+        viewState = .home
+        return true
+    }
+
+    /// Asks the result workspace to run its export flow. Only meaningful with
+    /// a finished splat on screen.
+    func requestExportFromMenu() {
+        guard viewState == .viewer, outputPlyURL != nil else { return }
+        exportMenuRequestCount += 1
     }
 
     func startFromPendingSelection(timingBoundary: RunTimingBoundary? = nil) {
         let timingBoundary = timingBoundary ?? .capture()
-        guard !isRunActive else { return }
+        guard !hasActiveWork else { return }
         guard let inputSpec = buildInputSpec() else { return }
-        photoFolderCountTask?.cancel()
-        photoFolderCountTask = nil
+        let photoURLs = pendingPhotoURLs
+        let datasetInputSource = pendingDataset?.inputSource
         let title = projectTitle(for: inputSpec)
         let token = UUID()
         currentTaskToken = token
+        currentRunOrigin = .fresh
         isRunActive = true
         currentTask = Task {
             await startProject(
                 input: inputSpec,
+                photoURLs: photoURLs,
+                datasetInputSource: datasetInputSource,
                 title: title,
                 taskToken: token,
                 timingBoundary: timingBoundary
@@ -141,13 +522,229 @@ extension AppModel {
 
     @discardableResult
     func resumeProject(at url: URL) -> Bool {
-        guard !isRunActive else { return false }
+        guard !hasActiveWork else { return false }
+        let timingTask = cancelResultViewerTiming()
+        let timingBoundary = RunTimingBoundary.capture()
+        if let timingTask {
+            let token = UUID()
+            currentTaskToken = token
+            currentRunOrigin = .resume
+            isRunActive = true
+            currentTask = Task { [self, timingTask] in
+                await timingTask.value
+                if Task.isCancelled {
+                    if isCurrentTaskToken(token) {
+                        finishRun(
+                            taskToken: token,
+                            projectRunLeaseOwner: nil
+                        )
+                    }
+                    return
+                }
+                guard isCurrentTaskToken(token) else { return }
+                guard flushPendingNotesSave() else {
+                    finishRun(taskToken: token, projectRunLeaseOwner: nil)
+                    return
+                }
+                // Do not advertise the next project until the old timing
+                // transaction has released its short lease and the current
+                // project's pending notes are durable.
+                currentProjectURL = url
+                await resumeProjectTask(
+                    at: url,
+                    taskToken: token,
+                    timingBoundary: timingBoundary
+                )
+            }
+            return true
+        }
         guard flushPendingNotesSave() else { return false }
         let token = UUID()
         currentTaskToken = token
+        currentRunOrigin = .resume
         isRunActive = true
-        currentTask = Task { await resumeProjectTask(at: url, taskToken: token) }
+        // Record the target before the task's first suspension so the project
+        // is locked (rename/trash) for the entire open, not just after its
+        // metadata loads.
+        currentProjectURL = url
+        currentTask = Task {
+            await resumeProjectTask(
+                at: url,
+                taskToken: token,
+                timingBoundary: timingBoundary
+            )
+        }
         return true
+    }
+
+    /// Re-runs a finished project at the requested detail profile. The pipeline
+    /// re-resolves the plan and rolls back only the stages the plan diff
+    /// invalidates; the published output is replaced when the new export lands.
+    @discardableResult
+    func retrainProject(at url: URL, profile: DetailProfile) -> Bool {
+        guard !hasActiveWork else { return false }
+        let timingTask = cancelResultViewerTiming()
+        let timingBoundary = RunTimingBoundary.capture()
+        if let timingTask {
+            let token = UUID()
+            currentTaskToken = token
+            currentRunOrigin = .retrain
+            isRunActive = true
+            currentTask = Task { [self, timingTask] in
+                await timingTask.value
+                if Task.isCancelled {
+                    if isCurrentTaskToken(token) {
+                        finishRun(
+                            taskToken: token,
+                            projectRunLeaseOwner: nil
+                        )
+                    }
+                    return
+                }
+                guard isCurrentTaskToken(token) else { return }
+                guard flushPendingNotesSave() else {
+                    finishRun(taskToken: token, projectRunLeaseOwner: nil)
+                    return
+                }
+                await beginDeferredRetrain(
+                    at: url,
+                    profile: profile,
+                    taskToken: token,
+                    timingBoundary: timingBoundary
+                )
+            }
+            return true
+        }
+        guard flushPendingNotesSave() else { return false }
+        var leaseOwner: AppProjectRunLeaseOwner?
+        var leaseOwnershipTransferred = false
+        defer {
+            if !leaseOwnershipTransferred {
+                leaseOwner?.release()
+            }
+        }
+        do {
+            let acquired = try acquireAppProjectRunLeaseOwner(at: url)
+            leaseOwner = acquired
+        } catch {
+            presentProjectMutationFailure(
+                error,
+                fallbackTitle: "Couldn’t start re-training"
+            )
+            return false
+        }
+        guard let leaseOwner else { return false }
+        let token = UUID()
+        currentTaskToken = token
+        currentRunOrigin = .retrain
+        isRunActive = true
+        currentProjectURL = url
+        currentTask = Task { [self, leaseOwner] in
+            await beginRetrainWithLease(
+                at: url,
+                profile: profile,
+                taskToken: token,
+                leaseOwner: leaseOwner,
+                timingBoundary: timingBoundary
+            )
+        }
+        leaseOwnershipTransferred = true
+        return true
+    }
+
+    private func beginDeferredRetrain(
+        at url: URL,
+        profile: DetailProfile,
+        taskToken: UUID,
+        timingBoundary: RunTimingBoundary
+    ) async {
+        var leaseOwner: AppProjectRunLeaseOwner?
+        var leaseOwnershipTransferred = false
+        defer {
+            if !leaseOwnershipTransferred {
+                leaseOwner?.release()
+            }
+        }
+        do {
+            let acquired = try acquireAppProjectRunLeaseOwner(at: url)
+            leaseOwner = acquired
+        } catch {
+            presentProjectMutationFailure(
+                error,
+                fallbackTitle: "Couldn’t start re-training"
+            )
+            finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
+            return
+        }
+        guard let leaseOwner, isCurrentTaskToken(taskToken) else { return }
+        currentProjectURL = url
+        leaseOwnershipTransferred = true
+        await beginRetrainWithLease(
+            at: url,
+            profile: profile,
+            taskToken: taskToken,
+            leaseOwner: leaseOwner,
+            timingBoundary: timingBoundary
+        )
+    }
+
+    private func beginRetrainWithLease(
+        at url: URL,
+        profile: DetailProfile,
+        taskToken: UUID,
+        leaseOwner: AppProjectRunLeaseOwner,
+        timingBoundary: RunTimingBoundary
+    ) async {
+        do {
+            _ = try await preservePublishedResultForRetraining(at: url)
+            try Task.checkCancellation()
+            guard isCurrentTaskToken(taskToken) else {
+                leaseOwner.release()
+                return
+            }
+        } catch is CancellationError {
+            leaseOwner.release()
+            finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
+            return
+        } catch {
+            leaseOwner.release()
+            actionFailure = ActionFailurePresentation(
+                title: "Couldn’t start re-training",
+                message: "EasySplat couldn’t preserve the current splat for retraining. The existing result is unchanged."
+            )
+            finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
+            return
+        }
+
+        do {
+            _ = try updateProjectMetadata(
+                at: url,
+                leaseOwner: leaseOwner
+            ) { metadata in
+                metadata.requestedRunOptions.detailProfile = profile
+            }
+        } catch {
+            leaseOwner.release()
+            presentProjectMutationFailure(
+                error,
+                fallbackTitle: "Couldn’t update project options"
+            )
+            finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
+            return
+        }
+        guard isCurrentTaskToken(taskToken) else {
+            leaseOwner.release()
+            return
+        }
+        clearSubjectIsolationSession()
+        currentProjectURL = url
+        await resumeProjectTask(
+            at: url,
+            taskToken: taskToken,
+            bypassFinishedOutput: true,
+            projectRunLeaseOwner: leaseOwner,
+            timingBoundary: timingBoundary
+        )
     }
 
     static func validationRecovery(for error: RunPlanResolver.ValidationError) -> RunValidationRecovery? {
@@ -286,34 +883,44 @@ extension AppModel {
         projectURL: URL?
     ) -> Bool {
         if case .useMoreTrainingMemory(let budgetBytes) = recovery {
-            guard let projectURL,
-                  budgetBytes > 0,
-                  mutateProjectMetadata(at: projectURL, mutation: { metadata in
-                      metadata.trainingMemoryRetryBudgetBytes = budgetBytes
-                  }) != nil else {
-                statusTitle = "Couldn’t update the training plan"
-                statusDetail = "The project was not changed. Check folder permissions and try again."
-                lastError = statusTitle
+            guard let projectURL, budgetBytes > 0 else {
+                presentProjectMutationFailure(
+                    nil,
+                    fallbackTitle: "Couldn’t update the training plan"
+                )
+                return false
+            }
+            do {
+                _ = try updateProjectMetadata(at: projectURL) { metadata in
+                    metadata.trainingMemoryRetryBudgetBytes = budgetBytes
+                }
+            } catch {
+                presentProjectMutationFailure(
+                    error,
+                    fallbackTitle: "Couldn’t update the training plan"
+                )
                 return false
             }
             return true
         }
         if let projectURL {
-            let updated = mutateProjectMetadata(at: projectURL) { metadata in
-                var options = metadata.requestedRunOptions
-                recovery.apply(to: &options)
-                if !RunPlanResolver.supports(
-                    resourcePolicy: options.resourcePolicy,
-                    memoryGB: hardwareProfile.memoryGB
-                ) {
-                    options.resourcePolicy = .automatic
+            do {
+                _ = try updateProjectMetadata(at: projectURL) { [hardwareProfile] metadata in
+                    var options = metadata.requestedRunOptions
+                    recovery.apply(to: &options)
+                    if !RunPlanResolver.supports(
+                        resourcePolicy: options.resourcePolicy,
+                        memoryGB: hardwareProfile.memoryGB
+                    ) {
+                        options.resourcePolicy = .automatic
+                    }
+                    metadata.requestedRunOptions = options
                 }
-                metadata.requestedRunOptions = options
-            }
-            guard updated != nil else {
-                statusTitle = "Couldn’t update project options"
-                statusDetail = "The project was not changed. Check folder permissions and try again."
-                lastError = statusTitle
+            } catch {
+                presentProjectMutationFailure(
+                    error,
+                    fallbackTitle: "Couldn’t update project options"
+                )
                 return false
             }
             return true
@@ -332,15 +939,170 @@ extension AppModel {
     func retryAfterFailure() {
         guard failureRetryAllowed else { return }
         let projectURL = currentProjectURL
-        if let recovery = validationRecovery {
-            guard applyValidationRecovery(recovery, projectURL: projectURL) else { return }
-            validationRecovery = nil
-        }
         if let projectURL {
-            resumeProject(at: projectURL)
+            if let recovery = validationRecovery {
+                guard retryProject(
+                    at: projectURL,
+                    applying: recovery
+                ) else { return }
+                validationRecovery = nil
+            } else {
+                resumeProject(at: projectURL)
+            }
         } else {
+            if let recovery = validationRecovery {
+                guard applyValidationRecovery(recovery, projectURL: nil) else { return }
+                validationRecovery = nil
+            }
             startFromPendingSelection()
         }
+    }
+
+    private func retryProject(
+        at projectURL: URL,
+        applying recovery: RunValidationRecovery
+    ) -> Bool {
+        guard !hasActiveWork else { return false }
+        let timingTask = cancelResultViewerTiming()
+        let timingBoundary = RunTimingBoundary.capture()
+        if let timingTask {
+            let token = UUID()
+            currentTaskToken = token
+            currentRunOrigin = .resume
+            isRunActive = true
+            currentTask = Task { [self, timingTask] in
+                await timingTask.value
+                if Task.isCancelled {
+                    if isCurrentTaskToken(token) {
+                        finishRun(
+                            taskToken: token,
+                            projectRunLeaseOwner: nil
+                        )
+                    }
+                    return
+                }
+                guard isCurrentTaskToken(token) else { return }
+                guard flushPendingNotesSave() else {
+                    finishRun(taskToken: token, projectRunLeaseOwner: nil)
+                    return
+                }
+                await beginDeferredRetry(
+                    at: projectURL,
+                    applying: recovery,
+                    taskToken: token,
+                    timingBoundary: timingBoundary
+                )
+            }
+            return true
+        }
+        guard flushPendingNotesSave() else { return false }
+        var leaseOwner: AppProjectRunLeaseOwner?
+        var leaseOwnershipTransferred = false
+        defer {
+            if !leaseOwnershipTransferred {
+                leaseOwner?.release()
+            }
+        }
+        do {
+            let acquired = try acquireAppProjectRunLeaseOwner(at: projectURL)
+            leaseOwner = acquired
+            _ = try updateProjectMetadata(
+                at: projectURL,
+                leaseOwner: acquired
+            ) { [hardwareProfile] metadata in
+                if case .useMoreTrainingMemory(let budgetBytes) = recovery {
+                    guard budgetBytes > 0 else { return }
+                    metadata.trainingMemoryRetryBudgetBytes = budgetBytes
+                    return
+                }
+                var options = metadata.requestedRunOptions
+                recovery.apply(to: &options)
+                if !RunPlanResolver.supports(
+                    resourcePolicy: options.resourcePolicy,
+                    memoryGB: hardwareProfile.memoryGB
+                ) {
+                    options.resourcePolicy = .automatic
+                }
+                metadata.requestedRunOptions = options
+            }
+        } catch {
+            presentProjectMutationFailure(
+                error,
+                fallbackTitle: "Couldn’t update project options"
+            )
+            return false
+        }
+        guard let leaseOwner else { return false }
+
+        let token = UUID()
+        currentTaskToken = token
+        currentRunOrigin = .resume
+        isRunActive = true
+        currentProjectURL = projectURL
+        currentTask = Task { [self, leaseOwner] in
+            await resumeProjectTask(
+                at: projectURL,
+                taskToken: token,
+                projectRunLeaseOwner: leaseOwner,
+                timingBoundary: timingBoundary
+            )
+        }
+        leaseOwnershipTransferred = true
+        return true
+    }
+
+    private func beginDeferredRetry(
+        at projectURL: URL,
+        applying recovery: RunValidationRecovery,
+        taskToken: UUID,
+        timingBoundary: RunTimingBoundary
+    ) async {
+        var leaseOwner: AppProjectRunLeaseOwner?
+        var leaseOwnershipTransferred = false
+        defer {
+            if !leaseOwnershipTransferred {
+                leaseOwner?.release()
+            }
+        }
+        do {
+            let acquired = try acquireAppProjectRunLeaseOwner(at: projectURL)
+            leaseOwner = acquired
+            _ = try updateProjectMetadata(
+                at: projectURL,
+                leaseOwner: acquired
+            ) { [hardwareProfile] metadata in
+                if case .useMoreTrainingMemory(let budgetBytes) = recovery {
+                    guard budgetBytes > 0 else { return }
+                    metadata.trainingMemoryRetryBudgetBytes = budgetBytes
+                    return
+                }
+                var options = metadata.requestedRunOptions
+                recovery.apply(to: &options)
+                if !RunPlanResolver.supports(
+                    resourcePolicy: options.resourcePolicy,
+                    memoryGB: hardwareProfile.memoryGB
+                ) {
+                    options.resourcePolicy = .automatic
+                }
+                metadata.requestedRunOptions = options
+            }
+        } catch {
+            presentProjectMutationFailure(
+                error,
+                fallbackTitle: "Couldn’t update project options"
+            )
+            finishRun(taskToken: taskToken, projectRunLeaseOwner: nil)
+            return
+        }
+        guard let leaseOwner, isCurrentTaskToken(taskToken) else { return }
+        currentProjectURL = projectURL
+        leaseOwnershipTransferred = true
+        await resumeProjectTask(
+            at: projectURL,
+            taskToken: taskToken,
+            projectRunLeaseOwner: leaseOwner,
+            timingBoundary: timingBoundary
+        )
     }
 
     func refreshProjectSummaries() {
@@ -446,6 +1208,11 @@ extension AppModel {
             } else {
                 status = .inProgress
             }
+            let hasPreviousResultHint = PublishedResultResolver
+                .hasQuickPreviousResultHint(
+                    projectURL: url,
+                    metadata: metadata
+                )
             let sidecarOpened = LastOpenedSidecar.load(from: ProjectPaths(root: url).lastOpenedSidecarURL)
             summaries.append(ProjectSummary(
                 id: metadata.id,
@@ -453,6 +1220,7 @@ extension AppModel {
                 url: url,
                 createdAt: metadata.createdAt,
                 status: status,
+                hasPreviousResultHint: hasPreviousResultHint,
                 isActive: isActive,
                 isInterrupted: isInterrupted,
                 checkpointUpdatedAt: metadata.checkpoint?.updatedAt,
@@ -690,12 +1458,18 @@ extension AppModel {
     /// reset(), project switch, or app termination so a half-typed note
     /// doesn't silently disappear.
     @discardableResult
-    func flushPendingNotesSave() -> Bool {
+    func flushPendingNotesSave(
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) -> Bool {
         notesSaveTask?.cancel()
         notesSaveTask = nil
         guard let pending = pendingNotesSave else { return true }
         do {
-            _ = try persistProjectNotes(at: pending.url, text: pending.text)
+            _ = try persistProjectNotes(
+                at: pending.url,
+                text: pending.text,
+                projectRunLeaseOwner: projectRunLeaseOwner
+            )
             pendingNotesSave = nil
             notesSaveState = .saved
             return true
@@ -705,8 +1479,9 @@ extension AppModel {
         }
     }
 
-    /// Stamp the project as opened-by-the-user at this moment so the home
-    /// list can sort by real interaction instead of pipeline-derived signals.
+    /// Stamp the project as opened-by-the-user at this moment. Kept as
+    /// diagnostic metadata only; it deliberately does not feed the Recent
+    /// sort, so opening a project never reorders the sidebar.
     /// Writes to a sidecar file so it cannot clobber concurrent pipeline
     /// writes to project.json. Silent no-op on file errors.
     func markProjectOpened(at url: URL, at moment: Date = Date()) {
@@ -732,21 +1507,27 @@ extension AppModel {
         }
     }
 
-    private func persistProjectNotes(at url: URL, text: String) throws -> Bool {
-        let metadataURL = ProjectPaths(root: url).metadataURL
+    private func persistProjectNotes(
+        at url: URL,
+        text: String,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) throws -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let newNotes: String? = trimmed.isEmpty ? nil : trimmed
         // Deliberately do not assign `currentProjectNotes` here. The binding
         // owner (notes editor) drives that property; reassigning the trimmed
         // value back into the binding mid-typing would yank cursor position
         // and drop in-progress whitespace from the user.
-        var didChange = false
-        _ = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+        let didChange = SynchronizedAppValue(false)
+        _ = try updateProjectMetadata(
+            at: url,
+            leaseOwner: projectRunLeaseOwner
+        ) { metadata in
             guard metadata.notes != newNotes else { return }
             metadata.notes = newNotes
-            didChange = true
+            didChange.set(true)
         }
-        return didChange
+        return didChange.value
     }
 
     private func presentNotesSaveFailure(projectURL: URL) {
@@ -760,6 +1541,17 @@ extension AppModel {
             title: "Couldn’t save notes",
             message: message
         )
+    }
+
+    func presentPendingNotesSaveFailureIfNeeded(at projectURL: URL) {
+        guard let pendingNotesSave,
+              ProjectSummary.hasSameLocation(
+                  pendingNotesSave.url,
+                  projectURL
+              ) else {
+            return
+        }
+        presentNotesSaveFailure(projectURL: projectURL)
     }
 
     func loadProjectNotes(projectURL: URL) -> String {
@@ -777,15 +1569,14 @@ extension AppModel {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         actionFailure = nil
-        let metadataURL = ProjectPaths(root: url).metadataURL
         do {
-            var didChange = false
-            _ = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+            let didChange = SynchronizedAppValue(false)
+            _ = try updateProjectMetadata(at: url) { metadata in
                 guard metadata.title != trimmed else { return }
                 metadata.title = trimmed
-                didChange = true
+                didChange.set(true)
             }
-            guard didChange else { return false }
+            guard didChange.value else { return false }
             refreshProjectSummaries()
             return true
         } catch {
@@ -794,6 +1585,16 @@ extension AppModel {
                 message: "The project name wasn’t changed. Check folder permissions and try again."
             )
             return false
+        }
+    }
+
+    @discardableResult
+    func updateViewerUprightFlip(
+        at projectURL: URL,
+        isActive: Bool
+    ) throws -> ProjectMetadata {
+        try updateProjectMetadata(at: projectURL) { metadata in
+            metadata.viewerPreferences.isUprightFlipActive = isActive
         }
     }
 

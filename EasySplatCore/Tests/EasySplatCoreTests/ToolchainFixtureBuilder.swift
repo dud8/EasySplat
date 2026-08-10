@@ -105,8 +105,22 @@ enum ToolchainFixtureBuilder {
                 "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
                 "source_version": "1.1.3",
                 "source_tree_sha256": String(repeating: "a", count: 64),
-                "overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23",
-                "raster_test_sha256": "3cf418fcd564240f1157f3206cb01974454f617327abc9b0c41b71ec49d46e30",
+                "density_control_patch_sha256": "895df7c0562f885b6389897a990683419cdcb319faf2b24e4d1c44d0950432b9",
+                "projection_vjp_patch_sha256": "e283e1c608f2ea940c46cdcc08252ba0381fa7c33f9490c2812e2f1a83157667",
+                "alpha_cap_patch_sha256": "ee5b7f1563248d279f0b1a9d5fe9637feeb171cfa42546004772e7424b7bd7a6",
+                "projection_oracle_patch_sha256": "cfcf5a0c70bb6cbd05c25c1263d19ff87792abfc326fb43df4e1d17baf77c0a3",
+                "overlay_sha256": "a7c9ccd00e697c820b6f1335653922e114350b97141443adcda2175b161ddbbf",
+                "raster_test_sha256": "a7066c5ce8eff0a1ebb0586c83b77ac235446bd500e465fc3bb0e68d88c4ac2e",
+                "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
+                "isolation_source_sha256": "65504b0448c61b4f2602d86150ff6ce83be61bfc48cc9f632fa72d95b4992e61",
+                "isolation_runtime_header_sha256": "f3fae8409eeb24446bd9b5f4970b64522f01b1048c25827b712f4bef087b7d82",
+                "isolation_runtime_source_sha256": "87499dde716e8a4ae687ba220684fc5730013e7a6fd8ad7979db9f505c7025dd",
+                "isolation_mask_header_sha256": "51956923935621ef2e3681f33e11b1f63a6d1ed969234ee9e50edab927f712d7",
+                "isolation_mask_source_sha256": "ad9844c13dd427517311f0ad0725ffa348beb4c590d6febc6efe11c38d7240e8",
+                "isolation_lift_source_sha256": "c063a934eee67eb22e04483f32e798e6844ee722dde9daddeed79f5db56c13bc",
+                "isolation_test_sha256": "56b9fd653f70026d93adde200d8b7375bf30df9409b28e78d7db27006a2d5cdf",
+                "isolation_mask_test_sha256": "f4900f77878a22417c1bd397ee87d2730c21344d9ba9ab7e1579bfa083e7d2bc",
+                "isolation_patch_sha256": "a8a579d9d2a5ca23ce87ae0dd2a1f79de8da56bbfa62851244cfdda51bc37f59",
                 "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
                 "source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb",
                 "checkpoint_patch_sha256": String(repeating: "d", count: 64),
@@ -119,7 +133,7 @@ enum ToolchainFixtureBuilder {
                 "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
                 "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
                 "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
-                "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
+                "allocation_pressure_patch_sha256": "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8",
                 "exact_prefix_hardening_patch_sha256": "510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb",
                 "quaternion_stability_patch_sha256": "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786",
                 "dependencies": [
@@ -247,9 +261,54 @@ enum ToolchainFixtureBuilder {
         )
         return ToolchainPaths(
             root: fixture.root,
+            dataRoot: fixture.root,
+            toolchainIdentity: "local-\(fixture.root.lastPathComponent)",
             colmap: fixture.colmap,
             msplat: fixture.root.appendingPathComponent("bin/easysplat-train"),
+            metallib: fixture.root.appendingPathComponent("bin/default.metallib"),
             da3: da3
         )
     }
+
+    /// Rearranges a single-root tree into the split layout a signed app bundle
+    /// uses: Mach-Os under `Contents/Helpers`, everything else under
+    /// `Contents/Resources/Toolchain`.
+    static func makeAppBundleLayout(
+        at bundle: URL,
+        movingTreeAt tree: URL
+    ) throws -> AppBundleToolchainLayout {
+        let fm = FileManager.default
+        let helpers = bundle.appendingPathComponent(
+            BundledToolchainLocator.helpersRelativePath,
+            isDirectory: true
+        )
+        let data = bundle.appendingPathComponent(
+            BundledToolchainLocator.dataRelativePath,
+            isDirectory: true
+        )
+        try fm.createDirectory(at: helpers, withIntermediateDirectories: true)
+        try fm.createDirectory(at: data, withIntermediateDirectories: true)
+
+        for name in ["bin", "lib", "licenses", "da3_mps"] {
+            let source = tree.appendingPathComponent(name)
+            guard fm.fileExists(atPath: source.path) else { continue }
+            try fm.moveItem(at: source, to: helpers.appendingPathComponent(name))
+        }
+        for name in ["msplat", "provenance", "supply-chain"] {
+            let source = tree.appendingPathComponent(name)
+            guard fm.fileExists(atPath: source.path) else { continue }
+            try fm.moveItem(at: source, to: data.appendingPathComponent(name))
+        }
+        let stagedMetallib = helpers.appendingPathComponent("bin/default.metallib")
+        if fm.fileExists(atPath: stagedMetallib.path) {
+            try fm.moveItem(at: stagedMetallib, to: data.appendingPathComponent("default.metallib"))
+        }
+        return AppBundleToolchainLayout(bundle: bundle, helpers: helpers, data: data)
+    }
+}
+
+struct AppBundleToolchainLayout {
+    let bundle: URL
+    let helpers: URL
+    let data: URL
 }

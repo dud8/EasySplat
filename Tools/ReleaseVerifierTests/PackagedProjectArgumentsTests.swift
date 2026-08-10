@@ -331,8 +331,6 @@ final class PackagedProjectArgumentsTests: XCTestCase {
         [
             "--project", root.appendingPathComponent("Project.easysplatproj").path,
             "--marker", root.appendingPathComponent("marker.json").path,
-            "--public-key-file", root.appendingPathComponent("public.key").path,
-            "--expected-manifest", root.appendingPathComponent("toolchain.json").path,
             "--app-version", "1.0.0",
             "--expected-release-verification-token-sha256", String(repeating: "1", count: 64),
             "--expected-executable", root.appendingPathComponent("EasySplat").path,

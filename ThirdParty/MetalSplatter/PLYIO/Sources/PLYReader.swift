@@ -8,6 +8,11 @@ public protocol PLYReaderDelegate {
 }
 
 public class PLYReader {
+    public typealias ReadOperation = (
+        _ buffer: UnsafeMutablePointer<UInt8>,
+        _ maximumLength: Int
+    ) -> Int
+
     public enum Error: LocalizedError {
         case cannotOpenSource(URL)
         case readError(URL)
@@ -89,9 +94,19 @@ public class PLYReader {
     }
 
     let url: URL
+    private let readOperation: ReadOperation?
 
     public init(_ url: URL) {
         self.url = url
+        self.readOperation = nil
+    }
+
+    /// Reads a PLY from bytes already bound by the caller, such as an open file
+    /// descriptor. The operation follows `InputStream.read` conventions: it
+    /// returns a positive byte count, zero at EOF, or -1 on failure.
+    public init(sourceLabel: URL, read: @escaping ReadOperation) {
+        self.url = sourceLabel
+        self.readOperation = read
     }
 
     public func read(to delegate: PLYReaderDelegate) {
@@ -102,7 +117,12 @@ public class PLYReader {
         to delegate: PLYReaderDelegate,
         shouldCancel: @escaping @Sendable () -> Bool
     ) {
-        PLYReaderStream().read(url, to: delegate, shouldCancel: shouldCancel)
+        PLYReaderStream().read(
+            url,
+            readOperation: readOperation,
+            to: delegate,
+            shouldCancel: shouldCancel
+        )
     }
 }
 
@@ -122,6 +142,7 @@ fileprivate class PLYReaderStream {
 
     public func read(
         _ url: URL,
+        readOperation: PLYReader.ReadOperation?,
         to delegate: PLYReaderDelegate,
         shouldCancel: @escaping @Sendable () -> Bool
     ) {
@@ -131,7 +152,8 @@ fileprivate class PLYReaderStream {
         currentElementGroup = 0
         currentElementCountInGroup = 0
 
-        guard let inputStream = InputStream(url: url) else {
+        let inputStream = readOperation == nil ? InputStream(url: url) : nil
+        guard readOperation != nil || inputStream != nil else {
             delegate.didFailReading(withError: PLYReader.Error.cannotOpenSource(url))
             return
         }
@@ -141,8 +163,8 @@ fileprivate class PLYReaderStream {
         defer { buffer.deallocate() }
         var headerData = Data()
 
-        inputStream.open()
-        defer { inputStream.close() }
+        inputStream?.open()
+        defer { inputStream?.close() }
 
         var phase: Phase = .unstarted
 
@@ -151,7 +173,13 @@ fileprivate class PLYReaderStream {
                 delegate.didFailReading(withError: CancellationError())
                 return
             }
-            let readResult = inputStream.read(buffer, maxLength: bufferSize)
+            let readResult = readOperation?(buffer, bufferSize)
+                ?? inputStream?.read(buffer, maxLength: bufferSize)
+                ?? -1
+            guard readResult >= -1, readResult <= bufferSize else {
+                delegate.didFailReading(withError: PLYReader.Error.readError(url))
+                return
+            }
             let bytesRead: Int
             switch readResult {
             case -1:
@@ -212,6 +240,10 @@ fileprivate class PLYReaderStream {
                             let header = try parseHeader(headerData)
                             self.header = header
                             phase = .body
+                            // Groups declaring zero elements are only skipped after an
+                            // element is read, so a leading empty group would leave the
+                            // body loop waiting forever for an element that cannot come.
+                            advancePastEmptyElementGroups()
                             delegate.didStartReading(withHeader: header)
                         } catch {
                             delegate.didFailReading(withError: error)
@@ -248,6 +280,17 @@ fileprivate class PLYReaderStream {
     private var isComplete: Bool {
         guard let header else { return false }
         return currentElementGroup == header.elements.count
+    }
+
+    /// Steps over element groups that declare no elements, so an empty group never
+    /// leaves the body loop waiting on an element the file does not contain.
+    private func advancePastEmptyElementGroups() {
+        guard let header else { return }
+        while currentElementGroup < header.elements.count,
+              currentElementCountInGroup == header.elements[currentElementGroup].count {
+            currentElementGroup += 1
+            currentElementCountInGroup = 0
+        }
     }
 
     // Maybe remove already-processed bytes from body, to reclaim memory
@@ -403,10 +446,7 @@ fileprivate class PLYReaderStream {
 
                     delegate.didRead(element: reusableElement, typeIndex: self.currentElementGroup, withHeader: elementHeader)
                     currentElementCountInGroup += 1
-                    while !isComplete && currentElementCountInGroup == header.elements[currentElementGroup].count {
-                        currentElementGroup += 1
-                        currentElementCountInGroup = 0
-                    }
+                    advancePastEmptyElementGroups()
                 }
             }
         case .binaryBigEndian, .binaryLittleEndian:
@@ -430,10 +470,7 @@ fileprivate class PLYReaderStream {
 
                     delegate.didRead(element: reusableElement, typeIndex: currentElementGroup, withHeader: elementHeader)
                     currentElementCountInGroup += 1
-                    while !isComplete && currentElementCountInGroup == header.elements[currentElementGroup].count {
-                        currentElementGroup += 1
-                        currentElementCountInGroup = 0
-                    }
+                    advancePastEmptyElementGroups()
                 }
             }
         }

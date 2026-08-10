@@ -4,27 +4,6 @@ import XCTest
 
 @MainActor
 final class ToolchainManagerTests: XCTestCase {
-    func testDefaultInitializerIgnoresLocalToolchainEnvironment() async {
-        await withEnvironmentAsync([
-            "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/private/tmp/easysplat-untrusted-toolchain",
-        ]) {
-            let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
-
-            XCTAssertNil(manager.localToolchainRoot)
-        }
-    }
-
-    func testUsesExplicitInstallationRoot() {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let manager = ToolchainManager(
-            runner: MockSubprocessRunner(scripts: []),
-            installationRoot: root
-        )
-
-        XCTAssertEqual(manager.toolchainRoot().standardizedFileURL, root.standardizedFileURL)
-    }
-
     func testValidateToolchainSucceeds() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -440,6 +419,16 @@ final class ToolchainManagerTests: XCTestCase {
             "metal_safety_patch_sha256",
             "overlay_sha256",
             "raster_test_sha256",
+            "isolation_header_sha256",
+            "isolation_source_sha256",
+            "isolation_runtime_header_sha256",
+            "isolation_runtime_source_sha256",
+            "isolation_mask_header_sha256",
+            "isolation_mask_source_sha256",
+            "isolation_lift_source_sha256",
+            "isolation_test_sha256",
+            "isolation_mask_test_sha256",
+            "isolation_patch_sha256",
             "stage_timing_patch_sha256",
             "memory_efficiency_patch_sha256",
             "densification_memory_patch_sha256",
@@ -486,6 +475,16 @@ final class ToolchainManagerTests: XCTestCase {
             "exact_raster_patch_sha256",
             "overlay_sha256",
             "raster_test_sha256",
+            "isolation_header_sha256",
+            "isolation_source_sha256",
+            "isolation_runtime_header_sha256",
+            "isolation_runtime_source_sha256",
+            "isolation_mask_header_sha256",
+            "isolation_mask_source_sha256",
+            "isolation_lift_source_sha256",
+            "isolation_test_sha256",
+            "isolation_mask_test_sha256",
+            "isolation_patch_sha256",
             "stage_timing_patch_sha256",
             "memory_efficiency_patch_sha256",
             "densification_memory_patch_sha256",
@@ -543,16 +542,103 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
+    func testValidateToolchainAcceptsIsolationModeVersionOneInMsplatSelfCheck() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let output = """
+        {"event":"self_check","isolation_mode_version":1,"scene_bounds_status":"ok","schema_version":2,"sequence":1,"status":"ok","version":"1.1.3 (git 106499b)"}
+
+        """
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root, msplatSelfCheckStdout: output)
+        )
+
+        XCTAssertNoThrow(
+            try manager.test_validateToolchain(
+                root: root,
+                requiredCapabilities: [.da3Base, .da3Small]
+            )
+        )
+    }
+
+    func testValidateToolchainRequiresExactIntegerIsolationModeVersionOneInMsplatSelfCheck() throws {
+        let invalidValues: [(label: String, field: String)] = [
+            ("missing", ""),
+            ("zero", #","isolation_mode_version":0"#),
+            ("two", #","isolation_mode_version":2"#),
+            ("boolean", #","isolation_mode_version":true"#),
+            ("string", #","isolation_mode_version":"1""#),
+            ("null", #","isolation_mode_version":null"#),
+            ("floating one", #","isolation_mode_version":1.0"#),
+            ("fractional", #","isolation_mode_version":1.5"#),
+        ]
+
+        for invalidValue in invalidValues {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+            let output = #"{"event":"self_check","scene_bounds_status":"ok","schema_version":2,"sequence":1,"status":"ok","version":"1.1.3 (git 106499b)""#
+                + invalidValue.field
+                + "}\n"
+            let manager = ToolchainManager(
+                runner: makeValidationRunner(root: root, msplatSelfCheckStdout: output)
+            )
+
+            XCTAssertThrowsError(
+                try manager.test_validateToolchain(
+                    root: root,
+                    requiredCapabilities: [.da3Base, .da3Small]
+                ),
+                "expected rejection for \(invalidValue.label) isolation_mode_version"
+            ) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error, got \(error)")
+                }
+                XCTAssertTrue(
+                    message.contains("self-check"),
+                    "expected self-check failure for \(invalidValue.label), got \(message)"
+                )
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsUnexpectedMsplatSelfCheckKeys() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let output = """
+        {"event":"self_check","extra":true,"isolation_mode_version":1,"scene_bounds_status":"ok","schema_version":2,"sequence":1,"status":"ok","version":"1.1.3 (git 106499b)"}
+
+        """
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root, msplatSelfCheckStdout: output)
+        )
+
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(
+                root: root,
+                requiredCapabilities: [.da3Base, .da3Small]
+            )
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("self-check"), "expected self-check failure; got \(message)")
+        }
+    }
+
     func testValidateToolchainRejectsMalformedMsplatSelfCheckEvents() throws {
         let invalidOutputs = [
             "not json\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"scene_bounds_status\":\"failed\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n{\"event\":\"self_check\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":2,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"9.9.9\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"failed\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n{\"event\":\"self_check\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":2,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3\"}\n",
+            "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"9.9.9\"}\n",
         ]
         for output in invalidOutputs {
             let root = try TestFileBuilder.makeTempDir()
@@ -798,84 +884,6 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testCoreToolchainLooksInstalled() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
-
-        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: root))
-
-        try FileManager.default.removeItem(at: fixture.colmap)
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: root))
-
-        let freshRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: freshRoot) }
-        let freshFixture = try ToolchainFixtureBuilder.createToolchain(at: freshRoot)
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: freshRoot))
-        try FileManager.default.removeItem(at: freshFixture.da3VendorSentinel)
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: freshRoot))
-
-        let missingMsplatRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: missingMsplatRoot) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: missingMsplatRoot, includeMsplat: false)
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: missingMsplatRoot))
-
-        let partialMsplatRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: partialMsplatRoot) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: partialMsplatRoot)
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: partialMsplatRoot))
-        try FileManager.default.removeItem(
-            at: partialMsplatRoot.appendingPathComponent("bin/default.metallib")
-        )
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: partialMsplatRoot))
-
-        let tamperedMsplatRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: tamperedMsplatRoot) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: tamperedMsplatRoot)
-        try Data("tampered metallib\n".utf8).write(
-            to: tamperedMsplatRoot.appendingPathComponent("bin/default.metallib")
-        )
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: tamperedMsplatRoot))
-
-        let legacyMsplatRoot = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: legacyMsplatRoot) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: legacyMsplatRoot, includeMsplat: false)
-        FileManager.default.createFile(
-            atPath: legacyMsplatRoot.appendingPathComponent("bin/msplat-train").path,
-            contents: Data("legacy".utf8)
-        )
-        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: legacyMsplatRoot))
-    }
-
-    func testArtifactInstallProbeAcceptsOnlyCurrentComponentNames() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
-        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
-
-        XCTAssertTrue(manager.test_artifactLooksInstalled(
-            name: "macos-arm64-core",
-            root: root
-        ))
-        XCTAssertTrue(manager.test_artifactLooksInstalled(
-            name: "geometry-da3-base",
-            root: root
-        ))
-        XCTAssertTrue(manager.test_artifactLooksInstalled(
-            name: "geometry-da3-small",
-            root: root
-        ))
-        XCTAssertFalse(manager.test_artifactLooksInstalled(
-            name: "future-core",
-            root: root
-        ))
-        XCTAssertFalse(manager.test_artifactLooksInstalled(
-            name: "macos-arm64-models",
-            root: root
-        ))
-    }
-
     func testValidateToolchainFailsWhenDa3AppMissing() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1036,22 +1044,543 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testEnsureToolchainUsesLocalOverride() async throws {
+    func testResolveToolchainUsesDevelopmentOverride() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root),
+            appVersion: "9.9.9",
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let toolchain = try await manager.resolveToolchain(
+            request: ToolchainCapabilityRequest(capabilities: [.da3Base, .da3Small]),
+            onProgress: { _, _ in }
+        )
+        XCTAssertEqual(toolchain.root, root)
+        XCTAssertEqual(toolchain.dataRoot, root)
+        XCTAssertEqual(toolchain.metallib, root.appendingPathComponent("bin/default.metallib"))
+        XCTAssertEqual(toolchain.toolchainIdentity, "local-\(root.lastPathComponent)")
+    }
+
+    func testValidationUsesAsyncRunnerForEveryInteractiveProbe() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let runner = AsyncOnlyValidationRunner(backing: makeValidationRunner(root: root))
+        let manager = ToolchainManager(runner: runner)
+
+        let toolchain = try await manager.test_validateToolchain(
+            root: root,
+            requiredCapabilities: [.core, .colmap, .msplat, .da3Base, .da3Small]
+        )
+
+        XCTAssertEqual(toolchain.root, root)
+        XCTAssertEqual(runner.asyncCallCount, 9)
+        XCTAssertEqual(runner.syncCallCount, 0)
+    }
+
+    func testResolveToolchainRethrowsCancellationAndRetriesInsteadOfMemoizing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let runner = CancelFirstValidationRunner(backing: makeValidationRunner(root: root))
+        let manager = ToolchainManager(
+            runner: runner,
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let request = ToolchainCapabilityRequest(
+            capabilities: [.core, .colmap, .msplat]
+        )
+        let progress = LockedToolchainProgress()
+
+        do {
+            _ = try await manager.resolveToolchain(
+                request: request,
+                onProgress: { progress.append($1) }
+            )
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Cancellation is control flow, not an invalid-toolchain diagnosis.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertFalse(progress.messages.contains("Tools ready"))
+
+        let toolchain = try await manager.resolveToolchain(
+            request: request,
+            onProgress: { progress.append($1) }
+        )
+
+        XCTAssertEqual(toolchain.root, root)
+        XCTAssertEqual(runner.cancelledCallCount, 1)
+        XCTAssertGreaterThan(runner.asyncCallCount, 1)
+        XCTAssertEqual(progress.messages.filter { $0 == "Tools ready" }.count, 1)
+    }
+
+    func testConcurrentProgressCancellationCannotRestoreAnOlderMemoEntry() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let backing = makeValidationRunner(root: root, repetitions: 3)
+        let validationGate = OrderedValidationStartRunner(backing: backing)
+        let readyGate = OrderedReadyCancellationGate()
+        let manager = ToolchainManager(
+            runner: validationGate,
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let request = ToolchainCapabilityRequest(
+            capabilities: [.core, .colmap, .msplat]
+        )
+
+        let first = Task {
+            try await manager.resolveToolchain(
+                request: request,
+                onProgress: { _, message in
+                    if message == "Tools ready" {
+                        readyGate.cancelAndWait(.first)
+                    }
+                }
+            )
+        }
+        let firstValidationStarted = await validationGate.waitUntilStarted(.first)
+        XCTAssertTrue(firstValidationStarted)
+
+        let second = Task {
+            try await manager.resolveToolchain(
+                request: request,
+                onProgress: { _, message in
+                    if message == "Tools ready" {
+                        readyGate.cancelAndWait(.second)
+                    }
+                }
+            )
+        }
+        let secondValidationStarted = await validationGate.waitUntilStarted(.second)
+        XCTAssertTrue(secondValidationStarted)
+
+        validationGate.resume(.first)
+        let firstReady = await readyGate.waitUntilReady(.first)
+        XCTAssertTrue(firstReady)
+        validationGate.resume(.second)
+        let secondReady = await readyGate.waitUntilReady(.second)
+        XCTAssertTrue(secondReady)
+
+        readyGate.resume(.first)
+        do {
+            _ = try await first.value
+            XCTFail("Expected the first resolution to be cancelled")
+        } catch is CancellationError {
+            // Expected: cancellation requested by the progress callback.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        readyGate.resume(.second)
+        do {
+            _ = try await second.value
+            XCTFail("Expected the second resolution to be cancelled")
+        } catch is CancellationError {
+            // Expected: cancellation requested by the progress callback.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        let callsBeforeRetry = backing.calls.count
+        let paths = try await manager.resolveToolchain(
+            request: request,
+            onProgress: { _, _ in }
+        )
+
+        XCTAssertEqual(paths.root, root)
+        XCTAssertGreaterThan(
+            backing.calls.count,
+            callsBeforeRetry,
+            "both cancelled resolutions must leave the memo empty"
+        )
+    }
+
+    func testResolveToolchainCancellationTerminatesStubbornValidationDescendant() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let descendantPIDURL = root.appendingPathComponent("validation-descendant.pid")
+        try TestFileBuilder.createExecutable(
+            at: fixture.colmap,
+            script: """
+            #!/bin/sh
+            if [ "${1:-}" = "help" ]; then
+                (
+                    trap '' INT TERM HUP
+                    exec /bin/sleep 60
+                ) &
+                descendant=$!
+                printf '%s\n' "$descendant" > "$EASYSPLAT_TEST_PID_FILE"
+                printf 'ready\n'
+                trap 'exit 23' INT TERM
+                while :; do :; done
+            fi
+            exit 0
+            """
+        )
+        let ready = DispatchSemaphore(value: 0)
+        let runner = StubbornValidationRunner(
+            colmapPath: fixture.colmap.path,
+            descendantPIDURL: descendantPIDURL,
+            ready: ready,
+            backing: makeValidationRunner(root: root)
+        )
+        let manager = ToolchainManager(
+            runner: runner,
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let task = Task {
+            try await manager.resolveToolchain(
+                request: ToolchainCapabilityRequest(
+                    capabilities: [.core, .colmap, .msplat]
+                ),
+                onProgress: { _, _ in }
+            )
+        }
+
+        guard await waitForToolchainSignal(ready, timeout: 2) else {
+            task.cancel()
+            _ = try? await task.value
+            return XCTFail("Validation child did not start through runAsync")
+        }
+        let descendantPID = try await waitForToolchainPID(
+            in: descendantPIDURL,
+            timeout: 2
+        )
+        defer { _ = kill(descendantPID, SIGKILL) }
+
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected after the process tree has been reaped.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        let descendantRemainsAlive = await toolchainProcessRemainsAlive(descendantPID)
+        XCTAssertFalse(descendantRemainsAlive)
+    }
+
+    func testToolchainHashingObservesCancellationDuringChunkedRead() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("large-metallib")
+        let descriptor = Darwin.open(
+            file.path,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+            mode_t(0o600)
+        )
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        guard descriptor >= 0 else { return }
+        defer { Darwin.close(descriptor) }
+        XCTAssertEqual(Darwin.ftruncate(descriptor, off_t(512 * 1_024 * 1_024)), 0)
+        let started = DispatchSemaphore(value: 0)
+        let task = Task.detached {
+            started.signal()
+            return try await ToolchainManager().test_sha256Hex(url: file)
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
+        try await Task.sleep(nanoseconds: 10_000_000)
+
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation during hashing")
+        } catch is CancellationError {
+            // Expected at a bounded hashing chunk.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+    }
+
+    func testResolveToolchainUsesSplitAppBundleLayout() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: layout.helpers),
+            appVersion: "2.5.0",
+            locator: BundledToolchainLocator(
+                bundleURL: layout.bundle,
+                developmentOverrideRoot: nil,
+                validateSignature: { _ in }
+            )
+        )
+        let toolchain = try await manager.resolveToolchain(
+            request: ToolchainCapabilityRequest(capabilities: [.core, .colmap, .msplat]),
+            onProgress: { _, _ in }
+        )
+        XCTAssertEqual(toolchain.root, layout.helpers)
+        XCTAssertEqual(toolchain.dataRoot, layout.data)
+        XCTAssertEqual(toolchain.metallib, layout.data.appendingPathComponent("default.metallib"))
+        XCTAssertEqual(toolchain.toolchainIdentity, "2.5.0")
+    }
+
+    func testResolveToolchainRefusesDa3FromAnAppBundle() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: layout.helpers.appendingPathComponent("da3_mps").path
+            )
+        )
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: layout.helpers),
+            locator: BundledToolchainLocator(
+                bundleURL: layout.bundle,
+                developmentOverrideRoot: nil,
+                validateSignature: { _ in }
+            )
+        )
+        do {
+            _ = try await manager.resolveToolchain(
+                request: ToolchainCapabilityRequest(capabilities: [.core, .da3Base]),
+                onProgress: { _, _ in }
+            )
+            XCTFail("Expected artifactNotFound")
+        } catch ToolchainManager.ToolchainError.artifactNotFound {
+        } catch {
+            XCTFail("Expected artifactNotFound, got \(error)")
+        }
+    }
+
+    func testResolveToolchainAllowsDa3FromADevelopmentOverride() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root),
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        let toolchain = try await manager.resolveToolchain(
+            request: ToolchainCapabilityRequest(capabilities: [.core, .da3Base]),
+            onProgress: { _, _ in }
+        )
+        XCTAssertEqual(toolchain.da3.root, root.appendingPathComponent("da3_mps", isDirectory: true))
+    }
+
+    func testResolveToolchainValidatesAKnownCapabilitySetOnce() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
         let runner = makeValidationRunner(root: root)
-
-        let manager = ToolchainManager(runner: runner, localToolchainRoot: root)
-        let manifestURL = URL(string: "https://example.com/manifest.json")!
-        let toolchain = try await manager.ensureToolchain(
-            manifestURL: manifestURL,
-            publicKeyBase64: "ignored",
-            request: ToolchainCapabilityRequest(capabilities: [.da3Base, .da3Small]),
-            onProgress: { _, _ in }
+        let manager = ToolchainManager(
+            runner: runner,
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
         )
-        XCTAssertEqual(toolchain.root, root)
+        let request = ToolchainCapabilityRequest(capabilities: [.core, .colmap, .msplat])
+        _ = try await manager.resolveToolchain(request: request, onProgress: { _, _ in })
+        let callsAfterFirst = runner.calls.count
+        XCTAssertGreaterThan(callsAfterFirst, 0)
+
+        _ = try await manager.resolveToolchain(request: request, onProgress: { _, _ in })
+        XCTAssertEqual(runner.calls.count, callsAfterFirst)
+    }
+
+    func testResolveToolchainRejectsAnEmptyCapabilityRequest() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            locator: BundledToolchainLocator(developmentOverrideRoot: root)
+        )
+        do {
+            _ = try await manager.resolveToolchain(
+                request: ToolchainCapabilityRequest(capabilities: []),
+                onProgress: { _, _ in }
+            )
+            XCTFail("Expected invalidToolchain")
+        } catch ToolchainManager.ToolchainError.invalidToolchain {
+        } catch {
+            XCTFail("Expected invalidToolchain, got \(error)")
+        }
+    }
+
+    /// Provenance, msplat, and supply-chain payload live under the data root in a
+    /// split layout; evidence has to read each file from the root it came from.
+    func testInstalledTreeEvidenceReadsProvenanceFromASplitLayout() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+
+        let evidence = try ToolchainManager().installedTreeEvidence(
+            root: layout.helpers,
+            dataRoot: layout.data,
+            toolchainIdentity: "2.5.0"
+        )
+
+        XCTAssertEqual(evidence.toolchainVersion, "2.5.0")
+        let recorded = Set(evidence.provenanceRecords.map(\.path))
+        XCTAssertTrue(recorded.contains("provenance/colmap.json"))
+        XCTAssertTrue(recorded.contains("msplat/build_info.json"))
+        XCTAssertTrue(recorded.contains("supply-chain/components.json"))
+        XCTAssertNotNil(evidence.installedCriticalFileSHA256["bin/default.metallib"])
+        XCTAssertFalse(evidence.nativeTrainerBuildDigest.isEmpty)
+    }
+
+    /// A single-root development tree and the split bundle carved out of it hold
+    /// identical bytes, so the trainer digest must not depend on the layout.
+    func testInstalledTreeEvidenceDigestIsIndependentOfLayout() throws {
+        let single = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: single) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: single)
+        let singleEvidence = try ToolchainManager().installedTreeEvidence(
+            root: single,
+            toolchainIdentity: "local-single"
+        )
+
+        let split = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: split) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: split)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: split.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: split
+        )
+        let splitEvidence = try ToolchainManager().installedTreeEvidence(
+            root: layout.helpers,
+            dataRoot: layout.data,
+            toolchainIdentity: "local-split"
+        )
+
+        XCTAssertEqual(
+            singleEvidence.nativeTrainerBuildDigest,
+            splitEvidence.nativeTrainerBuildDigest
+        )
+    }
+
+    func testLocatorRejectsABundleWithoutTheAppExtension() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.bundle", isDirectory: true),
+            movingTreeAt: root
+        )
+
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        )
+    }
+
+    func testLocatorRejectsAMissingHelpersDirectory() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+        try FileManager.default.removeItem(at: layout.helpers)
+
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        )
+    }
+
+    func testLocatorRejectsAMissingDataDirectory() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+        try FileManager.default.removeItem(at: layout.data)
+
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        )
+    }
+
+    func testLocatorRejectsANonExecutableColmap() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: layout.helpers.appendingPathComponent("bin/colmap").path
+        )
+
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        )
+    }
+
+    /// The relaxed `signedAppBundle` policy skips helper receipt digests because
+    /// the app signature covers them. A structurally perfect but unsigned bundle
+    /// carries no such cover, so shape alone must not earn that policy.
+    func testLocatorRejectsAStructurallyValidButUnsignedBundle() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let layout = try ToolchainFixtureBuilder.makeAppBundleLayout(
+            at: root.appendingPathComponent("Fixture.app", isDirectory: true),
+            movingTreeAt: root
+        )
+
+        // Every shape check passes; only the missing signature can reject it.
+        XCTAssertNoThrow(
+            try BundledToolchainLocator(
+                bundleURL: layout.bundle,
+                developmentOverrideRoot: nil,
+                validateSignature: { _ in }
+            ).locate()
+        )
+        XCTAssertThrowsError(
+            try BundledToolchainLocator(bundleURL: layout.bundle).locate()
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("expected invalidToolchain; got \(error)")
+            }
+            XCTAssertTrue(
+                message.contains("not signed") || message.contains("modified"),
+                "expected a signature failure; got \(message)"
+            )
+        }
+    }
+
+    /// The override wins outright, so a bundle that would otherwise be rejected
+    /// never gets consulted.
+    func testLocatorPrefersTheDevelopmentOverrideOverTheBundle() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let source = try BundledToolchainLocator(
+            bundleURL: root.appendingPathComponent("Missing.app", isDirectory: true),
+            developmentOverrideRoot: root
+        ).locate()
+
+        XCTAssertEqual(source, .developmentOverride(root: root))
+        XCTAssertTrue(source.isDevelopmentOverride)
     }
 
     private func makeValidationRunner(
@@ -1075,9 +1604,10 @@ final class ToolchainManagerTests: XCTestCase {
         vocabularyTerminationReason: Process.TerminationReason = .exit,
         da3HelpExitCode: Int32 = 0,
         msplatSelfCheckExitCode: Int32 = 0,
-        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
+        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"isolation_mode_version\":1,\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+        repetitions: Int = 1
     ) -> MockSubprocessRunner {
-        MockSubprocessRunner(scripts: [
+        let scripts: [MockSubprocessRunner.Script] = [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["help"], result: .init(exitCode: 0, terminationReason: colmapTerminationReason, stdout: colmapHelpStdout, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["mapper", "-h"], result: .init(exitCode: mapperExitCode, terminationReason: mapperTerminationReason, stdout: mapperStdout, stderr: mapperStderr), onRun: nil),
@@ -1097,8 +1627,356 @@ final class ToolchainManagerTests: XCTestCase {
                 ),
                 onRun: nil
             )
-        ])
+        ]
+        return MockSubprocessRunner(
+            scripts: (0..<repetitions).flatMap { _ in scripts }
+        )
     }
+}
+
+private enum ForbiddenSynchronousValidationProbe: Error {
+    case invoked
+}
+
+private final class LockedToolchainProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var messages: [String] { lock.withLock { storage } }
+
+    func append(_ message: String) {
+        lock.withLock { storage.append(message) }
+    }
+}
+
+private enum OrderedResolutionParticipant {
+    case first
+    case second
+}
+
+private final class OrderedValidationStartRunner: @unchecked Sendable, SubprocessRunning {
+    private let lock = NSLock()
+    private let backing: MockSubprocessRunner
+    private let firstStarted = DispatchSemaphore(value: 0)
+    private let secondStarted = DispatchSemaphore(value: 0)
+    private let resumeFirst = DispatchSemaphore(value: 0)
+    private let resumeSecond = DispatchSemaphore(value: 0)
+    private var coordinatedCallCount = 0
+
+    init(backing: MockSubprocessRunner) {
+        self.backing = backing
+    }
+
+    func waitUntilStarted(_ participant: OrderedResolutionParticipant) async -> Bool {
+        await waitForToolchainSignal(
+            participant == .first ? firstStarted : secondStarted,
+            timeout: 2
+        )
+    }
+
+    func resume(_ participant: OrderedResolutionParticipant) {
+        (participant == .first ? resumeFirst : resumeSecond).signal()
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        let participant: OrderedResolutionParticipant? = lock.withLock {
+            coordinatedCallCount += 1
+            switch coordinatedCallCount {
+            case 1: return .first
+            case 2: return .second
+            default: return nil
+            }
+        }
+        if let participant {
+            let started = participant == .first ? firstStarted : secondStarted
+            let resume = participant == .first ? resumeFirst : resumeSecond
+            started.signal()
+            guard await waitForToolchainSignal(resume, timeout: 2) else {
+                throw CancellationError()
+            }
+        }
+        return try await backing.runAsync(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+}
+
+private final class OrderedReadyCancellationGate: @unchecked Sendable {
+    private let firstReady = DispatchSemaphore(value: 0)
+    private let secondReady = DispatchSemaphore(value: 0)
+    private let resumeFirst = DispatchSemaphore(value: 0)
+    private let resumeSecond = DispatchSemaphore(value: 0)
+
+    func waitUntilReady(_ participant: OrderedResolutionParticipant) async -> Bool {
+        await waitForToolchainSignal(
+            participant == .first ? firstReady : secondReady,
+            timeout: 2
+        )
+    }
+
+    func resume(_ participant: OrderedResolutionParticipant) {
+        (participant == .first ? resumeFirst : resumeSecond).signal()
+    }
+
+    func cancelAndWait(_ participant: OrderedResolutionParticipant) {
+        withUnsafeCurrentTask { task in
+            task?.cancel()
+        }
+        let ready = participant == .first ? firstReady : secondReady
+        let resume = participant == .first ? resumeFirst : resumeSecond
+        ready.signal()
+        _ = resume.wait(timeout: .now() + 2)
+    }
+}
+
+private final class AsyncOnlyValidationRunner: @unchecked Sendable, SubprocessRunning {
+    private let lock = NSLock()
+    private let backing: MockSubprocessRunner
+    private var asyncCalls = 0
+    private var syncCalls = 0
+
+    var asyncCallCount: Int { lock.withLock { asyncCalls } }
+    var syncCallCount: Int { lock.withLock { syncCalls } }
+
+    init(backing: MockSubprocessRunner) {
+        self.backing = backing
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        lock.withLock { syncCalls += 1 }
+        throw ForbiddenSynchronousValidationProbe.invoked
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        lock.withLock { asyncCalls += 1 }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+}
+
+private final class CancelFirstValidationRunner: @unchecked Sendable, SubprocessRunning {
+    private let lock = NSLock()
+    private let backing: MockSubprocessRunner
+    private var shouldCancel = true
+    private var asyncCalls = 0
+    private var cancelledCalls = 0
+
+    var asyncCallCount: Int { lock.withLock { asyncCalls } }
+    var cancelledCallCount: Int { lock.withLock { cancelledCalls } }
+
+    init(backing: MockSubprocessRunner) {
+        self.backing = backing
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        if consumeCancellation() { throw CancellationError() }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        lock.withLock { asyncCalls += 1 }
+        if consumeCancellation() { throw CancellationError() }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    private func consumeCancellation() -> Bool {
+        lock.withLock {
+            guard shouldCancel else { return false }
+            shouldCancel = false
+            cancelledCalls += 1
+            return true
+        }
+    }
+}
+
+private final class StubbornValidationRunner: @unchecked Sendable, SubprocessRunning {
+    private let colmapPath: String
+    private let descendantPIDURL: URL
+    private let ready: DispatchSemaphore
+    private let backing: MockSubprocessRunner
+    private let real = SubprocessRunner()
+
+    init(
+        colmapPath: String,
+        descendantPIDURL: URL,
+        ready: DispatchSemaphore,
+        backing: MockSubprocessRunner
+    ) {
+        self.colmapPath = colmapPath
+        self.descendantPIDURL = descendantPIDURL
+        self.ready = ready
+        self.backing = backing
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        throw ForbiddenSynchronousValidationProbe.invoked
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        if launchPath == colmapPath, arguments == ["help"] {
+            var explicitEnvironment = environment
+            explicitEnvironment["EASYSPLAT_TEST_PID_FILE"] = descendantPIDURL.path
+            return try await real.runAsync(
+                launchPath,
+                arguments,
+                currentDirectory: currentDirectory,
+                environment: explicitEnvironment,
+                removingEnvironmentKeys: removingEnvironmentKeys,
+                onStdout: { [ready] line in
+                    if line == "ready" { ready.signal() }
+                    onStdout(line)
+                },
+                onStderr: onStderr
+            )
+        }
+        return try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+}
+
+private func waitForToolchainSignal(
+    _ semaphore: DispatchSemaphore,
+    timeout: TimeInterval
+) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(
+                returning: semaphore.wait(timeout: .now() + timeout) == .success
+            )
+        }
+    }
+}
+
+private func waitForToolchainPID(in url: URL, timeout: TimeInterval) async throws -> pid_t {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let contents = try? String(contentsOf: url, encoding: .utf8),
+           let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return pid
+        }
+        try await Task.sleep(nanoseconds: 25_000_000)
+    }
+    throw CocoaError(.fileReadNoSuchFile)
+}
+
+private func toolchainProcessRemainsAlive(_ pid: pid_t) async -> Bool {
+    for _ in 0..<20 {
+        if kill(pid, 0) != 0, errno == ESRCH { return false }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+    }
+    return kill(pid, 0) == 0 || errno != ESRCH
 }
 
 enum NativeColmapHelpFixture {
@@ -1181,5 +2059,73 @@ enum NativeColmapHelpFixture {
     private static func help(command: String, options: [String]) -> String {
         "COLMAP 4.1.1 \(command)\nOptions:\n" +
             options.sorted().map { "  --\($0) <value>" }.joined(separator: "\n") + "\n"
+    }
+}
+
+extension ToolchainManagerTests {
+    /// Distribution signing rewrites the helper after its receipt is written, so
+    /// the receipt digest and the shipped bytes belong to different domains.
+    /// A signed bundle must not compare them; an unsigned tree still must.
+    func testSignedBundlePolicySkipsTheRewrittenExecutableDigest() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        // Stand in for what signing does to the executable's bytes.
+        let trainer = root.appendingPathComponent("bin/easysplat-train")
+        let handle = try FileHandle(forWritingTo: trainer)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("signature".utf8))
+        try handle.close()
+
+        let capabilities: Set<ToolchainCapability> = [.core, .colmap, .msplat]
+
+        do {
+            _ = try await ToolchainManager(runner: makeValidationRunner(root: root)).validateToolchain(
+                root: root,
+                requiredCapabilities: capabilities,
+                toolchainIdentity: "local-fixture",
+                integrityPolicy: .unsignedDevelopmentTree
+            )
+            XCTFail("an unsigned tree must still match its receipt")
+        } catch {
+            XCTAssertTrue(error is ToolchainManager.ToolchainError)
+        }
+
+        let signed = try await ToolchainManager(
+            runner: makeValidationRunner(root: root)
+        ).validateToolchain(
+            root: root,
+            requiredCapabilities: capabilities,
+            toolchainIdentity: "0.2.0",
+            integrityPolicy: .signedAppBundle
+        )
+        XCTAssertEqual(signed.integrityPolicy, .signedAppBundle)
+    }
+
+    /// The metallib is not Mach-O and signing leaves it alone, so its digest is
+    /// still load-bearing in a signed bundle.
+    func testSignedBundlePolicyStillRejectsATamperedMetallib() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let metallib = root.appendingPathComponent("bin/default.metallib")
+        let handle = try FileHandle(forWritingTo: metallib)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("tampered".utf8))
+        try handle.close()
+
+        do {
+            _ = try await ToolchainManager(runner: makeValidationRunner(root: root)).validateToolchain(
+                root: root,
+                requiredCapabilities: [.core, .colmap, .msplat],
+                toolchainIdentity: "0.2.0",
+                integrityPolicy: .signedAppBundle
+            )
+            XCTFail("a signed tree must still match its metallib receipt")
+        } catch {
+            XCTAssertTrue(error is ToolchainManager.ToolchainError)
+        }
     }
 }

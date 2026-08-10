@@ -123,6 +123,23 @@ extension PipelineRunner {
         }
     }
 
+    func test_copySelectedDataset(
+        groups: [SelectedFrameGroup],
+        to directory: URL,
+        manifestURL: URL,
+        projectPaths: ProjectPaths,
+        maxDimension: CGFloat
+    ) throws -> (frames: [URL], manifest: [SelectedFrameMapping]) {
+        try copySelected(
+            groups: groups,
+            to: directory,
+            manifestURL: manifestURL,
+            maxDimension: maxDimension,
+            projectPaths: projectPaths,
+            datasetPreservesSourceBytes: true
+        )
+    }
+
     func test_selectedImagesHaveUniformPixelDimensions(_ images: [URL]) throws -> Bool {
         try selectedImagesHaveUniformPixelDimensions(images)
     }

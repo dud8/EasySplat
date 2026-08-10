@@ -34,6 +34,7 @@ public struct VideoInputPreflightLimits: Equatable, Sendable {
 public enum VideoInputPreflightIssue: Equatable, Sendable {
     case noVideosSelected
     case sourceUnavailable
+    case accessDenied
     case symbolicLink
     case notRegularFile
     case emptyFile
@@ -1417,11 +1418,31 @@ public struct VideoInputPreflight: Sendable {
         return sources
     }
 
+    /// Separates a refused read from a file that is gone. `errno` is the only
+    /// evidence that tells them apart, so read it before any other system call.
+    /// The sandbox refuses a source once the grant that came with the user's
+    /// selection lapses, and "the file is no longer available" sends the user
+    /// looking for a missing file that is still where they left it.
+    private static func issueForFailedCall(
+        otherwise fallback: @autoclosure () -> VideoInputPreflightIssue
+    ) -> VideoInputPreflightIssue {
+        let code = errno
+        guard code == EACCES || code == EPERM else { return fallback() }
+        return .accessDenied
+    }
+
     private func inspectSource(_ url: URL, index: Int) throws -> Source {
         let name = Self.safeDisplayName(for: url, fallbackIndex: index)
         var pathStatus = stat()
-        guard url.isFileURL, lstat(url.path, &pathStatus) == 0 else {
+        guard url.isFileURL else {
             throw failure(index: index, name: name, issue: .sourceUnavailable)
+        }
+        guard lstat(url.path, &pathStatus) == 0 else {
+            throw failure(
+                index: index,
+                name: name,
+                issue: Self.issueForFailedCall(otherwise: .sourceUnavailable)
+            )
         }
         if (pathStatus.st_mode & S_IFMT) == S_IFLNK {
             throw failure(index: index, name: name, issue: .symbolicLink)
@@ -1434,7 +1455,11 @@ public struct VideoInputPreflight: Sendable {
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
         guard descriptor >= 0 else {
-            throw failure(index: index, name: name, issue: .sourceUnavailable)
+            throw failure(
+                index: index,
+                name: name,
+                issue: Self.issueForFailedCall(otherwise: .sourceUnavailable)
+            )
         }
         defer { Darwin.close(descriptor) }
         var status = stat()
@@ -1483,7 +1508,11 @@ public struct VideoInputPreflight: Sendable {
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
         guard input >= 0 else {
-            throw failure(index: source.index, name: source.safeDisplayName, issue: .sourceUnavailable)
+            throw failure(
+                index: source.index,
+                name: source.safeDisplayName,
+                issue: Self.issueForFailedCall(otherwise: .sourceUnavailable)
+            )
         }
         defer { Darwin.close(input) }
         var initial = stat()
@@ -1957,7 +1986,7 @@ public struct VideoInputPreflight: Sendable {
         }
         defer { free(canonicalPointer) }
         let canonicalParent = URL(fileURLWithPath: String(cString: canonicalPointer))
-        let parentDescriptor = try openDirectoryChain(canonicalParent)
+        let parentDescriptor = try openDirectoryRefusingSymlinks(canonicalParent)
         defer { Darwin.close(parentDescriptor) }
         var parentStatus = stat()
         guard fstat(parentDescriptor, &parentStatus) == 0,
@@ -1997,33 +2026,25 @@ public struct VideoInputPreflight: Sendable {
         return container
     }
 
-    private static func openDirectoryChain(_ url: URL) throws -> Int32 {
+    /// Opens a directory, refusing the whole path if any part of it is a
+    /// symbolic link.
+    ///
+    /// This used to walk from the root a component at a time, opening each one
+    /// with `O_NOFOLLOW`. Inside the App Sandbox that cannot work: the app may
+    /// not open `/Users`, so the walk failed at its first step no matter which
+    /// directory it was asked for, and staging was never created. The kernel
+    /// applies the same rule to the whole path with `O_NOFOLLOW_ANY`, which
+    /// needs no read access to any parent directory.
+    private static func openDirectoryRefusingSymlinks(_ url: URL) throws -> Int32 {
         guard url.isFileURL, url.path.hasPrefix("/") else {
             throw CocoaError(.fileReadUnsupportedScheme)
         }
-        var descriptor = Darwin.open(
-            "/",
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC
         )
         guard descriptor >= 0 else { throw currentPOSIXError() }
-        do {
-            for component in url.pathComponents where component != "/" {
-                let next = component.withCString {
-                    openat(
-                        descriptor,
-                        $0,
-                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-                    )
-                }
-                guard next >= 0 else { throw currentPOSIXError() }
-                Darwin.close(descriptor)
-                descriptor = next
-            }
-            return descriptor
-        } catch {
-            Darwin.close(descriptor)
-            throw error
-        }
+        return descriptor
     }
 
     private static func createStagingRoot(in container: URL) throws -> URL {

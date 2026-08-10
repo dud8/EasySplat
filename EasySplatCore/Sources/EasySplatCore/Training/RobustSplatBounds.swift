@@ -195,6 +195,11 @@ public enum RobustSplatBounds {
 }
 
 public enum SplatSceneBoundsCalculator {
+    struct Measurement {
+        let bounds: SplatSceneBounds
+        let pointCount: Int
+    }
+
     static func matches(_ lhs: SplatSceneBounds, _ rhs: SplatSceneBounds) -> Bool {
         approximatelyEqual(lhs.center.x, rhs.center.x)
             && approximatelyEqual(lhs.center.y, rhs.center.y)
@@ -202,15 +207,47 @@ public enum SplatSceneBoundsCalculator {
             && approximatelyEqual(lhs.radius, rhs.radius)
     }
 
+    /// - Parameter format: the container to parse as. Callers opening a
+    ///   user-chosen file should pass the format detected from that file.
     public static func compute(
         at url: URL,
+        format: SplatSceneFormat = .ply,
         maximumSampleCount: Int? = nil,
         shouldCancel: @escaping @Sendable () -> Bool = { false }
     ) throws -> SplatSceneBounds? {
+        try compute(
+            using: SplatSceneReaderFactory.reader(for: url, format: format),
+            maximumSampleCount: maximumSampleCount,
+            shouldCancel: shouldCancel
+        )
+    }
+
+    static func compute(
+        using reader: SplatSceneReader,
+        maximumSampleCount: Int? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool = { false }
+    ) throws -> SplatSceneBounds? {
+        try measure(
+            using: reader,
+            maximumSampleCount: maximumSampleCount,
+            shouldCancel: shouldCancel
+        )?.bounds
+    }
+
+    static func measure(
+        using reader: SplatSceneReader,
+        maximumSampleCount: Int? = nil,
+        shouldCancel: @escaping @Sendable () -> Bool = { false }
+    ) throws -> Measurement? {
         let collector = BoundsCollector(maximumSampleCount: maximumSampleCount)
-        SplatPLYSceneReader(url).read(to: collector, shouldCancel: shouldCancel)
+        reader.read(to: collector, shouldCancel: shouldCancel)
         if let error = collector.error { throw error }
-        return RobustSplatBounds.computeTrainingBounds(preparedSamples: collector.samples)
+        guard let bounds = RobustSplatBounds.computeTrainingBounds(
+            preparedSamples: collector.samples
+        ) else {
+            return nil
+        }
+        return Measurement(bounds: bounds, pointCount: collector.pointCount)
     }
 
     private static func approximatelyEqual(_ lhs: Double, _ rhs: Double) -> Bool {
@@ -222,7 +259,7 @@ public enum SplatSceneBoundsCalculator {
         fileprivate var samples: [RobustSplatBounds.PreparedSample] = []
         fileprivate var error: Error?
         private let maximumSampleCount: Int?
-        private var pointCount = 0
+        fileprivate var pointCount = 0
         private var pointIndex = 0
         private var sampleSlot = 0
         private var nextSampleIndex: Int?

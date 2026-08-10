@@ -26,6 +26,7 @@ final class RunDurationPredictorTests: XCTestCase {
             url: URL(fileURLWithPath: "/tmp/t-\(id.uuidString).easysplatproj"),
             createdAt: Date(timeIntervalSince1970: 0),
             status: status,
+            hasPreviousResultHint: false,
             isActive: false,
             isInterrupted: false,
             checkpointUpdatedAt: nil,

@@ -6,6 +6,7 @@ import Metal
 import MetalKit
 import MetalSplatter
 import os
+import QuartzCore
 import simd
 import SwiftUI
 
@@ -190,6 +191,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private var sourceOpeningDirection = SIMD3<Float>(0, 0, -1)
     private(set) var isViewOnlyFlipActive = false
 
+    private var heldMovementKeys: Set<ViewerMovementKey> = []
+    private var isSprintKeyHeld = false
+    private var lastFlightFrameTime: TimeInterval?
+    private static let maximumFlightFrameDelta: TimeInterval = 0.1
+
     var pan: SIMD2<Float> {
         let displacement = cameraState.target - sceneCenter
         return SIMD2<Float>(
@@ -201,6 +207,10 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     var interactionRevision: UInt64 { cameraState.interactionRevision }
 
     private(set) var drawableSize: CGSize = .zero
+    /// Subordinate mode: the scene is a live training preview sharing the GPU with
+    /// the trainer that produced it, so this view yields rather than competes.
+    var isTrainingPreview = false
+    private var lastPreviewDrawTime: CFTimeInterval?
     private static let modelLoadExecutor = SerialModelLoadExecutor(
         queue: DispatchQueue(label: "com.easysplat.model-load", qos: .userInitiated)
     )
@@ -216,13 +226,18 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             viewportSize: metalKitView.bounds.size,
             verticalFOV: Float(Constants.fovy.radians)
         )
-        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
+        // Splat colours are sRGB code values and the trainer composites them in that
+        // space, so the attachment must not linearise for blending. Colour management
+        // moves to the layer instead: without an explicit colour space no matching
+        // happens at all and the bytes land unconverted on a wide-gamut display.
+        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm
+        metalKitView.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
         metalKitView.sampleCount = 1
         metalKitView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         metalKitView.enableSetNeedsDisplay = true
         metalKitView.isPaused = true
-        metalKitView.preferredFramesPerSecond = 24
+        metalKitView.preferredFramesPerSecond = Constants.idleFramesPerSecond
     }
 
     func load(_ model: ModelIdentifier?, forceReload: Bool = false) async throws {
@@ -275,12 +290,19 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let hostObservation = try? LiveTrainingResourceObserver().observe()
         let installedMemoryBytes = hostObservation?.installedMemoryBytes
             ?? ProcessInfo.processInfo.physicalMemory
+        // A training preview shares the machine with the trainer that produced it,
+        // so a failed observation must not be read as calm here: assuming normal
+        // would let the preview allocate into headroom training is about to need.
+        // The result viewer keeps its existing optimistic default — nothing is
+        // competing with it.
+        let observedPressure = hostObservation?.memoryPressure
+            ?? (isTrainingPreview ? .unknown : .normal)
         let maximumWorkingSetBytes = ViewerMemoryAdmissionPolicy.resolveBudgetBytes(
             physicalMemoryBytes: installedMemoryBytes,
             recommendedMaxWorkingSetBytes: device.value.recommendedMaxWorkingSetSize,
             currentAllocatedBytes: UInt64(max(0, device.value.currentAllocatedSize)),
             availableHostMemoryBytes: hostObservation?.availableHostMemoryBytes,
-            memoryPressure: hostObservation?.memoryPressure ?? .normal
+            memoryPressure: observedPressure
         )
         let maximumRecoverableWorkingSetBytes =
             ViewerMemoryAdmissionPolicy.resolveMaximumRecoverableBytes(
@@ -297,6 +319,15 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                 sampleCount: sampleCount,
                 maxViewCount: 1,
                 maxSimultaneousRenders: Constants.maxSimultaneousRenders,
+                // What the trainer's rasterizer keys on, so the viewer shows what was
+                // fitted. Euclidean distance was here because it is invariant under
+                // rotation about the camera centre and so hides a sort that has fallen
+                // behind. That invariance covers `ViewerCameraState.freeLook` and nothing
+                // else: the primary drag and the arrow keys `orbit`, which moves the
+                // camera, and under an orbit neither key is invariant and the two cost
+                // the same. Depth costs a little more during a free look and renders
+                // better in every mode; the trade is measured in the temporal gate.
+                sortOrdering: .cameraForwardDepth,
                 maximumWorkingSetBytes: maximumWorkingSetBytes,
                 maximumRecoverableWorkingSetBytes: maximumRecoverableWorkingSetBytes
             )
@@ -348,7 +379,81 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     private func requestDraw() {
+        // In continuous flight mode the view's own timer drives frames;
+        // explicit draws on top would double-schedule.
+        guard metalKitView.isPaused else { return }
+        if isTrainingPreview {
+            // Every draw resorts the scene on the CPU and submits Metal work. While
+            // training holds the GPU, a dropped intermediate frame costs the user
+            // nothing; stealing the cycle from the trainer costs them the run.
+            let now = CACurrentMediaTime()
+            let minimumInterval = 1.0 / Double(Constants.trainingPreviewFramesPerSecond)
+            if let lastPreviewDrawTime, now - lastPreviewDrawTime < minimumInterval {
+                return
+            }
+            lastPreviewDrawTime = now
+        }
         metalKitView.draw()
+    }
+
+    /// While any movement key is held the view runs its own frame timer;
+    /// on release it returns to on-demand drawing with one final frame so the
+    /// splat sort settles on the resting camera.
+    func setMovementInput(_ keys: Set<ViewerMovementKey>, isSprinting: Bool) {
+        // Sustained 60 fps flight is the single most expensive thing this view can
+        // do. A preview is for looking, not travelling, so it never enters flight.
+        guard !isTrainingPreview else { return }
+        let wasFlying = !heldMovementKeys.isEmpty
+        heldMovementKeys = keys
+        isSprintKeyHeld = isSprinting
+        let isFlying = !heldMovementKeys.isEmpty
+        guard isFlying != wasFlying else { return }
+        if isFlying {
+            lastFlightFrameTime = nil
+            metalKitView.enableSetNeedsDisplay = false
+            metalKitView.preferredFramesPerSecond = Constants.flightFramesPerSecond
+            metalKitView.isPaused = false
+        } else {
+            metalKitView.isPaused = true
+            metalKitView.enableSetNeedsDisplay = true
+            metalKitView.preferredFramesPerSecond = Constants.idleFramesPerSecond
+            requestDraw()
+        }
+    }
+
+    /// The first tick after activation only establishes the clock baseline, and
+    /// oversized gaps (stalls, wake from sleep) are clamped so the camera never
+    /// teleports.
+    func integrateFlight(now: TimeInterval) {
+        guard !heldMovementKeys.isEmpty else { return }
+        defer { lastFlightFrameTime = now }
+        guard let lastFlightFrameTime else { return }
+        let dt = Float(min(now - lastFlightFrameTime, Self.maximumFlightFrameDelta))
+        guard dt > 0 else { return }
+
+        let axes = heldMovementKeys.flightAxisVector
+        guard axes != .zero else { return }
+        let worldDirection = cameraState.rightDirection * axes.x
+            + SIMD3<Float>(0, 1, 0) * axes.y
+            + cameraState.forwardDirection * axes.z
+        let lengthSquared = simd_length_squared(worldDirection)
+        guard lengthSquared.isFinite, lengthSquared > 0 else { return }
+        // Cap combined input at unit speed without normalizing: near-cancelling
+        // combinations (forward plus up at a steep pitch) must stay slow.
+        let direction = lengthSquared > 1
+            ? worldDirection / sqrt(lengthSquared)
+            : worldDirection
+        let speed = cameraState.sceneRadius * Constants.flightSpeedPerSecond
+            * (isSprintKeyHeld ? Constants.flightSprintMultiplier : 1)
+        cameraState.flyTranslate(direction * speed * dt)
+    }
+
+    func freeLook(deltaX: Float, deltaY: Float) {
+        cameraState.freeLook(
+            deltaYaw: deltaX * Constants.orbitSpeed,
+            deltaPitch: deltaY * Constants.orbitSpeed
+        )
+        requestDraw()
     }
 
     var viewportCamera: ModelRenderer.CameraMatrices {
@@ -420,6 +525,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        integrateFlight(now: CACurrentMediaTime())
         guard let modelRenderer else { return }
 
         _ = inFlightSemaphore.wait(timeout: DispatchTime.distantFuture)

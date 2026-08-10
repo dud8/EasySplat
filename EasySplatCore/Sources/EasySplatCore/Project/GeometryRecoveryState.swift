@@ -131,6 +131,15 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
                   matchingDatabaseDigest == nil else {
                 throw ValidationError.invalidBackendFields
             }
+        case .importedPoses:
+            // Matching runs on the COLMAP edges (pair recovery fields are
+            // legitimate), but mapping is seeded triangulation with no
+            // incremental cadence.
+            guard plannedIncrementalCadence == nil,
+                  activeIncrementalCadence == nil,
+                  cadenceFallbackTrigger == nil else {
+                throw ValidationError.invalidBackendFields
+            }
         case .colmap:
             guard colmapComputeMode != nil,
                   let plannedIncrementalCadence,
@@ -195,12 +204,7 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
     }
 
     func isBound(to geometryBackend: SfmBackend) -> Bool {
-        switch (activeBackend, geometryBackend) {
-        case (.da3, .da3), (.colmap, .colmap):
-            return true
-        case (.da3, .colmap), (.colmap, .da3):
-            return false
-        }
+        activeBackend == geometryBackend
     }
 
     private static func isSHA256(_ value: String) -> Bool {

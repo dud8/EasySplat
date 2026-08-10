@@ -33,7 +33,7 @@ run_release_verifier() {
   local network_policy=$1
   local verifier_home=$2
   local writable_root=$3
-  local cache_root=$4
+  local bundle_root=$4
   local sandbox_profile=""
   local developer_root=""
   local developer_root_mode=""
@@ -45,6 +45,7 @@ run_release_verifier() {
   local invoking_home="${HOME:-}"
   local outside_read_probe=""
   local outside_write_probe=""
+  local bundle_write_probe=""
   local network_probe_status=0
   local network_rule=""
   local command_status=0
@@ -90,14 +91,19 @@ run_release_verifier() {
     return 1
   fi
   E2E_VERIFIER_TOKEN="$verification_token"
-  if ! mkdir -p "$verifier_home/tmp" "$writable_root" "$cache_root" \
+  if ! mkdir -p "$verifier_home/tmp" "$writable_root" \
     || ! chmod 700 "$verifier_home" "$verifier_home/tmp"; then
+    cleanup_release_verifier_processes || true
+    return 1
+  fi
+  if [ ! -d "$bundle_root" ]; then
+    echo "Release verification requires the packaged app bundle it attests." >&2
     cleanup_release_verifier_processes || true
     return 1
   fi
   if ! verifier_home="$(cd "$verifier_home" && pwd -P)" \
     || ! writable_root="$(cd "$writable_root" && pwd -P)" \
-    || ! cache_root="$(cd "$cache_root" && pwd -P)" \
+    || ! bundle_root="$(cd "$bundle_root" && pwd -P)" \
     || ! invoking_cwd="$(pwd -P)"; then
     cleanup_release_verifier_processes || true
     return 1
@@ -202,11 +208,10 @@ PY
   fi
   sandbox_profile="$verifier_home/release-verifier.sb"
   if ! "$python_runtime_executable" -I - \
-    "$sandbox_profile" "$network_rule" "$verifier_home" "$writable_root" "$cache_root" \
+    "$sandbox_profile" "$network_rule" "$verifier_home" "$writable_root" "$bundle_root" \
     "$darwin_user_temp" "$python_runtime_root" "$python_runtime_executable" \
     "$python_app_executable" "$developer_root" "$invoking_cwd" "$invoking_home" \
     "$verification_token" "$@" <<'PY'
-import hashlib
 import json
 import os
 import re
@@ -216,7 +221,8 @@ from pathlib import Path
 
 profile_path = Path(sys.argv[1])
 network_rule = sys.argv[2]
-isolated_roots = [os.path.realpath(value) for value in sys.argv[3:6]]
+writable_roots = [os.path.realpath(value) for value in sys.argv[3:5]]
+bundle_root = os.path.realpath(sys.argv[5])
 replacement_parent = os.path.realpath(sys.argv[6]).rstrip("/") + "/TemporaryItems"
 python_runtime_root = os.path.realpath(sys.argv[7])
 python_runtime_executable = os.path.realpath(sys.argv[8])
@@ -293,8 +299,11 @@ def require_narrow_directory(path, label):
         raise SystemExit(f"{label} would expose an unsafe broad filesystem root: {resolved}")
     return resolved
 
-for index, value in enumerate(isolated_roots):
-    isolated_roots[index] = require_narrow_directory(value, "Release-verifier isolated root")
+for index, value in enumerate(writable_roots):
+    writable_roots[index] = require_narrow_directory(value, "Release-verifier isolated root")
+bundle_root = require_narrow_directory(bundle_root, "Release-verifier app bundle")
+if not bundle_root.endswith(".app"):
+    raise SystemExit("Release-verifier app bundle is not an app bundle.")
 python_runtime_root = require_narrow_directory(
     python_runtime_root,
     "System Python runtime",
@@ -332,7 +341,8 @@ read_subpaths = [
     "/Library/Apple/usr",
     "/private/var/db/timezone",
     python_runtime_root,
-    *isolated_roots,
+    bundle_root,
+    *writable_roots,
 ]
 read_literals = [
     "/dev/null",
@@ -359,18 +369,14 @@ if python_app_executable:
 path_options = {
     "--input-manifest": "file",
     "--input-root": "input",
-    "--public-key-file": "file",
-    "--bootstrap-manifest": "file",
-    "--bootstrap-core-archive": "file",
-    "--expected-manifest": "file",
+    "--app-bundle": "input",
 }
-scalar_options = {"--expected-manifest-file-sha256"}
 seen_options = set()
 index = 1
 while index < len(command):
     option = command[index]
     kind = path_options.get(option)
-    if kind is None and option not in scalar_options:
+    if kind is None:
         index += 1
         continue
     if option in seen_options:
@@ -378,14 +384,6 @@ while index < len(command):
     seen_options.add(option)
     if index + 1 >= len(command):
         raise SystemExit(f"Release-verifier option has no value: {option}")
-    if option in scalar_options:
-        value = command[index + 1]
-        if not re.fullmatch(r"[0-9A-Fa-f]{64}", value):
-            raise SystemExit(
-                "Release-verifier expected-manifest digest must be a SHA-256 hex value."
-            )
-        index += 2
-        continue
     raw_path = command[index + 1]
     if not os.path.isabs(raw_path):
         raise SystemExit(f"Release-verifier input path must be absolute: {option}")
@@ -396,6 +394,10 @@ while index < len(command):
         raise SystemExit(f"Release-verifier input is unavailable: {option}: {error}") from error
     if kind == "file" and not stat.S_ISREG(metadata.st_mode):
         raise SystemExit(f"Release-verifier input must be a regular file: {option}")
+    if option == "--app-bundle" and path != bundle_root:
+        raise SystemExit(
+            "Release-verifier app bundle does not match the sandboxed read-only root."
+        )
     if stat.S_ISDIR(metadata.st_mode):
         read_subpaths.append(require_narrow_directory(path, option))
     elif stat.S_ISREG(metadata.st_mode):
@@ -416,52 +418,18 @@ process_executables = [
     "/usr/bin/env",
     "/usr/bin/file",
     "/usr/bin/touch",
-    "/usr/bin/unzip",
-    "/usr/bin/zipinfo",
     executable,
     python_runtime_executable,
 ]
 if python_app_executable:
     process_executables.append(python_app_executable)
-expected_manifest_path = None
-expected_manifest_sha256 = None
-index = 1
-while index < len(command):
-    if command[index] == "--expected-manifest" and index + 1 < len(command):
-        expected_manifest_path = os.path.realpath(command[index + 1])
-    elif (
-        command[index] == "--expected-manifest-file-sha256"
-        and index + 1 < len(command)
-    ):
-        expected_manifest_sha256 = command[index + 1].lower()
-    index += 1
-if expected_manifest_path is not None and expected_manifest_sha256 is not None:
-    try:
-        manifest_data = Path(expected_manifest_path).read_bytes()
-        if hashlib.sha256(manifest_data).hexdigest() != expected_manifest_sha256:
-            raise ValueError("file digest does not match the authenticated release input")
-        manifest = json.loads(manifest_data)
-        toolchain_version = manifest["version"]
-    except (
-        OSError,
-        UnicodeError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as error:
-        raise SystemExit(
-            f"Release-verifier expected manifest cannot define process rights: {error}"
-        ) from error
-    if not isinstance(toolchain_version, str) or not re.fullmatch(
-        r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}", toolchain_version
-    ):
-        raise SystemExit("Release-verifier toolchain version is unsafe for process rights.")
-    toolchain_bin = os.path.join(isolated_roots[2], toolchain_version, "bin")
-    process_executables.extend(
-        os.path.join(toolchain_bin, name)
-        for name in ("colmap", "ffmpeg", "easysplat-train")
-    )
+# The helpers live at a fixed path inside the bundle, so the profile names them
+# directly rather than deriving them from a document the run supplied.
+toolchain_bin = os.path.join(bundle_root, "Contents", "Helpers", "bin")
+process_executables.extend(
+    os.path.join(toolchain_bin, name)
+    for name in ("colmap", "ffmpeg", "easysplat-train")
+)
 process_filters = " ".join(
     f"(literal {json.dumps(path)})" for path in unique(process_executables)
 )
@@ -496,7 +464,7 @@ directory_data_filters = " ".join(
     f"(literal {json.dumps(path)})" for path in unique(directory_data_paths)
 )
 write_filters = " ".join(
-    f"(subpath {json.dumps(path)})" for path in isolated_roots
+    f"(subpath {json.dumps(path)})" for path in writable_roots
 )
 profile_path.write_text(
     "\n".join([
@@ -583,6 +551,14 @@ PY
   if [ -e "$outside_write_probe" ]; then
     rm -f "$outside_write_probe"
     echo "Release-verifier sandbox left an outside-root write probe." >&2
+    cleanup_release_verifier_processes || true
+    return 1
+  fi
+  bundle_write_probe="$bundle_root/Contents/.easysplat-release-verifier-probe"
+  if /usr/bin/sandbox-exec -f "$sandbox_profile" \
+    /usr/bin/touch "$bundle_write_probe" 2>/dev/null || [ -e "$bundle_write_probe" ]; then
+    rm -f "$bundle_write_probe"
+    echo "Release-verifier sandbox allowed a write into the attested app bundle." >&2
     cleanup_release_verifier_processes || true
     return 1
   fi
@@ -678,113 +654,4 @@ PY
   fi
   E2E_VERIFIER_TOKEN=""
   return "$command_status"
-}
-
-cached_toolchain_snapshot() {
-  python3 - "$1" <<'PY'
-import hashlib
-import json
-import os
-import stat
-import sys
-from pathlib import Path, PurePosixPath
-
-root = Path(sys.argv[1]).resolve(strict=True)
-receipts = list(root.rglob(".easysplat_toolchain_state.json"))
-if len(receipts) != 1:
-    raise SystemExit(f"Cached-only verification requires exactly one signed receipt (found {len(receipts)}).")
-receipt = receipts[0]
-receipt_metadata = receipt.lstat()
-if not stat.S_ISREG(receipt_metadata.st_mode) or receipt_metadata.st_nlink != 1:
-    raise SystemExit("Cached-only receipt must be an ordinary, non-hardlinked regular file.")
-if stat.S_IMODE(receipt_metadata.st_mode) != 0o600:
-    raise SystemExit("Cached-only receipt must use mode 0600.")
-
-state = json.loads(receipt.read_text(encoding="utf-8"))
-if state.get("schemaVersion") != 2:
-    raise SystemExit("Cached-only receipt must use toolchain schema 2.")
-manifest = state.get("signedManifest") or {}
-manifest_version = manifest.get("version")
-if not isinstance(manifest_version, str) or receipt.parent.parent != root or receipt.parent.name != manifest_version:
-    raise SystemExit("Cached-only receipt is not stored under its exact signed toolchain version.")
-core = [row for row in manifest.get("components", []) if row.get("name") == "macos-arm64-core"]
-if len(core) != 1:
-    raise SystemExit("Cached-only receipt has no unique signed core component.")
-component = core[0]
-if state.get("installedArtifacts") != {"macos-arm64-core": component.get("sha256")}:
-    raise SystemExit("Cached-only receipt must attest exactly the signed core component.")
-if set(state.get("installedCapabilities", [])) != set(component.get("capabilities", [])):
-    raise SystemExit("Cached-only receipt capabilities do not match the signed core component.")
-critical_hashes = component.get("criticalFileHashes")
-contents = component.get("contents")
-if not isinstance(critical_hashes, dict) or not isinstance(contents, list):
-    raise SystemExit("Cached-only signed core lacks exact contents or critical hashes.")
-if set(critical_hashes) != set(contents):
-    raise SystemExit("Cached-only signed core does not hash every expected file exactly once.")
-
-version_prefix = receipt.parent.relative_to(root).as_posix()
-receipt_relative = receipt.relative_to(root).as_posix()
-expected_files = {f"{version_prefix}/{relative}" for relative in contents} | {receipt_relative}
-actual_files = set()
-directory_records = {}
-file_records = {}
-
-def metadata_record(metadata):
-    return {
-        "device": metadata.st_dev,
-        "inode": metadata.st_ino,
-        "mode": stat.S_IMODE(metadata.st_mode),
-        "links": metadata.st_nlink,
-        "size": metadata.st_size,
-        "mtimeNs": metadata.st_mtime_ns,
-        "ctimeNs": metadata.st_ctime_ns,
-    }
-
-for current, directory_names, file_names in os.walk(root, topdown=True, followlinks=False):
-    current_path = Path(current)
-    current_relative = current_path.relative_to(root).as_posix()
-    current_metadata = current_path.lstat()
-    if not stat.S_ISDIR(current_metadata.st_mode):
-        raise SystemExit(f"Cached toolchain path is not a directory: {current_relative}")
-    directory_records[current_relative] = metadata_record(current_metadata)
-    for name in directory_names:
-        child = current_path / name
-        if child.is_symlink():
-            raise SystemExit(f"Cached toolchain contains a symlinked directory: {child.relative_to(root)}")
-    for name in file_names:
-        path = current_path / name
-        relative = path.relative_to(root).as_posix()
-        metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise SystemExit(f"Cached toolchain file is not ordinary and single-link: {relative}")
-        actual_files.add(relative)
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        file_records[relative] = {**metadata_record(metadata), "sha256": digest.hexdigest()}
-
-if actual_files != expected_files:
-    missing = sorted(expected_files - actual_files)
-    extra = sorted(actual_files - expected_files)
-    raise SystemExit(f"Cached toolchain file closure changed (missing={missing}, extra={extra}).")
-for relative, expected_digest in critical_hashes.items():
-    parts = PurePosixPath(relative).parts
-    if not parts or relative.startswith("/") or any(part in ("", ".", "..") for part in parts):
-        raise SystemExit(f"Cached signed core contains an unsafe path: {relative}")
-    installed_relative = f"{version_prefix}/{relative}"
-    if file_records[installed_relative]["sha256"] != expected_digest:
-        raise SystemExit(f"Cached critical-file hash differs from the signed manifest: {relative}")
-for executable in ("bin/colmap", "bin/easysplat-train"):
-    installed_relative = f"{version_prefix}/{executable}"
-    if file_records[installed_relative]["mode"] != 0o755:
-        raise SystemExit(f"Cached core executable does not use mode 0755: {executable}")
-
-print(json.dumps({
-    "schemaVersion": 1,
-    "receipt": receipt_relative,
-    "directories": directory_records,
-    "files": file_records,
-}, sort_keys=True, separators=(",", ":")))
-PY
 }

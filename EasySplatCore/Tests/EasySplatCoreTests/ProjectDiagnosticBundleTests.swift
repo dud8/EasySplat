@@ -75,6 +75,128 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertTrue(bundle.contains("third line"))
     }
 
+    func testDiagnosticsReportNoSubjectArtifactAndTailIsolationLog() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                title: "NoSubjectArtifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            to: paths.metadataURL
+        )
+        try "isolation completed without a subject\n".write(
+            to: paths.isolationLogURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertTrue(bundle.contains("## Subject Isolation\nStatus: no artifact"))
+        XCTAssertTrue(bundle.contains("## isolation.log (tail)"))
+        XCTAssertTrue(bundle.contains("isolation completed without a subject"))
+    }
+
+    func testDiagnosticsReportValidSubjectArtifactWithoutMaskIdentityOrAnchor() throws {
+        let fixture = try makeSubjectIsolationFixture()
+        defer { fixture.cleanup() }
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                id: fixture.projectID,
+                title: "ValidSubjectArtifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            to: fixture.paths.metadataURL
+        )
+        let artifact = try fixture.makeArtifact()
+        _ = try SubjectIsolationArtifactStore.publish(
+            artifact,
+            stagedOutputURL: fixture.stagedOutputURL,
+            stagedMasksURL: fixture.stagedMasksURL,
+            paths: fixture.paths
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: fixture.root))
+
+        XCTAssertTrue(bundle.contains("## Subject Isolation\nStatus: valid"))
+        XCTAssertTrue(bundle.contains("Variant: subject"))
+        XCTAssertTrue(bundle.contains("Mask views: 3 · selected: 2 · held out: 1"))
+        XCTAssertTrue(bundle.contains("Vision request revision: 1 · policy revision: 1"))
+        XCTAssertFalse(bundle.contains("frame-0.png"))
+        XCTAssertFalse(bundle.contains("frame-1.png"))
+        XCTAssertFalse(bundle.contains("normalizedX"))
+        XCTAssertFalse(bundle.contains("normalizedY"))
+        XCTAssertFalse(bundle.contains("Output/isolated.ply"))
+        XCTAssertFalse(bundle.contains("Isolation/masks"))
+    }
+
+    func testDiagnosticsReportStaleAndInvalidSubjectArtifacts() throws {
+        let staleFixture = try makeSubjectIsolationFixture()
+        defer { staleFixture.cleanup() }
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                id: staleFixture.projectID,
+                title: "StaleSubjectArtifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            to: staleFixture.paths.metadataURL
+        )
+        _ = try SubjectIsolationArtifactStore.publish(
+            staleFixture.makeArtifact(),
+            stagedOutputURL: staleFixture.stagedOutputURL,
+            stagedMasksURL: staleFixture.stagedMasksURL,
+            paths: staleFixture.paths
+        )
+        try TestFileBuilder.writeMinimalPly(
+            at: staleFixture.paths.outputSplatURL,
+            vertexCount: 2
+        )
+
+        let staleBundle = try XCTUnwrap(
+            ProjectDiagnosticBundle.build(projectURL: staleFixture.root)
+        )
+        XCTAssertTrue(
+            staleBundle.contains("## Subject Isolation\nStatus: stale (source output)")
+        )
+
+        let invalidRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: invalidRoot) }
+        let invalidPaths = ProjectPaths(root: invalidRoot)
+        try invalidPaths.ensureDirectories()
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                title: "InvalidSubjectArtifact",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                )
+            ),
+            to: invalidPaths.metadataURL
+        )
+        try TestFileBuilder.writeMinimalPly(at: invalidPaths.isolatedOutputURL)
+
+        let invalidBundle = try XCTUnwrap(
+            ProjectDiagnosticBundle.build(projectURL: invalidRoot)
+        )
+        XCTAssertTrue(invalidBundle.contains("## Subject Isolation\nStatus: invalid"))
+    }
+
     func testSkipsSymlinkedLogTailWithoutReadingExternalContents() throws {
         let parent = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: parent) }
@@ -554,6 +676,9 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             resolvedRunPlan: makeResolvedRunPlan(for: geometry, requestedOptions: options),
             state: PipelineState(stage: .trainSplat, lastError: nil)
         )
+        let plan = try XCTUnwrap(metadata.resolvedRunPlan)
+        training.iterationLimit = plan.trainerIterationLimit
+        training.plateauWindow = plan.plateauWindow
         try saveControlledPhotoMetadata(metadata, to: paths.metadataURL)
         let persistedGeometry = try persistGeometrySidecar(geometry, paths: paths)
         training.datasetDerivation.sourceSelectedFramesDigest =
@@ -844,7 +969,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertTrue(bundle.contains("Bundle adjustment plan: local 2, global 1.4× frames / 1.4× points, up to 5 refinements"))
         XCTAssertTrue(bundle.contains("Bundle adjustment accepted: local 2, global 1.1× frames / 1.1× points, up to 5 refinements"))
         XCTAssertTrue(bundle.contains("Bundle adjustment retry trigger: lowReconstructionQuality"))
-        XCTAssertTrue(bundle.contains("Mapping fallback: Retry for <redacted> at ~/private/input.mov"))
+        XCTAssertTrue(bundle.contains("Mapping fallback: Retry for <redacted> at <local-path>"))
         XCTAssertTrue(
             bundle.contains(
                 "Camera grouping: allSelectedImagesShared · 4 images · 4 → 1 cameras"
@@ -911,7 +1036,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         )
         XCTAssertEqual(
             mapping["fallbackReason"] as? String,
-            "Retry for <redacted> at ~/private/input.mov"
+            "Retry for <redacted> at <local-path>"
         )
         XCTAssertEqual(Set(mapping.keys), [
             "modelCount",
@@ -995,23 +1120,497 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertFalse(bundle.contains("private_debug.jsonl"))
     }
 
-    func testHomePathSanitizerReplacesHome() {
+    func testHomePathSanitizerRedactsEntirePathWithoutRevealingDescendants() {
         let sanitizer = HomePathSanitizer(homePath: "/Users/example")
-        XCTAssertEqual(sanitizer.sanitize("/Users/example/Documents/foo"), "~/Documents/foo")
-        XCTAssertEqual(sanitizer.sanitize("/var/tmp/x"), "/var/tmp/x")
+        let input = "Could not read /Users/example/Clients/Acme/secret.mov; retry later."
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(sanitized, "Could not read <local-path>; retry later.")
+        XCTAssertFalse(sanitized.contains("Clients"))
+        XCTAssertFalse(sanitized.contains("Acme"))
+        XCTAssertFalse(sanitized.contains("secret.mov"))
+        XCTAssertEqual(
+            sanitizer.sanitize("Mapper retry 2 of 3: no model registered."),
+            "Mapper retry 2 of 3: no model registered."
+        )
     }
 
-    func testSanitizerRedactsRemovableVolumeNamesAndURLCredentials() {
+    func testSanitizerRedactsPathBeforeOverlappingSensitiveValue() {
+        let sanitizer = HomePathSanitizer(
+            homePath: "/Users/example",
+            sensitiveValues: ["example"]
+        )
+
+        let sanitized = sanitizer.sanitize(
+            "Could not read /Users/example/Clients/secret.mov; retry later."
+        )
+
+        XCTAssertEqual(sanitized, "Could not read <local-path>; retry later.")
+        for component in ["Users", "example", "Clients", "secret.mov"] {
+            XCTAssertFalse(sanitized.contains(component), "Leaked path component: \(component)")
+        }
+    }
+
+    func testSanitizerRedactsAbsoluteTemporaryPaths() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+
+        let privateTemporary = sanitizer.sanitize(
+            "source=/private/tmp/Client/secret.mov status=failed"
+        )
+        let varTemporary = sanitizer.sanitize("/var/tmp/x")
+
+        XCTAssertEqual(privateTemporary, "source=<local-path> status=failed")
+        XCTAssertEqual(varTemporary, "<local-path>")
+        for component in ["private", "tmp", "Client", "secret.mov"] {
+            XCTAssertFalse(
+                privateTemporary.contains(component),
+                "Leaked private temporary-path component: \(component)"
+            )
+        }
+        for component in ["var", "tmp", "x"] {
+            XCTAssertFalse(
+                varTemporary.contains(component),
+                "Leaked var temporary-path component: \(component)"
+            )
+        }
+    }
+
+    func testSanitizerRedactsPathInTruncatedEscapedJSONString() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = #"{"message":"failed to read \/Users\/example\/Clients\/secret.mov"#
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertTrue(sanitized.contains("failed to read"))
+        XCTAssertTrue(sanitized.contains("<local-path>"))
+        for component in ["Users", "example", "Clients", "secret.mov"] {
+            XCTAssertFalse(sanitized.contains(component), "Leaked escaped path component: \(component)")
+        }
+    }
+
+    func testSanitizerRedactsEntireMountedVolumePathAndURLCredentials() {
         let sanitizer = HomePathSanitizer(homePath: "/Users/example")
         let input = "source=/Volumes/Client Drive/House/input.mov url=https://alice:secret@example.com/file"
         let sanitized = sanitizer.sanitize(input)
 
         XCTAssertFalse(sanitized.contains("Client Drive"))
+        XCTAssertFalse(sanitized.contains("House"))
+        XCTAssertFalse(sanitized.contains("input.mov"))
         XCTAssertFalse(sanitized.contains("alice"))
         XCTAssertFalse(sanitized.contains("secret"))
-        XCTAssertTrue(sanitized.contains("/Volumes/<redacted>/House/input.mov"))
+        XCTAssertTrue(sanitized.contains("source=<local-path>"))
         XCTAssertTrue(sanitized.contains("https://example.com/file"))
-        XCTAssertEqual(sanitizer.sanitize("/Volumes/Client Drive"), "/Volumes/<redacted>")
+        XCTAssertEqual(sanitizer.sanitize("/Volumes/Client Drive"), "<local-path>")
+    }
+
+    func testSanitizerRedactsSemanticValuesInsideEscapedJSONStrings() throws {
+        let projectID = "33333333-3333-3333-3333-333333333333"
+        let sanitizer = HomePathSanitizer(
+            homePath: "/Users/example",
+            sensitiveValues: ["Client House", projectID]
+        )
+        let input = #"{"attempt":2,"home":"\/Users\/example\/Clients\/Acme\/secret.mov","mounted":"\/Volumes\/Client Drive\/House\/input.mov","projectID":"33333333\u002D3333\u002D3333\u002D3333\u002D333333333333","projectTitle":"Client\u0020House","status":"retrying"}"#
+
+        let sanitized = sanitizer.sanitize(input)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(sanitized.utf8)) as? [String: Any]
+        )
+
+        XCTAssertEqual(payload["attempt"] as? Int, 2)
+        XCTAssertEqual(payload["status"] as? String, "retrying")
+        XCTAssertEqual(payload["home"] as? String, "<local-path>")
+        XCTAssertEqual(payload["mounted"] as? String, "<local-path>")
+        XCTAssertEqual(payload["projectID"] as? String, "<redacted>")
+        XCTAssertEqual(payload["projectTitle"] as? String, "<redacted>")
+        XCTAssertEqual(
+            Set(payload.keys),
+            ["attempt", "home", "mounted", "projectID", "projectTitle", "status"]
+        )
+        XCTAssertFalse(sanitized.contains("Clients"))
+        XCTAssertFalse(sanitized.contains("Client Drive"))
+        XCTAssertFalse(sanitized.contains("Client House"))
+        XCTAssertFalse(sanitized.contains(projectID))
+    }
+
+    func testSanitizerRedactsQuotedPathsContainingSpacesQuotesAndPunctuation() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = #"Import failed for '/Users/example/Client Work/Scene "Final", take #2.mov'; retry is available."#
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(
+            sanitized,
+            "Import failed for '<local-path>'; retry is available."
+        )
+        XCTAssertFalse(sanitized.contains("Client Work"))
+        XCTAssertFalse(sanitized.contains("Scene"))
+        XCTAssertFalse(sanitized.contains("Final"))
+        XCTAssertFalse(sanitized.contains("#2.mov"))
+    }
+
+    func testSanitizerRedactsUnquotedHomePathsContainingSpaces() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "source=/Users/example/Client Work/Scene Final.mov status=failed"
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(sanitized, "source=<local-path> status=failed")
+        XCTAssertFalse(sanitized.contains("Client Work"))
+        XCTAssertFalse(sanitized.contains("Scene Final.mov"))
+    }
+
+    func testSanitizerRecognizesLocalPathsAfterDiagnosticPunctuation() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let cases = [
+            ("failed:/Users/example/Clients/secret.mov", "failed:<local-path>"),
+            ("failed./Users/example/Clients/secret.mov", "failed.<local-path>"),
+            ("failed_/Users/example/Clients/secret.mov", "failed_<local-path>"),
+            ("url:file:///Users/example/Clients/secret.mov", "url:<local-path>"),
+        ]
+
+        for (input, expected) in cases {
+            XCTAssertEqual(sanitizer.sanitize(input), expected, "Input: \(input)")
+        }
+
+        let publicText = "ratio=1/2 docs=https://example.com/v1/models ipv6=https://[2001:db8::1]/v1/models"
+        XCTAssertEqual(sanitizer.sanitize(publicText), publicText)
+    }
+
+    func testSanitizerRedactsDoubleSlashMacOSAbsolutePathAlias() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "source=//Users/example/Clients/secret.mov status=failed"
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(sanitized, "source=<local-path> status=failed")
+        for component in ["Users", "example", "Clients", "secret.mov"] {
+            XCTAssertFalse(sanitized.contains(component), "Leaked path component: \(component)")
+        }
+    }
+
+    func testSanitizerRedactsUnquotedPathContainingApostrophe() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "source=/Users/example/Bob's Files/secret.mov status=failed"
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(sanitized, "source=<local-path> status=failed")
+        for component in ["Bob", "Files", "secret.mov"] {
+            XCTAssertFalse(sanitized.contains(component), "Leaked path component: \(component)")
+        }
+    }
+
+    func testSanitizerRedactsUnquotedPathContainingApostropheBeforeSpace() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "source=/Users/example/Bob' Files/secret.mov status=failed"
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(sanitized, "source=<local-path> status=failed")
+        for component in ["Bob", "Files", "secret.mov"] {
+            XCTAssertFalse(sanitized.contains(component), "Leaked path component: \(component)")
+        }
+    }
+
+    func testSanitizerRedactsCompleteSingleQuotedPathContainingApostrophes() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "Import failed for '/Users/example/Bob's Files/secret.mov'; retry is available."
+        let punctuatedApostrophe = "Import failed for '/Users/example/Clients'; Archive/secret.mov'; retry is available."
+
+        let sanitized = sanitizer.sanitize(input)
+        let sanitizedPunctuation = sanitizer.sanitize(punctuatedApostrophe)
+
+        XCTAssertEqual(sanitized, "Import failed for '<local-path>'; retry is available.")
+        XCTAssertEqual(sanitizedPunctuation, "Import failed for '<local-path>'; retry is available.")
+        for component in ["Bob", "Files", "secret.mov"] {
+            XCTAssertFalse(sanitized.contains(component), "Leaked path component: \(component)")
+        }
+        for component in ["Clients", "Archive", "secret.mov"] {
+            XCTAssertFalse(
+                sanitizedPunctuation.contains(component),
+                "Leaked punctuated path component: \(component)"
+            )
+        }
+    }
+
+    func testSanitizerClosesQuotedPathBeforeOrdinaryProse() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "Could not open '/Users/example/secret.mov' because permission was denied."
+
+        XCTAssertEqual(
+            sanitizer.sanitize(input),
+            "Could not open '<local-path>' because permission was denied."
+        )
+    }
+
+    func testSanitizerUsesFirstValidQuotedPathCloseBeforePossessiveProse() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "Could not open '/Users/example/secret.mov' because users' permissions changed."
+
+        XCTAssertEqual(
+            sanitizer.sanitize(input),
+            "Could not open '<local-path>' because users' permissions changed."
+        )
+    }
+
+    func testSanitizerPreservesFieldsAfterUnclosedQuotedPath() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "source='/Users/example/secret.mov status=failed"
+
+        XCTAssertEqual(
+            sanitizer.sanitize(input),
+            "source='<local-path> status=failed"
+        )
+    }
+
+    func testSanitizerTreatsCRLFCharacterAsPathTerminator() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "path=/Users/example/secret.mov\r\nPermission denied"
+
+        XCTAssertEqual(
+            sanitizer.sanitize(input),
+            "path=<local-path>\r\nPermission denied"
+        )
+    }
+
+    func testSanitizerRedactsSingleSlashFileURIAndPreservesProse() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "Could not open file:/Users/example/Clients/secret.mov because permission was denied."
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(
+            sanitized,
+            "Could not open <local-path> because permission was denied."
+        )
+        for component in ["Users", "example", "Clients", "secret.mov"] {
+            XCTAssertFalse(sanitized.contains(component), "Leaked file URI component: \(component)")
+        }
+    }
+
+    func testSanitizerTreatsDecodedJSONStringPathCharactersAsSemanticContent() throws {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let privatePath = "/Users/example/Client;Secret\nPipe|Tick`Angles<Hidden>Quote\"/secret.mov"
+        let inputData = try JSONSerialization.data(
+            withJSONObject: ["path": privatePath, "status": "failed"],
+            options: [.sortedKeys]
+        )
+        let input = try XCTUnwrap(String(data: inputData, encoding: .utf8))
+
+        let sanitized = sanitizer.sanitize(input)
+        let payload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(sanitized.utf8)) as? [String: String]
+        )
+
+        XCTAssertEqual(payload, ["path": "<local-path>", "status": "failed"])
+        for component in ["Client", "Secret", "Pipe", "Tick", "Angles", "Hidden", "Quote", "secret.mov"] {
+            XCTAssertFalse(sanitized.contains(component), "Leaked path component: \(component)")
+        }
+    }
+
+    func testSanitizerDecodesPathSeparatorsInTruncatedJSONStringTail() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let pathInput = #"{"message":"failed \u002FUsers\u002Fexample\u002FClients\u002Fsecret.mov"#
+
+        let sanitizedPath = sanitizer.sanitize(pathInput)
+
+        XCTAssertTrue(sanitizedPath.contains("failed"))
+        XCTAssertTrue(sanitizedPath.contains("<local-path>"))
+        for component in ["Users", "example", "Clients", "secret.mov"] {
+            XCTAssertFalse(sanitizedPath.contains(component), "Leaked escaped path component: \(component)")
+        }
+    }
+
+    func testSanitizerDecodesSensitiveUnicodeEscapesInTruncatedJSONStringTail() {
+        let projectID = "33333333-3333-3333-3333-333333333333"
+        let sanitizer = HomePathSanitizer(
+            homePath: "/Users/example",
+            sensitiveValues: [projectID, "😀"]
+        )
+        let input = #"{"message":"project 33333333\u002D3333\u002D3333\u002D3333\u002D333333333333 \uD83D\uDE00 unavailable"#
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertTrue(sanitized.contains("project <redacted> <redacted> unavailable"))
+        XCTAssertFalse(sanitized.contains(projectID))
+    }
+
+    func testSanitizerDoesNotDecodeUnmatchedSurrogateInTruncatedJSONStringTail() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = #"{"message":"value \uD800 remains"#
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(sanitized, input)
+    }
+
+    func testSanitizerRedactsEscapedPathInsideMalformedClosedJSONString() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = #"{"message":"failed \u002FUsers\u002Fexample\u002FClients\u002Fsecret.mov\q"}"#
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertTrue(sanitized.contains("failed"))
+        XCTAssertTrue(sanitized.contains("<local-path>"))
+        for component in ["Users", "example", "Clients", "secret.mov"] {
+            XCTAssertFalse(
+                sanitized.contains(component),
+                "Leaked malformed escaped path component: \(component)"
+            )
+        }
+    }
+
+    func testSanitizerScannerWorkRemainsLinearForLongWhitespaceAndJSON() {
+        let sanitizer = HomePathSanitizer(
+            homePath: "/Users/example",
+            sensitiveValues: ["Client House"]
+        )
+        let smallInput = "source=/Users/example/input.mov"
+            + String(repeating: " ", count: 8_192)
+            + "status=failed "
+            + String(repeating: #"{"value":"safe"}"#, count: 128)
+        let largeInput = "source=/Users/example/input.mov"
+            + String(repeating: " ", count: 32_768)
+            + "status=failed "
+            + String(repeating: #"{"value":"safe"}"#, count: 512)
+        var smallMetrics = HomePathSanitizer.ScanMetrics()
+        var largeMetrics = HomePathSanitizer.ScanMetrics()
+
+        let smallOutput = sanitizer.sanitize(smallInput, metrics: &smallMetrics)
+        let largeOutput = sanitizer.sanitize(largeInput, metrics: &largeMetrics)
+
+        XCTAssertTrue(smallOutput.hasPrefix("source=<local-path>"))
+        XCTAssertTrue(largeOutput.hasPrefix("source=<local-path>"))
+        XCTAssertLessThanOrEqual(
+            largeMetrics.characterVisits,
+            smallMetrics.characterVisits * 5,
+            "A 4× input must not trigger superlinear scanner work."
+        )
+        XCTAssertLessThanOrEqual(
+            largeMetrics.characterVisits,
+            largeInput.count * 12,
+            "Each pass must perform only a bounded number of visits per character."
+        )
+    }
+
+    func testSanitizerPreservesExplanationAndNetworkURLsAfterLocalPath() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "Failed to read /Users/example/x, see https://help.example.com/docs"
+
+        XCTAssertEqual(
+            sanitizer.sanitize(input),
+            "Failed to read <local-path>, see https://help.example.com/docs"
+        )
+        XCTAssertEqual(
+            sanitizer.sanitize("endpoint=https://[2001:db8::1]/v1/models"),
+            "endpoint=https://[2001:db8::1]/v1/models"
+        )
+        XCTAssertEqual(
+            sanitizer.sanitize("endpoint=https://alice:secret@[2001:db8::1]/v1/models"),
+            "endpoint=https://[2001:db8::1]/v1/models"
+        )
+    }
+
+    func testSanitizerRedactsSensitiveNetworkURLQueryValues() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "endpoint=https://alice:credential@example.com/download"
+            + "?file=scene.ply"
+            + "&access_token=access-value"
+            + "&TOKEN=token-value"
+            + "&api_key=api-value"
+            + "&key=key-value"
+            + "&password=password-value"
+            + "&secret=secret-value"
+            + "&signature=signature-value"
+            + "&authorization=authorization-value"
+            + "&auth=auth-value"
+            + "&code=code-value"
+            + "&page=2#result"
+        let expected = "endpoint=https://example.com/download"
+            + "?file=scene.ply"
+            + "&access_token=<redacted>"
+            + "&TOKEN=<redacted>"
+            + "&api_key=<redacted>"
+            + "&key=<redacted>"
+            + "&password=<redacted>"
+            + "&secret=<redacted>"
+            + "&signature=<redacted>"
+            + "&authorization=<redacted>"
+            + "&auth=<redacted>"
+            + "&code=<redacted>"
+            + "&page=2#result"
+
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertEqual(sanitized, expected)
+        for value in [
+            "credential", "access-value", "token-value", "api-value",
+            "key-value", "password-value", "secret-value", "signature-value",
+            "authorization-value", "auth-value", "code-value",
+        ] {
+            XCTAssertFalse(sanitized.contains(value), "Leaked URL credential: \(value)")
+        }
+    }
+
+    func testSanitizerRedactsPercentEncodedSensitiveQueryKeyAndKeepsHarmlessQuery() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "https://example.com/download?%61ccess_token=secret&page=2&sort=newest"
+
+        XCTAssertEqual(
+            sanitizer.sanitize(input),
+            "https://example.com/download?%61ccess_token=<redacted>&page=2&sort=newest"
+        )
+    }
+
+    func testSanitizerRedactsSensitiveQueryAfterSemicolonDelimiter() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "https://example.com/download?page=2;access_token=secret;sort=newest"
+
+        XCTAssertEqual(
+            sanitizer.sanitize(input),
+            "https://example.com/download?page=2;access_token=<redacted>;sort=newest"
+        )
+    }
+
+    func testSanitizerPreservesSentencePunctuationAfterSensitiveURLQuery() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "Open (https://example.com/download?access_token=secret). Continue."
+
+        XCTAssertEqual(
+            sanitizer.sanitize(input),
+            "Open (https://example.com/download?access_token=<redacted>). Continue."
+        )
+    }
+
+    func testSanitizerSensitiveQueryScanningRemainsLinear() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let smallInput = "endpoint=https://example.com/download?"
+            + Array(repeating: "page=2;access_token=secret", count: 128).joined(separator: "&")
+            + "). Continue."
+        let largeInput = "endpoint=https://example.com/download?"
+            + Array(repeating: "page=2;access_token=secret", count: 512).joined(separator: "&")
+            + "). Continue."
+        var smallMetrics = HomePathSanitizer.ScanMetrics()
+        var largeMetrics = HomePathSanitizer.ScanMetrics()
+
+        let smallOutput = sanitizer.sanitize(smallInput, metrics: &smallMetrics)
+        let largeOutput = sanitizer.sanitize(largeInput, metrics: &largeMetrics)
+
+        XCTAssertFalse(smallOutput.contains("access_token=secret"))
+        XCTAssertFalse(largeOutput.contains("access_token=secret"))
+        XCTAssertTrue(smallOutput.hasSuffix("). Continue."))
+        XCTAssertTrue(largeOutput.hasSuffix("). Continue."))
+        XCTAssertLessThanOrEqual(
+            largeMetrics.characterVisits,
+            smallMetrics.characterVisits * 5,
+            "A 4× query must not trigger superlinear scanner work."
+        )
+        XCTAssertLessThanOrEqual(
+            largeMetrics.characterVisits,
+            largeInput.count * 12,
+            "Query sanitization must perform bounded work per character."
+        )
     }
 
     func testDiagnosticsRedactProjectIdentityFromErrorsAndLogs() throws {
@@ -1042,6 +1641,48 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
         XCTAssertFalse(bundle.contains("123 Main St"))
         XCTAssertFalse(bundle.contains(identifier.uuidString))
+    }
+
+    func testDiagnosticsRedactPunctuatedProjectBundleNameFromErrorsAndLogs() throws {
+        let bundleName = #"Client "West", #7.easysplatproj"#
+        let lowercasedBundleName = bundleName.lowercased()
+        let encodedBundleName = try XCTUnwrap(
+            bundleName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed)
+        )
+        let parent = try TestFileBuilder.makeTempDir()
+        let root = parent.appendingPathComponent(bundleName, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try saveControlledPhotoMetadata(
+            ProjectMetadata(
+                title: "Neutral title",
+                input: .photos(folder: "Originals/Photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .walkthrough,
+                    detailProfile: .balanced
+                ),
+                state: PipelineState(
+                    stage: .sfmMapping,
+                    lastError: "Could not reopen \(lowercasedBundleName); write access was lost."
+                )
+            ),
+            to: paths.metadataURL
+        )
+        try "Recovery for \(encodedBundleName) is still available.".write(
+            to: paths.pipelineLogURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertFalse(bundle.contains(bundleName))
+        XCTAssertFalse(bundle.localizedCaseInsensitiveContains("client \"west\""))
+        XCTAssertFalse(bundle.contains(encodedBundleName))
+        XCTAssertFalse(bundle.localizedCaseInsensitiveContains("#7.easysplatproj"))
+        XCTAssertTrue(bundle.contains("Could not reopen <redacted>; write access was lost."))
+        XCTAssertTrue(bundle.contains("Recovery for <redacted> is still available."))
     }
 
     func testSharingSanitizerRedactsProjectIdentityPathsAndCredentials() throws {
@@ -1078,8 +1719,8 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertFalse(sanitized.contains("Client Drive"))
         XCTAssertFalse(sanitized.contains("alice"))
         XCTAssertFalse(sanitized.contains("secret"))
-        XCTAssertTrue(sanitized.contains("~/Documents/input.mov"))
-        XCTAssertTrue(sanitized.contains("/Volumes/<redacted>/House/input.mov"))
+        XCTAssertTrue(sanitized.contains("home=<local-path>"))
+        XCTAssertTrue(sanitized.contains("media=<local-path>"))
         XCTAssertTrue(sanitized.contains("https://example.com/file"))
     }
 

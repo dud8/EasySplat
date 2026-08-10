@@ -16,6 +16,24 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertEqual(lowQualityMessage.userMessage, "The camera solve was unstable. Try a slower capture with more light.")
         XCTAssertTrue(lowQualityMessage.debugMessage.contains("Low-quality reconstruction"))
 
+        // When every quality criterion passed and only coverage fell short,
+        // the copy names the shortfall instead of blaming stability.
+        let coverageShortfall = ReconstructionScore(
+            registeredImages: 6,
+            totalImages: 10,
+            meanReprojectionError: 0.7,
+            pointCount: 1_500,
+            observationCount: 6_000,
+            meanTrackLength: 3.5
+        )
+        let shortfallError = runner.test_makePipelineErrorLowQuality(coverageShortfall)
+        let shortfallMessage = runner.test_failureMessages(for: shortfallError, stage: .sfmMapping)
+        XCTAssertEqual(
+            shortfallMessage.userMessage,
+            "The camera solve could only include 6 of 10 photos, which is too few to build a reliable splat. Add photos that overlap the missing areas with clear shared detail."
+        )
+        XCTAssertTrue(shortfallMessage.debugMessage.contains("Low-quality reconstruction"))
+
         let transcode = runner.test_makePipelineErrorImageTranscodeFailed("bad")
         let transcodeMessage = runner.test_failureMessages(for: transcode, stage: .selectFrames)
         XCTAssertEqual(transcodeMessage.userMessage, "Failed to convert photos for processing. Try exporting as JPEG/PNG.")
@@ -221,6 +239,62 @@ final class PipelineRunnerErrorTests: XCTestCase {
         let message = runner.test_failureMessages(for: failure, stage: .sfmMapping)
         XCTAssertEqual(message.userMessage, "Processing failed. Check details for more info.")
         XCTAssertTrue(message.debugMessage.contains("Tool: geometry-helper"))
+    }
+
+    func testPipelineLogNamesTheFailingErrorAlongsideTheUserMessage() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logURL = root.appendingPathComponent("pipeline.log")
+        let logger = PipelineLogger(
+            eventsURL: root.appendingPathComponent("events.jsonl"),
+            logURL: logURL,
+            emit: { _ in }
+        )
+
+        logger.emit(.pipelineFailed(
+            stage: .sfmMapping,
+            userMessage: "Processing failed. Check details for more info.",
+            debugMessage: "EasySplatCore.PairGraphEvidenceStoreError.invalidEvidence"
+        ))
+
+        // The diagnostic bundle ships pipeline.log but not events.jsonl, so the
+        // error identity has to land here to be diagnosable after the fact.
+        let log = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(log.contains("Processing failed. Check details for more info."))
+        XCTAssertTrue(
+            log.contains("EasySplatCore.PairGraphEvidenceStoreError.invalidEvidence"),
+            "pipeline.log did not carry the failure's debug identity:\n\(log)"
+        )
+        XCTAssertTrue(log.split(whereSeparator: \.isNewline).allSatisfy {
+            $0.hasPrefix("[err] [")
+        }, "every failure line stays prefixed:\n\(log)")
+    }
+
+    func testPipelineLogBoundsAVerboseFailureDetail() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let logURL = root.appendingPathComponent("pipeline.log")
+        let logger = PipelineLogger(
+            eventsURL: root.appendingPathComponent("events.jsonl"),
+            logURL: logURL,
+            emit: { _ in }
+        )
+
+        logger.emit(.pipelineFailed(
+            stage: .sfmMapping,
+            userMessage: "Processing failed. Check details for more info.",
+            debugMessage: (0..<40).map { "stderr line \($0)" }.joined(separator: "\n")
+        ))
+
+        // A subprocess failure carries its output tails; the log tail the bundle
+        // ships has to keep room for the surrounding context.
+        let log = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(log.contains("stderr line 0"))
+        XCTAssertFalse(log.contains("stderr line 39"))
+        XCTAssertTrue(
+            log.contains("28 more lines in events.jsonl"),
+            "truncation was not disclosed:\n\(log)"
+        )
     }
 
     private func conditioningMeasurementFixture() -> GeometryConditioningMeasurement {
@@ -430,7 +504,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
 
         XCTAssertEqual(
             message.userMessage,
-            "EasySplat found separate parts of the capture. Add views between the gaps with clear shared detail, and keep the scene still."
+            "EasySplat could not connect this capture into one scene. The largest connected group is 243 of 256 photos. Add photos that overlap the missing areas with clear shared detail, and keep the scene still."
         )
         for hiddenImplementationTerm in ["faiss", "exact", "colmap", "unordered", "graph"] {
             XCTAssertFalse(message.userMessage.lowercased().contains(hiddenImplementationTerm))
@@ -453,6 +527,38 @@ final class PipelineRunnerErrorTests: XCTestCase {
             )
         )
         XCTAssertTrue(message.debugMessage.contains("degree p10/median/p90 0/8/19"))
+    }
+
+    func testTerminalConnectionFailureNamesTheLargestGroupForFullyDisconnectedCaptures() throws {
+        let runner = makeRunner()
+        let failure = try CaptureConnectionFailure(
+            pairingPolicy: .unorderedRetrieval,
+            selectedViewCount: 8,
+            attempt: PairMatchingAttemptArtifact(
+                attemptNumber: 2,
+                matcher: .exact,
+                recoveryLevel: .normal,
+                outcome: .rejected,
+                exactRecoveryReason: .faissGeometryRejectedAfterRetries,
+                scheduledPairCount: 28,
+                attemptedPairCount: 28,
+                rawMatchedPairCount: 0,
+                spatiallyVerifiedPairCount: 0,
+                durationSeconds: 1
+            ),
+            connectedComponentCount: 8,
+            isolatedViewCount: 8,
+            descriptorlessViewCount: 0,
+            componentViewCounts: Array(repeating: 1, count: 8),
+            degreeP10: 0,
+            degreeMedian: 0,
+            degreeP90: 0
+        )
+
+        XCTAssertEqual(
+            runner.test_failureMessages(for: failure, stage: .sfmMatching).userMessage,
+            "EasySplat could not connect this capture into one scene. The largest connected group is 1 of 8 photos. Add photos that overlap the missing areas with clear shared detail, and keep the scene still."
+        )
     }
 
     func testCaptureConnectionFailureRejectsImpossibleTopologyAndDegreeEvidence() {

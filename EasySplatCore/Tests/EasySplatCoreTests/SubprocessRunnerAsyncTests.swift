@@ -210,6 +210,8 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
             return XCTFail("Child process did not start")
         }
 
+        let cancellationClock = ContinuousClock()
+        let cancellationStarted = cancellationClock.now
         task.cancel()
         do {
             _ = try await task.value
@@ -219,6 +221,7 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         } catch {
             XCTFail("Expected CancellationError, got \(error)")
         }
+        let cancellationElapsed = cancellationStarted.duration(to: cancellationClock.now)
 
         let result = try XCTUnwrap(results.values.first)
         XCTAssertEqual(results.values.count, 1)
@@ -229,6 +232,10 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         XCTAssertEqual(
             receipt.effectiveValuesForControlledKeys["EASYSPLAT_SUBPROCESS_CUSTOM"],
             "child"
+        )
+        try ReleaseReliabilityFixtureSupport.recordRequiredTimingCheck(
+            workload: "cooperative-cancellation-under-two-seconds",
+            elapsed: cancellationElapsed
         )
     }
 

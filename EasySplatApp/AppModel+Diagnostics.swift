@@ -122,6 +122,11 @@ extension AppModel {
                 return
             }
             do {
+                // The panel closed several awaits ago; its grant on the chosen file
+                // has to be open again for the atomic write to land.
+                let destinationAccess = SecurityScopedAccess()
+                destinationAccess.claim([destination])
+                defer { destinationAccess.releaseAll() }
                 try finalText.data(using: .utf8)?.write(to: destination, options: [.atomic])
                 self.shareStatusMessage = "Diagnostics saved to \(destination.lastPathComponent)."
                 self.shareStatusIsError = false

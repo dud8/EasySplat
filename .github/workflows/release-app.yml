@@ -18,6 +18,14 @@ on:
         required: false
         default: ""
         type: string
+      testflight_run_id:
+        description: "Successful approved Release TestFlight workflow run ID"
+        required: true
+        type: string
+      testflight_build_number:
+        description: "CFBundleVersion approved in the TestFlight run"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -39,6 +47,8 @@ jobs:
       source_commit: ${{ steps.authority.outputs.source_commit }}
       benchmark_artifact_id: ${{ steps.authority.outputs.benchmark_artifact_id }}
       benchmark_artifact_digest: ${{ steps.authority.outputs.benchmark_artifact_digest }}
+      testflight_artifact_id: ${{ steps.authority.outputs.testflight_artifact_id }}
+      testflight_artifact_digest: ${{ steps.authority.outputs.testflight_artifact_digest }}
       authority_artifact_id: ${{ steps.upload-authority.outputs.artifact-id }}
       authority_artifact_digest: ${{ format('sha256:{0}', steps.upload-authority.outputs.artifact-digest) }}
     steps:
@@ -50,22 +60,31 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
           INPUT_BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
+          INPUT_TESTFLIGHT_RUN_ID: ${{ inputs.testflight_run_id }}
+          INPUT_TESTFLIGHT_BUILD_NUMBER: ${{ inputs.testflight_build_number }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/main"
           test "$DEFAULT_BRANCH" = "main"
-          /usr/bin/python3 -I - "$INPUT_VERSION" "$INPUT_TOOLCHAIN_VERSION" "$INPUT_BENCHMARK_RUN_ID" <<'PY'
+          /usr/bin/python3 -I - \
+            "$INPUT_VERSION" "$INPUT_TOOLCHAIN_VERSION" "$INPUT_BENCHMARK_RUN_ID" \
+            "$INPUT_TESTFLIGHT_RUN_ID" "$INPUT_TESTFLIGHT_BUILD_NUMBER" <<'PY'
           import re
           import sys
 
-          app, toolchain, benchmark = sys.argv[1:]
+          app, toolchain, benchmark, testflight_run, testflight_build = sys.argv[1:]
           core = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+          build = r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){0,2}"
           if re.fullmatch(core, app) is None:
               raise SystemExit("app version must be stable semantic versioning without build metadata")
           if re.fullmatch(core, toolchain) is None:
               raise SystemExit("toolchain version must be stable semantic versioning without build metadata")
           if benchmark and re.fullmatch(r"[1-9][0-9]*", benchmark) is None:
               raise SystemExit("benchmark run ID must be a positive integer")
+          if re.fullmatch(r"[1-9][0-9]*", testflight_run) is None:
+              raise SystemExit("TestFlight run ID must be a positive integer")
+          if re.fullmatch(build, testflight_build) is None:
+              raise SystemExit("TestFlight build number has an invalid shape")
           PY
           test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
             "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = "main"
@@ -107,6 +126,23 @@ jobs:
               "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .digest)"
             [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           fi
+          TESTFLIGHT_RUN_API="repos/$GITHUB_REPOSITORY/actions/runs/$INPUT_TESTFLIGHT_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$TESTFLIGHT_RUN_API" --jq .head_sha)" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$TESTFLIGHT_RUN_API" --jq .event)" = "workflow_dispatch"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$TESTFLIGHT_RUN_API" --jq .conclusion)" = "success"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$TESTFLIGHT_RUN_API" --jq '.path | split("@")[0]')" = ".github/workflows/release-testflight.yml"
+          TESTFLIGHT_EXPECTED_NAME="easysplat-testflight-gate-$GITHUB_SHA-$INPUT_TESTFLIGHT_BUILD_NUMBER"
+          TESTFLIGHT_ARTIFACT_IDS="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' --paginate \
+            "$TESTFLIGHT_RUN_API/artifacts" --jq ".artifacts[] | select(.name == \"$TESTFLIGHT_EXPECTED_NAME\" and .expired == false) | .id")"
+          test "$(printf '%s\n' "$TESTFLIGHT_ARTIFACT_IDS" | sed '/^$/d' | wc -l | tr -d '[:space:]')" = "1"
+          TESTFLIGHT_ARTIFACT_ID="$(printf '%s\n' "$TESTFLIGHT_ARTIFACT_IDS" | sed '/^$/d')"
+          TESTFLIGHT_ARTIFACT_DIGEST="$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$TESTFLIGHT_ARTIFACT_ID" --jq .digest)"
+          [[ "$TESTFLIGHT_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$TESTFLIGHT_ARTIFACT_ID" --jq .workflow_run.id)" = "$INPUT_TESTFLIGHT_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$TESTFLIGHT_ARTIFACT_ID" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
           AUTHORITY_ROOT="$RUNNER_TEMP/easysplat-live-release-authority"
           test ! -e "$AUTHORITY_ROOT"
           mkdir -m 0700 "$AUTHORITY_ROOT"
@@ -115,6 +151,8 @@ jobs:
             "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$TAG" \
             "$INPUT_VERSION" "$INPUT_TOOLCHAIN_VERSION" \
             "$INPUT_BENCHMARK_RUN_ID" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" \
+            "$INPUT_TESTFLIGHT_RUN_ID" "$INPUT_TESTFLIGHT_BUILD_NUMBER" \
+            "$TESTFLIGHT_ARTIFACT_ID" "$TESTFLIGHT_ARTIFACT_DIGEST" \
             "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
             "$GITHUB_WORKFLOW_REF" "$GITHUB_WORKFLOW_SHA" <<'PY'
           import json
@@ -138,10 +176,14 @@ jobs:
                   if sys.argv[7]
                   else None
               ),
-              "workflowRunID": sys.argv[10],
-              "workflowRunAttempt": sys.argv[11],
-              "workflowRef": sys.argv[12],
-              "workflowSHA": sys.argv[13],
+              "testflightRunID": sys.argv[10],
+              "testflightBuildNumber": sys.argv[11],
+              "testflightArtifactID": sys.argv[12],
+              "testflightArtifactDigest": sys.argv[13],
+              "workflowRunID": sys.argv[14],
+              "workflowRunAttempt": sys.argv[15],
+              "workflowRef": sys.argv[16],
+              "workflowSHA": sys.argv[17],
           }
           descriptor = os.open(
               destination,
@@ -160,6 +202,8 @@ jobs:
             echo "source_commit=$GITHUB_SHA"
             echo "benchmark_artifact_id=$ARTIFACT_ID"
             echo "benchmark_artifact_digest=$ARTIFACT_DIGEST"
+            echo "testflight_artifact_id=$TESTFLIGHT_ARTIFACT_ID"
+            echo "testflight_artifact_digest=$TESTFLIGHT_ARTIFACT_DIGEST"
           } >>"$GITHUB_OUTPUT"
 
       - name: Upload exact live release authority
@@ -250,9 +294,13 @@ jobs:
           EXPECTED_SOURCE: ${{ needs.live-policy-preflight.outputs.source_commit }}
           EXPECTED_BENCHMARK_ARTIFACT_ID: ${{ needs.live-policy-preflight.outputs.benchmark_artifact_id }}
           EXPECTED_BENCHMARK_ARTIFACT_DIGEST: ${{ needs.live-policy-preflight.outputs.benchmark_artifact_digest }}
+          EXPECTED_TESTFLIGHT_ARTIFACT_ID: ${{ needs.live-policy-preflight.outputs.testflight_artifact_id }}
+          EXPECTED_TESTFLIGHT_ARTIFACT_DIGEST: ${{ needs.live-policy-preflight.outputs.testflight_artifact_digest }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
           INPUT_BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
+          INPUT_TESTFLIGHT_RUN_ID: ${{ inputs.testflight_run_id }}
+          INPUT_TESTFLIGHT_BUILD_NUMBER: ${{ inputs.testflight_build_number }}
         run: |
           /usr/bin/python3 -I - "$AUTHORITY_PATH" <<'PY'
           import json
@@ -282,6 +330,10 @@ jobs:
                   if os.environ["INPUT_BENCHMARK_RUN_ID"]
                   else None
               ),
+              "testflightRunID": os.environ["INPUT_TESTFLIGHT_RUN_ID"],
+              "testflightBuildNumber": os.environ["INPUT_TESTFLIGHT_BUILD_NUMBER"],
+              "testflightArtifactID": os.environ["EXPECTED_TESTFLIGHT_ARTIFACT_ID"],
+              "testflightArtifactDigest": os.environ["EXPECTED_TESTFLIGHT_ARTIFACT_DIGEST"],
               "workflowRunID": os.environ["GITHUB_RUN_ID"],
               "workflowRunAttempt": os.environ["GITHUB_RUN_ATTEMPT"],
               "workflowRef": os.environ["GITHUB_WORKFLOW_REF"],
@@ -306,6 +358,450 @@ jobs:
             echo "TOOLCHAIN_TAG=toolchain-v$INPUT_TOOLCHAIN_VERSION"
             echo "BENCHMARK_RUN_ID=$INPUT_BENCHMARK_RUN_ID"
           } >>"$GITHUB_ENV"
+
+      - name: Reverify exact approved TestFlight gate identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTFLIGHT_RUN_ID: ${{ inputs.testflight_run_id }}
+          TESTFLIGHT_BUILD_NUMBER: ${{ inputs.testflight_build_number }}
+          TESTFLIGHT_ARTIFACT_ID: ${{ needs.live-policy-preflight.outputs.testflight_artifact_id }}
+          TESTFLIGHT_ARTIFACT_DIGEST: ${{ needs.live-policy-preflight.outputs.testflight_artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$TESTFLIGHT_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$TESTFLIGHT_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$TESTFLIGHT_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          API="repos/$GITHUB_REPOSITORY/actions/artifacts/$TESTFLIGHT_ARTIFACT_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .expired)" = "false"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .digest)" = "$TESTFLIGHT_ARTIFACT_DIGEST"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.id)" = "$TESTFLIGHT_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .name)" = \
+            "easysplat-testflight-gate-$GITHUB_SHA-$TESTFLIGHT_BUILD_NUMBER"
+
+      - name: Download exact approved TestFlight gate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          run-id: ${{ inputs.testflight_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ needs.live-policy-preflight.outputs.testflight_artifact_id }}
+          path: ${{ runner.temp }}/approved-testflight-gate
+
+      - name: Bind approved TestFlight dogfood before checkout
+        env:
+          GATE_PATH: ${{ runner.temp }}/approved-testflight-gate/testflight-gate.json
+          EXPECTED_SOURCE: ${{ needs.live-policy-preflight.outputs.source_commit }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_TESTFLIGHT_RUN_ID: ${{ inputs.testflight_run_id }}
+          INPUT_TESTFLIGHT_BUILD_NUMBER: ${{ inputs.testflight_build_number }}
+          EXPECTED_TESTFLIGHT_ARTIFACT_ID: ${{ needs.live-policy-preflight.outputs.testflight_artifact_id }}
+          EXPECTED_TESTFLIGHT_ARTIFACT_DIGEST: ${{ needs.live-policy-preflight.outputs.testflight_artifact_digest }}
+        run: |
+          /usr/bin/python3 -I - "$GATE_PATH" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import stat
+          import sys
+
+          def fail(message):
+              raise SystemExit(message)
+
+          def require(condition, message):
+              if not condition:
+                  fail(message)
+
+          def reject_constant(value):
+              fail(f"TestFlight gate contains non-finite JSON: {value}")
+
+          def unique_object(pairs):
+              value = {}
+              for key, child in pairs:
+                  require(key not in value, f"TestFlight gate repeats key: {key}")
+                  value[key] = child
+              return value
+
+          def evidence(value, label):
+              require(
+                  isinstance(value, dict) and set(value) == {"byteCount", "sha256"},
+                  f"{label} evidence shape differs",
+              )
+              require(
+                  isinstance(value["byteCount"], int)
+                  and not isinstance(value["byteCount"], bool)
+                  and value["byteCount"] > 0,
+                  f"{label} byte count is invalid",
+              )
+              require(
+                  isinstance(value["sha256"], str)
+                  and re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is not None,
+                  f"{label} digest is invalid",
+              )
+
+          REQUIRED_DOGFOOD_CHECKS = {
+              "cancelModelConversion",
+              "cancelPreparation",
+              "cancelTraining",
+              "childTerminationBounded",
+              "colmapPolycamZip",
+              "exportDownloadsAbsentExisting",
+              "exportEvidenceMatchesSource",
+              "exportTmpAbsentExisting",
+              "failedRetrainPreviousResultRelaunch",
+              "folderEmptyUnreadableDeepOversizedMixedWrapped",
+              "importerAddFiles",
+              "importerAddFolders",
+              "importerCancellationAlternation",
+              "importerReplaceFiles",
+              "importerReplaceFolders",
+              "nerfstudioCanonicalTrainOnly",
+              "plyTamperRejected",
+              "previousResultExportShare",
+              "realPhotoViewer",
+              "receiptTamperRejected",
+              "relaunchClean",
+              "replacementPreservation",
+              "secondInstanceReadExport",
+              "shareAppSwitch",
+              "shareClickAway",
+              "shareEscape",
+              "shareSelectedService",
+              "shareTenCycleDiskBaseline",
+              "shareViewerNavigation",
+              "subjectKeyboard",
+              "subjectVoiceOver",
+              "successfulReplacementRetrain",
+              "traversalSymlinkZipReplacement",
+          }
+
+          def exact_object(value, keys, label):
+              require(
+                  isinstance(value, dict) and set(value) == keys,
+                  f"{label} schema differs",
+              )
+              return value
+
+          def validate_dogfood_result(
+              value,
+              *,
+              container,
+              expected_app,
+              expected_package_sha256,
+              expected_source,
+              expected_submission,
+          ):
+              result = exact_object(
+                  value,
+                  {
+                      "app",
+                      "artifacts",
+                      "checks",
+                      "completedAt",
+                      "container",
+                      "host",
+                      "metrics",
+                      "packageSHA256",
+                      "recordType",
+                      "schemaVersion",
+                      "sourceCommit",
+                      "submissionArtifact",
+                      "tester",
+                  },
+                  f"{container} dogfood result",
+              )
+              require(
+                  result["recordType"] == "testflightDogfoodResult"
+                  and result["schemaVersion"] == 1,
+                  f"{container} dogfood result schema differs",
+              )
+              require(result["container"] == container, f"{container} dogfood container differs")
+              require(result["app"] == expected_app, f"{container} dogfood app differs")
+              require(
+                  result["sourceCommit"] == expected_source,
+                  f"{container} dogfood source differs",
+              )
+              require(
+                  result["packageSHA256"] == expected_package_sha256,
+                  f"{container} dogfood package differs",
+              )
+              require(
+                  isinstance(result["packageSHA256"], str)
+                  and re.fullmatch(r"[0-9a-f]{64}", result["packageSHA256"]) is not None,
+                  f"{container} dogfood package digest is invalid",
+              )
+              require(
+                  result["submissionArtifact"] == expected_submission,
+                  f"{container} dogfood submission artifact differs",
+              )
+              require(
+                  isinstance(result["tester"], str)
+                  and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", result["tester"])
+                  is not None,
+                  f"{container} dogfood tester is invalid",
+              )
+              require(
+                  isinstance(result["completedAt"], str)
+                  and re.fullmatch(
+                      r"20[0-9]{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z",
+                      result["completedAt"],
+                  )
+                  is not None,
+                  f"{container} dogfood completion time is invalid",
+              )
+              host = exact_object(
+                  result["host"],
+                  {"containerFingerprintSHA256", "macOSBuild", "machineModel", "testFlightBuild"},
+                  f"{container} dogfood host",
+              )
+              require(
+                  isinstance(host["containerFingerprintSHA256"], str)
+                  and re.fullmatch(r"[0-9a-f]{64}", host["containerFingerprintSHA256"])
+                  is not None,
+                  f"{container} dogfood container fingerprint is invalid",
+              )
+              for key in ("macOSBuild", "machineModel", "testFlightBuild"):
+                  require(
+                      isinstance(host[key], str) and 0 < len(host[key]) <= 128,
+                      f"{container} dogfood host {key} is invalid",
+                  )
+              checks = exact_object(
+                  result["checks"],
+                  REQUIRED_DOGFOOD_CHECKS,
+                  f"{container} dogfood checks",
+              )
+              require(
+                  all(child is True for child in checks.values()),
+                  f"{container} dogfood has a failed or unconfirmed check",
+              )
+              metrics = exact_object(
+                  result["metrics"],
+                  {
+                      "activeShareSessionsAfter",
+                      "cancellationMaxSeconds",
+                      "shareCleanupMaxSeconds",
+                      "shareCycles",
+                      "shareTemporaryBytesAfter",
+                      "shareTemporaryBytesBefore",
+                  },
+                  f"{container} dogfood metrics",
+              )
+              for key, maximum in (
+                  ("cancellationMaxSeconds", 2.0),
+                  ("shareCleanupMaxSeconds", 1.0),
+              ):
+                  child = metrics[key]
+                  require(
+                      not isinstance(child, bool)
+                      and isinstance(child, (int, float))
+                      and 0 <= float(child) <= maximum,
+                      f"{container} dogfood exceeds {key}",
+                  )
+              for key in (
+                  "activeShareSessionsAfter",
+                  "shareCycles",
+                  "shareTemporaryBytesAfter",
+                  "shareTemporaryBytesBefore",
+              ):
+                  child = metrics[key]
+                  require(
+                      isinstance(child, int) and not isinstance(child, bool) and child >= 0,
+                      f"{container} dogfood {key} is invalid",
+                  )
+              require(
+                  metrics["shareCycles"] == 10
+                  and metrics["activeShareSessionsAfter"] == 0
+                  and metrics["shareTemporaryBytesAfter"]
+                  == metrics["shareTemporaryBytesBefore"],
+                  f"{container} dogfood share cleanup gate failed",
+              )
+              artifacts = result["artifacts"]
+              require(
+                  isinstance(artifacts, list) and 2 <= len(artifacts) <= 50,
+                  f"{container} dogfood evidence artifact set is invalid",
+              )
+              artifact_names = set()
+              for index, artifact in enumerate(artifacts):
+                  artifact = exact_object(
+                      artifact,
+                      {"byteCount", "name", "sha256"},
+                      f"{container} dogfood artifact {index}",
+                  )
+                  name = artifact["name"]
+                  require(
+                      isinstance(name, str)
+                      and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name)
+                      is not None
+                      and name not in artifact_names,
+                      f"{container} dogfood artifact name is invalid or repeated",
+                  )
+                  artifact_names.add(name)
+                  require(
+                      isinstance(artifact["byteCount"], int)
+                      and not isinstance(artifact["byteCount"], bool)
+                      and artifact["byteCount"] > 0,
+                      f"{container} dogfood artifact byte count is invalid",
+                  )
+                  require(
+                      isinstance(artifact["sha256"], str)
+                      and re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) is not None,
+                      f"{container} dogfood artifact digest is invalid",
+                  )
+              return result
+
+          path = Path(sys.argv[1])
+          descriptor = os.open(
+              path,
+              os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+          )
+          try:
+              before = os.fstat(descriptor)
+              require(
+                  stat.S_ISREG(before.st_mode)
+                  and before.st_nlink == 1
+                  and 0 < before.st_size <= 64 * 1024,
+                  "approved TestFlight gate is not a bounded ordinary file",
+              )
+              chunks = []
+              remaining = before.st_size
+              while remaining:
+                  chunk = os.read(descriptor, min(64 * 1024, remaining))
+                  require(chunk, "approved TestFlight gate was truncated")
+                  chunks.append(chunk)
+                  remaining -= len(chunk)
+              require(not os.read(descriptor, 1), "approved TestFlight gate grew")
+              after = os.fstat(descriptor)
+          finally:
+              os.close(descriptor)
+          visible = os.lstat(path)
+          identity = lambda item: (
+              item.st_dev,
+              item.st_ino,
+              item.st_mode,
+              item.st_nlink,
+              item.st_size,
+              item.st_mtime_ns,
+              item.st_ctime_ns,
+          )
+          require(
+              identity(before) == identity(after) == identity(visible),
+              "approved TestFlight gate changed while reading",
+          )
+          raw = b"".join(chunks)
+          try:
+              payload = json.loads(
+                  raw.decode("utf-8"),
+                  object_pairs_hook=unique_object,
+                  parse_constant=reject_constant,
+              )
+          except (UnicodeDecodeError, json.JSONDecodeError) as error:
+              fail(f"approved TestFlight gate is invalid JSON: {error}")
+          require(isinstance(payload, dict), "approved TestFlight gate is not an object")
+          require(
+              set(payload)
+              == {
+                  "app",
+                  "dogfood",
+                  "package",
+                  "recordType",
+                  "schemaVersion",
+                  "sidecars",
+                  "sourceCommit",
+                  "submissionArtifact",
+                  "workflow",
+              },
+              "approved TestFlight gate closure differs",
+          )
+          app = payload["app"]
+          require(isinstance(app, dict) and set(app) == {"appleID", "build", "version"}, "approved app identity differs")
+          require(
+              isinstance(app["appleID"], str)
+              and re.fullmatch(r"[1-9][0-9]{5,19}", app["appleID"]) is not None,
+              "approved Apple ID is invalid",
+          )
+          expected_app = {
+              "appleID": app["appleID"],
+              "build": os.environ["INPUT_TESTFLIGHT_BUILD_NUMBER"],
+              "version": os.environ["INPUT_VERSION"],
+          }
+          require(app == expected_app, "approved TestFlight app version or build differs")
+          evidence(payload["package"], "approved package")
+          sidecars = payload["sidecars"]
+          require(
+              isinstance(sidecars, dict)
+              and set(sidecars) == {"processingReceipt", "releaseEvidence", "uploadReceipt"},
+              "approved TestFlight sidecar closure differs",
+          )
+          for name, value in sidecars.items():
+              evidence(value, f"approved {name}")
+          require(
+              payload["recordType"] == "testflightDogfoodGate"
+              and payload["schemaVersion"] == 1,
+              "approved TestFlight gate schema differs",
+          )
+          require(
+              payload["sourceCommit"] == os.environ["EXPECTED_SOURCE"],
+              "approved TestFlight source differs",
+          )
+          submission = payload["submissionArtifact"]
+          require(isinstance(submission, dict) and set(submission) == {"digest", "id"}, "submission artifact identity differs")
+          require(
+              isinstance(submission["id"], str)
+              and re.fullmatch(r"[1-9][0-9]*", submission["id"]) is not None,
+              "submission artifact ID is invalid",
+          )
+          require(
+              isinstance(submission["digest"], str)
+              and re.fullmatch(r"sha256:[0-9a-f]{64}", submission["digest"]) is not None,
+              "submission artifact digest is invalid",
+          )
+          dogfood = exact_object(
+              payload["dogfood"],
+              {"affectedInternalContainer", "approvalEnvironment", "freshContainer"},
+              "approved dogfood closure",
+          )
+          require(
+              dogfood["approvalEnvironment"] == "testflight-dogfood",
+              "approved dogfood environment differs",
+          )
+          fresh = validate_dogfood_result(
+              dogfood["freshContainer"],
+              container="fresh",
+              expected_app=expected_app,
+              expected_package_sha256=payload["package"]["sha256"],
+              expected_source=os.environ["EXPECTED_SOURCE"],
+              expected_submission=submission,
+          )
+          affected = validate_dogfood_result(
+              dogfood["affectedInternalContainer"],
+              container="affectedInternal",
+              expected_app=expected_app,
+              expected_package_sha256=payload["package"]["sha256"],
+              expected_source=os.environ["EXPECTED_SOURCE"],
+              expected_submission=submission,
+          )
+          require(
+              fresh["host"]["containerFingerprintSHA256"]
+              != affected["host"]["containerFingerprintSHA256"],
+              "fresh and affected dogfood results name the same app container",
+          )
+          workflow = payload["workflow"]
+          require(isinstance(workflow, dict) and set(workflow) == {"runAttempt", "runID"}, "TestFlight workflow identity differs")
+          require(workflow["runID"] == os.environ["INPUT_TESTFLIGHT_RUN_ID"], "approved TestFlight run differs")
+          require(
+              isinstance(workflow["runAttempt"], str)
+              and re.fullmatch(r"[1-9][0-9]*", workflow["runAttempt"]) is not None,
+              "approved TestFlight attempt is invalid",
+          )
+          require(
+              raw
+              == (
+                  json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                  + "\n"
+              ).encode("utf-8"),
+              "approved TestFlight gate is not canonical JSON",
+          )
+          PY
 
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -375,31 +871,30 @@ jobs:
           actionlint
           gitleaks git --redact
 
-      - name: Fetch signed toolchain closure
+      - name: Stage the toolchain tree the app will carry
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          test -s EasySplatApp/Resources/public_key_ed25519.txt
-          rm -rf Toolchains/out
-          mkdir -p Toolchains/out
+          # The app embeds these bytes, so the build stages the tree itself
+          # rather than handing an archive to an installer.
+          TOOLCHAIN_DOWNLOAD="$RUNNER_TEMP/easysplat-toolchain-download"
+          TOOLCHAIN_OUT="$RUNNER_TEMP/easysplat-toolchain-out"
+          test ! -e "$TOOLCHAIN_DOWNLOAD"
+          test ! -e "$TOOLCHAIN_OUT"
+          mkdir -m 0700 "$TOOLCHAIN_DOWNLOAD" "$TOOLCHAIN_OUT"
           gh release download "$TOOLCHAIN_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --dir Toolchains/out \
-            --pattern manifest.json \
-            --pattern toolchain-release-request.json \
-            --pattern toolchain-authority-envelope.json \
-            --pattern toolchain-authority-receipt.json \
-            --pattern toolchain-benchmark-evidence.json \
-            --pattern "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
-            --pattern "toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
-            --pattern "toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"
-          mv Toolchains/out/manifest.json Toolchains/manifest.json
-          install -m 0644 \
-            EasySplatApp/Resources/public_key_ed25519.txt \
-            Toolchains/public_key_ed25519.txt
-          cmp -s \
-            EasySplatApp/Resources/public_key_ed25519.txt \
-            Toolchains/public_key_ed25519.txt
+            --dir "$TOOLCHAIN_DOWNLOAD" \
+            --pattern "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip"
+          /usr/bin/ditto --noqtn -x -k \
+            "$TOOLCHAIN_DOWNLOAD/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
+            "$TOOLCHAIN_OUT"
+          for required in bin/colmap bin/easysplat-train bin/default.metallib \
+            lib/libomp.dylib supply-chain/components.json; do
+            test -f "$TOOLCHAIN_OUT/$required"
+          done
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          printf 'TOOLCHAIN_OUT=%s\n' "$TOOLCHAIN_OUT" >>"$GITHUB_ENV"
 
       - name: Prepare data-only uncredentialed app handoff
         run: |
@@ -415,35 +910,13 @@ jobs:
           mkdir -m 0700 \
             "$PREPARED_ROOT/product" \
             "$PREPARED_ROOT/toolchain"
-          mkdir -m 0700 "$PREPARED_ROOT/toolchain/out"
-          install -m 0600 Toolchains/manifest.json "$PREPARED_ROOT/toolchain/manifest.json"
-          install -m 0600 Toolchains/public_key_ed25519.txt "$PREPARED_ROOT/toolchain/public_key_ed25519.txt"
-          for name in \
-            "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
-            "toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
-            "toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip" \
-            toolchain-release-request.json \
-            toolchain-authority-envelope.json \
-            toolchain-authority-receipt.json \
-            toolchain-benchmark-evidence.json; do
-            install -m 0600 "Toolchains/out/$name" "$PREPARED_ROOT/toolchain/out/$name"
-          done
-          MANIFEST_TOOL_BUILD="$RUNNER_TEMP/easysplat-manifest-tool-build"
-          /usr/bin/swift build \
-            -c release \
-            --package-path Tools/ManifestTool \
-            --scratch-path "$MANIFEST_TOOL_BUILD" \
-            --product ManifestTool
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TOOLCHAIN_TAG"
+          /usr/bin/ditto --noqtn "$TOOLCHAIN_OUT" "$PREPARED_ROOT/toolchain/out"
           scripts/release/build_app.sh \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --public-key-path "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
+            --toolchain-dir "$PREPARED_ROOT/toolchain/out" \
             --version "$VERSION" \
-            --bootstrap-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
-            --bootstrap-core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
             --project-url "https://github.com/$GITHUB_REPOSITORY" \
             --build-root "$PREPARED_BUILD" \
-            --manifest-tool-bin "$MANIFEST_TOOL_BUILD/release/ManifestTool" \
+            --source-commit "$GITHUB_SHA" \
             --prepare-release
           /usr/bin/ditto --noqtn \
             "$PREPARED_BUILD/Export/EasySplat.app" \
@@ -559,21 +1032,6 @@ jobs:
           test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
           test "$(git rev-parse "v${{ inputs.version }}^{commit}")" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
-          TRUSTED_BUILD="$RUNNER_TEMP/easysplat-trusted-manifest-tool"
-          test ! -e "$TRUSTED_BUILD"
-          DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-            /usr/bin/swift build \
-              -c release \
-              --package-path Tools/ManifestTool \
-              --scratch-path "$TRUSTED_BUILD" \
-              --product ManifestTool
-          TRUSTED_AUTHORITY="$RUNNER_TEMP/easysplat-trusted-signing-authority"
-          test ! -e "$TRUSTED_AUTHORITY"
-          mkdir -m 0700 "$TRUSTED_AUTHORITY"
-          install -m 0500 \
-            "$TRUSTED_BUILD/release/ManifestTool" \
-            "$TRUSTED_AUTHORITY/ManifestTool"
-          echo "TRUSTED_MANIFEST_TOOL=$TRUSTED_AUTHORITY/ManifestTool" >>"$GITHUB_ENV"
 
       - name: Download exact prepared release
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -711,7 +1169,6 @@ jobs:
           PREPARED_ROOT="$RUNNER_TEMP/prepared-extract/easysplat-prepared-release"
           SIGNED_OUTPUT="$RUNNER_TEMP/easysplat-signed-output"
           SIGNING_BUILD="$RUNNER_TEMP/easysplat-signing-build"
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
           /usr/bin/env -i \
             HOME="$HOME" \
             USER="$USER" \
@@ -722,18 +1179,12 @@ jobs:
             "$GITHUB_WORKSPACE/scripts/release/build_dmg.sh" \
             --app-version "${{ inputs.version }}" \
             --toolchain-version "${{ inputs.toolchain_version }}" \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --core-artifact-url "$BASE_URL/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
-            --da3-base-artifact-url "$BASE_URL/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
-            --da3-small-artifact-url "$BASE_URL/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
             --project-url "https://github.com/$GITHUB_REPOSITORY" \
             --build-root "$SIGNING_BUILD" \
             --output-dir "$SIGNED_OUTPUT" \
             --prepared-release-root "$PREPARED_ROOT" \
             --prepared-manifest-sha256 "$PREPARED_MANIFEST_SHA256" \
             --source-commit "$GITHUB_SHA" \
-            --manifest-tool-bin "$TRUSTED_MANIFEST_TOOL" \
-            --use-existing-toolchain \
             --production \
             --identity-fingerprint "$EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1" \
             --team-id "$EASYSPLAT_DEVELOPER_TEAM_ID" \
@@ -919,7 +1370,6 @@ jobs:
           /usr/bin/syspolicy_check distribution "$INSTALL" \
             >"$EVIDENCE/syspolicy.txt" 2>&1
           PREPARED_ROOT="$RUNNER_TEMP/prepared-extract/easysplat-prepared-release"
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
           FIXTURE_ROOT="$RUNNER_TEMP/easysplat-release-fixture"
           test ! -e "$FIXTURE_ROOT"
           /usr/bin/python3 -I "$GITHUB_WORKSPACE/scripts/release/generate_release_fixture.py" generate \
@@ -931,13 +1381,6 @@ jobs:
           cmp -s \
             "$EVIDENCE/release-fixture-generation.json" \
             "$EVIDENCE/release-fixture-preflight.json"
-          ONLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-online-toolchains"
-          OFFLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-offline-toolchains"
-          CACHED_CACHE_ROOT="$RUNNER_TEMP/easysplat-release-cached-toolchains"
-          mkdir -m 0700 \
-            "$ONLINE_CACHE_ROOT" \
-            "$OFFLINE_CACHE_ROOT" \
-            "$CACHED_CACHE_ROOT"
           "$GITHUB_WORKSPACE/scripts/release/verify_release.sh" \
             --app "$INSTALL" \
             --dmg "$DMG" \
@@ -951,19 +1394,9 @@ jobs:
             --packaged-app-smoke \
             --source-url "https://github.com/$GITHUB_REPOSITORY" \
             --source-commit "$GITHUB_SHA" \
-            --release-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
-            --core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
-            --da3-base-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
-            --da3-small-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
+            --toolchain-dir "$PREPARED_ROOT/toolchain/out" \
             --fixture "$FIXTURE_ROOT" \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --public-key-file "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
-            --toolchain-root "$ONLINE_CACHE_ROOT" \
             --e2e-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
-            --offline-cache-root "$OFFLINE_CACHE_ROOT" \
-            --offline-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
-            --cached-cache-root "$CACHED_CACHE_ROOT" \
-            --cached-runner "$EASYSPLAT_TRUSTED_RELEASE_VERIFIER" \
             --evidence-dir "$EVIDENCE/full-verification"
           HOME="$HOME_ROOT" TMPDIR="$HOME_ROOT" /usr/bin/open -n "$INSTALL"
           sleep 5
@@ -1120,11 +1553,6 @@ jobs:
           cmp -s \
             "$EVIDENCE/release-fixture-generation.json" \
             "$EVIDENCE/release-fixture-preflight.json"
-          ONLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-online-toolchains"
-          OFFLINE_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-offline-toolchains"
-          CACHED_CACHE_ROOT="$RUNNER_TEMP/easysplat-macos15-cached-toolchains"
-          mkdir -m 0700 "$ONLINE_CACHE_ROOT" "$OFFLINE_CACHE_ROOT" "$CACHED_CACHE_ROOT"
-          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v${{ inputs.toolchain_version }}"
           scripts/release/verify_release.sh \
             --app "$INSTALL" \
             --dmg "$DMG" \
@@ -1138,19 +1566,9 @@ jobs:
             --packaged-app-smoke \
             --source-url "https://github.com/$GITHUB_REPOSITORY" \
             --source-commit "$GITHUB_SHA" \
-            --release-manifest "$PREPARED_ROOT/toolchain/manifest.json" \
-            --core-archive "$PREPARED_ROOT/toolchain/out/toolchain-macos-arm64-${{ inputs.toolchain_version }}-core.zip" \
-            --da3-base-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-base-${{ inputs.toolchain_version }}.zip" \
-            --da3-small-archive "$PREPARED_ROOT/toolchain/out/toolchain-geometry-da3-small-${{ inputs.toolchain_version }}.zip" \
+            --toolchain-dir "$PREPARED_ROOT/toolchain/out" \
             --fixture "$FIXTURE_ROOT" \
-            --manifest-url "$BASE_URL/manifest.json" \
-            --public-key-file "$PREPARED_ROOT/toolchain/public_key_ed25519.txt" \
-            --toolchain-root "$ONLINE_CACHE_ROOT" \
             --e2e-runner "$VERIFIER_BIN" \
-            --offline-cache-root "$OFFLINE_CACHE_ROOT" \
-            --offline-runner "$VERIFIER_BIN" \
-            --cached-cache-root "$CACHED_CACHE_ROOT" \
-            --cached-runner "$VERIFIER_BIN" \
             --evidence-dir "$EVIDENCE/full-verification"
           {
             echo "source_commit=$GITHUB_SHA"
@@ -1310,7 +1728,7 @@ jobs:
             --release-mode production
             --bundle "$RUNNER_TEMP/build-bundle"
             --output "$PUBLICATION"
-            --toolchain-public-key EasySplatApp/Resources/public_key_ed25519.txt
+            --toolchain-public-key scripts/release/toolchain_authority_public_key.txt
             --app-version "${{ inputs.version }}"
             --toolchain-version "${{ inputs.toolchain_version }}"
             --source-repository "$GITHUB_REPOSITORY"
@@ -1405,10 +1823,13 @@ jobs:
           EXPECTED_LIBYAML_VERSION = [0, 2, 1].freeze
           MAXIMUM_INPUT_BYTES = 8 * 1024 * 1024
           RELEASE_WORKFLOW = ".github/workflows/release-app.yml"
+          TESTFLIGHT_WORKFLOW = ".github/workflows/release-testflight.yml"
           ADMIN_TOKEN = /(?<![A-Za-z0-9_])EASYSPLAT_RELEASE_ADMIN_TOKEN(?![A-Za-z0-9_])/i
           SIGNING_SECRET = /(?<![A-Za-z0-9_])EASYSPLAT_(?:DEVELOPER_ID_APPLICATION_SHA1|DEVELOPER_TEAM_ID|NOTARY_KEYCHAIN_PROFILE)(?![A-Za-z0-9_])/i
           SIGNING_ENVIRONMENT = /(?<![A-Za-z0-9_-])release-signing(?![A-Za-z0-9_-])/i
           RELEASE_ENVIRONMENT = /(?<![A-Za-z0-9_-])release-publication(?![A-Za-z0-9_-])/i
+          TESTFLIGHT_SECRET = /(?<![A-Za-z0-9_])EASYSPLAT_(?:APPLE_DISTRIBUTION_SHA1|MAC_INSTALLER_DISTRIBUTION_SHA1|MAS_PROVISIONING_PROFILE_BASE64|MAS_TEAM_ID|ASC_KEY_ID|ASC_ISSUER_ID|ASC_PRIVATE_KEY_BASE64)(?![A-Za-z0-9_])/i
+          TESTFLIGHT_ENVIRONMENT = /(?<![A-Za-z0-9_-])testflight-(?:signing|submission|dogfood)(?![A-Za-z0-9_-])/i
           DYNAMIC_SECRET_INDEX = /(?<![A-Za-z0-9_])secrets\s*\[/i
 
 
@@ -1446,7 +1867,7 @@ jobs:
                 end
               end
 
-              audit_release_boundary(root, jobs_entry&.last) unless @path == RELEASE_WORKFLOW
+              audit_authority_boundary(root, jobs_entry&.last)
             rescue Psych::SyntaxError => error
               fail!("invalid YAML: #{error.message}")
             end
@@ -1527,12 +1948,21 @@ jobs:
               end
             end
 
-            def audit_release_boundary(root, jobs)
+            def audit_authority_boundary(root, jobs)
               each_string(root) do |value|
-                if ADMIN_TOKEN.match?(value) || SIGNING_SECRET.match?(value) ||
-                   SIGNING_ENVIRONMENT.match?(value) || RELEASE_ENVIRONMENT.match?(value) ||
-                   DYNAMIC_SECRET_INDEX.match?(value)
-                  fail!("workflow can enter the release authority boundary")
+                release_secret = ADMIN_TOKEN.match?(value) || SIGNING_SECRET.match?(value)
+                release_authority = release_secret || SIGNING_ENVIRONMENT.match?(value) || RELEASE_ENVIRONMENT.match?(value)
+                testflight_secret = TESTFLIGHT_SECRET.match?(value)
+                testflight_authority = testflight_secret || TESTFLIGHT_ENVIRONMENT.match?(value)
+                forbidden = if @path == RELEASE_WORKFLOW
+                              testflight_secret
+                            elsif @path == TESTFLIGHT_WORKFLOW
+                              release_authority
+                            else
+                              release_authority || testflight_authority
+                            end
+                if forbidden || DYNAMIC_SECRET_INDEX.match?(value)
+                  fail!("workflow can enter another authority boundary")
                 end
               end
               return unless jobs.is_a?(Hash)
@@ -1543,8 +1973,19 @@ jobs:
                 environment = environment_entry.last
                 environment = policy_entry(environment, "name", "job #{job_name.inspect} environment")&.last if environment.is_a?(Hash)
                 if environment.is_a?(String) && environment.include?("$" + "{{")
-                  fail!("job #{job_name.inspect} computes its release environment")
+                  fail!("job #{job_name.inspect} computes its authority environment")
                 end
+                next unless environment.is_a?(String)
+                release_environment = SIGNING_ENVIRONMENT.match?(environment) || RELEASE_ENVIRONMENT.match?(environment)
+                testflight_environment = TESTFLIGHT_ENVIRONMENT.match?(environment)
+                forbidden = if @path == RELEASE_WORKFLOW
+                              testflight_environment
+                            elsif @path == TESTFLIGHT_WORKFLOW
+                              release_environment
+                            else
+                              release_environment || testflight_environment
+                            end
+                fail!("job #{job_name.inspect} enters another authority environment") if forbidden
               end
             end
 
@@ -1651,6 +2092,9 @@ jobs:
               "verification_environment",
               "signing_environment",
               "release_environment",
+              "testflight_signing_environment",
+              "testflight_submission_environment",
+              "testflight_dogfood_environment",
               "authority",
               "collaborators",
               "keys",
@@ -2032,6 +2476,9 @@ jobs:
               environment_is_protected(snapshot["verification_environment"], "release-verification", authority_login)
               environment_is_protected(snapshot["signing_environment"], "release-signing", authority_login)
               environment_is_protected(snapshot["release_environment"], "release-publication", authority_login)
+              environment_is_protected(snapshot["testflight_signing_environment"], "testflight-signing", authority_login)
+              environment_is_protected(snapshot["testflight_submission_environment"], "testflight-submission", authority_login)
+              environment_is_protected(snapshot["testflight_dogfood_environment"], "testflight-dogfood", authority_login)
 
               collaborators = snapshot["collaborators"]
               require(isinstance(collaborators, list) and collaborators, "repository collaborator authority cannot be proven")
@@ -2109,6 +2556,9 @@ jobs:
               verification_environment = api(f"repos/{repository}/environments/release-verification")
               signing_environment = api(f"repos/{repository}/environments/release-signing")
               release_environment = api(f"repos/{repository}/environments/release-publication")
+              testflight_signing_environment = api(f"repos/{repository}/environments/testflight-signing")
+              testflight_submission_environment = api(f"repos/{repository}/environments/testflight-submission")
+              testflight_dogfood_environment = api(f"repos/{repository}/environments/testflight-dogfood")
               authority = api("/user")
 
               collaborator_endpoint = f"repos/{repository}/collaborators?affiliation=all&per_page=100"
@@ -2153,6 +2603,9 @@ jobs:
                   "verification_environment": verification_environment,
                   "signing_environment": signing_environment,
                   "release_environment": release_environment,
+                  "testflight_signing_environment": testflight_signing_environment,
+                  "testflight_submission_environment": testflight_submission_environment,
+                  "testflight_dogfood_environment": testflight_dogfood_environment,
                   "authority": authority,
                   "collaborators": collaborators,
                   "keys": keys,

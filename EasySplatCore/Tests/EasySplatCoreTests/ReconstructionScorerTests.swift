@@ -105,6 +105,69 @@ final class ReconstructionScorerTests: XCTestCase {
         }
     }
 
+    func testViablePartialRegistrationAcceptsCoverageShortfallsWithSoundQuality() {
+        // The user's terminal shape: 16 of 18 admitted photos, good geometry.
+        let shortfall = ReconstructionScore(
+            registeredImages: 16,
+            totalImages: 22,
+            meanReprojectionError: 0.74,
+            pointCount: 1_712,
+            observationCount: 6_307,
+            meanTrackLength: 3.68
+        )
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            shortfall,
+            admittedTotalImages: 18,
+            capturePath: .automatic
+        ))
+        XCTAssertTrue(ReconstructionScorer.isViablePartialRegistration(
+            shortfall,
+            admittedTotalImages: 18,
+            capturePath: .automatic
+        ))
+
+        // Below the viable floor, above the admitted count, or with a real
+        // quality defect, the shortfall stays rejected.
+        var belowViableFloor = shortfall
+        belowViableFloor.registeredImages = 7
+        XCTAssertFalse(ReconstructionScorer.isViablePartialRegistration(
+            belowViableFloor,
+            admittedTotalImages: 18,
+            capturePath: .automatic
+        ))
+        XCTAssertFalse(ReconstructionScorer.isViablePartialRegistration(
+            shortfall,
+            admittedTotalImages: 15,
+            capturePath: .automatic
+        ))
+        XCTAssertFalse(ReconstructionScorer.isViablePartialRegistration(
+            shortfall,
+            admittedTotalImages: 0,
+            capturePath: .automatic
+        ))
+        var badReprojection = shortfall
+        badReprojection.meanReprojectionError = 2.6
+        XCTAssertFalse(ReconstructionScorer.isViablePartialRegistration(
+            badReprojection,
+            admittedTotalImages: 18,
+            capturePath: .automatic
+        ))
+        var pointless = shortfall
+        pointless.pointCount = 0
+        XCTAssertFalse(ReconstructionScorer.isViablePartialRegistration(
+            pointless,
+            admittedTotalImages: 18,
+            capturePath: .automatic
+        ))
+        var trackless = shortfall
+        trackless.meanTrackLength = 0
+        XCTAssertFalse(ReconstructionScorer.isViablePartialRegistration(
+            trackless,
+            admittedTotalImages: 18,
+            capturePath: .automatic
+        ))
+    }
+
     func testAcceptableRejectsTracklessSparseModel() {
         let score = ReconstructionScore(
             registeredImages: 90,

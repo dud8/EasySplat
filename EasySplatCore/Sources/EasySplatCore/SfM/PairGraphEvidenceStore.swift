@@ -23,7 +23,7 @@ struct PairGraphPlanBinding: Codable, Sendable, Equatable {
         let temporalPolicyIsCoherent = (temporalPairing == .none)
             == temporalOffsets.isEmpty
         let backendIsCoherent = switch geometryBackend {
-        case .colmap:
+        case .colmap, .importedPoses:
             modelIdentifier == "none"
         case .da3:
             modelIdentifier == "DA3-BASE" || modelIdentifier == "DA3-SMALL"
@@ -392,6 +392,53 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
         )
     }
 
+    /// Views matching admitted to mapping: the dominant verified component
+    /// when the graph did not fully connect, else every selected view. Nil
+    /// only for evidence that fails the admissibility contract.
+    var admittedViewCount: Int? {
+        PairGraphConnectivityPolicy.admissibleDominantViewCount(
+            totalViewCount: imageNames.count,
+            componentViewCounts: acceptedInspection.componentViewCounts,
+            connectedComponentCount: acceptedInspection.connectedComponentCount,
+            isolatedViewCount: acceptedInspection.isolatedViewCount,
+            descriptorlessViewCount: acceptedInspection.descriptorlessViewCount
+        )
+    }
+
+    /// Members of the dominant verified component, derived from the persisted
+    /// verified pair list. Returns nil when the graph connects every view or
+    /// when the derivation disagrees with the persisted component sizes.
+    func dominantComponentImageNames() -> Set<String>? {
+        let expectedDominant = acceptedInspection.componentViewCounts.first ?? 0
+        guard expectedDominant >= 2, expectedDominant < imageNames.count else {
+            return nil
+        }
+        var adjacency: [String: Set<String>] = [:]
+        for pair in acceptedInspection.spatiallyVerifiedPairs {
+            adjacency[pair.firstImageName, default: []].insert(pair.secondImageName)
+            adjacency[pair.secondImageName, default: []].insert(pair.firstImageName)
+        }
+        var visited: Set<String> = []
+        var dominant: Set<String> = []
+        for imageName in imageNames where !visited.contains(imageName) {
+            visited.insert(imageName)
+            var component: Set<String> = [imageName]
+            var pending = [imageName]
+            while let current = pending.popLast() {
+                for neighbor in adjacency[current, default: []]
+                    where visited.insert(neighbor).inserted {
+                    component.insert(neighbor)
+                    pending.append(neighbor)
+                }
+            }
+            if component.count > dominant.count {
+                dominant = component
+            }
+        }
+        guard dominant.count == expectedDominant else { return nil }
+        return dominant
+    }
+
     static func digest(of pairs: [ColmapScheduledPair]) -> String {
         let data = pairs.isEmpty
             ? Data()
@@ -732,7 +779,8 @@ enum PairGraphEvidenceStore {
         }
         let acceptedAttempt = evidence.attempts.last
         guard isSHA256(evidence.selectedFramesDigest),
-              evidence.planBinding.geometryBackend == .colmap,
+              evidence.planBinding.geometryBackend == .colmap
+                || evidence.planBinding.geometryBackend == .importedPoses,
               evidence.planBinding.pairingPolicy == evidence.pairingPolicy,
               evidence.planBinding.isStructurallyValid,
               evidence.planBinding.normalDescriptorMatcher == .faiss,
@@ -1146,7 +1194,8 @@ enum PairGraphEvidenceStore {
     ) throws {
         try validate(evidence)
         guard evidence.planBinding == PairGraphPlanBinding(resolvedPlan),
-              resolvedPlan.geometryBackend == .colmap,
+              resolvedPlan.geometryBackend == .colmap
+                || resolvedPlan.geometryBackend == .importedPoses,
               resolvedPlan.normalDescriptorMatcher == .faiss else {
             throw PairGraphEvidenceStoreError.invalidEvidence
         }
@@ -1477,7 +1526,7 @@ enum PairGraphEvidenceStore {
               descriptorlessViewCount < imageCount else {
             throw PairGraphEvidenceStoreError.invalidEvidence
         }
-        guard let dominantViewCount = PairGraphConnectivityPolicy.dominantViewCount(
+        guard let dominantViewCount = PairGraphConnectivityPolicy.admissibleDominantViewCount(
             totalViewCount: imageCount,
             componentViewCounts: inspection.componentViewCounts,
             connectedComponentCount: inspection.connectedComponentCount,
@@ -1489,9 +1538,11 @@ enum PairGraphEvidenceStore {
         let hasMinorVerifiedComponent = inspection.componentViewCounts
             .dropFirst()
             .contains { $0 > 1 }
-        if hasMinorVerifiedComponent {
-            guard isOrdered(pairingPolicy),
-                  attempt.artifact.recoveryLevel != .normal else {
+        if hasMinorVerifiedComponent, isOrdered(pairingPolicy) {
+            // Ordered policies only ever accept minor verified components
+            // past the normal recovery level. Unordered policies reach them
+            // through the terminal viable acceptance at any level.
+            guard attempt.artifact.recoveryLevel != .normal else {
                 throw PairGraphEvidenceStoreError.invalidEvidence
             }
         }

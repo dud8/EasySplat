@@ -98,8 +98,6 @@ public struct PackagedProjectArguments: Equatable, Sendable {
     public let inputManifestURL: URL
     public let inputRootURL: URL
     public let marker: URL
-    public let publicKeyFile: URL
-    public let expectedManifest: URL
     public let appVersion: String
     public let expectedReleaseVerificationTokenSHA256: String
     public let expectedExecutable: URL
@@ -110,8 +108,7 @@ public struct PackagedProjectArguments: Equatable, Sendable {
     public static let usage = "Usage: EasySplatReleaseVerifier verify-packaged-project "
         + "--project <root.easysplatproj> "
         + "--input-manifest <schema1.json> --input-root <directory> "
-        + "--marker <schema3.json> --public-key-file <file> "
-        + "--expected-manifest <manifest.json> --app-version <semver> "
+        + "--marker <schema3.json> --app-version <semver> "
         + "--expected-release-verification-token-sha256 <sha256> "
         + "--expected-executable <file> --expected-executable-sha256 <sha256> "
         + "--expected-executable-bytes <bytes> --evidence <attestation.md>"
@@ -120,7 +117,7 @@ public struct PackagedProjectArguments: Equatable, Sendable {
         var values: [String: String] = [:]
         let allowed: Set<String> = [
             "--project", "--input-manifest", "--input-root",
-            "--marker", "--public-key-file", "--expected-manifest", "--app-version",
+            "--marker", "--app-version",
             "--expected-release-verification-token-sha256", "--expected-executable",
             "--expected-executable-sha256", "--expected-executable-bytes", "--evidence",
         ]
@@ -137,8 +134,6 @@ public struct PackagedProjectArguments: Equatable, Sendable {
         }
         guard let project = values["--project"],
               let marker = values["--marker"],
-              let publicKeyFile = values["--public-key-file"],
-              let expectedManifest = values["--expected-manifest"],
               let appVersion = values["--app-version"],
               let expectedTokenSHA256 = values[
                 "--expected-release-verification-token-sha256"
@@ -163,8 +158,6 @@ public struct PackagedProjectArguments: Equatable, Sendable {
             inputManifest,
             inputRoot,
             marker,
-            publicKeyFile,
-            expectedManifest,
             expectedExecutable,
             evidence,
         ].compactMap { $0 }
@@ -177,8 +170,6 @@ public struct PackagedProjectArguments: Equatable, Sendable {
             inputManifestURL: URL(fileURLWithPath: inputManifest),
             inputRootURL: URL(fileURLWithPath: inputRoot, isDirectory: true),
             marker: URL(fileURLWithPath: marker),
-            publicKeyFile: URL(fileURLWithPath: publicKeyFile),
-            expectedManifest: URL(fileURLWithPath: expectedManifest),
             appVersion: appVersion,
             expectedReleaseVerificationTokenSHA256: expectedTokenSHA256,
             expectedExecutable: URL(fileURLWithPath: expectedExecutable),

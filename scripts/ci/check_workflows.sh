@@ -8,6 +8,7 @@ TESTS="$ROOT/.github/workflows/tests.yml"
 SECURITY="$ROOT/.github/workflows/security.yml"
 CODEQL="$ROOT/.github/workflows/codeql.yml"
 RELEASE_GATE="$ROOT/.github/workflows/release-app.yml"
+TESTFLIGHT_GATE="$ROOT/.github/workflows/release-testflight.yml"
 TOOLCHAIN_GATE="$ROOT/.github/workflows/toolchain-build.yml"
 TOOLCHAIN_PUBLISH="$ROOT/.github/workflows/toolchain-publish.yml"
 BENCHMARK_GATE="$ROOT/.github/workflows/benchmark-release.yml"
@@ -45,7 +46,7 @@ require_job_count() {
   [ "$count" -eq "$expected" ] || fail "${file#"$ROOT/"} must contain exactly $expected jobs"
 }
 
-for workflow in "$TESTS" "$SECURITY" "$CODEQL" "$RELEASE_GATE" "$TOOLCHAIN_GATE" "$TOOLCHAIN_PUBLISH" "$BENCHMARK_GATE"; do
+for workflow in "$TESTS" "$SECURITY" "$CODEQL" "$RELEASE_GATE" "$TESTFLIGHT_GATE" "$TOOLCHAIN_GATE" "$TOOLCHAIN_PUBLISH" "$BENCHMARK_GATE"; do
   require_file "$workflow"
 done
 
@@ -159,6 +160,7 @@ fi
 require_line '^[[:space:]]+security-events: write$' "$CODEQL"
 
 require_job_count "$RELEASE_GATE" 8
+require_job_count "$TESTFLIGHT_GATE" 4
 require_line '^  workflow_dispatch:$' "$RELEASE_GATE"
 for job in \
   live-policy-preflight \
@@ -273,9 +275,13 @@ for contract in \
   'release-authority.json' \
   'benchmark_artifact_id=' \
   'benchmark_artifact_digest=' \
+  'testflight_artifact_id=' \
+  'testflight_artifact_digest=' \
+  'easysplat-testflight-gate-' \
   'repos/$GITHUB_REPOSITORY/branches/main' \
   'repos/$GITHUB_REPOSITORY/commits/main' \
-  '.github/workflows/benchmark-release.yml'; do
+  '.github/workflows/benchmark-release.yml' \
+  '.github/workflows/release-testflight.yml'; do
   grep -Fq -- "$contract" <<<"$preflight_release_block" \
     || fail "live release preflight is missing: $contract"
 done
@@ -306,12 +312,110 @@ for contract in \
   'authority_artifact_id' \
   'authority_artifact_digest' \
   'release-authority.json' \
+  'Download exact approved TestFlight gate' \
+  'payload["recordType"] == "testflightDogfoodGate"' \
+  'REQUIRED_DOGFOOD_CHECKS' \
+  'container="fresh"' \
+  'container="affectedInternal"' \
   '0valididentitiesfound'; do
   grep -Fq -- "$contract" <<<"$prepare_release_block" \
     || fail "identity-free builder attestation is missing: $contract"
 done
 if grep -Eq 'environment: release-(signing|release)|contents: write|EASYSPLAT_(RELEASE_ADMIN_TOKEN|DEVELOPER_ID_APPLICATION_SHA1|DEVELOPER_TEAM_ID|NOTARY_KEYCHAIN_PROFILE)' <<<"$prepare_release_block"; then
   fail "uncredentialed release preparation must not enter signing or publication authority"
+fi
+
+testflight_authorize_block="$(sed -n '/^  authorize-source:/,/^  build-store-package:/p' "$TESTFLIGHT_GATE")"
+testflight_build_block="$(sed -n '/^  build-store-package:/,/^  submit-testflight:/p' "$TESTFLIGHT_GATE")"
+testflight_submission_block="$(sed -n '/^  submit-testflight:/,/^  approve-dogfood:/p' "$TESTFLIGHT_GATE")"
+testflight_dogfood_block="$(sed -n '/^  approve-dogfood:/,$p' "$TESTFLIGHT_GATE")"
+for contract in \
+  'workflow_dispatch:' \
+  'group: testflight-publication' \
+  'cancel-in-progress: false'; do
+  require_text "$contract" "$TESTFLIGHT_GATE"
+done
+if grep -Eq '^[[:space:]]+(push|pull_request):' "$TESTFLIGHT_GATE"; then
+  fail "TestFlight publication must be manually dispatched from protected main"
+fi
+for contract in \
+  "github.ref == 'refs/heads/main'" \
+  'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"' \
+  'test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"' \
+  'test "$(git rev-parse "v$VERSION^{commit}")" = "$GITHUB_SHA"' \
+  'repos/$GITHUB_REPOSITORY/branches/main'; do
+  grep -Fq -- "$contract" <<<"$testflight_authorize_block" \
+    || fail "TestFlight source authorization is missing: $contract"
+done
+for contract in \
+  'environment: testflight-signing' \
+  'runs-on: [self-hosted, macOS, ARM64, easysplat-signing, easysplat-ephemeral]' \
+  'test "$(/usr/bin/uname -m)" = "arm64"' \
+  'scripts/release/build_app.sh' \
+  '--app-store' \
+  '--source-commit "$GITHUB_SHA"' \
+  'scripts/release/build_mas_package.sh' \
+  'mas_release_evidence.py verify'; do
+  grep -Fq -- "$contract" <<<"$testflight_build_block" \
+    || fail "TestFlight Store package production is missing: $contract"
+done
+for secret in \
+  EASYSPLAT_APPLE_DISTRIBUTION_SHA1 \
+  EASYSPLAT_MAC_INSTALLER_DISTRIBUTION_SHA1 \
+  EASYSPLAT_MAS_PROVISIONING_PROFILE_BASE64 \
+  EASYSPLAT_MAS_TEAM_ID; do
+  [ "$(grep -Fc "secrets.$secret" <<<"$testflight_build_block")" -eq 1 ] \
+    || fail "$secret must enter exactly one TestFlight signing step"
+  if grep -Fq "secrets.$secret" <<<"$testflight_submission_block$testflight_dogfood_block"; then
+    fail "$secret escaped the TestFlight signing job"
+  fi
+done
+for contract in \
+  'environment: testflight-submission' \
+  'scripts/release/upload_mas_package.sh' \
+  '--upload' \
+  '--apple-id "${{ inputs.apple_id }}"' \
+  '--bundle-version "${{ inputs.build_number }}"' \
+  'mas_release_evidence.py verify-processing' \
+  '"$PACKAGE.upload.json"' \
+  '"$PACKAGE.processing.json"'; do
+  grep -Fq -- "$contract" <<<"$testflight_submission_block" \
+    || fail "TestFlight terminal submission is missing: $contract"
+done
+for secret in \
+  EASYSPLAT_ASC_KEY_ID \
+  EASYSPLAT_ASC_ISSUER_ID \
+  EASYSPLAT_ASC_PRIVATE_KEY_BASE64; do
+  [ "$(grep -Fc "secrets.$secret" <<<"$testflight_submission_block")" -eq 1 ] \
+    || fail "$secret must enter exactly one TestFlight submission step"
+  if grep -Fq "secrets.$secret" <<<"$testflight_build_block$testflight_dogfood_block" \
+      || grep -Fq "secrets.$secret" "$RELEASE_GATE"; then
+    fail "$secret escaped the TestFlight submission job"
+  fi
+done
+for contract in \
+  'needs: submit-testflight' \
+  'environment: testflight-dogfood' \
+  'EASYSPLAT_TESTFLIGHT_FRESH_RESULT_BASE64' \
+  'EASYSPLAT_TESTFLIGHT_AFFECTED_RESULT_BASE64' \
+  'mas_release_evidence.py verify-processing' \
+  'testflight_dogfood_evidence.py materialize' \
+  'testflight_dogfood_evidence.py build-gate' \
+  'fresh-container-result.json' \
+  'affected-internal-container-result.json' \
+  'easysplat-testflight-gate-${{ github.sha }}-${{ inputs.build_number }}'; do
+  grep -Fiq -- "$contract" <<<"$testflight_dogfood_block" \
+    || fail "TestFlight dogfood authority is missing: $contract"
+done
+if grep -Fq '"freshContainer": True' <<<"$testflight_dogfood_block" \
+    || grep -Fq '"affectedInternalContainer": True' <<<"$testflight_dogfood_block"; then
+  fail "TestFlight dogfood authority must not accept hard-coded approval booleans"
+fi
+if grep -Eq 'secrets\.|contents: write|EASYSPLAT_RELEASE_ADMIN_TOKEN|EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1|EASYSPLAT_NOTARY_KEYCHAIN_PROFILE' <<<"$testflight_dogfood_block"; then
+  fail "TestFlight dogfood approval must remain secret-free and read-only"
+fi
+if grep -Eq 'contents: write|EASYSPLAT_RELEASE_ADMIN_TOKEN|EASYSPLAT_DEVELOPER_ID_APPLICATION_SHA1|EASYSPLAT_NOTARY_KEYCHAIN_PROFILE' "$TESTFLIGHT_GATE"; then
+  fail "TestFlight production must not receive Developer ID publication authority"
 fi
 grep -Fq 'environment: release-signing' <<<"$signing_release_block" \
   || fail "Developer ID production must use the protected signing environment"
@@ -332,7 +436,7 @@ for contract in \
   'PATH=/usr/bin:/bin:/usr/sbin:/sbin' \
   '/bin/bash --noprofile --norc -p' \
   '"$GITHUB_WORKSPACE/scripts/release/build_dmg.sh"' \
-  '--manifest-tool-bin "$TRUSTED_MANIFEST_TOOL"'; do
+  '--prepared-release-root "$PREPARED_ROOT"'; do
   grep -Fq -- "$contract" <<<"$signing_release_block" \
     || fail "credentialed app signing is missing: $contract"
 done

@@ -153,7 +153,7 @@ APPROVED_PAIRED_BASELINE = {
     },
 }
 MAX_TOOLCHAIN_INSTALL_STATE_BYTES = 16 * 1024 * 1024
-PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = ROOT / "EasySplatApp/Resources/public_key_ed25519.txt"
+PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = ROOT / "scripts/release/toolchain_authority_public_key.txt"
 RELEASE_TOOLCHAIN_COMPONENTS = frozenset(
     {"macos-arm64-core", "geometry-da3-base", "geometry-da3-small"}
 )

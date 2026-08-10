@@ -52,6 +52,7 @@ public struct PhotoInputPreflightLimits: Equatable, Sendable {
 
 public enum PhotoInputPreflightIssue: Equatable, Sendable {
     case folderUnavailable
+    case accessDenied(relativePath: String)
     case symbolicLink(relativePath: String)
     case unreadableEntry(relativePath: String)
     case sourceChanged(relativePath: String)
@@ -74,6 +75,20 @@ public struct PhotoInputPreflightFailure: Error, Equatable, Sendable {
     public init(issue: PhotoInputPreflightIssue) {
         self.issue = issue
     }
+}
+
+/// Classifies the file-system call that just failed. `errno` is the only thing
+/// that separates a refused read from a file that moved or changed underneath
+/// us, and the two need opposite answers: one is fixed by picking the photos
+/// again, the other by leaving them alone. Call this before any other system
+/// call, which would overwrite `errno`.
+private func photoIssueForFailedCall(
+    relativePath: String,
+    otherwise fallback: @autoclosure () -> PhotoInputPreflightIssue
+) -> PhotoInputPreflightIssue {
+    let code = errno
+    guard code == EACCES || code == EPERM else { return fallback() }
+    return .accessDenied(relativePath: relativePath)
 }
 
 private struct PhotoFileEvidence: Equatable, Sendable {
@@ -530,6 +545,74 @@ extension PhotoInputPreflight {
         )
     }
 
+    /// Admits an explicit set of photo files, which may originate from several
+    /// different folders. Each file is validated with the same symlink, hardlink,
+    /// and regular-file guards the folder walk applies to its entries.
+    public static func prepare(
+        photos: [URL],
+        stagingParent: URL,
+        photoSelection: PhotoSelection,
+        inputOrdering: InputOrdering,
+        keyframeBudget: Int,
+        requiredAtomicWorkspaceReserveBytes: Int64,
+        limits: PhotoInputPreflightLimits = .init(),
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> PreparedPhotoInput {
+        try await prepare(
+            photos: photos,
+            stagingParent: stagingParent,
+            photoSelection: photoSelection,
+            inputOrdering: inputOrdering,
+            keyframeBudget: keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: requiredAtomicWorkspaceReserveBytes,
+            limits: limits,
+            availableCapacity: defaultPhotoAvailableCapacity,
+            contentTypeResolver: defaultPhotoContentType,
+            rawDecoder: RawPhotoDecoder(),
+            projectionProbe: NativeProjectionMetadataProbe.tag(inImageAt:),
+            progress: progress
+        )
+    }
+
+    static func prepare(
+        photos: [URL],
+        stagingParent: URL,
+        photoSelection: PhotoSelection,
+        inputOrdering: InputOrdering,
+        keyframeBudget: Int,
+        requiredAtomicWorkspaceReserveBytes: Int64,
+        limits: PhotoInputPreflightLimits,
+        availableCapacity: @escaping PhotoAvailableCapacity,
+        contentTypeResolver: @escaping PhotoContentTypeResolver = defaultPhotoContentType,
+        rawDecoder: any RawPhotoDecoding = RawPhotoDecoder(),
+        projectionProbe: @escaping ProjectionProbe = NativeProjectionMetadataProbe.tag(inImageAt:),
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> PreparedPhotoInput {
+        try Task.checkCancellation()
+        guard limits.isValid, keyframeBudget > 0, requiredAtomicWorkspaceReserveBytes >= 0 else {
+            throw PhotoInputPreflightFailure(issue: .invalidLimits)
+        }
+        let sources = try securedSources(
+            from: photos,
+            limits: limits,
+            contentTypeResolver: contentTypeResolver
+        )
+        return try await prepareFromSecuredSources(
+            sources: sources,
+            stagingParent: stagingParent,
+            photoSelection: photoSelection,
+            inputOrdering: inputOrdering,
+            keyframeBudget: keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: requiredAtomicWorkspaceReserveBytes,
+            limits: limits,
+            availableCapacity: availableCapacity,
+            contentTypeResolver: contentTypeResolver,
+            rawDecoder: rawDecoder,
+            projectionProbe: projectionProbe,
+            progress: progress
+        )
+    }
+
     static func prepare(
         folder: URL,
         stagingParent: URL,
@@ -553,6 +636,40 @@ extension PhotoInputPreflight {
             limits: limits,
             contentTypeResolver: contentTypeResolver
         )
+        return try await prepareFromSecuredSources(
+            sources: sources,
+            stagingParent: stagingParent,
+            photoSelection: photoSelection,
+            inputOrdering: inputOrdering,
+            keyframeBudget: keyframeBudget,
+            requiredAtomicWorkspaceReserveBytes: requiredAtomicWorkspaceReserveBytes,
+            limits: limits,
+            availableCapacity: availableCapacity,
+            contentTypeResolver: contentTypeResolver,
+            rawDecoder: rawDecoder,
+            projectionProbe: projectionProbe,
+            progress: progress
+        )
+    }
+
+    /// Shared admission pipeline once a secured, deduplicated source set exists.
+    /// Both the folder walk and the explicit file-list path converge here, so
+    /// analysis, selection, and staging stay identical regardless of how the
+    /// sources were gathered.
+    private static func prepareFromSecuredSources(
+        sources: [Source],
+        stagingParent: URL,
+        photoSelection: PhotoSelection,
+        inputOrdering: InputOrdering,
+        keyframeBudget: Int,
+        requiredAtomicWorkspaceReserveBytes: Int64,
+        limits: PhotoInputPreflightLimits,
+        availableCapacity: @escaping PhotoAvailableCapacity,
+        contentTypeResolver: @escaping PhotoContentTypeResolver,
+        rawDecoder: any RawPhotoDecoding,
+        projectionProbe: @escaping ProjectionProbe,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> PreparedPhotoInput {
         let container: URL
         let root: URL
         do {
@@ -814,13 +931,24 @@ extension PhotoInputPreflight {
         contentTypeResolver: PhotoContentTypeResolver
     ) throws -> [Source] {
         guard folder.isFileURL else { throw PhotoInputPreflightFailure(issue: .folderUnavailable) }
+        let folderName = folder.lastPathComponent
         var rootStatus = stat()
-        guard lstat(folder.path, &rootStatus) == 0,
-              (rootStatus.st_mode & S_IFMT) == S_IFDIR else {
+        guard lstat(folder.path, &rootStatus) == 0 else {
+            throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                relativePath: folderName,
+                otherwise: .folderUnavailable
+            ))
+        }
+        guard (rootStatus.st_mode & S_IFMT) == S_IFDIR else {
             throw PhotoInputPreflightFailure(issue: .folderUnavailable)
         }
         let rootDescriptor = Darwin.open(folder.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard rootDescriptor >= 0 else { throw PhotoInputPreflightFailure(issue: .folderUnavailable) }
+        guard rootDescriptor >= 0 else {
+            throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                relativePath: folderName,
+                otherwise: .folderUnavailable
+            ))
+        }
         defer { Darwin.close(rootDescriptor) }
         var descriptorStatus = stat()
         guard fstat(rootDescriptor, &descriptorStatus) == 0,
@@ -879,6 +1007,94 @@ extension PhotoInputPreflight {
         return sources
     }
 
+    /// Builds admission sources from an explicit file list, which may span several
+    /// folders. Applies the same per-entry guards as the folder walk (`lstat`,
+    /// reject symbolic links, require a regular file with a single hard link) plus
+    /// the same content-type, per-file, and total-byte limits. Sorting by path
+    /// gives a deterministic order independent of how the caller collected the URLs.
+    private static func securedSources(
+        from photoURLs: [URL],
+        limits: PhotoInputPreflightLimits,
+        contentTypeResolver: PhotoContentTypeResolver
+    ) throws -> [Source] {
+        let orderedURLs = photoURLs
+            .map { $0.standardizedFileURL }
+            .sorted { $0.path < $1.path }
+        var validated: [(url: URL, relativePath: String, evidence: PhotoFileEvidence)] = []
+        var seenIdentities = Set<[UInt64]>()
+        for url in orderedURLs {
+            try Task.checkCancellation()
+            guard url.isFileURL else {
+                throw PhotoInputPreflightFailure(issue: .folderUnavailable)
+            }
+            let relativePath = url.lastPathComponent
+            var status = stat()
+            guard lstat(url.path, &status) == 0 else {
+                throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                    relativePath: relativePath,
+                    otherwise: .unreadableEntry(relativePath: relativePath)
+                ))
+            }
+            let kind = status.st_mode & S_IFMT
+            if kind == S_IFLNK {
+                throw PhotoInputPreflightFailure(issue: .symbolicLink(relativePath: relativePath))
+            }
+            guard kind == S_IFREG else {
+                throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relativePath))
+            }
+            guard status.st_nlink == 1 else {
+                throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relativePath))
+            }
+            let identity: [UInt64] = [UInt64(status.st_dev), UInt64(status.st_ino)]
+            guard seenIdentities.insert(identity).inserted else {
+                // The same underlying file was named more than once; keep one.
+                continue
+            }
+            guard validated.count < limits.maximumTraversalEntryCount else {
+                throw PhotoInputPreflightFailure(issue: .traversalLimitExceeded)
+            }
+            validated.append((url, relativePath, PhotoFileEvidence(status)))
+        }
+
+        var total: Int64 = 0
+        var sources: [Source] = []
+        for item in validated {
+            let detectedType = try securelyDetectedType(
+                at: item.url,
+                evidence: item.evidence,
+                relativePath: item.relativePath,
+                resolver: contentTypeResolver
+            )
+            guard detectedType != nil
+                    || UTType(filenameExtension: item.url.pathExtension)?.conforms(to: .image) == true
+            else {
+                continue
+            }
+            guard sources.count < limits.maximumPhotoCount else {
+                throw PhotoInputPreflightFailure(issue: .tooManyPhotos(maximum: limits.maximumPhotoCount))
+            }
+            guard item.evidence.size > 0, item.evidence.size <= limits.maximumSinglePhotoBytes else {
+                throw PhotoInputPreflightFailure(
+                    issue: .totalBytesExceeded(maximum: limits.maximumTotalBytes)
+                )
+            }
+            let (next, overflow) = total.addingReportingOverflow(item.evidence.size)
+            guard !overflow, next <= limits.maximumTotalBytes else {
+                throw PhotoInputPreflightFailure(issue: .totalBytesExceeded(maximum: limits.maximumTotalBytes))
+            }
+            total = next
+            sources.append(Source(
+                discoveryIndex: sources.count,
+                url: item.url,
+                relativePath: item.relativePath,
+                safeDisplayName: safePhotoDisplayName(item.url.lastPathComponent, index: sources.count),
+                evidence: item.evidence,
+                detectedTypeIdentifier: detectedType
+            ))
+        }
+        return sources
+    }
+
     private static func enumerateDirectory(
         descriptor: Int32,
         prefix: String,
@@ -923,7 +1139,10 @@ extension PhotoInputPreflight {
             let relative = prefix.isEmpty ? name : "\(prefix)/\(name)"
             var status = stat()
             guard name.withCString({ fstatat(descriptor, $0, &status, AT_SYMLINK_NOFOLLOW) }) == 0 else {
-                throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relative))
+                throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                    relativePath: relative,
+                    otherwise: .unreadableEntry(relativePath: relative)
+                ))
             }
             let kind = status.st_mode & S_IFMT
             if kind == S_IFLNK {
@@ -934,7 +1153,10 @@ extension PhotoInputPreflight {
                     openat(descriptor, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 }
                 guard child >= 0 else {
-                    throw PhotoInputPreflightFailure(issue: .unreadableEntry(relativePath: relative))
+                    throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                        relativePath: relative,
+                        otherwise: .unreadableEntry(relativePath: relative)
+                    ))
                 }
                 var opened = stat()
                 guard fstat(child, &opened) == 0,
@@ -977,7 +1199,10 @@ extension PhotoInputPreflight {
     ) throws -> String? {
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else {
-            throw PhotoInputPreflightFailure(issue: .sourceChanged(relativePath: relativePath))
+            throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                relativePath: relativePath,
+                otherwise: .sourceChanged(relativePath: relativePath)
+            ))
         }
         defer { Darwin.close(descriptor) }
         var opened = stat()
@@ -1019,7 +1244,10 @@ extension PhotoInputPreflight {
             O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
         )
         guard descriptor >= 0 else {
-            throw PhotoInputPreflightFailure(issue: .sourceChanged(relativePath: source.safeDisplayName))
+            throw PhotoInputPreflightFailure(issue: photoIssueForFailedCall(
+                relativePath: source.safeDisplayName,
+                otherwise: .sourceChanged(relativePath: source.safeDisplayName)
+            ))
         }
         defer { Darwin.close(descriptor) }
         guard source.evidence.size > 0 else { return nil }
@@ -1574,7 +1802,7 @@ extension PhotoInputPreflight {
         }
         defer { free(canonicalPointer) }
         let canonicalParent = URL(fileURLWithPath: String(cString: canonicalPointer))
-        let parentDescriptor = try openDirectoryChain(canonicalParent)
+        let parentDescriptor = try openDirectoryRefusingSymlinks(canonicalParent)
         defer { Darwin.close(parentDescriptor) }
         var parentStatus = stat()
         guard fstat(parentDescriptor, &parentStatus) == 0,
@@ -1662,37 +1890,27 @@ extension PhotoInputPreflight {
         throw PhotoInputPreflightFailure(issue: .stagingUnavailable)
     }
 
-    private static func openDirectoryChain(_ url: URL) throws -> Int32 {
+    /// Opens a directory, refusing the whole path if any part of it is a
+    /// symbolic link.
+    ///
+    /// This used to walk from the root a component at a time, opening each one
+    /// with `O_NOFOLLOW`. Inside the App Sandbox that cannot work: the app may
+    /// not open `/Users`, so the walk failed at its first step no matter which
+    /// directory it was asked for, and staging was never created. The kernel
+    /// applies the same rule to the whole path with `O_NOFOLLOW_ANY`, which
+    /// needs no read access to any parent directory.
+    private static func openDirectoryRefusingSymlinks(_ url: URL) throws -> Int32 {
         guard url.isFileURL, url.path.hasPrefix("/") else {
             throw PhotoInputPreflightFailure(issue: .stagingUnavailable)
         }
-        var descriptor = Darwin.open(
-            "/",
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW_ANY | O_CLOEXEC
         )
         guard descriptor >= 0 else {
             throw PhotoInputPreflightFailure(issue: .stagingUnavailable)
         }
-        do {
-            for component in url.pathComponents where component != "/" {
-                let next = component.withCString {
-                    openat(
-                        descriptor,
-                        $0,
-                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-                    )
-                }
-                guard next >= 0 else {
-                    throw PhotoInputPreflightFailure(issue: .stagingUnavailable)
-                }
-                Darwin.close(descriptor)
-                descriptor = next
-            }
-            return descriptor
-        } catch {
-            Darwin.close(descriptor)
-            throw error
-        }
+        return descriptor
     }
 
     private static func evidence(at url: URL) -> PhotoFileEvidence? {

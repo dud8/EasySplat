@@ -5,7 +5,7 @@ struct RootView: View {
     @State private var selectedProjectURL: URL?
 
     private var isRunActive: Bool {
-        model.isRunActive
+        model.hasActiveWork
     }
 
     private var actionFailureIsPresented: Binding<Bool> {
@@ -35,6 +35,11 @@ struct RootView: View {
         .onChange(of: model.currentProjectURL) { _, projectURL in
             selectedProjectURL = projectURL.map(ProjectSidebar.selectionID(for:))
         }
+        .onChange(of: model.splatOpenRequests) { _, requests in
+            guard !requests.isEmpty else { return }
+            model.splatOpenRequests.removeAll()
+            requests.forEach(StandaloneSplatWindowPresenter.shared.present)
+        }
         .alert(
             model.actionFailure?.title ?? "Action failed",
             isPresented: actionFailureIsPresented
@@ -61,15 +66,13 @@ struct RootView: View {
 
     @MainActor
     static func prepareNewSplat(model: AppModel, selectedProjectURL: inout URL?) {
-        guard model.flushPendingNotesSave() else { return }
-        model.reset()
-        model.clearPendingInputs()
-        model.viewState = .home
+        guard model.beginNewSplat() else { return }
         selectedProjectURL = nil
     }
 
     @MainActor
     static func prepareProjectList(model: AppModel, selectedProjectURL: inout URL?) {
+        guard !model.hasActiveWork else { return }
         guard model.flushPendingNotesSave() else { return }
         model.reset()
         model.viewState = .home

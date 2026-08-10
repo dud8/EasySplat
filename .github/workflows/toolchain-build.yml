@@ -197,7 +197,7 @@ jobs:
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --app-version-minimum "$APP_VERSION_MINIMUM" \
             --app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE" \
-            --public-key-file "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --public-key-file "scripts/release/toolchain_authority_public_key.txt" \
             --core-zip "$COMPONENTS/toolchain-macos-arm64-$VERSION-core.zip" \
             --core-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-macos-arm64-$VERSION-core.zip" \
             --da3-base-zip "$COMPONENTS/toolchain-geometry-da3-base-$VERSION.zip" \
@@ -505,7 +505,7 @@ jobs:
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --app-version-minimum "$APP_VERSION_MINIMUM" \
             --app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE" \
-            --public-key-file "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --public-key-file "scripts/release/toolchain_authority_public_key.txt" \
             --core-zip "$FINAL/toolchain-macos-arm64-$VERSION-core.zip" \
             --core-url "https://github.com/$GITHUB_REPOSITORY/releases/download/toolchain-v$VERSION/toolchain-macos-arm64-$VERSION-core.zip" \
             --da3-base-zip "$FINAL/toolchain-geometry-da3-base-$VERSION.zip" \

@@ -30,6 +30,175 @@ final class ProcessingTimingTextTests: XCTestCase {
         XCTAssertEqual(ProcessingPhase.finish.heading, "Step 4 of 4 · Finishing")
     }
 
+    func testPhaseRailMarksEarlierPhasesDoneAndLaterPhasesPending() {
+        XCTAssertEqual(ProcessingView.railState(of: .prepare, current: .reconstruct), .completed)
+        XCTAssertEqual(ProcessingView.railState(of: .reconstruct, current: .reconstruct), .current)
+        XCTAssertEqual(ProcessingView.railState(of: .train, current: .reconstruct), .pending)
+        XCTAssertEqual(ProcessingView.railState(of: .finish, current: .reconstruct), .pending)
+        XCTAssertEqual(ProcessingView.railState(of: .prepare, current: .prepare), .current)
+        XCTAssertEqual(ProcessingView.railState(of: .finish, current: .finish), .current)
+    }
+
+    func testPhaseRailStatesNeverShareASymbol() {
+        let symbols = [
+            ProcessingView.railSymbolName(for: .completed),
+            ProcessingView.railSymbolName(for: .current),
+            ProcessingView.railSymbolName(for: .pending)
+        ]
+        XCTAssertEqual(Set(symbols).count, symbols.count)
+    }
+
+    func testContextLineJoinsOnlyThePartsThatExist() {
+        XCTAssertEqual(
+            ProcessingView.contextLine(projectTitle: "Harbor House", inputSummary: "2 videos"),
+            "Harbor House — 2 videos"
+        )
+        XCTAssertEqual(
+            ProcessingView.contextLine(projectTitle: "Harbor House", inputSummary: nil),
+            "Harbor House"
+        )
+        XCTAssertEqual(
+            ProcessingView.contextLine(projectTitle: nil, inputSummary: "Photo folder"),
+            "Photo folder"
+        )
+        XCTAssertNil(ProcessingView.contextLine(projectTitle: nil, inputSummary: nil))
+    }
+
+    func testWindowSubtitleMirrorsThePhaseOnlyWhileARunIsActive() {
+        XCTAssertEqual(
+            ProcessingPhase.windowSubtitle(stage: .sfmMatching, isRunActive: true),
+            "Step 2 of 4 · Reconstructing scene"
+        )
+        XCTAssertEqual(
+            ProcessingPhase.windowSubtitle(stage: nil, isRunActive: true),
+            "Step 1 of 4 · Preparing input"
+        )
+        XCTAssertEqual(ProcessingPhase.windowSubtitle(stage: .trainSplat, isRunActive: false), "")
+        XCTAssertEqual(ProcessingPhase.windowSubtitle(stage: nil, isRunActive: false), "")
+    }
+
+    func testInputDisplaySummaryCoversEveryShape() {
+        XCTAssertEqual(InputSpec.video(files: ["/tmp/a.mov"]).displaySummary, "1 video")
+        XCTAssertEqual(
+            InputSpec.video(files: ["/tmp/a.mov", "/tmp/b.mov"]).displaySummary,
+            "2 videos"
+        )
+        XCTAssertEqual(InputSpec.photos(folder: "/tmp/photos").displaySummary, "Photo folder")
+        XCTAssertEqual(
+            InputSpec.mixed(videos: ["/tmp/a.mov"], photosFolder: "/tmp/photos").displaySummary,
+            "1 video and photos"
+        )
+        XCTAssertEqual(
+            InputSpec.mixed(
+                videos: ["/tmp/a.mov", "/tmp/b.mov"],
+                photosFolder: "/tmp/photos"
+            ).displaySummary,
+            "2 videos and photos"
+        )
+    }
+
+    func testLiveTechnicalDetailsRenderABoundedTailWhileCopyKeepsTheFullLog() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(projectBaseURL: base)
+        model.statusDetail = "Training splat · 30,000 of 40,000"
+        model.logLines = (1...1_000).map { "line \($0)" }
+
+        // A recoverable error buried 1,000 lines ago must stay visible live.
+        model.errorLogLines = ["[err] Could not record an intermediate training checkpoint"]
+
+        let live = model.processingDetailsText ?? ""
+        XCTAssertTrue(live.contains("Training splat · 30,000 of 40,000"))
+        XCTAssertTrue(live.contains("line 1000"), "The newest line must stay visible")
+        XCTAssertFalse(live.contains("line 1\n"), "The oldest lines must not render live")
+        XCTAssertTrue(
+            live.contains("Could not record an intermediate training checkpoint"),
+            "Recent errors stay visible after scrolling out of the general tail"
+        )
+        let renderedLogLines = live.split(separator: "\n").count
+        XCTAssertLessThanOrEqual(
+            renderedLogLines,
+            AppModel.technicalLogTailLimit + AppModel.technicalErrorTailLimit + 4
+        )
+
+        let full = model.errorDetailsText ?? ""
+        XCTAssertTrue(full.contains("line 1\n"), "Copy Details keeps the whole buffer")
+        XCTAssertTrue(full.contains("line 1000"))
+    }
+
+    func testProgressLogGatesUniqueCounterFloodsButNeverBucketAdvances() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(projectBaseURL: base)
+
+        // Per-event counters make every message unique; only the first inside
+        // the interval may land.
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Exact raster fallback 1: 5 intersections")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Exact raster fallback 2: 6 intersections")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Exact raster fallback 3: 7 intersections")
+        XCTAssertEqual(model.logLines.filter { $0.contains("Exact raster fallback") }.count, 1)
+
+        // Bucketed training milestones ignore the interval: an advance always
+        // logs, a repeat never does. The message must match what PipelineRunner
+        // actually emits — pinning a format the pipeline stopped producing is how
+        // this gate silently stopped applying.
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training splat · 120 of 40,000")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training splat · 121 of 40,000")
+        model.maybeAppendProgressLog(stage: .trainSplat, message: "Training splat · 240 of 40,000")
+        XCTAssertEqual(model.logLines.filter { $0.contains("Training splat") }.count, 2)
+    }
+
+    func testProgressRatioReadsBothSpellingsThePipelineEmits() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(projectBaseURL: base)
+
+        // Dataset preparation counts with a slash, the trainer counts with "of".
+        let slash = model.parseProgressRatio("Preparing msplat dataset (images) 12/40")
+        XCTAssertEqual(slash?.current, 12)
+        XCTAssertEqual(slash?.total, 40)
+
+        let spelled = model.parseProgressRatio("Training splat · 1,200 of 40,000")
+        XCTAssertEqual(spelled?.current, 1200)
+        XCTAssertEqual(spelled?.total, 40000)
+
+        // A bare count is not a ratio.
+        XCTAssertNil(model.parseProgressRatio("Training model with msplat"))
+    }
+
+    func testTrainingProgressGatesMatchThePipelinesOwnMessages() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(projectBaseURL: base)
+
+        // Bucketed by percent: 10% advances past 0%, the repeat does not.
+        model.maybeAppendProgressLog(
+            stage: .trainSplat, message: "Preparing msplat dataset (images) 1/40")
+        model.maybeAppendProgressLog(
+            stage: .trainSplat, message: "Preparing msplat dataset (images) 4/40")
+        model.maybeAppendProgressLog(
+            stage: .trainSplat, message: "Preparing msplat dataset (images) 5/40")
+        XCTAssertEqual(
+            model.logLines.filter { $0.contains("(images)") }.count,
+            2
+        )
+    }
+
+    func testTechnicalLogStaysPinnedOnlyNearTheBottom() {
+        // Content shorter than the viewport → always pinned.
+        XCTAssertTrue(ProcessingView.isPinnedToBottom(
+            contentOffsetY: 0, contentHeight: 100, containerHeight: 260, tolerance: 24))
+        // Scrolled to the exact bottom → pinned.
+        XCTAssertTrue(ProcessingView.isPinnedToBottom(
+            contentOffsetY: 740, contentHeight: 1000, containerHeight: 260, tolerance: 24))
+        // Within tolerance of the bottom → still pinned.
+        XCTAssertTrue(ProcessingView.isPinnedToBottom(
+            contentOffsetY: 720, contentHeight: 1000, containerHeight: 260, tolerance: 24))
+        // Scrolled up past the tolerance → released.
+        XCTAssertFalse(ProcessingView.isPinnedToBottom(
+            contentOffsetY: 500, contentHeight: 1000, containerHeight: 260, tolerance: 24))
+    }
+
     func testVisibleProgressNeverPresentsInternalStageFractionsAsPhaseProgress() {
         XCTAssertNil(ProcessingView.phaseProgress(stage: .importInput, progress: 0.8))
         XCTAssertNil(ProcessingView.phaseProgress(stage: .extractFrames, progress: 0.2))
@@ -294,10 +463,16 @@ final class ProcessingTimingTextTests: XCTestCase {
     }
 
     func testFormatElapsedClampsRoundsAndFormats() {
-        XCTAssertEqual(ProcessingView.formatElapsed(0), "0m 00s")
-        XCTAssertEqual(ProcessingView.formatElapsed(-5), "0m 00s", "Negative elapsed clamps to zero.")
+        XCTAssertEqual(ProcessingView.formatElapsed(0), "0s")
+        XCTAssertEqual(ProcessingView.formatElapsed(-5), "0s", "Negative elapsed clamps to zero.")
+        XCTAssertEqual(ProcessingView.formatElapsed(5), "5s")
+        XCTAssertEqual(ProcessingView.formatElapsed(27), "27s", "Sub-minute durations drop the zero-minute prefix.")
+        XCTAssertEqual(ProcessingView.formatElapsed(59.6), "1m 00s", "Rounding can carry into the next minute.")
         XCTAssertEqual(ProcessingView.formatElapsed(65), "1m 05s")
+        XCTAssertEqual(ProcessingView.formatElapsed(67), "1m 07s")
         XCTAssertEqual(ProcessingView.formatElapsed(90.6), "1m 31s", "Rounds to the nearest second.")
+        XCTAssertEqual(ProcessingView.formatElapsed(1261), "21m 01s")
+        XCTAssertEqual(ProcessingView.formatElapsed(1591), "26m 31s")
         XCTAssertEqual(ProcessingView.formatElapsed(3661), "1h 01m 01s", "Hours appear only when non-zero.")
     }
 
@@ -322,7 +497,11 @@ final class ProcessingTimingTextTests: XCTestCase {
     func testTimingTextSilenceAtLeastOneSecondReadsAgo() {
         XCTAssertEqual(
             ProcessingView.timingText(elapsed: 65, silenceSeconds: 5),
-            "Elapsed 1m 05s · Last update 0m 05s ago"
+            "Elapsed 1m 05s · Last update 5s ago"
+        )
+        XCTAssertEqual(
+            ProcessingView.timingText(elapsed: 1591, silenceSeconds: 67),
+            "Elapsed 26m 31s · Last update 1m 07s ago"
         )
     }
 }

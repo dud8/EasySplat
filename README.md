@@ -84,7 +84,14 @@ SfM/colmap/sparse/0
 SfM/geometry_manifest.json
 Training/training_manifest.json
 Output/splat.ply
+Output/splat_receipt.json
 ```
+
+Separate from `project.json`, `Output/splat_receipt.json` is the authority for newly published result bytes: `Output/splat.ply` is usable when both files validate as one published pair. The sole compatibility exception is a fully validated, successfully completed legacy project created before receipts; it may open only its current result. A bare PLY never authorizes a previous result after a failed or interrupted retrain. Publication preserves the current validated pair, installs the new PLY first, and commits by installing its receipt last. Pipeline startup reconciles any interrupted publication before beginning new work.
+
+Retraining leaves the validated pair in place until a replacement pair commits. If the new attempt fails, the project remains **Failed** while **View Previous Result** opens the receipt-bound result. Its reconstruction, run-plan, training, and timing facts come from the receipt; the project title, notes, and viewer preferences remain current. Viewer, export, and share resolve the same authority every time, so a stale summary or bare PLY cannot unlock a result.
+
+Export keeps the save-panel grant for the complete operation and reconciles the exact selected file after publication. A destination race is reported as a conflict and EasySplat does not overwrite ambiguous bytes. Share uses a validated temporary snapshot; dismissing the picker deletes that snapshot immediately, while a selected service retains it only until AppKit reports success or failure.
 
 Stored artifact paths are project-relative and resolved through the safe project-path resolver.
 
@@ -95,6 +102,7 @@ Stored artifact paths are project-relative and resolved through the safe project
 - **The scene will not reconstruct:** capture more overlap, remove unrelated clips, or choose the correct Capture Path, Lens, and Input Order.
 - **Memory pressure:** choose Fast and Conserve Memory, then reduce capture length if needed.
 - **A result will not export:** EasySplat exports only a validated finished PLY.
+- **A retrain failed:** use **View Previous Result** when shown. EasySplat keeps the last validated splat available until a replacement finishes.
 
 Use **Copy Diagnostics** or **Save Diagnostics…** from a failed project when asking for help. Report reproducible bugs through [GitHub Issues](https://github.com/dud8/EasySplat/issues). Report security problems privately as described in [SECURITY.md](SECURITY.md).
 
@@ -136,7 +144,7 @@ input
   → bounded COLMAP feature matching and camera reconstruction
   → canonical COLMAP model
   → native msplat Metal training
-  → validated Output/splat.ply
+  → validated Output/splat.ply + Output/splat_receipt.json pair
 ```
 
 COLMAP is the automatic geometry route in `0.2.0`. It is not a user-facing backend choice. A single-batch DA3 initializer remains available only to the typed benchmark override until it clears the full quality corpus. MetalSplatter is the native result viewer.
@@ -170,6 +178,14 @@ gitleaks git --redact
 The full release benchmark needs the external 26-scene corpus described by `scripts/benchmark/corpus.json`; large media is intentionally not stored in Git.
 Native trainer changes also run `./scripts/ci/test_msplat_native_build.sh`. The Release App workflow generates the pinned synthetic fixture under the hosted runner's temporary root, then reuses those exact bytes for packaged-app, remote-only, bundled-offline, and cached-only verification. It does not accept a repository variable or external fixture path. `scripts/release/release_fixture_manifest.json` binds the MIT generator, camera construction, per-image hashes and sizes, and aggregate closure digest.
 
+On the exact 48 GiB M4 Max reference host, run the additional product-performance gate:
+
+```bash
+./scripts/ci/run_release_reliability_product_gate.sh
+```
+
+The release-reliability product gate runs optimized XCTest entry points against real 10,000-entry folder and ZIP fixtures plus a 139.6 MiB PLY validation and export. Its host-bound baseline enforces at most 1.25 times baseline operation wall time and whole-process peak RSS plus 64 MiB. The gate separately proves the two-second cooperative-cancellation and one-second passive-share-cleanup budgets, uses one fresh receipt per workload, and verifies the fixture and test binary identities before and after every run. It intentionally fails closed on any other host rather than pretending its numbers are comparable.
+
 Fixture reproducibility proves input integrity only. The integrated geometry-conditioning gate rejects weak camera support, collapsed trajectories, inadequate parallax, and degenerate point distributions before training. Packaged release verification also requires the exact generated corpus to pass signed-core reconstruction for at least 11 of 12 views plus native msplat training on macOS 15 and macOS 26.
 
 ## Release builds
@@ -185,6 +201,8 @@ After the signed toolchain is live, create `v0.2.0` at the same protected `main`
 Before either tag is created, the reviewed commit must be merged, both repositories' `main` branches must be protected, exposed credentials must be rotated, and the owner must explicitly approve publication. Make EasySplat public only with that approval, then run all four CodeQL jobs on the exact protected-main commit. See [ONBOARDING.md](ONBOARDING.md#releases) for the operator sequence, required environments, and runner roles. `./scripts/run.sh` remains the development entry point.
 
 Release App verifies hardened-runtime and nested-code signatures, notarization receipts, stapling, Gatekeeper assessment, a quarantined install, the DMG, checksums, SBOM, licenses, and provenance. It can resume only its exact repository/tag/commit-owned draft and rejects different or foreign assets. Final publication remains a separate human action.
+
+TestFlight uses the separate **Release TestFlight** workflow. It builds one source-bound, App Store-signed arm64 package, verifies its package/signature/entitlement evidence, uploads that exact package once, and does not treat upload acceptance as success. The submission must reach App Store Connect's terminal `READY_TO_TEST` state with no processing errors. Release approval then requires exact-build dogfood records from both a fresh container and the affected internal container; the records are bound to the source commit, package, build, submission artifact, and processing receipt.
 
 ## License
 

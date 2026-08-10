@@ -255,6 +255,72 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
     }
 }
 
+public extension PairGraphMeasurement {
+    /// True when this graph could only have been accepted through the
+    /// terminal dominant-component continuation: the strict connectivity
+    /// policy would have refused it, so the splat covers part of the
+    /// capture. Strict acceptances, including ordered captures that
+    /// legitimately carried minor fragments past the normal recovery
+    /// level, stay false.
+    var usedViableDominantAcceptance: Bool {
+        let totalViewCount = componentViewCounts.reduce(0, +)
+        guard PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: totalViewCount,
+            componentViewCounts: componentViewCounts,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        ) != nil else {
+            return PairGraphConnectivityPolicy.viableDominantViewCount(
+                totalViewCount: totalViewCount,
+                componentViewCounts: componentViewCounts,
+                connectedComponentCount: connectedComponentCount,
+                isolatedViewCount: isolatedViewCount,
+                descriptorlessViewCount: descriptorlessViewCount
+            ) != nil
+        }
+        let hasMinorVerifiedComponent = componentViewCounts
+            .dropFirst()
+            .contains { $0 > 1 }
+        guard hasMinorVerifiedComponent else {
+            return false
+        }
+        let isOrdered: Bool
+        switch pairingPolicy {
+        case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
+            isOrdered = true
+        case .unorderedRetrieval, .segmentedMixed:
+            isOrdered = false
+        }
+        return !(isOrdered && matcherAttempts.last?.recoveryLevel != .normal)
+    }
+}
+
+public extension GeometryArtifact {
+    /// True when the splat was built from part of the capture: matching
+    /// admitted only the dominant connected group, or the camera solve was
+    /// terminally accepted with fewer registered views than the strict
+    /// fraction of the admitted count. Strict runs stay false.
+    var usedPartialCoverageAcceptance: Bool {
+        if let measurement = pairGraph.measurement,
+           measurement.usedViableDominantAcceptance {
+            return true
+        }
+        let admittedViewCount = pairGraph.measurement.flatMap { measurement in
+            PairGraphConnectivityPolicy.admissibleDominantViewCount(
+                totalViewCount: totalViewCount,
+                componentViewCounts: measurement.componentViewCounts,
+                connectedComponentCount: measurement.connectedComponentCount,
+                isolatedViewCount: measurement.isolatedViewCount,
+                descriptorlessViewCount: measurement.descriptorlessViewCount
+            )
+        } ?? totalViewCount
+        guard admittedViewCount > 0 else { return false }
+        return Double(registeredViewCount) / Double(admittedViewCount)
+            < ReconstructionScorer.minimumRegisteredViewFraction
+    }
+}
+
 public struct PairGraphArtifact: Codable, Sendable, Equatable {
     public var status: PairGraphMeasurementStatus
     public var measurement: PairGraphMeasurement?
@@ -717,10 +783,67 @@ public struct GeometryConditioningArtifact: Codable, Sendable, Equatable {
     }
 }
 
+/// Discriminates how the accepted geometry was produced. `computed` geometry is
+/// solved by the toolchain and carries the full pair-graph, worker-execution, and
+/// mapping evidence. `imported` geometry is adopted directly from an external
+/// dataset model; it carries its own authenticated evidence contract in
+/// `importedEvidence` instead. Absent from manifests written before the imported
+/// route existed, which decode as `computed`.
+public enum GeometryArtifactSource: String, Codable, Sendable, Equatable {
+    case computed
+    case imported
+}
+
+/// The evidence contract that stands in for pair-graph, worker-execution, and
+/// feature-database evidence when geometry is adopted directly from a dataset.
+/// Re-verified on every load: the seed and source file digests are recomputed
+/// against the persisted `Import/seed` and `Import/source` files so a swapped
+/// seed invalidates the artifact, and the rollups are pinned into the artifact's
+/// solver provenance (`revision` == `sourceClosureSHA256`, `payloadSHA256` ==
+/// `seedClosureSHA256`).
+public struct ImportedGeometryEvidence: Codable, Sendable, Equatable {
+    /// `DatasetKind.rawValue` of the imported dataset.
+    public var datasetKind: String
+    /// `DatasetGeometryRoute.rawValue`; always `adoptDirect` for imported geometry.
+    public var route: String
+    /// The three converted seed files under `Import/seed`, with digests.
+    public var seedFiles: [DatasetReceiptFile]
+    /// The verbatim original geometry metadata under `Import/source`, with digests.
+    public var sourceFiles: [DatasetReceiptFile]
+    /// Rollup digest over `seedFiles`; binds the persisted `Import/seed`.
+    public var seedClosureSHA256: String
+    /// Rollup digest over `sourceFiles`; binds the persisted `Import/source`.
+    public var sourceClosureSHA256: String
+    public var imageCount: Int
+
+    public init(
+        datasetKind: String,
+        route: String,
+        seedFiles: [DatasetReceiptFile],
+        sourceFiles: [DatasetReceiptFile],
+        seedClosureSHA256: String,
+        sourceClosureSHA256: String,
+        imageCount: Int
+    ) {
+        self.datasetKind = datasetKind
+        self.route = route
+        self.seedFiles = seedFiles
+        self.sourceFiles = sourceFiles
+        self.seedClosureSHA256 = seedClosureSHA256
+        self.sourceClosureSHA256 = sourceClosureSHA256
+        self.imageCount = imageCount
+    }
+}
+
 public struct GeometryArtifact: Codable, Sendable, Equatable {
     public static let currentSchemaVersion = 35
 
     public var schemaVersion: Int
+    /// How this geometry was produced. `nil` decodes as `.computed` so manifests
+    /// written before the imported route existed keep loading unchanged.
+    public var source: GeometryArtifactSource?
+    /// Present only for `.imported` geometry; `nil` for computed geometry.
+    public var importedEvidence: ImportedGeometryEvidence?
     public var solverVersion: String
     public var runtimeVersion: String
     public var modelVersion: String
@@ -760,16 +883,27 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var mapping: MappingArtifact
     public var canonicalOrientation: CanonicalOrientationArtifact
 
+    /// Resolves the discriminator, defaulting pre-import manifests to `.computed`.
+    public var resolvedSource: GeometryArtifactSource { source ?? .computed }
+
     public var allowsViewOnlyUprightFlip: Bool {
-        canonicalOrientation.status == .axisAlignedSignUnverified
-            && GeometryArtifactStore.isCanonicalOrientationValid(
+        switch canonicalOrientation.status {
+        case .axisAlignedSignUnverified, .unresolved:
+            // Unresolved scenes train in the raw source frame; the flip is a
+            // best-effort 180-degree correction for the common inverted case.
+            return GeometryArtifactStore.isCanonicalOrientationValid(
                 canonicalOrientation,
                 registeredViewCount: registeredViewCount
             )
+        case .verified:
+            return false
+        }
     }
 
     public init(
         schemaVersion: Int,
+        source: GeometryArtifactSource? = nil,
+        importedEvidence: ImportedGeometryEvidence? = nil,
         solverVersion: String,
         runtimeVersion: String,
         modelVersion: String,
@@ -806,6 +940,8 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         canonicalOrientation: CanonicalOrientationArtifact
     ) {
         self.schemaVersion = schemaVersion
+        self.source = source
+        self.importedEvidence = importedEvidence
         self.solverVersion = solverVersion
         self.runtimeVersion = runtimeVersion
         self.modelVersion = modelVersion

@@ -6,14 +6,10 @@ ROOT="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/strict_semver.sh
 source "$ROOT/scripts/release/lib/strict_semver.sh"
 APP_VERSION=""
+TOOLCHAIN_DIR="$ROOT/Toolchains/out"
 TOOLCHAIN_VERSION=""
-MANIFEST_URL=""
-CORE_ARTIFACT_URL=""
-DA3_BASE_ARTIFACT_URL=""
-DA3_SMALL_ARTIFACT_URL=""
 PROJECT_URL=""
 RELEASE_MODE=""
-USE_EXISTING_TOOLCHAIN=0
 IDENTITY_FINGERPRINT=""
 TEAM_ID=""
 NOTARY_KEYCHAIN_PROFILE=""
@@ -27,8 +23,6 @@ OUT_DIR="$ROOT/release/DMG"
 PREPARED_RELEASE_ROOT=""
 PREPARED_MANIFEST_SHA256=""
 SOURCE_COMMIT_OVERRIDE=""
-MANIFEST_TOOL_BIN=""
-MANIFEST_TOOL_BIN_SET=0
 PUBLICATION_ACTIVE=0
 FINAL_DMG_SHA256=""
 FINAL_DMG_NAME=""
@@ -61,20 +55,8 @@ while [[ $# -gt 0 ]]; do
       TOOLCHAIN_VERSION="$2"
       shift 2
       ;;
-    --manifest-url)
-      MANIFEST_URL="$2"
-      shift 2
-      ;;
-    --core-artifact-url)
-      CORE_ARTIFACT_URL="$2"
-      shift 2
-      ;;
-    --da3-base-artifact-url)
-      DA3_BASE_ARTIFACT_URL="$2"
-      shift 2
-      ;;
-    --da3-small-artifact-url)
-      DA3_SMALL_ARTIFACT_URL="$2"
+    --toolchain-dir)
+      TOOLCHAIN_DIR="$2"
       shift 2
       ;;
     --project-url)
@@ -176,23 +158,6 @@ while [[ $# -gt 0 ]]; do
       SOURCE_COMMIT_OVERRIDE="$2"
       shift 2
       ;;
-    --manifest-tool-bin)
-      if [ "$MANIFEST_TOOL_BIN_SET" -eq 1 ]; then
-        echo "--manifest-tool-bin may be supplied only once." >&2
-        exit 1
-      fi
-      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
-        echo "--manifest-tool-bin requires an absolute trusted executable path." >&2
-        exit 1
-      fi
-      MANIFEST_TOOL_BIN="$2"
-      MANIFEST_TOOL_BIN_SET=1
-      shift 2
-      ;;
-    --use-existing-toolchain)
-      USE_EXISTING_TOOLCHAIN=1
-      shift
-      ;;
     *)
       echo "Unknown arg: $1" >&2
       exit 1
@@ -202,16 +167,8 @@ done
 
 unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
 
-if [ -z "$APP_VERSION" ] || [ -z "$TOOLCHAIN_VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_dmg.sh --app-version <semver> --toolchain-version <semver> --manifest-url <https-url> --core-artifact-url <https-url> --da3-base-artifact-url <https-url> --da3-small-artifact-url <https-url> --use-existing-toolchain (--development-unsigned | --production --identity-fingerprint <sha1> --team-id <id> --notary-keychain-profile <name> --prepared-release-root <absolute-path> --prepared-manifest-sha256 <sha256> --source-commit <sha1> --manifest-tool-bin <trusted executable>) [--project-url <https-url>] [--build-root <absolute-path>] [--output-dir <absolute-path>]" >&2
-  exit 1
-fi
-if [ "$USE_EXISTING_TOOLCHAIN" -ne 1 ]; then
-  echo "Release packaging requires --use-existing-toolchain. Toolchain Producer signs and notarizes the native components, then emits a post-sign request. The external authority signs that exact request; Toolchain Publication verifies the benchmarked closure and stages the draft." >&2
-  exit 1
-fi
-if [ -z "$MANIFEST_URL" ] || [ -z "$CORE_ARTIFACT_URL" ] || [ -z "$DA3_BASE_ARTIFACT_URL" ] || [ -z "$DA3_SMALL_ARTIFACT_URL" ]; then
-  echo "Release packaging requires explicit HTTPS manifest and component URLs." >&2
+if [ -z "$APP_VERSION" ] || [ -z "$TOOLCHAIN_VERSION" ] || [ -z "$TOOLCHAIN_DIR" ] || [ -z "$RELEASE_MODE" ]; then
+  echo "Usage: build_dmg.sh --app-version <semver> --toolchain-version <semver> --toolchain-dir <absolute-path> (--development-unsigned | --production --identity-fingerprint <sha1> --team-id <id> --notary-keychain-profile <name> --prepared-release-root <absolute-path> --prepared-manifest-sha256 <sha256> --source-commit <sha1>) [--project-url <https-url>] [--build-root <absolute-path>] [--output-dir <absolute-path>]" >&2
   exit 1
 fi
 if [ "$RELEASE_MODE" = production ]; then
@@ -256,33 +213,16 @@ fi
 if [ "$RELEASE_MODE" = production ]; then
   if [ -z "$PREPARED_RELEASE_ROOT" ] \
       || ! [[ "$PREPARED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] \
-      || ! [[ "$SOURCE_COMMIT_OVERRIDE" =~ ^[0-9a-f]{40}$ ]] \
-      || [ "$MANIFEST_TOOL_BIN_SET" -ne 1 ]; then
-    echo "Production packaging requires a prepared release root, its lowercase SHA-256 manifest digest, a lowercase 40-hex source commit, and an independently trusted ManifestTool." >&2
+      || ! [[ "$SOURCE_COMMIT_OVERRIDE" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Production packaging requires a prepared release root, its lowercase SHA-256 manifest digest, and a lowercase 40-hex source commit." >&2
     exit 1
   fi
 elif [ -n "$PREPARED_RELEASE_ROOT" ] \
     || [ -n "$PREPARED_MANIFEST_SHA256" ] \
-    || [ -n "$SOURCE_COMMIT_OVERRIDE" ] \
-    || [ "$MANIFEST_TOOL_BIN_SET" -ne 0 ]; then
+    || [ -n "$SOURCE_COMMIT_OVERRIDE" ]; then
   echo "Prepared release inputs require production mode." >&2
   exit 1
 fi
-
-/usr/bin/python3 -I - \
-  "$MANIFEST_URL" \
-  "$CORE_ARTIFACT_URL" \
-  "$DA3_BASE_ARTIFACT_URL" \
-  "$DA3_SMALL_ARTIFACT_URL" <<'PY'
-import sys
-from urllib.parse import urlparse
-
-labels = ("Manifest URL", "Core artifact URL", "DA3 Base artifact URL", "DA3 Small artifact URL")
-for label, value in zip(labels, sys.argv[1:]):
-    parsed = urlparse(value)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-        raise SystemExit(f"{label} must use HTTPS and contain no credentials.")
-PY
 
 if ! easysplat_is_strict_semver_without_build_metadata "$APP_VERSION"; then
   echo "App version must be strict semantic versioning without build metadata: $APP_VERSION" >&2
@@ -310,152 +250,12 @@ if command -v xcodebuild >/dev/null 2>&1; then
   fi
 fi
 
-TOOLCHAINS="$ROOT/Toolchains"
-if [ -n "$PREPARED_RELEASE_ROOT" ]; then
-  TOOLCHAINS="$PREPARED_RELEASE_ROOT/toolchain"
+if [ -n "$PREPARED_RELEASE_ROOT" ] && [ "$TOOLCHAIN_DIR" = "$ROOT/Toolchains/out" ]; then
+  TOOLCHAIN_DIR="$PREPARED_RELEASE_ROOT/toolchain/out"
 fi
-OUT="$TOOLCHAINS/out"
-CORE_ZIP="$OUT/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip"
-DA3_BASE_ZIP="$OUT/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip"
-DA3_SMALL_ZIP="$OUT/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"
-MANIFEST="$TOOLCHAINS/manifest.json"
-PUB="$TOOLCHAINS/public_key_ed25519.txt"
-TRACKED_APP_AUTHORITY="$ROOT/EasySplatApp/Resources/public_key_ed25519.txt"
-for required in "$PUB" "$MANIFEST" "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"; do
-  if [ ! -f "$required" ]; then
-    echo "Missing existing signed toolchain artifact: $required" >&2
-    exit 1
-  fi
-done
-if [ ! -f "$TRACKED_APP_AUTHORITY" ]; then
-  echo "Missing tracked app authority: $TRACKED_APP_AUTHORITY" >&2
-  exit 1
-fi
-
-/usr/bin/python3 -I - "$PUB" "$TRACKED_APP_AUTHORITY" <<'PY'
-import base64
-import binascii
-import sys
-from pathlib import Path
-
-
-def read_ed25519_public_key(path_value: str, label: str) -> bytes:
-    path = Path(path_value)
-    try:
-        encoded = path.read_text(encoding="ascii").strip()
-        decoded = base64.b64decode(encoded, validate=True)
-    except (OSError, UnicodeError, binascii.Error, ValueError) as error:
-        raise SystemExit(f"{label} is not a valid base64 Ed25519 public key: {path}") from error
-    if len(decoded) != 32:
-        raise SystemExit(f"{label} must decode to exactly 32 bytes: {path}")
-    return decoded
-
-
-toolchain_authority = read_ed25519_public_key(
-    sys.argv[1], "Signed toolchain authority"
-)
-tracked_app_authority = read_ed25519_public_key(
-    sys.argv[2], "Tracked app authority"
-)
-if toolchain_authority != tracked_app_authority:
-    raise SystemExit(
-        "Signed toolchain authority does not match the tracked app authority."
-    )
-PY
-
-if [ -n "$PREPARED_RELEASE_ROOT" ]; then
-  PREPARED_RELEASE_ROOT="$(/usr/bin/python3 -I - "$PREPARED_RELEASE_ROOT" <<'PY'
-import os
-import stat
-import sys
-
-candidate = sys.argv[1]
-if not os.path.isabs(candidate) or os.path.normpath(candidate) != candidate:
-    raise SystemExit("Prepared release root must be an absolute normalized path.")
-resolved = os.path.realpath(candidate)
-if resolved != candidate:
-    raise SystemExit("Prepared release root must contain no symlink ancestry.")
-metadata = os.lstat(resolved)
-if (
-    not stat.S_ISDIR(metadata.st_mode)
-    or metadata.st_uid != os.geteuid()
-    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-):
-    raise SystemExit("Prepared release root must be owned and not group/world writable.")
-print(resolved)
-PY
-)" || exit 1
-  PREPARED_APP="$PREPARED_RELEASE_ROOT/product/EasySplat.app"
-  PREPARED_DSYM="$PREPARED_RELEASE_ROOT/product/EasySplat.app.dSYM"
-  for required in \
-    "$PREPARED_APP" \
-    "$PREPARED_DSYM" \
-    "$PREPARED_RELEASE_ROOT/prepared-release.json"; do
-    if [ ! -e "$required" ] || [ -L "$required" ]; then
-      echo "Prepared release product is missing or linked: $required" >&2
-      exit 1
-    fi
-  done
-  MANIFEST_TOOL_BIN="$(/usr/bin/python3 -I - \
-    "$MANIFEST_TOOL_BIN" "$PREPARED_RELEASE_ROOT" <<'PY'
-import os
-import stat
-import sys
-
-candidate, prepared_root = sys.argv[1:]
-if not os.path.isabs(candidate) or os.path.normpath(candidate) != candidate:
-    raise SystemExit("Trusted ManifestTool path must be absolute and normalized.")
-resolved = os.path.realpath(candidate)
-if resolved != candidate:
-    raise SystemExit("Trusted ManifestTool path must contain no symlink ancestry.")
-try:
-    metadata = os.lstat(resolved)
-except OSError as error:
-    raise SystemExit(f"Cannot inspect trusted ManifestTool: {error}") from error
-if (
-    not stat.S_ISREG(metadata.st_mode)
-    or metadata.st_nlink != 1
-    or metadata.st_uid != os.geteuid()
-    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    or not metadata.st_mode & stat.S_IXUSR
-):
-    raise SystemExit(
-        "Trusted ManifestTool must be an owned, single-link, owner-executable regular file."
-    )
-if os.path.commonpath((resolved, prepared_root)) == prepared_root:
-    raise SystemExit("Trusted ManifestTool must be outside the prepared artifact.")
-print(resolved)
-PY
-)" || exit 1
-fi
-
-manifest_tool=(/usr/bin/swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool)
-if [ -n "$PREPARED_RELEASE_ROOT" ]; then
-  manifest_tool=("$MANIFEST_TOOL_BIN")
-fi
-"${manifest_tool[@]}" verify-release \
-  --manifest "$MANIFEST" \
-  --public-key-file "$PUB" \
-  --toolchain-version "$TOOLCHAIN_VERSION" \
-  --app-version "$APP_VERSION" \
-  --core-zip "$CORE_ZIP" \
-  --core-url "$CORE_ARTIFACT_URL" \
-  --da3-base-zip "$DA3_BASE_ZIP" \
-  --da3-base-url "$DA3_BASE_ARTIFACT_URL" \
-  --da3-small-zip "$DA3_SMALL_ZIP" \
-  --da3-small-url "$DA3_SMALL_ARTIFACT_URL"
-
-/usr/bin/python3 -I "$ROOT/scripts/release/generate_release_metadata.py" verify-toolchain \
-  --toolchain-version "$TOOLCHAIN_VERSION" \
-  --manifest "$MANIFEST" \
-  --core "$CORE_ZIP" \
-  --core-url "$CORE_ARTIFACT_URL" \
-  --da3-base "$DA3_BASE_ZIP" \
-  --da3-base-url "$DA3_BASE_ARTIFACT_URL" \
-  --da3-small "$DA3_SMALL_ZIP" \
-  --da3-small-url "$DA3_SMALL_ARTIFACT_URL"
 
 BUILD_ROOT="$(/usr/bin/python3 -I - "$BUILD_ROOT" "$ROOT" <<'PY'
+
 import os
 import stat
 import sys
@@ -537,6 +337,47 @@ PY
 PACKAGE_BUILD_ROOT="$(mktemp -d "$BUILD_ROOT/.EasySplat-$APP_VERSION.package.XXXXXX")"
 chmod 0700 "$PACKAGE_BUILD_ROOT"
 
+# The app build and the release metadata each read the toolchain separately, so
+# a tree that changes between them would ship one closure and describe another.
+# Freezing it once here is what makes the SBOM describe the sealed helpers.
+/usr/bin/ditto --noqtn "$TOOLCHAIN_DIR" "$PACKAGE_BUILD_ROOT/toolchain"
+TOOLCHAIN_DIR="$PACKAGE_BUILD_ROOT/toolchain"
+
+if [ -n "$PREPARED_RELEASE_ROOT" ]; then
+  PREPARED_RELEASE_ROOT="$(/usr/bin/python3 -I - "$PREPARED_RELEASE_ROOT" <<'PY'
+import os
+import stat
+import sys
+
+candidate = sys.argv[1]
+if not os.path.isabs(candidate) or os.path.normpath(candidate) != candidate:
+    raise SystemExit("Prepared release root must be an absolute normalized path.")
+resolved = os.path.realpath(candidate)
+if resolved != candidate:
+    raise SystemExit("Prepared release root must contain no symlink ancestry.")
+metadata = os.lstat(resolved)
+if (
+    not stat.S_ISDIR(metadata.st_mode)
+    or metadata.st_uid != os.geteuid()
+    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+):
+    raise SystemExit("Prepared release root must be owned and not group/world writable.")
+print(resolved)
+PY
+)" || exit 1
+  PREPARED_APP="$PREPARED_RELEASE_ROOT/product/EasySplat.app"
+  PREPARED_DSYM="$PREPARED_RELEASE_ROOT/product/EasySplat.app.dSYM"
+  for required in \
+    "$PREPARED_APP" \
+    "$PREPARED_DSYM" \
+    "$PREPARED_RELEASE_ROOT/prepared-release.json"; do
+    if [ ! -e "$required" ] || [ -L "$required" ]; then
+      echo "Prepared release product is missing or linked: $required" >&2
+      exit 1
+    fi
+  done
+fi
+
 if [ -n "$PREPARED_RELEASE_ROOT" ]; then
   /usr/bin/python3 -I "$ROOT/scripts/release/prepared_release.py" verify \
     --root "$PREPARED_RELEASE_ROOT" \
@@ -583,12 +424,16 @@ if [ -n "$PREPARED_RELEASE_ROOT" ]; then
     --team-id "$TEAM_ID" \
     --receipt "$PACKAGE_BUILD_ROOT/Export/EasySplat.app-signing.json"
 else
+for required in bin/colmap bin/easysplat-train bin/default.metallib lib/libomp.dylib; do
+  if [ ! -f "$TOOLCHAIN_DIR/$required" ]; then
+    echo "Missing toolchain artifact: $TOOLCHAIN_DIR/$required" >&2
+    exit 1
+  fi
+done
+
   build_app_args=(
-    --manifest-url "$MANIFEST_URL"
-    --public-key-path "$PUB"
     --version "$APP_VERSION"
-    --bootstrap-manifest "$MANIFEST"
-    --bootstrap-core-archive "$CORE_ZIP"
+    --toolchain-dir "$TOOLCHAIN_DIR"
     --build-root "$PACKAGE_BUILD_ROOT"
   )
   if [ -n "$PROJECT_URL" ]; then
@@ -807,14 +652,7 @@ SOURCE_URL="${PROJECT_URL:-https://github.com/${GITHUB_REPOSITORY:-dud8/EasySpla
   --source-commit "$SOURCE_COMMIT" \
   --source-url "$SOURCE_URL" \
   --dmg "$DMG_PATH" \
-  --manifest "$MANIFEST" \
-  --manifest-url "$MANIFEST_URL" \
-  --core "$CORE_ZIP" \
-  --core-url "$CORE_ARTIFACT_URL" \
-  --da3-base "$DA3_BASE_ZIP" \
-  --da3-base-url "$DA3_BASE_ARTIFACT_URL" \
-  --da3-small "$DA3_SMALL_ZIP" \
-  --da3-small-url "$DA3_SMALL_ARTIFACT_URL" \
+  --toolchain-dir "$TOOLCHAIN_DIR" \
   --app-license "$ROOT/LICENSE" \
   --notice "$ROOT/NOTICE.md" \
   --viewer-license "$ROOT/ThirdParty/MetalSplatter/LICENSE" \

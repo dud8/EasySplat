@@ -1719,6 +1719,61 @@ final class ProjectPublicationTransactionTests: XCTestCase {
         }
     }
 
+    func testFreshPublicationAttestationAdvancesPastExactRunLeaseBindingOnly() throws {
+        let success = try makeAttestedPublicationFixture(title: "Attested Lease")
+        defer { try? FileManager.default.removeItem(at: success.base) }
+        let successRegistry = temporaryDirectory(suffix: "attested-lease-registry")
+        defer { try? FileManager.default.removeItem(at: successRegistry) }
+        try FileManager.default.createDirectory(
+            at: successRegistry,
+            withIntermediateDirectories: true
+        )
+        let successLease = try ProjectRunLease.acquire(
+            projectURL: success.publication.projectURL,
+            registryURL: successRegistry.appendingPathComponent("registry", isDirectory: true)
+        )
+        defer { successLease.release() }
+        try success.publication.attestation.projectRunLeaseDidAcquire()
+        let successMetadata = try ProjectMetadataStore.load(
+            from: ProjectPaths(root: success.publication.projectURL).metadataURL
+        )
+        XCTAssertNoThrow(try success.publication.attestation.consume(
+            projectURL: success.publication.projectURL,
+            metadata: successMetadata
+        ))
+        XCTAssertNoThrow(try success.publication.attestation.completeConsumption())
+
+        let mutated = try makeAttestedPublicationFixture(title: "Attested Lease Mutation")
+        defer { try? FileManager.default.removeItem(at: mutated.base) }
+        let mutatedRegistry = temporaryDirectory(suffix: "attested-lease-mutation-registry")
+        defer { try? FileManager.default.removeItem(at: mutatedRegistry) }
+        try FileManager.default.createDirectory(
+            at: mutatedRegistry,
+            withIntermediateDirectories: true
+        )
+        let mutatedLease = try ProjectRunLease.acquire(
+            projectURL: mutated.publication.projectURL,
+            registryURL: mutatedRegistry.appendingPathComponent("registry", isDirectory: true)
+        )
+        defer { mutatedLease.release() }
+        try mutated.publication.attestation.projectRunLeaseDidAcquire()
+        let unexpected = mutated.base.appendingPathComponent("later-library-churn")
+        try Data("unexpected".utf8).write(to: unexpected)
+        try FileManager.default.removeItem(at: unexpected)
+        let mutatedMetadata = try ProjectMetadataStore.load(
+            from: ProjectPaths(root: mutated.publication.projectURL).metadataURL
+        )
+        XCTAssertThrowsError(try mutated.publication.attestation.consume(
+            projectURL: mutated.publication.projectURL,
+            metadata: mutatedMetadata
+        )) {
+            XCTAssertEqual(
+                $0 as? FreshProjectPublicationAttestationError,
+                .filesystemChanged
+            )
+        }
+    }
+
     func testFreshPublicationAttestationBurnsOnWrongURL() throws {
         let fixture = try makeAttestedPublicationFixture(title: "Wrong URL")
         defer { try? FileManager.default.removeItem(at: fixture.base) }

@@ -1,21 +1,32 @@
+import CoreFoundation
 import Foundation
 
 extension ToolchainManager {
+    /// `dataRoot` and `metallib` default to the single-root layout a development
+    /// tree uses; a split layout passes both explicitly.
     func validateToolchain(
         root: URL,
+        dataRoot: URL? = nil,
+        metallib: URL? = nil,
         requiredCapabilities: Set<ToolchainCapability>,
         repairExecutablePermissions: Bool = true,
-        authenticatedVersion: String? = nil
-    ) throws -> ToolchainPaths {
+        toolchainIdentity: String,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree
+    ) async throws -> ToolchainPaths {
+        try Task.checkCancellation()
+        let payloadRoot = dataRoot ?? root
         let colmap = root.appendingPathComponent("bin/colmap")
         if repairExecutablePermissions { ensureExecutable(at: colmap) }
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
 
-        try requireArm64Binary(at: colmap, label: "colmap")
+        try await requireArm64Binary(at: colmap, label: "colmap")
+        try Task.checkCancellation()
 
         let colmapCheck: SubprocessResult
         do {
-            colmapCheck = try runner.run(colmap.path, ["help"])
+            colmapCheck = try await runner.runAsync(colmap.path, ["help"])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP could not be launched.")
         }
@@ -23,10 +34,13 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
         }
         try validateNativeColmapRoot(colmapCheck)
+        try Task.checkCancellation()
 
         let matchesImporterProbe: SubprocessResult
         do {
-            matchesImporterProbe = try runner.run(colmap.path, ["matches_importer", "-h"])
+            matchesImporterProbe = try await runner.runAsync(colmap.path, ["matches_importer", "-h"])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP matches_importer could not be launched.")
         }
@@ -41,10 +55,13 @@ extension ToolchainManager {
             in: matchesImporterProbe,
             subject: "COLMAP matches_importer"
         )
+        try Task.checkCancellation()
 
         let mapperProbe: SubprocessResult
         do {
-            mapperProbe = try runner.run(colmap.path, ["mapper", "-h"])
+            mapperProbe = try await runner.runAsync(colmap.path, ["mapper", "-h"])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP mapper could not be launched.")
         }
@@ -63,10 +80,13 @@ extension ToolchainManager {
             in: mapperProbe,
             subject: "COLMAP mapper"
         )
+        try Task.checkCancellation()
 
         let vocabularyProbe: SubprocessResult
         do {
-            vocabularyProbe = try runner.run(colmap.path, ["local_vocab_retriever", "-h"])
+            vocabularyProbe = try await runner.runAsync(colmap.path, ["local_vocab_retriever", "-h"])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP local_vocab_retriever could not be launched.")
         }
@@ -86,6 +106,7 @@ extension ToolchainManager {
             in: vocabularyProbe,
             subject: "COLMAP local_vocab_retriever"
         )
+        try Task.checkCancellation()
 
         let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
         let da3SfmTool = da3Root.appendingPathComponent("bin/easysplat_da3_sfm")
@@ -133,11 +154,20 @@ extension ToolchainManager {
                 throw ToolchainError.missingBinary("da3_mps/python/bin/python3")
             }
             try validateBuildInfo(at: da3BuildInfo, expectedToolchainName: "da3_mps")
-            try requireArm64Binary(at: da3Python, label: "da3_mps python")
-            let da3Check = try runner.run(da3SfmTool.path, ["--help"])
+            try await requireArm64Binary(at: da3Python, label: "da3_mps python")
+            try Task.checkCancellation()
+            let da3Check: SubprocessResult
+            do {
+                da3Check = try await runner.runAsync(da3SfmTool.path, ["--help"])
+            } catch let error as CancellationError {
+                throw error
+            } catch {
+                throw ToolchainError.invalidToolchain("da3_mps could not be launched.")
+            }
             guard da3Check.exitCode == 0 else {
                 throw ToolchainError.invalidToolchain("da3_mps failed to launch (exit \(da3Check.exitCode)).")
             }
+            try Task.checkCancellation()
         }
         if needsBase || needsSmall {
             guard fileManager.fileExists(atPath: da3Models.path) else {
@@ -176,11 +206,12 @@ extension ToolchainManager {
         )
 
         let msplat = root.appendingPathComponent("bin/easysplat-train")
-        let msplatMetallib = root.appendingPathComponent("bin/default.metallib")
-        let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
+        let msplatMetallib = metallib ?? root.appendingPathComponent("bin/default.metallib")
+        let msplatRoot = payloadRoot.appendingPathComponent("msplat", isDirectory: true)
         let msplatBuildInfo = msplatRoot.appendingPathComponent("build_info.json")
         let msplatLicense = msplatRoot.appendingPathComponent("LICENSE")
-        try rejectLegacyMsplatFootprint(root: root)
+        try Task.checkCancellation()
+        try rejectLegacyMsplatFootprint(root: root, dataRoot: payloadRoot)
         guard pathExistsIncludingSymlink(msplat) else {
             throw ToolchainError.missingBinary("bin/easysplat-train")
         }
@@ -194,25 +225,37 @@ extension ToolchainManager {
             throw ToolchainError.missingLibrary("msplat/LICENSE")
         }
 
-        let runtimeVersion = try validateNativeMsplatClosure(
+        let runtimeVersion = try await validateNativeMsplatClosure(
+            integrityPolicy: integrityPolicy,
             root: root,
+            dataRoot: payloadRoot,
             executable: msplat,
             metallib: msplatMetallib,
             buildInfo: msplatBuildInfo,
             license: msplatLicense
         )
+        try Task.checkCancellation()
         if repairExecutablePermissions { ensureExecutable(at: msplat) }
         guard fileManager.isExecutableFile(atPath: msplat.path) else {
             throw ToolchainError.missingBinary("bin/easysplat-train")
         }
-        try requireArm64Binary(at: msplat, label: "easysplat-train")
-        try validateMsplatSelfCheck(executable: msplat, runtimeVersion: runtimeVersion)
+        try await requireArm64Binary(at: msplat, label: "easysplat-train")
+        try Task.checkCancellation()
+        try await validateMsplatSelfCheck(
+            executable: msplat,
+            metallib: msplatMetallib,
+            runtimeVersion: runtimeVersion
+        )
+        try Task.checkCancellation()
 
         return ToolchainPaths(
             root: root,
-            authenticatedVersion: authenticatedVersion,
+            dataRoot: payloadRoot,
+            toolchainIdentity: toolchainIdentity,
+            integrityPolicy: integrityPolicy,
             colmap: colmap,
             msplat: msplat,
+            metallib: msplatMetallib,
             da3: da3
         )
     }
@@ -333,19 +376,28 @@ extension ToolchainManager {
     }
 
     func validateNativeMsplatClosure(
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree,
         root: URL,
+        dataRoot: URL,
         executable: URL,
         metallib: URL,
         buildInfo: URL,
         license: URL
-    ) throws -> String {
-        let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
+    ) async throws -> String {
+        try Task.checkCancellation()
+        let msplatRoot = dataRoot.appendingPathComponent("msplat", isDirectory: true)
         let expectedFiles = Set(["LICENSE", "build_info.json"])
 
-        for url in [executable, metallib, msplatRoot, buildInfo, license] {
-            if let symlink = firstSymbolicLinkComponent(from: root, through: url) {
+        for (url, container) in [
+            (executable, root),
+            (metallib, dataRoot),
+            (msplatRoot, dataRoot),
+            (buildInfo, dataRoot),
+            (license, dataRoot),
+        ] {
+            if let symlink = firstSymbolicLinkComponent(from: container, through: url) {
                 throw ToolchainError.invalidToolchain(
-                    "Native msplat closure contains a symbolic link: \(projectRelativePath(symlink, root: root))."
+                    "Native msplat closure contains a symbolic link: \(projectRelativePath(symlink, root: container))."
                 )
             }
         }
@@ -409,10 +461,22 @@ extension ToolchainManager {
             }
         }
 
-        return try validateMsplatBuildInfo(at: buildInfo, executable: executable, metallib: metallib)
+        try Task.checkCancellation()
+        return try await validateMsplatBuildInfo(
+            at: buildInfo,
+            executable: executable,
+            metallib: metallib,
+            integrityPolicy: integrityPolicy
+        )
     }
 
-    func validateMsplatBuildInfo(at url: URL, executable: URL, metallib: URL) throws -> String {
+    func validateMsplatBuildInfo(
+        at url: URL,
+        executable: URL,
+        metallib: URL,
+        integrityPolicy: ToolchainIntegrityPolicy = .unsignedDevelopmentTree
+    ) async throws -> String {
+        try Task.checkCancellation()
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -437,8 +501,22 @@ extension ToolchainManager {
             "source_commit",
             "source_version",
             "source_tree_sha256",
+            "density_control_patch_sha256",
+            "projection_vjp_patch_sha256",
+            "alpha_cap_patch_sha256",
+            "projection_oracle_patch_sha256",
             "overlay_sha256",
             "raster_test_sha256",
+            "isolation_header_sha256",
+            "isolation_source_sha256",
+            "isolation_runtime_header_sha256",
+            "isolation_runtime_source_sha256",
+            "isolation_mask_header_sha256",
+            "isolation_mask_source_sha256",
+            "isolation_lift_source_sha256",
+            "isolation_test_sha256",
+            "isolation_mask_test_sha256",
+            "isolation_patch_sha256",
             "row_span_culling_patch_sha256",
             "geometry_adam_fusion_patch_sha256",
             "parallel_radix_scan_patch_sha256",
@@ -492,8 +570,22 @@ extension ToolchainManager {
             "source_url": "https://github.com/rayanht/msplat.git",
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
-            "overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23",
-            "raster_test_sha256": "3cf418fcd564240f1157f3206cb01974454f617327abc9b0c41b71ec49d46e30",
+            "density_control_patch_sha256": "895df7c0562f885b6389897a990683419cdcb319faf2b24e4d1c44d0950432b9",
+            "projection_vjp_patch_sha256": "e283e1c608f2ea940c46cdcc08252ba0381fa7c33f9490c2812e2f1a83157667",
+            "alpha_cap_patch_sha256": "ee5b7f1563248d279f0b1a9d5fe9637feeb171cfa42546004772e7424b7bd7a6",
+            "projection_oracle_patch_sha256": "cfcf5a0c70bb6cbd05c25c1263d19ff87792abfc326fb43df4e1d17baf77c0a3",
+            "overlay_sha256": "a7c9ccd00e697c820b6f1335653922e114350b97141443adcda2175b161ddbbf",
+            "raster_test_sha256": "a7066c5ce8eff0a1ebb0586c83b77ac235446bd500e465fc3bb0e68d88c4ac2e",
+            "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
+            "isolation_source_sha256": "65504b0448c61b4f2602d86150ff6ce83be61bfc48cc9f632fa72d95b4992e61",
+            "isolation_runtime_header_sha256": "f3fae8409eeb24446bd9b5f4970b64522f01b1048c25827b712f4bef087b7d82",
+            "isolation_runtime_source_sha256": "87499dde716e8a4ae687ba220684fc5730013e7a6fd8ad7979db9f505c7025dd",
+            "isolation_mask_header_sha256": "51956923935621ef2e3681f33e11b1f63a6d1ed969234ee9e50edab927f712d7",
+            "isolation_mask_source_sha256": "ad9844c13dd427517311f0ad0725ffa348beb4c590d6febc6efe11c38d7240e8",
+            "isolation_lift_source_sha256": "c063a934eee67eb22e04483f32e798e6844ee722dde9daddeed79f5db56c13bc",
+            "isolation_test_sha256": "56b9fd653f70026d93adde200d8b7375bf30df9409b28e78d7db27006a2d5cdf",
+            "isolation_mask_test_sha256": "f4900f77878a22417c1bd397ee87d2730c21344d9ba9ab7e1579bfa083e7d2bc",
+            "isolation_patch_sha256": "a8a579d9d2a5ca23ce87ae0dd2a1f79de8da56bbfa62851244cfdda51bc37f59",
             "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
             "source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb",
             "exact_raster_patch_sha256": "c34a8860ed8ae9bc92c976aaa1c3f89eec8aa9be9cab4778f074491e98860855",
@@ -503,7 +595,7 @@ extension ToolchainManager {
             "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
             "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
             "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
-            "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
+            "allocation_pressure_patch_sha256": "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8",
             "exact_prefix_hardening_patch_sha256": "510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb",
             "quaternion_stability_patch_sha256": "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786",
             "deployment_target": "macOS 15.0",
@@ -522,6 +614,16 @@ extension ToolchainManager {
             "source_tree_sha256",
             "overlay_sha256",
             "raster_test_sha256",
+            "isolation_header_sha256",
+            "isolation_source_sha256",
+            "isolation_runtime_header_sha256",
+            "isolation_runtime_source_sha256",
+            "isolation_mask_header_sha256",
+            "isolation_mask_source_sha256",
+            "isolation_lift_source_sha256",
+            "isolation_test_sha256",
+            "isolation_mask_test_sha256",
+            "isolation_patch_sha256",
             "patch_sha256",
             "checkpoint_patch_sha256",
             "numeric_stability_patch_sha256",
@@ -536,6 +638,10 @@ extension ToolchainManager {
             "allocation_pressure_patch_sha256",
             "exact_prefix_hardening_patch_sha256",
             "quaternion_stability_patch_sha256",
+            "density_control_patch_sha256",
+            "projection_vjp_patch_sha256",
+            "alpha_cap_patch_sha256",
+            "projection_oracle_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]
@@ -579,13 +685,16 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("msplat build_info.json build_timestamp is not ISO 8601.")
         }
 
-        let executableHash = try sha256Hex(url: executable)
-        guard executableHash == payload["executable_sha256"] as? String else {
-            throw ToolchainError.invalidToolchain(
-                "msplat build_info.json executable_sha256 mismatch."
-            )
+        if integrityPolicy == .unsignedDevelopmentTree {
+            let executableHash = try await sha256Hex(url: executable)
+            guard executableHash == payload["executable_sha256"] as? String else {
+                throw ToolchainError.invalidToolchain(
+                    "msplat build_info.json executable_sha256 mismatch."
+                )
+            }
         }
-        let metallibHash = try sha256Hex(url: metallib)
+        try Task.checkCancellation()
+        let metallibHash = try await sha256Hex(url: metallib)
         guard metallibHash == payload["metallib_sha256"] as? String else {
             throw ToolchainError.invalidToolchain("msplat build_info.json metallib_sha256 mismatch.")
         }
@@ -594,10 +703,16 @@ extension ToolchainManager {
         return "\(sourceVersion) (git \(sourceCommit.prefix(7)))"
     }
 
-    func validateMsplatSelfCheck(executable: URL, runtimeVersion: String) throws {
+    func validateMsplatSelfCheck(executable: URL, metallib: URL, runtimeVersion: String) async throws {
+        try Task.checkCancellation()
         let result: SubprocessResult
         do {
-            result = try runner.run(executable.path, ["--self-check", "--events-fd", "1"])
+            result = try await runner.runAsync(
+                executable.path,
+                ["--self-check", "--events-fd", "1", "--metallib", metallib.path]
+            )
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain("easysplat-train self-check could not run (\(error.localizedDescription)).")
         }
@@ -612,6 +727,7 @@ extension ToolchainManager {
         }
         let expectedKeys = Set([
             "event",
+            "isolation_mode_version",
             "scene_bounds_status",
             "schema_version",
             "sequence",
@@ -620,25 +736,35 @@ extension ToolchainManager {
         ])
         guard Set(event.keys) == expectedKeys,
               event["event"] as? String == "self_check",
+              exactJSONInteger(event["isolation_mode_version"], equals: 1),
               event["scene_bounds_status"] as? String == "ok",
-              event["schema_version"] as? Int == 2,
-              event["sequence"] as? Int == 1,
+              exactJSONInteger(event["schema_version"], equals: 2),
+              exactJSONInteger(event["sequence"], equals: 1),
               event["status"] as? String == "ok",
               event["version"] as? String == runtimeVersion else {
             throw ToolchainError.invalidToolchain("easysplat-train self-check event is invalid.")
         }
     }
 
-    func rejectLegacyMsplatFootprint(root: URL) throws {
+    private func exactJSONInteger(_ value: Any?, equals expected: Int64) -> Bool {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFNumberGetTypeID(),
+              !CFNumberIsFloatType(number) else {
+            return false
+        }
+        return number.int64Value == expected
+    }
+
+    func rejectLegacyMsplatFootprint(root: URL, dataRoot: URL) throws {
         let legacyPaths = [
-            root.appendingPathComponent("bin/msplat-train"),
-            root.appendingPathComponent("msplat/bin"),
-            root.appendingPathComponent("msplat/python"),
-            root.appendingPathComponent("msplat/core_extension_path.txt"),
+            (root.appendingPathComponent("bin/msplat-train"), root),
+            (dataRoot.appendingPathComponent("msplat/bin"), dataRoot),
+            (dataRoot.appendingPathComponent("msplat/python"), dataRoot),
+            (dataRoot.appendingPathComponent("msplat/core_extension_path.txt"), dataRoot),
         ]
-        if let legacy = legacyPaths.first(where: { pathExistsIncludingSymlink($0) }) {
+        if let legacy = legacyPaths.first(where: { pathExistsIncludingSymlink($0.0) }) {
             throw ToolchainError.invalidToolchain(
-                "Remove the legacy msplat footprint at \(projectRelativePath(legacy, root: root))."
+                "Remove the legacy msplat footprint at \(projectRelativePath(legacy.0, root: legacy.1))."
             )
         }
     }
@@ -689,10 +815,13 @@ extension ToolchainManager {
     /// cannot be executed at all — we'd rather block startup than silently allow a Rosetta build.
     /// Uses `-b` to strip the filename from output so paths containing "arm64" (e.g.
     /// `…/index-build/arm64-apple-macosx/…`) cannot satisfy the substring check on their own.
-    func requireArm64Binary(at url: URL, label: String) throws {
+    func requireArm64Binary(at url: URL, label: String) async throws {
+        try Task.checkCancellation()
         let probe: SubprocessResult
         do {
-            probe = try runner.run("/usr/bin/file", ["-b", url.path])
+            probe = try await runner.runAsync("/usr/bin/file", ["-b", url.path])
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw ToolchainError.invalidToolchain(
                 "\(label) architecture check could not run (\(error.localizedDescription))."
@@ -720,66 +849,6 @@ extension ToolchainManager {
                 "\(label) must be an arm64-only Mach-O binary."
             )
         }
-    }
-
-    func artifactLooksInstalled(name: String, root: URL) -> Bool {
-        switch name {
-        case "macos-arm64-core":
-            return coreToolchainLooksInstalled(root: root)
-        case "geometry-da3-base":
-            return da3RuntimeLooksInstalled(root: root)
-                && da3ModelLooksInstalled(named: "DA3-BASE", root: root)
-        case "geometry-da3-small":
-            return da3ModelLooksInstalled(named: "DA3-SMALL", root: root)
-        default:
-            return false
-        }
-    }
-
-    func da3ModelLooksInstalled(named modelName: String, root: URL) -> Bool {
-        let bundle = root.appendingPathComponent("da3_mps/models/\(modelName)", isDirectory: true)
-        return fileManager.fileExists(atPath: bundle.appendingPathComponent("model.safetensors").path)
-            && fileManager.fileExists(atPath: bundle.appendingPathComponent("config.json").path)
-            && fileManager.fileExists(atPath: bundle.appendingPathComponent("easysplat_model_info.json").path)
-    }
-
-    func da3RuntimeLooksInstalled(root: URL) -> Bool {
-        let da3 = root.appendingPathComponent("da3_mps", isDirectory: true)
-        return fileManager.fileExists(atPath: da3.appendingPathComponent("bin/easysplat_da3_sfm").path)
-            && fileManager.fileExists(atPath: da3.appendingPathComponent("python/bin/python3").path)
-            && fileManager.fileExists(atPath: da3.appendingPathComponent("build_info.json").path)
-            && fileManager.fileExists(atPath: da3.appendingPathComponent("app/easysplat_da3_sfm/run.py").path)
-            && fileManager.fileExists(
-                atPath: da3.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py").path
-            )
-    }
-
-    func coreToolchainLooksInstalled(root: URL) -> Bool {
-        let colmap = root.appendingPathComponent("bin/colmap")
-        let msplat = root.appendingPathComponent("msplat", isDirectory: true)
-        let msplatTrain = root.appendingPathComponent("bin/easysplat-train")
-        let msplatMetallib = root.appendingPathComponent("bin/default.metallib")
-        let msplatBuildInfo = msplat.appendingPathComponent("build_info.json")
-        let msplatLicense = msplat.appendingPathComponent("LICENSE")
-        let legacyMsplatPresent = [
-            root.appendingPathComponent("bin/msplat-train"),
-            root.appendingPathComponent("msplat/bin"),
-            root.appendingPathComponent("msplat/python"),
-            root.appendingPathComponent("msplat/core_extension_path.txt"),
-        ].contains { pathExistsIncludingSymlink($0) }
-        let msplatOK = !legacyMsplatPresent
-            && !isSymbolicLink(msplatTrain)
-            && fileManager.isExecutableFile(atPath: msplatTrain.path)
-            && (try? validateNativeMsplatClosure(
-                root: root,
-                executable: msplatTrain,
-                metallib: msplatMetallib,
-                buildInfo: msplatBuildInfo,
-                license: msplatLicense
-            )) != nil
-
-        return fileManager.isExecutableFile(atPath: colmap.path)
-            && msplatOK
     }
 
 }

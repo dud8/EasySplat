@@ -189,6 +189,54 @@ public enum ReconstructionScorer {
         return true
     }
 
+    /// Acceptance against the views matching admitted to mapping. The score's
+    /// own totalImages stays the selected count so logs and summaries remain
+    /// honest; only the coverage ratio is judged on the admitted subset.
+    public static func isAcceptable(
+        _ score: ReconstructionScore,
+        admittedTotalImages: Int,
+        capturePath: CapturePath
+    ) -> Bool {
+        guard admittedTotalImages > 0,
+              admittedTotalImages <= score.totalImages else {
+            return isAcceptable(score, capturePath: capturePath)
+        }
+        let admittedScore = ReconstructionScore(
+            registeredImages: score.registeredImages,
+            totalImages: max(score.registeredImages, admittedTotalImages),
+            meanReprojectionError: score.meanReprojectionError,
+            pointCount: score.pointCount,
+            observationCount: score.observationCount,
+            meanTrackLength: score.meanTrackLength
+        )
+        return isAcceptable(admittedScore, capturePath: capturePath)
+    }
+
+    /// A reconstruction that misses only the registered-view fraction while
+    /// every measured quality criterion passes. Terminal mapping exhaustion
+    /// may accept it; the strict fraction keeps driving retries before that.
+    public static func isViablePartialRegistration(
+        _ score: ReconstructionScore,
+        admittedTotalImages: Int,
+        capturePath: CapturePath
+    ) -> Bool {
+        guard score.registeredImages
+                >= PairGraphConnectivityPolicy.minimumViableDominantViewCount,
+              admittedTotalImages > 0,
+              score.registeredImages <= admittedTotalImages else {
+            return false
+        }
+        let coveredScore = ReconstructionScore(
+            registeredImages: score.registeredImages,
+            totalImages: score.registeredImages,
+            meanReprojectionError: score.meanReprojectionError,
+            pointCount: score.pointCount,
+            observationCount: score.observationCount,
+            meanTrackLength: score.meanTrackLength
+        )
+        return isAcceptable(coveredScore, capturePath: capturePath)
+    }
+
     public static func applyingExpectedTotalImages(
         _ score: ReconstructionScore,
         expectedTotalImages: Int

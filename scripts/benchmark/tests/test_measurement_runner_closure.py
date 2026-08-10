@@ -1015,17 +1015,17 @@ private struct EvidenceBindingProbe {
             source,
         )
         self.assertIn("let measured = try ColmapResidualAnalyzer.analyze", source)
-        self.assertIn(
-            "guard snapshot.metadata.state.stage == .sfmMapping,\n"
-            "          snapshot.metadata.state.lastError == nil,\n"
-            "          snapshot.geometryArtifact != nil else",
+        self.assertRegex(
             source,
+            r"guard snapshot\.metadata\.state\.stage == \.sfmMapping,\s+"
+            r"snapshot\.metadata\.state\.lastError == nil,\s+"
+            r"snapshot\.geometryArtifact != nil else",
         )
         metadata_guard = source.index(
             "guard snapshot.metadata.state.stage == .sfmMapping,"
         )
         model_conversion = source.index(
-            "try ColmapRunner().runModelConverter(", metadata_guard
+            "try await runMeasurementModelConverter(", metadata_guard
         )
         self.assertLess(metadata_guard, model_conversion)
 
@@ -1640,7 +1640,7 @@ private struct EvidenceBindingProbe {
             "ColmapRunner().captureRuntimeClosure(",
             "runMapper(",
             "MeasurementSparseModelSelector.select(",
-            "runModelConverter(",
+            "runMeasurementModelConverter(",
             "ColmapResidualAnalyzer.analyzeConditioning(",
             '"source_database_initial_evidence"',
             '"source_database_final_evidence"',
@@ -1803,7 +1803,7 @@ private struct EvidenceBindingProbe {
             "guard snapshot.metadata.state.stage == .sfmMapping,"
         )
         model_conversion = source.index(
-            "try ColmapRunner().runModelConverter(", mapping_guard
+            "try await runMeasurementModelConverter(", mapping_guard
         )
         self.assertLess(matching_branch, mapping_guard)
         self.assertLess(matching_branch, model_conversion)
@@ -1901,7 +1901,7 @@ private struct EvidenceBindingProbe {
         capture = helper.index(binding_literal)
         decode = helper.index("ProjectMetadataStore.decodeValidatedMetadataSnapshot(")
         semantic_guard = helper.index(
-            "metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion"
+            "ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion)"
         )
         revalidate = helper.index("try metadataBinding.revalidate()")
         envelope = helper.rindex("    return [")
@@ -1923,7 +1923,7 @@ private struct EvidenceBindingProbe {
         recovery = source[recovery_start:recovery_end]
 
         for required in (
-            "metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion",
+            "ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion)",
             "metadata.lastRunStartedAt == nil",
             "metadata.resolvedRunPlan == resolvedPlan",
             "verifiedMatchingRecovery(",
@@ -2069,7 +2069,7 @@ private struct EvidenceBindingProbe {
         )
         geometry_only_branch = source.index("if arguments.geometryOnly {", call)
         normal_training = source.index(
-            "let dataset = try prepareMeasurementDataset(", call
+            "let dataset = try await prepareMeasurementDataset(", call
         )
         self.assertLess(call, geometry_only_branch)
         self.assertLess(geometry_only_branch, normal_training)

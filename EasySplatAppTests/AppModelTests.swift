@@ -127,7 +127,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotNil(model.currentProjectURL)
         XCTAssertNotNil(model.outputPlyURL)
         XCTAssertTrue(model.pendingVideoURLs.isEmpty)
-        XCTAssertNil(model.pendingPhotosFolderURL)
+        XCTAssertTrue(model.pendingPhotoURLs.isEmpty)
         guard let projectURL = model.currentProjectURL else {
             XCTFail("Missing project URL")
             return
@@ -163,6 +163,9 @@ final class AppModelTests: XCTestCase {
             .init(wallClock: wallClockStart, monotonicSeconds: 999),
         ])
         let boundary = RunTimingBoundary.capture(sample: samples.next)
+        let publicationID = UUID(
+            uuidString: "11111111-2222-4333-8444-555555555555"
+        )!
         var capturedConfig: PipelineRunner.PipelineConfig?
         let model = AppModel(
             toolchainManager: MockToolchainManager(),
@@ -170,7 +173,11 @@ final class AppModelTests: XCTestCase {
             videoInputPreflight: passingVideoPreflight()
         ) { projectURL, config in
             capturedConfig = config
-            return MockPipelineRunner(projectURL: projectURL, config: config)
+            return PublishedResultMockPipelineRunner(
+                projectURL: projectURL,
+                config: config,
+                publicationID: publicationID
+            )
         }
         model.addInputs(urls: [input])
 
@@ -184,6 +191,23 @@ final class AppModelTests: XCTestCase {
 
         let projectURL = try XCTUnwrap(model.currentProjectURL)
         let outputURL = try XCTUnwrap(model.outputPlyURL)
+        let paths = ProjectPaths(root: projectURL)
+        XCTAssertEqual(
+            model.pendingResultViewerTiming?.expectedPublicationID,
+            publicationID
+        )
+        let preparedReceipt = try PublishedSplatReceiptStore.load(
+            projectPaths: paths
+        )
+        let preparedMetadata = try ProjectMetadataStore.load(
+            from: paths.metadataURL
+        )
+        let preparedStageTimings = try XCTUnwrap(
+            preparedMetadata.stageTimings
+        )
+        XCTAssertEqual(preparedStageTimings.map(\.stage), [.trainSplat])
+        XCTAssertEqual(preparedReceipt.publicationID, publicationID)
+        XCTAssertNil(preparedReceipt.presentation.createToViewerReadySeconds)
         model.resultViewerDidBecomeReady(
             projectURL: projectURL.appendingPathComponent("stale.easysplatproj"),
             outputURL: outputURL
@@ -196,11 +220,24 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(samples.readCount, 2)
 
         model.resultViewerDidBecomeReady(projectURL: projectURL, outputURL: outputURL)
-        let recorded = try ProjectMetadataStore.load(
-            from: ProjectPaths(root: projectURL).metadataURL
+        let recordedReceipt = try await waitForPublishedViewerTiming(
+            paths: paths,
+            expectedSeconds: 9
+        )
+        let recorded = try await waitForPersistedViewerTiming(
+            paths: paths,
+            expectedSeconds: 9
         )
         XCTAssertEqual(try XCTUnwrap(recorded.createToViewerReadySeconds), 9, accuracy: 1e-12)
-        XCTAssertNil(recorded.stageTimings)
+        XCTAssertEqual(recordedReceipt.publicationID, publicationID)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                recordedReceipt.presentation.createToViewerReadySeconds
+            ),
+            9,
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(recorded.stageTimings, preparedStageTimings)
         XCTAssertEqual(samples.readCount, 3)
 
         model.resultViewerDidBecomeReady(projectURL: projectURL, outputURL: outputURL)
@@ -208,7 +245,1335 @@ final class AppModelTests: XCTestCase {
             from: ProjectPaths(root: projectURL).metadataURL
         )
         XCTAssertEqual(try XCTUnwrap(unchanged.createToViewerReadySeconds), 9, accuracy: 1e-12)
+        XCTAssertEqual(unchanged.stageTimings, preparedStageTimings)
         XCTAssertEqual(samples.readCount, 3)
+    }
+
+    func testViewerTimingRetriesMetadataAfterReceiptCommitWithoutChangingReceipt() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Viewer Timing Retry.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        var metadata = ProjectMetadata(
+            title: "Viewer Timing Retry",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let publicationID = UUID(
+            uuidString: "c9a82f1d-9e86-4d57-a99a-f67ded2fe1d5"
+        )!
+        let sourceURL = paths.trainingURL.appendingPathComponent("current-result.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        let samples = LockedRunTimingSamples([
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_000),
+                monotonicSeconds: 20
+            ),
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_007),
+                monotonicSeconds: 27
+            ),
+        ])
+        let updater = ViewerTimingMetadataUpdateProbe()
+        let receiptUpdater = ViewerTimingReceiptUpdateProbe()
+        let plyValidationCounter = LockedCallCounter()
+        var pairOperations = PublishedResultPairOperations.system()
+        pairOperations.willValidatePly = { _ in
+            plyValidationCounter.record()
+        }
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            projectMetadataUpdater: updater.update,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update,
+            resultViewerTimingPairOperations: pairOperations
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: samples.next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        let firstReceipt = try await waitForPublishedViewerTiming(
+            paths: paths,
+            expectedSeconds: 7
+        )
+        XCTAssertEqual(firstReceipt.publicationID, publicationID)
+        XCTAssertEqual(
+            firstReceipt.presentation.createToViewerReadySeconds,
+            7
+        )
+        let persisted = try await waitForPersistedViewerTiming(
+            paths: paths,
+            expectedSeconds: 7
+        )
+        let retriedReceipt = try PublishedSplatReceiptStore.load(projectPaths: paths)
+
+        XCTAssertEqual(updater.attemptCount, 2)
+        XCTAssertEqual(
+            receiptUpdater.attemptCount,
+            1,
+            "A metadata retry must not rewrite the receipt."
+        )
+        XCTAssertEqual(
+            plyValidationCounter.count,
+            1,
+            "The receipt update and both metadata attempts must share one PLY validation."
+        )
+        XCTAssertEqual(persisted.createToViewerReadySeconds, 7)
+        XCTAssertEqual(retriedReceipt.publicationID, publicationID)
+        XCTAssertEqual(
+            retriedReceipt.presentation.createToViewerReadySeconds,
+            7
+        )
+        try await waitForViewerTimingTaskToFinish(model: model)
+        XCTAssertNil(model.pendingResultViewerTiming)
+        XCTAssertEqual(samples.readCount, 2)
+    }
+
+    func testViewerTimingReceiptAndMetadataShareOneContinuouslyHeldRunLease() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Viewer Timing Lease.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        var metadata = ProjectMetadata(
+            title: "Viewer Timing Lease",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let publicationID = UUID()
+        let sourceURL = paths.trainingURL.appendingPathComponent("lease-result.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        let leaseProbe = ViewerTimingRunLeaseProbe(projectURL: projectURL)
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            projectMetadataUpdater: { descriptor, mutation in
+                leaseProbe.observeMetadataUpdate()
+                return try ProjectMetadataStore.update(
+                    atProjectRootDescriptor: descriptor,
+                    mutation
+                )
+            },
+            projectRunLeaseOwnerAcquirer: leaseProbe.acquire,
+            resultViewerTimingReceiptUpdater: {
+                seconds,
+                expectedPublicationID,
+                expectedGeneration,
+                projectPaths,
+                projectRootDescriptor,
+                operations,
+                shouldCancel in
+                leaseProbe.observeReceiptUpdate()
+                return try PublishedResultPairStore.recordFirstViewerReadyTiming(
+                    seconds,
+                    expectedPublicationID: expectedPublicationID,
+                    expectedGeneration: expectedGeneration,
+                    projectPaths: projectPaths,
+                    projectRootDescriptor: projectRootDescriptor,
+                    operations: operations,
+                    shouldCancel: shouldCancel
+                )
+            }
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: LockedRunTimingSamples([
+                .init(wallClock: Date(), monotonicSeconds: 10),
+                .init(wallClock: Date(), monotonicSeconds: 13),
+            ]).next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        _ = try await waitForPersistedViewerTiming(
+            paths: paths,
+            expectedSeconds: 3
+        )
+
+        XCTAssertEqual(leaseProbe.acquireCount, 1)
+        XCTAssertTrue(leaseProbe.receiptObservedHeldLease)
+        XCTAssertTrue(leaseProbe.metadataObservedHeldLease)
+    }
+
+    func testViewerTimingRootSwapBeforePairOpenMutatesNeitherProjectRoot() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Viewer Timing Root A.easysplatproj",
+            isDirectory: true
+        )
+        let replacementURL = tempBase.appendingPathComponent(
+            "Viewer Timing Root B.easysplatproj",
+            isDirectory: true
+        )
+        let parkedOriginalURL = tempBase.appendingPathComponent(
+            "Viewer Timing Root A Parked.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        var metadata = ProjectMetadata(
+            title: "Viewer Timing Root Swap",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let publicationID = UUID()
+        let sourceURL = paths.trainingURL.appendingPathComponent("root-swap.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        try FileManager.default.copyItem(at: projectURL, to: replacementURL)
+        let originalMetadata = try Data(contentsOf: paths.metadataURL)
+        let originalReceipt = try Data(contentsOf: paths.outputSplatReceiptURL)
+        let replacementPaths = ProjectPaths(root: replacementURL)
+        let replacementMetadata = try Data(contentsOf: replacementPaths.metadataURL)
+        let replacementReceipt = try Data(
+            contentsOf: replacementPaths.outputSplatReceiptURL
+        )
+        let swapProbe = ViewerTimingRootSwapProbe(
+            canonicalURL: projectURL,
+            replacementURL: replacementURL,
+            parkedOriginalURL: parkedOriginalURL
+        )
+        let plyValidationCounter = LockedCallCounter()
+        var pairOperations = PublishedResultPairOperations.system()
+        pairOperations.willOpenProjectRoot = swapProbe.swapBeforeOpen
+        pairOperations.willValidatePly = { _ in
+            plyValidationCounter.record()
+        }
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            resultViewerTimingPairOperations: pairOperations
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        let samples = LockedRunTimingSamples([
+            .init(wallClock: Date(), monotonicSeconds: 5),
+            .init(wallClock: Date(), monotonicSeconds: 9),
+        ])
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: samples.next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        try await waitForViewerTimingTaskToFinish(model: model)
+
+        let parkedPaths = ProjectPaths(root: parkedOriginalURL)
+        let canonicalReplacementPaths = ProjectPaths(root: projectURL)
+        XCTAssertEqual(
+            try Data(contentsOf: parkedPaths.metadataURL),
+            originalMetadata
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: parkedPaths.outputSplatReceiptURL),
+            originalReceipt
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: canonicalReplacementPaths.metadataURL),
+            replacementMetadata
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: canonicalReplacementPaths.outputSplatReceiptURL),
+            replacementReceipt
+        )
+        XCTAssertNil(
+            try ProjectMetadataStore.load(from: parkedPaths.metadataURL)
+                .createToViewerReadySeconds
+        )
+        XCTAssertNil(
+            try ProjectMetadataStore.load(from: canonicalReplacementPaths.metadataURL)
+                .createToViewerReadySeconds
+        )
+        XCTAssertEqual(swapProbe.attemptCount, 1)
+        XCTAssertEqual(
+            plyValidationCounter.count,
+            0,
+            "A replaced pathname must be rejected before either root's PLY is opened."
+        )
+        XCTAssertNil(model.pendingResultViewerTiming)
+    }
+
+    func testViewerTimingRetriesInitialMetadataReadWithoutSecondRendererEvent() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Viewer Timing Read Retry.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        var metadata = ProjectMetadata(
+            title: "Viewer Timing Read Retry",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let publicationID = UUID(
+            uuidString: "9f2f3f12-a80c-4f10-b140-187b37d47d8c"
+        )!
+        let sourceURL = paths.trainingURL.appendingPathComponent("result.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        let samples = LockedRunTimingSamples([
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_000),
+                monotonicSeconds: 10
+            ),
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_005),
+                monotonicSeconds: 15
+            ),
+        ])
+        let metadataLoader = ViewerTimingMetadataLoadProbe(
+            failuresBeforeSuccess: 1
+        )
+        let receiptUpdater = ViewerTimingReceiptUpdateProbe()
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            projectMetadataDescriptorLoader: metadataLoader.load,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: samples.next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+
+        let persisted = try await waitForPersistedViewerTiming(
+            paths: paths,
+            expectedSeconds: 5
+        )
+        XCTAssertEqual(persisted.createToViewerReadySeconds, 5)
+        XCTAssertEqual(metadataLoader.attemptCount, 2)
+        XCTAssertEqual(receiptUpdater.attemptCount, 1)
+        XCTAssertEqual(samples.readCount, 2)
+        try await waitForViewerTimingTaskToFinish(model: model)
+        XCTAssertNil(model.pendingResultViewerTiming)
+    }
+
+    func testViewerTimingDoesNotRepublishReceiptAfterMetadataRetriesFail() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Viewer Timing Exhausted Retry.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        var metadata = ProjectMetadata(
+            title: "Viewer Timing Exhausted Retry",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let publicationID = UUID(
+            uuidString: "b7e22256-c0db-4bca-bc89-4c0efb56d418"
+        )!
+        let sourceURL = paths.trainingURL.appendingPathComponent("result.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        let metadataUpdater = AlwaysFailingViewerTimingMetadataUpdateProbe()
+        let receiptUpdater = ViewerTimingReceiptUpdateProbe()
+        let plyValidationCounter = LockedCallCounter()
+        var pairOperations = PublishedResultPairOperations.system()
+        pairOperations.willValidatePly = { _ in
+            plyValidationCounter.record()
+        }
+        let samples = LockedRunTimingSamples([
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_000),
+                monotonicSeconds: 10
+            ),
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_004),
+                monotonicSeconds: 14
+            ),
+        ])
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            projectMetadataUpdater: metadataUpdater.update,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update,
+            resultViewerTimingPairOperations: pairOperations
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: samples.next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        _ = try await waitForPublishedViewerTiming(
+            paths: paths,
+            expectedSeconds: 4
+        )
+        try await waitForViewerTimingTaskToFinish(model: model)
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        await Task.yield()
+
+        XCTAssertEqual(metadataUpdater.attemptCount, 2)
+        XCTAssertEqual(
+            receiptUpdater.attemptCount,
+            1,
+            "A durable receipt must not be republished after metadata retries are exhausted."
+        )
+        XCTAssertEqual(
+            plyValidationCounter.count,
+            1,
+            "Receipt-bound metadata retries must not hash the PLY again."
+        )
+        XCTAssertNil(
+            try ProjectMetadataStore.load(from: paths.metadataURL)
+                .createToViewerReadySeconds
+        )
+        XCTAssertNil(model.pendingResultViewerTiming)
+        XCTAssertEqual(samples.readCount, 2)
+    }
+
+    func testResetCancelsPausedViewerTimingReceiptUpdate() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Cancelled Viewer Timing.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        var metadata = ProjectMetadata(
+            title: "Cancelled Viewer Timing",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let publicationID = UUID(
+            uuidString: "0f133b74-49b7-40f0-831f-1c69923bf92e"
+        )!
+        let sourceURL = paths.trainingURL.appendingPathComponent("result.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        let started = expectation(description: "receipt update started")
+        let finished = expectation(description: "receipt update finished")
+        let receiptUpdater = BlockingViewerTimingReceiptUpdateProbe(
+            phase: .beforeUpdate,
+            started: started,
+            finished: finished
+        )
+        let samples = LockedRunTimingSamples([
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_000),
+                monotonicSeconds: 20
+            ),
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_006),
+                monotonicSeconds: 26
+            ),
+        ])
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: samples.next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        await fulfillment(of: [started], timeout: 2)
+        model.reset()
+        receiptUpdater.release()
+        await fulfillment(of: [finished], timeout: 2)
+        await Task.yield()
+
+        let unchangedMetadata = try ProjectMetadataStore.load(
+            from: paths.metadataURL
+        )
+        let unchangedReceipt = try PublishedSplatReceiptStore.load(
+            projectPaths: paths
+        )
+        XCTAssertNil(unchangedMetadata.createToViewerReadySeconds)
+        XCTAssertNil(
+            unchangedReceipt.presentation.createToViewerReadySeconds
+        )
+        XCTAssertNil(model.pendingResultViewerTiming)
+        XCTAssertNil(model.resultViewerTimingTask)
+        XCTAssertEqual(samples.readCount, 2)
+    }
+
+    func testPostcommitCancellationFinishesMetadataUnderTheSameTimingLease() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Committed Viewer Timing.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        var metadata = ProjectMetadata(
+            title: "Committed Viewer Timing",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let publicationID = UUID(
+            uuidString: "f62db772-72d7-4646-9128-4d9ce0af3f98"
+        )!
+        let sourceURL = paths.trainingURL.appendingPathComponent("result.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        let committed = expectation(description: "receipt timing committed")
+        let updaterFinished = expectation(description: "cancelled updater finished")
+        let receiptUpdater = BlockingViewerTimingReceiptUpdateProbe(
+            phase: .afterUpdate,
+            started: committed,
+            finished: updaterFinished
+        )
+        let firstSamples = LockedRunTimingSamples([
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_000),
+                monotonicSeconds: 20
+            ),
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_006),
+                monotonicSeconds: 26
+            ),
+        ])
+        let metadataUpdater = ViewerTimingMetadataSuccessProbe()
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            projectMetadataUpdater: metadataUpdater.update,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: firstSamples.next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        await fulfillment(of: [committed], timeout: 2)
+        model.reset()
+        receiptUpdater.release()
+        await fulfillment(of: [updaterFinished], timeout: 2)
+        let reconciled = try await waitForPersistedViewerTiming(
+            paths: paths,
+            expectedSeconds: 6
+        )
+
+        XCTAssertEqual(
+            try PublishedSplatReceiptStore.load(projectPaths: paths)
+                .presentation.createToViewerReadySeconds,
+            6
+        )
+        XCTAssertEqual(reconciled.createToViewerReadySeconds, 6)
+        XCTAssertEqual(metadataUpdater.attemptCount, 1)
+        XCTAssertNil(model.pendingResultViewerTiming)
+    }
+
+    func testReadyProjectHealsMetadataOnlyFromFullyBoundPublishedLineage() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Viewer Timing Healing.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        var metadata = ProjectMetadata(
+            title: "Viewer Timing Healing",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let publicationID = UUID()
+        let sourceURL = paths.trainingURL.appendingPathComponent("healing-result.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        _ = try PublishedResultPairStore.recordFirstViewerReadyTiming(
+            6,
+            expectedPublicationID: publicationID,
+            projectPaths: paths
+        )
+        let receiptUpdater = ViewerTimingReceiptUpdateProbe()
+        let plyValidationCounter = LockedCallCounter()
+        let resolverOperations: PublishedResultResolverOperations = {
+            var operations = PublishedResultResolverOperations.system()
+            operations.didBeginPlyEvidenceValidation = { _ in
+                plyValidationCounter.record()
+            }
+            return operations
+        }()
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update,
+            publishedResultResolver: { projectURL in
+                try PublishedResultResolver.resolve(
+                    projectURL: projectURL,
+                    operations: resolverOperations
+                )
+            }
+        )
+
+        XCTAssertTrue(model.resumeProject(at: projectURL))
+        try await waitForViewState(model: model, state: .viewer)
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        let healed = try await waitForPersistedViewerTiming(
+            paths: paths,
+            expectedSeconds: 6
+        )
+
+        XCTAssertEqual(healed.createToViewerReadySeconds, 6)
+        XCTAssertEqual(receiptUpdater.attemptCount, 0)
+        XCTAssertEqual(
+            plyValidationCounter.count,
+            1,
+            "Healing must make one fully lineage-bound publication decision."
+        )
+    }
+
+    func testResumeTimingHealingRootSwapBeforeAuthorityCaptureMutatesNeitherRoot() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Resume Healing A.easysplatproj",
+            isDirectory: true
+        )
+        let replacementURL = tempBase.appendingPathComponent(
+            "Resume Healing B.easysplatproj",
+            isDirectory: true
+        )
+        let parkedOriginalURL = tempBase.appendingPathComponent(
+            "Resume Healing A Parked.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        var metadata = ProjectMetadata(
+            title: "Resume Healing A",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let publicationID = UUID()
+        let sourceURL = paths.trainingURL.appendingPathComponent("healing-a.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        _ = try PublishedResultPairStore.recordFirstViewerReadyTiming(
+            8,
+            expectedPublicationID: publicationID,
+            projectPaths: paths
+        )
+        try FileManager.default.copyItem(at: projectURL, to: replacementURL)
+        let originalMetadata = try Data(contentsOf: paths.metadataURL)
+        let originalReceipt = try Data(contentsOf: paths.outputSplatReceiptURL)
+        let replacementPaths = ProjectPaths(root: replacementURL)
+        let replacementMetadata = try Data(contentsOf: replacementPaths.metadataURL)
+        let replacementReceipt = try Data(
+            contentsOf: replacementPaths.outputSplatReceiptURL
+        )
+        let swapProbe = ViewerTimingRootSwapProbe(
+            canonicalURL: projectURL,
+            replacementURL: replacementURL,
+            parkedOriginalURL: parkedOriginalURL
+        )
+        let receiptUpdater = ViewerTimingReceiptUpdateProbe()
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            projectRunLeaseOwnerAcquirer: { url in
+                try swapProbe.swapBeforeOpen()
+                return try ProjectRunLeaseOwner.acquire(projectURL: url)
+            },
+            resultViewerTimingReceiptUpdater: receiptUpdater.update
+        )
+
+        XCTAssertTrue(model.resumeProject(at: projectURL))
+        try await waitForViewState(model: model, state: .viewer)
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        try await waitForViewerTimingTaskToFinish(model: model)
+
+        XCTAssertEqual(swapProbe.attemptCount, 1)
+        XCTAssertEqual(
+            try Data(
+                contentsOf: ProjectPaths(root: parkedOriginalURL).metadataURL
+            ),
+            originalMetadata
+        )
+        XCTAssertEqual(
+            try Data(
+                contentsOf: ProjectPaths(root: parkedOriginalURL)
+                    .outputSplatReceiptURL
+            ),
+            originalReceipt
+        )
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), replacementMetadata)
+        XCTAssertEqual(
+            try Data(contentsOf: paths.outputSplatReceiptURL),
+            replacementReceipt
+        )
+        XCTAssertNil(model.pendingResultViewerTiming)
+        XCTAssertEqual(receiptUpdater.attemptCount, 0)
+    }
+
+    func testViewerTimingDoesNotCrossPublicationReplacement() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Viewer Timing Generation Race.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        var metadata = ProjectMetadata(
+            title: "Viewer Timing Generation Race",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let publicationA = UUID(
+            uuidString: "aaaaaaaa-1111-4111-8111-111111111111"
+        )!
+        let sourceA = paths.trainingURL.appendingPathComponent("result-a.ply")
+        try writeMinimalPly(at: sourceA)
+        let resultA = try publishAppTestResult(
+            sourceURL: sourceA,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationA
+        )
+        let committed = expectation(description: "receipt A timing committed")
+        let updaterFinished = expectation(description: "receipt updater returned")
+        let receiptUpdater = BlockingViewerTimingReceiptUpdateProbe(
+            phase: .afterUpdate,
+            started: committed,
+            finished: updaterFinished
+        )
+        let samples = LockedRunTimingSamples([
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_000),
+                monotonicSeconds: 40
+            ),
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_008),
+                monotonicSeconds: 48
+            ),
+        ])
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = resultA.outputURL
+        model.viewState = .viewer
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: resultA.outputURL,
+            expectedPublicationID: publicationA,
+            boundary: .capture(sample: samples.next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: resultA.outputURL
+        )
+        await fulfillment(of: [committed], timeout: 2)
+
+        let publicationB = UUID(
+            uuidString: "bbbbbbbb-2222-4222-8222-222222222222"
+        )!
+        let sourceB = paths.trainingURL.appendingPathComponent("result-b.ply")
+        try writeMinimalPly(at: sourceB, vertexCount: 2)
+        _ = try publishAppTestResult(
+            sourceURL: sourceB,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationB
+        )
+        receiptUpdater.release()
+        await fulfillment(of: [updaterFinished], timeout: 2)
+        try await waitForViewerTimingTaskToFinish(model: model)
+
+        let currentReceipt = try PublishedSplatReceiptStore.load(
+            projectPaths: paths
+        )
+        let unchangedMetadata = try ProjectMetadataStore.load(
+            from: paths.metadataURL
+        )
+        XCTAssertEqual(currentReceipt.publicationID, publicationB)
+        XCTAssertNil(
+            currentReceipt.presentation.createToViewerReadySeconds,
+            "Publication A timing must not be copied into publication B."
+        )
+        XCTAssertNil(unchangedMetadata.createToViewerReadySeconds)
+        XCTAssertNil(model.pendingResultViewerTiming)
+        XCTAssertEqual(samples.readCount, 2)
+    }
+
+    func testMissingPublishedReceiptSkipsTimingWithoutHidingHealthyViewer() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+
+        let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let samples = LockedRunTimingSamples([
+            .init(wallClock: startedAt, monotonicSeconds: 100),
+            .init(
+                wallClock: startedAt.addingTimeInterval(2),
+                monotonicSeconds: 102
+            ),
+            .init(
+                wallClock: startedAt.addingTimeInterval(9),
+                monotonicSeconds: 109
+            ),
+        ])
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            videoInputPreflight: passingVideoPreflight()
+        ) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+        model.addInputs(urls: [input])
+
+        model.startFromPendingSelection(
+            timingBoundary: .capture(sample: samples.next)
+        )
+        try await waitForViewState(model: model, state: .viewer)
+
+        let projectURL = try XCTUnwrap(model.currentProjectURL)
+        let outputURL = try XCTUnwrap(model.outputPlyURL)
+        let paths = ProjectPaths(root: projectURL)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: paths.outputSplatReceiptURL.path
+            )
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: outputURL
+        )
+
+        let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(model.viewState, .viewer)
+        XCTAssertNil(metadata.createToViewerReadySeconds)
+        XCTAssertNil(model.pendingResultViewerTiming)
+        XCTAssertEqual(
+            samples.readCount,
+            2,
+            "A result without a validated receipt must not consume a timing sample."
+        )
+    }
+
+    func testPreviousResultViewerReadyDoesNotRecordCreateToViewerTiming() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Failed Retrain.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        let publicationID = UUID(
+            uuidString: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        )!
+        var metadata = ProjectMetadata(
+            title: "Failed Retrain",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let sourceURL = paths.trainingURL.appendingPathComponent(
+            "previous-result.ply"
+        )
+        try writeMinimalPly(at: sourceURL)
+        let previousResult = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        metadata = try ProjectMetadataStore.update(at: paths.metadataURL) {
+            latest in
+            latest.title = "Renamed after failure"
+            latest.notes = "Live notes after the failed retrain"
+            latest.viewerPreferences = ViewerPreferences(
+                isUprightFlipActive: true
+            )
+            latest.requestedRunOptions.detailProfile = .fast
+            latest.state = PipelineState(
+                stage: .trainSplat,
+                lastError: "The retrain failed."
+            )
+            latest.pendingPublicationID = UUID()
+            latest.lastRunStartedAt = nil
+            latest.lastFailureAt = Date(timeIntervalSince1970: 1_767_225_700)
+            latest.createToViewerReadySeconds = 12.5
+        }
+        let receiptBeforeOpen = try PublishedSplatReceiptStore.load(
+            projectPaths: paths
+        )
+        let model = AppModel(projectBaseURL: tempBase)
+        XCTAssertTrue(model.viewPreviousResult(at: projectURL))
+        try await waitForViewState(model: model, state: .viewer)
+
+        XCTAssertTrue(model.isShowingPreviousResult)
+        XCTAssertEqual(model.previousResultAttemptOutcome, .failed)
+        XCTAssertEqual(model.outputPlyURL, previousResult.outputURL)
+        XCTAssertEqual(
+            model.currentRunOptions,
+            receiptBeforeOpen.presentation.requestedRunOptions
+        )
+        XCTAssertEqual(
+            model.currentStageTimings,
+            receiptBeforeOpen.presentation.stageTimings
+        )
+        XCTAssertEqual(
+            model.currentProjectNotes,
+            "Live notes after the failed retrain"
+        )
+        XCTAssertEqual(
+            model.currentViewerPreferences,
+            metadata.viewerPreferences
+        )
+        XCTAssertNil(model.pendingResultViewerTiming)
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: previousResult.outputURL
+        )
+
+        let unchangedReceipt = try PublishedSplatReceiptStore.load(
+            projectPaths: paths
+        )
+        XCTAssertEqual(unchangedReceipt.publicationID, publicationID)
+        XCTAssertEqual(
+            unchangedReceipt.presentation.createToViewerReadySeconds,
+            receiptBeforeOpen.presentation.createToViewerReadySeconds,
+            "Live project timing must not be copied into a previous result receipt."
+        )
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: paths.metadataURL)
+                .createToViewerReadySeconds,
+            12.5
+        )
+
+        _ = try ProjectMetadataStore.update(at: paths.metadataURL) { latest in
+            latest.state = PipelineState(stage: .trainSplat, lastError: nil)
+            latest.lastRunStartedAt = Date(timeIntervalSince1970: 1_767_225_800)
+            latest.lastFailureAt = nil
+        }
+        let interruptedModel = AppModel(projectBaseURL: tempBase)
+        XCTAssertTrue(interruptedModel.viewPreviousResult(at: projectURL))
+        try await waitForViewState(model: interruptedModel, state: .viewer)
+        XCTAssertTrue(interruptedModel.isShowingPreviousResult)
+        XCTAssertEqual(
+            interruptedModel.previousResultAttemptOutcome,
+            .interrupted
+        )
+    }
+
+    func testViewerTimingRejectsStalePublicationWithoutHidingHealthyResult() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Publication Race.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        var metadata = ProjectMetadata(
+            title: "Publication Race",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let currentPublicationID = UUID(
+            uuidString: "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        )!
+        let stalePublicationID = UUID(
+            uuidString: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        )!
+        let sourceURL = paths.trainingURL.appendingPathComponent(
+            "current-result.ply"
+        )
+        try writeMinimalPly(at: sourceURL)
+        let currentResult = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: currentPublicationID
+        )
+
+        let samples = LockedRunTimingSamples([
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_000),
+                monotonicSeconds: 20
+            ),
+            .init(
+                wallClock: Date(timeIntervalSince1970: 1_700_000_009),
+                monotonicSeconds: 29
+            ),
+        ])
+        let receiptUpdater = ViewerTimingReceiptUpdateProbe()
+        let plyValidationCounter = LockedCallCounter()
+        var pairOperations = PublishedResultPairOperations.system()
+        pairOperations.willValidatePly = { _ in
+            plyValidationCounter.record()
+        }
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update,
+            resultViewerTimingPairOperations: pairOperations
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = currentResult.outputURL
+        model.viewState = .viewer
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: currentResult.outputURL,
+            expectedPublicationID: stalePublicationID,
+            boundary: .capture(sample: samples.next)
+        )
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: currentResult.outputURL
+        )
+        try await waitForViewerTimingTaskToFinish(model: model)
+
+        var unchangedMetadata = try ProjectMetadataStore.load(
+            from: paths.metadataURL
+        )
+        var unchangedReceipt = try PublishedSplatReceiptStore.load(
+            projectPaths: paths
+        )
+        XCTAssertEqual(model.viewState, .viewer)
+        XCTAssertEqual(model.outputPlyURL, currentResult.outputURL)
+        XCTAssertNil(model.lastError)
+        XCTAssertNil(unchangedMetadata.createToViewerReadySeconds)
+        XCTAssertEqual(unchangedReceipt.publicationID, currentPublicationID)
+        XCTAssertNil(
+            unchangedReceipt.presentation.createToViewerReadySeconds
+        )
+        XCTAssertNil(
+            model.pendingResultViewerTiming,
+            "A permanent publication mismatch must retire the stale renderer generation."
+        )
+        XCTAssertEqual(receiptUpdater.attemptCount, 1)
+        XCTAssertEqual(plyValidationCounter.count, 1)
+        XCTAssertEqual(samples.readCount, 2)
+
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: currentResult.outputURL
+        )
+        await Task.yield()
+
+        unchangedMetadata = try ProjectMetadataStore.load(
+            from: paths.metadataURL
+        )
+        unchangedReceipt = try PublishedSplatReceiptStore.load(
+            projectPaths: paths
+        )
+        XCTAssertNil(unchangedMetadata.createToViewerReadySeconds)
+        XCTAssertNil(
+            unchangedReceipt.presentation.createToViewerReadySeconds
+        )
+        XCTAssertEqual(receiptUpdater.attemptCount, 1)
+        XCTAssertEqual(
+            plyValidationCounter.count,
+            1,
+            "A retired stale generation must not hash publication B again."
+        )
+        XCTAssertEqual(
+            samples.readCount,
+            2,
+            "A retry must reuse the original first-ready sample."
+        )
     }
 
     func testResultViewerReadyNeverOverwritesPersistedTiming() throws {
@@ -248,7 +1613,11 @@ final class AppModelTests: XCTestCase {
 
         let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertEqual(try XCTUnwrap(metadata.createToViewerReadySeconds), 12.5, accuracy: 1e-12)
-        XCTAssertEqual(samples.readCount, 2)
+        XCTAssertEqual(
+            samples.readCount,
+            1,
+            "An ineligible result with persisted timing must not take a new sample."
+        )
     }
 
     func testRunTimingBoundaryIgnoresWallClockSkew() {
@@ -462,17 +1831,14 @@ final class AppModelTests: XCTestCase {
             MockPipelineRunner(projectURL: url, config: config)
         }
         model.addInputs(urls: [folder])
-        for _ in 0..<100 where model.selectionWarning == nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        XCTAssertEqual(model.pendingPhotoURLs.count, 2, "Folder photos should be ingested as a file list.")
         let warning = try XCTUnwrap(model.selectionWarning)
-        XCTAssertTrue(warning.contains("Thin"), "Warning should name the folder, got: \(warning)")
         XCTAssertTrue(warning.contains("2 photos"), "Warning should mention the actual count, got: \(warning)")
         XCTAssertTrue(warning.contains("Add at least 3"), "Warning should explain the hard floor, got: \(warning)")
         XCTAssertFalse(warning.contains("will still attempt"), "Warning must not promise a run below the hard floor.")
 
-        model.removePhotoFolder()
-        XCTAssertNil(model.pendingPhotosFolderURL)
+        model.removeAllPhotos()
+        XCTAssertTrue(model.pendingPhotoURLs.isEmpty)
         XCTAssertNil(model.selectionWarning)
     }
 
@@ -490,17 +1856,13 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
 
         model.addInputs(urls: [video, folder])
-        for _ in 0..<100 where model.photoFolderCountTask != nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
 
         XCTAssertEqual(model.pendingVideoURLs, [video])
-        XCTAssertEqual(model.pendingPhotosFolderURL, folder)
-        XCTAssertNil(model.photoFolderCountTask)
+        XCTAssertEqual(model.pendingPhotoURLs.count, 2)
         XCTAssertNil(model.selectionWarning)
     }
 
-    func testAddInputsKeepsFirstPhotoFolderAndWarnsAboutTheRest() throws {
+    func testAddInputsMergesPhotosFromMultipleFolders() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
         let first = base.appendingPathComponent("First", isDirectory: true)
@@ -508,27 +1870,33 @@ final class AppModelTests: XCTestCase {
         try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
         for index in 0..<AppModel.minimumRecommendedPhotos {
-            try Data("image".utf8).write(to: first.appendingPathComponent("photo-\(index).jpg"))
+            try Data("image-a-\(index)".utf8).write(to: first.appendingPathComponent("photo-\(index).jpg"))
+            try Data("image-b-\(index)".utf8).write(to: second.appendingPathComponent("photo-\(index).jpg"))
         }
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
 
         model.addInputs(urls: [first, second])
 
-        XCTAssertEqual(model.pendingPhotosFolderURL, first)
-        XCTAssertEqual(
-            model.selectionWarning,
-            "Ignored 1 additional photo folder. EasySplat uses one photo folder per splat."
-        )
+        XCTAssertEqual(model.pendingPhotoURLs.count, AppModel.minimumRecommendedPhotos * 2)
+        XCTAssertTrue(model.pendingVideoURLs.isEmpty)
+        XCTAssertNil(model.selectionWarning, "Both folders should merge; no folder is discarded.")
     }
 
-    func testAddingSeparateClipsPreservesExplicitContinuousOrdering() {
-        let model = AppModel(toolchainManager: MockToolchainManager())
+    func testAddingSeparateClipsPreservesExplicitContinuousOrdering() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString,
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let first = root.appendingPathComponent("one.mov")
+        let second = root.appendingPathComponent("two.mov")
+        try Data("one".utf8).write(to: first)
+        try Data("two".utf8).write(to: second)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: root)
         model.requestedRunOptions.inputOrdering = .continuous
 
-        model.addInputs(urls: [
-            URL(fileURLWithPath: "/tmp/one.mov"),
-            URL(fileURLWithPath: "/tmp/two.mov"),
-        ])
+        model.addInputs(urls: [first, second])
 
         XCTAssertEqual(model.requestedRunOptions.inputOrdering, .continuous)
         XCTAssertNil(model.selectionWarning)
@@ -543,6 +1911,7 @@ final class AppModelTests: XCTestCase {
         let video = root.appendingPathComponent("capture.mov")
         let photos = root.appendingPathComponent("Photos", isDirectory: true)
         try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+        try Data("photo".utf8).write(to: photos.appendingPathComponent("frame.jpg"))
         try Data("video".utf8).write(to: video)
         let model = AppModel(toolchainManager: MockToolchainManager())
         defer { model.clearPendingInputs() }
@@ -840,6 +2209,10 @@ final class AppModelTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
         let projectURL = tempBase.appendingPathComponent("Failed.easysplatproj", isDirectory: true)
+        let movedURL = tempBase.appendingPathComponent(
+            "Moved Failed.easysplatproj",
+            isDirectory: true
+        )
         try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
         var trashedURLs: [URL] = []
         let model = AppModel(
@@ -848,15 +2221,29 @@ final class AppModelTests: XCTestCase {
             pipelineRunnerFactory: { url, config in
                 MockPipelineRunner(projectURL: url, config: config)
             },
-            projectTrashHandler: { trashedURLs.append($0) }
+            projectTrashHandler: {
+                trashedURLs.append($0)
+                try FileManager.default.moveItem(at: $0, to: movedURL)
+            }
         )
         model.currentProjectURL = projectURL
         model.viewState = .processing
 
         model.cancelCurrentProject(deleteProject: true)
 
-        XCTAssertEqual(trashedURLs, [projectURL])
-        XCTAssertTrue(FileManager.default.fileExists(atPath: projectURL.path))
+        let quarantinedURL = try XCTUnwrap(trashedURLs.first)
+        XCTAssertEqual(trashedURLs.count, 1)
+        XCTAssertEqual(
+            quarantinedURL.deletingLastPathComponent().standardizedFileURL,
+            tempBase.standardizedFileURL
+        )
+        XCTAssertTrue(
+            quarantinedURL.lastPathComponent.hasPrefix(
+                ".easysplat-trash-"
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: projectURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: movedURL.path))
         XCTAssertEqual(model.viewState, .home)
         XCTAssertNil(model.currentProjectURL)
     }
@@ -889,6 +2276,402 @@ final class AppModelTests: XCTestCase {
             model.actionFailure?.message,
             "The project stayed in place. Check Finder permissions and try again."
         )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: projectURL.path))
+        XCTAssertTrue(try projectTrashQuarantineURLs(in: tempBase).isEmpty)
+    }
+
+    func testTrashSourceSwapPreservesOriginalAndReplacementWithoutCallingHandler() throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = tempBase.appendingPathComponent(
+            "Canonical.easysplatproj",
+            isDirectory: true
+        )
+        let replacementURL = tempBase.appendingPathComponent(
+            "Replacement.easysplatproj",
+            isDirectory: true
+        )
+        let parkedOriginalURL = tempBase.appendingPathComponent(
+            "Parked Original.easysplatproj",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectURL,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: replacementURL,
+            withIntermediateDirectories: true
+        )
+        let originalMarker = projectURL.appendingPathComponent("identity.txt")
+        let replacementMarker = replacementURL.appendingPathComponent("identity.txt")
+        try Data("A".utf8).write(to: originalMarker)
+        try Data("B".utf8).write(to: replacementMarker)
+        let handlerCalls = LockedCallCounter()
+        let checkpointHook = ProjectTrashQuarantineCheckpointHook { checkpoint in
+            guard checkpoint == .canonicalIdentityValidated else { return }
+            try FileManager.default.moveItem(
+                at: projectURL,
+                to: parkedOriginalURL
+            )
+            try FileManager.default.moveItem(
+                at: replacementURL,
+                to: projectURL
+            )
+        }
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            projectTrashHandler: { _ in handlerCalls.record() },
+            projectTrashQuarantineCheckpointHook: checkpointHook
+        )
+        model.currentProjectURL = projectURL
+        model.viewState = .processing
+
+        XCTAssertFalse(model.moveProjectToTrash(at: projectURL))
+
+        XCTAssertEqual(handlerCalls.count, 0)
+        XCTAssertEqual(
+            try Data(contentsOf: parkedOriginalURL.appendingPathComponent("identity.txt")),
+            Data("A".utf8)
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: projectURL.appendingPathComponent("identity.txt")),
+            Data("B".utf8)
+        )
+        XCTAssertTrue(try projectTrashQuarantineURLs(in: tempBase).isEmpty)
+        XCTAssertEqual(model.currentProjectURL, projectURL)
+        XCTAssertEqual(model.viewState, .processing)
+    }
+
+    func testTrashHandlerFailureRestoresVerifiedProjectWhenCanonicalLeafIsAbsent() throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Rollback.easysplatproj",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectURL,
+            withIntermediateDirectories: true
+        )
+        let markerURL = projectURL.appendingPathComponent("identity.txt")
+        try Data("A".utf8).write(to: markerURL)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            projectTrashHandler: { _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        model.currentProjectURL = projectURL
+        model.viewState = .processing
+
+        XCTAssertFalse(model.moveProjectToTrash(at: projectURL))
+
+        XCTAssertEqual(try Data(contentsOf: markerURL), Data("A".utf8))
+        XCTAssertTrue(try projectTrashQuarantineURLs(in: tempBase).isEmpty)
+        XCTAssertEqual(model.actionFailure?.title, "Couldn’t move project to Trash")
+    }
+
+    func testTrashHandlerFailurePreservesVerifiedProjectAndForeignCanonicalReplacement() throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Conflict.easysplatproj",
+            isDirectory: true
+        )
+        let replacementURL = tempBase.appendingPathComponent(
+            "Conflict Replacement.easysplatproj",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectURL,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: replacementURL,
+            withIntermediateDirectories: true
+        )
+        try Data("A".utf8).write(
+            to: projectURL.appendingPathComponent("identity.txt")
+        )
+        try Data("B".utf8).write(
+            to: replacementURL.appendingPathComponent("identity.txt")
+        )
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            projectTrashHandler: { _ in
+                try FileManager.default.moveItem(
+                    at: replacementURL,
+                    to: projectURL
+                )
+                throw CocoaError(.fileWriteUnknown)
+            }
+        )
+        model.currentProjectURL = projectURL
+        model.viewState = .processing
+
+        XCTAssertFalse(model.moveProjectToTrash(at: projectURL))
+
+        XCTAssertEqual(
+            try Data(contentsOf: projectURL.appendingPathComponent("identity.txt")),
+            Data("B".utf8)
+        )
+        let quarantineURLs = try projectTrashQuarantineURLs(in: tempBase)
+        XCTAssertEqual(quarantineURLs.count, 1)
+        let quarantineURL = try XCTUnwrap(quarantineURLs.first)
+        XCTAssertEqual(
+            try Data(contentsOf: quarantineURL.appendingPathComponent("identity.txt")),
+            Data("A".utf8)
+        )
+        XCTAssertEqual(
+            model.actionFailure?.message,
+            "The project folder changed while it was being moved. Every item was preserved. Check Finder and try again."
+        )
+    }
+
+    func testIdleTrashDoesNotInvokeHandlerWhileAnotherProcessOwnsRunLease() throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Busy Trash",
+            lastError: "Stopped",
+            withOutput: false,
+            stage: .sfmMapping
+        )
+        let externalLease = try ProjectRunLease.acquire(projectURL: projectURL)
+        defer { externalLease.release() }
+        var trashedURLs: [URL] = []
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            projectTrashHandler: { trashedURLs.append($0) }
+        )
+        model.currentProjectURL = projectURL
+        model.viewState = .processing
+
+        XCTAssertFalse(model.moveProjectToTrash(at: projectURL))
+
+        XCTAssertTrue(trashedURLs.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: projectURL.path))
+        XCTAssertEqual(model.currentProjectURL, projectURL)
+        XCTAssertEqual(model.viewState, .processing)
+    }
+
+    func testTrashWaitsForBlockedViewerTimingBeforeMovingTheProject() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Timing Before Trash.easysplatproj",
+            isDirectory: true
+        )
+        let movedURL = tempBase.appendingPathComponent(
+            "Moved Timing Project.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        var metadata = ProjectMetadata(
+            title: "Timing Before Trash",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let publicationID = UUID()
+        let sourceURL = paths.trainingURL.appendingPathComponent(
+            "timing-before-trash.ply"
+        )
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        let receiptCommitted = expectation(
+            description: "viewer timing receipt committed"
+        )
+        let receiptUpdaterFinished = expectation(
+            description: "viewer timing updater returned"
+        )
+        let trashRan = expectation(description: "project moved after timing")
+        let receiptUpdater = BlockingViewerTimingReceiptUpdateProbe(
+            phase: .afterUpdate,
+            started: receiptCommitted,
+            finished: receiptUpdaterFinished
+        )
+        var timingWasPersistedBeforeMove = false
+        let model = AppModel(
+            projectBaseURL: tempBase,
+            projectTrashHandler: { url in
+                timingWasPersistedBeforeMove = try ProjectMetadataStore.load(
+                    from: ProjectPaths(root: url).metadataURL
+                ).createToViewerReadySeconds == 4
+                try FileManager.default.moveItem(at: url, to: movedURL)
+                trashRan.fulfill()
+            },
+            resultViewerTimingReceiptUpdater: receiptUpdater.update
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        let samples = LockedRunTimingSamples([
+            .init(wallClock: Date(), monotonicSeconds: 10),
+            .init(wallClock: Date(), monotonicSeconds: 14),
+        ])
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: samples.next)
+        )
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        await fulfillment(of: [receiptCommitted], timeout: 2)
+
+        XCTAssertTrue(model.moveProjectToTrash(at: projectURL))
+        XCTAssertNotNil(model.deferredProjectMutationTask)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: projectURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: movedURL.path))
+
+        receiptUpdater.release()
+        await fulfillment(
+            of: [receiptUpdaterFinished, trashRan],
+            timeout: 2
+        )
+        try await waitForDeferredProjectMutationToFinish(model: model)
+
+        XCTAssertTrue(timingWasPersistedBeforeMove)
+        let movedPaths = ProjectPaths(root: movedURL)
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: movedPaths.metadataURL)
+                .createToViewerReadySeconds,
+            4
+        )
+        XCTAssertEqual(
+            try PublishedSplatReceiptStore.load(projectPaths: movedPaths)
+                .presentation.createToViewerReadySeconds,
+            4
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: projectURL.path))
+        XCTAssertNil(model.currentProjectURL)
+    }
+
+    func testStoppedRunKeepsTaskLeaseThroughTrashAndReleasesAfterFinish() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Stop Then Trash",
+            lastError: nil,
+            withOutput: false,
+            stage: .sfmMapping
+        )
+        let movedURL = tempBase.appendingPathComponent(
+            "Moved Stop Then Trash.easysplatproj",
+            isDirectory: true
+        )
+        var trashObservedHeldLease = false
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { _, _ in
+                BlockingPipelineRunner()
+            },
+            projectTrashHandler: { url in
+                do {
+                    let unexpected = try ProjectRunLease.acquire(projectURL: url)
+                    unexpected.release()
+                } catch ProjectRunLeaseError.alreadyRunning {
+                    trashObservedHeldLease = true
+                }
+                try FileManager.default.moveItem(at: url, to: movedURL)
+            }
+        )
+
+        XCTAssertTrue(model.resumeProject(at: projectURL))
+        try await waitForPipelineState(model: model, stage: .trainSplat)
+
+        model.cancelCurrentProject(deleteProject: true)
+        try await waitForRunToFinish(model: model)
+
+        XCTAssertTrue(trashObservedHeldLease)
+        XCTAssertEqual(model.viewState, .home)
+        XCTAssertNil(model.currentProjectURL)
+        let reacquiredLease = try ProjectRunLease.acquire(
+            projectURL: movedURL
+        )
+        reacquiredLease.release()
+    }
+
+    func testStoppedRunFlushesPendingNotesWithItsExistingTaskLease() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Stop With Pending Note",
+            lastError: nil,
+            withOutput: false,
+            stage: .sfmMapping
+        )
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
+            BlockingPipelineRunner()
+        }
+
+        XCTAssertTrue(model.resumeProject(at: projectURL))
+        try await waitForPipelineState(model: model, stage: .trainSplat)
+        model.scheduleNotesSave(at: projectURL, to: "last edit")
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForRunToFinish(model: model)
+
+        let persisted = try ProjectMetadataStore.load(
+            from: ProjectPaths(root: projectURL).metadataURL
+        )
+        XCTAssertEqual(persisted.notes, "last edit")
+        XCTAssertNil(model.pendingNotesSave)
     }
 
     func testTrashAbortsWhenPendingNotesCannotBeSaved() {
@@ -943,6 +2726,210 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.viewState, .viewer)
         XCTAssertEqual(model.pendingNotesSave?.text, "final keystroke")
         XCTAssertEqual(model.actionFailure?.title, "Couldn’t save notes")
+    }
+
+    func testResumeWaitsForCancelledViewerTimingBeforeActivatingNewProject() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let currentProjectURL = tempBase.appendingPathComponent(
+            "Current Timing.easysplatproj",
+            isDirectory: true
+        )
+        let currentPaths = ProjectPaths(root: currentProjectURL)
+        try currentPaths.ensureDirectories()
+        var currentMetadata = ProjectMetadata(
+            title: "Current Timing",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        currentMetadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: currentMetadata.requestedRunOptions,
+            input: currentMetadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(
+            currentMetadata,
+            to: currentPaths.metadataURL
+        )
+        let publicationID = UUID()
+        let sourceURL = currentPaths.trainingURL.appendingPathComponent(
+            "cancelled-timing.ply"
+        )
+        try writeMinimalPly(at: sourceURL)
+        let currentResult = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: currentPaths,
+            metadata: currentMetadata,
+            publicationID: publicationID
+        )
+        let nextProjectURL = try makeProject(
+            at: tempBase,
+            name: "Next Ready",
+            lastError: nil,
+            withOutput: true
+        )
+        let timingStarted = expectation(
+            description: "viewer timing updater blocked before commit"
+        )
+        let timingFinished = expectation(
+            description: "cancelled viewer timing updater finished"
+        )
+        let receiptUpdater = BlockingViewerTimingReceiptUpdateProbe(
+            phase: .beforeUpdate,
+            started: timingStarted,
+            finished: timingFinished
+        )
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            resultViewerTimingReceiptUpdater: receiptUpdater.update
+        )
+        model.currentProjectURL = currentProjectURL
+        model.outputPlyURL = currentResult.outputURL
+        model.viewState = .viewer
+        let samples = LockedRunTimingSamples([
+            .init(wallClock: Date(), monotonicSeconds: 20),
+            .init(wallClock: Date(), monotonicSeconds: 25),
+        ])
+        model.prepareResultViewerTiming(
+            projectID: currentMetadata.id,
+            projectURL: currentProjectURL,
+            outputURL: currentResult.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: samples.next)
+        )
+        model.resultViewerDidBecomeReady(
+            projectURL: currentProjectURL,
+            outputURL: currentResult.outputURL
+        )
+        await fulfillment(of: [timingStarted], timeout: 2)
+        let metadataBefore = try Data(contentsOf: currentPaths.metadataURL)
+        let receiptBefore = try Data(
+            contentsOf: currentPaths.outputSplatReceiptURL
+        )
+
+        XCTAssertTrue(model.resumeProject(at: nextProjectURL))
+        XCTAssertNil(
+            model.pendingResultViewerTiming,
+            "Navigation must retire the old viewer generation before the new task gets its first turn."
+        )
+        XCTAssertNil(model.resultViewerTimingTask)
+        XCTAssertTrue(model.isRunActive)
+        XCTAssertTrue(
+            ProjectSummary.hasSameLocation(
+                model.currentProjectURL,
+                currentProjectURL
+            ),
+            "The next project must not activate while the old timing lease is still held."
+        )
+        XCTAssertEqual(try Data(contentsOf: currentPaths.metadataURL), metadataBefore)
+        XCTAssertEqual(
+            try Data(contentsOf: currentPaths.outputSplatReceiptURL),
+            receiptBefore
+        )
+
+        receiptUpdater.release()
+        await fulfillment(of: [timingFinished], timeout: 2)
+        try await waitForViewState(model: model, state: .viewer)
+        try await waitForRunToFinish(model: model)
+
+        XCTAssertEqual(try Data(contentsOf: currentPaths.metadataURL), metadataBefore)
+        XCTAssertEqual(
+            try Data(contentsOf: currentPaths.outputSplatReceiptURL),
+            receiptBefore
+        )
+        XCTAssertTrue(
+            ProjectSummary.hasSameLocation(model.currentProjectURL, nextProjectURL)
+        )
+    }
+
+    func testCancellingDeferredResumeRetiresThePendingRunBeforeMutation() async throws {
+        try await assertCancellingDeferredProjectMutationRetiresRun(.resume)
+    }
+
+    func testCancellingDeferredRetrainRetiresThePendingRunBeforeMutation() async throws {
+        try await assertCancellingDeferredProjectMutationRetiresRun(.retrain)
+    }
+
+    func testCancellingDeferredRetryRetiresThePendingRunBeforeMutation() async throws {
+        try await assertCancellingDeferredProjectMutationRetiresRun(.retry)
+    }
+
+    func testReadyProjectOpensReadOnlyWhileAnotherProcessOwnsRunLease() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Busy Ready Viewer",
+            lastError: nil,
+            withOutput: true
+        )
+        let externalLease = try ProjectRunLease.acquire(projectURL: projectURL)
+        defer { externalLease.release() }
+        var runnerFactoryCallCount = 0
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { projectURL, config in
+            runnerFactoryCallCount += 1
+            return MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        XCTAssertTrue(model.resumeProject(at: projectURL))
+        try await waitForViewState(model: model, state: .viewer)
+
+        XCTAssertEqual(runnerFactoryCallCount, 0)
+        XCTAssertEqual(model.outputPlyURL, ProjectPaths(root: projectURL).outputSplatURL)
+    }
+
+    func testUnfinishedProjectDoesNotResumeWhileAnotherProcessOwnsRunLease() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Busy Resume",
+            lastError: nil,
+            withOutput: false,
+            stage: .sfmMapping
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let bytesBefore = try Data(contentsOf: paths.metadataURL)
+        let externalLease = try ProjectRunLease.acquire(projectURL: projectURL)
+        defer { externalLease.release() }
+        var runnerFactoryCallCount = 0
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { projectURL, config in
+            runnerFactoryCallCount += 1
+            return MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        XCTAssertTrue(model.resumeProject(at: projectURL))
+        try await waitForRunToFinish(model: model)
+
+        XCTAssertEqual(runnerFactoryCallCount, 0)
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), bytesBefore)
+        XCTAssertEqual(model.lastError, "This project is already being processed.")
+        XCTAssertEqual(model.viewState, .processing)
     }
 
     func testRenameFailureUsesAppLevelActionFailure() throws {
@@ -1059,7 +3046,11 @@ final class AppModelTests: XCTestCase {
             ))
         }
         let toolchain = CapabilityRecordingToolchainManager()
-        let model = AppModel(toolchainManager: toolchain, projectBaseURL: base) { projectURL, config in
+        let model = AppModel(
+            toolchainManager: toolchain,
+            projectBaseURL: base,
+            hardwareProfile: HardwareProfile(memoryGB: 8, cpuCount: 8, gpuWorkingSetGB: 5)
+        ) { projectURL, config in
             MockPipelineRunner(projectURL: projectURL, config: config)
         }
         model.addInputs(urls: [photos])
@@ -1072,7 +3063,8 @@ final class AppModelTests: XCTestCase {
             RunPlanResolver.ValidationError.insufficientValidPhotos(
                 actual: 2,
                 minimum: 3
-            ).localizedDescription
+            ).localizedDescription,
+            model.errorDetails ?? "No preflight details were recorded."
         )
         XCTAssertNil(toolchain.lastRequest)
         XCTAssertNil(model.currentProjectURL)
@@ -1672,6 +3664,43 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(recovered.requestedRunOptions.detailProfile, .balanced)
     }
 
+    func testValidationRecoveryLeavesMetadataByteIdenticalWhenAnotherProcessOwnsRunLease() throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Busy Recovery",
+            lastError: nil,
+            withOutput: false,
+            stage: .trainSplat
+        )
+        let paths = ProjectPaths(root: projectURL)
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        metadata.requestedRunOptions = RequestedRunOptions(
+            detailProfile: .highDetail
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let bytesBefore = try Data(contentsOf: paths.metadataURL)
+        let externalLease = try ProjectRunLease.acquire(projectURL: projectURL)
+        defer { externalLease.release() }
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        )
+
+        XCTAssertFalse(
+            model.applyValidationRecovery(.useBalanced, projectURL: projectURL)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), bytesBefore)
+        XCTAssertEqual(model.statusTitle, "This project is already being processed.")
+    }
+
     func testMetalAllocationFailureOffersRetryWithoutChangingTheRunPlan() {
         let model = AppModel(
             toolchainManager: MockToolchainManager(),
@@ -1755,14 +3784,10 @@ final class AppModelTests: XCTestCase {
         try Data("geometry".utf8).write(to: geometrySentinel, options: [.atomic])
         try Data("training".utf8).write(to: trainingSentinel, options: [.atomic])
         let metadataBefore = try Data(contentsOf: paths.metadataURL)
-        let missingManifestURL = URL(
-            string: "https://release-user:release-secret@example.com/toolchain/manifest.json?token=private#download"
-        )!
 
         let model = AppModel(
-            toolchainManager: MissingManifestToolchainManager(
-                statusCode: 410,
-                resourceURL: missingManifestURL
+            toolchainManager: DamagedToolchainManager(
+                message: "This EasySplat build is missing its built-in tools. Reinstall EasySplat."
             ),
             projectBaseURL: tempBase,
             hardwareProfile: standardHardwareProfile
@@ -1775,16 +3800,10 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.lastError,
-            "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
+            "EasySplat’s built-in tools are missing or damaged. Reinstall EasySplat."
         )
         let errorDetails = try XCTUnwrap(model.errorDetails)
-        XCTAssertTrue(errorDetails.contains("HTTP status: 410"))
-        XCTAssertTrue(errorDetails.contains("HTTP resource: https://example.com/toolchain/manifest.json"))
-        XCTAssertFalse(errorDetails.contains("release-user"))
-        XCTAssertFalse(errorDetails.contains("release-secret"))
-        XCTAssertFalse(errorDetails.contains("token=private"))
-        XCTAssertFalse(errorDetails.contains("#download"))
-        XCTAssertTrue(errorDetails.contains("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)"))
+        XCTAssertTrue(errorDetails.contains("missing its built-in tools"))
         XCTAssertEqual(
             model.statusDetail,
             "The saved project and its checkpoint are unchanged."
@@ -1872,6 +3891,36 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(reloaded.notes)
     }
 
+    func testUpdateProjectNotesLeavesMetadataByteIdenticalWhileRunLeaseIsOwned() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(
+            at: base,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: base,
+            name: "Busy Notes",
+            lastError: nil,
+            withOutput: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let bytesBefore = try Data(contentsOf: paths.metadataURL)
+        let externalLease = try ProjectRunLease.acquire(projectURL: projectURL)
+        defer { externalLease.release() }
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: base
+        )
+
+        XCTAssertFalse(
+            model.updateProjectNotes(at: projectURL, to: "must wait")
+        )
+
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), bytesBefore)
+    }
+
     func testRenameProjectUpdatesPersistedTitle() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
@@ -1914,6 +3963,71 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.renameProject(at: projectURL, to: ""))
         XCTAssertFalse(model.renameProject(at: projectURL, to: "   "))
         XCTAssertFalse(model.renameProject(at: projectURL, to: "Same"))
+    }
+
+    func testRenameProjectLeavesMetadataByteIdenticalWhileRunLeaseIsOwned() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(
+            at: base,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: base,
+            name: "Busy Rename",
+            lastError: nil,
+            withOutput: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let bytesBefore = try Data(contentsOf: paths.metadataURL)
+        let externalLease = try ProjectRunLease.acquire(projectURL: projectURL)
+        defer { externalLease.release() }
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: base
+        )
+
+        XCTAssertFalse(model.renameProject(at: projectURL, to: "Changed"))
+
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), bytesBefore)
+    }
+
+    func testUprightPreferenceLeavesMetadataByteIdenticalWhileRunLeaseIsOwned() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(
+            at: base,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: base,
+            name: "Busy Upright Preference",
+            lastError: nil,
+            withOutput: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let bytesBefore = try Data(contentsOf: paths.metadataURL)
+        let externalLease = try ProjectRunLease.acquire(projectURL: projectURL)
+        defer { externalLease.release() }
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: base
+        )
+
+        XCTAssertThrowsError(
+            try model.updateViewerUprightFlip(
+                at: projectURL,
+                isActive: true
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? ProjectRunLeaseError,
+                .alreadyRunning
+            )
+        }
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), bytesBefore)
     }
 
     func testStartProjectPersistsHumanTitleSeparatelyFromSafeBundleLeaf() async throws {
@@ -2022,7 +4136,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.requestedRunOptions.detailProfile, .balanced)
         await model.startProject(input: .video(files: [input.path]), title: "BalancedDefault")
 
-        XCTAssertEqual(capturedPlan?.trainerIterationLimit, 7_000)
+        XCTAssertEqual(capturedPlan?.trainerIterationLimit, 30_000)
         let projectURL = try XCTUnwrap(model.currentProjectURL)
         let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
         XCTAssertEqual(metadata.requestedRunOptions.detailProfile, .balanced)
@@ -2107,14 +4221,14 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.lastError,
-            "Couldn’t prepare the required tools. Check your connection and try again."
+            "Couldn’t prepare the required tools."
         )
         XCTAssertTrue(model.errorDetails?.contains("manifest unreachable") == true)
         XCTAssertNil(model.currentProjectURL)
         XCTAssertNil(model.currentRunOptions)
         XCTAssertNil(model.currentInput)
         XCTAssertEqual(model.pendingVideoURLs, [input])
-        XCTAssertNil(model.pendingPhotosFolderURL)
+        XCTAssertTrue(model.pendingPhotoURLs.isEmpty)
         XCTAssertTrue(model.projectSummaries.isEmpty)
         let projectBundles = try FileManager.default.contentsOfDirectory(
             at: tempBase,
@@ -2211,13 +4325,9 @@ final class AppModelTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("input.mov")
         try Data("video".utf8).write(to: input)
-        let missingManifestURL = URL(
-            string: "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
-        )!
         let model = AppModel(
-            toolchainManager: MissingManifestToolchainManager(
-                statusCode: 404,
-                resourceURL: missingManifestURL
+            toolchainManager: DamagedToolchainManager(
+                message: "This EasySplat build is missing its built-in tools. Reinstall EasySplat."
             ),
             projectBaseURL: tempBase,
             hardwareProfile: standardHardwareProfile,
@@ -2231,12 +4341,10 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.lastError,
-            "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
+            "EasySplat’s built-in tools are missing or damaged. Reinstall EasySplat."
         )
         let errorDetails = try XCTUnwrap(model.errorDetails)
-        XCTAssertTrue(errorDetails.contains("HTTP status: 404"))
-        XCTAssertTrue(errorDetails.contains("HTTP resource: \(missingManifestURL.absoluteString)"))
-        XCTAssertTrue(errorDetails.contains("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)"))
+        XCTAssertTrue(errorDetails.contains("missing its built-in tools"))
         XCTAssertNil(model.currentProjectURL)
         XCTAssertTrue(model.projectSummaries.isEmpty)
     }
@@ -2249,6 +4357,7 @@ final class AppModelTests: XCTestCase {
         let photos = tempBase.appendingPathComponent("Photos", isDirectory: true)
         try Data("video".utf8).write(to: video)
         try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+        try Data("photo".utf8).write(to: photos.appendingPathComponent("frame.jpg"))
         let toolchain = CapabilityRecordingToolchainManager()
         let model = AppModel(toolchainManager: toolchain, projectBaseURL: tempBase) { _, _ in
             XCTFail("Pipeline runner should not start for unsupported continuous mixed input.")
@@ -2534,7 +4643,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.selectionWarning)
     }
 
-    func testAddInputsDeduplicatesSymlinkAndHardLinkAliasesByFileIdentity() throws {
+    func testAddInputsRejectsSymlinksAndDeduplicatesHardLinksByFileIdentity() throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
@@ -2549,8 +4658,8 @@ final class AppModelTests: XCTestCase {
 
         model.addInputs(urls: [symlink, video, hardLink])
 
-        XCTAssertEqual(model.pendingVideoURLs, [symlink], "The first presentation URL should be preserved.")
-        XCTAssertNil(model.selectionWarning)
+        XCTAssertEqual(model.pendingVideoURLs, [video])
+        XCTAssertEqual(model.selectionWarning, "Skipped 1 file EasySplat can't use as capture input.")
     }
 
     func testAddInputsKeepsDistinctFilesWithTheSameBasenameInUserOrder() throws {
@@ -2589,47 +4698,43 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.pendingVideoURLs.isEmpty)
         XCTAssertEqual(
             model.selectionWarning,
-            "Ignored 1 file(s). Supported: video files and a photo folder."
+            "Ignored 1 file. Add photos, a video, or a folder of them."
         )
     }
 
-    func testAddInputsDeduplicatesFolderAliasesAndCountsOnlyDistinctAdditionalFolders() throws {
+    func testAddInputsMergesFolderPhotosAndDeduplicatesEquivalentPaths() throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         let selected = base.appendingPathComponent("Selected", isDirectory: true)
         let nested = selected.appendingPathComponent("nested", isDirectory: true)
-        let alias = base.appendingPathComponent("Selected Alias", isDirectory: true)
         let second = base.appendingPathComponent("Second", isDirectory: true)
         let third = base.appendingPathComponent("Third", isDirectory: true)
         for folder in [nested, second, third] {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             for index in 0..<AppModel.minimumRecommendedPhotos {
-                try Data("image".utf8).write(
+                try Data("image-\(folder.lastPathComponent)-\(index)".utf8).write(
                     to: folder.appendingPathComponent("photo-\(index).jpg")
                 )
             }
         }
-        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: selected)
         let alternateSpelling = URL(fileURLWithPath: selected.path + "/nested/..", isDirectory: true)
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
 
-        model.addInputs(urls: [selected, alternateSpelling, alias, second, third])
+        // `selected` and its `nested/..` spelling resolve to the same photos, so
+        // only their distinct files count once. `second` and `third` contribute
+        // their own. The photos live one level down in `nested`.
+        model.addInputs(urls: [selected, alternateSpelling, second, third])
 
-        XCTAssertEqual(model.pendingPhotosFolderURL, selected)
-        XCTAssertEqual(
-            model.selectionWarning,
-            "Ignored 2 additional photo folders. EasySplat uses one photo folder per splat."
-        )
+        XCTAssertEqual(model.pendingPhotoURLs.count, AppModel.minimumRecommendedPhotos * 3)
+        XCTAssertNil(model.selectionWarning, "All folders merge; none is discarded.")
 
-        model.addInputs(urls: [alias, second])
+        // Re-adding the same sources contributes nothing new.
+        model.addInputs(urls: [second])
 
-        XCTAssertEqual(model.pendingPhotosFolderURL, selected)
-        XCTAssertEqual(
-            model.selectionWarning,
-            "Ignored 1 additional photo folder. EasySplat uses one photo folder per splat."
-        )
+        XCTAssertEqual(model.pendingPhotoURLs.count, AppModel.minimumRecommendedPhotos * 3)
+        XCTAssertNil(model.selectionWarning)
     }
 
     func testAddInputsAcceptsSupportedVideoExtensionsWithoutSystemTypeRegistration() throws {
@@ -2675,6 +4780,7 @@ final class AppModelTests: XCTestCase {
         let output = paths.outputURL.appendingPathComponent("splat.ply")
         try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
         try writeMinimalPly(at: output)
+        XCTAssertEqual(Darwin.chmod(output.path, 0o600), 0)
 
         let options = RequestedRunOptions(detailProfile: .highDetail)
         var metadata = ProjectMetadata(
@@ -2695,7 +4801,7 @@ final class AppModelTests: XCTestCase {
             paths: paths,
             trainingArtifact: makeCompletedTrainingArtifact(
                 for: output,
-                detailProfile: .highDetail
+                metadata: metadata
             )
         )
 
@@ -2713,6 +4819,181 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.viewState, .viewer)
         XCTAssertEqual(model.outputPlyURL, output)
         XCTAssertNil(toolchainManager.lastRequest)
+    }
+
+    func testResumeProjectShowsOpeningStateWhileValidatingFinishedOutput() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: tempBase, name: "Finished", lastError: nil, withOutput: true)
+        let output = ProjectPaths(root: projectURL).outputSplatURL
+
+        let validationStarted = DispatchSemaphore(value: 0)
+        let allowValidationToFinish = DispatchSemaphore(value: 0)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { url, config in
+                MockPipelineRunner(projectURL: url, config: config)
+            },
+            publishedResultResolver: { projectURL in
+                validationStarted.signal()
+                _ = allowValidationToFinish.wait(timeout: .now() + 2)
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
+            }
+        )
+
+        model.resumeProject(at: projectURL)
+        let validationStartResult = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: validationStarted.wait(timeout: .now() + 1))
+            }
+        }
+        XCTAssertEqual(validationStartResult, .success)
+        XCTAssertEqual(model.viewState, .opening)
+
+        // Opening a finished project must never present the pipeline progress
+        // screen while its output is being validated.
+        let deadline = Date().addingTimeInterval(0.2)
+        while Date() < deadline {
+            XCTAssertNotEqual(model.viewState, .processing)
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        allowValidationToFinish.signal()
+        try await waitForViewState(model: model, state: .viewer)
+        XCTAssertEqual(model.outputPlyURL, output)
+    }
+
+    func testResumeProjectKeepsOpenedProjectCurrentForTheWholeOpen() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: tempBase, name: "Finished", lastError: nil, withOutput: true)
+
+        let validationStarted = DispatchSemaphore(value: 0)
+        let allowValidationToFinish = DispatchSemaphore(value: 0)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { url, config in
+                MockPipelineRunner(projectURL: url, config: config)
+            },
+            publishedResultResolver: { projectURL in
+                validationStarted.signal()
+                _ = allowValidationToFinish.wait(timeout: .now() + 2)
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
+            }
+        )
+
+        model.resumeProject(at: projectURL)
+
+        // The sidebar's lock and trash-cancel branch key on currentProjectURL,
+        // so a run must never be active without it — not even for the slice
+        // between the click and the task's first turn.
+        XCTAssertTrue(model.isRunActive)
+        XCTAssertTrue(ProjectSummary.hasSameLocation(model.currentProjectURL, projectURL))
+
+        let validationStartResult = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: validationStarted.wait(timeout: .now() + 1))
+            }
+        }
+        XCTAssertEqual(validationStartResult, .success)
+        XCTAssertTrue(ProjectSummary.hasSameLocation(model.currentProjectURL, projectURL))
+
+        allowValidationToFinish.signal()
+        try await waitForViewState(model: model, state: .viewer)
+        XCTAssertTrue(ProjectSummary.hasSameLocation(model.currentProjectURL, projectURL))
+    }
+
+    func testResolvedResultCannotInstallAfterCurrentProjectChanges() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let firstProject = try makeProject(
+            at: tempBase,
+            name: "First Finished",
+            lastError: nil,
+            withOutput: true
+        )
+        let secondProject = try makeProject(
+            at: tempBase,
+            name: "Second Finished",
+            lastError: nil,
+            withOutput: true
+        )
+        let secondOutput = ProjectPaths(root: secondProject).outputSplatURL
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        )
+        model.currentProjectURL = secondProject
+        model.outputPlyURL = secondOutput
+
+        do {
+            _ = try await model.resolveAndInstallCurrentPublishedResult(
+                at: firstProject
+            )
+            XCTFail("A stale result must not install over the active project")
+        } catch {
+            // Expected: the active project no longer matches the resolved root.
+        }
+
+        XCTAssertTrue(
+            ProjectSummary.hasSameLocation(model.currentProjectURL, secondProject)
+        )
+        XCTAssertEqual(model.outputPlyURL, secondOutput)
+        XCTAssertNil(model.resolvedPublishedResult)
+    }
+
+    func testResumeProjectFallsThroughToProcessingWhenOutputValidationFails() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: tempBase, name: "Unfinished", lastError: nil, withOutput: false)
+
+        let validationStarted = DispatchSemaphore(value: 0)
+        let allowValidationToFinish = DispatchSemaphore(value: 0)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { _, _ in BlockingPipelineRunner() },
+            publishedResultResolver: { projectURL in
+                validationStarted.signal()
+                _ = allowValidationToFinish.wait(timeout: .now() + 2)
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
+            }
+        )
+
+        model.resumeProject(at: projectURL)
+        let validationStartResult = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: validationStarted.wait(timeout: .now() + 1))
+            }
+        }
+        XCTAssertEqual(validationStartResult, .success)
+        XCTAssertEqual(model.viewState, .opening)
+
+        allowValidationToFinish.signal()
+        try await waitForViewState(model: model, state: .processing)
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+        XCTAssertFalse(model.isRunActive)
     }
 
     func testResumeProjectRunsPipelineWhenOutputPathIsDirectory() async throws {
@@ -2821,6 +5102,456 @@ final class AppModelTests: XCTestCase {
         model.cancelCurrentProject(deleteProject: false)
         try await waitForViewState(model: model, state: .home, timeout: 4.0)
         XCTAssertFalse(model.isRunActive)
+    }
+
+    func testRetrainProjectBypassesFinishedOutputAndRestartsFramePreparation() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = tempBase.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
+        try writeMinimalPly(at: output)
+        XCTAssertEqual(Darwin.chmod(output.path, 0o600), 0)
+
+        var metadata = ProjectMetadata(
+            title: "Project",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try persistCompletedAppTestArtifacts(
+            metadata: metadata,
+            paths: paths,
+            trainingArtifact: makeCompletedTrainingArtifact(for: output, metadata: metadata)
+        )
+        let preRetrainResolution = try PublishedResultResolver.resolve(
+            projectURL: projectURL
+        )
+        guard case .current(.legacy) = preRetrainResolution else {
+            return XCTFail(
+                "Expected a preservable legacy result, got \(preRetrainResolution)"
+            )
+        }
+
+        let runner = ResumeRecordingPipelineRunner(projectURL: projectURL)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
+            runner
+        }
+
+        XCTAssertTrue(model.retrainProject(at: projectURL, profile: .highDetail))
+        try await waitForViewState(model: model, state: .viewer)
+        XCTAssertNil(model.actionFailure, String(describing: model.actionFailure))
+
+        // The changed profile moves frame budgets, so the run must restart at
+        // frame preparation instead of short-circuiting to the viewer.
+        XCTAssertEqual(runner.resumeFrom, .extractFrames)
+        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(persisted.requestedRunOptions.detailProfile, .highDetail)
+        guard case .current(.receiptBound(let current)) =
+            try PublishedResultResolver.resolve(projectURL: projectURL) else {
+            return XCTFail("A successful retrain must replace previous authority")
+        }
+        XCTAssertEqual(
+            current.presentation.requestedRunOptions.detailProfile,
+            .highDetail
+        )
+        XCTAssertFalse(model.hasValidatedPreviousResult)
+        XCTAssertFalse(model.isShowingPreviousResult)
+    }
+
+    func testRetrainSameProfileRestartsAtTheTrainingBoundaryForNewBudgets() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = tempBase.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
+        try writeMinimalPly(at: output)
+        XCTAssertEqual(Darwin.chmod(output.path, 0o600), 0)
+
+        var metadata = ProjectMetadata(
+            title: "Project",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        // A project finished under the previous fixed balanced budget: only the
+        // trainer fields differ from what current hardware resolves.
+        var legacyPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        legacyPlan.trainerIterationLimit = 7_000
+        legacyPlan.plateauWindow = 800
+        metadata.resolvedRunPlan = legacyPlan
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try persistCompletedAppTestArtifacts(
+            metadata: metadata,
+            paths: paths,
+            trainingArtifact: makeCompletedTrainingArtifact(for: output, metadata: metadata)
+        )
+
+        let runner = ResumeRecordingPipelineRunner(projectURL: projectURL)
+        var capturedConfig: PipelineRunner.PipelineConfig?
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, config in
+            capturedConfig = config
+            return runner
+        }
+
+        XCTAssertTrue(model.retrainProject(at: projectURL, profile: .balanced))
+        try await waitForViewState(model: model, state: .viewer)
+
+        XCTAssertEqual(runner.resumeFrom, .sfmMapping)
+        XCTAssertEqual(capturedConfig?.runIntent, .retrain)
+        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(persisted.requestedRunOptions.detailProfile, .balanced)
+    }
+
+    func testRetrainSameCurrentProfileStillRestartsAtTrainingBoundary() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(
+            UUID().uuidString,
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = tempBase.appendingPathComponent(
+            "Project.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try writeMinimalPly(at: paths.outputSplatURL)
+        XCTAssertEqual(Darwin.chmod(paths.outputSplatURL.path, 0o600), 0)
+
+        var metadata = ProjectMetadata(
+            title: "Project",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try persistCompletedAppTestArtifacts(
+            metadata: metadata,
+            paths: paths,
+            trainingArtifact: makeCompletedTrainingArtifact(
+                for: paths.outputSplatURL,
+                metadata: metadata
+            )
+        )
+
+        let runner = ResumeRecordingPipelineRunner(projectURL: projectURL)
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
+            runner
+        }
+
+        XCTAssertTrue(model.retrainProject(at: projectURL, profile: .balanced))
+        try await waitForViewState(model: model, state: .viewer)
+
+        XCTAssertEqual(
+            runner.resumeFrom,
+            .sfmMapping,
+            "A same-profile retrain must regenerate private training output for a new publication."
+        )
+    }
+
+    func testRetrainIsIgnoredWhileRunIsActive() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let firstURL = try makeProject(at: tempBase, name: "First", lastError: nil, withOutput: false)
+        let secondURL = try makeProject(at: tempBase, name: "Second", lastError: nil, withOutput: true)
+        var callCount = 0
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
+            callCount += 1
+            return BlockingPipelineRunner()
+        }
+
+        model.resumeProject(at: firstURL)
+        try await waitForViewState(model: model, state: .processing)
+        try await waitForCurrentProjectURL(model: model, url: firstURL)
+        let secondProfileBefore = try ProjectMetadataStore.load(
+            from: ProjectPaths(root: secondURL).metadataURL
+        ).requestedRunOptions.detailProfile
+
+        XCTAssertFalse(model.retrainProject(at: secondURL, profile: .highDetail))
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(model.currentProjectURL, firstURL)
+        let secondProfileAfter = try ProjectMetadataStore.load(
+            from: ProjectPaths(root: secondURL).metadataURL
+        ).requestedRunOptions.detailProfile
+        XCTAssertEqual(secondProfileAfter, secondProfileBefore)
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+        XCTAssertFalse(model.isRunActive)
+    }
+
+    func testRetrainLeavesMetadataByteIdenticalWhenAnotherProcessOwnsRunLease() throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Busy Retrain",
+            lastError: nil,
+            withOutput: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let bytesBefore = try Data(contentsOf: paths.metadataURL)
+        let externalLease = try ProjectRunLease.acquire(projectURL: projectURL)
+        defer { externalLease.release() }
+        var runnerFactoryCallCount = 0
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { projectURL, config in
+            runnerFactoryCallCount += 1
+            return MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        XCTAssertFalse(
+            model.retrainProject(at: projectURL, profile: .highDetail)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), bytesBefore)
+        XCTAssertEqual(runnerFactoryCallCount, 0)
+        XCTAssertFalse(model.isRunActive)
+        XCTAssertEqual(model.statusTitle, "This project is already being processed.")
+    }
+
+    func testRetrainReleasesRunLeaseWhenMetadataMutationFailsAfterPreservation() async throws {
+        enum MutationFailure: Error {
+            case injected
+        }
+
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Mutation Failure",
+            lastError: nil,
+            withOutput: true
+        )
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { projectURL, config in
+                MockPipelineRunner(projectURL: projectURL, config: config)
+            },
+            projectMetadataUpdater: { _, _ in
+                throw MutationFailure.injected
+            }
+        )
+
+        XCTAssertTrue(
+            model.retrainProject(at: projectURL, profile: .highDetail)
+        )
+        try await waitForRunToFinish(model: model)
+        XCTAssertNil(model.currentTask)
+        XCTAssertFalse(model.isRunActive)
+
+        let reacquiredLease = try ProjectRunLease.acquire(
+            projectURL: projectURL
+        )
+        reacquiredLease.release()
+    }
+
+    func testRetrainPreservationFailureLeavesExistingResultAndOptionsUnchanged() async throws {
+        enum PreservationFailure: Error {
+            case injected
+        }
+
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Preservation Failure",
+            lastError: nil,
+            withOutput: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let metadataBefore = try Data(contentsOf: paths.metadataURL)
+        let outputBefore = try Data(contentsOf: paths.outputSplatURL)
+        var runnerFactoryCallCount = 0
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { projectURL, config in
+                runnerFactoryCallCount += 1
+                return MockPipelineRunner(projectURL: projectURL, config: config)
+            },
+            publishedResultPreserver: { _ in
+                throw PreservationFailure.injected
+            }
+        )
+
+        XCTAssertTrue(
+            model.retrainProject(at: projectURL, profile: .highDetail)
+        )
+        try await waitForRunToFinish(model: model)
+
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), metadataBefore)
+        XCTAssertEqual(try Data(contentsOf: paths.outputSplatURL), outputBefore)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: paths.outputSplatReceiptURL.path
+            )
+        )
+        XCTAssertEqual(runnerFactoryCallCount, 0)
+        XCTAssertEqual(
+            model.actionFailure?.title,
+            "Couldn’t start re-training"
+        )
+        XCTAssertEqual(
+            model.actionFailure?.message,
+            "EasySplat couldn’t preserve the current splat for retraining. The existing result is unchanged."
+        )
+        let reacquiredLease = try ProjectRunLease.acquire(
+            projectURL: projectURL
+        )
+        reacquiredLease.release()
+    }
+
+    func testRecoveryRetryReleasesRunLeaseWhenMetadataMutationFailsBeforeTaskStarts() throws {
+        enum MutationFailure: Error {
+            case injected
+        }
+
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Recovery Mutation Failure",
+            lastError: "Training failed",
+            withOutput: false,
+            stage: .trainSplat
+        )
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { projectURL, config in
+                MockPipelineRunner(projectURL: projectURL, config: config)
+            },
+            projectMetadataUpdater: { _, _ in
+                throw MutationFailure.injected
+            }
+        )
+        model.currentProjectURL = projectURL
+        model.validationRecovery = .useBalanced
+        model.failureRetryAllowed = true
+
+        model.retryAfterFailure()
+
+        XCTAssertNil(model.currentTask)
+        XCTAssertFalse(model.isRunActive)
+        XCTAssertEqual(model.validationRecovery, .useBalanced)
+        let reacquiredLease = try ProjectRunLease.acquire(
+            projectURL: projectURL
+        )
+        reacquiredLease.release()
+    }
+
+    func testResumeTaskReleasesSuppliedLeaseWhenTokenIsAlreadyStale() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(
+            at: tempBase,
+            withIntermediateDirectories: true
+        )
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "Stale Resume Token",
+            lastError: nil,
+            withOutput: false,
+            stage: .sfmMapping
+        )
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        )
+        let owner = try AppProjectRunLeaseOwner(
+            projectURL: projectURL,
+            acquire: model.projectRunLeaseOwnerAcquirer
+        )
+        model.currentTaskToken = UUID()
+
+        await model.resumeProjectTask(
+            at: projectURL,
+            taskToken: UUID(),
+            projectRunLeaseOwner: owner
+        )
+
+        let reacquiredLease = try ProjectRunLease.acquire(
+            projectURL: projectURL
+        )
+        reacquiredLease.release()
     }
 
     func testLoadPipelineLogTailWithInvalidUtf8() throws {
@@ -3307,7 +6038,7 @@ final class AppModelTests: XCTestCase {
         )
         let trainingArtifact = try makeCompletedTrainingArtifact(
             for: paths.outputURL.appendingPathComponent("splat.ply"),
-            detailProfile: .balanced,
+            metadata: metadata,
             sceneBounds: SplatSceneBounds(
                 center: ScenePoint3D(x: 0, y: 0, z: 0),
                 radius: 3 * Foundation.exp(-4.0)
@@ -3348,11 +6079,6 @@ final class AppModelTests: XCTestCase {
         let outside = base.appendingPathComponent("outside.ply")
         try writeMinimalPly(at: outside)
         try writeMinimalPly(at: paths.outputSplatURL)
-        var artifact = try makeCompletedTrainingArtifact(
-            for: paths.outputSplatURL,
-            detailProfile: .balanced
-        )
-        artifact.outputPath = "../outside.ply"
         var metadata = ProjectMetadata(
             title: "EscapingOutput",
             input: .video(files: []),
@@ -3365,6 +6091,11 @@ final class AppModelTests: XCTestCase {
             hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
             developmentOverrides: .none
         )
+        var artifact = try makeCompletedTrainingArtifact(
+            for: paths.outputSplatURL,
+            metadata: metadata
+        )
+        artifact.outputPath = "../outside.ply"
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(metadata).write(to: paths.metadataURL, options: .atomic)
@@ -3497,12 +6228,8 @@ final class AppModelTests: XCTestCase {
     }
 
     func testAppConfigUsesBundledAuthorityWhenDevelopmentOverridesAreForbidden() throws {
-        let expectedPublicKey = try String(contentsOf: appResourceURL(named: "public_key_ed25519.txt"), encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         let environment = [
             "EASYSPLAT_PROJECT_HOME_URL": "https://release-verifier-poison.invalid/project",
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://release-verifier-poison.invalid/manifest.json",
-            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-verifier-poison-public-key",
             "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/release-verifier-poison/toolchain",
             "EASYSPLAT_SKIP_TRAINING": "1",
             "EASYSPLAT_STOP_AFTER_STAGE": PipelineStage.sfmMapping.rawValue,
@@ -3518,20 +6245,6 @@ final class AppModelTests: XCTestCase {
             "https://github.com/dud8/EasySplat"
         )
         XCTAssertEqual(
-            AppConfig.resolvedToolchainManifestURL(
-                environment: environment,
-                allowsDevelopmentOverrides: false
-            ).absoluteString,
-            "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
-        )
-        XCTAssertEqual(
-            AppConfig.resolvedToolchainPublicKeyBase64(
-                environment: environment,
-                allowsDevelopmentOverrides: false
-            ),
-            expectedPublicKey
-        )
-        XCTAssertEqual(
             AppConfig.developmentOverrides(
                 environment: environment,
                 allowsDevelopmentOverrides: false
@@ -3543,8 +6256,6 @@ final class AppModelTests: XCTestCase {
     func testAppConfigAllowsAuthorityOverridesForDevelopmentLaunches() {
         let environment = [
             "EASYSPLAT_PROJECT_HOME_URL": "https://example.com/project-home",
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://example.com/toolchain/manifest.json",
-            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "OVERRIDE_PUBLIC_KEY_BASE64",
         ]
 
         XCTAssertEqual(
@@ -3553,20 +6264,6 @@ final class AppModelTests: XCTestCase {
                 allowsDevelopmentOverrides: true
             ).absoluteString,
             "https://example.com/project-home"
-        )
-        XCTAssertEqual(
-            AppConfig.resolvedToolchainManifestURL(
-                environment: environment,
-                allowsDevelopmentOverrides: true
-            ).absoluteString,
-            "https://example.com/toolchain/manifest.json"
-        )
-        XCTAssertEqual(
-            AppConfig.resolvedToolchainPublicKeyBase64(
-                environment: environment,
-                allowsDevelopmentOverrides: true
-            ),
-            "OVERRIDE_PUBLIC_KEY_BASE64"
         )
     }
 
@@ -3610,19 +6307,6 @@ final class AppModelTests: XCTestCase {
 #else
         XCTAssertFalse(AppConfig.allowsDevelopmentOverrides)
 #endif
-    }
-
-    func testAppConfigDiscoversPairedBundledToolchainBootstrapFiles() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-
-        let bootstrap = try XCTUnwrap(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-
-        XCTAssertEqual(bootstrap.manifestURL, fixture.manifestURL)
-        XCTAssertEqual(bootstrap.coreArchiveURL, fixture.coreArchiveURL)
     }
 
     func testReleaseVerificationInputRejectsLegacyPositionalGate() throws {
@@ -3797,8 +6481,7 @@ final class AppModelTests: XCTestCase {
             (["EASYSPLAT_RELEASE_VERIFY_TOKEN": ""], [executable]),
             ([:], [executable, "--easysplat-release-verify-invalid"]),
             ([
-                "EASYSPLAT_TOOLCHAIN_MANIFEST_URL":
-                    "https://release-verifier-poison.invalid/manifest.json",
+                "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/release-verifier-poison/toolchain",
             ], [executable]),
         ]
 
@@ -3884,8 +6567,6 @@ final class AppModelTests: XCTestCase {
         ))
         for override in [
             "EASYSPLAT_PROJECT_HOME_URL",
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL",
-            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64",
             "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT",
             "EASYSPLAT_SKIP_TRAINING",
             "EASYSPLAT_STOP_AFTER_STAGE",
@@ -3917,8 +6598,6 @@ final class AppModelTests: XCTestCase {
         let gate = "--easysplat-release-verify-bundled-pipeline"
         let poison = [
             "EASYSPLAT_PROJECT_HOME_URL": "https://release-verifier-poison.invalid/project",
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://release-verifier-poison.invalid/manifest.json",
-            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-verifier-poison-public-key",
             "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": "/release-verifier-poison/toolchain",
             "EASYSPLAT_SKIP_TRAINING": "1",
             "EASYSPLAT_STOP_AFTER_STAGE": PipelineStage.sfmMapping.rawValue,
@@ -4790,164 +7469,24 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: base.path), [])
     }
 
-    func testAppConfigRejectsPartialBundledToolchainBootstrapPairs() throws {
-        for missingName in ["manifest.json", "macos-arm64-core.zip"] {
-            let fixture = try makeToolchainBootstrapFixture()
-            defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-            try FileManager.default.removeItem(
-                at: fixture.bootstrapRoot.appendingPathComponent(missingName)
-            )
-
-            XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-                environment: [:],
-                resourceRoot: fixture.resourceRoot
-            ))
-        }
-    }
-
-    func testAppConfigRejectsEmptyBundledToolchainBootstrapManifest() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        try Data().write(to: fixture.manifestURL)
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigRejectsEmptyBundledToolchainBootstrapCoreArchive() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        try Data().write(to: fixture.coreArchiveURL)
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigRejectsSymbolicLinkInBundledToolchainBootstrapPair() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        let manifestTarget = fixture.resourceRoot.appendingPathComponent("real-manifest.json")
-        try Data("manifest".utf8).write(to: manifestTarget)
-        try FileManager.default.removeItem(at: fixture.manifestURL)
-        try FileManager.default.createSymbolicLink(
-            at: fixture.manifestURL,
-            withDestinationURL: manifestTarget
-        )
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigRejectsDirectoryInBundledToolchainBootstrapPair() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        try FileManager.default.removeItem(at: fixture.coreArchiveURL)
-        try FileManager.default.createDirectory(
-            at: fixture.coreArchiveURL,
-            withIntermediateDirectories: false
-        )
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigRejectsMultiplyLinkedBundledToolchainBootstrapFile() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        try FileManager.default.linkItem(
-            at: fixture.coreArchiveURL,
-            to: fixture.resourceRoot.appendingPathComponent("second-core-link.zip")
-        )
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
-    }
-
-    func testAppConfigManifestOverrideDisablesBundledToolchainBootstrap() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: ["EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://example.com/manifest.json"],
-            resourceRoot: fixture.resourceRoot,
-            allowsDevelopmentOverrides: true
-        ))
-    }
-
-    func testAppConfigPublicKeyOverrideDisablesBundledToolchainBootstrap() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-
-        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
-            environment: ["EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-authority-override"],
-            resourceRoot: fixture.resourceRoot,
-            allowsDevelopmentOverrides: true
-        ))
-    }
-
-    func testBundledToolchainBootstrapIgnoresAuthorityEnvironmentWhenOverridesAreForbidden() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-
-        let bootstrap = AppConfig.bundledToolchainBootstrap(
-            environment: [
-                "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://example.com/manifest.json",
-                "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-authority-override",
-            ],
-            resourceRoot: fixture.resourceRoot,
-            allowsDevelopmentOverrides: false
-        )
-
-        XCTAssertEqual(bootstrap?.manifestURL, fixture.manifestURL)
-        XCTAssertEqual(bootstrap?.coreArchiveURL, fixture.coreArchiveURL)
-    }
-
-    func testDefaultToolchainManagerFactoryReceivesBundledBootstrapAndExplicitLocalRoot() throws {
-        let fixture = try makeToolchainBootstrapFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
-        let expected = try XCTUnwrap(AppConfig.bundledToolchainBootstrap(
-            environment: [:],
-            resourceRoot: fixture.resourceRoot
-        ))
+    func testDefaultToolchainManagerFactoryReceivesTheDevelopmentOverrideRoot() {
         let localRoot = URL(fileURLWithPath: "/private/tmp/easysplat-toolchain", isDirectory: true)
-        var received: ToolchainBootstrap?
-        var receivedPolicy: ToolchainSourcePolicy?
         var receivedLocalRoot: URL?
 
         _ = AppModel.makeDefaultToolchainManager(
-            bundledBootstrap: expected,
-            sourcePolicy: .bundledBootstrapOnly,
             developmentOverrides: DevelopmentOverrides(localToolchainRoot: localRoot)
-        ) { bootstrap, sourcePolicy, explicitLocalRoot in
-            received = bootstrap
-            receivedPolicy = sourcePolicy
+        ) { explicitLocalRoot in
             receivedLocalRoot = explicitLocalRoot
             return MockToolchainManager()
         }
 
-        XCTAssertEqual(received, expected)
-        XCTAssertEqual(receivedPolicy, .bundledBootstrapOnly)
         XCTAssertEqual(receivedLocalRoot, localRoot)
     }
 
     func testDefaultToolchainManagerFactoryReceivesNoLocalRootWithoutDevelopmentOverride() {
         var receivedLocalRoot: URL?
 
-        _ = AppModel.makeDefaultToolchainManager(
-            bundledBootstrap: nil,
-            sourcePolicy: .automatic,
-            developmentOverrides: .none
-        ) { _, _, explicitLocalRoot in
+        _ = AppModel.makeDefaultToolchainManager(developmentOverrides: .none) { explicitLocalRoot in
             receivedLocalRoot = explicitLocalRoot
             return MockToolchainManager()
         }
@@ -4970,49 +7509,6 @@ final class AppModelTests: XCTestCase {
         )
         try data.write(to: manifest)
         return manifest
-    }
-
-    func testDefaultToolchainSourcePolicyUsesOnlyBundledCoreForReleaseVerification() {
-        let home = URL(fileURLWithPath: "/private/tmp/easysplat-release-home", isDirectory: true)
-        let configuration = AppConfig.ReleaseVerificationConfiguration(
-            inputManifestURL: home.appendingPathComponent("inputs.json"),
-            inputRootURL: home.appendingPathComponent("inputs", isDirectory: true),
-            successMarkerURL: home.appendingPathComponent("passed.json"),
-            verificationToken: "easysplat-release-verify-12345678-1234-4abc-9def-1234567890ab"
-        )
-
-        XCTAssertEqual(
-            AppModel.defaultToolchainSourcePolicy(
-                releaseVerificationConfiguration: configuration
-            ),
-            .bundledBootstrapOnly
-        )
-        XCTAssertEqual(
-            AppModel.defaultToolchainSourcePolicy(
-                releaseVerificationConfiguration: nil
-            ),
-            .automatic
-        )
-    }
-
-    func testAppConfigEnablesInsecureLoopbackOnlyForDebugManifest() async {
-        await withAppEnvironmentAsync([
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "http://127.0.0.1:8000/manifest.json",
-        ]) {
-            XCTAssertTrue(AppConfig.allowInsecureLoopbackToolchainHTTP)
-        }
-
-        await withAppEnvironmentAsync([
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "http://downloads.example.com/manifest.json",
-        ]) {
-            XCTAssertFalse(AppConfig.allowInsecureLoopbackToolchainHTTP)
-        }
-
-        await withAppEnvironmentAsync([
-            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://downloads.example.com/manifest.json",
-        ]) {
-            XCTAssertFalse(AppConfig.allowInsecureLoopbackToolchainHTTP)
-        }
     }
 
     func testErrorDetailsTextCombinesFields() {
@@ -5361,6 +7857,136 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    private enum DeferredProjectMutationAction {
+        case resume
+        case retrain
+        case retry
+    }
+
+    private func assertCancellingDeferredProjectMutationRetiresRun(
+        _ action: DeferredProjectMutationAction
+    ) async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = tempBase.appendingPathComponent(
+            "Deferred Current.easysplatproj",
+            isDirectory: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        var metadata = ProjectMetadata(
+            title: "Deferred Current",
+            input: .video(files: []),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            state: PipelineState(stage: .done, lastError: nil)
+        )
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: standardHardwareProfile,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let publicationID = UUID()
+        let sourceURL = paths.trainingURL.appendingPathComponent("current.ply")
+        try writeMinimalPly(at: sourceURL)
+        let result = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
+        )
+        let nextProjectURL = try makeProject(
+            at: tempBase,
+            name: "Deferred Target",
+            lastError: nil,
+            withOutput: false,
+            stage: .sfmMapping
+        )
+        let timingStarted = expectation(
+            description: "viewer timing updater blocked before mutation"
+        )
+        let timingFinished = expectation(
+            description: "viewer timing updater retired"
+        )
+        let receiptUpdater = BlockingViewerTimingReceiptUpdateProbe(
+            phase: .beforeUpdate,
+            started: timingStarted,
+            finished: timingFinished
+        )
+        defer { receiptUpdater.release() }
+        let runnerFactoryCalls = LockedCallCounter()
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile,
+            pipelineRunnerFactory: { url, config in
+                runnerFactoryCalls.record()
+                return MockPipelineRunner(projectURL: url, config: config)
+            },
+            resultViewerTimingReceiptUpdater: receiptUpdater.update
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = result.outputURL
+        model.viewState = .viewer
+        let samples = LockedRunTimingSamples([
+            .init(wallClock: Date(), monotonicSeconds: 20),
+            .init(wallClock: Date(), monotonicSeconds: 25),
+        ])
+        model.prepareResultViewerTiming(
+            projectID: metadata.id,
+            projectURL: projectURL,
+            outputURL: result.outputURL,
+            expectedPublicationID: publicationID,
+            boundary: .capture(sample: samples.next)
+        )
+        model.resultViewerDidBecomeReady(
+            projectURL: projectURL,
+            outputURL: result.outputURL
+        )
+        await fulfillment(of: [timingStarted], timeout: 2)
+        let metadataBefore = try Data(contentsOf: paths.metadataURL)
+        let receiptBefore = try Data(contentsOf: paths.outputSplatReceiptURL)
+
+        switch action {
+        case .resume:
+            XCTAssertTrue(model.resumeProject(at: nextProjectURL))
+        case .retrain:
+            XCTAssertTrue(
+                model.retrainProject(at: projectURL, profile: .highDetail)
+            )
+        case .retry:
+            model.validationRecovery = .useFast
+            model.failureRetryAllowed = true
+            model.retryAfterFailure()
+        }
+        let deferredTask = try XCTUnwrap(model.currentTask)
+        XCTAssertTrue(model.isRunActive)
+
+        model.cancelCurrentProject(deleteProject: false)
+        XCTAssertTrue(model.isRunActive)
+        receiptUpdater.release()
+        await fulfillment(of: [timingFinished], timeout: 2)
+        await deferredTask.value
+
+        XCTAssertFalse(model.isRunActive)
+        XCTAssertNil(model.currentTask)
+        XCTAssertNil(model.currentTaskToken)
+        XCTAssertNil(model.stopAction)
+        XCTAssertEqual(model.viewState, .home)
+        XCTAssertNil(model.currentProjectURL)
+        XCTAssertEqual(runnerFactoryCalls.count, 0)
+        XCTAssertEqual(try Data(contentsOf: paths.metadataURL), metadataBefore)
+        XCTAssertEqual(
+            try Data(contentsOf: paths.outputSplatReceiptURL),
+            receiptBefore
+        )
+    }
+
     private func waitForViewState(model: AppModel, state: AppModel.ViewState, timeout: TimeInterval = 2.0) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -5370,6 +7996,95 @@ final class AppModelTests: XCTestCase {
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         XCTFail("Timed out waiting for viewState to become \(state)")
+    }
+
+    private func waitForRunToFinish(
+        model: AppModel,
+        timeout: TimeInterval = 2
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while ContinuousClock.now < deadline {
+            if !model.isRunActive, model.currentTask == nil { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for the project task to finish")
+    }
+
+    private func waitForPublishedViewerTiming(
+        paths: ProjectPaths,
+        expectedSeconds: TimeInterval,
+        timeout: TimeInterval = 2
+    ) async throws -> PublishedSplatReceipt {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let receipt = try? PublishedSplatReceiptStore.load(
+                projectPaths: paths
+            ), receipt.presentation.createToViewerReadySeconds
+                == expectedSeconds {
+                return receipt
+            }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for the viewer timing receipt update")
+        return try PublishedSplatReceiptStore.load(projectPaths: paths)
+    }
+
+    private func waitForPersistedViewerTiming(
+        paths: ProjectPaths,
+        expectedSeconds: TimeInterval,
+        timeout: TimeInterval = 2
+    ) async throws -> ProjectMetadata {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let metadata = try? ProjectMetadataStore.load(
+                from: paths.metadataURL
+            ), metadata.createToViewerReadySeconds == expectedSeconds {
+                return metadata
+            }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for the project viewer timing update")
+        return try ProjectMetadataStore.load(from: paths.metadataURL)
+    }
+
+    private func waitForViewerTimingReceiptAttempt(
+        model: AppModel,
+        timeout: TimeInterval = 2
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if model.pendingResultViewerTiming == nil
+                || model.pendingResultViewerTiming?.isReceiptUpdateInFlight
+                    == false {
+                return
+            }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for the viewer timing receipt attempt")
+    }
+
+    private func waitForViewerTimingTaskToFinish(
+        model: AppModel,
+        timeout: TimeInterval = 2
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if model.resultViewerTimingTask == nil { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for the viewer timing task to finish")
+    }
+
+    private func waitForDeferredProjectMutationToFinish(
+        model: AppModel,
+        timeout: TimeInterval = 2
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while ContinuousClock.now < deadline {
+            if model.deferredProjectMutationTask == nil { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for the deferred project mutation")
     }
 
     private func waitForCurrentProjectURL(model: AppModel, url: URL, timeout: TimeInterval = 2.0) async throws {
@@ -5448,7 +8163,7 @@ final class AppModelTests: XCTestCase {
                 paths: paths,
                 trainingArtifact: makeCompletedTrainingArtifact(
                     for: outputURL,
-                    detailProfile: .balanced
+                    metadata: metadata
                 )
             )
         }
@@ -5653,8 +8368,11 @@ private func makeMockToolchainPaths() -> ToolchainPaths {
     let da3Root = URL(fileURLWithPath: "/mock/da3")
     return ToolchainPaths(
         root: URL(fileURLWithPath: "/tmp/toolchain"),
+        dataRoot: URL(fileURLWithPath: "/tmp/toolchain"),
+        toolchainIdentity: "local-toolchain",
         colmap: URL(fileURLWithPath: "/mock/colmap"),
         msplat: URL(fileURLWithPath: "/mock/easysplat-train"),
+        metallib: URL(fileURLWithPath: "/mock/default.metallib"),
         da3: Da3Toolchain(
             root: da3Root,
             sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
@@ -5689,9 +8407,7 @@ private final class LockedRunTimingSamples: @unchecked Sendable {
 }
 
 final class MockToolchainManager: ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
@@ -5711,9 +8427,7 @@ final class CapabilityRecordingToolchainManager: @unchecked Sendable, ToolchainM
         queue.sync { requests.count }
     }
 
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
@@ -5725,9 +8439,7 @@ final class CapabilityRecordingToolchainManager: @unchecked Sendable, ToolchainM
 struct FailingToolchainManager: ToolchainManaging {
     var message: String
 
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
@@ -5735,20 +8447,14 @@ struct FailingToolchainManager: ToolchainManaging {
     }
 }
 
-struct MissingManifestToolchainManager: ToolchainManaging {
-    var statusCode: Int
-    var resourceURL: URL
+struct DamagedToolchainManager: ToolchainManaging {
+    var message: String
 
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
-        throw ToolchainManager.ToolchainError.manifestHTTPFailure(
-            statusCode: statusCode,
-            resourceURL: resourceURL
-        )
+        throw ToolchainManager.ToolchainError.invalidToolchain(message)
     }
 }
 
@@ -5815,7 +8521,7 @@ final class MockPipelineRunner: PipelineRunning {
         try writeMinimalPly(at: outputURL)
         let trainingArtifact = try makeCompletedTrainingArtifact(
             for: outputURL,
-            detailProfile: metadata.effectiveDetailProfile
+            metadata: metadata
         )
         metadata.state = PipelineState(stage: .done, lastError: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -5823,6 +8529,55 @@ final class MockPipelineRunner: PipelineRunning {
             metadata: metadata,
             paths: paths,
             trainingArtifact: trainingArtifact
+        )
+    }
+}
+
+final class PublishedResultMockPipelineRunner: PipelineRunning {
+    private let projectURL: URL
+    private let config: PipelineRunner.PipelineConfig
+    private let publicationID: UUID
+
+    init(
+        projectURL: URL,
+        config: PipelineRunner.PipelineConfig,
+        publicationID: UUID
+    ) {
+        self.projectURL = projectURL
+        self.config = config
+        self.publicationID = publicationID
+    }
+
+    func run(
+        resumeFrom lastCompletedStage: PipelineStage?,
+        events: @escaping @Sendable (PipelineEvent) -> Void
+    ) async throws {
+        try await MockPipelineRunner(
+            projectURL: projectURL,
+            config: config
+        ).run(resumeFrom: lastCompletedStage, events: events)
+
+        let paths = ProjectPaths(root: projectURL)
+        let sourceDirectory = paths.trainingURL.appendingPathComponent(
+            "app-test-publication",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourceDirectory,
+            withIntermediateDirectories: true
+        )
+        let sourceURL = sourceDirectory.appendingPathComponent("splat.ply")
+        try FileManager.default.copyItem(
+            at: paths.outputSplatURL,
+            to: sourceURL
+        )
+        try FileManager.default.removeItem(at: paths.outputSplatURL)
+        let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        _ = try publishAppTestResult(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: publicationID
         )
     }
 }
@@ -5924,20 +8679,32 @@ final class ResumeRecordingPipelineRunner: PipelineRunning {
     ) async throws {
         resumeFrom = lastCompletedStage
         let paths = ProjectPaths(root: projectURL)
-        let outputURL = paths.outputURL.appendingPathComponent("splat.ply")
-        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-        try writeMinimalPly(at: outputURL)
-        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-        let trainingArtifact = try makeCompletedTrainingArtifact(
-            for: outputURL,
-            detailProfile: metadata.effectiveDetailProfile
+        let sourceURL = paths.trainingURL.appendingPathComponent(
+            "test-runner-output.ply"
         )
-        metadata.state = PipelineState(stage: .done, lastError: nil)
+        try FileManager.default.createDirectory(
+            at: sourceURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeMinimalPly(at: sourceURL)
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        metadata.resolvedRunPlan = RunPlanResolver.resolve(
+            requestedOptions: metadata.requestedRunOptions,
+            input: metadata.input,
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none
+        )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-        try persistCompletedAppTestArtifacts(
-            metadata: metadata,
+        _ = try publishAppTestResult(
+            sourceURL: sourceURL,
             paths: paths,
-            trainingArtifact: trainingArtifact
+            metadata: metadata,
+            publicationID: UUID()
         )
     }
 }
@@ -5973,19 +8740,21 @@ final class DirectoryOutputRepairingPipelineRunner: PipelineRunning {
             try FileManager.default.removeItem(at: outputURL)
         }
         try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-        try writeMinimalPly(at: outputURL)
-
-        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-        let trainingArtifact = try makeCompletedTrainingArtifact(
-            for: outputURL,
-            detailProfile: metadata.effectiveDetailProfile
+        let sourceURL = paths.trainingURL.appendingPathComponent(
+            "repair-runner-output.ply"
         )
-        metadata.state = PipelineState(stage: .done, lastError: nil)
-        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-        try persistCompletedAppTestArtifacts(
-            metadata: metadata,
+        try FileManager.default.createDirectory(
+            at: sourceURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try writeMinimalPly(at: sourceURL)
+        defer { try? FileManager.default.removeItem(at: sourceURL) }
+        let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        _ = try publishAppTestResult(
+            sourceURL: sourceURL,
             paths: paths,
-            trainingArtifact: trainingArtifact
+            metadata: metadata,
+            publicationID: UUID()
         )
     }
 }
@@ -6028,6 +8797,312 @@ private func writeMinimalPly(at url: URL, vertexCount: Int = 1) throws {
     \(body)
     """
     try text.write(to: url, atomically: true, encoding: .utf8)
+    guard Darwin.chmod(url.path, 0o600) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+}
+
+@discardableResult
+private func publishAppTestResult(
+    sourceURL: URL,
+    paths: ProjectPaths,
+    metadata: ProjectMetadata,
+    publicationID: UUID
+) throws -> ValidatedPublishedResult {
+    try publishAppTestResultFixture(
+        sourceURL: sourceURL,
+        paths: paths,
+        metadata: metadata,
+        publicationID: publicationID
+    )
+}
+
+private func projectTrashQuarantineURLs(in parentURL: URL) throws -> [URL] {
+    try FileManager.default.contentsOfDirectory(
+        at: parentURL,
+        includingPropertiesForKeys: nil,
+        options: []
+    ).filter {
+        $0.lastPathComponent.hasPrefix(".easysplat-trash-")
+    }
+}
+
+private final class ViewerTimingMetadataUpdateProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+
+    var attemptCount: Int {
+        lock.withLock { attempts }
+    }
+
+    func update(
+        projectRootDescriptor: Int32,
+        mutation: AppModel.ProjectMetadataMutation
+    ) throws -> ProjectMetadata {
+        let attempt = lock.withLock { () -> Int in
+            attempts += 1
+            return attempts
+        }
+        if attempt == 1 {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+        }
+        return try ProjectMetadataStore.update(
+            atProjectRootDescriptor: projectRootDescriptor,
+            mutation
+        )
+    }
+}
+
+private final class ViewerTimingMetadataSuccessProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+
+    var attemptCount: Int {
+        lock.withLock { attempts }
+    }
+
+    func update(
+        projectRootDescriptor: Int32,
+        mutation: AppModel.ProjectMetadataMutation
+    ) throws -> ProjectMetadata {
+        lock.withLock { attempts += 1 }
+        return try ProjectMetadataStore.update(
+            atProjectRootDescriptor: projectRootDescriptor,
+            mutation
+        )
+    }
+}
+
+private final class LockedCallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int {
+        lock.withLock { value }
+    }
+
+    func record() {
+        lock.withLock { value += 1 }
+    }
+}
+
+private final class ViewerTimingRunLeaseProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let projectURL: URL
+    private var acquisitions = 0
+    private var receiptHeld = false
+    private var metadataHeld = false
+
+    init(projectURL: URL) {
+        self.projectURL = projectURL
+    }
+
+    var acquireCount: Int {
+        lock.withLock { acquisitions }
+    }
+
+    var receiptObservedHeldLease: Bool {
+        lock.withLock { receiptHeld }
+    }
+
+    var metadataObservedHeldLease: Bool {
+        lock.withLock { metadataHeld }
+    }
+
+    func acquire(projectURL: URL) throws -> ProjectRunLeaseOwner {
+        lock.withLock { acquisitions += 1 }
+        return try ProjectRunLeaseOwner.acquire(projectURL: projectURL)
+    }
+
+    func observeReceiptUpdate() {
+        let held = observesHeldLease()
+        lock.withLock { receiptHeld = held }
+    }
+
+    func observeMetadataUpdate() {
+        let held = observesHeldLease()
+        lock.withLock { metadataHeld = held }
+    }
+
+    private func observesHeldLease() -> Bool {
+        do {
+            let unexpected = try ProjectRunLease.acquire(projectURL: projectURL)
+            unexpected.release()
+            return false
+        } catch ProjectRunLeaseError.alreadyRunning {
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
+private final class ViewerTimingRootSwapProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let canonicalURL: URL
+    private let replacementURL: URL
+    private let parkedOriginalURL: URL
+    private var attempts = 0
+
+    init(
+        canonicalURL: URL,
+        replacementURL: URL,
+        parkedOriginalURL: URL
+    ) {
+        self.canonicalURL = canonicalURL
+        self.replacementURL = replacementURL
+        self.parkedOriginalURL = parkedOriginalURL
+    }
+
+    var attemptCount: Int {
+        lock.withLock { attempts }
+    }
+
+    func swapBeforeOpen() throws {
+        let shouldSwap = lock.withLock { () -> Bool in
+            attempts += 1
+            return attempts == 1
+        }
+        guard shouldSwap else { return }
+        try FileManager.default.moveItem(
+            at: canonicalURL,
+            to: parkedOriginalURL
+        )
+        try FileManager.default.moveItem(
+            at: replacementURL,
+            to: canonicalURL
+        )
+    }
+}
+
+private final class AlwaysFailingViewerTimingMetadataUpdateProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+
+    var attemptCount: Int {
+        lock.withLock { attempts }
+    }
+
+    func update(
+        projectRootDescriptor _: Int32,
+        mutation _: AppModel.ProjectMetadataMutation
+    ) throws -> ProjectMetadata {
+        lock.withLock { attempts += 1 }
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))
+    }
+}
+
+private final class ViewerTimingMetadataLoadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let failuresBeforeSuccess: Int
+    private var attempts = 0
+
+    init(failuresBeforeSuccess: Int) {
+        self.failuresBeforeSuccess = failuresBeforeSuccess
+    }
+
+    var attemptCount: Int {
+        lock.withLock { attempts }
+    }
+
+    func load(projectRootDescriptor: Int32) throws -> ProjectMetadata {
+        let attempt = lock.withLock { () -> Int in
+            attempts += 1
+            return attempts
+        }
+        if attempt <= failuresBeforeSuccess {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+        }
+        return try ProjectMetadataStore.load(
+            fromProjectRootDescriptor: projectRootDescriptor
+        )
+    }
+}
+
+private final class ViewerTimingReceiptUpdateProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+
+    var attemptCount: Int {
+        lock.withLock { attempts }
+    }
+
+    func update(
+        seconds: TimeInterval,
+        expectedPublicationID: UUID,
+        expectedGeneration: PublishedResultGeneration?,
+        projectPaths: ProjectPaths,
+        projectRootDescriptor: Int32?,
+        operations: PublishedResultPairOperations,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> ValidatedPublishedResult {
+        lock.withLock { attempts += 1 }
+        return try PublishedResultPairStore.recordFirstViewerReadyTiming(
+            seconds,
+            expectedPublicationID: expectedPublicationID,
+            expectedGeneration: expectedGeneration,
+            projectPaths: projectPaths,
+            projectRootDescriptor: projectRootDescriptor,
+            operations: operations,
+            shouldCancel: shouldCancel
+        )
+    }
+}
+
+private final class BlockingViewerTimingReceiptUpdateProbe: @unchecked Sendable {
+    enum Phase {
+        case beforeUpdate
+        case afterUpdate
+    }
+
+    private let phase: Phase
+    private let started: XCTestExpectation
+    private let finished: XCTestExpectation
+    private let gate = DispatchSemaphore(value: 0)
+
+    init(
+        phase: Phase,
+        started: XCTestExpectation,
+        finished: XCTestExpectation
+    ) {
+        self.phase = phase
+        self.started = started
+        self.finished = finished
+    }
+
+    func release() {
+        gate.signal()
+    }
+
+    func update(
+        seconds: TimeInterval,
+        expectedPublicationID: UUID,
+        expectedGeneration: PublishedResultGeneration?,
+        projectPaths: ProjectPaths,
+        projectRootDescriptor: Int32?,
+        operations: PublishedResultPairOperations,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> ValidatedPublishedResult {
+        defer { finished.fulfill() }
+        if phase == .beforeUpdate {
+            started.fulfill()
+            gate.wait()
+        }
+        let result = try PublishedResultPairStore.recordFirstViewerReadyTiming(
+            seconds,
+            expectedPublicationID: expectedPublicationID,
+            expectedGeneration: expectedGeneration,
+            projectPaths: projectPaths,
+            projectRootDescriptor: projectRootDescriptor,
+            operations: operations,
+            shouldCancel: shouldCancel
+        )
+        if phase == .afterUpdate {
+            started.fulfill()
+            gate.wait()
+        }
+        return result
+    }
 }
 
 private func posixPermissions(at url: URL) throws -> Int {
@@ -6056,15 +9131,19 @@ private func transactionLeaves(in base: URL) throws -> [String] {
 
 private struct InjectedPublicationFailure: Error {}
 
-private func makeCompletedTrainingArtifact(
+func makeCompletedTrainingArtifact(
     for outputURL: URL,
-    detailProfile: DetailProfile,
+    metadata: ProjectMetadata,
     sceneBounds suppliedSceneBounds: SplatSceneBounds? = nil
 ) throws -> TrainingArtifact {
-    let budget: (iterationLimit: Int, plateauWindow: Int) = switch detailProfile {
-    case .fast: (3_000, 400)
-    case .balanced: (7_000, 800)
-    case .highDetail: (15_000, 1_500)
+    // Snapshot load rejects artifacts whose trainer budget disagrees with the
+    // persisted plan, so mirror the plan when one exists.
+    let detailProfile = metadata.effectiveDetailProfile
+    let budget: (iterationLimit: Int, plateauWindow: Int)
+    if let plan = metadata.resolvedRunPlan {
+        budget = (plan.trainerIterationLimit, plan.plateauWindow)
+    } else {
+        budget = (7_000, 800)
     }
     guard let header = ProjectArtifactValidator.readPlyHeader(at: outputURL),
           let fileSize = try outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize else {

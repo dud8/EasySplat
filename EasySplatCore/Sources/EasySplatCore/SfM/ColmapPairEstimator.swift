@@ -13,6 +13,16 @@ struct DisconnectedVocabularyRetrievalEvidence: Error, Equatable, Sendable {
     let evidence: PairGraphRetrievalAttemptEvidence
 }
 
+/// A `local_vocab_retriever` invocation that could not execute, even after the
+/// database was resealed and the call retried. Distinct from
+/// `DisconnectedVocabularyRetrievalEvidence`, which describes a retrieval that
+/// ran and produced a graph the pairing policy rejected. Carries the tool's own
+/// error so a terminal failure still names the real cause instead of the
+/// generic stage message.
+struct VocabularyRetrievalExecutionFailure: Error {
+    let underlying: ColmapRunnerError
+}
+
 struct CaptureRetrievalConnectionFailure: Error, Equatable, Sendable {
     let pairingPolicy: ResolvedPairingPolicy
     let selectedViewCount: Int

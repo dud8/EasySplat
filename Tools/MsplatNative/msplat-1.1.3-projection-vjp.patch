@@ -1,0 +1,33 @@
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -1643,15 +1643,25 @@
+     float rw = 1.f / (p_hom.w + 1e-6f);
+ 
+     float3 v_ndc = {0.5f * img_size.x * v_xy.x, 0.5f * img_size.y * v_xy.y, 0.0f};
++    // The pixel coordinate divides by the homogeneous w, so w carries a cotangent of
++    // its own: d(x/w)/dw = -x/w^2, and the same for y. Both projected coordinates
++    // contribute, so the w term is weighted by p_hom.x and p_hom.y respectively. The
++    // shipped form summed the raw cotangents instead, and then discarded the result.
+     float4 v_proj = {
+-        v_ndc.x * rw, v_ndc.y * rw, 0., -(v_ndc.x + v_ndc.y) * rw * rw
++        v_ndc.x * rw,
++        v_ndc.y * rw,
++        0.,
++        -(v_ndc.x * p_hom.x + v_ndc.y * p_hom.y) * rw * rw
+     };
+     // df / d_world = df / d_cam * d_cam / d_world
+-    // = v_proj * P[:3, :3]
++    // = v_proj * P[:3, :], including the denominator row: a perspective matrix has a
++    // non-zero P[3, :3], so the world position reaches the pixel through w as well as
++    // through x and y. Dropping that row left every visible gaussian with a position
++    // gradient of the wrong direction, not merely the wrong scale.
+     return {
+-        mat[0] * v_proj.x + mat[4] * v_proj.y + mat[8] * v_proj.z,
+-        mat[1] * v_proj.x + mat[5] * v_proj.y + mat[9] * v_proj.z,
+-        mat[2] * v_proj.x + mat[6] * v_proj.y + mat[10] * v_proj.z
++        mat[0] * v_proj.x + mat[4] * v_proj.y + mat[8] * v_proj.z + mat[12] * v_proj.w,
++        mat[1] * v_proj.x + mat[5] * v_proj.y + mat[9] * v_proj.z + mat[13] * v_proj.w,
++        mat[2] * v_proj.x + mat[6] * v_proj.y + mat[10] * v_proj.z + mat[14] * v_proj.w
+     };
+ }
+ 

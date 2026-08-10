@@ -258,6 +258,66 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }
     }
 
+    func testMappingFragmentationIgnoresOmittedViewsOutsideTheAdmittedComponent() {
+        func candidate(order: Int, imageIDs: Set<UInt32>) -> MappedSparseModelCandidate {
+            MappedSparseModelCandidate(
+                url: URL(fileURLWithPath: "/tmp/\(order)"),
+                order: order,
+                score: ReconstructionScore(
+                    registeredImages: imageIDs.count,
+                    totalImages: 22,
+                    meanReprojectionError: 0.7,
+                    pointCount: imageIDs.count * 10,
+                    observationCount: imageIDs.count * 30,
+                    meanTrackLength: 3
+                )
+            )
+        }
+
+        // A split capture: matching admitted the 12-view dominant component;
+        // the 10-view separate group still reconstructs as a credible sibling.
+        let selectedIDs = Set((1...12).map(UInt32.init))
+        let siblingIDs = Set((13...22).map(UInt32.init))
+        let selected = candidate(order: 0, imageIDs: selectedIDs)
+        let sibling = candidate(order: 1, imageIDs: siblingIDs)
+        let memberships: [ColmapSparseModelMembership] = [
+            .init(modelOrder: 0, imageIDs: selectedIDs),
+            .init(modelOrder: 1, imageIDs: siblingIDs),
+        ]
+
+        // Unscoped, the credible sibling counts as recoverable loss.
+        XCTAssertNotNil(PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: [selected, sibling],
+            memberships: memberships,
+            residualValidatedModelOrders: [1],
+            totalSelectedViewCount: 22
+        ))
+
+        // Scoped to the admitted component, the sibling's views are expected
+        // losses and the selected model is accepted.
+        XCTAssertNil(PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: [selected, sibling],
+            memberships: memberships,
+            residualValidatedModelOrders: [1],
+            totalSelectedViewCount: 22,
+            admittedImageIDs: selectedIDs
+        ))
+
+        // Admitted views the mapper dropped into a sibling still count.
+        let admittedIncludingDropped = selectedIDs.union([13, 14, 15])
+        let evidence = PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: [selected, sibling],
+            memberships: memberships,
+            residualValidatedModelOrders: [1],
+            totalSelectedViewCount: 22,
+            admittedImageIDs: admittedIncludingDropped
+        )
+        XCTAssertEqual(evidence?.omittedRecoverableViewCount, 3)
+    }
+
     func testMappingFragmentationUsesCredibleMembershipUnionDeterministically() {
         func candidate(
             order: Int,
@@ -508,7 +568,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
             rows: [(1, "café frame.jpg", 1)]
         )
 
-        let changed = try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+        let changed = try makeRunner(projectURL: root).prepareExternalRefinementSeed(
             rawModelURL: rawModel,
             outputModelURL: outputModel,
             databaseURL: databaseURL
@@ -544,7 +604,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         try writeImageMappingDatabase(at: databaseURL, rows: [(10, "frame.jpg", 20)])
 
         XCTAssertThrowsError(
-            try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+            try makeRunner(projectURL: root).prepareExternalRefinementSeed(
                 rawModelURL: rawModel,
                 outputModelURL: outputModel,
                 databaseURL: databaseURL
@@ -574,7 +634,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
             var reachedTarget = false
 
             XCTAssertThrowsError(
-                try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+                try makeRunner(projectURL: root).prepareExternalRefinementSeed(
                     rawModelURL: rawModel,
                     outputModelURL: outputModel,
                     databaseURL: databaseURL,
@@ -1021,6 +1081,157 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertGreaterThan(sideMeans.left, sideMeans.right + 0.25)
     }
 
+    func testDatasetCopySelectedPreservesSourceBytesAcrossExtensions() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A source set the photo path would transform in three different ways:
+        // bake the EXIF orientation, lift the exposure, and re-encode. Every one
+        // of those re-encodes the pixels, which would desync the imported
+        // calibration keyed to the original grid. The dataset copy must move no
+        // byte and must keep the retain-all count and per-file lineage intact.
+        let oriented = root.appendingPathComponent("img_000.jpg")
+        try writeOrientedJPEG(to: oriented, width: 8, height: 12, orientation: 6)
+        let underexposed = root.appendingPathComponent("img_001.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: underexposed,
+            size: 40,
+            value: 36,
+            utType: .jpeg
+        ))
+        XCTAssertGreaterThan(
+            try FrameScoring.scoreFrame(at: underexposed).lowLightExposureEV,
+            0
+        )
+        let png = root.appendingPathComponent("img_002.png")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: png,
+            size: 24,
+            value: 128,
+            utType: .png
+        ))
+
+        let sources = [oriented, underexposed, png]
+        let sourceSHA256s = try sources.map { try GeometryArtifactStore.sha256(of: $0) }
+        var bindings: [String: PipelineRunner.SelectedInputSource] = [:]
+        for (index, source) in sources.enumerated() {
+            bindings[source.lastPathComponent] = PipelineRunner.SelectedInputSource(
+                projectRelativePath: "Originals/Photos/\(source.lastPathComponent)",
+                sha256: sourceSHA256s[index],
+                photoRetainedRank: index
+            )
+        }
+
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
+        let runner = makeRunner(projectURL: root)
+        let result = try runner.test_copySelectedDataset(
+            groups: [.init(
+                id: "photos",
+                frames: sources,
+                isVideo: false,
+                sourceBindingsByFileName: bindings
+            )],
+            to: selected,
+            manifestURL: root.appendingPathComponent("selected_frames.json"),
+            projectPaths: ProjectPaths(root: root),
+            maxDimension: 128
+        )
+
+        // Retain-all: every imported image survives selection.
+        XCTAssertEqual(result.frames.count, sources.count)
+        XCTAssertEqual(result.manifest.count, sources.count)
+        XCTAssertEqual(
+            result.frames.map(\.lastPathComponent),
+            ["frame_000000.jpg", "frame_000001.jpg", "frame_000002.png"]
+        )
+
+        for (index, entry) in result.manifest.enumerated() {
+            let output = result.frames[index]
+            let outputSHA256 = try GeometryArtifactStore.sha256(of: output)
+            XCTAssertEqual(
+                outputSHA256,
+                sourceSHA256s[index],
+                "dataset frame \(index) is not byte-identical to its source"
+            )
+            XCTAssertEqual(entry.sourceSHA256, sourceSHA256s[index])
+            XCTAssertEqual(entry.selectedSHA256, sourceSHA256s[index])
+            XCTAssertEqual(entry.photoRetainedRank, index)
+            XCTAssertNil(entry.lowLightExposureEV)
+            let normalization = try XCTUnwrap(entry.normalization)
+            XCTAssertFalse(normalization.transcoded)
+            XCTAssertEqual(normalization.outputFormat, output.pathExtension.lowercased())
+            XCTAssertEqual(normalization.outputPixelWidth, normalization.sourcePixelWidth)
+            XCTAssertEqual(normalization.outputPixelHeight, normalization.sourcePixelHeight)
+        }
+
+        // The imported orientation is untouched (the photo path would bake it to 1).
+        let orientedOutput = try XCTUnwrap(
+            CGImageSourceCreateWithURL(result.frames[0] as CFURL, nil)
+        )
+        let orientedProps = try XCTUnwrap(
+            CGImageSourceCopyPropertiesAtIndex(orientedOutput, 0, nil) as? [CFString: Any]
+        )
+        XCTAssertEqual(
+            (orientedProps[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1,
+            6
+        )
+    }
+
+    func testDatasetCopySelectedBytesAreInvariantAcrossDetailProfiles() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // The resolved maximum dimension is the only frame-selection knob a
+        // DetailProfile moves. A dataset frame must hash identically no matter
+        // which profile resolved the run, so two dimensions stand in for two
+        // profiles here and both must reproduce the source bytes exactly.
+        let source = root.appendingPathComponent("img_000.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: source,
+            size: 48,
+            value: 40,
+            utType: .jpeg
+        ))
+        let sourceSHA256 = try GeometryArtifactStore.sha256(of: source)
+        let sourceData = try Data(contentsOf: source)
+        let runner = makeRunner(projectURL: root)
+
+        func datasetDigest(maxDimension: CGFloat, label: String) throws -> String {
+            let selected = root.appendingPathComponent("selected-\(label)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: selected,
+                withIntermediateDirectories: true
+            )
+            let result = try runner.test_copySelectedDataset(
+                groups: [.init(
+                    id: "photos",
+                    frames: [source],
+                    isVideo: false,
+                    sourceBindingsByFileName: [
+                        source.lastPathComponent: PipelineRunner.SelectedInputSource(
+                            projectRelativePath: "Originals/Photos/\(source.lastPathComponent)",
+                            sha256: sourceSHA256,
+                            photoRetainedRank: 0
+                        )
+                    ]
+                )],
+                to: selected,
+                manifestURL: root.appendingPathComponent("manifest-\(label).json"),
+                projectPaths: ProjectPaths(root: root),
+                maxDimension: maxDimension
+            )
+            let output = try XCTUnwrap(result.frames.first)
+            XCTAssertEqual(try Data(contentsOf: output), sourceData)
+            XCTAssertNil(result.manifest.first?.lowLightExposureEV)
+            return try GeometryArtifactStore.sha256(of: output)
+        }
+
+        let fastDigest = try datasetDigest(maxDimension: 1_024, label: "fast")
+        let highDetailDigest = try datasetDigest(maxDimension: 2_048, label: "high")
+        XCTAssertEqual(fastDigest, sourceSHA256)
+        XCTAssertEqual(highDetailDigest, sourceSHA256)
+        XCTAssertEqual(fastDigest, highDetailDigest)
+    }
+
     func testSelectedFrameNormalizationRequiresSDRBridgeWithoutResizeOrRotation() {
         XCTAssertTrue(PipelineRunner.selectedFrameRequiresTranscode(
             exposureEV: 0,
@@ -1249,7 +1460,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertFalse(runner.test_normalizedToolLogIsError(cudaFallbackWarning, isError: true))
     }
 
-    func testRegenerateBinarySparseModelReadsOnlyAuthenticatedText() throws {
+    func testRegenerateBinarySparseModelReadsOnlyAuthenticatedText() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let model = root.appendingPathComponent("model", isDirectory: true)
@@ -1270,7 +1481,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
 
-        XCTAssertTrue(try runner.regenerateBinarySparseModelFiles(at: model))
+        let regenerated = try await runner.regenerateBinarySparseModelFiles(at: model)
+        XCTAssertTrue(regenerated)
         for name in ["cameras.bin", "points3D.bin"] {
             XCTAssertEqual(try Data(contentsOf: model.appendingPathComponent(name)), Data([1, 2, 3]))
         }
@@ -1279,7 +1491,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertNotNil(images.range(of: Data("frame.jpg".utf8)))
     }
 
-    func testEnsureTextSparseModelDerivesTextFromBinaryWhenBothFamiliesExist() throws {
+    func testEnsureTextSparseModelDerivesTextFromBinaryWhenBothFamiliesExist() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let model = root.appendingPathComponent("model", isDirectory: true)
@@ -1324,7 +1536,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         var originalDirectory = stat()
         XCTAssertEqual(Darwin.lstat(model.path, &originalDirectory), 0)
 
-        XCTAssertTrue(try runner.ensureTextSparseModelFiles(at: model))
+        let converted = try await runner.ensureTextSparseModelFiles(at: model)
+        XCTAssertTrue(converted)
         var publishedDirectory = stat()
         XCTAssertEqual(Darwin.lstat(model.path, &publishedDirectory), 0)
         XCTAssertNotEqual(publishedDirectory.st_ino, originalDirectory.st_ino)
@@ -1344,7 +1557,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["model_converter"])
     }
 
-    func testEnsureTextSparseModelKeepsTextOnlyModelWithoutConversion() throws {
+    func testEnsureTextSparseModelKeepsTextOnlyModelWithoutConversion() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let model = root.appendingPathComponent("model", isDirectory: true)
@@ -1352,11 +1565,12 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let original = try sparseTextModelBytes(at: model)
         let runner = makeRunner(projectURL: root)
 
-        XCTAssertFalse(try runner.ensureTextSparseModelFiles(at: model))
+        let converted = try await runner.ensureTextSparseModelFiles(at: model)
+        XCTAssertFalse(converted)
         XCTAssertEqual(try sparseTextModelBytes(at: model), original)
     }
 
-    func testEnsureTextSparseModelPreservesExistingTextWhenConversionFails() throws {
+    func testEnsureTextSparseModelPreservesExistingTextWhenConversionFails() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let model = root.appendingPathComponent("model", isDirectory: true)
@@ -1380,11 +1594,13 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
 
-        XCTAssertThrowsError(try runner.ensureTextSparseModelFiles(at: model))
+        await XCTAssertThrowsErrorAsync {
+            try await runner.ensureTextSparseModelFiles(at: model)
+        }
         XCTAssertEqual(try sparseTextModelBytes(at: model), original)
     }
 
-    func testEnsureTextSparseModelPreservesExistingTextWhenConverterOutputIsIncomplete() throws {
+    func testEnsureTextSparseModelPreservesExistingTextWhenConverterOutputIsIncomplete() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let model = root.appendingPathComponent("model", isDirectory: true)
@@ -1409,11 +1625,13 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
 
-        XCTAssertThrowsError(try runner.ensureTextSparseModelFiles(at: model))
+        await XCTAssertThrowsErrorAsync {
+            try await runner.ensureTextSparseModelFiles(at: model)
+        }
         XCTAssertEqual(try sparseTextModelBytes(at: model), original)
     }
 
-    func testEnsureTextSparseModelPreservesExistingTextWhenConverterOutputIsMalformed() throws {
+    func testEnsureTextSparseModelPreservesExistingTextWhenConverterOutputIsMalformed() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let model = root.appendingPathComponent("model", isDirectory: true)
@@ -1440,11 +1658,13 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
 
-        XCTAssertThrowsError(try runner.ensureTextSparseModelFiles(at: model))
+        await XCTAssertThrowsErrorAsync {
+            try await runner.ensureTextSparseModelFiles(at: model)
+        }
         XCTAssertEqual(try sparseTextModelBytes(at: model), original)
     }
 
-    func testEnsureTextSparseModelRollsBackFailureAfterAtomicSwap() throws {
+    func testEnsureTextSparseModelRollsBackFailureAfterAtomicSwap() async throws {
         enum InjectedFailure: Error { case afterSwap }
 
         let root = try TestFileBuilder.makeTempDir()
@@ -1465,19 +1685,239 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
 
-        XCTAssertThrowsError(try runner.ensureTextSparseModelFiles(
-            at: model,
-            publicationCheckpoint: { checkpoint in
-                if case .afterSwap = checkpoint {
-                    throw InjectedFailure.afterSwap
+        await XCTAssertThrowsErrorAsync({
+            try await runner.ensureTextSparseModelFiles(
+                at: model,
+                publicationCheckpoint: { checkpoint in
+                    if case .afterSwap = checkpoint {
+                        throw InjectedFailure.afterSwap
+                    }
                 }
-            }
-        )) { error in
+            )
+        }, errorHandler: { error in
             guard case InjectedFailure.afterSwap = error else {
                 return XCTFail("Expected injected post-swap failure, got \(error)")
             }
-        }
+        })
         XCTAssertEqual(try sparseTextModelBytes(at: model), original)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: root.path)
+                .contains(where: { $0.hasPrefix(".text-model-") })
+        )
+    }
+
+    func testEnsureTextSparseModelCancellationBeforePublicationPreservesCanonicalModelAndCleansStaging() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "OPENCV_FISHEYE")
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("authoritative \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let original = try sparseModelBytes(at: model)
+        let gate = GatedModelConverterRunner { arguments in
+            let output = URL(
+                fileURLWithPath: try XCTUnwrap(self.argumentValue("--output_path", arguments))
+            )
+            try self.writeSparseTextModel(at: output, cameraModel: "PINHOLE")
+        }
+        let runner = makeRunner(projectURL: root, subprocess: gate)
+        let task = Task {
+            try await runner.ensureTextSparseModelFiles(at: model)
+        }
+
+        guard await waitForPipelineHelperSignal(gate.entered, timeout: 2) else {
+            gate.release.signal()
+            _ = try? await task.value
+            return XCTFail("Model conversion did not enter runAsync")
+        }
+        task.cancel()
+        gate.release.signal()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation before publication")
+        } catch is CancellationError {
+            // Expected before the canonical model is swapped.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertEqual(try sparseModelBytes(at: model), original)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: root.path)
+                .contains(where: { $0.hasPrefix(".text-model-") })
+        )
+    }
+
+    func testRegenerateBinarySparseModelCancellationPreservesCanonicalModelAndCleansStaging() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "PINHOLE")
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("existing \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let original = try sparseModelBytes(at: model)
+        let gate = GatedModelConverterRunner { arguments in
+            try self.writeBinaryModel(to: arguments)
+        }
+        let runner = makeRunner(projectURL: root, subprocess: gate)
+        let task = Task {
+            try await runner.regenerateBinarySparseModelFiles(at: model)
+        }
+
+        guard await waitForPipelineHelperSignal(gate.entered, timeout: 2) else {
+            gate.release.signal()
+            _ = try? await task.value
+            return XCTFail("Binary conversion did not enter runAsync")
+        }
+        task.cancel()
+        gate.release.signal()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation before binary publication")
+        } catch is CancellationError {
+            // Expected with the canonical text and binary files untouched.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertEqual(try sparseModelBytes(at: model), original)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: root.path)
+                .contains(where: { $0.hasPrefix(".binary-model-") })
+        )
+    }
+
+    func testRegenerateBinarySparseModelRollsBackFailureAfterAtomicSwap() async throws {
+        enum InjectedFailure: Error { case afterSwap }
+
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "PINHOLE")
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("existing \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let original = try sparseModelBytes(at: model)
+        let subprocess = MockSubprocessRunner(scripts: [modelConverterScript { arguments in
+            try self.writeBinaryModel(to: arguments)
+        }])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+
+        await XCTAssertThrowsErrorAsync({
+            try await runner.regenerateBinarySparseModelFiles(
+                at: model,
+                publicationCheckpoint: { checkpoint in
+                    if case .afterSwap = checkpoint {
+                        throw InjectedFailure.afterSwap
+                    }
+                }
+            )
+        }, errorHandler: { error in
+            guard case InjectedFailure.afterSwap = error else {
+                return XCTFail("Expected injected post-swap failure, got \(error)")
+            }
+        })
+        XCTAssertEqual(try sparseModelBytes(at: model), original)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: root.path)
+                .contains(where: { $0.hasPrefix(".binary-model-") })
+        )
+    }
+
+    func testRegenerateBinarySparseModelRestoresCanonicalModelBeforeSurfacingPostSwapCancellation() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "PINHOLE")
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("existing \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let original = try sparseModelBytes(at: model)
+        let afterSwap = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let subprocess = MockSubprocessRunner(scripts: [modelConverterScript { arguments in
+            try self.writeBinaryModel(to: arguments)
+        }])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+        let task = Task {
+            try await runner.regenerateBinarySparseModelFiles(
+                at: model,
+                publicationCheckpoint: { checkpoint in
+                    if case .afterSwap = checkpoint {
+                        afterSwap.signal()
+                        release.wait()
+                    }
+                }
+            )
+        }
+
+        guard await waitForPipelineHelperSignal(afterSwap, timeout: 2) else {
+            release.signal()
+            _ = try? await task.value
+            return XCTFail("Binary model was not atomically published")
+        }
+        task.cancel()
+        release.signal()
+        do {
+            _ = try await task.value
+            XCTFail("Expected post-swap cancellation")
+        } catch is CancellationError {
+            // The original model must be restored before cancellation escapes.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        XCTAssertEqual(try sparseModelBytes(at: model), original)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: root.path)
+                .contains(where: { $0.hasPrefix(".binary-model-") })
+        )
+    }
+
+    func testEnsureTextSparseModelRestoresCanonicalModelBeforeSurfacingPostSwapCancellation() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "OPENCV_FISHEYE")
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("authoritative \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let original = try sparseModelBytes(at: model)
+        let subprocess = MockSubprocessRunner(scripts: [modelConverterScript { arguments in
+            let output = URL(
+                fileURLWithPath: try XCTUnwrap(self.argumentValue("--output_path", arguments))
+            )
+            try self.writeSparseTextModel(at: output, cameraModel: "PINHOLE")
+        }])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+
+        do {
+            _ = try await runner.ensureTextSparseModelFiles(
+                at: model,
+                publicationCheckpoint: { checkpoint in
+                    if case .afterSwap = checkpoint { throw CancellationError() }
+                }
+            )
+            XCTFail("Expected post-swap cancellation")
+        } catch is CancellationError {
+            // The swap has already begun, so rollback must finish first.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        XCTAssertEqual(try sparseModelBytes(at: model), original)
         XCTAssertFalse(
             try FileManager.default.contentsOfDirectory(atPath: root.path)
                 .contains(where: { $0.hasPrefix(".text-model-") })
@@ -2371,6 +2811,15 @@ final class PipelineRunnerHelperTests: XCTestCase {
         })
     }
 
+    private func sparseModelBytes(at directory: URL) throws -> [String: Data] {
+        try Dictionary(uniqueKeysWithValues: [
+            "cameras.txt", "images.txt", "points3D.txt",
+            "cameras.bin", "images.bin", "points3D.bin",
+        ].map { name in
+            (name, try Data(contentsOf: directory.appendingPathComponent(name)))
+        })
+    }
+
     private func writeLearnedPoints(to directory: URL, count: Int) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let rows = (1...count).map { "\($0) \(Double($0)) 0.0 2.0 10 20 30 -1.0" }
@@ -2423,4 +2872,81 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }
     }
 
+}
+
+private final class GatedModelConverterRunner: @unchecked Sendable, SubprocessRunning {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+
+    private let execute: ([String]) throws -> Void
+
+    init(execute: @escaping ([String]) throws -> Void) {
+        self.execute = execute
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        try complete(
+            arguments: arguments,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        try complete(
+            arguments: arguments,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys
+        )
+    }
+
+    private func complete(
+        arguments: [String],
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>
+    ) throws -> SubprocessResult {
+        entered.signal()
+        release.wait()
+        try execute(arguments)
+        return SubprocessResult(
+            exitCode: 0,
+            terminationReason: .exit,
+            stdout: "",
+            stderr: "",
+            environmentReceipt: SubprocessEnvironmentReceipt(
+                explicitOverrides: environment,
+                removedKeys: removingEnvironmentKeys,
+                effectiveValuesForControlledKeys: environment
+            )
+        )
+    }
+}
+
+private func waitForPipelineHelperSignal(
+    _ semaphore: DispatchSemaphore,
+    timeout: TimeInterval
+) async -> Bool {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global().async {
+            continuation.resume(
+                returning: semaphore.wait(timeout: .now() + timeout) == .success
+            )
+        }
+    }
 }

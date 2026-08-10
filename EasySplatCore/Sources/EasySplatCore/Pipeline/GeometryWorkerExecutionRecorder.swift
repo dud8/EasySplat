@@ -158,6 +158,10 @@ final class GeometryWorkerExecutionRecorder: @unchecked Sendable {
             artifact = Self.emptyArtifact(budget: budget, runtimeClosure: runtimeClosure)
         }
         if !recoveryBaselinePending {
+            artifact.vocabularyRetrievalInvocations =
+                Self.retrievalReceiptsWithoutRedundantDuplicates(
+                    artifact.vocabularyRetrievalInvocations
+                )
             try persistLocked()
         }
     }
@@ -206,7 +210,20 @@ final class GeometryWorkerExecutionRecorder: @unchecked Sendable {
                     }
                     return
                 }
-                artifact.vocabularyRetrievalInvocations.append(invocation)
+                // Attempt ordinals are unique across pair-graph attempts, and
+                // publication requires exactly one receipt for each. A second
+                // receipt for an ordinal supersedes the first: the resealed
+                // retry follows its own failure, and a resumed run replays the
+                // attempt it was interrupted in.
+                if let attemptOrdinal = invocation.pairExecution?.attemptOrdinal,
+                   let superseded = artifact.vocabularyRetrievalInvocations
+                       .firstIndex(where: {
+                           $0.pairExecution?.attemptOrdinal == attemptOrdinal
+                       }) {
+                    artifact.vocabularyRetrievalInvocations[superseded] = invocation
+                } else {
+                    artifact.vocabularyRetrievalInvocations.append(invocation)
+                }
             case .mapper, .pointTriangulator, .bundleAdjuster, .modelAnalyzer,
                  .modelConverter:
                 guard invocation.mappingAttemptOrdinal == nil,
@@ -341,6 +358,23 @@ final class GeometryWorkerExecutionRecorder: @unchecked Sendable {
             }
             let ordinal = allocatedMaximum + 1
             activeMappingAttemptOrdinal = ordinal
+            // Acceptance is recorded before the publication tail runs, so an
+            // accepted evaluation still in the ledger belongs to a run that
+            // died after selecting its solve — a new attempt could not be
+            // starting otherwise. Nothing recorded so far backs a published
+            // geometry, and publication reads two accepted solves as
+            // contradictory evidence, so open the attempt on a clean mapping
+            // slate instead of carrying the superseded acceptance forward.
+            // The ordinal is allocated above, off the pre-clear maximum, so
+            // attempts stay monotonic across runs.
+            if artifact.mappingAndRefinementInvocations.contains(where: {
+                $0.command == .mapper
+                    && $0.succeeded
+                    && $0.mapperExecution?.evaluation?.status == .accepted
+            }) {
+                artifact.mappingAndRefinementInvocations.removeAll()
+                try persistLocked()
+            }
             return ordinal
         }
     }
@@ -577,6 +611,33 @@ final class GeometryWorkerExecutionRecorder: @unchecked Sendable {
         if !completed(.sfmMapping) {
             artifact.mappingAndRefinementInvocations.removeAll(keepingCapacity: false)
         }
+    }
+
+    /// Repairs a ledger that a run before the per-ordinal replacement above left
+    /// with more retrieval receipts than pair-graph attempts. Only receipts that
+    /// prove nothing the kept ones do not are dropped — an identical replay, and
+    /// a failure the same request later succeeded on. Anything else is a real
+    /// inconsistency and is left for validation to reject.
+    private static func retrievalReceiptsWithoutRedundantDuplicates(
+        _ invocations: [ColmapWorkerInvocationEvidence]
+    ) -> [ColmapWorkerInvocationEvidence] {
+        var kept: [ColmapWorkerInvocationEvidence] = []
+        for invocation in invocations {
+            guard invocation.succeeded,
+                  let binding = invocation.pairExecution else {
+                kept.append(invocation)
+                continue
+            }
+            guard !kept.contains(invocation) else { continue }
+            kept.removeAll { superseded in
+                guard !superseded.succeeded,
+                      let failed = superseded.pairExecution else { return false }
+                return failed.attemptOrdinal == binding.attemptOrdinal
+                    && failed.retrievalRequestDigest == binding.retrievalRequestDigest
+            }
+            kept.append(invocation)
+        }
+        return kept
     }
 
     private func persistLocked() throws {

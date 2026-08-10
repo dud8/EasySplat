@@ -267,6 +267,134 @@ final class PipelineRunnerRetryTests: XCTestCase {
         )
     }
 
+    func testExplicitRetrainAfterFinalCompletionPersistenceFailureDurablyMintsNewPublicationID() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+
+        let failedPublicationID = UUID(
+            uuidString: "11111111-2222-4333-8444-555555555555"
+        )!
+        let retrainPublicationID = UUID(
+            uuidString: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+        )!
+        let fixture = try writeFinalCompletionPersistenceFailureState(
+            paths: paths,
+            pendingPublicationID: failedPublicationID
+        )
+        var previousAttemptMetadata = try ProjectMetadataStore.load(
+            from: paths.metadataURL
+        )
+        previousAttemptMetadata.createToViewerReadySeconds = 91.25
+        try ProjectMetadataStore.save(previousAttemptMetadata, to: paths.metadataURL)
+        let probe = PipelinePublicationGenerationProbe(
+            generatedPublicationID: retrainPublicationID
+        )
+        let subprocess = MockSubprocessRunner(scripts: [])
+        let tooling = PipelineRunner.Tooling(
+            runner: subprocess,
+            prepareRuntimeInputLease: { _, observedPaths, _ in
+                try probe.stopAfterObservingDurableRunStart(paths: observedPaths)
+            },
+            makePublicationID: {
+                probe.makePublicationID()
+            }
+        )
+        let runner = PipelineRunner(
+            projectURL: root,
+            config: PipelineRunner.PipelineConfig(
+                toolchain: TestToolchains.toolchainPaths(root: root),
+                hardwareProfile: fixture.hardware,
+                resolvedRunPlan: fixture.plan,
+                runIntent: .retrain
+            ),
+            tooling: tooling
+        )
+
+        do {
+            try await runner.run { _ in }
+            XCTFail("Expected the deterministic post-run-start stop")
+        } catch PipelinePublicationGenerationTestStop.afterDurableRunStart {
+            // Expected: the probe stops before any stage or publication work.
+        } catch {
+            XCTFail("Unexpected run error: \(error)")
+        }
+
+        XCTAssertEqual(probe.generationCallCount, 1)
+        XCTAssertEqual(probe.observedDurablePublicationIDs, [retrainPublicationID])
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: paths.metadataURL).pendingPublicationID,
+            retrainPublicationID,
+            "The terminal failure record must retain the newly persisted retrain generation."
+        )
+        XCTAssertNil(
+            try ProjectMetadataStore.load(from: paths.metadataURL)
+                .createToViewerReadySeconds,
+            "A newly minted retrain generation must not inherit the previous publication's viewer-ready timing."
+        )
+        XCTAssertTrue(subprocess.calls.isEmpty)
+    }
+
+    func testResumeAfterFinalCompletionPersistenceFailureRetainsPendingPublicationID() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+
+        let pendingPublicationID = UUID(
+            uuidString: "66666666-7777-4888-8999-AAAAAAAAAAAA"
+        )!
+        let unusedPublicationID = UUID(
+            uuidString: "BBBBBBBB-CCCC-4DDD-8EEE-FFFFFFFFFFFF"
+        )!
+        let fixture = try writeFinalCompletionPersistenceFailureState(
+            paths: paths,
+            pendingPublicationID: pendingPublicationID
+        )
+        let probe = PipelinePublicationGenerationProbe(
+            generatedPublicationID: unusedPublicationID
+        )
+        let subprocess = MockSubprocessRunner(scripts: [])
+        let tooling = PipelineRunner.Tooling(
+            runner: subprocess,
+            prepareRuntimeInputLease: { _, observedPaths, _ in
+                try probe.stopAfterObservingDurableRunStart(paths: observedPaths)
+            },
+            makePublicationID: {
+                probe.makePublicationID()
+            }
+        )
+        let runner = PipelineRunner(
+            projectURL: root,
+            config: PipelineRunner.PipelineConfig(
+                toolchain: TestToolchains.toolchainPaths(root: root),
+                hardwareProfile: fixture.hardware,
+                resolvedRunPlan: fixture.plan,
+                runIntent: .resume
+            ),
+            tooling: tooling
+        )
+
+        do {
+            try await runner.run { _ in }
+            XCTFail("Expected the deterministic post-run-start stop")
+        } catch PipelinePublicationGenerationTestStop.afterDurableRunStart {
+            // Expected: the probe stops before any stage or publication work.
+        } catch {
+            XCTFail("Unexpected run error: \(error)")
+        }
+
+        XCTAssertEqual(probe.generationCallCount, 0)
+        XCTAssertEqual(probe.observedDurablePublicationIDs, [pendingPublicationID])
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: paths.metadataURL).pendingPublicationID,
+            pendingPublicationID,
+            "Resume must preserve the generation needed to adopt an interrupted publication."
+        )
+        XCTAssertTrue(subprocess.calls.isEmpty)
+    }
+
     func testPairGraphRecoveryRecognizesRecoverableGeometryFailures() {
         XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(
             after: PipelineRunner.PipelineError.outputMissing
@@ -742,6 +870,82 @@ final class PipelineRunnerRetryTests: XCTestCase {
             ),
             .corrupt
         )
+    }
+
+    func testCompletedTrainingArtifactValidatesPlyExactlyOnceBeforeRejectingStaleDerivation() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let trainingArtifact = makeTrainingArtifact(
+            outputPath: "Training/msplat/splat.ply"
+        )
+        try writeCompletedTrainingArtifact(trainingArtifact, paths: paths)
+        let metadata = ProjectMetadata(
+            title: "Stale training",
+            input: .photos(folder: "/tmp/Photos"),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .highDetail)
+        )
+        let validations = PipelineValidationCounter()
+        var tooling = PipelineRunner.Tooling()
+        tooling.completedTrainingOutputEvidence = { url in
+            validations.record(url.lastPathComponent)
+            return try ProjectArtifactValidator.validatedPlyEvidence(at: url)
+        }
+
+        XCTAssertEqual(
+            try makeRunner(
+                projectURL: root,
+                tooling: tooling
+            ).test_validateStageOutput(
+                .trainSplat,
+                paths: paths,
+                metadata: metadata
+            ),
+            .corrupt,
+            "The independent current-geometry/derivation check must still fail closed."
+        )
+        XCTAssertEqual(validations.labels, ["splat.ply"])
+    }
+
+    func testCompletedTrainingArtifactRejectsMismatchedSinglePlyEvidenceBeforeDerivation() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let trainingArtifact = makeTrainingArtifact(
+            outputPath: "Training/msplat/splat.ply"
+        )
+        try writeCompletedTrainingArtifact(trainingArtifact, paths: paths)
+        let metadata = ProjectMetadata(
+            title: "Mismatched evidence",
+            input: .photos(folder: "/tmp/Photos"),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .highDetail)
+        )
+        let validations = PipelineValidationCounter()
+        var tooling = PipelineRunner.Tooling()
+        tooling.completedTrainingOutputEvidence = { url in
+            validations.record(url.lastPathComponent)
+            let evidence = try ProjectArtifactValidator.validatedPlyEvidence(at: url)
+            return ValidatedPlyArtifactEvidence(
+                byteCount: evidence.byteCount,
+                vertexCount: evidence.vertexCount,
+                format: evidence.format,
+                sha256: String(repeating: "0", count: 64),
+                sceneBounds: evidence.sceneBounds
+            )
+        }
+        let runner = makeRunner(projectURL: root, tooling: tooling)
+
+        XCTAssertEqual(
+            try runner.validateStageOutput(
+                .trainSplat,
+                paths: paths,
+                metadata: metadata
+            ),
+            .corrupt(reason: TrainingArtifactStoreError.invalidManifest.localizedDescription)
+        )
+        XCTAssertEqual(validations.labels, ["splat.ply"])
     }
 
     func testValidateStageOutputDetectsCorruptDatabase() throws {
@@ -1795,7 +1999,10 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(persisted.state.stage, .sfmFeatures)
         XCTAssertNil(persisted.state.lastError)
         XCTAssertNil(persisted.checkpoint)
-        XCTAssertNil(persisted.lastRunStartedAt)
+        XCTAssertNotNil(
+            persisted.lastRunStartedAt,
+            "A plan change occurs inside the active attempt; its run-start marker must remain durable."
+        )
         XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 0)
         XCTAssertEqual(try databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL), 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: sparseSentinel.path))
@@ -2269,6 +2476,41 @@ final class PipelineRunnerRetryTests: XCTestCase {
         )
     }
 
+    private func writeFinalCompletionPersistenceFailureState(
+        paths: ProjectPaths,
+        pendingPublicationID: UUID
+    ) throws -> (hardware: HardwareProfile, plan: ResolvedRunPlan) {
+        let options = RequestedRunOptions(inputOrdering: .unordered)
+        let photoFixture = try writeControlledPhotoInputFixture(paths: paths)
+        let hardware = HardwareProfile(
+            memoryGB: 48,
+            cpuCount: 16,
+            gpuWorkingSetGB: 36
+        )
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: photoFixture.input,
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        var metadata = ProjectMetadata(
+            title: "Failed final completion",
+            input: photoFixture.input,
+            photoInputReceipts: photoFixture.receipts,
+            photoSelectionReceipt: photoFixture.selectionReceipt,
+            requestedRunOptions: options,
+            resolvedRunPlan: plan,
+            state: PipelineState(
+                stage: .done,
+                lastError: "Project state wasn't saved."
+            ),
+            lastFailureAt: Date(timeIntervalSince1970: 100)
+        )
+        metadata.pendingPublicationID = pendingPublicationID
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        return (hardware, plan)
+    }
+
     private func writeCurrentSelectedVideoFixture(
         paths: ProjectPaths,
         selectedFrameCount: Int = RunPlanResolver.minimumReconstructionImageCount
@@ -2561,10 +2803,70 @@ final class PipelineRunnerRetryTests: XCTestCase {
         )
     }
 
-    private func makeRunner(projectURL: URL) -> PipelineRunner {
+    private func makeRunner(
+        projectURL: URL,
+        tooling: PipelineRunner.Tooling = PipelineRunner.Tooling()
+    ) -> PipelineRunner {
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
-        return PipelineRunner(projectURL: projectURL, config: config)
+        return PipelineRunner(
+            projectURL: projectURL,
+            config: config,
+            tooling: tooling
+        )
     }
 
+}
+
+private final class PipelineValidationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var labels: [String] {
+        lock.withLock { storage }
+    }
+
+    func record(_ label: String) {
+        lock.withLock { storage.append(label) }
+    }
+}
+
+private enum PipelinePublicationGenerationTestStop: Error {
+    case afterDurableRunStart
+}
+
+private final class PipelinePublicationGenerationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let generatedPublicationID: UUID
+    private var storedGenerationCallCount = 0
+    private var storedDurablePublicationIDs: [UUID?] = []
+
+    init(generatedPublicationID: UUID) {
+        self.generatedPublicationID = generatedPublicationID
+    }
+
+    var generationCallCount: Int {
+        lock.withLock { storedGenerationCallCount }
+    }
+
+    var observedDurablePublicationIDs: [UUID?] {
+        lock.withLock { storedDurablePublicationIDs }
+    }
+
+    func makePublicationID() -> UUID {
+        lock.withLock {
+            storedGenerationCallCount += 1
+            return generatedPublicationID
+        }
+    }
+
+    func stopAfterObservingDurableRunStart(
+        paths: ProjectPaths
+    ) throws -> RuntimeInputSnapshotLease {
+        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        lock.withLock {
+            storedDurablePublicationIDs.append(persisted.pendingPublicationID)
+        }
+        throw PipelinePublicationGenerationTestStop.afterDurableRunStart
+    }
 }

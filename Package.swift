@@ -39,9 +39,7 @@ let package = Package(
             path: "EasySplatApp",
             exclude: ["AGENTS.md", "Resources/EasySplatAppIcon.icns"],
             resources: [
-                .copy("Resources/project_home_url.txt"),
-                .copy("Resources/public_key_ed25519.txt"),
-                .copy("Resources/toolchain_manifest_url.txt")
+                .copy("Resources/project_home_url.txt")
             ]
         ),
         .executableTarget(

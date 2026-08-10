@@ -10,6 +10,10 @@ public struct ProjectMetadata: Codable, Sendable {
     public var videoInputReceipts: [VideoInputReceipt]?
     public var photoInputReceipts: [PhotoInputReceipt]?
     public var photoSelectionReceipt: PhotoSelectionReceipt?
+    /// Present exactly when `input` is a dataset: binds the imported pose
+    /// seed, its source geometry files, and the entry-to-adopted-image
+    /// mapping. Introduced in project format 32.
+    public var datasetPoseSeed: DatasetPoseSeedReceipt?
     public var requestedRunOptions: RequestedRunOptions
     public var resolvedRunPlan: ResolvedRunPlan?
     public var trainingMemoryRetryBudgetBytes: Int64?
@@ -18,6 +22,11 @@ public struct ProjectMetadata: Codable, Sendable {
     public var state: PipelineState
     public var checkpoint: PipelineCheckpoint?
     public var lastRunStartedAt: Date?
+    /// Durable identity allocated at the required run-start boundary and used
+    /// by receipt-last publication. It survives failed/interrupted attempts so
+    /// a committed pair can be adopted exactly once after relaunch.
+    /// Introduced in project format 33.
+    public var pendingPublicationID: UUID?
     public var stageTimings: [StageTimingRecord]?
     /// Monotonic elapsed time from the user's Create action until the first
     /// rendered preview for that run. This is an end-to-end boundary, not a
@@ -35,6 +44,7 @@ public struct ProjectMetadata: Codable, Sendable {
         case videoInputReceipts
         case photoInputReceipts
         case photoSelectionReceipt
+        case datasetPoseSeed
         case requestedRunOptions
         case resolvedRunPlan
         case trainingMemoryRetryBudgetBytes
@@ -43,6 +53,7 @@ public struct ProjectMetadata: Codable, Sendable {
         case state
         case checkpoint
         case lastRunStartedAt
+        case pendingPublicationID
         case stageTimings
         case createToViewerReadySeconds
         case notes
@@ -58,6 +69,7 @@ public struct ProjectMetadata: Codable, Sendable {
         videoInputReceipts: [VideoInputReceipt]? = nil,
         photoInputReceipts: [PhotoInputReceipt]? = nil,
         photoSelectionReceipt: PhotoSelectionReceipt? = nil,
+        datasetPoseSeed: DatasetPoseSeedReceipt? = nil,
         requestedRunOptions: RequestedRunOptions = RequestedRunOptions(),
         resolvedRunPlan: ResolvedRunPlan? = nil,
         trainingMemoryRetryBudgetBytes: Int64? = nil,
@@ -66,6 +78,7 @@ public struct ProjectMetadata: Codable, Sendable {
         state: PipelineState = PipelineState(stage: .importInput, lastError: nil),
         checkpoint: PipelineCheckpoint? = nil,
         lastRunStartedAt: Date? = nil,
+        pendingPublicationID: UUID? = nil,
         stageTimings: [StageTimingRecord]? = nil,
         createToViewerReadySeconds: Double? = nil,
         notes: String? = nil,
@@ -79,6 +92,7 @@ public struct ProjectMetadata: Codable, Sendable {
         self.videoInputReceipts = videoInputReceipts
         self.photoInputReceipts = photoInputReceipts
         self.photoSelectionReceipt = photoSelectionReceipt
+        self.datasetPoseSeed = datasetPoseSeed
         self.requestedRunOptions = requestedRunOptions
         self.resolvedRunPlan = resolvedRunPlan
         self.trainingMemoryRetryBudgetBytes = trainingMemoryRetryBudgetBytes
@@ -87,6 +101,7 @@ public struct ProjectMetadata: Codable, Sendable {
         self.state = state
         self.checkpoint = checkpoint
         self.lastRunStartedAt = lastRunStartedAt
+        self.pendingPublicationID = pendingPublicationID
         self.stageTimings = stageTimings
         self.createToViewerReadySeconds = createToViewerReadySeconds
         self.notes = notes
@@ -644,12 +659,18 @@ public enum InputSpec: Codable, Sendable {
     case video(files: [String])
     case photos(folder: String)
     case mixed(videos: [String], photosFolder: String)
+    /// A pre-processed dataset import. `imagesFolder` is surfaced through
+    /// `photosFolder` deliberately: dataset images ride the photo admission,
+    /// receipt, and frame-selection machinery unchanged, and only the sites
+    /// that must diverge branch on `isDataset`. Introduced in project
+    /// format 32.
+    case dataset(kind: DatasetKind, imagesFolder: String)
 
     public var videoFiles: [String] {
         switch self {
         case .video(let files):
             return files
-        case .photos:
+        case .photos, .dataset:
             return []
         case .mixed(let videos, _):
             return videos
@@ -664,11 +685,23 @@ public enum InputSpec: Codable, Sendable {
             return folder
         case .mixed(_, let photosFolder):
             return photosFolder
+        case .dataset(_, let imagesFolder):
+            return imagesFolder
         }
     }
 
     public var hasVideos: Bool { !videoFiles.isEmpty }
     public var hasPhotos: Bool { photosFolder != nil }
+
+    public var isDataset: Bool {
+        if case .dataset = self { return true }
+        return false
+    }
+
+    public var datasetKind: DatasetKind? {
+        if case .dataset(let kind, _) = self { return kind }
+        return nil
+    }
 }
 
 /// Persisted pipeline state used for status, retry, and resume handling.

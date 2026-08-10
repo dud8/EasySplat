@@ -1885,10 +1885,40 @@ PY
 validate_metadata() {
   local root="$1"
   "$PYTHON_BIN" - "$root" "$NORMALIZED_MTIME_EPOCH" <<'PY'
+import ctypes
 import os
 import stat
 import sys
 from pathlib import Path
+
+_libc = ctypes.CDLL(None, use_errno=True)
+_listxattr = _libc.listxattr
+_listxattr.argtypes = (ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+_listxattr.restype = ctypes.c_ssize_t
+_XATTR_NOFOLLOW = 0x0001
+
+
+def xattr_names(path: Path) -> set[str]:
+    encoded = os.fsencode(path)
+    ctypes.set_errno(0)
+    size = _listxattr(encoded, None, 0, _XATTR_NOFOLLOW)
+    if size < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    if size == 0:
+        return set()
+    buffer = ctypes.create_string_buffer(size)
+    ctypes.set_errno(0)
+    actual = _listxattr(encoded, buffer, size, _XATTR_NOFOLLOW)
+    if actual < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), path)
+    return {
+        os.fsdecode(name)
+        for name in bytes(buffer.raw[:actual]).split(b"\0")
+        if name
+    }
+
 
 root = Path(sys.argv[1])
 epoch = int(sys.argv[2])
@@ -1906,10 +1936,13 @@ for path in [root, *sorted(root.rglob("*"))]:
         raise SystemExit(f"noncanonical install ownership: {path}")
     if metadata.st_mtime_ns != epoch * 1_000_000_000:
         raise SystemExit(f"noncanonical install modification time: {path}")
+
+ALLOWED_XATTRS = {"com.apple.provenance"}
+for path in [root, *sorted(root.rglob("*"))]:
+    unexpected = xattr_names(path) - ALLOWED_XATTRS
+    if unexpected:
+        raise SystemExit("extended attributes survived OpenImageIO normalization")
 PY
-  if "$XATTR_BIN" -l -r "$root" 2>/dev/null | /usr/bin/grep -q .; then
-    die "extended attributes survived OpenImageIO normalization"
-  fi
 }
 
 write_receipt() {

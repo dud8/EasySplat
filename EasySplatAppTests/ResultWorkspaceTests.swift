@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import MetalKit
 import MetalSplatter
+import simd
 import XCTest
 @testable import EasySplatApp
 @testable import EasySplatCore
@@ -149,6 +150,32 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertEqual(
             planner.nextDecision(now: Date()),
             .start(request: retry, forceReload: true)
+        )
+    }
+
+    func testContinuousInteractionDefersViewerLoadsUntilReleasedPlusIdleDelay() {
+        let url = URL(fileURLWithPath: "/tmp/result.ply")
+        let request = PreviewLoadRequest(url: url, reloadToken: 0)
+        var planner = PreviewReloadPlanner()
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+
+        planner.setContinuousInteraction(true, now: start)
+        planner.request(request)
+        XCTAssertEqual(
+            planner.nextDecision(now: start.addingTimeInterval(10)),
+            .deferLoad(PreviewReloadPlanner.interactionIdleDelay)
+        )
+
+        planner.setContinuousInteraction(false, now: start.addingTimeInterval(12))
+        XCTAssertEqual(
+            planner.nextDecision(now: start.addingTimeInterval(12.5)),
+            .deferLoad(PreviewReloadPlanner.interactionIdleDelay - 0.5)
+        )
+        XCTAssertEqual(
+            planner.nextDecision(
+                now: start.addingTimeInterval(12 + PreviewReloadPlanner.interactionIdleDelay + 0.1)
+            ),
+            .start(request: request, forceReload: false)
         )
     }
 
@@ -321,6 +348,47 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertNil(ViewerKeyboardCommand.resolve(keyCode: 49, characters: " ", modifiers: []))
     }
 
+    func testViewerMovementKeysMapPhysicalPositionsWithoutHijackingSystemShortcuts() {
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 13), .forward)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 1), .backward)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 0), .strafeLeft)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 2), .strafeRight)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 14), .up)
+        XCTAssertEqual(ViewerKeyboardCommand.resolveMovementKey(keyCode: 12), .down)
+        XCTAssertNil(ViewerKeyboardCommand.resolveMovementKey(keyCode: 3))
+        XCTAssertNil(ViewerKeyboardCommand.resolveMovementKey(keyCode: 126))
+
+        XCTAssertFalse(ViewerKeyboardModifiers([]).blocksMovement)
+        XCTAssertFalse(ViewerKeyboardModifiers([.shift]).blocksMovement)
+        XCTAssertTrue(ViewerKeyboardModifiers([.command]).blocksMovement)
+        XCTAssertTrue(ViewerKeyboardModifiers([.control]).blocksMovement)
+        XCTAssertTrue(ViewerKeyboardModifiers([.option]).blocksMovement)
+    }
+
+    func testFlightAxisVectorSumsHeldKeysAndCancelsOpposedPairs() {
+        XCTAssertEqual(Set<ViewerMovementKey>().flightAxisVector, SIMD3<Float>.zero)
+        XCTAssertEqual(
+            Set<ViewerMovementKey>([.forward, .backward]).flightAxisVector,
+            SIMD3<Float>.zero
+        )
+        XCTAssertEqual(
+            Set<ViewerMovementKey>([.forward, .strafeRight, .up]).flightAxisVector,
+            SIMD3<Float>(1, 1, 1)
+        )
+    }
+
+    func testViewerPointerCommandRoutesButtonsAndModifiersToDragModes() {
+        XCTAssertEqual(ViewerPointerCommand.dragMode(forPrimaryButtonWith: []), .orbit)
+        XCTAssertEqual(ViewerPointerCommand.dragMode(forPrimaryButtonWith: [.option]), .pan)
+        XCTAssertEqual(ViewerPointerCommand.dragMode(forPrimaryButtonWith: [.control]), .freeLook)
+        XCTAssertEqual(
+            ViewerPointerCommand.dragMode(forPrimaryButtonWith: [.control, .option]),
+            .freeLook
+        )
+        XCTAssertEqual(ViewerPointerCommand.secondaryButtonDragMode, .freeLook)
+        XCTAssertEqual(ViewerPointerCommand.middleButtonDragMode, .pan)
+    }
+
     @MainActor
     func testApplyingNewBoundsClearsPriorPan() throws {
         let device = try requireMetalDevice()
@@ -454,6 +522,154 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    func testIntegrateFlightMovesAlongTheViewDirectionScaledBySceneRadiusAndTime() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        let start = renderer.cameraState
+        renderer.setMovementInput([.forward], isSprinting: false)
+
+        renderer.integrateFlight(now: 10)
+        XCTAssertEqual(renderer.cameraState.target, start.target)
+
+        renderer.integrateFlight(now: 10.08)
+        let expected = start.target
+            + start.forwardDirection * (5 * Constants.flightSpeedPerSecond * 0.08)
+        XCTAssertLessThan(simd_distance(renderer.cameraState.target, expected), 1e-3)
+        renderer.setMovementInput([], isSprinting: false)
+    }
+
+    @MainActor
+    func testIntegrateFlightAppliesTheSprintMultiplierAlongWorldUp() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        renderer.orbit(deltaX: 0, deltaY: 100)
+        let start = renderer.cameraState
+        renderer.setMovementInput([.up], isSprinting: true)
+
+        renderer.integrateFlight(now: 0)
+        renderer.integrateFlight(now: 0.1)
+
+        let climb = 5 * Constants.flightSpeedPerSecond * Constants.flightSprintMultiplier * 0.1
+        let expected = start.target + SIMD3<Float>(0, climb, 0)
+        XCTAssertLessThan(simd_distance(renderer.cameraState.target, expected), 1e-3)
+        renderer.setMovementInput([], isSprinting: false)
+    }
+
+    @MainActor
+    func testIntegrateFlightClampsLargeFrameGapsToAvoidTeleporting() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        let start = renderer.cameraState
+        renderer.setMovementInput([.forward], isSprinting: false)
+
+        renderer.integrateFlight(now: 0)
+        renderer.integrateFlight(now: 60)
+
+        let moved = simd_distance(renderer.cameraState.target, start.target)
+        XCTAssertEqual(moved, 5 * Constants.flightSpeedPerSecond * 0.1, accuracy: 1e-3)
+        renderer.setMovementInput([], isSprinting: false)
+    }
+
+    @MainActor
+    func testIntegrateFlightKeepsNearCancellingInputsSlowInsteadOfNormalizing() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        renderer.orbit(deltaX: 0, deltaY: 2_000)
+        let start = renderer.cameraState
+        XCTAssertGreaterThan(start.pitch, 1.5)
+        renderer.setMovementInput([.forward, .down], isSprinting: false)
+
+        renderer.integrateFlight(now: 0)
+        renderer.integrateFlight(now: 1)
+
+        let moved = simd_distance(renderer.cameraState.target, start.target)
+        XCTAssertGreaterThan(moved, 0)
+        XCTAssertLessThan(moved, 0.05)
+        renderer.setMovementInput([], isSprinting: false)
+    }
+
+    @MainActor
+    func testMovementInputTogglesContinuousRenderingOnlyOnActivationEdges() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+        XCTAssertEqual(view.preferredFramesPerSecond, Constants.idleFramesPerSecond)
+
+        renderer.setMovementInput([.forward], isSprinting: false)
+        XCTAssertFalse(view.isPaused)
+        XCTAssertFalse(view.enableSetNeedsDisplay)
+        XCTAssertEqual(view.preferredFramesPerSecond, Constants.flightFramesPerSecond)
+
+        renderer.setMovementInput([.forward, .strafeLeft], isSprinting: true)
+        XCTAssertFalse(view.isPaused)
+        XCTAssertFalse(view.enableSetNeedsDisplay)
+
+        renderer.setMovementInput([], isSprinting: false)
+        XCTAssertTrue(view.isPaused)
+        XCTAssertTrue(view.enableSetNeedsDisplay)
+        XCTAssertEqual(view.preferredFramesPerSecond, Constants.idleFramesPerSecond)
+    }
+
+    @MainActor
+    func testFlightSuppressesExplicitDrawsAndSettlesWithOneFinalFrame() throws {
+        let device = try requireMetalDevice()
+        let view = DrawRecordingMTKView(frame: .zero, device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        var draws = 0
+        view.onDraw = { draws += 1 }
+
+        renderer.orbit(deltaX: 4, deltaY: 2)
+        XCTAssertEqual(draws, 1)
+
+        renderer.setMovementInput([.forward], isSprinting: false)
+        renderer.orbit(deltaX: 4, deltaY: 2)
+        XCTAssertEqual(draws, 1)
+
+        renderer.setMovementInput([], isSprinting: false)
+        XCTAssertEqual(draws, 2)
+    }
+
+    @MainActor
+    func testRendererFreeLookRotatesInPlaceWithTheSameSensitivityAsOrbit() throws {
+        let device = try requireMetalDevice()
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: SIMD3<Float>(1, 2, 3), radius: 5)
+        let start = renderer.cameraState
+
+        renderer.freeLook(deltaX: 40, deltaY: -24)
+
+        XCTAssertEqual(
+            renderer.cameraState.yaw,
+            start.yaw + 40 * Constants.orbitSpeed,
+            accuracy: 1e-5
+        )
+        XCTAssertEqual(
+            renderer.cameraState.pitch,
+            start.pitch - 24 * Constants.orbitSpeed,
+            accuracy: 1e-5
+        )
+        XCTAssertLessThan(
+            simd_distance(renderer.cameraState.cameraPosition, start.cameraPosition),
+            1e-3
+        )
+        XCTAssertGreaterThan(
+            simd_distance(renderer.cameraState.target, start.target),
+            0
+        )
+    }
+
+    @MainActor
     func testFailedReplacementPreservesRenderedSceneAndCamera() async throws {
         let device = try requireMetalDevice()
         let view = MTKView(
@@ -520,7 +736,9 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertEqual(view.accessibilityValue() as? String, "Loading")
         XCTAssertEqual(
             view.accessibilityHelp(),
-            "Drag to orbit. Option-drag pans. Scroll or pinch zooms. Press F to fit or R to reset."
+            "Drag to orbit. Right-drag or Control-drag looks around. Option-drag pans. "
+                + "Scroll or pinch zooms. Hold W, A, S, D to fly, E and Q to fly up and down, "
+                + "and Shift to sprint. Press F to fit or R to reset."
         )
         XCTAssertTrue((view.accessibilityChildren() ?? []).isEmpty)
     }
@@ -594,6 +812,145 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    func testInteractiveViewerAggregatesHeldMovementKeysAndIgnoresAutoRepeats() throws {
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        var reported: [Set<ViewerMovementKey>] = []
+        viewer.onMovementInputChanged = { keys, _ in reported.append(keys) }
+
+        viewer.keyDown(with: try keyEvent(keyCode: 13))
+        viewer.keyDown(with: try keyEvent(keyCode: 13, isARepeat: true))
+        viewer.keyDown(with: try keyEvent(keyCode: 2))
+        viewer.keyUp(with: try keyEvent(keyCode: 13, type: .keyUp))
+        viewer.keyUp(with: try keyEvent(keyCode: 2, type: .keyUp))
+
+        XCTAssertEqual(reported, [
+            [.forward],
+            [.forward, .strafeRight],
+            [.strafeRight],
+            [],
+        ])
+    }
+
+    @MainActor
+    func testInteractiveViewerBlocksModifiedMovementKeysButAlwaysHonorsReleases() throws {
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        var reported: [Set<ViewerMovementKey>] = []
+        viewer.onMovementInputChanged = { keys, _ in reported.append(keys) }
+
+        viewer.keyDown(with: try keyEvent(keyCode: 13, modifiers: [.command]))
+        viewer.keyDown(with: try keyEvent(keyCode: 13, modifiers: [.option]))
+        XCTAssertTrue(reported.isEmpty)
+
+        viewer.keyDown(with: try keyEvent(keyCode: 13))
+        viewer.keyUp(with: try keyEvent(keyCode: 13, modifiers: [.command], type: .keyUp))
+        XCTAssertEqual(reported, [[.forward], []])
+    }
+
+    @MainActor
+    func testInteractiveViewerTracksSprintThroughShiftFlagsChanges() throws {
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        var reported: [(keys: Set<ViewerMovementKey>, isSprinting: Bool)] = []
+        viewer.onMovementInputChanged = { reported.append(($0, $1)) }
+
+        viewer.keyDown(with: try keyEvent(keyCode: 13))
+        viewer.flagsChanged(
+            with: try keyEvent(keyCode: 56, modifiers: [.shift], type: .flagsChanged)
+        )
+        viewer.flagsChanged(with: try keyEvent(keyCode: 56, type: .flagsChanged))
+        viewer.keyUp(with: try keyEvent(keyCode: 13, type: .keyUp))
+
+        XCTAssertEqual(reported.map(\.isSprinting), [false, true, false, false])
+        XCTAssertEqual(reported[1].keys, [.forward])
+    }
+
+    @MainActor
+    func testInteractiveViewerClearsHeldMovementKeysWhenFocusOrKeyWindowIsLost() throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let content = try XCTUnwrap(window.contentView)
+        let other = ViewerFocusTestView(frame: .zero)
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        content.addSubview(viewer)
+        content.addSubview(other)
+        var reported: [Set<ViewerMovementKey>] = []
+        viewer.onMovementInputChanged = { keys, _ in reported.append(keys) }
+
+        XCTAssertTrue(window.makeFirstResponder(viewer))
+        viewer.keyDown(with: try keyEvent(keyCode: 13))
+        XCTAssertEqual(reported.last, [.forward])
+
+        XCTAssertTrue(window.makeFirstResponder(other))
+        XCTAssertEqual(reported.last, [])
+
+        XCTAssertTrue(window.makeFirstResponder(viewer))
+        viewer.keyDown(with: try keyEvent(keyCode: 1))
+        XCTAssertEqual(reported.last, [.backward])
+
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+        XCTAssertEqual(reported.last, [])
+    }
+
+    @MainActor
+    func testInteractiveViewerRoutesSecondaryControlAndMiddleDragsDistinctly() throws {
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 600, height: 400),
+            device: nil
+        )
+        var orbits = 0
+        var looks = 0
+        var pans = 0
+        viewer.onOrbit = { _, _ in orbits += 1 }
+        viewer.onFreeLook = { _, _ in looks += 1 }
+        viewer.onPan = { _, _ in pans += 1 }
+
+        viewer.mouseDown(with: try mouseEvent(.leftMouseDown, at: NSPoint(x: 10, y: 10)))
+        viewer.mouseDragged(with: try mouseEvent(.leftMouseDragged, at: NSPoint(x: 20, y: 14)))
+        XCTAssertEqual(orbits, 1)
+
+        viewer.rightMouseDown(with: try mouseEvent(.rightMouseDown, at: NSPoint(x: 10, y: 10)))
+        viewer.rightMouseDragged(
+            with: try mouseEvent(.rightMouseDragged, at: NSPoint(x: 30, y: 24))
+        )
+        XCTAssertEqual(looks, 1)
+
+        viewer.mouseDown(
+            with: try mouseEvent(.leftMouseDown, at: .zero, modifiers: [.control])
+        )
+        viewer.mouseDragged(with: try mouseEvent(.leftMouseDragged, at: NSPoint(x: 6, y: 3)))
+        XCTAssertEqual(looks, 2)
+
+        viewer.mouseDown(
+            with: try mouseEvent(.leftMouseDown, at: .zero, modifiers: [.option])
+        )
+        viewer.mouseDragged(with: try mouseEvent(.leftMouseDragged, at: NSPoint(x: 6, y: 3)))
+        XCTAssertEqual(pans, 1)
+
+        viewer.otherMouseDown(with: try middleMouseEvent(.otherMouseDown, at: .zero))
+        viewer.otherMouseDragged(
+            with: try middleMouseEvent(.otherMouseDragged, at: CGPoint(x: 5, y: 5))
+        )
+        XCTAssertEqual(pans, 2)
+        XCTAssertEqual(orbits, 1)
+        XCTAssertEqual(looks, 2)
+    }
+
+    @MainActor
     func testDismantlingViewerClearsCallbacksAndReleasesRendererOwnership() throws {
         let device = try requireMetalDevice()
         weak var weakView: InteractiveMTKView?
@@ -626,7 +983,9 @@ final class ResultWorkspaceTests: XCTestCase {
             XCTAssertNil(view?.onScrollZoom)
             XCTAssertNil(view?.onMagnify)
             XCTAssertNil(view?.onPan)
+            XCTAssertNil(view?.onFreeLook)
             XCTAssertNil(view?.onKeyboardCommand)
+            XCTAssertNil(view?.onMovementInputChanged)
             XCTAssertNil(view?.onInteractionActivity)
             XCTAssertNil(view?.delegate)
             XCTAssertNil(coordinator.renderer)
@@ -713,7 +1072,7 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
-    func testCancellingShareKeepsValidatedSnapshotReadyForAnotherAttempt() async throws {
+    func testNilPickerSelectionCancelsAndRemovesPreparedSnapshotImmediately() async throws {
         let base = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: base) }
         let projectURL = try makeFinishedProject(
@@ -725,7 +1084,6 @@ final class ResultWorkspaceTests: XCTestCase {
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base
         )
-        defer { model.cancelSharing() }
         model.currentProjectURL = projectURL
         model.outputPlyURL = ProjectPaths(root: projectURL).outputURL
             .appendingPathComponent("splat.ply")
@@ -748,13 +1106,481 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertFalse(model.isShareSheetActive)
         XCTAssertNil(model.shareStatusMessage)
         XCTAssertFalse(model.shareStatusIsError)
-        XCTAssertTrue(model.isShareReady)
-        XCTAssertEqual(model.test_preparedShareItem(), preparedBefore)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: preparedBefore.shareURL.path))
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: preparedBefore.shareDirectoryURL.path)
+        )
     }
 
     @MainActor
-    func testTwoConsecutiveShareCancelsReuseOneValidatedSnapshot() async throws {
+    func testPickerCloseQueuesPassiveCancellationUntilTheNextMainActorTurn() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        defer { model.cancelSharing() }
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputURL
+            .appendingPathComponent("splat.ply")
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        var presentedPicker: NSSharingServicePicker?
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { picker, _, _, _ in presentedPicker = picker }
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+
+        let dismissalClock = ContinuousClock()
+        let dismissalStarted = dismissalClock.now
+        try XCTUnwrap(presentedPicker).close()
+
+        XCTAssertTrue(model.activeShareSession === session)
+        XCTAssertTrue(model.isShareSheetActive)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.shareDirectoryURL.path))
+        try ReleaseReliabilityFixtureSupport.recordRequiredTimingCheck(
+            workload: "passive-share-cleanup-under-one-second",
+            elapsed: dismissalStarted.duration(to: dismissalClock.now)
+        )
+    }
+
+    @MainActor
+    func testLocalMouseDownQueuesCancellationWithoutConsumingTheEvent() async throws {
+        let center = NotificationCenter()
+        let observation = ShareDismissalObservation(
+            notificationCenter: center,
+            application: NSObject()
+        )
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let session = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [URL(fileURLWithPath: "/tmp/share.ply")], from: NSButton())
+        let event = try mouseEvent(.leftMouseDown, at: .zero)
+
+        let returned = observation.handleLocalEvent(event)
+
+        XCTAssertTrue(returned === event)
+        XCTAssertTrue(model.activeShareSession === session)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertFalse(model.isShareSheetActive)
+    }
+
+    @MainActor
+    func testEscapeQueuesCancellationButOtherKeysDoNot() async throws {
+        let observation = ShareDismissalObservation(
+            notificationCenter: NotificationCenter(),
+            application: NSObject()
+        )
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let session = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [URL(fileURLWithPath: "/tmp/share.ply")], from: NSButton())
+
+        _ = observation.handleLocalEvent(try keyEvent(keyCode: 0))
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(model.activeShareSession === session)
+
+        let escape = try keyEvent(keyCode: 53)
+        XCTAssertTrue(observation.handleLocalEvent(escape) === escape)
+        XCTAssertTrue(model.activeShareSession === session)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+    }
+
+    @MainActor
+    func testQueuedDismissalLosesToSelectionAndLateSignalsCannotCancelInFlight() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputSplatURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        let observation = RetainingShareDismissalObservation()
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+        let service = NSSharingService(
+            title: "Selected",
+            image: NSImage(size: NSSize(width: 16, height: 16)),
+            alternateImage: nil,
+            handler: {}
+        )
+
+        observation.emit(at: 0)
+        session.sharingServicePicker(
+            NSSharingServicePicker(items: [prepared.shareURL]),
+            didChoose: service
+        )
+
+        XCTAssertEqual(observation.stopCount, 1)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertEqual(model.test_inFlightShareSessionCount(), 1)
+        observation.emit(at: 0)
+        await Task.yield()
+        await Task.yield()
+        XCTAssertEqual(model.test_inFlightShareSessionCount(), 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prepared.shareURL.path))
+
+        session.sharingService(service, didShareItems: [prepared.shareURL])
+        XCTAssertEqual(model.test_inFlightShareSessionCount(), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.shareDirectoryURL.path))
+    }
+
+    @MainActor
+    func testDuplicateDismissalSignalsAttemptSnapshotCleanupOnlyOnceEvenWhenRefused() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputSplatURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        defer {
+            ShareSnapshotStorage.remove(
+                prepared.shareDirectory,
+                expectedFileLeaf: prepared.shareURL.lastPathComponent
+            )
+        }
+        let observation = RetainingShareDismissalObservation()
+        var removalCount = 0
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { _, _, _, _ in },
+            snapshotRemover: { _ in
+                removalCount += 1
+                return .refused
+            },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+
+        observation.emit(at: 0)
+        observation.emit(at: 0)
+        await waitForShareSessionToClear(model)
+        observation.emit(at: 0)
+        await Task.yield()
+
+        XCTAssertEqual(removalCount, 1)
+        XCTAssertEqual(observation.stopCount, 1)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.shareStatusMessage)
+        XCTAssertFalse(model.shareStatusIsError)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prepared.shareURL.path))
+    }
+
+    @MainActor
+    func testStaleDismissalGenerationCannotCancelANewerSession() async {
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let observation = RetainingShareDismissalObservation()
+        let older = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = older
+        model.isShareSheetActive = true
+        older.present(items: [URL(fileURLWithPath: "/tmp/older.ply")], from: NSButton())
+        model.cancelSharing()
+
+        let newer = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = newer
+        model.isShareSheetActive = true
+        newer.present(items: [URL(fileURLWithPath: "/tmp/newer.ply")], from: NSButton())
+
+        observation.emit(at: 0)
+        await Task.yield()
+        await Task.yield()
+
+        XCTAssertTrue(model.activeShareSession === newer)
+        XCTAssertTrue(model.isShareSheetActive)
+        model.cancelSharing()
+    }
+
+    @MainActor
+    func testAppAndWindowResignOnlyArmDismissalUntilTheirMatchingReturn() async throws {
+        let center = NotificationCenter()
+        let application = NSObject()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let anchor = NSButton()
+        try XCTUnwrap(window.contentView).addSubview(anchor)
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+
+        let appObservation = ShareDismissalObservation(
+            notificationCenter: center,
+            application: application
+        )
+        let appSession = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: appObservation
+        )
+        model.activeShareSession = appSession
+        model.isShareSheetActive = true
+        appSession.present(items: [URL(fileURLWithPath: "/tmp/app.ply")], from: anchor)
+
+        center.post(name: NSApplication.didResignActiveNotification, object: application)
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(model.activeShareSession === appSession)
+        center.post(name: NSApplication.didBecomeActiveNotification, object: application)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+
+        let windowObservation = ShareDismissalObservation(
+            notificationCenter: center,
+            application: application
+        )
+        let windowSession = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: windowObservation
+        )
+        model.activeShareSession = windowSession
+        model.isShareSheetActive = true
+        windowSession.present(items: [URL(fileURLWithPath: "/tmp/window.ply")], from: anchor)
+
+        center.post(name: NSWindow.didResignKeyNotification, object: window)
+        await Task.yield()
+        await Task.yield()
+        XCTAssertTrue(model.activeShareSession === windowSession)
+        center.post(name: NSWindow.didBecomeKeyNotification, object: window)
+        await waitForShareSessionToClear(model)
+        XCTAssertNil(model.activeShareSession)
+    }
+
+    @MainActor
+    func testAnchorWindowCloseAndMinimizeDismissAwaitingPicker() async throws {
+        for notificationName in [
+            NSWindow.willCloseNotification,
+            NSWindow.didMiniaturizeNotification,
+        ] {
+            let center = NotificationCenter()
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            let anchor = NSButton()
+            try XCTUnwrap(window.contentView).addSubview(anchor)
+            let model = AppModel(toolchainManager: ResultTestToolchainManager())
+            let observation = ShareDismissalObservation(
+                notificationCenter: center,
+                application: NSObject()
+            )
+            let session = ShareSession(
+                model: model,
+                presenter: { _, _, _, _ in },
+                dismissalObservation: observation
+            )
+            model.activeShareSession = session
+            model.isShareSheetActive = true
+            session.present(items: [URL(fileURLWithPath: "/tmp/window.ply")], from: anchor)
+
+            center.post(name: notificationName, object: window)
+            await waitForShareSessionToClear(model)
+
+            XCTAssertNil(model.activeShareSession, "Failed for \(notificationName.rawValue)")
+            XCTAssertFalse(model.isShareSheetActive)
+        }
+    }
+
+    @MainActor
+    func testTransientPickerWindowCloseDismissesAwaitingSession() async throws {
+        let center = NotificationCenter()
+        let anchorWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 200),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let pickerWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        let anchor = NSButton()
+        try XCTUnwrap(anchorWindow.contentView).addSubview(anchor)
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let observation = ShareDismissalObservation(
+            notificationCenter: center,
+            application: NSObject()
+        )
+        let session = ShareSession(
+            model: model,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [URL(fileURLWithPath: "/tmp/share.ply")], from: anchor)
+
+        center.post(name: NSWindow.willCloseNotification, object: pickerWindow)
+        await waitForShareSessionToClear(model)
+
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertFalse(model.isShareSheetActive)
+    }
+
+    @MainActor
+    func testResetCancelsAwaitingSelectionOnceAndIgnoresCleanupRefusal() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputSplatURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        defer {
+            ShareSnapshotStorage.remove(
+                prepared.shareDirectory,
+                expectedFileLeaf: prepared.shareURL.lastPathComponent
+            )
+        }
+        let observation = RetainingShareDismissalObservation()
+        var removalCount = 0
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { _, _, _, _ in },
+            snapshotRemover: { _ in
+                removalCount += 1
+                return .refused
+            },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+
+        model.reset()
+        model.reset()
+
+        XCTAssertEqual(removalCount, 1)
+        XCTAssertEqual(observation.stopCount, 1)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.shareStatusMessage)
+        XCTAssertFalse(model.shareStatusIsError)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: prepared.shareURL.path))
+    }
+
+    @MainActor
+    func testNewSplatNavigationCancelsAwaitingSelectionAndDeletesSnapshotSynchronously() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = ProjectPaths(root: projectURL).outputSplatURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        let observation = RetainingShareDismissalObservation()
+        let session = ShareSession(
+            model: model,
+            preparedItem: prepared,
+            presenter: { _, _, _, _ in },
+            dismissalObservation: observation
+        )
+        model.activeShareSession = session
+        model.isShareSheetActive = true
+        session.present(items: [prepared.shareURL], from: NSButton())
+
+        XCTAssertTrue(model.beginNewSplat())
+
+        XCTAssertEqual(observation.stopCount, 1)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: prepared.shareDirectoryURL.path))
+    }
+
+    @MainActor
+    func testNextShareAfterCancellationRevalidatesAndRecopies() async throws {
         let base = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: base) }
         let projectURL = try makeFinishedProject(
@@ -775,9 +1601,8 @@ final class ResultWorkspaceTests: XCTestCase {
         }
 
         model.requestCurrentSplatShare(from: NSButton(), presenter: presenter)
-        for _ in 0..<300 where model.activeShareSession == nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        let firstRequest = try XCTUnwrap(model.sharePreparationTask)
+        await firstRequest.value
         let firstSession = try XCTUnwrap(model.activeShareSession)
         let firstPrepared = try XCTUnwrap(model.test_preparedShareItem())
         firstSession.sharingServicePicker(
@@ -786,16 +1611,17 @@ final class ResultWorkspaceTests: XCTestCase {
         )
 
         XCTAssertNil(model.activeShareSession)
-        XCTAssertTrue(model.isShareReady)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: firstPrepared.shareURL.path))
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: firstPrepared.shareDirectoryURL.path)
+        )
 
         model.requestCurrentSplatShare(from: NSButton(), presenter: presenter)
-        for _ in 0..<300 where model.activeShareSession == nil {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        let secondRequest = try XCTUnwrap(model.sharePreparationTask)
+        await secondRequest.value
         let secondSession = try XCTUnwrap(model.activeShareSession)
         let secondPrepared = try XCTUnwrap(model.test_preparedShareItem())
-        XCTAssertEqual(secondPrepared, firstPrepared)
+        XCTAssertNotEqual(secondPrepared.shareDirectory, firstPrepared.shareDirectory)
         XCTAssertEqual(presentationCount, 2)
         secondSession.sharingServicePicker(
             NSSharingServicePicker(items: [secondPrepared.shareURL]),
@@ -803,11 +1629,11 @@ final class ResultWorkspaceTests: XCTestCase {
         )
 
         XCTAssertNil(model.activeShareSession)
-        XCTAssertTrue(model.isShareReady)
-        XCTAssertEqual(model.test_preparedShareItem(), firstPrepared)
-
-        model.cancelSharing()
-        XCTAssertFalse(FileManager.default.fileExists(atPath: firstPrepared.shareDirectoryURL.path))
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: secondPrepared.shareDirectoryURL.path)
+        )
     }
 
     @MainActor
@@ -1125,7 +1951,10 @@ final class ResultWorkspaceTests: XCTestCase {
             model: model,
             preparedItem: prepared,
             presenter: { _, _, _, _ in },
-            snapshotRemover: { _ in releaseCount += 1 }
+            snapshotRemover: { _ in
+                releaseCount += 1
+                return .removed
+            }
         )
         model.activeShareSession = session
         model.isShareSheetActive = true
@@ -1861,10 +2690,12 @@ final class ResultWorkspaceTests: XCTestCase {
         let model = AppModel(
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base,
-            finishedOutputValidator: { _ in
+            publishedResultResolver: { projectURL in
                 validationStarted.signal()
                 _ = allowValidationToFinish.wait(timeout: .now() + 2)
-                return firstOutput
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
             }
         )
         model.currentProjectURL = firstProject
@@ -1898,11 +2729,13 @@ final class ResultWorkspaceTests: XCTestCase {
         let model = AppModel(
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base,
-            finishedOutputValidator: { _ in
+            publishedResultResolver: { projectURL in
                 validationThread.record(isMainThread: Thread.isMainThread)
                 validationStarted.signal()
                 _ = allowValidationToFinish.wait(timeout: .now() + 2)
-                return outputURL
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
             }
         )
         model.currentProjectURL = projectURL
@@ -1948,10 +2781,12 @@ final class ResultWorkspaceTests: XCTestCase {
         let model = AppModel(
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base,
-            finishedOutputValidator: { _ in
+            publishedResultResolver: { projectURL in
                 validationStarted.signal()
                 _ = allowValidationToFinish.wait(timeout: .now() + 2)
-                return firstOutput
+                return try PublishedResultResolver.resolve(
+                    projectURL: projectURL
+                )
             }
         )
         model.currentProjectURL = firstProject
@@ -2959,6 +3794,148 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    func testFailedRetrainPreviousResultRemainsExportableAndShareable() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fixture = try makeFailedRetrainPreviousResult(in: base)
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        defer { model.cancelSharing() }
+        model.currentProjectURL = fixture.projectURL
+        model.outputPlyURL = fixture.result.outputURL
+
+        let exportURL = try await model.validatedCurrentSplatForExport()
+        XCTAssertEqual(
+            exportURL.standardizedFileURL,
+            fixture.result.outputURL.standardizedFileURL
+        )
+
+        await model.prepareCurrentSplatForSharing()
+
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        XCTAssertTrue(model.isShareReady)
+        XCTAssertEqual(
+            prepared.source.publicationID,
+            fixture.result.receipt.publicationID
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: prepared.shareURL),
+            try Data(contentsOf: fixture.result.outputURL)
+        )
+        guard case .previous(let resolved) = try PublishedResultResolver.resolve(
+            projectURL: fixture.projectURL
+        ) else {
+            return XCTFail("Expected the failed retrain to retain previous-result authority")
+        }
+        XCTAssertEqual(
+            resolved.publishedResult.receipt.publicationID,
+            fixture.result.receipt.publicationID
+        )
+    }
+
+    @MainActor
+    func testPreviousResultExportAndShareRejectTamperedCanonicalPly() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fixture = try makeFailedRetrainPreviousResult(in: base)
+        let original = try Data(contentsOf: fixture.result.outputURL)
+        let handle = try FileHandle(forWritingTo: fixture.result.outputURL)
+        try handle.seek(toOffset: UInt64(original.count - 1))
+        try handle.write(contentsOf: Data([(try XCTUnwrap(original.last)) ^ 0xff]))
+        try handle.close()
+
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = fixture.projectURL
+        model.outputPlyURL = fixture.result.outputURL
+
+        do {
+            _ = try await model.validatedCurrentSplatForExport()
+            XCTFail("Tampered previous output must not be exportable")
+        } catch {
+            // Expected: every action performs a fresh authoritative resolution.
+        }
+
+        await model.prepareCurrentSplatForSharing()
+
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareReady)
+    }
+
+    @MainActor
+    func testPreparedPreviousShareSurvivesTimingOnlyReceiptUpdate() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fixture = try makeFailedRetrainPreviousResult(in: base)
+        let paths = ProjectPaths(root: fixture.projectURL)
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+        defer { model.cancelSharing() }
+        model.currentProjectURL = fixture.projectURL
+        model.outputPlyURL = fixture.result.outputURL
+        await model.prepareCurrentSplatForSharing()
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+
+        let updated = try PublishedResultPairStore.recordFirstViewerReadyTiming(
+            4.25,
+            expectedPublicationID: fixture.result.receipt.publicationID,
+            expectedGeneration: fixture.result.generation,
+            projectPaths: paths
+        )
+        XCTAssertEqual(
+            updated.receipt.publicationID,
+            fixture.result.receipt.publicationID
+        )
+        XCTAssertNotEqual(updated.generation, fixture.result.generation)
+
+        var presentationCount = 0
+        await model.presentPreparedShare(
+            from: NSButton(),
+            presenter: { _, _, _, _ in presentationCount += 1 }
+        )
+
+        XCTAssertEqual(presentationCount, 1)
+        XCTAssertNotNil(model.activeShareSession)
+        XCTAssertEqual(model.test_preparedShareItem(), prepared)
+        XCTAssertNil(model.shareStatusMessage)
+    }
+
+    @MainActor
+    func testProjectSummaryRefreshDropsStalePreviousResultHintAfterReceiptTamper() throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let fixture = try makeFailedRetrainPreviousResult(in: base)
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base
+        )
+
+        model.refreshProjectSummaries()
+
+        var summary = try XCTUnwrap(model.projectSummaries.first)
+        XCTAssertEqual(summary.status, .failed)
+        XCTAssertTrue(summary.hasPreviousResultHint)
+        XCTAssertTrue(ProjectListFilter.failed.matches(summary))
+
+        try Data(#"{"schemaVersion":2,"future":"untouched"}"#.utf8).write(
+            to: ProjectPaths(root: fixture.projectURL).outputSplatReceiptURL,
+            options: .atomic
+        )
+        model.refreshProjectSummaries()
+
+        summary = try XCTUnwrap(model.projectSummaries.first)
+        XCTAssertEqual(summary.status, .failed)
+        XCTAssertFalse(summary.hasPreviousResultHint)
+        XCTAssertTrue(ProjectListFilter.failed.matches(summary))
+    }
+
+    @MainActor
     func testCancellingExportCancelsDetachedPublicationAndPreservesDestination() async throws {
         let base = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: base) }
@@ -3074,11 +4051,11 @@ final class ResultWorkspaceTests: XCTestCase {
         let model = AppModel(
             toolchainManager: ResultTestToolchainManager(),
             projectBaseURL: base,
-            finishedOutputValidator: { requestedProjectURL in
+            publishedResultResolver: { requestedProjectURL in
                 observation.record(isMainThread: Thread.isMainThread)
-                return requestedProjectURL.standardizedFileURL == projectURL.standardizedFileURL
-                    ? outputURL
-                    : nil
+                return try PublishedResultResolver.resolve(
+                    projectURL: requestedProjectURL
+                )
             }
         )
         model.currentProjectURL = projectURL
@@ -3170,6 +4147,13 @@ final class ResultWorkspaceTests: XCTestCase {
             .appendingPathComponent("EasySplat-result-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    @MainActor
+    private func waitForShareSessionToClear(_ model: AppModel) async {
+        for _ in 0..<50 where model.activeShareSession != nil {
+            await Task.yield()
+        }
     }
 
     @MainActor
@@ -3343,6 +4327,51 @@ final class ResultWorkspaceTests: XCTestCase {
         return projectURL
     }
 
+    private struct FailedRetrainPreviousResultFixture {
+        let projectURL: URL
+        let result: ValidatedPublishedResult
+    }
+
+    private func makeFailedRetrainPreviousResult(
+        in base: URL
+    ) throws -> FailedRetrainPreviousResultFixture {
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let paths = ProjectPaths(root: projectURL)
+        let sourceURL = paths.trainingURL.appendingPathComponent(
+            "previous-result-source.ply",
+            isDirectory: false
+        )
+        try FileManager.default.copyItem(at: paths.outputSplatURL, to: sourceURL)
+        try FileManager.default.removeItem(at: paths.outputSplatURL)
+        let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let result = try publishAppTestResultFixture(
+            sourceURL: sourceURL,
+            paths: paths,
+            metadata: metadata,
+            publicationID: UUID(
+                uuidString: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            )!
+        )
+        _ = try ProjectMetadataStore.update(at: paths.metadataURL) { latest in
+            latest.requestedRunOptions.detailProfile = .highDetail
+            latest.state = PipelineState(
+                stage: .trainSplat,
+                lastError: "The retrain failed."
+            )
+            latest.pendingPublicationID = UUID()
+            latest.lastRunStartedAt = nil
+            latest.lastFailureAt = Date(timeIntervalSince1970: 1_767_225_700)
+        }
+        return FailedRetrainPreviousResultFixture(
+            projectURL: projectURL,
+            result: result
+        )
+    }
+
     private func writeResultPly(to url: URL) throws {
         let text = """
         ply
@@ -3366,6 +4395,9 @@ final class ResultWorkspaceTests: XCTestCase {
         0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0
         """
         try text.write(to: url, atomically: true, encoding: .utf8)
+        guard Darwin.chmod(url.path, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     @MainActor
@@ -3378,10 +4410,12 @@ final class ResultWorkspaceTests: XCTestCase {
 
     private func keyEvent(
         keyCode: UInt16,
-        modifiers: NSEvent.ModifierFlags = []
+        modifiers: NSEvent.ModifierFlags = [],
+        type: NSEvent.EventType = .keyDown,
+        isARepeat: Bool = false
     ) throws -> NSEvent {
         try XCTUnwrap(NSEvent.keyEvent(
-            with: .keyDown,
+            with: type,
             location: .zero,
             modifierFlags: modifiers,
             timestamp: 0,
@@ -3389,9 +4423,42 @@ final class ResultWorkspaceTests: XCTestCase {
             context: nil,
             characters: keyCode == 48 ? "\t" : "",
             charactersIgnoringModifiers: keyCode == 48 ? "\t" : "",
-            isARepeat: false,
+            isARepeat: isARepeat,
             keyCode: keyCode
         ))
+    }
+
+    private func mouseEvent(
+        _ type: NSEvent.EventType,
+        at location: NSPoint,
+        modifiers: NSEvent.ModifierFlags = []
+    ) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(
+            with: type,
+            location: location,
+            modifierFlags: modifiers,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ))
+    }
+
+    /// `NSEvent.mouseEvent` cannot set a button number, so middle-button events
+    /// are built from a CGEvent that carries `.center` explicitly.
+    private func middleMouseEvent(
+        _ type: CGEventType,
+        at location: CGPoint
+    ) throws -> NSEvent {
+        let cgEvent = try XCTUnwrap(CGEvent(
+            mouseEventSource: nil,
+            mouseType: type,
+            mouseCursorPosition: location,
+            mouseButton: .center
+        ))
+        return try XCTUnwrap(NSEvent(cgEvent: cgEvent))
     }
 
     @MainActor
@@ -3403,8 +4470,64 @@ final class ResultWorkspaceTests: XCTestCase {
         view.onScrollZoom = { [renderer] _, _ in _ = renderer }
         view.onMagnify = { [renderer] _, _ in _ = renderer }
         view.onPan = { [renderer] _, _ in _ = renderer }
+        view.onFreeLook = { [renderer] _, _ in _ = renderer }
         view.onKeyboardCommand = { [renderer] _ in _ = renderer }
+        view.onMovementInputChanged = { [renderer] _, _ in _ = renderer }
         view.onInteractionActivity = { [renderer] in _ = renderer }
+    }
+
+    func testInspectorDefaultsClosedWhenTheCanvasWouldBeCrushed() {
+        // The 920pt minimum window minus the 260pt sidebar leaves 660.
+        XCTAssertFalse(ViewerView.initialInspectorPresentation(
+            storedPreference: nil,
+            workspaceWidth: 660
+        ))
+        // Sidebar collapsed at the minimum window: the full 920 has room.
+        XCTAssertTrue(ViewerView.initialInspectorPresentation(
+            storedPreference: nil,
+            workspaceWidth: 920
+        ))
+        let threshold = ViewerView.inspectorIdealWidth + ViewerView.minimumComfortableCanvasWidth
+        XCTAssertTrue(ViewerView.initialInspectorPresentation(
+            storedPreference: nil,
+            workspaceWidth: threshold
+        ))
+        XCTAssertFalse(ViewerView.initialInspectorPresentation(
+            storedPreference: nil,
+            workspaceWidth: threshold - 1
+        ))
+    }
+
+    func testARememberedInspectorChoiceBeatsTheWidthRule() {
+        XCTAssertTrue(ViewerView.initialInspectorPresentation(
+            storedPreference: true,
+            workspaceWidth: 400
+        ))
+        XCTAssertFalse(ViewerView.initialInspectorPresentation(
+            storedPreference: false,
+            workspaceWidth: 1400
+        ))
+    }
+}
+
+@MainActor
+private final class RetainingShareDismissalObservation: ShareDismissalObserving {
+    private var candidates: [() -> Void] = []
+    private(set) var stopCount = 0
+
+    func start(
+        anchorView: NSView,
+        onDismissalCandidate: @escaping () -> Void
+    ) {
+        candidates.append(onDismissalCandidate)
+    }
+
+    func stop() {
+        stopCount += 1
+    }
+
+    func emit(at index: Int) {
+        candidates[index]()
     }
 }
 
@@ -3526,9 +4649,7 @@ private final class ShareHashCancellationProbe: @unchecked Sendable {
 }
 
 private struct ResultTestToolchainManager: ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {

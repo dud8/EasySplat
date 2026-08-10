@@ -86,9 +86,24 @@ SfM/colmap/sparse/0
 SfM/geometry_manifest.json
 Training/training_manifest.json
 Output/splat.ply
+Output/splat_receipt.json
 ```
 
 `ProjectPaths` is the layout authority. Stored paths are relative to the project root and must pass the safe resolver before use. Never accept an absolute path, traversal, or escaping symlink from metadata.
+
+Separate from `project.json`, `Output/splat_receipt.json` is the authority for newly published result bytes. `Output/splat.ply` normally requires its matching, fully validated receipt. The sole compatibility exception is a fully validated, successfully completed legacy project created before receipts; it may open only its current result. A bare PLY never establishes previous-result authority after a failed or interrupted retrain.
+
+`PublishedResultResolver` is the sole authority used by viewer, export, share, and retraining. A current result requires the complete finished-project contract and its matching receipt. A previous result requires a fully validated receipt/PLY pair but allows `project.json` to describe a failed or interrupted latest attempt. Everything else is unavailable. Project summaries may advertise previous-result availability as a hint, but every action performs full resolution again.
+
+Retraining never removes the published pair. A failed retrain remains `Failed`; the separate **View Previous Result** action opens the validated prior publication. Result-era run options, reconstruction, orientation, training, and timing presentation come from the receipt. Title, notes, and viewer preferences remain live project state. Subject isolation stays unavailable for a previous result unless its independently validated artifact names the same publication UUID.
+
+Subject isolation is optional and never replaces the canonical result. `Output/splat.ply` remains the only canonical splat payload. A completed optional result adds `Output/isolated.ply`, `Isolation/isolation_manifest.json`, the validated `Isolation/masks/` files, and private `Isolation/staging/` work.
+
+The viewer's chosen variant is session-local and starts on the original. Isolation reuses the bundled native filtering binary; a missing, stale, invalid, or failed optional artifact never blocks opening, viewing, sharing, or recovering the canonical project.
+
+User-selected export holds the save-panel security scope until publication reconciliation finishes. It streams into an app-owned candidate, validates by descriptor, and commits only against the exact selected path. Reconciliation treats matching bytes as success even if Foundation threw, preserves an unchanged prior destination on failure, and leaves foreign or unstable destination bytes untouched while reporting a conflict.
+
+Share preparation copies a validated publication into a temporary snapshot. Passive picker dismissal, Escape, reset, and navigation all use one idempotent cancellation path that retires the session and deletes the snapshot synchronously. Once a sharing service is selected, the payload remains alive until exactly one success or failure callback. Publication UUID and PLY identity—not timing-only receipt changes—control snapshot invalidation.
 
 The new-project order is deliberate:
 
@@ -102,7 +117,7 @@ The new-project order is deliberate:
 
 A setup failure therefore creates no failed project and keeps input available for Try Again.
 
-EasySplat reads only the project format written by the current build. The project library logs and skips older, newer, malformed, and unsafe bundles without changing or deleting them.
+EasySplat reads project formats 31, 32, and 33. It writes the current format, 33, so saving an accepted older project migrates it forward. The project library logs and skips unsupported older or newer, malformed, and unsafe bundles without changing or deleting them.
 
 ## Durable stages and recovery
 
@@ -111,7 +126,9 @@ The internal pipeline has finer stages than the UI. A checkpoint is useful only 
 - Before training, Stop preserves the last durable geometry/import stage.
 - Native training writes an atomic checkpoint generation with model arrays, optimizer moments, schedule, seed, trainer version, and geometry identity.
 - Resume validates the checkpoint and dataset identity. If native msplat rejects it, EasySplat restarts training honestly.
-- A replacement PLY is written to a temporary path, validated, then atomically promoted. A good previous output is never overwritten by an invalid replacement.
+- Final publication stages a new PLY and receipt under `Output/`, preserves the current validated pair, installs the PLY first, and installs the receipt last as the authority-conferring commit.
+- Pipeline startup reconciles an interrupted publication before inspecting inputs or recording a new attempt. Before receipt commit it restores the prior validated pair; after receipt commit it keeps the new pair only if both files fully validate, otherwise it restores the prior pair.
+- Successful finalization validates the private training output and current geometry, prepares the rebound training manifest and receipt, commits and revalidates the pair, persists and rereads the training manifest, persists `.done`, invalidates stale derived artifacts, and only then removes disposable training data.
 
 Do not call an intermediate file a checkpoint or snapshot unless its complete-state contract is validated.
 
@@ -213,13 +230,24 @@ Release verification adds:
 
 ```bash
 ./scripts/benchmark/run_suite.sh --profile release
+./scripts/benchmark/validate_subject_isolation_results.py /path/to/subject-isolation-results.json
 ./scripts/ci/test_msplat_native_build.sh
 shellcheck $(git ls-files 'scripts/*.sh' 'scripts/**/*.sh')
 actionlint
 gitleaks git --redact
 ```
 
+On the exact 48 GiB M4 Max reference host, also run:
+
+```bash
+./scripts/ci/run_release_reliability_product_gate.sh
+```
+
 The full benchmark requires external media matching `scripts/benchmark/corpus.json`. Never fabricate evidence or mark an unavailable scene as passed. The Release App workflow runs the packaged verifier with the built app, DMG, signed component closure, generated fixture, and online/offline runners. Geometry conditioning is part of the production pipeline and is recomputed when a geometry artifact is loaded. The packaged fixture must reconstruct at least 11 of 12 views before native training. Release verification also checks the signed and notarized app, stapled DMG, Gatekeeper assessment, quarantined installation, SBOM, licenses, provenance, checksums, and cached offline reuse.
+
+`run_release_reliability_product_gate.sh` builds optimized XCTest code with the DEBUG-only deterministic seams enabled, then runs four real entry points in isolated processes: 10,000-file folder admission, 10,000-entry ZIP extraction with a 139.6 MiB payload, exact 139.6 MiB PLY validation, and publication to an absent user-selected destination. `scripts/ci/release_reliability_m4_max_baseline.json` is bound to the 48 GiB M4 Max reference host; the command fails closed elsewhere. Each workload must remain within 1.25 times baseline operation wall time and whole-process peak RSS plus 64 MiB. Separate exact XCTests enforce cooperative cancellation within two seconds and passive share cleanup within one second. The harness strips credential-bearing environment variables, consumes a fresh one-shot success receipt, and verifies fixture and XCTest identities before and after execution.
+
+The subject-isolation validator consumes a schema-version 1 JSON object bound to an Apple M4 Max with 48 GiB of memory and confirms that timing excludes the first toolchain installation. Its `captures` array records each outcome (`automatic_correct`, `user_selected`, `asked`, `refused`, or `wrong_automatic`), source Gaussian count, isolation time, incremental unified-memory bytes, canonical PLY SHA-256 and byte count before and after isolation, plus held-out IoU and boundary F1 for accepted outputs.
 
 ## Releases
 
@@ -248,5 +276,8 @@ First merge the reviewed release commit, make the repository public, manually di
 9. Create `v0.2.0` at the same protected-main commit and run **Release App**. `build_dmg.sh --production` accepts only the workflow-bound prepared-root digest, source commit, and independently built `ManifestTool`; it cannot rebuild from a mutable checkout or fall back to unsigned output.
 10. Require the workflow's signing, notarization, hardened-runtime, nested-code, stapling, Gatekeeper, quarantined-install, DMG, checksum, SBOM, license, provenance, toolchain, and offline-cache checks to pass. It leaves an owned stable app draft.
 11. As a separate human action, independently re-fetch the exact app draft and match its release identity and asset IDs, sizes, and digests before publication.
+12. Dispatch **Release TestFlight** from protected `main` at the same immutable app tag. Its isolated signing job builds and inspects one source-bound App Store-signed arm64 package, including the embedded provisioning profile, restricted MAS entitlements, package signature, provenance, and checksum closure.
+13. Let the submission job upload that exact package once. A successful transport is not release evidence: require the matching App Store Connect delivery to reach terminal `READY_TO_TEST`, remain present on App Store Connect, and report no processing errors.
+14. Install that exact TestFlight build in a fresh container and the affected internal container. Record the complete importer, dataset, cancellation, export, share, previous-result, accessibility, second-instance, and ten-cycle share-cleanup matrix in the two strict dogfood records. **Release TestFlight** binds both records to the reviewed source, package, app build, submission artifact, and terminal receipts before producing its approval gate.
 
 The fine-grained `EASYSPLAT_TOOLCHAIN_PUBLICATION_TOKEN` and `EASYSPLAT_RELEASE_ADMIN_TOKEN` credentials need repository **Contents: write** to stage draft assets and **Administration: read** to verify the immutable-release setting. Neither EasySplat workflow publishes automatically. Use `./scripts/run.sh` only for local toolchain builds and development.

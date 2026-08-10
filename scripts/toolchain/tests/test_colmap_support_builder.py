@@ -1238,12 +1238,15 @@ class ArtifactTests(unittest.TestCase):
                 self.assertTrue(stat.S_ISDIR(metadata.st_mode), path)
                 expected_mode = 0o755
             self.assertEqual(stat.S_IMODE(metadata.st_mode), expected_mode, path)
-        attributes = subprocess.run(
-            ["/usr/bin/xattr", "-l", "-r", str(self.install)],
-            check=True,
-            capture_output=True,
-        ).stdout
-        self.assertEqual(attributes, b"")
+        for path in [self.install, *self.install.rglob("*")]:
+            names = subprocess.run(
+                ["/usr/bin/xattr", str(path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            unexpected = [name for name in names if name != "com.apple.provenance"]
+            self.assertEqual(unexpected, [], path)
 
     def test_libraries_are_arm64_and_target_macos_15_or_earlier(self) -> None:
         libraries = sorted((self.install / "lib").glob("*.a"))

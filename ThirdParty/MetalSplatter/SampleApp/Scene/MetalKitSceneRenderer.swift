@@ -27,7 +27,10 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         guard let queue = self.device.makeCommandQueue() else { return nil }
         self.commandQueue = queue
         self.metalKitView = metalKitView
-        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
+        // Splat colours are sRGB code values, so the attachment must not linearise them
+        // for blending; the layer's colour space handles display matching instead.
+        metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm
+        metalKitView.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
         metalKitView.sampleCount = 1
         // This is required because we render front-to-back (see SplatRenderer.Constants.renderFrontToBack).
@@ -48,7 +51,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                                           stencilFormat: metalKitView.depthStencilPixelFormat,
                                           sampleCount: metalKitView.sampleCount,
                                           maxViewCount: 1,
-                                          maxSimultaneousRenders: Constants.maxSimultaneousRenders)
+                                          maxSimultaneousRenders: Constants.maxSimultaneousRenders,
+                                          // Interactive, and stated rather than defaulted: the
+                                          // argument has no default, so no renderer can composite
+                                          // under an ordering nobody chose.
+                                          sortOrdering: .cameraForwardDepth)
             try splat.readPLY(from: url)
             modelRenderer = splat
         case .sampleBox:

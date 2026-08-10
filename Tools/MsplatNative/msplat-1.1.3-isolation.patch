@@ -1,0 +1,551 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index fa0f3c4..23fcf22 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,6 +4,8 @@ project(msplat LANGUAGES CXX OBJCXX)
+ 
+ set(CMAKE_CXX_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_OBJCXX_STANDARD 17)
++set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
+ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+ 
+ # Version
+@@ -52,22 +54,35 @@ find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
+ 
+ find_library(IMAGEIO_FRAMEWORK ImageIO REQUIRED)
+ find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
++find_library(COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+ 
+ # --- Compile Metal shaders ---
+ 
+ set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
++set(ISOLATION_METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/isolation_lift.metal)
+ configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
++configure_file(
++    ${ISOLATION_METAL_SOURCE}
++    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/isolation_lift.metal
++    COPYONLY
++)
+ add_custom_command(
+     OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
+     COMMAND xcrun -sdk macosx metal -O3 -c
+         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
+         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
++    COMMAND xcrun -sdk macosx metal -O3 -c
++        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/isolation_lift.metal
++        -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/isolation_lift.air
+     COMMAND xcrun -sdk macosx metallib
+         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
++        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/isolation_lift.air
+         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
+     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
++    COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/isolation_lift.air
+     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
+-    DEPENDS ${METAL_SOURCE}
++    COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/isolation_lift.metal
++    DEPENDS ${METAL_SOURCE} ${ISOLATION_METAL_SOURCE}
+     COMMENT "Compiling Metal kernels → default.metallib"
+ )
+ add_custom_target(metallib ALL
+@@ -107,7 +122,13 @@ add_dependencies(msplat_core metallib)
+ 
+ # --- CLI binary ---
+ 
+-add_executable(msplat cli/msplat.cpp)
++set(EASYSPLAT_CLI_SOURCES
++    cli/msplat.cpp
++    cli/isolation.cpp
++    cli/isolation_runtime.cpp
++    cli/isolation_mask.mm
++)
++add_executable(msplat ${EASYSPLAT_CLI_SOURCES})
+ target_link_libraries(msplat PRIVATE
+     msplat_core
+     CLI11::CLI11
+@@ -135,7 +156,34 @@ if(MSPLAT_BUILD_RASTER_TESTS)
+         USE_MPS
+         MSPLAT_ENABLE_RASTER_TEST_HOOKS
+     )
+-    add_executable(msplat_allocation_pressure_cli cli/msplat.cpp)
++    add_executable(
++        msplat_isolation_tests
++        tests/isolation_tests.cpp
++        cli/isolation.cpp
++    )
++    target_include_directories(msplat_isolation_tests PRIVATE ${CMAKE_SOURCE_DIR}/cli)
++    add_executable(
++        msplat_isolation_mask_tests
++        tests/isolation_mask_tests.mm
++        cli/isolation_mask.mm
++        cli/isolation.cpp
++    )
++    target_include_directories(
++        msplat_isolation_mask_tests
++        PRIVATE
++        ${CMAKE_SOURCE_DIR}/cli
++    )
++    target_link_libraries(
++        msplat_isolation_mask_tests
++        PRIVATE
++        ${FOUNDATION_LIBRARY}
++        ${COREFOUNDATION_FRAMEWORK}
++        ${IMAGEIO_FRAMEWORK}
++        ${COREGRAPHICS_FRAMEWORK}
++        nlohmann_json::nlohmann_json
++        pthread
++    )
++    add_executable(msplat_allocation_pressure_cli ${EASYSPLAT_CLI_SOURCES})
+     target_link_libraries(msplat_allocation_pressure_cli PRIVATE
+         msplat_core_raster_tests CLI11::CLI11 pthread
+     )
+diff --git a/core/metal/bindings.h b/core/metal/bindings.h
+index 9c90d2a..13df182 100644
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -29,6 +29,21 @@ struct MsplatRasterStats {
+     bool allocation_unavailable;
+ };
+ 
++struct MsplatIsolationContributionRecord {
++    uint32_t gaussian_id;
++    uint16_t label;
++    uint16_t reserved;
++    float weight;
++    float centrality_weight;
++};
++
++static constexpr uint32_t MSPLAT_ISOLATION_RECORDS_PER_PIXEL = 24;
++static_assert(sizeof(MsplatIsolationContributionRecord) == 16);
++static_assert(offsetof(MsplatIsolationContributionRecord, gaussian_id) == 0);
++static_assert(offsetof(MsplatIsolationContributionRecord, label) == 4);
++static_assert(offsetof(MsplatIsolationContributionRecord, weight) == 8);
++static_assert(offsetof(MsplatIsolationContributionRecord, centrality_weight) == 12);
++
+ // Release all cached GPU tensors (call before exit to prevent GPU memory leak)
+ void cleanup_msplat_metal();
+ 
+@@ -152,6 +167,13 @@ void msplat_copy_last_raster_reference_debug(
+     int point_count,
+     int pixel_count
+ );
++void msplat_copy_isolation_projection_for_testing(
++    float* xys,
++    float* depths,
++    int* radii,
++    float* conics,
++    int point_count
++);
+ #endif
+ MsplatRasterStats msplat_get_raster_stats();
+ bool msplat_raster_memory_budget_was_exceeded();
+@@ -183,6 +205,31 @@ MTensor msplat_render(
+     MTensor &opacities, MTensor &background
+ );
+ 
++// Encodes one forced-exact projection/sort pass. The caller must commit and
++// synchronize before lifting; a capacity failure requires grow, clear, and
++// full replay.
++void msplat_prepare_isolation_view(
++    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
++    MTensor &quats, MTensor &viewmat, MTensor &projmat,
++    float fx, float fy, float cx, float cy,
++    unsigned img_height, unsigned img_width,
++    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
++    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
++    MTensor &features_dc, MTensor &features_rest,
++    MTensor &opacities, MTensor &background
++);
++
++// Consumes the last successfully synchronized isolation view without
++// rerendering. Each call clears its status output, so callers must synchronize
++// and inspect that output before reusing the stripe buffers.
++void msplat_lift_isolation_stripe(
++    unsigned img_height, unsigned img_width,
++    MTensor &mask_labels, MTensor &selected_gaussians, bool use_selection,
++    unsigned row_start, unsigned row_count,
++    MTensor &records, MTensor &record_counts, MTensor &soft_alpha,
++    MTensor &isolation_status
++);
++
+ // Fused forward + backward + Adam + grad_stats in one encoder
+ // Returns: (radii [N], loss_value float)
+ std::tuple<MTensor, float> msplat_train_step(
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+index 4e9da64..94fc7ce 100644
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -317,6 +317,7 @@ struct MetalContext {
+     // Forward pipeline kernels
+     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso;
+     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
++    id<MTLComputePipelineState> isolation_lift_stripe_kernel_cpso;
+     // Tile-local sorting
+     id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
+     id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
+@@ -460,6 +461,7 @@ MetalContext* init_msplat_metal_context() {
+     // Forward pipeline
+     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
+     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
++    ctx->isolation_lift_stripe_kernel_cpso        = load(@"isolation_lift_stripe_kernel");
+     // Tile-local sorting
+     ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
+     ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
+@@ -567,6 +569,32 @@ static void throw_if_raster_failed();
+ static void attach_exact_raster_timing_handler();
+ static void throw_if_exact_raster_timing_invalid();
+ static dispatch_group_t g_exact_raster_timing_group = dispatch_group_create();
++enum class IsolationPreparedState {
++    invalid,
++    pendingSync,
++    ready,
++};
++struct IsolationPreparedView {
++    IsolationPreparedState state = IsolationPreparedState::invalid;
++    int numPoints = 0;
++    unsigned imageHeight = 0;
++    unsigned imageWidth = 0;
++};
++static IsolationPreparedView g_isolation_prepared_view;
++
++static void invalidate_isolation_prepared_view() {
++    g_isolation_prepared_view = IsolationPreparedView {};
++}
++
++static void update_isolation_prepared_view_after_sync() {
++    if (g_isolation_prepared_view.state != IsolationPreparedState::pendingSync) return;
++    const MsplatRasterStats stats = msplat_get_raster_stats();
++    g_isolation_prepared_view.state =
++        stats.capacity_exceeded || stats.memory_budget_exceeded ||
++            stats.resource_limit_exceeded || stats.allocation_unavailable
++        ? IsolationPreparedState::invalid
++        : IsolationPreparedState::ready;
++}
+ #ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
+ static bool g_fail_next_sync_for_testing = false;
+ #endif
+@@ -623,12 +651,24 @@ void msplat_commit() {
+ }
+ 
+ void msplat_gpu_sync() {
+-    sync_and_drain_exact_raster_timing();
++    try {
++        sync_and_drain_exact_raster_timing();
++        update_isolation_prepared_view_after_sync();
++    } catch (...) {
++        invalidate_isolation_prepared_view();
++        throw;
++    }
+     throw_if_raster_failed();
+ }
+ 
+ void msplat_gpu_sync_for_raster_replay() {
+-    sync_and_drain_exact_raster_timing();
++    try {
++        sync_and_drain_exact_raster_timing();
++        update_isolation_prepared_view_after_sync();
++    } catch (...) {
++        invalidate_isolation_prepared_view();
++        throw;
++    }
+ }
+ 
+ void msplat_enable_gpu_timing(bool enable) {
+@@ -1524,6 +1564,7 @@ void msplat_preflight_raster_memory(
+         features_rest_bases < 0) {
+         throw std::invalid_argument("msplat: raster preflight dimensions are invalid");
+     }
++    invalidate_isolation_prepared_view();
+     const uint64_t tile_columns =
+         (static_cast<uint64_t>(image_width) + tile_width - 1) / tile_width;
+     const uint64_t tile_rows =
+@@ -1640,6 +1681,7 @@ static void resize_exact_raster_capacity(
+             static_cast<uint64_t>(get_global_context()->device.currentAllocatedSize)
+         );
+     }
++    invalidate_isolation_prepared_view();
+     MetalContext *context = get_global_context();
+     msplat_gpu_sync_for_raster_replay();
+     if (g_exact_capacity_limit_for_testing != 0 &&
+@@ -1817,6 +1859,7 @@ void msplat_clear_raster_capacity_failure() {
+     if (!g_tcache.raster_stats.defined()) {
+         throw std::runtime_error("msplat: raster capacity failure has no statistics buffer");
+     }
++    invalidate_isolation_prepared_view();
+     auto *stats = g_tcache.raster_stats.data<uint32_t>();
+     stats[kRasterStatFatalFlag] = 0;
+     stats[kRasterStatFirstOverflowIteration] = 0;
+@@ -2084,6 +2127,47 @@ void msplat_copy_last_raster_reference_debug(
+     std::memcpy(raster_color_gradients, g_tcache.v_colors_rast.data<float>(), static_cast<size_t>(point_count) * 3 * sizeof(float));
+     std::memcpy(opacity_gradients, g_tcache.v_opacity.data<float>(), static_cast<size_t>(point_count) * sizeof(float));
+ }
++
++void msplat_copy_isolation_projection_for_testing(
++    float* xys,
++    float* depths,
++    int* radii,
++    float* conics,
++    int point_count
++) {
++    if (xys == nullptr || depths == nullptr || radii == nullptr ||
++        conics == nullptr || point_count <= 0 ||
++        g_isolation_prepared_view.state != IsolationPreparedState::ready ||
++        g_isolation_prepared_view.numPoints != point_count ||
++        g_tcache.xys.numel() != static_cast<int64_t>(point_count) * 2 ||
++        g_tcache.depths.numel() != point_count ||
++        g_tcache.radii_out.numel() != point_count ||
++        g_tcache.conics.numel() != static_cast<int64_t>(point_count) * 3) {
++        throw std::runtime_error(
++            "msplat: isolation projection snapshot is unavailable"
++        );
++    }
++    std::memcpy(
++        xys,
++        g_tcache.xys.data<float>(),
++        static_cast<size_t>(point_count) * 2 * sizeof(float)
++    );
++    std::memcpy(
++        depths,
++        g_tcache.depths.data<float>(),
++        static_cast<size_t>(point_count) * sizeof(float)
++    );
++    std::memcpy(
++        radii,
++        g_tcache.radii_out.data<int>(),
++        static_cast<size_t>(point_count) * sizeof(int)
++    );
++    std::memcpy(
++        conics,
++        g_tcache.conics.data<float>(),
++        static_cast<size_t>(point_count) * 3 * sizeof(float)
++    );
++}
+ #endif
+ 
+ static void throw_if_raster_failed() {
+@@ -2173,6 +2257,7 @@ void cleanup_msplat_metal() {
+     } else {
+         dispatch_group_wait(g_exact_raster_timing_group, DISPATCH_TIME_FOREVER);
+     }
++    invalidate_isolation_prepared_view();
+     g_tcache = FusedTensorCache{};
+     g_initial_raster_fallback_count = 0;
+     g_last_raster_required_bytes = 0;
+@@ -2399,8 +2484,10 @@ static void forward_pipeline(
+     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
+     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
+     MTensor &features_dc, MTensor &features_rest,
+-    MTensor &opacities, MTensor &background
++    MTensor &opacities, MTensor &background,
++    bool force_exact
+ ) {
++    invalidate_isolation_prepared_view();
+     MetalContext* ctx = get_global_context();
+     int tile_bounds_x = std::get<0>(tile_bounds);
+     int tile_bounds_y = std::get<1>(tile_bounds);
+@@ -2565,7 +2652,7 @@ static void forward_pipeline(
+             // tile_bins written by sort kernel, tile_counts no longer used
+             [blit fillBuffer:g_tcache.overflow_flag.buffer()
+                        range:NSMakeRange(0, g_tcache.overflow_flag.nbytes())
+-                       value:g_force_exact_for_testing ? 1 : 0];
++                       value:(force_exact || g_force_exact_for_testing) ? 1 : 0];
+             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
+             [blit endEncoding];
+ 
+@@ -2609,10 +2696,187 @@ MTensor msplat_render(
+         quats, viewmat, projmat, fx, fy, cx, cy,
+         img_height, img_width, tile_bounds, clip_thresh,
+         degree, degrees_to_use, cam_pos, features_dc, features_rest,
+-        opacities, background);
++        opacities, background, false);
+     return g_tcache.out_img;
+ }
+ 
++void msplat_prepare_isolation_view(
++    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
++    MTensor &quats, MTensor &viewmat, MTensor &projmat,
++    float fx, float fy, float cx, float cy,
++    unsigned img_height, unsigned img_width,
++    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
++    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
++    MTensor &features_dc, MTensor &features_rest,
++    MTensor &opacities, MTensor &background
++) {
++    const auto isGpuFloat = [](const MTensor &tensor) {
++        return tensor.isGpu() && tensor.dtype() == DType::Float32;
++    };
++    const uint64_t expectedTileColumns =
++        (static_cast<uint64_t>(img_width) + BLOCK_X - 1) / BLOCK_X;
++    const uint64_t expectedTileRows =
++        (static_cast<uint64_t>(img_height) + BLOCK_Y - 1) / BLOCK_Y;
++    if (num_points <= 0 || img_height == 0 || img_width == 0 ||
++        expectedTileColumns > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
++        expectedTileRows > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
++        expectedTileColumns * expectedTileRows >
++            static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
++        std::get<0>(tile_bounds) != static_cast<int>(expectedTileColumns) ||
++        std::get<1>(tile_bounds) != static_cast<int>(expectedTileRows) ||
++        std::get<2>(tile_bounds) != 1 ||
++        !std::isfinite(glob_scale) || glob_scale <= 0 ||
++        !std::isfinite(fx) || !std::isfinite(fy) || fx <= 0 || fy <= 0 ||
++        !std::isfinite(cx) || !std::isfinite(cy) ||
++        !std::isfinite(clip_thresh) || clip_thresh <= 0 ||
++        cam_pos == nullptr || !std::isfinite(cam_pos[0]) ||
++        !std::isfinite(cam_pos[1]) || !std::isfinite(cam_pos[2]) ||
++        degree > 4 || degrees_to_use > degree ||
++        !isGpuFloat(means3d) ||
++        means3d.numel() != static_cast<int64_t>(num_points) * 3 ||
++        !isGpuFloat(scales) ||
++        scales.numel() != static_cast<int64_t>(num_points) * 3 ||
++        !isGpuFloat(quats) ||
++        quats.numel() != static_cast<int64_t>(num_points) * 4 ||
++        !isGpuFloat(viewmat) || viewmat.numel() != 16 ||
++        !isGpuFloat(projmat) || projmat.numel() != 16 ||
++        !isGpuFloat(features_dc) ||
++        features_dc.numel() != static_cast<int64_t>(num_points) * 3 ||
++        !isGpuFloat(features_rest) || features_rest.ndim() != 3 ||
++        features_rest.size(0) != num_points ||
++        features_rest.size(1) !=
++            static_cast<int64_t>((degree + 1) * (degree + 1) - 1) ||
++        features_rest.size(2) != 3 ||
++        !isGpuFloat(opacities) || opacities.numel() != num_points ||
++        !isGpuFloat(background) || background.numel() != 3) {
++        throw std::invalid_argument("msplat: isolation view inputs are invalid");
++    }
++    forward_pipeline(
++        num_points, means3d, scales, glob_scale,
++        quats, viewmat, projmat, fx, fy, cx, cy,
++        img_height, img_width, tile_bounds, clip_thresh,
++        degree, degrees_to_use, cam_pos, features_dc, features_rest,
++        opacities, background, true
++    );
++    g_isolation_prepared_view = IsolationPreparedView {
++        IsolationPreparedState::pendingSync,
++        num_points,
++        img_height,
++        img_width,
++    };
++}
++
++void msplat_lift_isolation_stripe(
++    unsigned img_height, unsigned img_width,
++    MTensor &mask_labels, MTensor &selected_gaussians, bool use_selection,
++    unsigned row_start, unsigned row_count,
++    MTensor &records, MTensor &record_counts, MTensor &soft_alpha,
++    MTensor &isolation_status
++) {
++    const uint64_t imagePixels =
++        static_cast<uint64_t>(img_height) * static_cast<uint64_t>(img_width);
++    const uint64_t stripePixels =
++        static_cast<uint64_t>(row_count) * static_cast<uint64_t>(img_width);
++    constexpr uint64_t recordBytesPerPixel =
++        MSPLAT_ISOLATION_RECORDS_PER_PIXEL *
++        sizeof(MsplatIsolationContributionRecord);
++    const bool recordBytesOverflow =
++        stripePixels > std::numeric_limits<uint64_t>::max() / recordBytesPerPixel;
++    const uint64_t recordBytes =
++        recordBytesOverflow ? 0 : stripePixels * recordBytesPerPixel;
++    if (g_isolation_prepared_view.state != IsolationPreparedState::ready ||
++        g_isolation_prepared_view.imageHeight != img_height ||
++        g_isolation_prepared_view.imageWidth != img_width ||
++        img_height == 0 || img_width == 0 ||
++        imagePixels > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
++        stripePixels > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
++        recordBytesOverflow ||
++        recordBytes > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
++        row_count == 0 || row_start >= img_height ||
++        row_count > img_height - row_start ||
++        !mask_labels.isGpu() || mask_labels.dtype() != DType::UInt8 ||
++        mask_labels.ndim() != 2 ||
++        mask_labels.size(0) != img_height || mask_labels.size(1) != img_width ||
++        mask_labels.numel() != static_cast<int64_t>(imagePixels) ||
++        !selected_gaussians.isGpu() ||
++        selected_gaussians.dtype() != DType::UInt8 ||
++        selected_gaussians.ndim() != 1 ||
++        selected_gaussians.numel() != g_isolation_prepared_view.numPoints ||
++        !records.isGpu() || records.dtype() != DType::UInt8 ||
++        records.nbytes() < static_cast<size_t>(recordBytes) ||
++        !record_counts.isGpu() || record_counts.dtype() != DType::Int32 ||
++        record_counts.numel() < static_cast<int64_t>(stripePixels) ||
++        !soft_alpha.isGpu() || soft_alpha.dtype() != DType::Float32 ||
++        soft_alpha.numel() < static_cast<int64_t>(stripePixels) ||
++        !isolation_status.isGpu() || isolation_status.dtype() != DType::Int32 ||
++        isolation_status.numel() != 1) {
++        throw std::invalid_argument("msplat: isolation stripe buffers are invalid");
++    }
++
++    MetalContext *ctx = get_global_context();
++    auto tileBounds = std::make_shared<std::array<uint32_t, 4>>(
++        std::array<uint32_t, 4> {
++            static_cast<uint32_t>(
++                (static_cast<uint64_t>(img_width) + BLOCK_X - 1) / BLOCK_X
++            ),
++            static_cast<uint32_t>(
++                (static_cast<uint64_t>(img_height) + BLOCK_Y - 1) / BLOCK_Y
++            ),
++            1u,
++            0xDEADu,
++        }
++    );
++    auto imageSize = std::make_shared<std::array<uint32_t, 4>>(
++        std::array<uint32_t, 4> {img_width, img_height, 1u, 0xDEADu}
++    );
++    const uint32_t useSelection = use_selection ? 1u : 0u;
++    const uint32_t rowStart = row_start;
++    const uint32_t rowCount = row_count;
++    const NSUInteger threadWidth = 16;
++    const NSUInteger threadHeight = std::min<NSUInteger>(
++        16,
++        ctx->isolation_lift_stripe_kernel_cpso.maxTotalThreadsPerThreadgroup /
++            threadWidth
++    );
++    if (threadHeight == 0) {
++        throw std::runtime_error(
++            "msplat: isolation kernel threadgroup limit is unsupported"
++        );
++    }
++    id<MTLCommandBuffer> commandBuffer = ctx->getCommandBuffer();
++    assert(commandBuffer && "Failed to retrieve isolation command buffer");
++    dispatch_sync(ctx->d_queue, ^(){
++        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
++        [blit fillBuffer:isolation_status.buffer()
++                   range:NSMakeRange(0, isolation_status.nbytes())
++                   value:0];
++        [blit endEncoding];
++
++        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
++        assert(encoder && "Failed to create isolation compute encoder");
++        [encoder setComputePipelineState:ctx->isolation_lift_stripe_kernel_cpso];
++        [encoder setBytes:tileBounds->data() length:sizeof(*tileBounds) atIndex:0];
++        [encoder setBytes:imageSize->data() length:sizeof(*imageSize) atIndex:1];
++        ENC_BUF(encoder, g_tcache.tile_bins, 2);
++        ENC_BUF(encoder, g_tcache.gaussian_ids, 3);
++        ENC_BUF(encoder, g_tcache.packed_xy_opac, 4);
++        ENC_BUF(encoder, g_tcache.packed_conic, 5);
++        ENC_BUF(encoder, mask_labels, 6);
++        ENC_BUF(encoder, selected_gaussians, 7);
++        ENC_SCALAR(encoder, useSelection, 8);
++        ENC_SCALAR(encoder, rowStart, 9);
++        ENC_SCALAR(encoder, rowCount, 10);
++        ENC_BUF(encoder, records, 11);
++        ENC_BUF(encoder, record_counts, 12);
++        ENC_BUF(encoder, soft_alpha, 13);
++        ENC_BUF(encoder, isolation_status, 14);
++        ENC_BUF(encoder, g_tcache.raster_stats, 15);
++        [encoder dispatchThreads:MTLSizeMake(img_width, row_count, 1)
++            threadsPerThreadgroup:MTLSizeMake(threadWidth, threadHeight, 1)];
++        [encoder endEncoding];
++    });
++}
++
+ std::tuple<MTensor, float> msplat_train_step(
+     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
+     MTensor &quats, MTensor &viewmat, MTensor &projmat,
+@@ -2631,6 +2895,7 @@ std::tuple<MTensor, float> msplat_train_step(
+     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
+     float inv_max_dim
+ ) {
++    invalidate_isolation_prepared_view();
+     MetalContext* ctx = get_global_context();
+     int tile_bounds_x = std::get<0>(tile_bounds);
+     int tile_bounds_y = std::get<1>(tile_bounds);

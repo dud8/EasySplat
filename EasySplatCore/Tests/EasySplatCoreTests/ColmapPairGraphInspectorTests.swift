@@ -59,6 +59,188 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         ), 57)
     }
 
+    func testViableDominantComponentPolicyBoundaries() {
+        func viable(_ componentViewCounts: [Int], total: Int) -> Int? {
+            PairGraphConnectivityPolicy.viableDominantViewCount(
+                totalViewCount: total,
+                componentViewCounts: componentViewCounts,
+                connectedComponentCount: componentViewCounts.count,
+                isolatedViewCount: componentViewCounts.count(where: { $0 == 1 }),
+                descriptorlessViewCount: 0
+            )
+        }
+        XCTAssertEqual(viable([18, 1, 1, 1, 1], total: 22), 18)
+        XCTAssertEqual(viable([12, 10], total: 22), 12)
+        XCTAssertEqual(viable([8, 1, 1], total: 10), 8)
+        XCTAssertEqual(viable([10] + Array(repeating: 1, count: 50), total: 60), 10)
+        XCTAssertNil(viable([7, 1, 1], total: 9))
+        XCTAssertNil(viable([10, 10], total: 20))
+        XCTAssertNil(viable(Array(repeating: 1, count: 8), total: 8))
+    }
+
+    func testAdmissibleDominantComponentPolicyPrefersStrictThenViable() {
+        func admissible(_ componentViewCounts: [Int], total: Int) -> Int? {
+            PairGraphConnectivityPolicy.admissibleDominantViewCount(
+                totalViewCount: total,
+                componentViewCounts: componentViewCounts,
+                connectedComponentCount: componentViewCounts.count,
+                isolatedViewCount: componentViewCounts.count(where: { $0 == 1 }),
+                descriptorlessViewCount: 0
+            )
+        }
+        XCTAssertEqual(admissible([54, 1, 1, 1, 1, 1, 1], total: 60), 54)
+        XCTAssertEqual(admissible([18, 1, 1, 1, 1], total: 22), 18)
+        XCTAssertEqual(admissible([12, 10], total: 22), 12)
+        XCTAssertNil(admissible([7, 1, 1], total: 9))
+        // Legacy tiny strict acceptances stay admissible below the viability floor.
+        XCTAssertEqual(admissible([2], total: 2), 2)
+        XCTAssertEqual(admissible([5, 1], total: 6), nil)
+        XCTAssertEqual(admissible([6, 1], total: 7), nil)
+    }
+
+    func testViableDominantVerifiedComponentFollowsPolicyFloors() {
+        XCTAssertTrue(
+            makeInspection(componentSizes: [8, 1, 1, 1]).hasViableDominantVerifiedComponent
+        )
+        XCTAssertTrue(
+            makeInspection(componentSizes: [12, 10]).hasViableDominantVerifiedComponent
+        )
+        XCTAssertFalse(
+            makeInspection(componentSizes: [7, 1]).hasViableDominantVerifiedComponent
+        )
+        XCTAssertFalse(
+            makeInspection(componentSizes: [10, 10]).hasViableDominantVerifiedComponent
+        )
+        XCTAssertFalse(
+            makeInspection(
+                componentSizes: [18, 1, 1, 1, 1],
+                connectedComponentCount: 3
+            ).hasViableDominantVerifiedComponent
+        )
+    }
+
+    func testViableAcceptanceClassifierMatchesTheStrictPolicy() {
+        func measurement(
+            _ counts: [Int],
+            policy: ResolvedPairingPolicy = .unorderedRetrieval,
+            recoveryLevel: PairGraphRecoveryLevel = .normal
+        ) -> PairGraphMeasurement {
+            PairGraphMeasurement(
+                pairingPolicy: policy,
+                scheduledPairCount: 231,
+                attemptedPairCount: 231,
+                rawMatchedPairCount: 100,
+                spatiallyVerifiedPairCount: 100,
+                localPairCount: 231,
+                retrievalPairCount: 0,
+                loopRevisitPairCount: 0,
+                connectedComponentCount: counts.count,
+                isolatedViewCount: counts.count(where: { $0 == 1 }),
+                descriptorlessViewCount: 0,
+                componentViewCounts: counts,
+                articulationViewCount: 0,
+                biconnectedBlockCount: 1,
+                largestBiconnectedBlockViewCount: counts.first ?? 0,
+                secondLargestBiconnectedBlockViewCount: 0,
+                degreeP10: 0,
+                degreeMedian: 1,
+                degreeP90: 2,
+                matcherAttempts: [PairMatchingAttemptArtifact(
+                    attemptNumber: 1,
+                    matcher: .faiss,
+                    recoveryLevel: recoveryLevel,
+                    outcome: .completed,
+                    scheduledPairCount: 231,
+                    attemptedPairCount: 231,
+                    rawMatchedPairCount: 100,
+                    spatiallyVerifiedPairCount: 100,
+                    durationSeconds: 1
+                )],
+                pairListDigest: String(repeating: "d", count: 64),
+                featureDatabaseDigest: String(repeating: "e", count: 64),
+                matchingDatabaseDigest: String(repeating: "f", count: 64),
+                matchingDurationSeconds: 1
+            )
+        }
+
+        // Below the strict fraction: only the terminal continuation accepts.
+        XCTAssertTrue(measurement([18, 1, 1, 1, 1]).usedViableDominantAcceptance)
+        XCTAssertTrue(measurement([12, 10]).usedViableDominantAcceptance)
+        XCTAssertTrue(measurement([20, 2]).usedViableDominantAcceptance)
+
+        // Strict fraction passes ([57, 3] is exactly 95%), but unordered
+        // minors were never strictly acceptable, nor were ordered minors at
+        // the normal recovery level.
+        XCTAssertTrue(measurement([57, 3]).usedViableDominantAcceptance)
+        XCTAssertTrue(
+            measurement([57, 3], policy: .orderedOrbit).usedViableDominantAcceptance
+        )
+
+        // Strict acceptances stay quiet.
+        XCTAssertFalse(measurement([9, 1]).usedViableDominantAcceptance)
+        XCTAssertFalse(measurement([22]).usedViableDominantAcceptance)
+        XCTAssertFalse(
+            measurement(
+                [57, 3],
+                policy: .orderedOrbit,
+                recoveryLevel: .expanded
+            ).usedViableDominantAcceptance
+        )
+
+        // The artifact-level classifier adds the camera-solve shortfall: a
+        // registered count below the strict fraction of the admitted views
+        // warns even when the pair graph itself was strictly accepted.
+        func artifact(registered: Int, total: Int, counts: [Int]) -> GeometryArtifact {
+            var artifact = makeGeometryArtifact()
+            artifact.totalViewCount = total
+            artifact.registeredViewCount = registered
+            artifact.pairGraph = PairGraphArtifact(
+                status: .measured,
+                measurement: measurement(counts)
+            )
+            return artifact
+        }
+        // Matching-side continuation alone.
+        XCTAssertTrue(
+            artifact(registered: 18, total: 22, counts: [18, 1, 1, 1, 1])
+                .usedPartialCoverageAcceptance
+        )
+        // Solve shortfall under a viable graph (integration-test shape).
+        XCTAssertTrue(
+            artifact(registered: 8, total: 12, counts: [10, 1, 1])
+                .usedPartialCoverageAcceptance
+        )
+        // Solve shortfall under a strict graph.
+        XCTAssertTrue(
+            artifact(registered: 16, total: 22, counts: [22])
+                .usedPartialCoverageAcceptance
+        )
+        XCTAssertTrue(
+            artifact(registered: 9, total: 12, counts: [11, 1])
+                .usedPartialCoverageAcceptance
+        )
+        // Strict solves stay quiet, including at the exact boundary.
+        XCTAssertFalse(
+            artifact(registered: 22, total: 22, counts: [22])
+                .usedPartialCoverageAcceptance
+        )
+        XCTAssertFalse(
+            artifact(registered: 20, total: 22, counts: [22])
+                .usedPartialCoverageAcceptance
+        )
+        XCTAssertFalse(
+            artifact(registered: 10, total: 12, counts: [11, 1])
+                .usedPartialCoverageAcceptance
+        )
+        // No measurement (learned-provenance artifacts): the strict fraction
+        // over the selected count decides.
+        var unmeasured = makeGeometryArtifact()
+        unmeasured.pairGraph = PairGraphArtifact(status: .notEvaluated, measurement: nil)
+        unmeasured.totalViewCount = 22
+        unmeasured.registeredViewCount = 22
+        XCTAssertFalse(unmeasured.usedPartialCoverageAcceptance)
+    }
+
     func testOrderedDominantComponentPolicyAcceptsMinorVerifiedComponents() {
         let inspection = makeInspection(componentSizes: [239, 2, 2, 1, 1, 1, 1, 1, 1, 1])
 

@@ -1,0 +1,96 @@
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -1468,32 +1468,39 @@
+             float2 v_xy_local = {0.f, 0.f};
+             float v_opacity_local = 0.f;
+             //initialize everything to 0, only set if the lane is valid
+-            if(valid && alpha<0.999f){
++            if(valid){
+                 // compute the current T for this gaussian
+-                // alpha = opac * vis (guaranteed since alpha < 0.99 = min cap)
+                 float ra = 1.f / (1.f - alpha);
+                 T *= ra;
+                 const float fac = alpha * T;
+-                float v_alpha = 0.f;
+                 v_rgb_local = fac * v_out;
+ 
+                 // b_rgb has raw SH output; clamp inline: max(raw + 0.5, 0)
+                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
+                 // contribution from this pixel + background
+-                v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
++                const float v_alpha = dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
+                 // update the running sum
+                 buffer = fma(rgb, fac, buffer);
+ 
+-                // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
+-                const float v_sigma = -alpha * v_alpha;
+-                v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
+-                                                           delta.x * delta.y,
+-                                                           delta.y * delta.y);
+-                v_xy_local = v_sigma * float2(
+-                    fma(b_conic.x, delta.x, b_conic.y * delta.y),
+-                    fma(b_conic.y, delta.x, b_conic.z * delta.y));
+-                // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
+-                v_opacity_local = -v_sigma * (1.f - opac);
++                // Where the forward's min(0.999, opac * vis) cap binds, alpha no longer
++                // depends on sigma or opacity, so those gradients are genuinely zero. The
++                // transmittance and the running sum are not: the gaussian still occluded
++                // everything behind it and still contributed its colour. Skipping the whole
++                // block left T un-restored, so every nearer gaussian along the ray inherited
++                // a transmittance short by a factor of (1 - alpha) - up to 1000x - and its
++                // gradients with it.
++                if (alpha < 0.999f) {
++                    // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
++                    const float v_sigma = -alpha * v_alpha;
++                    v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
++                                                               delta.x * delta.y,
++                                                               delta.y * delta.y);
++                    v_xy_local = v_sigma * float2(
++                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
++                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
++                    // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
++                    v_opacity_local = -v_sigma * (1.f - opac);
++                }
+             }
+ 
+             v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
+@@ -3879,25 +3886,28 @@
+             float2 v_xy_local = {0.f, 0.f};
+             float v_opacity_local = 0.f;
+ 
+-            if (valid && alpha < 0.999f) {
++            if (valid) {
+                 float ra = 1.f / (1.f - alpha);
+                 T *= ra;
+                 const float fac = alpha * T;
+-                float v_alpha = 0.f;
+                 v_rgb_local = fac * v_out;
+ 
+                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
+-                v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
++                const float v_alpha = dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
+                 buffer = fma(rgb, fac, buffer);
+ 
+-                const float v_sigma = -alpha * v_alpha;
+-                v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
+-                                                           delta.x * delta.y,
+-                                                           delta.y * delta.y);
+-                v_xy_local = v_sigma * float2(
+-                    fma(b_conic.x, delta.x, b_conic.y * delta.y),
+-                    fma(b_conic.y, delta.x, b_conic.z * delta.y));
+-                v_opacity_local = -v_sigma * (1.f - opac);
++                // See the fast path: where the forward's alpha cap binds, sigma and opacity
++                // gradients vanish but T and the running sum must still advance.
++                if (alpha < 0.999f) {
++                    const float v_sigma = -alpha * v_alpha;
++                    v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
++                                                               delta.x * delta.y,
++                                                               delta.y * delta.y);
++                    v_xy_local = v_sigma * float2(
++                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
++                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
++                    v_opacity_local = -v_sigma * (1.f - opac);
++                }
+             }
+ 
+             v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);

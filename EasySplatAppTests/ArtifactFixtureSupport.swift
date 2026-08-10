@@ -337,6 +337,79 @@ func persistCompletedAppTestArtifacts(
     _ = try ProjectArtifactSnapshotStore.load(projectURL: paths.root)
 }
 
+@discardableResult
+func publishAppTestResultFixture(
+    sourceURL: URL,
+    paths: ProjectPaths,
+    metadata suppliedMetadata: ProjectMetadata,
+    publicationID: UUID = UUID(),
+    publishedAt: Date = Date(timeIntervalSince1970: 1_767_225_600)
+) throws -> ValidatedPublishedResult {
+    var metadata = suppliedMetadata
+    let plan = metadata.resolvedRunPlan ?? RunPlanResolver.resolve(
+        requestedOptions: metadata.requestedRunOptions,
+        input: metadata.input,
+        hardware: HardwareProfile(
+            memoryGB: 48,
+            cpuCount: 16,
+            gpuWorkingSetGB: 36
+        ),
+        developmentOverrides: .none
+    )
+    metadata.resolvedRunPlan = plan
+    metadata.state = PipelineState(stage: .exportSplat, lastError: nil)
+    metadata.checkpoint = nil
+    metadata.lastRunStartedAt = Date(timeIntervalSince1970: 1_767_225_000)
+    metadata.pendingPublicationID = publicationID
+    var stageTimings = metadata.stageTimings ?? []
+    if !stageTimings.contains(where: { $0.stage == .trainSplat }) {
+        stageTimings.append(
+            StageTimingRecord(
+                stage: .trainSplat,
+                startedAt: Date(timeIntervalSince1970: 1_767_225_500),
+                durationSeconds: 1
+            )
+        )
+    }
+    metadata.stageTimings = stageTimings
+
+    try FileManager.default.createDirectory(
+        at: paths.msplatOutputURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    if FileManager.default.fileExists(atPath: paths.msplatOutputURL.path) {
+        try FileManager.default.removeItem(at: paths.msplatOutputURL)
+    }
+    try FileManager.default.copyItem(at: sourceURL, to: paths.msplatOutputURL)
+    var training = try makeCompletedTrainingArtifact(
+        for: paths.msplatOutputURL,
+        metadata: metadata
+    )
+    training.outputPath = "Training/msplat/splat.ply"
+    try persistCompletedAppTestArtifacts(
+        metadata: metadata,
+        paths: paths,
+        trainingArtifact: training
+    )
+    let geometry = try GeometryArtifactStore.loadManifest(
+        from: paths.geometryManifestURL,
+        projectPaths: paths
+    )
+    let result = try PublishedResultPublisher.publishCompletedTraining(
+        metadata: metadata,
+        resolvedRunPlan: plan,
+        geometry: geometry,
+        paths: paths,
+        publicationID: publicationID,
+        publishedAt: publishedAt
+    )
+    metadata.pendingPublicationID = nil
+    metadata.lastRunStartedAt = nil
+    metadata.state = PipelineState(stage: .done, lastError: nil)
+    try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+    return result
+}
+
 private func makeAppTestWorkerEvidence(
     plan: ResolvedRunPlan,
     runtimeClosure: ColmapRuntimeClosureEvidence,

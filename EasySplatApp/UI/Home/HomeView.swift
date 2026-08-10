@@ -2,47 +2,131 @@ import EasySplatCore
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum InputImporterRequest: Equatable {
+    case addFiles
+    case addFolders
+    case replaceFiles
+    case replaceFolders
+
+    var selectionMode: InputSelectionMode {
+        switch self {
+        case .addFiles, .addFolders: .append
+        case .replaceFiles, .replaceFolders: .replace
+        }
+    }
+
+    var allowedContentTypes: [UTType] {
+        switch self {
+        case .addFolders, .replaceFolders:
+            [.folder]
+        case .addFiles, .replaceFiles:
+            [.image, .movie, .video, .mpeg4Movie, .quickTimeMovie, .zip]
+        }
+    }
+
+    var failureMessage: String {
+        switch self {
+        case .addFolders, .replaceFolders: "Couldn’t choose folder."
+        case .addFiles, .replaceFiles: "Couldn’t choose input"
+        }
+    }
+}
+
+struct InputImporterPresentation {
+    private(set) var request: InputImporterRequest?
+    private(set) var isPresented = false
+
+    mutating func present(_ request: InputImporterRequest) {
+        guard self.request == nil else { return }
+        self.request = request
+        isPresented = true
+    }
+
+    /// SwiftUI can lower the binding before either terminal callback arrives.
+    /// Keep the typed request until completion or cancellation consumes it.
+    mutating func presentationChanged(_ isPresented: Bool) {
+        self.isPresented = isPresented && request != nil
+    }
+
+    mutating func finish() -> InputImporterRequest? {
+        let finishedRequest = request
+        clear()
+        return finishedRequest
+    }
+
+    mutating func cancel() {
+        clear()
+    }
+
+    private mutating func clear() {
+        request = nil
+        isPresented = false
+    }
+}
+
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var showInputImporter = false
-    @State private var replaceInputOnImport = false
+    @State private var inputImporter = InputImporterPresentation()
     @State private var showLowDiskWarning = false
     @State private var optionsExpanded = false
+    @FocusState private var isDropZoneFocused: Bool
 
     private var hasInput: Bool {
-        !model.pendingVideoURLs.isEmpty || model.pendingPhotosFolderURL != nil
+        Self.hasSelectableInput(
+            hasMedia: !model.pendingVideoURLs.isEmpty || !model.pendingPhotoURLs.isEmpty,
+            hasDataset: model.pendingDataset != nil
+        )
+    }
+
+    /// Gates the Create Splat button: media and datasets are both valid
+    /// starting points.
+    nonisolated static func hasSelectableInput(hasMedia: Bool, hasDataset: Bool) -> Bool {
+        hasMedia || hasDataset
     }
 
     private var hasPhotos: Bool {
-        model.pendingPhotosFolderURL != nil
+        !model.pendingPhotoURLs.isEmpty
+    }
+
+    private var isDataset: Bool {
+        model.pendingDataset != nil
+    }
+
+    private var visibleOptionSections: VisibleOptionSections {
+        Self.visibleOptionSections(forDataset: isDataset)
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Spacing.large) {
-                VStack(alignment: .leading, spacing: Theme.Spacing.small) {
-                    Text("Create a 3D splat")
-                        .font(.largeTitle.weight(.semibold))
-                        .accessibilityAddTraits(.isHeader)
-                    Text("Choose a video or a folder of photos.")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
-                }
+                Text("Create a 3D splat")
+                    .font(.largeTitle.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
 
                 DropZoneView(
                     title: "Choose Input…",
-                    subtitle: "or drop a video or photos folder here",
-                    onChoose: { presentInputImporter(replacing: false) },
-                    onDropURLs: { model.addInputs(urls: $0) }
+                    subtitle: "or drop videos, photos, folders, or a dataset here",
+                    onChoose: { presentInputImporter(.addFiles) },
+                    onDropBatch: { model.addDroppedInputs($0) }
                 )
                 .frame(height: 180)
+                .focused($isDropZoneFocused)
                 .accessibilityIdentifier("home.chooseInput")
+
+                HStack {
+                    Spacer()
+                    Button("Choose Folder…") {
+                        presentInputImporter(.addFolders)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier("home.chooseFolder")
+                }
 
                 if hasInput {
                     selectedInputs
                 }
 
-                DisclosureGroup(isExpanded: $optionsExpanded) {
+                DisclosureSection(isExpanded: $optionsExpanded) {
                     optionControls
                         .padding(.top, Theme.Spacing.medium)
                 } label: {
@@ -54,6 +138,8 @@ struct HomeView: View {
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
+                                .truncationMode(.tail)
+                                .help(optionsSummary)
                         }
                     }
                 }
@@ -66,7 +152,8 @@ struct HomeView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                if let input = model.buildInputSpec(),
+                if !isDataset,
+                   let input = model.buildInputSpec(),
                    let prediction = RunDurationPredictor.predict(
                        options: model.requestedRunOptions,
                        input: input,
@@ -94,24 +181,18 @@ struct HomeView: View {
             .padding(Theme.Spacing.extraLarge)
             .frame(maxWidth: .infinity, alignment: .top)
         }
+        .pageScrollEdgeEffect()
+        .defaultFocus($isDropZoneFocused, true)
         .fileImporter(
-            isPresented: $showInputImporter,
-            allowedContentTypes: [
-                .folder,
-                .movie,
-                .video,
-                .mpeg4Movie,
-                .quickTimeMovie
-            ],
-            allowsMultipleSelection: true
-        ) { result in
-            defer { replaceInputOnImport = false }
-            guard case let .success(urls) = result else { return }
-            if replaceInputOnImport {
-                model.clearPendingInputs()
-            }
-            model.addInputs(urls: urls)
-        }
+            isPresented: Binding(
+                get: { inputImporter.isPresented },
+                set: { inputImporter.presentationChanged($0) }
+            ),
+            allowedContentTypes: inputImporter.request?.allowedContentTypes ?? [],
+            allowsMultipleSelection: true,
+            onCompletion: { result in handleImport(result) },
+            onCancellation: { inputImporter.cancel() }
+        )
         .alert("Low disk space", isPresented: $showLowDiskWarning) {
             Button("Create Anyway") {
                 model.startFromPendingSelection()
@@ -129,23 +210,41 @@ struct HomeView: View {
                     .font(.headline)
                 Spacer()
                 Button("Replace Input…") {
-                    presentInputImporter(replacing: true)
+                    presentInputImporter(.replaceFiles)
+                }
+                .buttonStyle(.borderless)
+                Button("Replace with Folder…") {
+                    presentInputImporter(.replaceFolders)
                 }
                 .buttonStyle(.borderless)
             }
 
-            if let folder = model.pendingPhotosFolderURL {
-                inputRow(name: folder.lastPathComponent, systemImage: "folder") {
-                    model.removePhotoFolder()
+            if let dataset = model.pendingDataset {
+                inputRow(name: datasetRowName(dataset), systemImage: "cube.transparent") {
+                    model.removeDataset()
                 }
-            }
+            } else {
+                if !model.pendingPhotoURLs.isEmpty {
+                    let count = model.pendingPhotoURLs.count
+                    inputRow(name: "\(count) \(count == 1 ? "photo" : "photos")", systemImage: "photo") {
+                        model.removeAllPhotos()
+                    }
+                }
 
-            ForEach(Array(model.pendingVideoURLs.enumerated()), id: \.element) { index, url in
-                inputRow(name: url.lastPathComponent, systemImage: "film") {
-                    model.pendingVideoURLs.remove(at: index)
+                ForEach(Array(model.pendingVideoURLs.enumerated()), id: \.element) { index, url in
+                    inputRow(name: url.lastPathComponent, systemImage: "film") {
+                        model.removeVideo(at: IndexSet(integer: index))
+                    }
                 }
             }
         }
+    }
+
+    private func datasetRowName(_ dataset: PendingDataset) -> String {
+        guard let imageCount = dataset.imageCount else {
+            return dataset.kind.displayName
+        }
+        return "\(dataset.kind.displayName) · \(imageCount) images"
     }
 
     private func inputRow(name: String, systemImage: String, remove: @escaping () -> Void) -> some View {
@@ -168,15 +267,18 @@ struct HomeView: View {
     }
 
     private var optionControls: some View {
-        VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
-            optionRow("Capture Path") {
-                Picker("Capture Path", selection: $model.requestedRunOptions.capturePath) {
-                    Text("Automatic").tag(CapturePath.automatic)
-                    Text("Around a subject").tag(CapturePath.orbit)
-                    Text("Through a space").tag(CapturePath.walkthrough)
-                    Text("Across a large area").tag(CapturePath.largeArea)
+        let sections = visibleOptionSections
+        return VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
+            if sections.capturePath {
+                optionRow("Capture Path") {
+                    Picker("Capture Path", selection: $model.requestedRunOptions.capturePath) {
+                        Text("Automatic").tag(CapturePath.automatic)
+                        Text("Around a subject").tag(CapturePath.orbit)
+                        Text("Through a space").tag(CapturePath.walkthrough)
+                        Text("Across a large area").tag(CapturePath.largeArea)
+                    }
+                    .accessibilityIdentifier("home.capturePath")
                 }
-                .accessibilityIdentifier("home.capturePath")
             }
 
             optionRow("Detail") {
@@ -192,40 +294,49 @@ struct HomeView: View {
                 .accessibilityIdentifier("home.detail")
             }
             if let explanation = Self.detailAvailabilityHelp(memoryGB: memoryGB) {
-                Text(explanation)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    Text(explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 260, alignment: .leading)
+                }
             }
 
-            optionRow("Camera Source") {
-                Picker("Camera Source", selection: $model.requestedRunOptions.cameraGrouping) {
-                    Text("Automatic").tag(CameraGrouping.automatic)
-                    Text("Same camera and lens").tag(CameraGrouping.sameCameraAndLens)
-                    Text("Mixed cameras or lenses").tag(CameraGrouping.mixedCamerasOrLenses)
+            if sections.cameraGrouping {
+                optionRow("Camera Source") {
+                    Picker("Camera Source", selection: $model.requestedRunOptions.cameraGrouping) {
+                        Text("Automatic").tag(CameraGrouping.automatic)
+                        Text("Same camera and lens").tag(CameraGrouping.sameCameraAndLens)
+                        Text("Mixed cameras or lenses").tag(CameraGrouping.mixedCamerasOrLenses)
+                    }
+                    .accessibilityIdentifier("home.cameraSource")
                 }
-                .accessibilityIdentifier("home.cameraSource")
             }
 
-            optionRow("Lens") {
-                Picker("Lens", selection: $model.requestedRunOptions.lensProjection) {
-                    Text("Automatic").tag(LensProjection.automatic)
-                    Text("Perspective").tag(LensProjection.perspective)
-                    Text("Fisheye").tag(LensProjection.fisheye)
+            if sections.lensProjection {
+                optionRow("Lens") {
+                    Picker("Lens", selection: $model.requestedRunOptions.lensProjection) {
+                        Text("Automatic").tag(LensProjection.automatic)
+                        Text("Perspective").tag(LensProjection.perspective)
+                        Text("Fisheye").tag(LensProjection.fisheye)
+                    }
+                    .accessibilityIdentifier("home.lens")
                 }
-                .accessibilityIdentifier("home.lens")
             }
 
-            optionRow("Input Order") {
-                Picker("Input Order", selection: $model.requestedRunOptions.inputOrdering) {
-                    Text("Automatic").tag(InputOrdering.automatic)
-                    Text("Continuous sequence")
-                        .tag(InputOrdering.continuous)
-                        .disabled(!continuousOrderingIsAvailable)
-                        .help(continuousOrderingHelp)
-                    Text("Unordered").tag(InputOrdering.unordered)
+            if sections.inputOrdering {
+                optionRow("Input Order") {
+                    Picker("Input Order", selection: $model.requestedRunOptions.inputOrdering) {
+                        Text("Automatic").tag(InputOrdering.automatic)
+                        Text("Continuous sequence")
+                            .tag(InputOrdering.continuous)
+                            .disabled(!continuousOrderingIsAvailable)
+                            .help(continuousOrderingHelp)
+                        Text("Unordered").tag(InputOrdering.unordered)
+                    }
+                    .accessibilityIdentifier("home.inputOrder")
                 }
-                .accessibilityIdentifier("home.inputOrder")
             }
 
             optionRow("Resource Use") {
@@ -261,7 +372,9 @@ struct HomeView: View {
     }
 
     private var continuousOrderingIsAvailable: Bool {
-        guard let input = model.buildInputSpec() else { return true }
+        // Ordering is inert for datasets, and their input spec should never be
+        // read as media here; the row itself is hidden in that case.
+        guard !isDataset, let input = model.buildInputSpec() else { return true }
         return RunPlanResolver.supports(inputOrdering: .continuous, input: input)
     }
 
@@ -298,35 +411,60 @@ struct HomeView: View {
             content()
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(width: 260, alignment: .trailing)
+                .accessibilityLabel(Text(title))
+                .frame(width: 260, alignment: .leading)
         }
     }
 
     private var optionsSummary: String {
         let options = model.requestedRunOptions
+        let sections = visibleOptionSections
         var parts = [Self.detailLabel(options.detailProfile)]
-        if options.capturePath != .automatic {
+        if sections.capturePath, options.capturePath != .automatic {
             parts.append(Self.captureLabel(options.capturePath))
         }
-        if options.cameraGrouping != .automatic {
+        if sections.cameraGrouping, options.cameraGrouping != .automatic {
             parts.append(Self.cameraLabel(options.cameraGrouping))
         }
-        if options.lensProjection != .automatic {
+        if sections.lensProjection, options.lensProjection != .automatic {
             parts.append(Self.lensLabel(options.lensProjection))
         }
-        if options.inputOrdering != .automatic {
+        if sections.inputOrdering, options.inputOrdering != .automatic {
             parts.append(Self.orderLabel(options.inputOrdering))
         }
         if options.resourcePolicy != .automatic {
             parts.append(Self.resourceLabel(options.resourcePolicy))
         }
-        if hasPhotos, options.photoSelection == .useAllValidPhotos {
+        if !isDataset, hasPhotos, options.photoSelection == .useAllValidPhotos {
             parts.append("All valid photos")
         }
         if parts.count == 1 {
             parts.append("Automatic")
         }
         return parts.joined(separator: " · ")
+    }
+
+    /// Which option sections a given input surfaces. Datasets fixed their
+    /// capture, ordering, and camera decisions upstream, so only Detail and
+    /// Resource Use remain meaningful; media inputs show the full set.
+    struct VisibleOptionSections: Equatable {
+        var capturePath: Bool
+        var detail: Bool
+        var cameraGrouping: Bool
+        var lensProjection: Bool
+        var inputOrdering: Bool
+        var resourceUse: Bool
+    }
+
+    nonisolated static func visibleOptionSections(forDataset: Bool) -> VisibleOptionSections {
+        VisibleOptionSections(
+            capturePath: !forDataset,
+            detail: true,
+            cameraGrouping: !forDataset,
+            lensProjection: !forDataset,
+            inputOrdering: !forDataset,
+            resourceUse: true
+        )
     }
 
     nonisolated static func detailLabel(_ value: DetailProfile) -> String {
@@ -378,9 +516,17 @@ struct HomeView: View {
         }
     }
 
-    private func presentInputImporter(replacing: Bool) {
-        replaceInputOnImport = replacing
-        showInputImporter = true
+    private func presentInputImporter(_ request: InputImporterRequest) {
+        inputImporter.present(request)
+    }
+
+    private func handleImport(_ result: Result<[URL], any Error>) {
+        guard let request = inputImporter.finish() else { return }
+        model.handleInputImporterResult(
+            result,
+            mode: request.selectionMode,
+            failureMessage: request.failureMessage
+        )
     }
 
     private func start() {

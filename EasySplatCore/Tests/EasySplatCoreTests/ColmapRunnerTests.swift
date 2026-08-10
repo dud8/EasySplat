@@ -1016,6 +1016,7 @@ final class ColmapRunnerTests: XCTestCase {
                     XCTAssertEqual(self.value(for: "--num_rounds", in: args), "1")
                     XCTAssertEqual(self.value(for: "--num_checks", in: args), "64")
                     XCTAssertEqual(self.value(for: "--num_threads", in: args), "6")
+                    XCTAssertEqual(self.value(for: "--memory_budget_bytes", in: args), "8589934592")
                 }
             )
         ])
@@ -1031,7 +1032,8 @@ final class ColmapRunnerTests: XCTestCase {
                 returnedNeighborCount: 16,
                 minimumFrameSeparation: 25,
                 queryStride: 10,
-                threadCount: 6
+                threadCount: 6,
+                memoryBudgetBytes: 8_589_934_592
             ),
             pairContext: ColmapPairWorkerInvocationContext(
                 attemptOrdinal: 1,
@@ -1164,6 +1166,24 @@ final class ColmapRunnerTests: XCTestCase {
             queryStride: 1,
             threadCount: 0
         ))
+        for outOfRange in [
+            ColmapVocabularyRetrievalOptions.minimumMemoryBudgetBytes - 1,
+            ColmapVocabularyRetrievalOptions.maximumMemoryBudgetBytes + 1,
+        ] {
+            XCTAssertThrowsError(try ColmapVocabularyRetrievalOptions(
+                candidateCount: 20,
+                returnedNeighborCount: 8,
+                minimumFrameSeparation: 0,
+                queryStride: 1,
+                threadCount: 1,
+                memoryBudgetBytes: outOfRange
+            )) { error in
+                XCTAssertEqual(
+                    error as? ColmapVocabularyRetrievalOptionsValidationError,
+                    .memoryBudgetOutOfRange
+                )
+            }
+        }
     }
 
     func testExactRecoveryUsesBruteForceMatching() async throws {
@@ -1334,7 +1354,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertEqual(runner.calls.count, 1)
     }
 
-    func testModelConverterUsesTxtOutput() throws {
+    func testModelConverterUsesTxtOutput() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
@@ -1349,7 +1369,7 @@ final class ColmapRunnerTests: XCTestCase {
         ])
 
         let colmap = ColmapRunner(runner: runner)
-        try colmap.runModelConverter(
+        try await colmap.runModelConverter(
             colmapPath: URL(fileURLWithPath: "/mock/colmap"),
             inputPath: URL(fileURLWithPath: "/tmp/in"),
             outputPath: URL(fileURLWithPath: "/tmp/out"),
@@ -1357,7 +1377,7 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
-    func testModelConverterReportsNativeAutoWorkerEvidenceFromProcessReceipt() throws {
+    func testModelConverterReportsNativeAutoWorkerEvidenceFromProcessReceipt() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let runner = MockSubprocessRunner(scripts: [
@@ -1374,7 +1394,7 @@ final class ColmapRunnerTests: XCTestCase {
             evidence.append(invocation)
         }
 
-        try colmap.runModelConverter(
+        try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1414,7 +1434,7 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
-    func testModelConverterAcceptsColmap41AuxiliaryTextFiles() throws {
+    func testModelConverterAcceptsColmap41AuxiliaryTextFiles() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let runner = MockSubprocessRunner(scripts: [
@@ -1439,7 +1459,7 @@ final class ColmapRunnerTests: XCTestCase {
             evidence.append(invocation)
         }
 
-        try colmap.runModelConverter(
+        try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1452,7 +1472,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertNotNil(evidence.values.first?.modelConversion?.convertedModelDigest)
     }
 
-    func testModelConverterRejectsUnknownAuxiliaryTextFile() throws {
+    func testModelConverterRejectsUnknownAuxiliaryTextFile() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let runner = MockSubprocessRunner(scripts: [
@@ -1471,7 +1491,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1486,7 +1506,7 @@ final class ColmapRunnerTests: XCTestCase {
         }
     }
 
-    func testModelConverterRejectsSymlinkedColmap41AuxiliaryTextFile() throws {
+    func testModelConverterRejectsSymlinkedColmap41AuxiliaryTextFile() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let outside = fixture.root.appendingPathComponent("outside-frames.txt")
@@ -1511,7 +1531,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1526,7 +1546,7 @@ final class ColmapRunnerTests: XCTestCase {
         }
     }
 
-    func testModelConverterRejectsHardLinkedColmap41AuxiliaryTextFile() throws {
+    func testModelConverterRejectsHardLinkedColmap41AuxiliaryTextFile() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let outside = fixture.root.appendingPathComponent("outside-frames.txt")
@@ -1551,7 +1571,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1561,7 +1581,7 @@ final class ColmapRunnerTests: XCTestCase {
         ))
     }
 
-    func testModelConverterRejectsFifoColmap41AuxiliaryTextFileWithoutBlocking() throws {
+    func testModelConverterRejectsFifoColmap41AuxiliaryTextFileWithoutBlocking() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let runner = MockSubprocessRunner(scripts: [
@@ -1584,7 +1604,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1594,8 +1614,8 @@ final class ColmapRunnerTests: XCTestCase {
         ))
     }
 
-    func testModelConverterAuxiliaryBytesDoNotChangeCanonicalModelDigest() throws {
-        func convertedDigest(auxiliaryMarker: String) throws -> String {
+    func testModelConverterAuxiliaryBytesDoNotChangeCanonicalModelDigest() async throws {
+        func convertedDigest(auxiliaryMarker: String) async throws -> String {
             let fixture = try makeModelConversionFixture()
             defer { try? FileManager.default.removeItem(at: fixture.root) }
             let runner = MockSubprocessRunner(scripts: [
@@ -1624,7 +1644,7 @@ final class ColmapRunnerTests: XCTestCase {
             colmap.setWorkerExecutionObserver { invocation in
                 evidence.append(invocation)
             }
-            try colmap.runModelConverter(
+            try await colmap.runModelConverter(
                 colmapPath: fixture.executable,
                 inputPath: fixture.input,
                 outputPath: fixture.output,
@@ -1635,13 +1655,12 @@ final class ColmapRunnerTests: XCTestCase {
             return try XCTUnwrap(evidence.values.first?.modelConversion?.convertedModelDigest)
         }
 
-        XCTAssertEqual(
-            try convertedDigest(auxiliaryMarker: "first"),
-            try convertedDigest(auxiliaryMarker: "second")
-        )
+        let firstDigest = try await convertedDigest(auxiliaryMarker: "first")
+        let secondDigest = try await convertedDigest(auxiliaryMarker: "second")
+        XCTAssertEqual(firstDigest, secondDigest)
     }
 
-    func testModelConverterAllowsUnrelatedSiblingChurnInSharedAncestor() throws {
+    func testModelConverterAllowsUnrelatedSiblingChurnInSharedAncestor() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let sharedAncestor = fixture.root.deletingLastPathComponent()
@@ -1663,7 +1682,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        try colmap.runModelConverter(
+        try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1675,7 +1694,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertEqual(runner.calls.count, 1)
     }
 
-    func testModelConverterRejectsExecutableSwapAndRestoreDuringInvocation() throws {
+    func testModelConverterRejectsExecutableSwapAndRestoreDuringInvocation() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let bin = fixture.executable.deletingLastPathComponent()
@@ -1704,7 +1723,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1716,7 +1735,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertEqual(runner.calls.count, 1)
     }
 
-    func testModelConverterRejectsOpenMPRuntimeSwapAndRestoreDuringInvocation() throws {
+    func testModelConverterRejectsOpenMPRuntimeSwapAndRestoreDuringInvocation() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let libraryDirectory = fixture.root.appendingPathComponent("lib", isDirectory: true)
@@ -1741,7 +1760,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1757,7 +1776,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertEqual(runner.calls.count, 1)
     }
 
-    func testModelConverterRejectsInputPathOutsideRecordedContext() throws {
+    func testModelConverterRejectsInputPathOutsideRecordedContext() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let differentInput = fixture.root.appendingPathComponent("different-input")
@@ -1773,7 +1792,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: differentInput,
             outputPath: fixture.output,
@@ -1784,7 +1803,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertTrue(runner.calls.isEmpty)
     }
 
-    func testModelConverterRejectsOutputPathOutsideRecordedContext() throws {
+    func testModelConverterRejectsOutputPathOutsideRecordedContext() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let differentOutput = fixture.root.appendingPathComponent("different-output")
@@ -1800,7 +1819,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: differentOutput,
@@ -1811,7 +1830,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertTrue(runner.calls.isEmpty)
     }
 
-    func testRecordedModelConverterRejectsNonTextOutput() throws {
+    func testRecordedModelConverterRejectsNonTextOutput() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let runner = MockSubprocessRunner(scripts: [
@@ -1825,7 +1844,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1837,7 +1856,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertTrue(runner.calls.isEmpty)
     }
 
-    func testModelConverterRejectsCandidateSwapAndRestoreDuringInvocation() throws {
+    func testModelConverterRejectsCandidateSwapAndRestoreDuringInvocation() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let source = fixture.input.appendingPathComponent("images.bin")
@@ -1861,7 +1880,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1872,7 +1891,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertEqual(runner.calls.count, 1)
     }
 
-    func testModelConverterRejectsUnexpectedBinaryModelMemberBeforeLaunch() throws {
+    func testModelConverterRejectsUnexpectedBinaryModelMemberBeforeLaunch() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         try Data("unsupported rigs".utf8).write(
@@ -1888,7 +1907,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1904,7 +1923,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertTrue(runner.calls.isEmpty)
     }
 
-    func testModelConverterRejectsPreexistingTextOutputBeforeLaunch() throws {
+    func testModelConverterRejectsPreexistingTextOutputBeforeLaunch() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         try Data("stale output".utf8).write(
@@ -1920,7 +1939,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1936,7 +1955,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertTrue(runner.calls.isEmpty)
     }
 
-    func testModelConverterRejectsSymlinkedStagingDescendantBeforeLaunch() throws {
+    func testModelConverterRejectsSymlinkedStagingDescendantBeforeLaunch() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let outside = fixture.root.appendingPathComponent("outside-binary", isDirectory: true)
@@ -1953,7 +1972,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -1969,7 +1988,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertTrue(runner.calls.isEmpty)
     }
 
-    func testModelConverterRejectsExecutableAncestorPathSwap() throws {
+    func testModelConverterRejectsExecutableAncestorPathSwap() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let trustedRoot = fixture.root.appendingPathComponent("trusted-toolchain", isDirectory: true)
@@ -2006,7 +2025,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -2017,7 +2036,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertEqual(runner.calls.count, 1)
     }
 
-    func testModelConverterStripsDynamicLoaderInjection() throws {
+    func testModelConverterStripsDynamicLoaderInjection() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let runner = MockSubprocessRunner(scripts: [
@@ -2031,7 +2050,7 @@ final class ColmapRunnerTests: XCTestCase {
         let colmap = ColmapRunner(runner: runner)
         colmap.setWorkerExecutionObserver { _ in }
 
-        try colmap.runModelConverter(
+        try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -2048,7 +2067,7 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
-    func testModelConverterReportsFailedInvocationBeforeThrowing() throws {
+    func testModelConverterReportsFailedInvocationBeforeThrowing() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let runner = MockSubprocessRunner(scripts: [
@@ -2069,7 +2088,7 @@ final class ColmapRunnerTests: XCTestCase {
             evidence.append(invocation)
         }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -2099,7 +2118,7 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
-    func testModelConverterRejectsZeroStatusTerminatedBySignal() throws {
+    func testModelConverterRejectsZeroStatusTerminatedBySignal() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
@@ -2113,7 +2132,7 @@ final class ColmapRunnerTests: XCTestCase {
             )
         ])
 
-        XCTAssertThrowsError(try ColmapRunner(runner: runner).runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await ColmapRunner(runner: runner).runModelConverter(
             colmapPath: URL(fileURLWithPath: "/mock/colmap"),
             inputPath: URL(fileURLWithPath: "/tmp/in"),
             outputPath: URL(fileURLWithPath: "/tmp/out"),
@@ -2135,7 +2154,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertEqual(runner.calls.count, 1)
     }
 
-    func testModelConverterFailsClosedWhenProcessReceiptIsUnavailable() throws {
+    func testModelConverterFailsClosedWhenProcessReceiptIsUnavailable() async throws {
         let fixture = try makeModelConversionFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let runner = FixedSubprocessResultRunner(result: .init(
@@ -2153,7 +2172,7 @@ final class ColmapRunnerTests: XCTestCase {
             evidence.append(invocation)
         }
 
-        XCTAssertThrowsError(try colmap.runModelConverter(
+        await XCTAssertThrowsErrorAwaiting(try await colmap.runModelConverter(
             colmapPath: fixture.executable,
             inputPath: fixture.input,
             outputPath: fixture.output,
@@ -2170,7 +2189,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertTrue(evidence.values.isEmpty)
     }
 
-    func testModelConverterDoesNotAttachTrainingConversionToGeometryEvidence() throws {
+    func testModelConverterDoesNotAttachTrainingConversionToGeometryEvidence() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
@@ -2184,7 +2203,7 @@ final class ColmapRunnerTests: XCTestCase {
             evidence.append(invocation)
         }
 
-        try colmap.runModelConverter(
+        try await colmap.runModelConverter(
             colmapPath: URL(fileURLWithPath: "/mock/colmap"),
             inputPath: URL(fileURLWithPath: "/tmp/in"),
             outputPath: URL(fileURLWithPath: "/tmp/out"),
@@ -2194,6 +2213,204 @@ final class ColmapRunnerTests: XCTestCase {
         )
 
         XCTAssertTrue(evidence.values.isEmpty)
+    }
+
+    func testModelConverterCancellationTerminatesStubbornDescendantAndRecordsOneFailure() async throws {
+        let fixture = try makeModelConversionFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let descendantPIDURL = fixture.root.appendingPathComponent("converter-descendant.pid")
+        try TestFileBuilder.createExecutable(
+            at: fixture.executable,
+            script: """
+            #!/bin/sh
+            (
+                trap '' INT TERM HUP
+                exec /bin/sleep 60
+            ) &
+            descendant=$!
+            printf '%s\n' "$descendant" > "$EASYSPLAT_TEST_PID_FILE"
+            printf 'ready\n'
+            trap 'exit 23' INT TERM
+            while :; do :; done
+            """
+        )
+        let ready = DispatchSemaphore(value: 0)
+        let evidence = WorkerEvidenceSink()
+        let colmap = ColmapRunner(runner: AsyncOnlyRealSubprocessRunner())
+        colmap.setWorkerExecutionObserver { evidence.append($0) }
+        let task = Task {
+            try await colmap.runModelConverter(
+                colmapPath: fixture.executable,
+                inputPath: fixture.input,
+                outputPath: fixture.output,
+                environment: ["EASYSPLAT_TEST_PID_FILE": descendantPIDURL.path],
+                recordGeometryWorkerExecution: true,
+                modelConversionContext: fixture.context,
+                onLog: { line, _ in
+                    if line == "ready" { ready.signal() }
+                }
+            )
+        }
+
+        guard await waitForColmapSignal(ready, timeout: 2) else {
+            task.cancel()
+            _ = try? await task.value
+            return XCTFail("Model converter did not launch through runAsync")
+        }
+        let descendantPID = try await waitForColmapPID(
+            in: descendantPIDURL,
+            timeout: 2
+        )
+        defer { _ = kill(descendantPID, SIGKILL) }
+
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected after the invocation receipt and process-tree cleanup.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        let invocation = try XCTUnwrap(evidence.values.first)
+        XCTAssertEqual(evidence.values.count, 1)
+        XCTAssertEqual(invocation.command, .modelConverter)
+        XCTAssertFalse(invocation.succeeded)
+        XCTAssertNil(invocation.modelConversion?.convertedModelDigest)
+        let descendantRemainsAlive = await colmapProcessRemainsAlive(descendantPID)
+        XCTAssertFalse(descendantRemainsAlive)
+    }
+
+    func testModelConverterLaunchFailureRecordsNoInvocationReceipt() async throws {
+        let fixture = try makeModelConversionFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let evidence = WorkerEvidenceSink()
+        let runner = AsyncLaunchFailingModelConverterRunner {
+            try self.writeConvertedModel(at: fixture.output)
+        }
+        let colmap = ColmapRunner(runner: runner)
+        colmap.setWorkerExecutionObserver { evidence.append($0) }
+
+        do {
+            try await colmap.runModelConverter(
+                colmapPath: fixture.executable,
+                inputPath: fixture.input,
+                outputPath: fixture.output,
+                recordGeometryWorkerExecution: true,
+                modelConversionContext: fixture.context,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected launch failure")
+        } catch AsyncLaunchFailingModelConverterRunner.LaunchError.failed {
+            // A child never existed, so no termination verifier ran.
+        } catch {
+            XCTFail("Expected launch failure, got \(error)")
+        }
+
+        XCTAssertTrue(evidence.values.isEmpty)
+        XCTAssertEqual(runner.asyncCallCount, 1)
+        XCTAssertEqual(runner.syncCallCount, 0)
+    }
+
+    func testModelConverterCancellationDuringPrelaunchBindingHashingLaunchesNoChildOrReceipt() async throws {
+        let fixture = try makeModelConversionFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let largeInput = fixture.input.appendingPathComponent("images.bin")
+        let handle = try FileHandle(forWritingTo: largeInput)
+        try handle.truncate(atOffset: 1_073_741_824)
+        try handle.close()
+
+        let started = DispatchSemaphore(value: 0)
+        let evidence = WorkerEvidenceSink()
+        let runner = AsyncLaunchFailingModelConverterRunner(onSynchronousRun: {})
+        let colmap = ColmapRunner(runner: runner)
+        colmap.setWorkerExecutionObserver { evidence.append($0) }
+        let task = Task.detached {
+            started.signal()
+            try await colmap.runModelConverter(
+                colmapPath: fixture.executable,
+                inputPath: fixture.input,
+                outputPath: fixture.output,
+                recordGeometryWorkerExecution: true,
+                modelConversionContext: fixture.context,
+                onLog: { _, _ in }
+            )
+        }
+
+        guard await waitForColmapSignal(started, timeout: 2) else {
+            task.cancel()
+            _ = try? await task.value
+            return XCTFail("Model conversion did not enter prelaunch binding")
+        }
+        try await Task.sleep(nanoseconds: 25_000_000)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation during prelaunch hashing")
+        } catch is CancellationError {
+            // Expected before a child exists or a receipt can be emitted.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertEqual(runner.asyncCallCount, 0)
+        XCTAssertEqual(runner.syncCallCount, 0)
+        XCTAssertTrue(evidence.values.isEmpty)
+    }
+
+    func testModelConverterIntegrityFailureOutranksConcurrentCancellation() async throws {
+        let fixture = try makeModelConversionFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let tamperedInput = fixture.input.appendingPathComponent("images.bin")
+        XCTAssertFalse(tamperedInput.path.contains("'"))
+        try TestFileBuilder.createExecutable(
+            at: fixture.executable,
+            script: """
+            #!/bin/sh
+            input_path="\(tamperedInput.path)"
+            printf 'ready\n'
+            trap 'printf tampered >> "$input_path"; exit 23' INT TERM
+            while :; do :; done
+            """
+        )
+        let ready = DispatchSemaphore(value: 0)
+        let evidence = WorkerEvidenceSink()
+        let colmap = ColmapRunner(runner: AsyncOnlyRealSubprocessRunner())
+        colmap.setWorkerExecutionObserver { evidence.append($0) }
+        let task = Task {
+            try await colmap.runModelConverter(
+                colmapPath: fixture.executable,
+                inputPath: fixture.input,
+                outputPath: fixture.output,
+                recordGeometryWorkerExecution: true,
+                modelConversionContext: fixture.context,
+                onLog: { line, _ in
+                    if line == "ready" { ready.signal() }
+                }
+            )
+        }
+
+        guard await waitForColmapSignal(ready, timeout: 2) else {
+            task.cancel()
+            _ = try? await task.value
+            return XCTFail("Model converter did not launch through runAsync")
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected binding-integrity failure")
+        } catch ColmapRunnerError.executionEvidenceUnavailable(let command) {
+            XCTAssertEqual(command, "model_converter")
+        } catch {
+            XCTFail("Expected integrity failure before cancellation, got \(error)")
+        }
+        let invocation = try XCTUnwrap(evidence.values.first)
+        XCTAssertEqual(evidence.values.count, 1)
+        XCTAssertEqual(invocation.command, .modelConverter)
+        XCTAssertFalse(invocation.succeeded)
+        XCTAssertNil(invocation.modelConversion?.convertedModelDigest)
     }
 
     func testImageUndistorterProducesBoundedColmapWorkspace() async throws {
@@ -2303,6 +2520,54 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
+    /// The binding watches every directory on the way to the model for being
+    /// swapped mid-run. Inside the App Sandbox it cannot climb past the
+    /// container, and that refusal is the system's own, so the walk stops there.
+    /// A directory this process could have watched and was merely not allowed to
+    /// read is a different matter: giving up there would leave the path
+    /// unwatched while COLMAP is still handed it as a string.
+    func testModelConverterRefusesAnAncestorItCannotWatch() async throws {
+        let enclosure = try TestFileBuilder.makeTempDir()
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o700)],
+                ofItemAtPath: enclosure.path
+            )
+            try? FileManager.default.removeItem(at: enclosure)
+        }
+        let fixture = try makeModelConversionFixture(enclosedIn: enclosure)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: fixture.executable.path,
+                argsPrefix: ["model_converter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in try self.writeConvertedModel(at: fixture.output) }
+            )
+        ])
+        // Crossable but not readable: the model still resolves, and the walk
+        // upward from it does not.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o111)],
+            ofItemAtPath: enclosure.path
+        )
+
+        await XCTAssertThrowsErrorAwaiting(
+            try await ColmapRunner(runner: runner).runModelConverter(
+                colmapPath: fixture.executable,
+                inputPath: fixture.input,
+                outputPath: fixture.output,
+                environment: [:],
+                recordGeometryWorkerExecution: true,
+                modelConversionContext: fixture.context,
+                onLog: { _, _ in }
+            )
+        ) { error in
+            guard case ColmapRunnerError.executionEvidenceUnavailable = error else {
+                return XCTFail("Expected missing execution evidence, got \(error).")
+            }
+        }
+    }
+
     private typealias ModelConversionFixture = (
         root: URL,
         executable: URL,
@@ -2311,8 +2576,22 @@ final class ColmapRunnerTests: XCTestCase {
         context: ColmapModelConversionWorkerInvocationContext
     )
 
-    private func makeModelConversionFixture() throws -> ModelConversionFixture {
-        let temporaryRoot = try TestFileBuilder.makeTempDir()
+    /// `enclosedIn` nests the fixture so a test can change the permissions of the
+    /// directory holding it, which the shared temporary directory would never
+    /// allow.
+    private func makeModelConversionFixture(
+        enclosedIn enclosure: URL? = nil
+    ) throws -> ModelConversionFixture {
+        let temporaryRoot: URL
+        if let enclosure {
+            temporaryRoot = enclosure.appendingPathComponent("toolchain", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: temporaryRoot,
+                withIntermediateDirectories: true
+            )
+        } else {
+            temporaryRoot = try TestFileBuilder.makeTempDir()
+        }
         let rootPath = try temporaryRoot.path.withCString { path in
             guard let resolved = Darwin.realpath(path, nil) else {
                 throw CocoaError(.fileReadNoSuchFile)
@@ -2401,6 +2680,39 @@ final class ColmapRunnerTests: XCTestCase {
         }
     }
 
+    private func waitForColmapSignal(
+        _ semaphore: DispatchSemaphore,
+        timeout: TimeInterval
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(
+                    returning: semaphore.wait(timeout: .now() + timeout) == .success
+                )
+            }
+        }
+    }
+
+    private func waitForColmapPID(in url: URL, timeout: TimeInterval) async throws -> pid_t {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let contents = try? String(contentsOf: url, encoding: .utf8),
+               let pid = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                return pid
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        throw CocoaError(.fileReadNoSuchFile)
+    }
+
+    private func colmapProcessRemainsAlive(_ pid: pid_t) async -> Bool {
+        for _ in 0..<20 {
+            if kill(pid, 0) != 0, errno == ESRCH { return false }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return kill(pid, 0) == 0 || errno != ESRCH
+    }
+
     private func environmentValues(in lines: [String]) -> [String: String] {
         Dictionary(uniqueKeysWithValues: lines.compactMap { line in
             let fields = line.split(
@@ -2476,6 +2788,142 @@ private final class FixedSubprocessResultRunner: @unchecked Sendable, Subprocess
     ) async throws -> SubprocessResult {
         try onRun?(arguments)
         return result
+    }
+}
+
+private final class AsyncOnlyRealSubprocessRunner: @unchecked Sendable, SubprocessRunning {
+    private let real = SubprocessRunner()
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        throw ForbiddenSynchronousModelConversion.invoked
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        try await real.runAsync(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onTermination: @escaping @Sendable (SubprocessResult) throws -> Void,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        try await real.runAsync(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
+            onTermination: onTermination,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+}
+
+private enum ForbiddenSynchronousModelConversion: Error {
+    case invoked
+}
+
+@MainActor
+private func XCTAssertThrowsErrorAwaiting<T>(
+    _ expression: @autoclosure () async throws -> T,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ errorHandler: (Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        let failureMessage = message()
+        XCTFail(
+            failureMessage.isEmpty ? "Expected error to be thrown" : failureMessage,
+            file: file,
+            line: line
+        )
+    } catch {
+        errorHandler(error)
+    }
+}
+
+private final class AsyncLaunchFailingModelConverterRunner: @unchecked Sendable, SubprocessRunning {
+    enum LaunchError: Error { case failed }
+
+    private let lock = NSLock()
+    private let onSynchronousRun: () throws -> Void
+    private var asyncCalls = 0
+    private var syncCalls = 0
+
+    var asyncCallCount: Int { lock.withLock { asyncCalls } }
+    var syncCallCount: Int { lock.withLock { syncCalls } }
+
+    init(onSynchronousRun: @escaping () throws -> Void) {
+        self.onSynchronousRun = onSynchronousRun
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        lock.withLock { syncCalls += 1 }
+        try onSynchronousRun()
+        return SubprocessResult(
+            exitCode: 0,
+            terminationReason: .exit,
+            stdout: "",
+            stderr: "",
+            environmentReceipt: SubprocessEnvironmentReceipt(
+                explicitOverrides: environment,
+                removedKeys: removingEnvironmentKeys,
+                effectiveValuesForControlledKeys: environment
+            )
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        lock.withLock { asyncCalls += 1 }
+        throw LaunchError.failed
     }
 }
 #endif

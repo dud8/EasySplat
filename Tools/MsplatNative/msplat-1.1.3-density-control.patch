@@ -1,0 +1,356 @@
+--- a/core/include/model.hpp
++++ b/core/include/model.hpp
+@@ -96,6 +96,26 @@
+   float splitScreenSize;
+   int maxSteps;
+   bool keepCrs;
++  // Admission threshold for densification, expressed in buffer slots. 0 disables it.
++  //
++  // This is a trigger, not a hard bound, and the difference matters. A pass is admitted
++  // while 3 * num_active <= maxCapacity, so one starting just under the line can still
++  // emit up to maxCapacity active gaussians - and the calibrated envelope it is derived
++  // from is a third of that. Making it a true bound would require the classify stage to
++  // clamp splits and duplications against the remaining headroom, which the kernels do
++  // not do today. What holds it in practice is the growth rate: measured passes add
++  // 1-2%, not the 200% the worst case allows.
++  //
++  // Two further gaps, both deliberate: setupOptimizers() seeds buf_capacity at 4x the
++  // SfM point count before this is consulted at all, and ensureCapacity() clamps its
++  // geometric doubling here but still honours any request larger than the ceiling,
++  // because the kernels are sized for the worst case of the pass they were handed.
++  //
++  // Culling continues past the threshold, so an over-dense scene stops growing rather
++  // than aborting mid-run on a memory-budget breach - which is the failure this exists
++  // to prevent.
++  int maxCapacity = 0;
++  bool populationCeilingReported = false;
+ 
+   float scale;
+   float translation[3] = {};
+--- a/core/src/model.cpp
++++ b/core/src/model.cpp
+@@ -1,6 +1,7 @@
+ // Modified by the EasySplat project in 2026 from msplat 1.1.3.
+ #include <climits>
+ #include <cmath>
++#include <cstdint>
+ #include <filesystem>
+ #include <fstream>
+ #include <iostream>
+@@ -16,6 +17,41 @@
+ 
+ static const double C0 = 0.28209479177387814;
+ 
++// Density-control thresholds. Coordinates are normalised by autoScaleAndCenter so the
++// camera cluster spans roughly [-1, 1], which makes reference 3DGS's "0.1 * scene
++// extent" world-scale prune directly comparable to 0.1 here. The shipped 0.5 let a
++// single gaussian grow to a third of a room before anything removed it.
++// The opacity cull threshold must sit BELOW the reset floor, or every reset drops the
++// whole model under the cull line and the next pass deletes it. Reference 3DGS pairs a
++// 0.01 reset with a 0.005 prune; the shipped 0.2/0.1 pair preserved the same ordering.
++static constexpr float kDensifyCullAlpha = 0.005f;
++// No opacity resets happen past stopSplitAt, so the tail can prune harder without the
++// mass-extinction risk. This is what removes the residual haze.
++static constexpr float kTailCullAlpha = 0.05f;
++static constexpr float kCullScale = 0.1f;
++// The tail reuses this cull for a different job and kCullScale is far too sharp for it.
++// Tail culling exists to remove fog, which runs an order of magnitude oversized; at
++// kCullScale it also removes ordinary background and ground-plane geometry that
++// densification is no longer running to replace. On mip-NeRF 360 flowers that cost
++// 2.77 dB held-out and blacked out the near foreground of 7 of 22 held-out views;
++// 99.8% of what it removed was under 1.0 in normalised units. Five times kCullScale
++// spares those and still catches anything pathological - the capture that motivated
++// tail culling carried gaussians past 12 units.
++static constexpr float kTailCullScale = 5.0f * kCullScale;
++// The thin-disc exemption must not ride on the phase threshold. Deriving its ceiling
++// from cull_scale_thresh silently widened it from 0.35 to 1.75 during tail passes,
++// admitting sheets that owned 5.4% of projected area on flowers and 8.2% on the
++// Apartment capture - a second behaviour change that the >1.85 oversize metric could
++// not see. Pin it to the shipped value and let only the scale cull move.
++static constexpr float kThinDiscCap = 3.5f * kCullScale;
++// Left at the shipped value. A tighter screen-size cull reads as reference-like, but
++// reference tunes it for object-centric captures; indoor walkthroughs put cameras a
++// metre from surfaces, so legitimate wall patches routinely exceed a tight screen
++// fraction and the model collapses. The scale cull above already covers the artifacts
++// this was meant to catch.
++static constexpr float kCullScreenSize = 0.15f;
++static constexpr int kTailCullEvery = 500;
++
+ int numShBases(int degree){
+     switch(degree){
+         case 0: return 1;
+@@ -214,7 +250,13 @@
+ 
+ void Model::ensureCapacity(int needed){
+     if (needed <= buf_capacity) return;
+-    int new_cap = std::max(needed, buf_capacity * 2);
++    // Doubling amortises reallocation, but it must not overshoot the admitted budget:
++    // a pass needing one slot more than capacity would otherwise take twice what the
++    // memory ceiling allows. The request itself always wins - refusing it here would
++    // hand the kernels a buffer smaller than the worst case they are sized for.
++    int headroom = buf_capacity * 2;
++    if (maxCapacity > 0 && headroom > maxCapacity) headroom = maxCapacity;
++    int new_cap = std::max(needed, headroom);
+ 
+     auto grow = [&](MTensor &buf) {
+         auto shape = buf.shape();
+@@ -257,15 +299,47 @@
+         // Surface a persistent GPU budget failure before changing topology.
+         msplat_gpu_sync();
+         int resetInterval = resetAlphaEvery * refineEvery;
+-        bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
+-
+-        if (doDensification){
++        const bool inGrowthWindow =
++            step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
++        // The growth window scales with the iteration budget but nothing bounded the
++        // population, so a longer run simply produced more geometry until the memory
++        // budget was breached mid-run. Hold the ceiling and keep culling instead.
++        // The test is against the worst case the pass can allocate, not the population
++        // it starts from: ensureCapacity(3 * num_active) below never shrinks, so a pass
++        // admitted at the bound would raise buf_capacity to three times it for good.
++        const std::int64_t worstCaseCapacity = 3ll * static_cast<std::int64_t>(num_active);
++        const bool atPopulationCeiling =
++            maxCapacity > 0 && worstCaseCapacity > static_cast<std::int64_t>(maxCapacity);
++        if (atPopulationCeiling && !populationCeilingReported) {
++            populationCeilingReported = true;
++            fprintf(stderr,
++                    "Densification reached the capacity ceiling at step %d "
++                    "(%d gaussians, worst case %lld slots, ceiling %d); "
++                    "continuing with culling only\n",
++                    step, num_active, static_cast<long long>(worstCaseCapacity),
++                    maxCapacity);
++        }
++        const bool doDensification = inGrowthWindow && !atPopulationCeiling;
++        // Growth stops halfway through the run, but culling must not. Without a tail
++        // pass the second half accumulates oversized, near-transparent gaussians that
++        // nothing ever removes, and they end up owning most of the rendered frame.
++        const bool doTailCull = !doDensification &&
++                                ((step >= stopSplitAt && step % kTailCullEvery == 0) ||
++                                 (atPopulationCeiling && inGrowthWindow));
++
++        if (doDensification || doTailCull){
+             int numPointsBefore = num_active;
++            // Unconditional, including for cull-only passes that cannot grow:
++            // ensureDensificationCompactScratch requires buf_capacity >= 3 * pointCount
++            // and throws otherwise, so a cull following a growth pass would trip that
++            // precondition. Sizing the scratch by phase would need the compaction
++            // kernels to agree, and buys nothing - capacity is already 3N by the time
++            // the tail phase begins.
+             ensureCapacity(3 * num_active);  // worst case: every gaussian splits
+             ensureDensificationCompactScratch(num_active);
+ 
+-            // Fill random samples for splits (CPU randn, shared memory)
+-            {
++            if (doDensification) {
++                // Fill random samples for splits (CPU randn, shared memory)
+                 std::mt19937 rng(step);
+                 std::normal_distribution<float> dist(0.0f, 1.0f);
+                 float *p = densify_random_samples.data<float>();
+@@ -273,14 +347,43 @@
+             }
+ 
+             float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
+-            int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
+-            bool checkHuge = step > refineEvery * resetAlphaEvery;
++            // Both screen-size gates keep their original window. Widening the cull gate
++            // was tried and reverted: combined with a tighter threshold it removed
++            // legitimate near-camera geometry and collapsed the model.
++            int check_screen_split = (step < stopScreenSizeAt) ? 1 : 0;
++            int check_screen_cull = check_screen_split;
++            // Scale, thin-disc and screen-size culling all hang off this flag. Gating it
++            // on the first opacity-reset interval alone left the fast profile with no
++            // size culling at all: its run ends at 3000, exactly where the window opens,
++            // so its whole tail phase saw opacity culling only. The tail exists to remove
++            // oversized geometry, so enable it there regardless of the reset schedule.
++            bool checkHuge = doTailCull || step > refineEvery * resetAlphaEvery;
++            // doTailCull covers two cases: past stopSplitAt, where growth is over for
++            // good, and the capacity ceiling, where it is refused for this pass only and
++            // resumes once a cull frees headroom. What both share is that this pass will
++            // not replace what it removes, which is what the relaxed scale threshold
++            // below is keyed on. On flowers the ceiling binds at step 6000 of a 15000
++            // step window, so that branch is the common one, not an edge case.
+             int fr_stride = (int)featuresRest_buf.stride0();
++            // An infinite gradient threshold leaves nothing flagged for split or
++            // duplication, which turns the fused densify pass into a cull-only pass.
++            float gradThresh = doTailCull ? std::numeric_limits<float>::infinity()
++                                          : densifyGradThresh;
++            // The threshold must key off the training phase, not off which branch asked
++            // for the cull. Opacity resets clamp the whole model to 0.01 and only fire
++            // before stopSplitAt, so any cull inside that window has to sit below the
++            // reset floor. A ceiling-triggered cull runs inside the growth window, and
++            // using the tail's 0.05 there would delete everything the reset just
++            // clamped -- the same mass-extinction failure the reset/cull ordering was
++            // introduced to avoid.
++            const bool opacityResetsStillFire = step < stopSplitAt;
++            float cullAlpha = opacityResetsStillFire ? kDensifyCullAlpha : kTailCullAlpha;
+ 
+             int new_count = msplat_densify(
+                 num_active, buf_capacity,
+-                densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
+-                0.1f, 0.5f, 0.15f, checkHuge ? 1 : 0,
++                gradThresh, densifySizeThresh, splitScreenSize, check_screen_split,
++                cullAlpha, doTailCull ? kTailCullScale : kCullScale, kThinDiscCap,
++                kCullScreenSize, checkHuge ? 1 : 0, check_screen_cull,
+                 xysGradNorm, visCounts, max2DSize, half_max_dim,
+                 means_buf, scales_buf, quats_buf,
+                 featuresDc_buf, featuresRest_buf, opacities_buf, fr_stride,
+@@ -294,14 +397,16 @@
+ 
+             num_active = new_count;
+             refreshViews();
+-            std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
+-        } else if (step >= stopSplitAt) {
+-            densify_compact_scratch.reset();
++            if (doDensification) {
++                std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
++            } else if (num_active != numPointsBefore) {
++                std::cout << "Culled: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
++            }
+         }
+ 
+         if (step < stopSplitAt && step % resetInterval == refineEvery){
+             msplat_gpu_sync();
+-            constexpr float resetLogit = -1.3862943611198906f;
++            constexpr float resetLogit = -4.59511985013459f;
+             float *op = opacities.data<float>();
+             for (int64_t i = 0; i < opacities.numel(); i++)
+                 if (op[i] > resetLogit) op[i] = resetLogit;
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -2808,6 +2808,15 @@
+ // Eliminates count→prefix_sum→scatter pipeline (3 dispatches + 3 barriers saved).
+ 
+ #define SORT_TG_SIZE 256
++// Held at 2048. Raising it is tempting - at 2048 the fast path overflows on nearly
++// every frame of the mip-NeRF 360 scenes (26,271 exact-raster fallbacks in 30,000
++// iterations) and each overflow forces a full exact re-render - but 2048 is the
++// ceiling in practice. The per-tile bitonic sort holds MAX_TILE_ELEMS 8-byte keys in
++// threadgroup memory against a 32 KB device limit, and Metal GPU Validation (which the
++// required native CI gate enables) instruments that allocation, so 4096 reports 64 KB
++// and fails pipeline creation. Reducing fallbacks needs a different mechanism:
++// smaller tiles, counted/compacted storage, or a sort that does not stage the whole
++// tile in threadgroup memory.
+ #define MAX_TILE_ELEMS 2048
+ 
+ // Scatter each gaussian's intersections directly into pre-allocated per-tile bins.
+@@ -4385,7 +4394,12 @@
+     if (check_screen && max_2d_size[idx] > screen_thresh) do_split = true;
+     do_split = do_split && high_grad;
+ 
+-    bool do_dup = !is_large && high_grad;
++    // Split and duplicate must be mutually exclusive. A small gaussian that exceeds the
++    // screen threshold satisfies both tests, and the host sizes its buffers for 3N
++    // (N + 2*splits + dups) under the assumption each gaussian picks at most one. With
++    // both flags set, N_new can reach 4N and overrun buffers whose only guard is an
++    // assert that compiles out in Release.
++    bool do_dup = !is_large && high_grad && !do_split;
+ 
+     split_flag[idx] = do_split ? 1 : 0;
+     dup_flag[idx]   = do_dup   ? 1 : 0;
+@@ -4562,6 +4576,7 @@
+     constant int& check_huge         [[buffer(10)]],
+     constant int& check_screen       [[buffer(11)]],
+     device int* keep_flag            [[buffer(12)]],
++    constant float& cull_disc_scale  [[buffer(13)]],
+     uint idx [[thread_position_in_grid]]
+ ) {
+     int nSplits = (N_old > 0) ? split_prefix[N_old - 1] : 0;
+@@ -4579,9 +4594,18 @@
+ 
+     // Huge gaussians
+     if (check_huge) {
+-        float s0 = scales_buf[idx*3], s1 = scales_buf[idx*3+1], s2 = scales_buf[idx*3+2];
+-        float max_s = max(max(exp(s0), exp(s1)), exp(s2));
+-        if (max_s > cull_scale_thresh) cull = true;
++        float e0 = exp(scales_buf[idx*3]), e1 = exp(scales_buf[idx*3+1]), e2 = exp(scales_buf[idx*3+2]);
++        float hi = max(max(e0, e1), e2);
++        float lo = min(min(e0, e1), e2);
++        float mid = e0 + e1 + e2 - hi - lo;
++        // A large but thin disc is how a flat wall or floor patch is represented, so
++        // size alone must not condemn it. Round blobs and needles of the same extent
++        // are fog and get culled. The exemption is bounded: past a few times the cull
++        // threshold a "disc" is a sheet draped across the whole scene, not a surface
++        // patch, and it is the single worst artifact class.
++        bool thin_disc = (hi < 3.0f * mid) && (mid > 8.0f * lo) &&
++                         (hi < cull_disc_scale);
++        if (hi > cull_scale_thresh && !thin_disc) cull = true;
+         if (check_screen && idx < (uint)N_old && max_2d_size[idx] > cull_screen_size) cull = true;
+     }
+ 
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -754,7 +754,7 @@
+ 
+ #define RAST_BLOCK_X 8
+ #define RAST_BLOCK_Y 8
+-static constexpr int64_t kMaxTileElements = 2048;
++static constexpr int64_t kMaxTileElements = 2048;  // must match MAX_TILE_ELEMS
+ static constexpr uint32_t kRasterStatFallbackCount = 0;
+ static constexpr uint32_t kRasterStatDroppedCount = 1;
+ static constexpr uint32_t kRasterStatLatestIntersectionCount = 2;
+@@ -1591,6 +1591,10 @@
+     g_tcache.ensure_backward(point_count, context->device);
+ }
+ 
++uint64_t msplat_max_tile_elements(void) {
++    return static_cast<uint64_t>(kMaxTileElements);
++}
++
+ void msplat_set_raster_memory_budget_bytes(uint64_t budget_bytes) {
+     if (budget_bytes == 0) {
+         throw std::invalid_argument("msplat: raster memory budget must be positive");
+@@ -3523,7 +3527,9 @@
+ int msplat_densify(
+     int N, int buf_capacity,
+     float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
+-    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
++    float cull_alpha_thresh, float cull_scale_thresh, float cull_disc_scale,
++    float cull_screen_size, int check_huge,
++    int check_screen_cull,
+     MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
+     float half_max_dim,
+     MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
+@@ -3567,6 +3573,7 @@
+     uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
+     int check_screen_int = check_screen;
+     int check_huge_int = check_huge;
++    int check_screen_cull_int = check_screen_cull;
+ 
+     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+     assert(command_buffer && "Failed to retrieve command buffer reference");
+@@ -3708,8 +3715,9 @@
+             ENC_SCALAR(enc, cull_alpha_thresh, 7);
+             ENC_SCALAR(enc, cull_scale_thresh, 8);
+             ENC_SCALAR(enc, cull_screen_size, 9);
++            ENC_SCALAR(enc, cull_disc_scale, 13);
+             ENC_SCALAR(enc, check_huge_int, 10);
+-            ENC_SCALAR(enc, check_screen_int, 11);
++            ENC_SCALAR(enc, check_screen_cull_int, 11);
+             ENC_BUF(enc, keep_flag, 12);
+             [enc dispatchThreads:MTLSizeMake(worst_case, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+         }
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -65,6 +65,10 @@
+ void msplat_gpu_sync();
+ void msplat_gpu_sync_for_raster_replay();
+ void msplat_set_raster_memory_budget_bytes(uint64_t budget_bytes);
++// Tile-local intersection slots per 16x16 tile. Callers sizing a memory budget need
++// this to account for the tile arena, which is fixed by resolution rather than by
++// gaussian count; duplicating the literal lets the estimate drift from the kernels.
++uint64_t msplat_max_tile_elements(void);
+ void msplat_preflight_raster_memory(
+     int point_count,
+     int image_height,
+@@ -254,7 +258,9 @@
+ int msplat_densify(
+     int N, int buf_capacity,
+     float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
+-    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
++    float cull_alpha_thresh, float cull_scale_thresh, float cull_disc_scale,
++    float cull_screen_size, int check_huge,
++    int check_screen_cull,
+     MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
+     float half_max_dim,
+     MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,

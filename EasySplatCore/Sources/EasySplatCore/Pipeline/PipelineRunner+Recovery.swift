@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import ImageIO
 import SQLite3
@@ -305,7 +306,12 @@ extension PipelineRunner {
                 )) != nil
             if databaseIsSymlink {
                 try self.removeItemIfPresent(paths.colmapDatabaseURL)
-            } else if FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path) {
+            } else if FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path),
+                      !preservingPairGraphRecovery {
+                // A preserved terminal recovery refers to the matches the
+                // exact attempt left in the database; resume re-inspects them
+                // instead of re-running the matcher. Any genuine re-matching
+                // clears these tables itself before importing.
                 try ColmapDatabaseMatchStore.clearMatchingResults(
                     at: paths.colmapDatabaseURL
                 )
@@ -327,11 +333,13 @@ extension PipelineRunner {
         }
     }
 
+    @discardableResult
     func invalidateAcceptedArtifactsForGeometryRerun(
         startingAt stage: PipelineStage,
         metadata: inout ProjectMetadata,
-        paths: ProjectPaths
-    ) throws {
+        paths: ProjectPaths,
+        runLease: ProjectRunLease? = nil
+    ) throws -> ProjectMetadata {
         try removeItemIfPresent(
             paths.colmapRefinementSeedModelURL.deletingLastPathComponent()
         )
@@ -344,9 +352,12 @@ extension PipelineRunner {
         metadata.stageTimings = metadata.stageTimings?.filter { timing in
             (PipelineStage.allCases.firstIndex(of: timing.stage) ?? 0) < rerunIndex
         }
-        try ProjectMetadataStore.savePreservingUserEditableFields(
+        return try persistRequiredMetadata(
             metadata,
-            to: paths.metadataURL
+            paths: paths,
+            runLease: runLease,
+            operation: .runStart,
+            stage: stage
         )
     }
 
@@ -354,12 +365,14 @@ extension PipelineRunner {
     /// policy is committed. If the process stops during cleanup, project.json still
     /// contains the old policy and resume validation sees the missing output. Once the
     /// save succeeds, the persisted stage boundary is sufficient to resume safely.
+    @discardableResult
     func persistResolvedPlanChange(
         _ resolvedPlan: ResolvedRunPlan,
         completedBoundary: PipelineStage?,
         metadata: inout ProjectMetadata,
-        paths: ProjectPaths
-    ) throws {
+        paths: ProjectPaths,
+        runLease: ProjectRunLease? = nil
+    ) throws -> ProjectMetadata {
         let fileManager = FileManager.default
         func removeInvalidatedItem(_ url: URL) throws {
             let isSymlink = (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
@@ -413,10 +426,15 @@ extension PipelineRunner {
         metadata.geometryRecovery = nil
         metadata.state = PipelineState(stage: completedBoundary ?? .importInput, lastError: nil)
         metadata.checkpoint = nil
-        metadata.lastRunStartedAt = nil
         metadata.lastFailureAt = nil
         try paths.ensureDirectories()
-        try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+        return try persistRequiredMetadata(
+            metadata,
+            paths: paths,
+            runLease: runLease,
+            operation: .runStart,
+            stage: completedBoundary ?? .importInput
+        )
     }
 
     func failureMessages(for error: Error, stage: PipelineStage) -> (userMessage: String, debugMessage: String) {
@@ -431,6 +449,24 @@ extension PipelineRunner {
                 )
             case let .lowQualityReconstruction(score, _):
                 let summary = ReconstructionScorer.summary(score)
+                let onlyCoverageFailed = score.registeredImages > 0
+                    && ReconstructionScorer.isAcceptable(
+                        ReconstructionScore(
+                            registeredImages: score.registeredImages,
+                            totalImages: score.registeredImages,
+                            meanReprojectionError: score.meanReprojectionError,
+                            pointCount: score.pointCount,
+                            observationCount: score.observationCount,
+                            meanTrackLength: score.meanTrackLength
+                        ),
+                        capturePath: .automatic
+                    )
+                if onlyCoverageFailed {
+                    return (
+                        "The camera solve could only include \(score.registeredImages) of \(score.totalImages) photos, which is too few to build a reliable splat. Add photos that overlap the missing areas with clear shared detail.",
+                        "Low-quality reconstruction. \(summary)."
+                    )
+                }
                 return ("The camera solve was unstable. Try a slower capture with more light.", "Low-quality reconstruction. \(summary).")
             case let .fragmentedReconstruction(evidence):
                 return (
@@ -559,8 +595,9 @@ extension PipelineRunner {
         }
         if let failure = error as? CaptureConnectionFailure {
             let attempt = failure.attempt
+            let largestGroup = failure.componentViewCounts.first ?? 0
             return (
-                "EasySplat found separate parts of the capture. Add views between the gaps with clear shared detail, and keep the scene still.",
+                "EasySplat could not connect this capture into one scene. The largest connected group is \(largestGroup) of \(failure.selectedViewCount) photos. Add photos that overlap the missing areas with clear shared detail, and keep the scene still.",
                 "Capture connection failed after all recovery attempts: policy \(failure.pairingPolicy.rawValue); \(failure.selectedViewCount) selected views; attempt \(attempt.attemptNumber); matcher \(attempt.matcher.rawValue); recovery \(attempt.recoveryLevel.rawValue); scheduled \(attempt.scheduledPairCount); attempted \(attempt.attemptedPairCount); raw matched \(attempt.rawMatchedPairCount); verified \(attempt.spatiallyVerifiedPairCount); \(failure.connectedComponentCount) components; \(failure.isolatedViewCount) isolated; \(failure.descriptorlessViewCount) descriptorless; component sizes \(failure.componentViewCounts); degree p10/median/p90 \(failure.degreeP10)/\(failure.degreeMedian)/\(failure.degreeP90)."
             )
         }
@@ -975,8 +1012,12 @@ extension PipelineRunner {
             }
             return .valid
         case .sfmFeatures:
+            // Only the DA3 route publishes its raw aligned seed as the feature
+            // boundary; a leftover seed must not mask missing classical
+            // feature evidence on the COLMAP or imported-pose routes.
             let seedZero = paths.colmapSeedModelURL
-            if sparseModelFilesExist(at: seedZero) {
+            if metadata.resolvedRunPlan?.geometryBackend == .da3,
+               sparseModelFilesExist(at: seedZero) {
                 return .valid
             }
             let databaseStatus = validateColmapDatabaseOutput(
@@ -1101,7 +1142,7 @@ extension PipelineRunner {
         case .trainSplat:
             let artifact: TrainingArtifact
             do {
-                artifact = try TrainingArtifactStore.load(
+                artifact = try TrainingArtifactStore.loadManifest(
                     from: paths.trainingManifestURL,
                     projectPaths: paths
                 )
@@ -1114,14 +1155,6 @@ extension PipelineRunner {
                 case .checkpointed:
                     return .missing
                 case .completed:
-                    do {
-                        try TrainingArtifactStore.validateArtifact(
-                            artifact,
-                            projectPaths: paths
-                        )
-                    } catch {
-                        return .corrupt(reason: error.localizedDescription)
-                    }
                     guard artifact.detailProfile == metadata.effectiveDetailProfile else {
                         return .corrupt(
                             reason: "completed training profile does not match the requested detail"
@@ -1140,15 +1173,31 @@ extension PipelineRunner {
                     guard let outputPath = artifact.outputPath else {
                         return .corrupt(reason: "completed training manifest has no output path")
                     }
-                    let outputStatus: StageOutputStatus
+                    let outputURL: URL
                     do {
-                        outputStatus = validatePlyFile(
-                            at: try paths.resolveProjectRelativePath(outputPath)
+                        outputURL = try paths.resolveProjectRelativePath(outputPath)
+                    } catch {
+                        return .corrupt(reason: error.localizedDescription)
+                    }
+                    var outputStatus = stat()
+                    if Darwin.lstat(outputURL.path, &outputStatus) != 0 {
+                        let code = errno
+                        if code == ENOENT || code == ENOTDIR {
+                            return .missing
+                        }
+                        return .corrupt(
+                            reason: "completed training output could not be inspected (POSIX \(code))"
+                        )
+                    }
+                    do {
+                        let evidence = try tooling.completedTrainingOutputEvidence(outputURL)
+                        try TrainingArtifactStore.validateCompletedOutput(
+                            artifact,
+                            evidence: evidence
                         )
                     } catch {
                         return .corrupt(reason: error.localizedDescription)
                     }
-                    guard outputStatus == .valid else { return outputStatus }
                     do {
                         guard let plan = metadata.resolvedRunPlan else {
                             return .corrupt(
@@ -1172,6 +1221,14 @@ extension PipelineRunner {
                                 reason: "completed training manifest does not match current input, geometry, or derivation"
                             )
                         }
+                        guard try TrainingArtifactStore.loadManifest(
+                            from: paths.trainingManifestURL,
+                            projectPaths: paths
+                        ) == artifact else {
+                            return .corrupt(
+                                reason: "completed training manifest changed during validation"
+                            )
+                        }
                     } catch {
                         return .corrupt(
                             reason: "completed training identity could not be verified: \(error.localizedDescription)"
@@ -1180,22 +1237,37 @@ extension PipelineRunner {
                     return .valid
             }
         case .exportSplat, .done:
-            let trainingArtifact: TrainingArtifact
             do {
-                trainingArtifact = try TrainingArtifactStore.load(
-                    from: paths.trainingManifestURL,
-                    projectPaths: paths
+                let trainingManifestExists = fm.fileExists(
+                    atPath: paths.trainingManifestURL.path
+                ) || ((try? fm.destinationOfSymbolicLink(
+                    atPath: paths.trainingManifestURL.path
+                )) != nil)
+                guard trainingManifestExists else { return .missing }
+                guard let resolvedRunPlan = metadata.resolvedRunPlan else {
+                    return .corrupt(reason: "published result has no resolved run plan")
+                }
+                _ = try GeometryArtifactStore.load(
+                    from: paths.geometryManifestURL,
+                    projectPaths: paths,
+                    expectedInput: metadata.input
                 )
+                guard try PublishedResultPublisher.resolveCompletedTraining(
+                    metadata: metadata,
+                    resolvedRunPlan: resolvedRunPlan,
+                    paths: paths,
+                    pairOperations: tooling.publishedResultPairOperations
+                ) != nil else {
+                    return .corrupt(
+                        reason: "published PLY and receipt do not match the completed run"
+                    )
+                }
+                return .valid
             } catch where BoundedFileReader.isMissingFileError(error) {
                 return .missing
             } catch {
                 return .corrupt(reason: error.localizedDescription)
             }
-            guard trainingArtifact.completionStatus == .completed,
-                  trainingArtifact.outputPath == "Output/splat.ply" else {
-                return .missing
-            }
-            return validatePlyFile(at: paths.outputSplatURL)
         }
     }
 

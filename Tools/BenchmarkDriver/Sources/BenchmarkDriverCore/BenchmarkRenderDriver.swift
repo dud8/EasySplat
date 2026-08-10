@@ -249,6 +249,10 @@ private final class ClosureLoadedScene: LoadedSceneRendering {
     func render(camera: RenderCamera, outputURL: URL) throws -> String {
         try renderImage(camera, outputURL)
     }
+
+    // The release lane renders through a closure that has no scene to count, and it does not
+    // report a population. Held-out rendering does, and gets it from the Metal scene instead.
+    var splatCount: Int { 0 }
 }
 
 struct ArtifactRoot {

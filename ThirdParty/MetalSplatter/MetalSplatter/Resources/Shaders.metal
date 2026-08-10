@@ -245,7 +245,7 @@ vertex ColorInOut splatVertexShader(uint vertexID [[vertex_id]],
             sphericalHarmonicCoefficients,
             splatIndex
         );
-        out.color = float4(pow(srgb, float3(2.2)), splat.color.a);
+        out.color = float4(srgb, splat.color.a);
     }
     return out;
 }

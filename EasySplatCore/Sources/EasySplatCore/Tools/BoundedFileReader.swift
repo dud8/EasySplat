@@ -11,6 +11,19 @@ public enum BoundedFileReader {
     }
 
     public static func readRegularFile(at url: URL, maximumBytes: Int) throws -> Data {
+        try readRegularFile(
+            at: url,
+            maximumBytes: maximumBytes,
+            shouldCancel: { false }
+        )
+    }
+
+    static func readRegularFile(
+        at url: URL,
+        maximumBytes: Int,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws -> Data {
+        try throwIfCancelled(shouldCancel)
         guard maximumBytes >= 0 else { throw BoundedFileReadError.invalidLimit }
         let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else {
@@ -33,6 +46,7 @@ public enum BoundedFileReader {
         if buffer.isEmpty { buffer = [0] }
 
         while true {
+            try throwIfCancelled(shouldCancel)
             let count = buffer.withUnsafeMutableBytes { bytes in
                 Darwin.read(descriptor, bytes.baseAddress, bytes.count)
             }
@@ -47,6 +61,7 @@ public enum BoundedFileReader {
             data.append(contentsOf: buffer[0..<count])
         }
 
+        try throwIfCancelled(shouldCancel)
         var finalMetadata = stat()
         guard fstat(descriptor, &finalMetadata) == 0,
               (finalMetadata.st_mode & S_IFMT) == S_IFREG,
@@ -56,6 +71,14 @@ public enum BoundedFileReader {
             throw BoundedFileReadError.changedDuringRead(url.lastPathComponent)
         }
         return data
+    }
+
+    private static func throwIfCancelled(
+        _ shouldCancel: @escaping @Sendable () -> Bool
+    ) throws {
+        if shouldCancel() {
+            throw CancellationError()
+        }
     }
 
     public static func readRegularFileTail(

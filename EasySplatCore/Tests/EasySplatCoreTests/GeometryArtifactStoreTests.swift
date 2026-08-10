@@ -1377,6 +1377,157 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testValidatesViablePartialCoverageBelowTheStrictFloor() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeDescriptorlessGeometryFixture(at: paths)
+        var artifact = makeDescriptorlessMeasuredArtifact(fixture: fixture)
+
+        // Two extra views never connected: 9 of 12 (75%) is below the strict
+        // floor, admitted through the viable dominant component, and judged
+        // on the admitted denominator (9/9).
+        func reshapeSelection(_ artifact: inout GeometryArtifact, viewCount: Int) throws {
+            let imageNames = (1...viewCount).map { String(format: "frame_%06d.jpg", $0) }
+            for (offset, imageName) in imageNames.enumerated() {
+                let frameURL = paths.framesSelectedURL.appendingPathComponent(imageName)
+                if !FileManager.default.fileExists(atPath: frameURL.path) {
+                    try Data("selected frame \(offset + 1)".utf8).write(
+                        to: frameURL,
+                        options: [.atomic]
+                    )
+                }
+            }
+            artifact.orderedImageNames = imageNames
+            artifact.orderedImageTimestamps = Array(repeating: nil, count: viewCount)
+            artifact.totalViewCount = viewCount
+            artifact.selectedFramesDigest = try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: imageNames,
+                projectPaths: paths
+            )
+            artifact.cameraGroupingReceipt = ColmapCameraGroupingReceipt(
+                mode: .allSelectedImagesShared,
+                cameraCountBefore: viewCount,
+                cameraCountAfter: 1,
+                groupedVideoSourceCount: 0,
+                groups: [
+                    ColmapCameraGroupReceipt(
+                        sourceGroupID: "all-selected-images",
+                        memberCount: viewCount,
+                        canonicalCameraID: 1
+                    )
+                ]
+            )
+        }
+        try reshapeSelection(&artifact, viewCount: 12)
+        artifact.pairGraph.measurement?.connectedComponentCount = 4
+        artifact.pairGraph.measurement?.isolatedViewCount = 3
+        artifact.pairGraph.measurement?.componentViewCounts = [9, 1, 1, 1]
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+
+        // Registering more views than the admitted component stays invalid.
+        var overRegistered = artifact
+        overRegistered.registeredViewCount = 10
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(overRegistered, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        // Tied largest groups have no admitted component; the coverage
+        // fraction falls back to the selected count and fails.
+        var tiedGroups = artifact
+        try reshapeSelection(&tiedGroups, viewCount: 18)
+        tiedGroups.pairGraph.measurement?.connectedComponentCount = 2
+        tiedGroups.pairGraph.measurement?.isolatedViewCount = 0
+        tiedGroups.pairGraph.measurement?.descriptorlessViewCount = 0
+        tiedGroups.pairGraph.measurement?.componentViewCounts = [9, 9]
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(tiedGroups, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidResiduals)
+        }
+    }
+
+    func testValidatesPartialRegistrationBelowTheStrictFractionOfAdmittedViews() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeDescriptorlessGeometryFixture(at: paths)
+        var artifact = makeDescriptorlessMeasuredArtifact(fixture: fixture)
+
+        // A strictly accepted graph admits 11 of 12 views, but the solve
+        // registered only 9 — below ceil(0.9 x 11). Terminal partial
+        // acceptance persists exactly this shape.
+        let imageNames = (1...12).map { String(format: "frame_%06d.jpg", $0) }
+        for (offset, imageName) in imageNames.enumerated() {
+            let frameURL = paths.framesSelectedURL.appendingPathComponent(imageName)
+            if !FileManager.default.fileExists(atPath: frameURL.path) {
+                try Data("selected frame \(offset + 1)".utf8).write(
+                    to: frameURL,
+                    options: [.atomic]
+                )
+            }
+        }
+        artifact.orderedImageNames = imageNames
+        artifact.orderedImageTimestamps = Array(repeating: nil, count: 12)
+        artifact.totalViewCount = 12
+        artifact.selectedFramesDigest = try GeometryArtifactStore.selectedFramesDigest(
+            orderedImageNames: imageNames,
+            projectPaths: paths
+        )
+        artifact.cameraGroupingReceipt = ColmapCameraGroupingReceipt(
+            mode: .allSelectedImagesShared,
+            cameraCountBefore: 12,
+            cameraCountAfter: 1,
+            groupedVideoSourceCount: 0,
+            groups: [
+                ColmapCameraGroupReceipt(
+                    sourceGroupID: "all-selected-images",
+                    memberCount: 12,
+                    canonicalCameraID: 1
+                )
+            ]
+        )
+        artifact.pairGraph.measurement?.connectedComponentCount = 2
+        artifact.pairGraph.measurement?.isolatedViewCount = 1
+        artifact.pairGraph.measurement?.componentViewCounts = [11, 1]
+        // Keep the chain-graph tallies consistent with the 11-view dominant.
+        artifact.pairGraph.measurement?.scheduledPairCount = 12
+        artifact.pairGraph.measurement?.attemptedPairCount = 12
+        artifact.pairGraph.measurement?.rawMatchedPairCount = 10
+        artifact.pairGraph.measurement?.spatiallyVerifiedPairCount = 10
+        artifact.pairGraph.measurement?.localPairCount = 12
+        artifact.pairGraph.measurement?.articulationViewCount = 9
+        artifact.pairGraph.measurement?.biconnectedBlockCount = 10
+        artifact.pairGraph.measurement?.matcherAttempts[0].scheduledPairCount = 12
+        artifact.pairGraph.measurement?.matcherAttempts[0].attemptedPairCount = 12
+        artifact.pairGraph.measurement?.matcherAttempts[0].rawMatchedPairCount = 10
+        artifact.pairGraph.measurement?.matcherAttempts[0].spatiallyVerifiedPairCount = 10
+        artifact.workerExecution.matchingInvocations[0].pairExecution =
+            defaultPairExecution(scheduledPairCount: 12)
+        _ = try GeometryWorkerExecutionArtifactStore.save(
+            artifact.workerExecution,
+            to: GeometryWorkerExecutionArtifactStore.canonicalURL(for: paths),
+            expectedBudget: artifact.workerExecution.resolvedBudget,
+            projectPaths: paths
+        )
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+
+        // Below the viable floor the relaxation does not apply.
+        var belowViableFloor = artifact
+        belowViableFloor.registeredViewCount = 7
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(belowViableFloor, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidResiduals)
+        }
+    }
+
     func testMappingArtifactAcceptsOverlappingModelsAndDetailedRecovery() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1882,6 +2033,84 @@ final class GeometryArtifactStoreTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalOrientation)
         }
+    }
+
+    func testSignUnverifiedOrientationAcceptsRelaxedResidualTail() {
+        func orientation(
+            status: CanonicalOrientationStatus,
+            p90: Double,
+            signAgreement: Double
+        ) -> CanonicalOrientationArtifact {
+            CanonicalOrientationArtifact(
+                status: status,
+                method: .cameraRightNullspace,
+                sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ(w: 0, x: 1, y: 0, z: 0),
+                evidence: CanonicalOrientationEvidence(
+                    supportCount: 24,
+                    eigenvalue0: 0.001,
+                    eigenvalue1: 0.1,
+                    eigenvalue2: 0.899,
+                    eigengap: 100,
+                    medianResidualDegrees: 2,
+                    p90ResidualDegrees: p90,
+                    medianAbsoluteImageUpAgreement: 0.85,
+                    signAgreement: signAgreement,
+                    bootstrapP95VariationDegrees: 1.5,
+                    trajectoryPlaneAgreementDegrees: nil
+                ),
+                canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
+            )
+        }
+
+        // The relaxed tier: only the p90 tail missed, sign evidence strong.
+        XCTAssertTrue(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .axisAlignedSignUnverified, p90: 10, signAgreement: 1),
+            registeredViewCount: 237
+        ))
+        // Legacy pattern: strict residuals with ambiguous sign.
+        XCTAssertTrue(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .axisAlignedSignUnverified, p90: 4, signAgreement: 0.5),
+            registeredViewCount: 237
+        ))
+        // Strict residuals with strong sign must be .verified, never sign-unverified.
+        XCTAssertFalse(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .axisAlignedSignUnverified, p90: 4, signAgreement: 1),
+            registeredViewCount: 237
+        ))
+        // The relaxed tier never upgrades to .verified.
+        XCTAssertFalse(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .verified, p90: 10, signAgreement: 1),
+            registeredViewCount: 237
+        ))
+        // Beyond the relaxed bound stays invalid.
+        XCTAssertFalse(GeometryArtifactStore.isCanonicalOrientationValid(
+            orientation(status: .axisAlignedSignUnverified, p90: 16, signAgreement: 1),
+            registeredViewCount: 237
+        ))
+    }
+
+    func testUprightFlipEligibilityFollowsOrientationStatus() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+
+        // A structurally valid unresolved orientation offers the best-effort flip.
+        XCTAssertEqual(artifact.canonicalOrientation.status, .unresolved)
+        XCTAssertTrue(artifact.allowsViewOnlyUprightFlip)
+
+        artifact.registeredViewCount = 24
+        artifact.canonicalOrientation = resolvedOrientationSolution().artifact
+        XCTAssertEqual(artifact.canonicalOrientation.status, .verified)
+        XCTAssertFalse(artifact.allowsViewOnlyUprightFlip)
+
+        var relaxed = resolvedOrientationSolution().artifact
+        relaxed.status = .axisAlignedSignUnverified
+        relaxed.evidence?.p90ResidualDegrees = 10
+        artifact.canonicalOrientation = relaxed
+        XCTAssertTrue(artifact.allowsViewOnlyUprightFlip)
     }
 
     func testRejectsOverflowingPairRoleCounts() throws {

@@ -248,14 +248,44 @@ public enum RunPlanResolver {
         return completedIndex < boundaryIndex ? lastCompletedStage : safeBoundary
     }
 
+    /// The most posed images a dataset import may carry. Enforced at
+    /// preflight with user-facing copy; re-clamped here so the resolved
+    /// keyframe budget can never exceed it.
+    public static let maximumDatasetImageCount = 1_000
+
+    /// Ceiling on any single dataset image dimension, enforced at preflight.
+    /// Keeps training-side pixel bounds and memory budgets meaningful.
+    public static let maximumDatasetImagePixelDimension = 8_192
+
+    /// Dataset facts the resolver needs without coupling to receipt storage.
+    public struct DatasetImportContext: Sendable, Equatable {
+        public let route: DatasetGeometryRoute
+        public let imageCount: Int
+        /// Largest single dimension across the dataset's images. Dataset
+        /// pixels are never resized (imported calibration describes the
+        /// original pixel grid), so the plan's image-dimension bound must
+        /// admit them or training-prep validation would reject the run late.
+        public let maximumImagePixelDimension: Int?
+
+        public init(route: DatasetGeometryRoute, imageCount: Int, maximumImagePixelDimension: Int? = nil) {
+            self.route = route
+            self.imageCount = imageCount
+            self.maximumImagePixelDimension = maximumImagePixelDimension
+        }
+    }
+
     public static func resolve(
         requestedOptions options: RequestedRunOptions,
         input: InputSpec,
         hardware: HardwareProfile,
         developmentOverrides: DevelopmentOverrides,
-        trainingMemoryRetryBudgetBytes: Int64? = nil
+        trainingMemoryRetryBudgetBytes: Int64? = nil,
+        datasetImport: DatasetImportContext? = nil
     ) -> ResolvedRunPlan {
-        let capturePath = options.capturePath
+        // Dataset imports made the pose/pairing decisions at capture time:
+        // the capture-path knob is inert and ordering is canonically
+        // unordered regardless of any stale request.
+        let capturePath = input.isDataset ? .automatic : options.capturePath
         let inputOrdering = resolvedInputOrdering(options.inputOrdering, input: input)
         let pairingPolicy = resolvedPairingPolicy(
             capturePath: capturePath,
@@ -285,21 +315,41 @@ public enum RunPlanResolver {
         )
         let cameraGrouping = resolvedCameraGrouping(options.cameraGrouping, input: input)
         let lensProjection = options.lensProjection
-        let route = developmentOverrides.candidateRoute ?? .colmap
+        let route: SfmBackend
+        if input.isDataset, datasetImport != nil {
+            route = .importedPoses
+        } else {
+            route = developmentOverrides.candidateRoute ?? .colmap
+        }
         let model = resolvedModel(route: route, memoryTier: memoryTier)
-        let keyframeBudget = route == .da3
-            ? 29
-            : resolvedKeyframeBudget(
+        let keyframeBudget: Int
+        if let datasetImport, input.isDataset {
+            // Every posed image must survive selection; the budget IS the
+            // reconciled image count, bounded by the admission ceiling.
+            keyframeBudget = min(max(datasetImport.imageCount, 1), maximumDatasetImageCount)
+        } else if route == .da3 {
+            keyframeBudget = 29
+        } else {
+            keyframeBudget = resolvedKeyframeBudget(
                 detail: options.detailProfile,
                 capturePath: capturePath,
                 memoryTier: memoryTier,
                 resourcePolicy: options.resourcePolicy
             )
-        let maximumImageDimension = resolvedMaximumImageDimension(
+        }
+        var maximumImageDimension = resolvedMaximumImageDimension(
             detail: options.detailProfile,
             memoryTier: memoryTier,
             resourcePolicy: options.resourcePolicy
         )
+        if input.isDataset, let datasetDimension = datasetImport?.maximumImagePixelDimension {
+            // Dataset images pass through unscaled; the bound is a validation
+            // ceiling for them, not a resize target.
+            maximumImageDimension = min(
+                max(maximumImageDimension, datasetDimension),
+                maximumDatasetImagePixelDimension
+            )
+        }
         let colmapMaximumImageDimension = min(
             maximumImageDimension,
             resolvedColmapMaximumImageDimension(
@@ -307,7 +357,7 @@ public enum RunPlanResolver {
                 memoryTier: memoryTier
             )
         )
-        let trainerBudget = trainerBudget(for: options.detailProfile)
+        let trainerBudget = trainerBudget(for: options.detailProfile, memoryTier: memoryTier)
         let baseTrainingMemoryBudget = TrainingMemoryBudget.resolve(
             hardware: hardware,
             resourcePolicy: options.resourcePolicy
@@ -337,6 +387,7 @@ public enum RunPlanResolver {
 
         return ResolvedRunPlan(
             geometryBackend: route,
+            datasetGeometryRoute: input.isDataset ? datasetImport?.route : nil,
             modelIdentifier: model,
             memoryTier: memoryTier.rawValue,
             chunkSize: route == .da3 ? 29 : 0,
@@ -367,7 +418,7 @@ public enum RunPlanResolver {
             requiredToolchainCapabilities: requiredCapabilities(route: route, model: model),
             capturePath: capturePath,
             inputOrdering: inputOrdering,
-            photoSelection: options.photoSelection,
+            photoSelection: input.isDataset ? .useAllValidPhotos : options.photoSelection,
             pairingPolicy: pairingPolicy,
             temporalPairing: pairingConfiguration.temporalPairing,
             temporalOffsets: pairingConfiguration.temporalOffsets,
@@ -396,11 +447,14 @@ public enum RunPlanResolver {
     }
 
     private static func resolvedInputOrdering(_ requested: InputOrdering, input: InputSpec) -> InputOrdering {
+        // Datasets are canonically unordered regardless of any stale request:
+        // pairing for imported poses must never assume capture continuity.
+        if input.isDataset { return .unordered }
         guard requested == .automatic else { return requested }
         switch input {
         case .video(let files):
             return files.count == 1 ? .continuous : .unordered
-        case .photos, .mixed:
+        case .photos, .mixed, .dataset:
             return .unordered
         }
     }
@@ -496,10 +550,12 @@ public enum RunPlanResolver {
         let resourceScale: Double
         if memoryTier == .constrained {
             resourceScale = 0.64
-        } else if resourcePolicy == .maximumPerformance {
-            resourceScale = 1.2
         } else {
-            resourceScale = 1.0
+            // Fast stays a quick preview on every machine; only the quality
+            // tiers spend the extra headroom on more keyframes.
+            let tierScale = memoryTier == .performance && detail != .fast ? 1.4 : 1.0
+            let policyScale = resourcePolicy == .maximumPerformance ? 1.2 : 1.0
+            resourceScale = tierScale * policyScale
         }
         return max(30, Int((detailBase * captureScale * resourceScale).rounded()))
     }
@@ -522,8 +578,9 @@ public enum RunPlanResolver {
             }
             return min(base, cap)
         }
-        guard resourcePolicy == .maximumPerformance else { return base }
-        return Int((Double(base) * 1.125).rounded())
+        let tierBase = memoryTier == .performance && detail == .balanced ? 1_920 : base
+        guard resourcePolicy == .maximumPerformance else { return tierBase }
+        return Int((Double(tierBase) * 1.125).rounded())
     }
 
     private static func resolvedAnalysisFrameRate(detail: DetailProfile, capturePath: CapturePath) -> Int {
@@ -565,11 +622,43 @@ public enum RunPlanResolver {
         return max(20, Int((base * captureScale * memoryScale).rounded()))
     }
 
-    private static func trainerBudget(for detail: DetailProfile) -> (iterations: Int, plateau: Int) {
+    // Persisted training manifests are validated against this closed set: every
+    // tier-resolved tuple plus the fixed pre-tier values, so projects trained
+    // before budgets scaled with hardware still load.
+    static func sanctionedTrainerBudgets(
+        for detail: DetailProfile
+    ) -> [(iterations: Int, plateau: Int)] {
+        let tiers: [MemoryTier] = [.constrained, .standard, .performance]
+        var budgets = tiers.map { trainerBudget(for: detail, memoryTier: $0) }
         switch detail {
-        case .fast: return (3_000, 400)
-        case .balanced: return (7_000, 800)
-        case .highDetail: return (15_000, 1_500)
+        case .fast:
+            break
+        case .balanced:
+            budgets.append((7_000, 800))
+        case .highDetail:
+            budgets.append((15_000, 1_500))
+        }
+        return budgets
+    }
+
+    // Iteration limits are ceilings, not targets: the trainer's plateau detector is
+    // the intended stop, and densification runs until iterationLimit / 2, so the
+    // ceiling also bounds how far the gaussian count can grow. It is no longer the
+    // only bound - the trainer derives a capacity ceiling from its memory budget and
+    // culls past the growth window - so raising a budget no longer trades directly
+    // against how much geometry survives.
+    private static func trainerBudget(
+        for detail: DetailProfile,
+        memoryTier: MemoryTier
+    ) -> (iterations: Int, plateau: Int) {
+        switch (detail, memoryTier) {
+        case (.fast, _): return (3_000, 400)
+        case (.balanced, .constrained): return (12_000, 1_200)
+        case (.balanced, .standard): return (20_000, 1_600)
+        case (.balanced, .performance): return (30_000, 2_000)
+        case (.highDetail, .constrained): return (20_000, 1_600)
+        case (.highDetail, .standard): return (30_000, 2_000)
+        case (.highDetail, .performance): return (40_000, 2_500)
         }
     }
 
@@ -622,13 +711,46 @@ public enum RunPlanResolver {
             featureExtractionWorkers: min(logicalCPUs, caps.extraction),
             coupledMatchingWorkers: min(halfLogicalCPUs, caps.matching),
             vocabularyRetrievalWorkers: min(halfLogicalCPUs, caps.retrieval),
-            maximumConcurrentVideoSourceAnalysisTasks: min(logicalCPUs, caps.videoSourceAnalysis)
+            maximumConcurrentVideoSourceAnalysisTasks: min(logicalCPUs, caps.videoSourceAnalysis),
+            retrievalMemoryBudgetBytes: resolvedRetrievalMemoryBudget(
+                memoryGB: memoryGB,
+                resourcePolicy: resourcePolicy
+            )
         )
+    }
+
+    /// Sizes the vocabulary retriever's memory ceiling to installed RAM. The
+    /// native tool otherwise falls back to a fixed 2 GiB default, which a denser
+    /// recovery retry can exceed on machines with far more memory to spare.
+    private static func resolvedRetrievalMemoryBudget(
+        memoryGB: Double,
+        resourcePolicy: ResourcePolicy
+    ) -> Int64 {
+        guard memoryGB.isFinite, memoryGB > 0 else {
+            return ColmapVocabularyRetrievalOptions.defaultMemoryBudgetBytes
+        }
+        let bytesPerGibibyte = 1_073_741_824.0
+        let physicalBytesValue = (memoryGB * bytesPerGibibyte).rounded()
+        let physicalMemoryBytes = physicalBytesValue >= Double(UInt64.max)
+            ? UInt64.max
+            : UInt64(physicalBytesValue)
+        // Reuse the trainer's RAM-headroom and policy-fraction sizing, but ignore
+        // the Metal working set: vocabulary retrieval runs entirely on the CPU, so
+        // passing no Metal budget makes `resolve` fall back to physical headroom.
+        let scaledBudget = TrainingMemoryBudget.resolve(
+            physicalMemoryBytes: physicalMemoryBytes,
+            recommendedMetalWorkingSetBytes: nil,
+            resourcePolicy: resourcePolicy
+        )
+        let floored = max(scaledBudget, ColmapVocabularyRetrievalOptions.minimumMemoryBudgetBytes)
+        return min(floored, ColmapVocabularyRetrievalOptions.maximumMemoryBudgetBytes)
     }
 
     private static func requiredCapabilities(route: SfmBackend, model: String) -> [String] {
         switch route {
-        case .colmap:
+        case .colmap, .importedPoses:
+            // Imported poses still use COLMAP for features, matching,
+            // triangulation, and undistortion.
             return ["geometry.colmap", "runtime.core", "training.msplat"]
         case .da3:
             let modelCapability = model == "DA3-SMALL"

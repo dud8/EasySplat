@@ -35,11 +35,13 @@ enum SparseTextPublicationCheckpoint: Sendable {
     case beforePublishedValidation
 }
 
-private enum SparseModelPublicationError: Error, LocalizedError {
+enum SparseModelPublicationError: Error, LocalizedError {
     case unsafeLayout
     case atomicRenameFailed(Int32)
     case atomicTextPublicationFailed(Int32)
     case atomicTextRollbackFailed(Int32, recoveryDirectory: String)
+    case atomicBinaryPublicationFailed(Int32)
+    case atomicBinaryRollbackFailed(Int32, recoveryDirectory: String)
 
     var errorDescription: String? {
         switch self {
@@ -51,6 +53,10 @@ private enum SparseModelPublicationError: Error, LocalizedError {
             return "Could not publish the COLMAP text model atomically (errno \(code))."
         case .atomicTextRollbackFailed(let code, let recoveryDirectory):
             return "Could not restore the previous COLMAP text model (errno \(code)). The preserved recovery directory is \(recoveryDirectory)."
+        case .atomicBinaryPublicationFailed(let code):
+            return "Could not publish the COLMAP binary model atomically (errno \(code))."
+        case .atomicBinaryRollbackFailed(let code, let recoveryDirectory):
+            return "Could not restore the previous COLMAP binary model (errno \(code)). The preserved recovery directory is \(recoveryDirectory)."
         }
     }
 }
@@ -60,7 +66,8 @@ extension PipelineRunner {
         at url: URL,
         mappingAttemptOrdinal: Int,
         workerExecutionRecorder: GeometryWorkerExecutionRecorder
-    ) throws -> CanonicalModelPublicationArtifact {
+    ) async throws -> CanonicalModelPublicationArtifact {
+        try Task.checkCancellation()
         let binaryNames = ["cameras.bin", "images.bin", "points3D.bin"]
         let textNames = ["cameras.txt", "images.txt", "points3D.txt"]
         let hasBinarySource = binaryNames.allSatisfy {
@@ -70,7 +77,13 @@ extension PipelineRunner {
         }
         let sourceNames = hasBinarySource ? binaryNames : textNames
         let sourceHashes = try Dictionary(uniqueKeysWithValues: sourceNames.map { name in
-            (name, try GeometryArtifactStore.sha256(of: url.appendingPathComponent(name)))
+            (
+                name,
+                try GeometryArtifactStore.sha256(
+                    of: url.appendingPathComponent(name),
+                    shouldCancel: { Task.isCancelled }
+                )
+            )
         })
         let candidateProjectRelativePath = try ProjectPaths(root: projectURL)
             .projectRelativePath(for: url)
@@ -82,7 +95,7 @@ extension PipelineRunner {
             .successfulModelConverterInvocationCount(
                 mappingAttemptOrdinal: mappingAttemptOrdinal
             )
-        let converted = try ensureTextSparseModelFiles(
+        let converted = try await ensureTextSparseModelFiles(
             at: url,
             mappingAttemptOrdinal: mappingAttemptOrdinal,
             candidateProjectRelativePath: candidateProjectRelativePath
@@ -155,7 +168,8 @@ extension PipelineRunner {
         case .unsafeLayout:
             return PipelineError.outputMissing
         case .atomicRenameFailed, .atomicTextPublicationFailed,
-                .atomicTextRollbackFailed:
+            .atomicTextRollbackFailed, .atomicBinaryPublicationFailed,
+            .atomicBinaryRollbackFailed:
             return error
         }
     }
@@ -313,7 +327,8 @@ extension PipelineRunner {
         candidates: [MappedSparseModelCandidate],
         memberships: [ColmapSparseModelMembership],
         residualValidatedModelOrders: Set<Int>,
-        totalSelectedViewCount: Int
+        totalSelectedViewCount: Int,
+        admittedImageIDs: Set<UInt32>? = nil
     ) -> MappingFragmentationEvidence? {
         guard totalSelectedViewCount > 0 else { return nil }
 
@@ -346,7 +361,14 @@ extension PipelineRunner {
         }
 
         guard credibleUnion.count <= totalSelectedViewCount else { return nil }
-        let omittedCount = credibleUnion.subtracting(selectedImageIDs).count
+        // Views matching already excluded from the admitted component are
+        // expected losses, not mapper fragmentation; only count omitted views
+        // the pair graph said belong with the selected reconstruction.
+        var omitted = credibleUnion.subtracting(selectedImageIDs)
+        if let admittedImageIDs {
+            omitted.formIntersection(admittedImageIDs)
+        }
+        let omittedCount = omitted.count
         guard omittedCount > ColmapMappingPolicy.maximumAcceptedRecoverableViewLoss else {
             return nil
         }
@@ -464,7 +486,7 @@ extension PipelineRunner {
         return SparseFileState(metadata)
     }
 
-    private func synchronizeSparseModelFile(at url: URL) throws {
+    func synchronizeSparseModelFile(at url: URL) throws {
         let descriptor = Darwin.open(
             url.path,
             O_RDONLY | O_NOFOLLOW | O_CLOEXEC
@@ -486,7 +508,7 @@ extension PipelineRunner {
         }
     }
 
-    private func synchronizeSparseModelDirectory(_ descriptor: Int32) throws {
+    func synchronizeSparseModelDirectory(_ descriptor: Int32) throws {
         while Darwin.fsync(descriptor) != 0 {
             let code = errno
             if code == EINTR { continue }
@@ -500,7 +522,8 @@ extension PipelineRunner {
         mappingAttemptOrdinal: Int? = nil,
         candidateProjectRelativePath: String? = nil,
         publicationCheckpoint: (SparseTextPublicationCheckpoint) throws -> Void = { _ in }
-    ) throws -> Bool {
+    ) async throws -> Bool {
+        try Task.checkCancellation()
         let fm = FileManager.default
         let txtFiles = ["cameras.txt", "images.txt", "points3D.txt"]
         let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
@@ -514,6 +537,7 @@ extension PipelineRunner {
                 throw PipelineError.outputMissing
             }
             _ = try captureMappedSparseModel(at: url)
+            try Task.checkCancellation()
             return false
         }
 
@@ -558,7 +582,7 @@ extension PipelineRunner {
         default:
             throw PipelineError.outputMissing
         }
-        try tooling.colmap.runModelConverter(
+        try await tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
             inputPath: binaryInput,
             outputPath: textOutput,
@@ -568,6 +592,7 @@ extension PipelineRunner {
             modelConversionContext: conversionContext,
             onLog: { _, _ in }
         )
+        try Task.checkCancellation()
         for name in txtFiles {
             guard let state = privateRegularFileState(
                 at: textOutput.appendingPathComponent(name)
@@ -651,6 +676,7 @@ extension PipelineRunner {
             }
         }
         try validateMappedSparseModel(replacementSnapshot, at: replacement)
+        try Task.checkCancellation()
         try publicationCheckpoint(.beforeSwap)
         let renameResult = exchangeModels()
         guard renameResult == 0 else {
@@ -658,11 +684,13 @@ extension PipelineRunner {
         }
 
         do {
+            try Task.checkCancellation()
             try publicationCheckpoint(.afterSwap)
             try synchronizeSparseModelDirectory(parentDescriptor)
             try synchronizeSparseModelDirectory(stagingDescriptor)
             try publicationCheckpoint(.beforePublishedValidation)
             try validateMappedSparseModel(replacementSnapshot, at: url)
+            try Task.checkCancellation()
         } catch {
             do {
                 try validateMappedSparseModel(sourceSnapshot, at: replacement)
@@ -701,7 +729,11 @@ extension PipelineRunner {
         return true
     }
 
-    func prepareDa3RefinementSeed(
+    /// Copies an externally produced COLMAP text seed (a DA3 aligned seed or an
+    /// imported dataset pose seed) into the refinement staging area with bounded
+    /// readers, then remaps its image and camera IDs onto the live feature
+    /// database. Returns true when normalization or remapping changed the model.
+    func prepareExternalRefinementSeed(
         rawModelURL: URL,
         outputModelURL: URL,
         databaseURL: URL,
@@ -754,6 +786,219 @@ extension PipelineRunner {
             try removeItemIfPresent(outputRootURL)
             throw error
         }
+    }
+
+    /// Rewrites the persisted dataset pose seed (`Import/seed`) so its image
+    /// NAME fields reference the selected frame files, then stages the result
+    /// under `SfM/colmap/seed/import/0` for database ID remapping. The seed's
+    /// NAMEs are dataset-declared paths; the adoption receipt binds each
+    /// declared path to the adopted photo, and the selected-frame manifest
+    /// binds that photo (by source digest) to its `Frames/selected` output.
+    /// Every seed image must resolve.
+    func finalizeImportedPoseSeed(
+        receipt: DatasetPoseSeedReceipt,
+        paths: ProjectPaths,
+        selectedFrameManifest: [SelectedFrameMapping],
+        checkCancellation: () throws -> Void = {},
+        onLog: (String) -> Void = { _ in }
+    ) throws -> URL {
+        var model = try ColmapModelReader.readText(modelDirectory: paths.importSeedURL)
+        let entriesByDeclaredPath = Dictionary(
+            receipt.entries.map { ($0.declaredPath, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var selectedNameBySourceSHA256: [String: String] = [:]
+        for mapping in selectedFrameManifest {
+            if let sourceSHA256 = mapping.sourceSHA256,
+               selectedNameBySourceSHA256[sourceSHA256] == nil {
+                selectedNameBySourceSHA256[sourceSHA256] = mapping.outputFileName
+            }
+        }
+        for index in model.images.indices {
+            try checkCancellation()
+            let declaredPath = model.images[index].name
+            guard let entry = entriesByDeclaredPath[declaredPath] else {
+                onLog("The imported pose seed lists \(declaredPath), which has no adoption receipt entry.")
+                throw PipelineError.geometryRegisteredImagesMismatch
+            }
+            guard let selectedName = selectedNameBySourceSHA256[entry.sourceSHA256] else {
+                onLog("The imported pose seed image \(declaredPath) has no selected frame.")
+                throw PipelineError.geometryRegisteredImagesMismatch
+            }
+            model.images[index].name = selectedName
+        }
+        let emitted = try ColmapTextModelEmitter.emit(model)
+        let stagingRootURL = paths.colmapSeedURL.appendingPathComponent(
+            "import",
+            isDirectory: true
+        )
+        let stagingModelURL = stagingRootURL.appendingPathComponent("0", isDirectory: true)
+        try removeItemIfPresent(stagingRootURL)
+        do {
+            try checkCancellation()
+            try FileManager.default.createDirectory(
+                at: stagingModelURL,
+                withIntermediateDirectories: true
+            )
+            let files = [
+                ("cameras.txt", emitted.camerasTxt),
+                ("images.txt", emitted.imagesTxt),
+                ("points3D.txt", emitted.points3DTxt),
+            ]
+            for (name, contents) in files {
+                try contents.write(
+                    to: stagingModelURL.appendingPathComponent(name),
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+        } catch {
+            try removeItemIfPresent(stagingRootURL)
+            throw error
+        }
+        return stagingModelURL
+    }
+
+    /// The shared seeded-triangulation mapping tail: point_triangulator against
+    /// a prepared refinement seed, one bounded bundle adjustment, then the
+    /// canonical-text, conditioning, membership, and scorer acceptance gates.
+    /// Both the DA3 aligned-seed branch and the imported-pose dataset branch
+    /// run this single implementation.
+    func runSeededTriangulationMapping(
+        seedModelURL: URL,
+        paths: ProjectPaths,
+        selectedFrames: [URL],
+        capturePath: CapturePath,
+        bundleOptions: ColmapBundleAdjustmentOptions,
+        mapperLabel: String,
+        toolLogSectionTitle: String,
+        refinementLogNoun: String,
+        scoreLogLabel: String,
+        beginMappingAttempt: () throws -> Int,
+        currentMappingAttemptCount: () -> Int,
+        prepareCanonicalTextCandidate: (URL, Int) async throws -> CanonicalModelPublicationArtifact,
+        emit: (PipelineEvent) -> Void
+    ) async throws -> (artifact: MappingArtifact, conditioning: GeometryConditioningAnalysis) {
+        let fm = FileManager.default
+        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let mappingAttemptOrdinal = try beginMappingAttempt()
+        try resetDirectory(paths.colmapSparseURL)
+        try resetDirectory(sparseZero)
+        let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+        colmapToolLog.beginSection(
+            title: toolLogSectionTitle,
+            metadata: [
+                "database": paths.colmapDatabaseURL.path,
+                "images": paths.framesSelectedURL.path,
+                "seed": seedModelURL.path,
+                "output": sparseZero.path,
+                "tool": config.toolchain.colmap.path
+            ]
+        )
+        emit(.stageLog(
+            stage: .sfmMapping,
+            line: "Running \(refinementLogNoun): point_triangulator.",
+            isError: false
+        ))
+        try tooling.checkCancellation()
+        try await tooling.colmap.runPointTriangulator(
+            colmapPath: config.toolchain.colmap,
+            database: paths.colmapDatabaseURL,
+            imagePath: paths.framesSelectedURL,
+            inputPath: seedModelURL,
+            outputPath: sparseZero,
+            environment: [:],
+            onLog: { line, isErr in
+                colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+            }
+        )
+
+        let baOutput = paths.colmapSparseURL.appendingPathComponent("0_ba", isDirectory: true)
+        removeIfExists(baOutput)
+        try fm.createDirectory(at: baOutput, withIntermediateDirectories: true)
+        emit(.stageLog(
+            stage: .sfmMapping,
+            line: "Running \(refinementLogNoun): bundle_adjuster.",
+            isError: false
+        ))
+        try await tooling.colmap.runBundleAdjuster(
+            colmapPath: config.toolchain.colmap,
+            inputPath: sparseZero,
+            outputPath: baOutput,
+            environment: [:],
+            bundleOptions: bundleOptions,
+            onLog: { line, isErr in
+                colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+            }
+        )
+        guard sparseModelFilesExist(at: baOutput) else {
+            throw PipelineError.outputMissing
+        }
+        removeIfExists(sparseZero)
+        try fm.moveItem(at: baOutput, to: sparseZero)
+        let canonicalModelPublication = try await prepareCanonicalTextCandidate(
+            sparseZero,
+            mappingAttemptOrdinal
+        )
+        let conditioningAnalysis = try validatedConditionedGeometry(
+            modelDirectory: sparseZero,
+            selectedFrames: selectedFrames,
+            requireStrongObservationCoverage: true
+        )
+
+        let membership = try ColmapSparseModelMembershipReader(
+            databaseURL: paths.colmapDatabaseURL,
+            selectedImageNames: selectedFrames.map(\.lastPathComponent)
+        ).read(
+            modelDirectories: [sparseZero],
+            checkCancellation: tooling.checkCancellation
+        )
+
+        let report = try await tooling.colmap.runModelAnalyzer(
+            colmapPath: config.toolchain.colmap,
+            modelPath: sparseZero,
+            environment: [:]
+        )
+        for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+            colmapToolLog.append(stream: "stdout", line: String(line))
+        }
+        let score = ReconstructionScorer.applyingExpectedTotalImages(
+            ReconstructionScorer.parseModelAnalyzerOutput(report),
+            expectedTotalImages: selectedFrames.count
+        )
+        emit(.stageLog(
+            stage: .sfmMapping,
+            line: "\(scoreLogLabel): \(ReconstructionScorer.summary(score)).",
+            isError: false
+        ))
+        guard ReconstructionScorer.isAcceptable(
+            score,
+            capturePath: capturePath
+        ),
+              score.registeredImages
+                == membership.largestModelRegisteredViewCount,
+              conditioningAnalysis.residuals.registeredViewCount
+                == score.registeredImages,
+              let residual = score.meanReprojectionError,
+              residual.isFinite else {
+            throw PipelineError.lowQualityReconstruction(score, mapper: mapperLabel)
+        }
+        let artifact = MappingArtifact(
+            modelCount: membership.modelCount,
+            largestModelRegisteredViewCount:
+                membership.largestModelRegisteredViewCount,
+            secondLargestModelRegisteredViewCount:
+                membership.secondLargestModelRegisteredViewCount,
+            unionRegisteredViewCount: membership.unionRegisteredViewCount,
+            attemptCount: currentMappingAttemptCount(),
+            acceptedMappingAttemptOrdinal: mappingAttemptOrdinal,
+            acceptedRefinementKind: .seededBundleAdjustment,
+            acceptedRefinementInvocationCount: 1,
+            incrementalCadence: nil,
+            canonicalModelPublication: canonicalModelPublication,
+            fallbackReason: nil
+        )
+        return (artifact, conditioningAnalysis)
     }
 
     func colmapOptionsForExtraction(workerCount: Int) -> ColmapOptions {

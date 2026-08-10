@@ -100,6 +100,22 @@ final class RequestedRunOptionsTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(ResolvedRunPlan.self, from: retiredData))
     }
 
+    func testGeometryWorkerBudgetDecodesLegacyPlanWithoutRetrievalBudget() throws {
+        let legacy = Data("""
+        {
+          "featureExtractionWorkers": 12,
+          "coupledMatchingWorkers": 8,
+          "vocabularyRetrievalWorkers": 8,
+          "maximumConcurrentVideoSourceAnalysisTasks": 4
+        }
+        """.utf8)
+        let budget = try JSONDecoder().decode(GeometryWorkerBudget.self, from: legacy)
+        XCTAssertEqual(
+            budget.retrievalMemoryBudgetBytes,
+            ColmapVocabularyRetrievalOptions.defaultMemoryBudgetBytes
+        )
+    }
+
     func testResolvedRunPlanGeneralValidationRejectsInvalidWorkerBudget() throws {
         var plan = makeResolvedRunPlan()
         plan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks = 0
@@ -126,13 +142,14 @@ final class ProjectMetadataCurrentVersionTests: XCTestCase {
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 31)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 33)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
             RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         XCTAssertNil(metadata.resolvedRunPlan)
+        XCTAssertNil(metadata.pendingPublicationID)
     }
 }
 

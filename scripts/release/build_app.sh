@@ -5,23 +5,23 @@ set -euo pipefail
 ROOT="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=lib/strict_semver.sh
 source "$ROOT/scripts/release/lib/strict_semver.sh"
-MANIFEST_URL=""
-PUBLIC_KEY_PATH=""
+TOOLCHAIN_DIR=""
 PROJECT_URL=""
 VERSION=""
+BUILD_NUMBER=""
 RELEASE_MODE=""
 IDENTITY_FINGERPRINT=""
 TEAM_ID=""
+SOURCE_COMMIT=""
 IDENTITY_FINGERPRINT_SET=0
 TEAM_ID_SET=0
-BOOTSTRAP_MANIFEST=""
-BOOTSTRAP_CORE_ARCHIVE=""
-PREPARED_BOOTSTRAP_VERIFIER=""
 BUILD_ROOT="$ROOT/build"
 XCODEBUILD_BIN="${EASYSPLAT_XCODEBUILD_BIN:-xcodebuild}"
 CODESIGN_BIN="${EASYSPLAT_CODESIGN_BIN:-codesign}"
 XCRUN_BIN="${EASYSPLAT_XCRUN_BIN:-xcrun}"
 INPUT_SNAPSHOT_DIR=""
+BUILD_SOURCE_ROOT="$ROOT"
+PROVISIONING_PROFILE=""
 BUILD_LOCK=""
 BUILD_LOCK_HELD=0
 APP_BUNDLE=""
@@ -36,11 +36,18 @@ cleanup() {
     rmdir "$BUILD_LOCK" 2>/dev/null || true
   fi
   if [ -n "$INPUT_SNAPSHOT_DIR" ]; then
+    source_snapshot="$INPUT_SNAPSHOT_DIR/source"
+    if [ -d "$source_snapshot" ]; then
+      /usr/bin/chflags -R nouchg "$source_snapshot" 2>/dev/null || true
+      /bin/chmod -R u+rwX "$source_snapshot" 2>/dev/null || true
+    fi
     rm -rf "$INPUT_SNAPSHOT_DIR"
   fi
-  if [ "$RELEASE_MODE" = production ] && [ "$SIGNED_BUILD_COMPLETE" -ne 1 ]; then
+  if [ "$RELEASE_MODE" = production ] || [ "$RELEASE_MODE" = app-store ]; then
+   if [ "$SIGNED_BUILD_COMPLETE" -ne 1 ]; then
     [ -z "$APP_BUNDLE" ] || rm -rf "$APP_BUNDLE"
     [ -z "$SIGNING_RECEIPT" ] || rm -f "$SIGNING_RECEIPT"
+   fi
   fi
   exit "$status"
 }
@@ -48,12 +55,16 @@ trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --manifest-url)
-      MANIFEST_URL="$2"
-      shift 2
-      ;;
-    --public-key-path)
-      PUBLIC_KEY_PATH="$2"
+    --toolchain-dir)
+      if [ -n "$TOOLCHAIN_DIR" ]; then
+        echo "--toolchain-dir may be supplied only once." >&2
+        exit 1
+      fi
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--toolchain-dir requires an absolute path." >&2
+        exit 1
+      fi
+      TOOLCHAIN_DIR="$2"
       shift 2
       ;;
     --project-url)
@@ -64,20 +75,16 @@ while [[ $# -gt 0 ]]; do
       VERSION="$2"
       shift 2
       ;;
-    --bootstrap-manifest)
-      if [ -n "$BOOTSTRAP_MANIFEST" ]; then
-        echo "--bootstrap-manifest may be supplied only once." >&2
+    --build-number)
+      if [ -n "$BUILD_NUMBER" ]; then
+        echo "--build-number may be supplied only once." >&2
         exit 1
       fi
-      BOOTSTRAP_MANIFEST="$2"
-      shift 2
-      ;;
-    --bootstrap-core-archive)
-      if [ -n "$BOOTSTRAP_CORE_ARCHIVE" ]; then
-        echo "--bootstrap-core-archive may be supplied only once." >&2
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--build-number requires up to three dot-separated integers." >&2
         exit 1
       fi
-      BOOTSTRAP_CORE_ARCHIVE="$2"
+      BUILD_NUMBER="$2"
       shift 2
       ;;
     --build-root)
@@ -86,14 +93,6 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       BUILD_ROOT="$2"
-      shift 2
-      ;;
-    --manifest-tool-bin)
-      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
-        echo "--manifest-tool-bin requires an absolute executable path." >&2
-        exit 1
-      fi
-      PREPARED_BOOTSTRAP_VERIFIER="$2"
       shift 2
       ;;
     --development-unsigned)
@@ -119,6 +118,26 @@ while [[ $# -gt 0 ]]; do
       fi
       RELEASE_MODE="prepare-release"
       shift
+      ;;
+    --app-store)
+      if [ -n "$RELEASE_MODE" ]; then
+        echo "Choose exactly one release mode." >&2
+        exit 1
+      fi
+      RELEASE_MODE="app-store"
+      shift
+      ;;
+    --provisioning-profile)
+      if [ -n "$PROVISIONING_PROFILE" ]; then
+        echo "--provisioning-profile may be supplied only once." >&2
+        exit 1
+      fi
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--provisioning-profile requires a path." >&2
+        exit 1
+      fi
+      PROVISIONING_PROFILE="$2"
+      shift 2
       ;;
     --identity-fingerprint)
       if [ "$IDENTITY_FINGERPRINT_SET" -eq 1 ]; then
@@ -146,6 +165,18 @@ while [[ $# -gt 0 ]]; do
       TEAM_ID_SET=1
       shift 2
       ;;
+    --source-commit)
+      if [ -n "$SOURCE_COMMIT" ]; then
+        echo "--source-commit may be supplied only once." >&2
+        exit 1
+      fi
+      if [ "$#" -lt 2 ] || ! [[ "$2" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+        echo "--source-commit requires the exact reviewed 40-hex commit." >&2
+        exit 1
+      fi
+      SOURCE_COMMIT="$2"
+      shift 2
+      ;;
     *)
       echo "Unknown arg: $1" >&2
       exit 1
@@ -155,23 +186,35 @@ done
 
 unset GITHUB_PERSONAL_ACCESS_TOKEN GH_TOKEN GITHUB_TOKEN
 
-if [ -z "$MANIFEST_URL" ] || [ -z "$PUBLIC_KEY_PATH" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> --bootstrap-manifest <path> --bootstrap-core-archive <path> [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release | --production --identity-fingerprint <sha1> --team-id <id>)" >&2
+if [ -z "$TOOLCHAIN_DIR" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
+  echo "Usage: build_app.sh --toolchain-dir <path> --version <semver> [--build-number <n[.n[.n]]>] [--project-url <url>] [--build-root <absolute-path>] (--development-unsigned | --prepare-release --source-commit <40-hex> | --production --source-commit <40-hex> --identity-fingerprint <sha1> --team-id <id> | --app-store --source-commit <40-hex> --provisioning-profile <path> --identity-fingerprint <sha1> --team-id <id>)" >&2
   exit 1
 fi
-if [ "$RELEASE_MODE" = production ]; then
+if [ "$RELEASE_MODE" != development-unsigned ] && [ -z "$SOURCE_COMMIT" ]; then
+  echo "A prepared or signed app requires the exact reviewed source commit." >&2
+  exit 1
+fi
+if [ "$RELEASE_MODE" = development-unsigned ] && [ -n "$SOURCE_COMMIT" ]; then
+  echo "A reviewed source commit is reserved for prepared and signed app builds." >&2
+  exit 1
+fi
+if [ "$RELEASE_MODE" = production ] || [ "$RELEASE_MODE" = app-store ]; then
   if ! [[ "$IDENTITY_FINGERPRINT" =~ ^[0-9A-Fa-f]{40}$ ]]; then
-    echo "Production builds require an exact 40-hex Developer ID fingerprint." >&2
+    echo "Signed builds require an exact 40-hex signing identity fingerprint." >&2
     exit 1
   fi
   if ! [[ "$TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
-    echo "Production builds require an exact 10-character Team ID." >&2
+    echo "Signed builds require an exact 10-character Team ID." >&2
+    exit 1
+  fi
+  if [ "$RELEASE_MODE" = app-store ] && [ -z "$PROVISIONING_PROFILE" ]; then
+    echo "App Store builds require --provisioning-profile." >&2
     exit 1
   fi
   if [ -n "${EASYSPLAT_XCODEBUILD_BIN:-}" ] \
       || [ -n "${EASYSPLAT_CODESIGN_BIN:-}" ] \
       || [ -n "${EASYSPLAT_SKIP_METAL_TOOLCHAIN_CHECK:-}" ]; then
-    echo "Production build command overrides are not permitted." >&2
+    echo "Signed build command overrides are not permitted." >&2
     exit 1
   fi
   PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -191,7 +234,11 @@ if [ "$RELEASE_MODE" = production ]; then
   CODESIGN_BIN=/usr/bin/codesign
   XCRUN_BIN=/usr/bin/xcrun
 elif [ -n "$IDENTITY_FINGERPRINT" ] || [ -n "$TEAM_ID" ]; then
-  echo "Signing identity arguments require --production." >&2
+  echo "Signing identity arguments require --production or --app-store." >&2
+  exit 1
+fi
+if [ "$RELEASE_MODE" != app-store ] && [ -n "$PROVISIONING_PROFILE" ]; then
+  echo "A provisioning profile is only used by --app-store." >&2
   exit 1
 fi
 if [ "$RELEASE_MODE" = prepare-release ]; then
@@ -218,37 +265,6 @@ if [ "$RELEASE_MODE" = prepare-release ]; then
   CODESIGN_BIN=/usr/bin/codesign
   XCRUN_BIN=/usr/bin/xcrun
 fi
-if { [ -n "$BOOTSTRAP_MANIFEST" ] && [ -z "$BOOTSTRAP_CORE_ARCHIVE" ]; } \
-  || { [ -z "$BOOTSTRAP_MANIFEST" ] && [ -n "$BOOTSTRAP_CORE_ARCHIVE" ]; }; then
-  echo "--bootstrap-manifest and --bootstrap-core-archive must be supplied together." >&2
-  exit 1
-fi
-if [ -z "$BOOTSTRAP_MANIFEST" ]; then
-  echo "Release app builds require --bootstrap-manifest and --bootstrap-core-archive." >&2
-  exit 1
-fi
-if [ -n "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
-  if [ "$RELEASE_MODE" != prepare-release ] \
-      || [ ! -x "$PREPARED_BOOTSTRAP_VERIFIER" ] \
-      || [ -L "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
-    echo "A prebuilt ManifestTool is only accepted for a prepared production build." >&2
-    exit 1
-  fi
-  PREPARED_BOOTSTRAP_VERIFIER="$(/usr/bin/python3 -I - "$PREPARED_BOOTSTRAP_VERIFIER" <<'PY'
-import os
-import sys
-
-value = sys.argv[1]
-if not os.path.isabs(value) or os.path.normpath(value) != value:
-    raise SystemExit("ManifestTool path must be absolute and normalized.")
-resolved = os.path.realpath(value)
-if resolved != value:
-    raise SystemExit("ManifestTool path must contain no symlink ancestry.")
-print(resolved)
-PY
-)" || exit 1
-fi
-
 validated_build_root="$(/usr/bin/python3 -I - "$BUILD_ROOT" "$ROOT" <<'PY'
 import os
 import sys
@@ -285,16 +301,15 @@ PY
 )" || exit 1
 BUILD_ROOT="$validated_build_root"
 
-/usr/bin/python3 -I - "$MANIFEST_URL" "$PROJECT_URL" <<'PY'
+/usr/bin/python3 -I - "$PROJECT_URL" <<'PY'
 import sys
 from urllib.parse import urlparse
 
-for label, value in (("Manifest URL", sys.argv[1]), ("Project URL", sys.argv[2])):
-    if not value and label == "Project URL":
-        continue
+value = sys.argv[1]
+if value:
     parsed = urlparse(value)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-        raise SystemExit(f"{label} must use HTTPS and contain no credentials.")
+        raise SystemExit("Project URL must use HTTPS and contain no credentials.")
 PY
 
 if ! easysplat_is_strict_semver_without_build_metadata "$VERSION"; then
@@ -307,62 +322,96 @@ if [ "$RELEASE_MODE" != development-unsigned ] \
   exit 1
 fi
 NUMERIC_VERSION="${VERSION%%-*}"
+# App Store Connect refuses a build whose CFBundleVersion it has already seen,
+# so a second upload of one marketing version needs a build number of its own.
+# Defaulting to the version keeps every other lane's plist exactly as it was.
+if [ -z "$BUILD_NUMBER" ]; then
+  BUILD_NUMBER="$NUMERIC_VERSION"
+elif ! [[ "$BUILD_NUMBER" =~ ^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){0,2}$ ]]; then
+  echo "A build number is up to three dot-separated integers: $BUILD_NUMBER" >&2
+  exit 1
+fi
 
-/usr/bin/python3 -I - "$PUBLIC_KEY_PATH" "$BOOTSTRAP_MANIFEST" "$BOOTSTRAP_CORE_ARCHIVE" <<'PY'
+TOOLCHAIN_DIR="$(/usr/bin/python3 -I - "$TOOLCHAIN_DIR" <<'PY'
 import os
 import stat
 import sys
 
-for label, value in (
-    ("Public key", sys.argv[1]),
-    ("Bootstrap manifest", sys.argv[2]),
-    ("Bootstrap core archive", sys.argv[3]),
-):
+root = sys.argv[1]
+if not os.path.isabs(root) or os.path.normpath(root) != root:
+    raise SystemExit("Toolchain directory must be an absolute, normalized path.")
+if os.path.realpath(root) != root:
+    raise SystemExit("Toolchain directory must contain no symlink ancestry.")
+
+required = (
+    "bin/colmap",
+    "bin/easysplat-train",
+    "bin/default.metallib",
+    "lib/libomp.dylib",
+    "msplat/build_info.json",
+    "msplat/LICENSE",
+    "provenance/colmap.json",
+    "supply-chain/components.json",
+)
+for relative in required:
+    path = os.path.join(root, relative)
     try:
-        metadata = os.lstat(value)
+        metadata = os.lstat(path)
     except FileNotFoundError:
-        raise SystemExit(f"{label} is missing: {value}")
+        raise SystemExit(f"Toolchain directory is missing {relative}: {path}")
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise SystemExit(f"{label} must be an ordinary, non-hardlinked regular file: {value}")
+        raise SystemExit(f"{relative} must be an ordinary, non-hardlinked regular file")
     if metadata.st_size == 0:
-        raise SystemExit(f"{label} must not be empty: {value}")
+        raise SystemExit(f"{relative} must not be empty")
+
+print(root)
 PY
+)" || exit 1
 
-INPUT_SNAPSHOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-inputs.XXXXXX")"
+INPUT_SNAPSHOT_DIR="$(mktemp -d "/private/tmp/easysplat-release-inputs.XXXXXX")"
 chmod 0700 "$INPUT_SNAPSHOT_DIR"
-SNAPSHOT_PUBLIC_KEY="$INPUT_SNAPSHOT_DIR/public_key_ed25519.txt"
-SNAPSHOT_BOOTSTRAP_MANIFEST="$INPUT_SNAPSHOT_DIR/manifest.json"
-SNAPSHOT_BOOTSTRAP_CORE="$INPUT_SNAPSHOT_DIR/macos-arm64-core.zip"
-install -m 0600 "$PUBLIC_KEY_PATH" "$SNAPSHOT_PUBLIC_KEY"
-install -m 0600 "$BOOTSTRAP_MANIFEST" "$SNAPSHOT_BOOTSTRAP_MANIFEST"
-install -m 0600 "$BOOTSTRAP_CORE_ARCHIVE" "$SNAPSHOT_BOOTSTRAP_CORE"
+INPUT_SNAPSHOT_DIR="$(cd "$INPUT_SNAPSHOT_DIR" && pwd -P)"
 
-verify_bootstrap() {
-  local public_key=$1
-  local manifest=$2
-  local core_archive=$3
-  local args=(
-    verify-bootstrap
-    --manifest "$manifest"
-    --public-key-file "$public_key"
-    --app-version "$VERSION"
-    --core-zip "$core_archive"
-    --url-policy "$BOOTSTRAP_URL_POLICY"
-  )
-  if [ -n "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
-    "$PREPARED_BOOTSTRAP_VERIFIER" "${args[@]}"
-  else
-    /usr/bin/swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
-  fi
-}
-BOOTSTRAP_URL_POLICY=release
-if [ "$RELEASE_MODE" = development-unsigned ]; then
-  BOOTSTRAP_URL_POLICY=loopback-development
+# The build validates the toolchain tree and then reads it again to stage and to
+# compare the staged bytes. Taking a private copy first is what makes those the
+# same bytes: whatever happens to the caller's tree afterwards, the product is
+# built from what was checked here.
+/usr/bin/ditto --noqtn "$TOOLCHAIN_DIR" "$INPUT_SNAPSHOT_DIR/toolchain"
+TOOLCHAIN_DIR="$INPUT_SNAPSHOT_DIR/toolchain"
+
+# Prepared and signed builds compile only the tracked bytes from the reviewed
+# commit. Ignored or untracked Swift files in the caller's checkout therefore
+# cannot enter the package even though ordinary git status omits them.
+if [ "$RELEASE_MODE" != development-unsigned ]; then
+  /usr/bin/python3 -I "$ROOT/scripts/release/export_reviewed_source.py" \
+    --repository "$ROOT" \
+    --source-commit "$SOURCE_COMMIT" \
+    --output "$INPUT_SNAPSHOT_DIR/source" \
+    >"$INPUT_SNAPSHOT_DIR/source-export.json"
+  BUILD_SOURCE_ROOT="$INPUT_SNAPSHOT_DIR/source"
+  /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/export_reviewed_source.py" \
+    --repository "$ROOT" \
+    --source-commit "$SOURCE_COMMIT" \
+    --output "$BUILD_SOURCE_ROOT" \
+    --lock-existing \
+    >"$INPUT_SNAPSHOT_DIR/source-lock.json"
 fi
-verify_bootstrap \
-  "$SNAPSHOT_PUBLIC_KEY" \
-  "$SNAPSHOT_BOOTSTRAP_MANIFEST" \
-  "$SNAPSHOT_BOOTSTRAP_CORE"
+
+# Bind the App Store profile to the exact selected bytes and the exact Apple
+# Distribution certificate before compilation starts. Every later consumer
+# reads only this private validated snapshot, so a path replacement cannot
+# change which capabilities are embedded in the signed app.
+if [ "$RELEASE_MODE" = app-store ]; then
+  VALIDATED_PROVISIONING_PROFILE="$INPUT_SNAPSHOT_DIR/embedded.provisionprofile"
+  /usr/bin/python3 -I \
+    "$BUILD_SOURCE_ROOT/scripts/release/validate_mas_provisioning_profile.py" \
+    --input-profile "$PROVISIONING_PROFILE" \
+    --output-profile "$VALIDATED_PROVISIONING_PROFILE" \
+    --team-identifier "$TEAM_ID" \
+    --bundle-identifier com.easysplat.app \
+    --certificate-sha1 "$IDENTITY_FINGERPRINT"
+  PROVISIONING_PROFILE="$VALIDATED_PROVISIONING_PROFILE"
+fi
 
 if [ "${XCODEBUILD_BIN##*/}" = "xcodebuild" ]; then
   if ! "$XCODEBUILD_BIN" -license check >/dev/null 2>&1; then
@@ -402,31 +451,52 @@ RES_DIR="$APP_BUNDLE/Contents/Resources"
 MACOS_DIR="$APP_BUNDLE/Contents/MacOS"
 OVERRIDE_RES_DIR="$OUT/AppResourcesOverride"
 
-if [ -z "$PROJECT_URL" ]; then
-  if [[ "$MANIFEST_URL" == *"/releases/"* ]]; then
-    PROJECT_URL="${MANIFEST_URL%/releases/*}"
-  elif [ -f "$ROOT/EasySplatApp/Resources/project_home_url.txt" ]; then
-    PROJECT_URL="$(cat "$ROOT/EasySplatApp/Resources/project_home_url.txt")"
-  fi
+if [ -z "$PROJECT_URL" ] \
+  && [ -f "$BUILD_SOURCE_ROOT/EasySplatApp/Resources/project_home_url.txt" ]; then
+  PROJECT_URL="$(cat "$BUILD_SOURCE_ROOT/EasySplatApp/Resources/project_home_url.txt")"
 fi
 
 rm -rf "$DERIVED" "$OUT"
 
-"$XCODEBUILD_BIN" \
-  -scheme EasySplatApp \
-  -configuration Release \
-  -destination "platform=macOS" \
-  -derivedDataPath "$DERIVED" \
-  ARCHS=arm64 \
-  ONLY_ACTIVE_ARCH=YES \
-  ENABLE_CODE_COVERAGE=NO \
-  CLANG_ENABLE_CODE_COVERAGE=NO \
-  CLANG_COVERAGE_MAPPING=NO \
-  CLANG_COVERAGE_MAPPING_LINKER_ARGS=NO \
-  DEBUG_INFORMATION_FORMAT=dwarf-with-dsym \
-  MACOSX_DEPLOYMENT_TARGET=15.0 \
-  SDKROOT=macosx \
-  build
+xcodebuild_arguments=(
+  -scheme EasySplatApp
+  -configuration Release
+  -destination "platform=macOS"
+  -derivedDataPath "$DERIVED"
+  ARCHS=arm64
+  ONLY_ACTIVE_ARCH=YES
+  ENABLE_CODE_COVERAGE=NO
+  CLANG_ENABLE_CODE_COVERAGE=NO
+  CLANG_COVERAGE_MAPPING=NO
+  CLANG_COVERAGE_MAPPING_LINKER_ARGS=NO
+  DEBUG_INFORMATION_FORMAT=dwarf-with-dsym
+  MACOSX_DEPLOYMENT_TARGET=15.0
+  SDKROOT=macosx
+)
+if [ "$RELEASE_MODE" != development-unsigned ]; then
+  # The private source snapshot is deleted after the build. Rebind compiler
+  # paths so the preserved dSYM remains useful without naming a vanished or
+  # machine-specific temporary directory.
+  xcodebuild_arguments+=(
+    "OTHER_SWIFT_FLAGS=-file-prefix-map $BUILD_SOURCE_ROOT=/EasySplatSource"
+    "OTHER_CFLAGS=-ffile-prefix-map=$BUILD_SOURCE_ROOT=/EasySplatSource"
+    "OTHER_CPLUSPLUSFLAGS=-ffile-prefix-map=$BUILD_SOURCE_ROOT=/EasySplatSource"
+  )
+fi
+xcodebuild_arguments+=(build)
+
+(
+  cd "$BUILD_SOURCE_ROOT"
+  "$XCODEBUILD_BIN" "${xcodebuild_arguments[@]}"
+)
+
+if [ "$RELEASE_MODE" != development-unsigned ]; then
+  /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/export_reviewed_source.py" \
+    --repository "$ROOT" \
+    --source-commit "$SOURCE_COMMIT" \
+    --output "$BUILD_SOURCE_ROOT" \
+    --verify-existing >/dev/null
+fi
 
 if [ ! -f "$BIN_PATH" ]; then
   echo "Missing built binary at $BIN_PATH" >&2
@@ -468,20 +538,58 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <string>EasySplatAppIcon</string>
   <key>CFBundleName</key>
   <string>EasySplat</string>
+  <key>CFBundleDisplayName</key>
+  <string>EasySplat</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
   <string>$NUMERIC_VERSION</string>
   <key>CFBundleVersion</key>
-  <string>$NUMERIC_VERSION</string>
+  <string>$BUILD_NUMBER</string>
+  <!-- The app hashes with SHA-256, checks code signatures, and opens no network
+       connection; it links no cryptographic library and neither do the tools it
+       carries. That is exempt encryption, so the store need not ask per build. -->
+  <key>ITSAppUsesNonExemptEncryption</key>
+  <false/>
   <key>EasySplatReleaseChannel</key>
   <string>$APP_RELEASE_CHANNEL</string>
   <key>EasySplatReleaseVersion</key>
   <string>$VERSION</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Gaussian Splat</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.polygon-file-format</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Splat</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>splat</string>
+      </array>
+    </dict>
+  </array>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.graphics-design</string>
   <key>LSMinimumSystemVersion</key>
   <string>15.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>© 2026 EasySplat contributors. MIT License.</string>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
 </dict>
@@ -489,17 +597,46 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 EOF
 
 # Copy direct resources used by Bundle.main
-if [ -d "$ROOT/EasySplatApp/Resources" ]; then
-  cp -R "$ROOT/EasySplatApp/Resources/." "$RES_DIR/"
+if [ -d "$BUILD_SOURCE_ROOT/EasySplatApp/Resources" ]; then
+  cp -R "$BUILD_SOURCE_ROOT/EasySplatApp/Resources/." "$RES_DIR/"
 fi
-BOOTSTRAP_RES_DIR="$RES_DIR/ToolchainBootstrap"
-rm -rf "$BOOTSTRAP_RES_DIR"
-mkdir -p "$BOOTSTRAP_RES_DIR"
-install -m 0644 "$SNAPSHOT_BOOTSTRAP_MANIFEST" "$BOOTSTRAP_RES_DIR/manifest.json"
-install -m 0644 "$SNAPSHOT_BOOTSTRAP_CORE" "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"
-if ! cmp -s "$SNAPSHOT_BOOTSTRAP_MANIFEST" "$BOOTSTRAP_RES_DIR/manifest.json" \
-  || ! cmp -s "$SNAPSHOT_BOOTSTRAP_CORE" "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"; then
-  echo "Copied bootstrap bytes changed while the app bundle was being assembled." >&2
+# Code signing treats every plain file under Contents/Helpers as unsigned nested
+# code, so only Mach-Os live there; the payload is sealed as ordinary resources.
+HELPERS_DIR="$APP_BUNDLE/Contents/Helpers"
+TOOLCHAIN_RES_DIR="$RES_DIR/Toolchain"
+rm -rf "$HELPERS_DIR" "$TOOLCHAIN_RES_DIR"
+mkdir -p "$HELPERS_DIR/bin" "$HELPERS_DIR/lib" "$TOOLCHAIN_RES_DIR"
+for helper in colmap easysplat-train; do
+  install -m 0755 "$TOOLCHAIN_DIR/bin/$helper" "$HELPERS_DIR/bin/$helper"
+done
+install -m 0755 "$TOOLCHAIN_DIR/lib/libomp.dylib" "$HELPERS_DIR/lib/libomp.dylib"
+install -m 0644 "$TOOLCHAIN_DIR/bin/default.metallib" "$TOOLCHAIN_RES_DIR/default.metallib"
+for payload in msplat provenance supply-chain licenses; do
+  if [ -d "$TOOLCHAIN_DIR/$payload" ]; then
+    cp -R "$TOOLCHAIN_DIR/$payload" "$TOOLCHAIN_RES_DIR/$payload"
+  fi
+done
+/usr/bin/find "$TOOLCHAIN_RES_DIR" -type d -exec chmod 0755 {} +
+/usr/bin/find "$TOOLCHAIN_RES_DIR" -type f -exec chmod 0644 {} +
+for staged in \
+  "bin/colmap:$HELPERS_DIR/bin/colmap" \
+  "bin/easysplat-train:$HELPERS_DIR/bin/easysplat-train" \
+  "lib/libomp.dylib:$HELPERS_DIR/lib/libomp.dylib" \
+  "bin/default.metallib:$TOOLCHAIN_RES_DIR/default.metallib"; do
+  if ! cmp -s "$TOOLCHAIN_DIR/${staged%%:*}" "${staged#*:}"; then
+    echo "Staged toolchain bytes differ from the source tree: ${staged%%:*}" >&2
+    exit 1
+  fi
+done
+if /usr/bin/find "$HELPERS_DIR" "$TOOLCHAIN_RES_DIR" \
+  \( -type l -o \( -type f -a ! -links 1 \) \) -print | /usr/bin/grep -q .; then
+  echo "Staged toolchain must contain no symlinks and no hard links." >&2
+  exit 1
+fi
+# colmap finds libomp through its own rpath; nothing is rewritten at package time.
+if ! /usr/bin/otool -l "$HELPERS_DIR/bin/colmap" \
+  | /usr/bin/grep -q "@executable_path/../lib"; then
+  echo "colmap no longer carries the rpath the bundled layout depends on." >&2
   exit 1
 fi
 if [ ! -s "$RES_DIR/EasySplatAppIcon.icns" ]; then
@@ -508,17 +645,17 @@ if [ ! -s "$RES_DIR/EasySplatAppIcon.icns" ]; then
 fi
 LICENSE_DIR="$RES_DIR/Licenses"
 mkdir -p "$LICENSE_DIR"
-install -m 0644 "$ROOT/LICENSE" "$LICENSE_DIR/EasySplat-LICENSE.txt"
-install -m 0644 "$ROOT/NOTICE.md" "$LICENSE_DIR/EasySplat-NOTICE.md"
-install -m 0644 "$ROOT/ThirdParty/MetalSplatter/LICENSE" "$LICENSE_DIR/MetalSplatter-LICENSE.txt"
+install -m 0644 "$BUILD_SOURCE_ROOT/LICENSE" "$LICENSE_DIR/EasySplat-LICENSE.txt"
+install -m 0644 "$BUILD_SOURCE_ROOT/NOTICE.md" "$LICENSE_DIR/EasySplat-NOTICE.md"
+install -m 0644 "$BUILD_SOURCE_ROOT/ThirdParty/MetalSplatter/LICENSE" "$LICENSE_DIR/MetalSplatter-LICENSE.txt"
 
 mkdir -p "$OVERRIDE_RES_DIR"
-printf "%s" "$MANIFEST_URL" > "$OVERRIDE_RES_DIR/toolchain_manifest_url.txt"
-install -m 0644 "$SNAPSHOT_PUBLIC_KEY" "$OVERRIDE_RES_DIR/public_key_ed25519.txt"
 printf "%s" "$PROJECT_URL" > "$OVERRIDE_RES_DIR/project_home_url.txt"
 cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/"
 if [ "$RELEASE_MODE" = production ]; then
   printf '%s' 'production release' >"$RES_DIR/release_channel.txt"
+elif [ "$RELEASE_MODE" = app-store ]; then
+  printf '%s' 'app store release' >"$RES_DIR/release_channel.txt"
 elif [ "$RELEASE_MODE" = prepare-release ]; then
   printf '%s' 'prepared release candidate' >"$RES_DIR/release_channel.txt"
 else
@@ -537,29 +674,71 @@ if [ -d "$DERIVED/Build/Products/Release/MetalSplatter_MetalSplatter.bundle" ]; 
   cp -R "$DERIVED/Build/Products/Release/MetalSplatter_MetalSplatter.bundle" "$RES_DIR/"
 fi
 
+if [ "$RELEASE_MODE" != development-unsigned ]; then
+  /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/mas_release_evidence.py" seal-source \
+    --repository "$ROOT" \
+    --source-commit "$SOURCE_COMMIT" \
+    --output "$RES_DIR/release_source.json"
+  chmod 0644 "$RES_DIR/release_source.json"
+fi
+
 rm -rf "$EXPORTED_DSYM_PATH"
 cp -R "$BUILT_DSYM_PATH" "$EXPORTED_DSYM_PATH"
 
-BUNDLED_PUBLIC_KEY="$RES_DIR/public_key_ed25519.txt"
-authority_files=("$BUNDLED_PUBLIC_KEY")
-if [ -d "$RES_DIR/EasySplat_EasySplatApp.bundle" ]; then
-  authority_files+=("$RES_DIR/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt")
-  if [ -d "$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources" ]; then
-    authority_files+=("$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources/public_key_ed25519.txt")
-  fi
-fi
-for authority_file in "${authority_files[@]}"; do
-  if ! cmp -s "$SNAPSHOT_PUBLIC_KEY" "$authority_file"; then
-    echo "Bundled app authority differs from the verified release input snapshot: $authority_file" >&2
-    exit 1
-  fi
-done
-verify_bootstrap "$BUNDLED_PUBLIC_KEY" \
-  "$BOOTSTRAP_RES_DIR/manifest.json" \
-  "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"
-
 plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
-if [ "$RELEASE_MODE" = production ]; then
+# Nothing in a shipped app may carry quarantine. Finding it after upload costs a
+# round trip through App Store Connect, so the build refuses it here.
+quarantined="$(
+  /usr/bin/find "$APP_BUNDLE" -type f \
+    -exec /usr/bin/xattr -p com.apple.quarantine {} \; -print 2>/dev/null \
+    | /usr/bin/grep "^$APP_BUNDLE" || true
+)"
+if [ -n "$quarantined" ]; then
+  echo "Quarantined files cannot ship; the store rejects the package:" >&2
+  printf '%s\n' "$quarantined" >&2
+  exit 1
+fi
+if [ "$RELEASE_MODE" = app-store ]; then
+  # The store validates the app against the profile sealed beside it, so the
+  # profile has to be staged before the signature covers the bundle.
+  # A profile downloaded through a browser carries com.apple.quarantine, and
+  # the store rejects a package containing any quarantined file (ITMS-91109).
+  # install(1) preserves the attribute; ditto --noqtn does not, and clearing
+  # the rest keeps provenance and where-from metadata out of the bundle too.
+  /usr/bin/ditto --noqtn "$PROVISIONING_PROFILE" \
+    "$APP_BUNDLE/Contents/embedded.provisionprofile"
+  /usr/bin/xattr -c "$APP_BUNDLE/Contents/embedded.provisionprofile"
+  chmod 0644 "$APP_BUNDLE/Contents/embedded.provisionprofile"
+  ENTITLEMENTS_DIR="$BUILD_SOURCE_ROOT/scripts/release/entitlements"
+  store_signing_args=(
+    --root "$APP_BUNDLE"
+    --kind app
+    --channel mas
+    --identity-fingerprint "$IDENTITY_FINGERPRINT"
+    --team-id "$TEAM_ID"
+    --receipt "$SIGNING_RECEIPT"
+    --entitlements "Contents/MacOS/EasySplatApp=$ENTITLEMENTS_DIR/mas-app.plist"
+  )
+  # The library is sealed by the bundle signature; only processes take
+  # entitlements.
+  for helper in bin/colmap bin/easysplat-train; do
+    store_signing_args+=(
+      --entitlements
+      "Contents/Helpers/$helper=$ENTITLEMENTS_DIR/mas-helper-inherit.plist"
+    )
+  done
+  /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/sign_macos_distribution.py" \
+    "${store_signing_args[@]}"
+  /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/sign_macos_distribution.py" \
+    --verify-only \
+    --bind-receipt-to-current-artifact \
+    --root "$APP_BUNDLE" \
+    --kind app \
+    --channel mas \
+    --identity-fingerprint "$IDENTITY_FINGERPRINT" \
+    --team-id "$TEAM_ID" \
+    --receipt "$SIGNING_RECEIPT"
+elif [ "$RELEASE_MODE" = production ]; then
   signing_args=(
     --root "$APP_BUNDLE"
     --kind app
@@ -567,9 +746,9 @@ if [ "$RELEASE_MODE" = production ]; then
     --team-id "$TEAM_ID"
     --receipt "$SIGNING_RECEIPT"
   )
-  /usr/bin/python3 -I "$ROOT/scripts/release/sign_macos_distribution.py" \
+  /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/sign_macos_distribution.py" \
     "${signing_args[@]}"
-  /usr/bin/python3 -I "$ROOT/scripts/release/sign_macos_distribution.py" \
+  /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/sign_macos_distribution.py" \
     --verify-only \
     --bind-receipt-to-current-artifact \
     --root "$APP_BUNDLE" \
@@ -577,10 +756,26 @@ if [ "$RELEASE_MODE" = production ]; then
     --identity-fingerprint "$IDENTITY_FINGERPRINT" \
     --team-id "$TEAM_ID" \
     --receipt "$SIGNING_RECEIPT"
-  SIGNED_BUILD_COMPLETE=1
 else
-  "$CODESIGN_BIN" --force --deep --sign - --timestamp=none "$APP_BUNDLE"
+  # Sign inside out. --deep is unsupported for distribution and would hide a
+  # broken nesting order here that then fails in the signed lane.
+  "$CODESIGN_BIN" --force --sign - --timestamp=none "$HELPERS_DIR/lib/libomp.dylib"
+  for helper in colmap easysplat-train; do
+    "$CODESIGN_BIN" --force --sign - --timestamp=none "$HELPERS_DIR/bin/$helper"
+  done
+  "$CODESIGN_BIN" --force --sign - --timestamp=none "$APP_BUNDLE"
   "$CODESIGN_BIN" --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+fi
+
+if [ "$RELEASE_MODE" != development-unsigned ]; then
+  /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/export_reviewed_source.py" \
+    --repository "$ROOT" \
+    --source-commit "$SOURCE_COMMIT" \
+    --output "$BUILD_SOURCE_ROOT" \
+    --verify-existing >/dev/null
+fi
+if [ "$RELEASE_MODE" = production ] || [ "$RELEASE_MODE" = app-store ]; then
+  SIGNED_BUILD_COMPLETE=1
 fi
 
 echo "Built app at: $APP_BUNDLE"

@@ -71,7 +71,7 @@ struct PhotoSelectionProjection: Equatable, Sendable {
                 throw PhotoSelectionProjectionError.invalidInputCombination
             }
             return (nil, nil)
-        case .photos:
+        case .photos, .dataset:
             guard !receipts.isEmpty else {
                 throw PhotoSelectionProjectionError.invalidInputCombination
             }

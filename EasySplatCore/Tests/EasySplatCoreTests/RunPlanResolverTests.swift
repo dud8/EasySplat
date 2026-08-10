@@ -118,12 +118,50 @@ final class RunPlanResolverTests: XCTestCase {
                 developmentOverrides: .none
             )
 
+            let budget = plan.geometryWorkerBudget
+            let context = "\(fixture.memoryGB) GB, \(fixture.cpuCount) CPUs, \(fixture.resourcePolicy)"
+            XCTAssertEqual(budget.featureExtractionWorkers, fixture.expected.featureExtractionWorkers, context)
+            XCTAssertEqual(budget.coupledMatchingWorkers, fixture.expected.coupledMatchingWorkers, context)
+            XCTAssertEqual(budget.vocabularyRetrievalWorkers, fixture.expected.vocabularyRetrievalWorkers, context)
             XCTAssertEqual(
-                plan.geometryWorkerBudget,
-                fixture.expected,
-                "\(fixture.memoryGB) GB, \(fixture.cpuCount) CPUs, \(fixture.resourcePolicy)"
+                budget.maximumConcurrentVideoSourceAnalysisTasks,
+                fixture.expected.maximumConcurrentVideoSourceAnalysisTasks,
+                context
             )
         }
+    }
+
+    func testRetrievalMemoryBudgetScalesWithInstalledRAM() {
+        func resolvedRetrievalBudget(memoryGB: Double, policy: ResourcePolicy) -> Int64 {
+            RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(detailProfile: .balanced, resourcePolicy: policy),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(memoryGB: memoryGB, cpuCount: 16, gpuWorkingSetGB: nil),
+                developmentOverrides: .none
+            ).geometryWorkerBudget.retrievalMemoryBudgetBytes
+        }
+
+        let lowerBound = ColmapVocabularyRetrievalOptions.minimumMemoryBudgetBytes
+        let upperBound = ColmapVocabularyRetrievalOptions.maximumMemoryBudgetBytes
+        let failedDefault = ColmapVocabularyRetrievalOptions.defaultMemoryBudgetBytes
+
+        for memoryGB in [16.0, 48.0, 64.0] {
+            let budget = resolvedRetrievalBudget(memoryGB: memoryGB, policy: .automatic)
+            XCTAssertGreaterThanOrEqual(budget, lowerBound, "\(memoryGB) GB budget below the tool floor")
+            XCTAssertLessThanOrEqual(budget, upperBound, "\(memoryGB) GB budget above the tool ceiling")
+            // The reported failure hard-capped retrieval at the 2 GiB default; a
+            // machine-scaled budget must clear it comfortably on any modern Mac.
+            XCTAssertGreaterThan(
+                budget, failedDefault,
+                "\(memoryGB) GB should exceed the old fixed 2 GiB default"
+            )
+        }
+
+        // More RAM never yields a smaller ceiling.
+        XCTAssertGreaterThanOrEqual(
+            resolvedRetrievalBudget(memoryGB: 64, policy: .automatic),
+            resolvedRetrievalBudget(memoryGB: 16, policy: .automatic)
+        )
     }
 
     func testIncompleteRunPlanIsRejected() throws {
@@ -163,8 +201,8 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.chunkSize, 0)
         XCTAssertEqual(plan.geometryProcessResolution, 0)
         XCTAssertEqual(plan.analysisFrameRate, 0)
-        XCTAssertEqual(plan.keyframeBudget, 250)
-        XCTAssertEqual(plan.maximumImageDimension, 1_600)
+        XCTAssertEqual(plan.keyframeBudget, 350)
+        XCTAssertEqual(plan.maximumImageDimension, 1_920)
         XCTAssertEqual(plan.colmapMaximumImageDimension, 1_232)
         XCTAssertEqual(plan.capturePath, .automatic)
         XCTAssertEqual(plan.inputOrdering, .unordered)
@@ -178,8 +216,8 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.normalDescriptorMatcher, .faiss)
         XCTAssertEqual(plan.cameraGrouping, .mixedCamerasOrLenses)
         XCTAssertEqual(plan.lensProjection, .automatic)
-        XCTAssertEqual(plan.trainerIterationLimit, 7_000)
-        XCTAssertEqual(plan.plateauWindow, 800)
+        XCTAssertEqual(plan.trainerIterationLimit, 30_000)
+        XCTAssertEqual(plan.plateauWindow, 2_000)
         XCTAssertEqual(plan.trainerMemoryBudgetBytes, 34_789_235_097)
         XCTAssertEqual(plan.colmapMaximumFeatureCount, 10_000)
         XCTAssertEqual(plan.colmapMaximumMatchCount, 10_000)
@@ -311,6 +349,36 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(plan.colmapMaximumFeatureCount, 4_096)
             XCTAssertEqual(plan.colmapMaximumMatchCount, 4_096)
             XCTAssertEqual(plan.geometryWorkerBudget.coupledMatchingWorkers, 4)
+        }
+    }
+
+    func testTrainerBudgetScalesWithMemoryTier() {
+        let cases: [(DetailProfile, ResourcePolicy, Double, String, Int, Int)] = [
+            (.fast, .automatic, 8, "constrained", 3_000, 400),
+            (.fast, .automatic, 48, "performance", 3_000, 400),
+            (.balanced, .automatic, 16, "constrained", 12_000, 1_200),
+            (.balanced, .automatic, 24, "standard", 20_000, 1_600),
+            (.balanced, .automatic, 48, "performance", 30_000, 2_000),
+            (.highDetail, .conserveMemory, 48, "constrained", 20_000, 1_600),
+            (.highDetail, .automatic, 24, "standard", 30_000, 2_000),
+            (.highDetail, .automatic, 48, "performance", 40_000, 2_500),
+        ]
+
+        for (detail, resourcePolicy, memoryGB, memoryTier, iterations, plateau) in cases {
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: detail,
+                    resourcePolicy: resourcePolicy
+                ),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(memoryGB: memoryGB, cpuCount: 16, gpuWorkingSetGB: 12),
+                developmentOverrides: .none
+            )
+
+            let caseName = "\(detail), \(resourcePolicy), \(memoryGB) GB"
+            XCTAssertEqual(plan.memoryTier, memoryTier, caseName)
+            XCTAssertEqual(plan.trainerIterationLimit, iterations, caseName)
+            XCTAssertEqual(plan.plateauWindow, plateau, caseName)
         }
     }
 

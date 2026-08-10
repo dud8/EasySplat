@@ -129,6 +129,58 @@ final class VnodeMutationMonitorTests: XCTestCase {
         XCTAssertFalse(later.isTrustworthy)
     }
 
+    func testAcknowledgingExpectedSnapshotClearsOnlyObservedGeneration() throws {
+        let kernel = KernelStub(pollResults: [
+            .success([.init(
+                descriptor: 17,
+                eventFlags: 0,
+                vnodeFlags: UInt32(NOTE_WRITE | NOTE_LINK)
+            )]),
+            .success([.init(
+                descriptor: 17,
+                eventFlags: 0,
+                vnodeFlags: UInt32(NOTE_RENAME)
+            )]),
+        ])
+        let monitor = try VnodeMutationMonitor(
+            watches: [.init(descriptor: 17, label: "library", ownership: .borrowed)],
+            systemCalls: kernel.systemCalls
+        )
+        defer { monitor.close() }
+
+        let expected = VnodeMutationMonitor.Snapshot(
+            mutations: [.init(label: "library", flags: [.write, .link])],
+            failure: nil
+        )
+        XCTAssertTrue(monitor.acknowledgeCurrentSnapshot { $0 == expected })
+        XCTAssertEqual(
+            monitor.poll().mutations,
+            [.init(label: "library", flags: [.rename])]
+        )
+    }
+
+    func testRejectedAcknowledgementKeepsObservedMutationSticky() throws {
+        let kernel = KernelStub(pollResults: [
+            .success([.init(
+                descriptor: 17,
+                eventFlags: 0,
+                vnodeFlags: UInt32(NOTE_DELETE)
+            )]),
+            .success([]),
+        ])
+        let monitor = try VnodeMutationMonitor(
+            watches: [.init(descriptor: 17, label: "library", ownership: .borrowed)],
+            systemCalls: kernel.systemCalls
+        )
+        defer { monitor.close() }
+
+        XCTAssertFalse(monitor.acknowledgeCurrentSnapshot { _ in false })
+        XCTAssertEqual(
+            monitor.poll().mutations,
+            [.init(label: "library", flags: [.delete])]
+        )
+    }
+
     func testRevokeEventFailsClosedAndReportsMutation() throws {
         let kernel = KernelStub(pollResults: [
             .success([.init(

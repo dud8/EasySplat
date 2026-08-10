@@ -1066,15 +1066,16 @@ enum ShareSnapshotStorage {
 }
 
 struct PreparedShareItem: Equatable, Sendable {
-    let projectURL: URL
-    let outputURL: URL
+    let source: AppModel.CurrentSplatPublicationSource
     let shareURL: URL
     let shareDirectory: ShareSnapshotDirectory
-    let validatedSHA256: String?
     let byteCount: Int64
     let outputSnapshot: ShareFileSnapshot
     let shareSnapshot: ShareFileSnapshot
 
+    var projectURL: URL { source.projectURL }
+    var outputURL: URL { source.outputURL }
+    var validatedSHA256: String? { source.expectedIdentity.sha256 }
     var shareDirectoryURL: URL { shareDirectory.url }
 }
 
@@ -1113,6 +1114,7 @@ extension AppModel {
         publisher: @escaping ShareSnapshotPublisher
     ) async {
         guard activeShareSession == nil else { return }
+        let requestedVariant = selectedSplatOutputVariant
         let token = UUID()
         latestShareOperationID = nil
         sharePreparationToken = token
@@ -1120,26 +1122,41 @@ extension AppModel {
         isShareReady = false
         isPreparingShare = true
 
-        guard let projectURL = currentProjectURL,
-              let displayedOutputURL = outputPlyURL,
-              ProjectSummary.hasSameLocation(
-                  displayedOutputURL,
-                  ProjectPaths(root: projectURL).outputSplatURL
-              ) else {
+        let source: CurrentSplatPublicationSource
+        do {
+            source = try await validatedCurrentSplatForPublication()
+        } catch is CancellationError {
+            clearSharePreparation(token: token)
+            return
+        } catch {
+            let message: String
+            if requestedVariant == .subject {
+                message = "Subject isn’t available to share."
+            } else if let projectURL = currentProjectURL {
+                message = unavailableOutputMessage(
+                    for: ProjectPaths(root: projectURL).outputSplatURL
+                )
+            } else {
+                message = "Finish a project before sharing."
+            }
             finishSharePreparationFailure(
                 token: token,
-                message: "Finish a project before sharing."
+                message: message
             )
             return
         }
-        let expectedOutputURL = ProjectPaths(root: projectURL).outputSplatURL
-        let validator = finishedOutputValidator
+        guard sharePreparationToken == token,
+              selectedSplatOutputVariant == source.variant,
+              ProjectSummary.hasSameLocation(
+                  currentProjectURL,
+                  source.projectURL
+              ) else {
+            clearSharePreparation(token: token)
+            return
+        }
         let worker = Task.detached(priority: .userInitiated) {
             try Self.makePreparedShareItem(
-                projectURL: projectURL,
-                displayedOutputURL: displayedOutputURL,
-                expectedOutputURL: expectedOutputURL,
-                validator: validator,
+                source: source,
                 publisher: publisher
             )
         }
@@ -1158,8 +1175,15 @@ extension AppModel {
                 return
             }
             guard sharePreparationToken == token,
-                  ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
-                  ProjectSummary.hasSameLocation(outputPlyURL, displayedOutputURL) else {
+                  selectedSplatOutputVariant == source.variant,
+                  ProjectSummary.hasSameLocation(
+                      currentProjectURL,
+                      source.projectURL
+                  ),
+                  ProjectSummary.hasSameLocation(
+                      displayedOutputURL,
+                      source.outputURL
+                  ) else {
                 ShareSnapshotStorage.remove(
                     item.shareDirectory,
                     expectedFileLeaf: item.shareURL.lastPathComponent
@@ -1250,10 +1274,16 @@ extension AppModel {
               !isShareSheetActive,
               let preparedShareItem,
               let projectURL = currentProjectURL,
+              selectedSplatOutputVariant == preparedShareItem.source.variant,
               ProjectSummary.hasSameLocation(projectURL, preparedShareItem.projectURL),
-              ProjectSummary.hasSameLocation(outputPlyURL, preparedShareItem.outputURL) else {
+              ProjectSummary.hasSameLocation(
+                  displayedOutputURL,
+                  preparedShareItem.outputURL
+              ) else {
             invalidatePreparedShareItem(
-                message: "Could not open the validated splat. Reopen the project and try again."
+                message: sharePresentationFailureMessage(
+                    for: preparedShareItem?.source.variant
+                )
             )
             return
         }
@@ -1294,23 +1324,28 @@ extension AppModel {
               permitsRequestedPreparation || !isPreparingShare,
               let preparedItem = preparedShareItem,
               let projectURL = currentProjectURL,
-              let displayedOutputURL = outputPlyURL,
+              let displayedOutputURL,
+              selectedSplatOutputVariant == preparedItem.source.variant,
               ProjectSummary.hasSameLocation(projectURL, preparedItem.projectURL),
               ProjectSummary.hasSameLocation(displayedOutputURL, preparedItem.outputURL) else {
             invalidatePreparedShareItem(
-                message: "Could not open the validated splat. Reopen the project and try again."
+                message: sharePresentationFailureMessage(
+                    for: preparedShareItem?.source.variant
+                )
             )
             return
         }
         let token = UUID()
         sharePreparationToken = token
         isPreparingShare = true
-        let validator = finishedOutputValidator
+        let resolver = publishedResultResolver
+        let subjectLoader = subjectIsolationArtifactLoader
         let validation = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             return try Self.isPreparedShareItemCurrent(
                 preparedItem,
-                validator: validator
+                resolver: resolver,
+                subjectLoader: subjectLoader
             )
         }
         let isCurrent: Bool
@@ -1330,11 +1365,17 @@ extension AppModel {
         }
         guard sharePreparationToken == token else { return }
         guard ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
-              ProjectSummary.hasSameLocation(outputPlyURL, displayedOutputURL),
+              selectedSplatOutputVariant == preparedItem.source.variant,
+              ProjectSummary.hasSameLocation(
+                  self.displayedOutputURL,
+                  displayedOutputURL
+              ),
               preparedShareItem == preparedItem,
               isCurrent else {
             invalidatePreparedShareItem(
-                message: "Could not open the validated splat. Reopen the project and try again."
+                message: sharePresentationFailureMessage(
+                    for: preparedItem.source.variant
+                )
             )
             return
         }
@@ -1424,10 +1465,19 @@ extension AppModel {
         shareStatusIsError = true
     }
 
-    func shareDidCancel(from session: ShareSession) {
-        guard activeShareSession === session else { return }
-        shareStatusMessage = nil
-        shareStatusIsError = false
+    func shareDismissalCandidate(
+        from session: ShareSession,
+        sessionID: UUID,
+        generation: UInt64
+    ) {
+        guard activeShareSession === session,
+              session.matchesAwaitingSelection(
+                  sessionID: sessionID,
+                  generation: generation
+              ) else {
+            return
+        }
+        clearShareSession(session)
     }
 
     func clearShareSession(_ session: ShareSession) {
@@ -1435,7 +1485,13 @@ extension AppModel {
         session.finish()
         activeShareSession = nil
         isShareSheetActive = false
-        // Keep the validated snapshot reusable. Reset and cancelSharing own its cleanup.
+        if preparedShareItem == session.preparedItem {
+            preparedShareItem = nil
+        }
+        isShareReady = false
+        shareStatusMessage = nil
+        shareStatusIsError = false
+        session.releasePreparedSnapshot()
     }
 
     func cancelSharing() {
@@ -1443,45 +1499,103 @@ extension AppModel {
         sharePreparationTask = nil
         sharePreparationToken = nil
         isPreparingShare = false
-        let session = activeShareSession
-        _ = session?.close()
-        activeShareSession = nil
+        if let activeShareSession {
+            clearShareSession(activeShareSession)
+        }
         latestShareOperationID = nil
         isShareSheetActive = false
         cleanupPreparedShareItem()
         isShareReady = false
     }
 
-    private nonisolated static func currentShareArtifactStillMatches(
-        _ preparedItem: PreparedShareItem,
-        projectURL: URL
-    ) -> Bool {
-        guard let snapshot = try? ProjectArtifactSnapshotStore.load(projectURL: projectURL) else {
-            return false
-        }
-        guard let trainingArtifact = snapshot.trainingArtifact else { return false }
-        return trainingArtifact.outputSHA256 == preparedItem.validatedSHA256
-            && trainingArtifact.outputBytes == preparedItem.byteCount
-    }
-
     private nonisolated static func isPreparedShareItemCurrent(
         _ preparedItem: PreparedShareItem,
-        validator: FinishedOutputValidator
+        resolver: PublishedResultResolverOperation,
+        subjectLoader: SubjectIsolationArtifactLoader
     ) throws -> Bool {
-        guard let currentOutputURL = validator(preparedItem.projectURL),
-              ProjectSummary.hasSameLocation(currentOutputURL, preparedItem.outputURL),
-              try ShareFileSnapshot.capture(
-                  at: currentOutputURL,
-                  shouldCancel: { Task.isCancelled }
-              ) == preparedItem.outputSnapshot,
-              currentShareArtifactStillMatches(
-                  preparedItem,
-                  projectURL: preparedItem.projectURL
-              ),
-              try ShareFileSnapshot.capture(
-                  at: preparedItem.shareURL,
-                  shouldCancel: { Task.isCancelled }
-              ) == preparedItem.shareSnapshot else {
+        let resolvedResult = try resolver(preparedItem.projectURL)
+        let currentOutputURL: URL
+        let verifiedOutputSHA256: String
+        switch preparedItem.source.variant {
+        case .original:
+            let resolvedOutputURL: URL
+            let identity: ExpectedPlyArtifactIdentity
+            let publicationID: UUID?
+            switch resolvedResult {
+            case .current(.receiptBound(let current)):
+                resolvedOutputURL = current.publishedResult.outputURL
+                identity = expectedPlyIdentity(
+                    from: current.publishedResult.outputEvidence
+                )
+                publicationID = current.publishedResult.receipt.publicationID
+            case .current(.legacy(let legacy)):
+                guard let legacyIdentity = expectedPlyIdentity(
+                    from: legacy.snapshot.trainingArtifact
+                ) else {
+                    return false
+                }
+                resolvedOutputURL = legacy.outputURL
+                identity = legacyIdentity
+                publicationID = nil
+            case .previous(let previous):
+                resolvedOutputURL = previous.publishedResult.outputURL
+                identity = expectedPlyIdentity(
+                    from: previous.publishedResult.outputEvidence
+                )
+                publicationID = previous.publishedResult.receipt.publicationID
+            case .unavailable:
+                return false
+            }
+            guard publicationID == preparedItem.source.publicationID,
+                  identity == preparedItem.source.expectedIdentity,
+                  ProjectSummary.hasSameLocation(
+                    resolvedOutputURL,
+                    preparedItem.outputURL
+                  ) else {
+                return false
+            }
+            currentOutputURL = resolvedOutputURL
+            verifiedOutputSHA256 = identity.sha256
+
+        case .subject:
+            let currentPublicationID: UUID?
+            switch resolvedResult {
+            case .current(.receiptBound(let current)):
+                currentPublicationID = current.publishedResult.receipt.publicationID
+            case .current(.legacy):
+                currentPublicationID = nil
+            case .previous(let previous):
+                currentPublicationID = previous.publishedResult.receipt.publicationID
+            case .unavailable:
+                return false
+            }
+            guard currentPublicationID == preparedItem.source.publicationID,
+                  case .valid(let artifact, let output) = subjectLoader(
+                ProjectPaths(root: preparedItem.projectURL)
+            ),
+            currentPublicationID == nil
+                || artifact.sourcePublicationID == currentPublicationID,
+            output.variant == .subject,
+            ProjectSummary.hasSameLocation(
+                output.url,
+                preparedItem.outputURL
+            ),
+            expectedPlyIdentity(from: output)
+                == preparedItem.source.expectedIdentity else {
+                return false
+            }
+            currentOutputURL = output.url
+            verifiedOutputSHA256 = output.sha256
+        }
+
+        guard ShareFileSnapshot.captureIdentity(
+            at: currentOutputURL,
+            verifiedSHA256: verifiedOutputSHA256
+        ) == preparedItem.outputSnapshot,
+        try ShareFileSnapshot.capture(
+            at: preparedItem.shareURL,
+            shouldCancel: { Task.isCancelled }
+        ) == preparedItem.shareSnapshot else {
             return false
         }
         return true
@@ -1529,44 +1643,17 @@ extension AppModel {
     }
 
     private nonisolated static func makePreparedShareItem(
-        projectURL: URL,
-        displayedOutputURL: URL,
-        expectedOutputURL: URL,
-        validator: FinishedOutputValidator,
+        source: CurrentSplatPublicationSource,
         publisher: ShareSnapshotPublisher
     ) throws -> PreparedShareItem {
         try Task.checkCancellation()
-        guard let validatedOutputURL = validator(projectURL),
-              ProjectSummary.hasSameLocation(validatedOutputURL, expectedOutputURL) else {
-            throw SharePreparationFailure(
-                message: shareUnavailableOutputMessage(for: expectedOutputURL)
-            )
-        }
-        try Task.checkCancellation()
-
-        let snapshot: ProjectArtifactSnapshot
-        do {
-            snapshot = try ProjectArtifactSnapshotStore.load(projectURL: projectURL)
-        } catch {
-            throw SharePreparationFailure(
-                message: shareUnavailableOutputMessage(for: expectedOutputURL)
-            )
-        }
-        guard let trainingArtifact = snapshot.trainingArtifact,
-              let expectedIdentity = expectedPlyIdentity(from: trainingArtifact) else {
-            throw SharePreparationFailure(
-                message: shareUnavailableOutputMessage(for: expectedOutputURL)
-            )
-        }
-        let validatedSHA256 = expectedIdentity.sha256
-
         var createdShareDirectory: ShareSnapshotDirectory?
         var expectedShareLeaf: String?
         do {
             let shareDirectory = try ShareSnapshotStorage.create()
             createdShareDirectory = shareDirectory
             let shareURL = shareDirectory.url.appendingPathComponent(
-                validatedOutputURL.lastPathComponent,
+                source.defaultFilename,
                 isDirectory: false
             )
             expectedShareLeaf = shareURL.lastPathComponent
@@ -1575,13 +1662,13 @@ extension AppModel {
                 expectedFileLeaf: shareURL.lastPathComponent
             )
             let evidence = try publisher(
-                validatedOutputURL,
+                source.outputURL,
                 shareURL,
-                expectedIdentity
+                source.expectedIdentity
             )
             guard evidence.byteCount <= UInt64(Int64.max),
                   let outputSnapshot = ShareFileSnapshot.captureIdentity(
-                      at: validatedOutputURL,
+                      at: source.outputURL,
                       verifiedSHA256: evidence.sha256
                   ),
                   let capturedShareSnapshot = ShareFileSnapshot.captureIdentity(
@@ -1598,11 +1685,9 @@ extension AppModel {
             )
             try Task.checkCancellation()
             return PreparedShareItem(
-                projectURL: projectURL.standardizedFileURL,
-                outputURL: displayedOutputURL.standardizedFileURL,
+                source: source,
                 shareURL: shareURL.standardizedFileURL,
                 shareDirectory: shareDirectory,
-                validatedSHA256: validatedSHA256,
                 byteCount: Int64(evidence.byteCount),
                 outputSnapshot: outputSnapshot,
                 shareSnapshot: capturedShareSnapshot
@@ -1640,6 +1725,163 @@ extension AppModel {
         return "Could not find \(expectedURL.lastPathComponent). Rebuild or reopen the project."
     }
 
+    private func sharePresentationFailureMessage(
+        for variant: SplatOutputVariant?
+    ) -> String {
+        if variant == .subject {
+            return "Could not open the validated Subject splat. Try again."
+        }
+        return "Could not open the validated splat. Reopen the project and try again."
+    }
+
+}
+
+@MainActor
+protocol ShareDismissalObserving: AnyObject {
+    func start(
+        anchorView: NSView,
+        onDismissalCandidate: @escaping () -> Void
+    )
+
+    func stop()
+}
+
+@MainActor
+final class ShareDismissalObservation: NSObject, ShareDismissalObserving {
+    private let notificationCenter: NotificationCenter
+    private let application: AnyObject
+    private weak var anchorWindow: NSWindow?
+    private var localEventMonitor: Any?
+    private var onDismissalCandidate: (() -> Void)?
+    private var applicationReturnArmed = false
+    private var windowReturnArmed = false
+
+    init(
+        notificationCenter: NotificationCenter = .default,
+        application: AnyObject = NSApplication.shared
+    ) {
+        self.notificationCenter = notificationCenter
+        self.application = application
+        super.init()
+    }
+
+    func start(
+        anchorView: NSView,
+        onDismissalCandidate: @escaping () -> Void
+    ) {
+        stop()
+        self.onDismissalCandidate = onDismissalCandidate
+        anchorWindow = anchorView.window
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]
+        ) { @MainActor [weak self] event in
+            self?.handleLocalEvent(event) ?? event
+        }
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(applicationDidResignActive(_:)),
+            name: NSApplication.didResignActiveNotification,
+            object: application
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive(_:)),
+            name: NSApplication.didBecomeActiveNotification,
+            object: application
+        )
+        notificationCenter.addObserver(
+            self,
+            selector: #selector(windowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: nil
+        )
+        if let anchorWindow {
+            notificationCenter.addObserver(
+                self,
+                selector: #selector(anchorWindowDidMiniaturize(_:)),
+                name: NSWindow.didMiniaturizeNotification,
+                object: anchorWindow
+            )
+            notificationCenter.addObserver(
+                self,
+                selector: #selector(anchorWindowDidResignKey(_:)),
+                name: NSWindow.didResignKeyNotification,
+                object: anchorWindow
+            )
+            notificationCenter.addObserver(
+                self,
+                selector: #selector(anchorWindowDidBecomeKey(_:)),
+                name: NSWindow.didBecomeKeyNotification,
+                object: anchorWindow
+            )
+        }
+    }
+
+    func stop() {
+        if let localEventMonitor {
+            NSEvent.removeMonitor(localEventMonitor)
+            self.localEventMonitor = nil
+        }
+        notificationCenter.removeObserver(self)
+        anchorWindow = nil
+        onDismissalCandidate = nil
+        applicationReturnArmed = false
+        windowReturnArmed = false
+    }
+
+    @discardableResult
+    func handleLocalEvent(_ event: NSEvent) -> NSEvent {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown:
+            onDismissalCandidate?()
+        case .keyDown where event.keyCode == 53:
+            onDismissalCandidate?()
+        default:
+            break
+        }
+        return event
+    }
+
+    @objc private func applicationDidResignActive(_ notification: Notification) {
+        applicationReturnArmed = true
+    }
+
+    @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        guard applicationReturnArmed else { return }
+        applicationReturnArmed = false
+        onDismissalCandidate?()
+    }
+
+    @objc private func windowWillClose(_ notification: Notification) {
+        onDismissalCandidate?()
+    }
+
+    @objc private func anchorWindowDidMiniaturize(_ notification: Notification) {
+        onDismissalCandidate?()
+    }
+
+    @objc private func anchorWindowDidResignKey(_ notification: Notification) {
+        windowReturnArmed = true
+    }
+
+    @objc private func anchorWindowDidBecomeKey(_ notification: Notification) {
+        guard windowReturnArmed else { return }
+        windowReturnArmed = false
+        onDismissalCandidate?()
+    }
+}
+
+@MainActor
+private final class DismissalAwareSharingServicePicker: NSSharingServicePicker {
+    nonisolated(unsafe) var onClose: (() -> Void)?
+
+    nonisolated override func close() {
+        let pickerDelegate = delegate
+        delegate = nil
+        super.close()
+        delegate = pickerDelegate
+        onClose?()
+    }
 }
 
 @MainActor
@@ -1656,16 +1898,20 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
         NSView,
         NSRectEdge
     ) -> Void
-    typealias SnapshotRemover = (PreparedShareItem) -> Void
+    typealias SnapshotRemover = (PreparedShareItem) -> ShareSnapshotRemovalOutcome
 
     private weak var model: AppModel?
     private weak var anchorView: NSView?
-    private var picker: NSSharingServicePicker?
+    private var picker: DismissalAwareSharingServicePicker?
     private var isPickerClosed = false
     private var serviceState: ServiceState = .awaitingSelection
     private var selectedService: NSSharingService?
     private let presenter: Presenter
     private let snapshotRemover: SnapshotRemover
+    private let dismissalObservation: any ShareDismissalObserving
+    private var isDismissalObservationActive = false
+    private var dismissalGeneration: UInt64 = 0
+    private var queuedDismissalGeneration: UInt64?
     private var didReleasePreparedSnapshot = false
 
     let id: UUID
@@ -1687,13 +1933,15 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
                 preparedItem.shareDirectory,
                 expectedFileLeaf: preparedItem.shareURL.lastPathComponent
             )
-        }
+        },
+        dismissalObservation: (any ShareDismissalObserving)? = nil
     ) {
         self.model = model
         self.preparedItem = preparedItem
         self.id = id
         self.presenter = presenter
         self.snapshotRemover = snapshotRemover
+        self.dismissalObservation = dismissalObservation ?? ShareDismissalObservation()
     }
 
     func present(items: [Any], from sourceView: NSView) {
@@ -1702,20 +1950,36 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
               picker == nil else {
             return
         }
-        let picker = NSSharingServicePicker(items: items)
+        dismissalGeneration &+= 1
+        let generation = dismissalGeneration
+        let sessionID = id
+        let picker = DismissalAwareSharingServicePicker(items: items)
         picker.delegate = self
+        picker.onClose = { [weak self] in
+            guard let self else { return }
+            self.isPickerClosed = true
+            self.queueDismissalCandidate(
+                sessionID: sessionID,
+                generation: generation
+            )
+        }
         self.picker = picker
         anchorView = sourceView
+        isDismissalObservationActive = true
+        dismissalObservation.start(anchorView: sourceView) { [weak self] in
+            self?.queueDismissalCandidate(
+                sessionID: sessionID,
+                generation: generation
+            )
+        }
         presenter(picker, sourceView.bounds, sourceView, .minY)
     }
 
     @discardableResult
     func close() -> Bool {
         guard !isPickerClosed else { return false }
-        isPickerClosed = true
-        picker?.delegate = nil
-        picker?.close()
-        picker = nil
+        stopDismissalObservation()
+        closePicker()
         if serviceState == .awaitingSelection {
             serviceState = .terminal
             anchorView = nil
@@ -1726,9 +1990,8 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
     func finish() {
         guard serviceState != .serviceInFlight else { return }
         serviceState = .terminal
-        isPickerClosed = true
-        picker?.delegate = nil
-        picker = nil
+        stopDismissalObservation()
+        closePicker()
         anchorView = nil
         selectedService?.delegate = nil
         selectedService = nil
@@ -1751,30 +2014,25 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
     ) {
         guard serviceState == .awaitingSelection else { return }
         guard let service else {
-            serviceState = .terminal
-            model?.shareDidCancel(from: self)
             model?.clearShareSession(self)
             return
         }
         guard preparedItem != nil else {
-            serviceState = .terminal
-            model?.shareDidCancel(from: self)
             model?.clearShareSession(self)
             return
         }
+        stopDismissalObservation()
+        detachPicker()
         serviceState = .serviceInFlight
         selectedService = service
         service.delegate = self
         guard model?.shareDidStart(from: self) == true else {
             service.delegate = nil
             selectedService = nil
-            serviceState = .terminal
+            serviceState = .awaitingSelection
             model?.clearShareSession(self)
             return
         }
-        isPickerClosed = true
-        picker?.delegate = nil
-        picker = nil
     }
 
     func sharingService(_ sharingService: NSSharingService, didShareItems items: [Any]) {
@@ -1799,20 +2057,82 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
         serviceState = .terminal
         selectedService?.delegate = nil
         selectedService = nil
-        picker?.delegate = nil
-        picker = nil
+        stopDismissalObservation()
+        detachPicker()
         anchorView = nil
         return true
     }
 
-    func releasePreparedSnapshot() {
+    func matchesAwaitingSelection(
+        sessionID: UUID,
+        generation: UInt64
+    ) -> Bool {
+        id == sessionID
+            && dismissalGeneration == generation
+            && serviceState == .awaitingSelection
+    }
+
+    private func queueDismissalCandidate(
+        sessionID: UUID,
+        generation: UInt64
+    ) {
+        guard matchesAwaitingSelection(
+            sessionID: sessionID,
+            generation: generation
+        ), queuedDismissalGeneration != generation else {
+            return
+        }
+        queuedDismissalGeneration = generation
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.queuedDismissalGeneration == generation,
+                  self.matchesAwaitingSelection(
+                      sessionID: sessionID,
+                      generation: generation
+                  ) else {
+                return
+            }
+            self.queuedDismissalGeneration = nil
+            self.model?.shareDismissalCandidate(
+                from: self,
+                sessionID: sessionID,
+                generation: generation
+            )
+        }
+    }
+
+    private func stopDismissalObservation() {
+        dismissalGeneration &+= 1
+        queuedDismissalGeneration = nil
+        guard isDismissalObservationActive else { return }
+        isDismissalObservationActive = false
+        dismissalObservation.stop()
+    }
+
+    private func closePicker() {
+        let picker = self.picker
+        let shouldClose = !isPickerClosed
+        detachPicker()
+        guard shouldClose else { return }
+        picker?.close()
+    }
+
+    private func detachPicker() {
+        isPickerClosed = true
+        picker?.onClose = nil
+        picker?.delegate = nil
+        picker = nil
+    }
+
+    @discardableResult
+    func releasePreparedSnapshot() -> ShareSnapshotRemovalOutcome? {
         guard serviceState == .terminal,
               !didReleasePreparedSnapshot,
               let preparedItem else {
-            return
+            return nil
         }
         didReleasePreparedSnapshot = true
-        snapshotRemover(preparedItem)
+        return snapshotRemover(preparedItem)
     }
 
     func anchoringView(

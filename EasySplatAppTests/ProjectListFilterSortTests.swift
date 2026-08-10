@@ -20,6 +20,7 @@ final class ProjectListFilterSortTests: XCTestCase {
             url: url ?? URL(fileURLWithPath: "/tmp/\(id.uuidString).easysplatproj"),
             createdAt: createdAt,
             status: status,
+            hasPreviousResultHint: false,
             isActive: false,
             isInterrupted: false,
             checkpointUpdatedAt: nil,
@@ -94,6 +95,13 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(visible.map(\.title), ["Kitchen"])
     }
 
+    func testRowUnavailabilityRequiresActiveRunAndOtherProject() {
+        XCTAssertTrue(ProjectSidebar.rowIsUnavailableDuringRun(isRunActive: true, isActiveProject: false))
+        XCTAssertFalse(ProjectSidebar.rowIsUnavailableDuringRun(isRunActive: true, isActiveProject: true))
+        XCTAssertFalse(ProjectSidebar.rowIsUnavailableDuringRun(isRunActive: false, isActiveProject: false))
+        XCTAssertFalse(ProjectSidebar.rowIsUnavailableDuringRun(isRunActive: false, isActiveProject: true))
+    }
+
     func testRenameDraftValidityRejectsEmptyAndUnchangedTitles() {
         XCTAssertTrue(ProjectSidebar.renameDraftIsInvalid(draft: "", currentTitle: "ProjectA"))
         XCTAssertTrue(ProjectSidebar.renameDraftIsInvalid(draft: "   ", currentTitle: "ProjectA"))
@@ -133,6 +141,23 @@ final class ProjectListFilterSortTests: XCTestCase {
             ProjectSidebar.selectionID(for: directoryURL),
             ProjectSidebar.selectionID(for: fileURL)
         )
+    }
+
+    func testSidebarRowIdentityMatchesSelectionTag() {
+        let directoryStyle = makeSummary(
+            url: URL(fileURLWithPath: "/tmp/Project.easysplatproj", isDirectory: true)
+        )
+        let fileStyle = makeSummary(
+            url: URL(fileURLWithPath: "/tmp/Project.easysplatproj")
+        )
+
+        // Row diffing (ForEach id) and selection matching (.tag) both read
+        // selectionID; a divergence would let a reorder strand the highlight.
+        for summary in [directoryStyle, fileStyle] {
+            XCTAssertEqual(summary.selectionID, ProjectSidebar.selectionID(for: summary))
+            XCTAssertEqual(summary.selectionID, ProjectSummary.canonicalURL(for: summary.url))
+        }
+        XCTAssertEqual(directoryStyle.selectionID, fileStyle.selectionID)
     }
 
     func testProjectRowAccessibilityIdentifierIsStableAndDoesNotExposeThePath() {
@@ -230,30 +255,38 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(model.actionFailure?.title, "Couldn’t save notes")
     }
 
-    func testSortByLastActivityPrefersLastOpenedAtOverStageTimings() {
-        let openedYesterday = makeSummary(
-            title: "OpenedYesterday",
+    func testSortByLastActivityIgnoresOpens() {
+        // A very recent open must not outrank older pipeline work; otherwise
+        // opening a project reshuffles the Recent list under the user's click.
+        let openedRecently = makeSummary(
+            title: "OpenedRecently",
             stageTimings: [
-                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 100), durationSeconds: 60)
+                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 40), durationSeconds: 60)
             ],
-            lastOpenedAt: Date(timeIntervalSince1970: 200_000)
+            lastOpenedAt: Date(timeIntervalSince1970: 1_000_000)
         )
-        let openedToday = makeSummary(
-            title: "OpenedToday",
+        let ranRecently = makeSummary(
+            title: "RanRecently",
             stageTimings: [
-                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 1_000), durationSeconds: 60)
-            ],
-            lastOpenedAt: Date(timeIntervalSince1970: 300_000)
-        )
-        let stageOnly = makeSummary(
-            title: "StageOnly",
-            stageTimings: [
-                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 500_000), durationSeconds: 60)
+                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 140), durationSeconds: 60)
             ],
             lastOpenedAt: nil
         )
-        let sorted = ProjectListSort.lastActivityNewest.apply(to: [openedYesterday, openedToday, stageOnly])
-        XCTAssertEqual(sorted.map(\.title), ["StageOnly", "OpenedToday", "OpenedYesterday"])
+        let sorted = ProjectListSort.lastActivityNewest.apply(to: [openedRecently, ranRecently])
+        XCTAssertEqual(sorted.map(\.title), ["RanRecently", "OpenedRecently"])
+    }
+
+    func testLastActivityIgnoresLastOpenedAt() {
+        let project = makeSummary(
+            createdAt: Date(timeIntervalSince1970: 100),
+            stageTimings: [
+                .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 400), durationSeconds: 50)
+            ],
+            lastOpenedAt: Date(timeIntervalSince1970: 9_000_000),
+            lastRunStartedAt: Date(timeIntervalSince1970: 300)
+        )
+
+        XCTAssertEqual(project.lastActivityAt, Date(timeIntervalSince1970: 450))
     }
 
     func testLastActivityUsesWorkCompletedAfterProjectWasOpened() {
@@ -301,12 +334,26 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(sorted.map(\.title), ["Apple", "monkey", "zebra"])
     }
 
+    func testOnlyExceptionalStatesEarnARowCaption() {
+        XCTAssertNil(ProjectSidebar.rowCaption(status: .ready, isInterrupted: false))
+        XCTAssertEqual(ProjectSidebar.rowCaption(status: .inProgress, isInterrupted: false), "In Progress")
+        XCTAssertEqual(ProjectSidebar.rowCaption(status: .failed, isInterrupted: false), "Failed")
+        XCTAssertEqual(
+            ProjectSidebar.rowCaption(
+                status: .failed,
+                isInterrupted: false,
+                hasPreviousResultHint: true
+            ),
+            "Failed · Previous result available"
+        )
+        XCTAssertEqual(ProjectSidebar.rowCaption(status: .ready, isInterrupted: true), "Unfinished")
+        XCTAssertEqual(ProjectSidebar.rowCaption(status: .inProgress, isInterrupted: true), "Unfinished")
+    }
+
 }
 
 private struct SidebarTestToolchainManager: ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
+    func resolveToolchain(
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {

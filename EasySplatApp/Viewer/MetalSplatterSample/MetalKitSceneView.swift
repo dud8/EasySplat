@@ -73,6 +73,18 @@ struct PreviewReloadPlanner {
     private(set) var inFlightRequest: PreviewLoadRequest?
     private(set) var lastHandledRequest: PreviewLoadRequest?
     private(set) var lastInteractionAt: Date?
+    private(set) var isContinuouslyInteracting = false
+
+    /// Held-key flight produces no per-event timestamps, so it declares itself
+    /// explicitly; deactivation counts as one interaction so loads still wait
+    /// out the idle delay afterwards.
+    mutating func setContinuousInteraction(_ active: Bool, now: Date) {
+        guard active != isContinuouslyInteracting else { return }
+        isContinuouslyInteracting = active
+        if !active {
+            lastInteractionAt = now
+        }
+    }
 
     mutating func request(_ request: PreviewLoadRequest) {
         latestRequested = request
@@ -99,6 +111,10 @@ struct PreviewReloadPlanner {
         if lastHandledRequest == target {
             pendingRequest = nil
             return .none
+        }
+
+        if isContinuouslyInteracting {
+            return .deferLoad(idleDelay)
         }
 
         if let lastInteractionAt {
@@ -298,6 +314,7 @@ struct MetalKitSceneView: NSViewRepresentable {
     var loadAttemptRevision: Int = 0
     var controller: SplatViewerController
     var sceneConfiguration = SplatViewerSceneConfiguration()
+    var isTrainingPreview: Bool = false
     var onLoadStateChanged: ((SplatViewerLoadState) -> Void)?
 
     @MainActor
@@ -362,6 +379,14 @@ struct MetalKitSceneView: NSViewRepresentable {
         func recordInteraction() {
             planner.recordInteraction(now: Date())
             scheduleLoadEvaluation()
+        }
+
+        func setContinuousInteraction(_ active: Bool) {
+            let wasActive = planner.isContinuouslyInteracting
+            planner.setContinuousInteraction(active, now: Date())
+            if wasActive, !active {
+                scheduleLoadEvaluation()
+            }
         }
 
         func scheduleInitializationFailure(_ message: String) {
@@ -557,7 +582,9 @@ struct MetalKitSceneView: NSViewRepresentable {
             interactiveView.onScrollZoom = nil
             interactiveView.onMagnify = nil
             interactiveView.onPan = nil
+            interactiveView.onFreeLook = nil
             interactiveView.onKeyboardCommand = nil
+            interactiveView.onMovementInputChanged = nil
             interactiveView.onInteractionActivity = nil
         }
         if coordinator.controller?.renderer === coordinator.renderer {
@@ -591,6 +618,7 @@ struct MetalKitSceneView: NSViewRepresentable {
             return metalKitView
         }
         context.coordinator.renderer = renderer
+        renderer.isTrainingPreview = isTrainingPreview
         controller.renderer = renderer
         renderer.onSortFailure = { [weak controller] message in
             controller?.recordSortFailure(message)
@@ -636,6 +664,16 @@ struct MetalKitSceneView: NSViewRepresentable {
                 controller?.resetCamera()
             }
         }
+        metalKitView.onFreeLook = { [weak renderer] deltaX, deltaY in
+            renderer?.freeLook(deltaX: Float(deltaX), deltaY: Float(deltaY))
+        }
+        metalKitView.onMovementInputChanged = { [
+            weak renderer,
+            weak coordinator = context.coordinator
+        ] keys, isSprinting in
+            renderer?.setMovementInput(keys, isSprinting: isSprinting)
+            coordinator?.setContinuousInteraction(!keys.isEmpty)
+        }
         metalKitView.onInteractionActivity = { [weak coordinator = context.coordinator] in
             coordinator?.recordInteraction()
         }
@@ -647,6 +685,7 @@ struct MetalKitSceneView: NSViewRepresentable {
     func updateNSView(_ view: MTKView, context: NSViewRepresentableContext<MetalKitSceneView>) {
         context.coordinator.controller = controller
         context.coordinator.onLoadStateChanged = onLoadStateChanged
+        context.coordinator.renderer?.isTrainingPreview = isTrainingPreview
         loadIfNeeded(context: context)
     }
 
@@ -671,11 +710,15 @@ final class InteractiveMTKView: MTKView {
     var onScrollZoom: ((CGFloat, CGPoint) -> Void)?
     var onMagnify: ((CGFloat, CGPoint) -> Void)?
     var onPan: ((CGFloat, CGFloat) -> Void)?
+    var onFreeLook: ((CGFloat, CGFloat) -> Void)?
     var onKeyboardCommand: ((ViewerKeyboardCommand) -> Void)?
+    var onMovementInputChanged: ((Set<ViewerMovementKey>, Bool) -> Void)?
     var onInteractionActivity: (() -> Void)?
 
     private var lastLocation: NSPoint?
-    private var isPanning = false
+    private var activeDragMode: ViewerDragMode?
+    private var heldMovementKeys: Set<ViewerMovementKey> = []
+    private var isSprintKeyHeld = false
 
     override init(frame frameRect: CGRect, device: MTLDevice?) {
         super.init(frame: frameRect, device: device)
@@ -719,18 +762,61 @@ final class InteractiveMTKView: MTKView {
         let resigned = super.resignFirstResponder()
         if resigned {
             noteFocusRingMaskChanged()
+            clearHeldMovementInput()
         }
         return resigned
     }
 
     override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
-        onInteractionActivity?()
-        lastLocation = event.locationInWindow
-        isPanning = event.modifierFlags.contains(.option)
+        beginDrag(
+            with: event,
+            mode: ViewerPointerCommand.dragMode(
+                forPrimaryButtonWith: ViewerKeyboardModifiers(event.modifierFlags)
+            )
+        )
     }
 
     override func mouseDragged(with event: NSEvent) {
+        continueDrag(with: event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        beginDrag(with: event, mode: ViewerPointerCommand.secondaryButtonDragMode)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        continueDrag(with: event)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        onInteractionActivity?()
+        super.rightMouseUp(with: event)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        beginDrag(with: event, mode: ViewerPointerCommand.middleButtonDragMode)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        guard event.buttonNumber == 2 else {
+            super.otherMouseDragged(with: event)
+            return
+        }
+        continueDrag(with: event)
+    }
+
+    private func beginDrag(with event: NSEvent, mode: ViewerDragMode) {
+        window?.makeFirstResponder(self)
+        onInteractionActivity?()
+        lastLocation = event.locationInWindow
+        activeDragMode = mode
+    }
+
+    private func continueDrag(with event: NSEvent) {
         onInteractionActivity?()
         guard let last = lastLocation else { return }
         let current = event.locationInWindow
@@ -738,9 +824,12 @@ final class InteractiveMTKView: MTKView {
         let deltaY = current.y - last.y
         lastLocation = current
 
-        if isPanning {
+        switch activeDragMode {
+        case .pan:
             onPan?(deltaX, deltaY)
-        } else {
+        case .freeLook:
+            onFreeLook?(deltaX, deltaY)
+        case .orbit, nil:
             onOrbit?(deltaX, deltaY)
         }
     }
@@ -771,6 +860,19 @@ final class InteractiveMTKView: MTKView {
             return
         }
 
+        if let movementKey = ViewerKeyboardCommand.resolveMovementKey(keyCode: event.keyCode),
+           !ViewerKeyboardModifiers(event.modifierFlags).blocksMovement {
+            // Auto-repeats are consumed too; letting them fall through to
+            // super would beep on every repeat while flying.
+            guard !event.isARepeat else { return }
+            onInteractionActivity?()
+            if heldMovementKeys.insert(movementKey).inserted {
+                isSprintKeyHeld = event.modifierFlags.contains(.shift)
+                onMovementInputChanged?(heldMovementKeys, isSprintKeyHeld)
+            }
+            return
+        }
+
         guard let command = ViewerKeyboardCommand.resolve(
             keyCode: event.keyCode,
             characters: event.charactersIgnoringModifiers,
@@ -781,6 +883,57 @@ final class InteractiveMTKView: MTKView {
         }
         onInteractionActivity?()
         onKeyboardCommand?(command)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        // Releases are never modifier-gated: a key pressed bare and released
+        // while a modifier is down must still stop the flight.
+        guard let movementKey = ViewerKeyboardCommand.resolveMovementKey(
+            keyCode: event.keyCode
+        ) else {
+            super.keyUp(with: event)
+            return
+        }
+        if heldMovementKeys.remove(movementKey) != nil {
+            onMovementInputChanged?(heldMovementKeys, isSprintKeyHeld)
+        }
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        let isShiftHeld = event.modifierFlags.contains(.shift)
+        if isShiftHeld != isSprintKeyHeld {
+            isSprintKeyHeld = isShiftHeld
+            onMovementInputChanged?(heldMovementKeys, isSprintKeyHeld)
+        }
+        super.flagsChanged(with: event)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.didResignKeyNotification,
+            object: nil
+        )
+        clearHeldMovementInput()
+        guard let window else { return }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidResignKey(_:)),
+            name: NSWindow.didResignKeyNotification,
+            object: window
+        )
+    }
+
+    @objc private func windowDidResignKey(_ notification: Notification) {
+        clearHeldMovementInput()
+    }
+
+    private func clearHeldMovementInput() {
+        guard !heldMovementKeys.isEmpty || isSprintKeyHeld else { return }
+        heldMovementKeys.removeAll()
+        isSprintKeyHeld = false
+        onMovementInputChanged?(heldMovementKeys, isSprintKeyHeld)
     }
 
     private func viewerPoint(for event: NSEvent) -> CGPoint {
@@ -796,7 +949,9 @@ final class InteractiveMTKView: MTKView {
         setAccessibilityLabel("Interactive 3D splat viewer")
         setViewerLoadState(.loading)
         setAccessibilityHelp(
-            "Drag to orbit. Option-drag pans. Scroll or pinch zooms. Press F to fit or R to reset."
+            "Drag to orbit. Right-drag or Control-drag looks around. Option-drag pans. "
+                + "Scroll or pinch zooms. Hold W, A, S, D to fly, E and Q to fly up and down, "
+                + "and Shift to sprint. Press F to fit or R to reset."
         )
         setAccessibilityChildren([])
     }

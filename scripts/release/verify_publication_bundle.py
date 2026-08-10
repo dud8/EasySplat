@@ -68,25 +68,18 @@ SYSTEM_TOOLS = {
     "codesign": "/usr/bin/codesign",
     "dwarfdump": "/usr/bin/dwarfdump",
 }
-APP_TOOLCHAIN_RESOURCE_PATHS = (
-    "Contents/Resources/public_key_ed25519.txt",
-    "Contents/Resources/toolchain_manifest_url.txt",
-    (
-        "Contents/Resources/EasySplat_EasySplatApp.bundle/"
-        "public_key_ed25519.txt"
-    ),
-    (
-        "Contents/Resources/EasySplat_EasySplatApp.bundle/"
-        "toolchain_manifest_url.txt"
-    ),
-    (
-        "Contents/Resources/EasySplat_EasySplatApp.bundle/Contents/Resources/"
-        "public_key_ed25519.txt"
-    ),
-    (
-        "Contents/Resources/EasySplat_EasySplatApp.bundle/Contents/Resources/"
-        "toolchain_manifest_url.txt"
-    ),
+APP_BUNDLED_TOOLCHAIN_EXECUTABLES = (
+    "Contents/Helpers/bin/colmap",
+    "Contents/Helpers/bin/easysplat-train",
+)
+APP_BUNDLED_TOOLCHAIN_PAYLOAD = (
+    "Contents/Helpers/lib/libomp.dylib",
+    "Contents/Resources/Toolchain/default.metallib",
+    "Contents/Resources/Toolchain/supply-chain/components.json",
+)
+APP_RETIRED_TOOLCHAIN_RESOURCE_NAMES = (
+    "public_key_ed25519.txt",
+    "toolchain_manifest_url.txt",
 )
 
 
@@ -1256,13 +1249,9 @@ def validate_provenance(
         release_mode=release_mode,
     )
     artifacts = payload["artifacts"]
-    expected_keys = {
-        "dmg",
-        "manifest",
-        "core",
-        "geometry-da3-base",
-        "geometry-da3-small",
-    }
+    # The toolchain ships inside the app, so the disk image is the only
+    # published artifact; the closure sections still describe every embedded file.
+    expected_keys = {"dmg"}
     if set(artifacts) != expected_keys:
         fail("release provenance artifact allowlist is invalid")
     for identifier, row in artifacts.items():
@@ -1286,7 +1275,6 @@ def validate_provenance(
             fail(f"artifact {identifier} URL is invalid")
     local_artifacts = {
         "dmg": (dmg, dmg.name, MAX_RELEASE_ASSET_BYTES),
-        "manifest": (manifest, "manifest.json", 8 * 1_024 * 1_024),
     }
     for identifier, (
         local_path,
@@ -1310,10 +1298,6 @@ def validate_provenance(
         "dmg": (
             f"https://github.com/{source_repository}/releases/download/"
             f"v{urllib.parse.quote(app_version, safe='.-')}/{dmg.name}"
-        ),
-        "manifest": (
-            f"https://github.com/{source_repository}/releases/download/"
-            f"toolchain-v{urllib.parse.quote(toolchain_version, safe='.-')}/manifest.json"
         ),
     }
     for identifier, expected_url in expected_download_urls.items():
@@ -1393,15 +1377,13 @@ def expected_spdx_document(
     files = {row["path"]: row for row in component_payload["files"]}
     archive_rows = {
         archive["id"]: archive["entries"]
-        for archive in license_closure["archives"]["archives"]
+        for archive in license_closure["archives"]["embedded"]
     }
     app_id = "SPDXRef-Package-EasySplat"
     viewer_id = "SPDXRef-Package-MetalSplatter"
     artifact_ids = {
-        "manifest": "SPDXRef-Package-Toolchain-Manifest",
+        "dmg": "SPDXRef-Package-DiskImage",
         "core": "SPDXRef-Package-Toolchain-Core",
-        "geometry-da3-base": "SPDXRef-Package-Geometry-DA3-Base",
-        "geometry-da3-small": "SPDXRef-Package-Geometry-DA3-Small",
     }
     component_ids = {
         component_id: spdx_component_id(component_id) for component_id in components
@@ -1475,17 +1457,9 @@ def expected_spdx_document(
         },
     ]
     artifact_licenses = {
-        "manifest": "MIT",
-        "core": "LicenseRef-EasySplat-Toolchain-Closure",
-        "geometry-da3-base": "LicenseRef-EasySplat-Toolchain-Closure",
-        "geometry-da3-small": "LicenseRef-EasySplat-Toolchain-Closure",
+        "dmg": "LicenseRef-EasySplat-Toolchain-Closure",
     }
-    for identifier in (
-        "manifest",
-        "core",
-        "geometry-da3-base",
-        "geometry-da3-small",
-    ):
+    for identifier in ("dmg",):
         artifact = artifacts[identifier]
         license_id = artifact_licenses[identifier]
         packages.append(
@@ -1506,6 +1480,29 @@ def expected_spdx_document(
                 ),
             }
         )
+    # The embedded toolchain is a package in its own right: it has no file of its
+    # own, so it is identified by the closure digest the app carries.
+    packages.append(
+        {
+            "SPDXID": artifact_ids["core"],
+            "name": "EasySplat-toolchain",
+            "versionInfo": provenance["toolchainVersion"],
+            "downloadLocation": "NONE",
+            "sourceInfo": "Embedded in the application bundle.",
+            "filesAnalyzed": False,
+            "checksums": [
+                {
+                    "algorithm": "SHA256",
+                    "checksumValue": provenance["supplyChain"]["componentsSHA256"],
+                }
+            ],
+            "licenseConcluded": "LicenseRef-EasySplat-Toolchain-Closure",
+            "licenseDeclared": "LicenseRef-EasySplat-Toolchain-Closure",
+            "copyrightText": (
+                "Copyright information is provided by the declared license files."
+            ),
+        }
+    )
     for component_id in sorted(components):
         component = components[component_id]
         closure_checksum = spdx_component_checksum(component, files)
@@ -1550,12 +1547,7 @@ def expected_spdx_document(
             "relatedSpdxElement": viewer_id,
         },
     ]
-    for identifier in (
-        "manifest",
-        "core",
-        "geometry-da3-base",
-        "geometry-da3-small",
-    ):
+    for identifier in ("dmg",):
         relationships.append(
             {
                 "spdxElementId": app_id,
@@ -1563,8 +1555,14 @@ def expected_spdx_document(
                 "relatedSpdxElement": artifact_ids[identifier],
             }
         )
-    for identifier in ("core", "geometry-da3-base", "geometry-da3-small"):
-        owners = sorted({row["component"] for row in archive_rows[identifier]})
+    for identifier in ("core",):
+        # A shared licence can be attributed to a component the app does not
+        # otherwise carry; the file ships, but there is no package to relate it to.
+        owners = sorted({
+            row["component"]
+            for row in archive_rows[identifier]
+            if row["component"] in component_ids
+        })
         for owner in owners:
             relationships.append(
                 {
@@ -2468,13 +2466,15 @@ def validate_open_license_archive(
 
     require_exact_keys(
         archive_closure,
-        {"schemaVersion", "toolchainVersion", "componentsSHA256", "archives"},
+        {"schemaVersion", "toolchainVersion", "componentsSHA256", "embedded"},
         "toolchain archive closure",
     )
-    archive_rows = archive_closure["archives"]
-    expected_archive_ids = ("core", "geometry-da3-base", "geometry-da3-small")
+    archive_rows = archive_closure["embedded"]
+    # The app carries one closure; nothing is published on its own any more, so
+    # the rows describe embedded content rather than downloadable archives.
+    expected_archive_ids = ("core",)
     if (
-        archive_closure["schemaVersion"] != 1
+        archive_closure["schemaVersion"] != 2
         or archive_closure["toolchainVersion"] != toolchain_version
         or archive_closure["componentsSHA256"] != components_sha
         or not isinstance(archive_rows, list)
@@ -2489,23 +2489,15 @@ def validate_open_license_archive(
             fail("toolchain archive closure row must be an object")
         require_exact_keys(
             archive_row,
-            {"id", "file", "sha256", "size", "entries"},
+            {"id", "entries"},
             f"toolchain archive closure {archive_id}",
         )
-        artifact = provenance_artifacts.get(archive_id)
         expected_entries = [
             row
             for row in file_rows
             if supply_chain_archive_for_path(row["path"]) == archive_id
         ]
-        if (
-            not isinstance(artifact, dict)
-            or archive_row["id"] != archive_id
-            or archive_row["file"] != artifact.get("file")
-            or archive_row["sha256"] != artifact.get("sha256")
-            or archive_row["size"] != artifact.get("size")
-            or archive_row["entries"] != expected_entries
-        ):
+        if archive_row["id"] != archive_id or archive_row["entries"] != expected_entries:
             fail(f"toolchain archive closure differs for {archive_id}")
     return {
         "components": components_payload,
@@ -2665,50 +2657,29 @@ def parse_uuid(output: str, label: str) -> str:
     return match.group(1)
 
 
-def validate_app_toolchain_resources(
-    app: Path,
-    *,
-    toolchain_version: str,
-    source_repository: str,
-    toolchain_public_key: Path,
-) -> None:
-    resource_names = {"public_key_ed25519.txt", "toolchain_manifest_url.txt"}
-    found = {
+def validate_app_toolchain_resources(app: Path) -> None:
+    """The app carries its tools; nothing in it may name a download."""
+    stale = {
         path.relative_to(app).as_posix()
         for path in app.rglob("*")
-        if path.name in resource_names
+        if path.name in APP_RETIRED_TOOLCHAIN_RESOURCE_NAMES
     }
-    expected = set(APP_TOOLCHAIN_RESOURCE_PATHS)
-    if found != expected:
-        fail("bundled toolchain resource closure is not exact")
+    if stale:
+        fail(f"app still carries a download-era toolchain resource: {sorted(stale)[0]}")
+    if (app / "Contents/Resources/ToolchainBootstrap").exists():
+        fail("app still carries a toolchain bootstrap directory")
 
-    expected_public_key = file_record(
-        toolchain_public_key,
-        maximum_size=1_024,
-    )
-    expected_manifest_url = (
-        f"https://github.com/{source_repository}/releases/download/"
-        f"toolchain-v{toolchain_version}/manifest.json"
-    ).encode("ascii")
-    expected_records = {
-        "public_key_ed25519.txt": (
-            expected_public_key["size_bytes"],
-            expected_public_key["sha256"],
-        ),
-        "toolchain_manifest_url.txt": (
-            len(expected_manifest_url),
-            hashlib.sha256(expected_manifest_url).hexdigest(),
-        ),
-    }
-
-    for relative in APP_TOOLCHAIN_RESOURCE_PATHS:
-        resource = app / relative
-        actual = file_record(resource, maximum_size=1_024)
-        if (actual["size_bytes"], actual["sha256"]) != expected_records[resource.name]:
-            fail(
-                "bundled toolchain resource does not match release authority: "
-                f"{relative}"
-            )
+    for relative in APP_BUNDLED_TOOLCHAIN_EXECUTABLES:
+        helper = app / relative
+        if helper.is_symlink() or not helper.is_file():
+            fail(f"app is missing a bundled helper: {relative}")
+        mode = helper.stat().st_mode
+        if not mode & 0o111 or mode & 0o022:
+            fail(f"bundled helper has an unsafe mode: {relative}")
+    for relative in APP_BUNDLED_TOOLCHAIN_PAYLOAD:
+        payload = app / relative
+        if payload.is_symlink() or not payload.is_file() or payload.stat().st_size == 0:
+            fail(f"app is missing bundled toolchain payload: {relative}")
 
 
 def validate_app_bundle(
@@ -2723,19 +2694,14 @@ def validate_app_bundle(
     if app.is_symlink() or not app.is_dir():
         fail("DMG must contain a real EasySplat.app directory")
     contents = app / "Contents"
-    expected = {"Info.plist", "MacOS", "Resources", "_CodeSignature"}
+    expected = {"Helpers", "Info.plist", "MacOS", "Resources", "_CodeSignature"}
     if (
         not contents.is_dir()
         or {entry.name for entry in contents.iterdir()} != expected
     ):
         fail("app Contents allowlist is invalid")
     validate_regular_tree(app, maximum_bytes=4 * 1_024 * 1_024 * 1_024)
-    validate_app_toolchain_resources(
-        app,
-        toolchain_version=toolchain_version,
-        source_repository=source_repository,
-        toolchain_public_key=toolchain_public_key,
-    )
+    validate_app_toolchain_resources(app)
     plist = contents / "Info.plist"
     executable = contents / "MacOS/EasySplatApp"
     if not executable.is_file() or executable.is_symlink():

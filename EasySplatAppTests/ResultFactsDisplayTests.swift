@@ -12,6 +12,82 @@ final class ResultFactsDisplayTests: XCTestCase {
         XCTAssertEqual(StageTimingDisplay.formatDuration(seconds: 3_725), "1h 2m")
     }
 
+    func testPartialCoverageWarnsExactlyWhenTheDominantComponentWasUsed() throws {
+        // The user's scenario: 18 of 22 photos, 4 stray singletons.
+        let strays = ViewerView.partialCoverageSummary(
+            registeredViewCount: 18,
+            totalViewCount: 22,
+            builtFromPartialAcceptance: true,
+            componentViewCounts: [18, 1, 1, 1, 1]
+        )
+        XCTAssertEqual(strays?.registered, 18)
+        XCTAssertEqual(strays?.total, 22)
+        XCTAssertEqual(strays?.separateGroupViewCount, 0)
+        XCTAssertEqual(
+            ViewerView.partialCoverageMessage(try XCTUnwrap(strays)),
+            "This splat covers 18 of 22 photos. To include the rest, add photos that overlap the missing areas, then use Re-train in the More menu."
+        )
+
+        // A split capture names the separate group.
+        let split = ViewerView.partialCoverageSummary(
+            registeredViewCount: 12,
+            totalViewCount: 22,
+            builtFromPartialAcceptance: true,
+            componentViewCounts: [12, 10]
+        )
+        XCTAssertEqual(split?.separateGroupViewCount, 10)
+        XCTAssertEqual(
+            ViewerView.partialCoverageMessage(try XCTUnwrap(split)),
+            "This splat covers 12 of 22 photos. A separate group of 10 photos couldn't be connected to it. Add photos that bridge the two areas, then use Re-train in the More menu."
+        )
+
+        // A partial camera solve on a fully connected capture warns without
+        // naming a separate group.
+        let solveShortfall = ViewerView.partialCoverageSummary(
+            registeredViewCount: 16,
+            totalViewCount: 22,
+            builtFromPartialAcceptance: true,
+            componentViewCounts: [22]
+        )
+        XCTAssertEqual(solveShortfall?.separateGroupViewCount, 0)
+        XCTAssertEqual(
+            ViewerView.partialCoverageMessage(try XCTUnwrap(solveShortfall)),
+            "This splat covers 16 of 22 photos. To include the rest, add photos that overlap the missing areas, then use Re-train in the More menu."
+        )
+
+        // A near-threshold continuation still warns even though registration
+        // sits above 90%.
+        XCTAssertEqual(
+            ViewerView.partialCoverageSummary(
+                registeredViewCount: 20,
+                totalViewCount: 22,
+                builtFromPartialAcceptance: true,
+                componentViewCounts: [20, 2]
+            )?.separateGroupViewCount,
+            2
+        )
+
+        // Strict acceptances stay silent regardless of the fraction.
+        XCTAssertNil(ViewerView.partialCoverageSummary(
+            registeredViewCount: 9,
+            totalViewCount: 10,
+            builtFromPartialAcceptance: false,
+            componentViewCounts: [9, 1]
+        ))
+        XCTAssertNil(ViewerView.partialCoverageSummary(
+            registeredViewCount: 22,
+            totalViewCount: 22,
+            builtFromPartialAcceptance: false,
+            componentViewCounts: [22]
+        ))
+        XCTAssertNil(ViewerView.partialCoverageSummary(
+            registeredViewCount: 0,
+            totalViewCount: 0,
+            builtFromPartialAcceptance: true,
+            componentViewCounts: nil
+        ))
+    }
+
     func testResultTotalPrefersCreateToViewerReadyWithoutChangingStageTotal() {
         let stages = [
             StageTimingRecord(

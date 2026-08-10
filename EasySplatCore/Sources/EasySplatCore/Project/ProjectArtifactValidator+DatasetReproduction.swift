@@ -187,10 +187,15 @@ extension ProjectArtifactValidator {
             from: sourcePaths.geometryManifestURL,
             to: scratchPaths.geometryManifestURL
         )
-        try copyStableFile(
-            from: sourcePaths.colmapDatabaseURL,
-            to: scratchPaths.colmapDatabaseURL
-        )
+        // Directly-adopted geometry has no feature database; its training
+        // dataset is reproduced from the adopted model alone. Every other route
+        // replays through the signed database.
+        if geometryArtifact.resolvedSource != .imported {
+            try copyStableFile(
+                from: sourcePaths.colmapDatabaseURL,
+                to: scratchPaths.colmapDatabaseURL
+            )
+        }
         let sourceModel = try sourcePaths.resolveProjectRelativePath(
             geometryArtifact.sourceModelPath
         )
@@ -234,9 +239,11 @@ extension ProjectArtifactValidator {
         let da3Root = root.appendingPathComponent("da3", isDirectory: true)
         let replayToolchain = ToolchainPaths(
             root: root,
-            authenticatedVersion: geometryArtifact.provenance.toolchainVersion,
+            dataRoot: root,
+            toolchainIdentity: geometryArtifact.provenance.toolchainVersion,
             colmap: colmapURL,
             msplat: root.appendingPathComponent("bin/easysplat-train"),
+            metallib: root.appendingPathComponent("bin/default.metallib"),
             da3: Da3Toolchain(
                 root: da3Root,
                 sfmTool: da3Root.appendingPathComponent("bin/da3-sfm"),

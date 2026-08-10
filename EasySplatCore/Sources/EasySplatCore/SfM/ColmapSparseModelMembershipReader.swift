@@ -129,11 +129,15 @@ struct ColmapSparseModelMembershipSummary: Sendable, Equatable {
     let unionImageIDs: Set<UInt32>
     let largestModelRegisteredViewCount: Int
     let secondLargestModelRegisteredViewCount: Int
+    let imageNamesByID: [UInt32: String]
 
     var modelCount: Int { models.count }
     var unionRegisteredViewCount: Int { unionImageIDs.count }
 
-    fileprivate init(models: [ColmapSparseModelMembership]) {
+    fileprivate init(
+        models: [ColmapSparseModelMembership],
+        imageNamesByID: [UInt32: String]
+    ) {
         self.models = models.sorted { $0.modelOrder < $1.modelOrder }
         unionImageIDs = models.reduce(into: Set<UInt32>()) {
             $0.formUnion($1.imageIDs)
@@ -141,6 +145,7 @@ struct ColmapSparseModelMembershipSummary: Sendable, Equatable {
         let sizes = models.map { $0.imageIDs.count }.sorted(by: >)
         largestModelRegisteredViewCount = sizes.first ?? 0
         secondLargestModelRegisteredViewCount = sizes.dropFirst().first ?? 0
+        self.imageNamesByID = imageNamesByID
     }
 }
 
@@ -223,7 +228,10 @@ struct ColmapSparseModelMembershipReader: Sendable {
         } catch {
             throw mappedDatabase(error)
         }
-        return ColmapSparseModelMembershipSummary(models: memberships)
+        return ColmapSparseModelMembershipSummary(
+            models: memberships,
+            imageNamesByID: databaseImages
+        )
     }
 
     /// Returns the exact camera image set consumed from `images.bin`, preserving the

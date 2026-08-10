@@ -100,7 +100,7 @@ def clean_system_temporary_directory():
     )
     try:
         attributes = extended_attribute_names(path)
-        if attributes:
+        if any(name != "com.apple.provenance" for name in attributes):
             raise RuntimeError(
                 "system temporary directory inherited extended attributes; "
                 "run this host-metadata suite with /usr/bin/python3 -I"
@@ -1624,7 +1624,13 @@ class BuilderOwnershipContractTests(unittest.TestCase):
         payload: bytes,
     ) -> Iterator[tuple[str, tuple[int, ...]]]:
         if builder == "msplat":
-            yield "", ()
+            runner = self.function(source, "run_promoter")
+            yield (
+                'PROMOTER_RUNTIME="$PROMOTER"\n'
+                "PROMOTER_RUNTIME_READY=1\n"
+                f"{runner}\n",
+                (),
+            )
             return
 
         source_path = root / "frozen-promoter-source.py"
@@ -1780,6 +1786,9 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
+            self.assertIn(
+                "com.apple.provenance", extended_attribute_names(payload)
+            )
             harness = (
                 "#!/bin/bash\n"
                 "set -euo pipefail\n"
@@ -1805,7 +1814,9 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 0,
                 normalized.stdout + normalized.stderr,
             )
-            self.assertEqual(extended_attribute_names(payload), ())
+            self.assertFalse(
+                set(extended_attribute_names(payload)) - {"com.apple.provenance"}
+            )
 
             subprocess.run(
                 [
@@ -1948,6 +1959,10 @@ class BuilderOwnershipContractTests(unittest.TestCase):
             "INSTALL_STAGE_OWNED=1\n"
             f"INSTALL_STAGE_DEVICE={metadata.st_dev}\n"
             f"INSTALL_STAGE_INODE={metadata.st_ino}\n"
+            "BUILD_INPUT_SNAPSHOT_OWNED=0\n"
+            "PROMOTER_RUNTIME_OWNED=0\n"
+            "BUILD_LOCK_OWNED=0\n"
+            "CLEANUP_DEFERRED_SIGNAL=0\n"
             "LOCK_OWNED=0\n"
             "GUARDED_RUN=0\n"
             "MODE=build\n"
@@ -2121,7 +2136,15 @@ class BuilderOwnershipContractTests(unittest.TestCase):
             accepted_before = {
                 path: extended_attribute_snapshot(path) for path in (stage, payload)
             }
-            self.assertTrue(all(accepted_before.values()))
+            self.assertTrue(
+                all(
+                    any(
+                        name == "com.apple.provenance"
+                        for name, _ in snapshot
+                    )
+                    for snapshot in accepted_before.values()
+                )
+            )
             accepted = subprocess.run(
                 ["/bin/bash", "--noprofile", "--norc", "-s"],
                 check=False,
@@ -2134,8 +2157,12 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 0,
                 accepted.stdout + accepted.stderr,
             )
-            self.assertEqual(extended_attribute_names(stage), ())
-            self.assertEqual(extended_attribute_names(payload), ())
+            self.assertFalse(
+                set(extended_attribute_names(stage)) - {"com.apple.provenance"}
+            )
+            self.assertFalse(
+                set(extended_attribute_names(payload)) - {"com.apple.provenance"}
+            )
 
             for path in (stage, payload):
                 subprocess.run(
@@ -2241,7 +2268,7 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                 if name == "colmap":
                     self.assertIn("run_frozen_promoter --recover", recovery)
                 elif name == "msplat":
-                    self.assertIn('"$PROMOTER" --recover', recovery)
+                    self.assertIn("run_promoter --recover", recovery)
                 else:
                     self.assertIn("run_promoter --recover", recovery)
                 self.assertIn("ambiguous staged install requires recovery", recovery)
@@ -2334,6 +2361,10 @@ class BuilderOwnershipContractTests(unittest.TestCase):
                         "INSTALL_STAGE_OWNED=0\n"
                         f"INSTALL_STAGE_DEVICE={stage.lstat().st_dev}\n"
                         f"INSTALL_STAGE_INODE={stage.lstat().st_ino}\n"
+                        "BUILD_INPUT_SNAPSHOT_OWNED=0\n"
+                        "PROMOTER_RUNTIME_OWNED=0\n"
+                        "BUILD_LOCK_OWNED=0\n"
+                        "CLEANUP_DEFERRED_SIGNAL=0\n"
                         "LOCK_OWNED=0\n"
                         "GUARDED_RUN=0\n"
                         "GUARDED_STAGE_DEVICE=\n"

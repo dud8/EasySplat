@@ -71,28 +71,14 @@ PRODUCTION_RELEASE_NOTES = (
     "Release files include the DMG SHA-256 checksum, provenance record, SPDX "
     "SBOM, third-party license bundle, and dSYM archive.\n"
 ).encode("utf-8")
-APP_TOOLCHAIN_RESOURCE_PATHS = tuple(
-    Path(relative)
-    for relative in (
-        "Contents/Resources/public_key_ed25519.txt",
-        "Contents/Resources/toolchain_manifest_url.txt",
-        (
-            "Contents/Resources/EasySplat_EasySplatApp.bundle/"
-            "public_key_ed25519.txt"
-        ),
-        (
-            "Contents/Resources/EasySplat_EasySplatApp.bundle/"
-            "toolchain_manifest_url.txt"
-        ),
-        (
-            "Contents/Resources/EasySplat_EasySplatApp.bundle/Contents/Resources/"
-            "public_key_ed25519.txt"
-        ),
-        (
-            "Contents/Resources/EasySplat_EasySplatApp.bundle/Contents/Resources/"
-            "toolchain_manifest_url.txt"
-        ),
-    )
+APP_BUNDLED_HELPERS = (
+    "Contents/Helpers/bin/colmap",
+    "Contents/Helpers/bin/easysplat-train",
+)
+APP_BUNDLED_PAYLOAD = (
+    "Contents/Helpers/lib/libomp.dylib",
+    "Contents/Resources/Toolchain/default.metallib",
+    "Contents/Resources/Toolchain/supply-chain/components.json",
 )
 
 
@@ -127,13 +113,16 @@ def write_app_fixture(root: Path) -> tuple[Path, Path]:
     executable.write_bytes(b"binary")
     (app / "Contents/Info.plist").write_bytes(b"plist")
     (app / "Contents/_CodeSignature").mkdir()
-    for relative in APP_TOOLCHAIN_RESOURCE_PATHS:
-        target = app / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.name == "public_key_ed25519.txt":
-            target.write_bytes(PUBLIC_KEY_BYTES)
-        else:
-            target.write_text(MANIFEST_URL, encoding="ascii")
+    for relative in APP_BUNDLED_HELPERS:
+        helper = app / relative
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_bytes(b"helper")
+        helper.chmod(0o755)
+    for relative in APP_BUNDLED_PAYLOAD:
+        payload = app / relative
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_bytes(b"payload")
+        payload.chmod(0o644)
     public_key = root / "expected-public-key.txt"
     public_key.write_bytes(PUBLIC_KEY_BYTES)
     return app, public_key
@@ -490,18 +479,16 @@ def supply_chain_fixture(
         ]
     }
     closure_payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "toolchainVersion": TOOLCHAIN_VERSION,
         "componentsSHA256": component_sha,
-        "archives": [
+        "embedded": [
             {
                 "id": archive_id,
-                "file": artifact_rows[archive_id]["file"],
-                "sha256": artifact_rows[archive_id]["sha256"],
-                "size": artifact_rows[archive_id]["size"],
                 "entries": [row for row in files if row["component"] == component_id],
             }
             for archive_id, _path, component_id in archives
+            if archive_id == "core"
         ],
     }
     archive_path = root / "licenses.zip"
@@ -722,18 +709,16 @@ def production_supply_chain_fixture(
         ]
     }
     closure_payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "toolchainVersion": TOOLCHAIN_VERSION,
         "componentsSHA256": component_sha,
-        "archives": [
+        "embedded": [
             {
                 "id": archive_id,
-                "file": artifact_rows[archive_id]["file"],
-                "sha256": artifact_rows[archive_id]["sha256"],
-                "size": artifact_rows[archive_id]["size"],
                 "entries": archive_entries[archive_id],
             }
             for archive_id in archive_entries
+            if archive_id == "core"
         ],
     }
     archive_path = root / "licenses.zip"
@@ -784,7 +769,7 @@ def spdx_fixture(supply_chain: dict[str, object]) -> dict[str, object]:
         components={row["id"]: row for row in component_payload["components"]},
         files={row["path"]: row for row in component_payload["files"]},
         license_bytes={},
-        archive_rows={row["id"]: row["entries"] for row in closure_payload["archives"]},
+        archive_rows={row["id"]: row["entries"] for row in closure_payload["embedded"]},
     )
     return GENERATOR.build_spdx(
         supply_chain["provenance"],
@@ -2065,14 +2050,14 @@ class ArtifactContentTests(unittest.TestCase):
             )
 
             self.assertEqual(len(closure["components"]["components"]), 63)
-            base = next(
+            core = next(
                 row
-                for row in closure["archives"]["archives"]
-                if row["id"] == "geometry-da3-base"
+                for row in closure["archives"]["embedded"]
+                if row["id"] == "core"
             )
             self.assertIn(
-                "da3_mps/app/easysplat_da3_sfm/run.py",
-                {row["path"] for row in base["entries"]},
+                "bin/colmap",
+                {row["path"] for row in core["entries"]},
             )
 
     def test_license_archive_rejects_forged_public_legal_files(self) -> None:
@@ -2243,16 +2228,14 @@ class ArtifactContentTests(unittest.TestCase):
                 with self.subTest(mutation=mutation):
                     fixture = production_supply_chain_fixture(root / mutation)
                     closure = fixture["closure"]
-                    core, base, _small = closure["archives"]
+                    (core,) = closure["embedded"]
                     runtime = next(
-                        row
-                        for row in base["entries"]
-                        if row["path"] == "da3_mps/app/easysplat_da3_sfm/run.py"
+                        row for row in core["entries"] if row["path"] == "bin/colmap"
                     )
                     if mutation == "missing":
-                        base["entries"].remove(runtime)
+                        core["entries"].remove(runtime)
                     else:
-                        core["entries"].append(runtime)
+                        core["entries"].append(dict(runtime))
                     replace_zip_entry(
                         fixture["archive_path"],
                         "toolchain-closure.json",
@@ -2474,9 +2457,8 @@ class ArtifactContentTests(unittest.TestCase):
                     {"publishedAt": "2026-07-15T12:00:01Z"},
                 )
 
-    def test_release_metadata_creation_time_is_current_and_not_predated(self) -> None:
+    def test_release_metadata_creation_time_is_truncated_to_whole_seconds(self) -> None:
         created_at = GENERATOR.release_created_at(
-            "2026-07-15T12:00:00Z",
             now=GENERATOR.datetime(
                 2026,
                 7,
@@ -2489,13 +2471,6 @@ class ArtifactContentTests(unittest.TestCase):
             ),
         )
         self.assertEqual(created_at, "2026-07-15T12:00:01Z")
-        with self.assertRaisesRegex(GENERATOR.MetadataError, "predates"):
-            GENERATOR.release_created_at(
-                "2026-07-15T12:00:01Z",
-                now=GENERATOR.datetime(
-                    2026, 7, 15, 12, 0, 0, tzinfo=GENERATOR.timezone.utc
-                ),
-            )
 
     def test_semver_comparison_honors_prerelease_precedence(self) -> None:
         ordered = (
@@ -2576,7 +2551,9 @@ class ArtifactContentTests(unittest.TestCase):
                 f"EasySplat-{VERSION}+builder.1-unsigned.dmg",
             )
         with self.assertRaisesRegex(GENERATOR.MetadataError, "build metadata"):
-            GENERATOR.validate_archives({}, f"{TOOLCHAIN_VERSION}+builder.1")
+            GENERATOR.validate_toolchain_tree(
+                Path("/nonexistent"), f"{TOOLCHAIN_VERSION}+builder.1"
+            )
 
     def test_required_zip_entries_must_be_nonempty_regular_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2694,7 +2671,7 @@ class ArtifactContentTests(unittest.TestCase):
                 source_commit=COMMIT,
             )
 
-    def test_provenance_requires_exact_app_and_manifest_release_urls(self) -> None:
+    def test_provenance_requires_the_exact_app_release_url(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dmg = root / f"EasySplat-{VERSION}-unsigned.dmg"
@@ -2741,14 +2718,6 @@ class ArtifactContentTests(unittest.TestCase):
                         f"{source_prefix}/v{VERSION}/wrong.dmg",
                         dmg.read_bytes(),
                     ),
-                    "manifest": artifact(
-                        "manifest.json",
-                        f"{source_prefix}/toolchain-v{TOOLCHAIN_VERSION}/manifest.json",
-                        manifest.read_bytes(),
-                    ),
-                    "core": artifact("core.zip", f"{source_prefix}/toolchain-v{TOOLCHAIN_VERSION}/core.zip"),
-                    "geometry-da3-base": artifact("base.zip", f"{source_prefix}/toolchain-v{TOOLCHAIN_VERSION}/base.zip"),
-                    "geometry-da3-small": artifact("small.zip", f"{source_prefix}/toolchain-v{TOOLCHAIN_VERSION}/small.zip"),
                 },
             }
             provenance_path = root / "provenance.json"
@@ -2785,37 +2754,8 @@ class ArtifactContentTests(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.PublicationError, "arm64-only"):
                     validate_app_fixture(app, public_key)
 
-    def test_app_bundle_binds_every_packaged_toolchain_resource(self) -> None:
-        for relative in APP_TOOLCHAIN_RESOURCE_PATHS:
-            with (
-                self.subTest(resource=relative),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                app, public_key = write_app_fixture(Path(temporary))
-                target = app / relative
-                if target.name == "public_key_ed25519.txt":
-                    target.write_bytes(base64.b64encode(bytes(reversed(range(32)))))
-                else:
-                    target.write_text(
-                        "https://attacker.invalid/manifest.json", encoding="ascii"
-                    )
-                with (
-                    mock.patch.object(
-                        MODULE,
-                        "load_plist",
-                        return_value=dict(MODULE.expected_app_plist(VERSION)),
-                    ),
-                    mock.patch.object(
-                        MODULE, "run_static", side_effect=valid_app_static_result
-                    ),
-                ):
-                    with self.assertRaisesRegex(
-                        MODULE.PublicationError, "bundled toolchain"
-                    ):
-                        validate_app_fixture(app, public_key)
-
-    def test_app_bundle_requires_every_toolchain_resource_copy(self) -> None:
-        for relative in APP_TOOLCHAIN_RESOURCE_PATHS:
+    def test_app_bundle_requires_every_bundled_helper_and_payload(self) -> None:
+        for relative in (*APP_BUNDLED_HELPERS, *APP_BUNDLED_PAYLOAD):
             with (
                 self.subTest(resource=relative),
                 tempfile.TemporaryDirectory() as temporary,
@@ -2833,16 +2773,14 @@ class ArtifactContentTests(unittest.TestCase):
                     ),
                 ):
                     with self.assertRaisesRegex(
-                        MODULE.PublicationError, "bundled toolchain resource closure"
+                        MODULE.PublicationError, "bundled (helper|toolchain payload)"
                     ):
                         validate_app_fixture(app, public_key)
 
-    def test_app_bundle_rejects_an_unexpected_toolchain_resource_copy(self) -> None:
+    def test_app_bundle_rejects_a_non_executable_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             app, public_key = write_app_fixture(Path(temporary))
-            duplicate = app / "Contents/Resources/Unexpected/public_key_ed25519.txt"
-            duplicate.parent.mkdir()
-            duplicate.write_bytes(PUBLIC_KEY_BYTES)
+            (app / APP_BUNDLED_HELPERS[0]).chmod(0o644)
             with (
                 mock.patch.object(
                     MODULE,
@@ -2854,17 +2792,64 @@ class ArtifactContentTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaisesRegex(
-                    MODULE.PublicationError, "bundled toolchain resource closure"
+                    MODULE.PublicationError, "bundled helper has an unsafe mode"
                 ):
                     validate_app_fixture(app, public_key)
 
-    def test_app_bundle_rejects_a_symlinked_toolchain_resource(self) -> None:
+    def test_app_bundle_rejects_a_retained_download_resource(self) -> None:
+        for relative in (
+            "Contents/Resources/public_key_ed25519.txt",
+            "Contents/Resources/EasySplat_EasySplatApp.bundle/toolchain_manifest_url.txt",
+        ):
+            with (
+                self.subTest(resource=relative),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                app, public_key = write_app_fixture(Path(temporary))
+                stale = app / relative
+                stale.parent.mkdir(parents=True, exist_ok=True)
+                stale.write_bytes(PUBLIC_KEY_BYTES)
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "load_plist",
+                        return_value=dict(MODULE.expected_app_plist(VERSION)),
+                    ),
+                    mock.patch.object(
+                        MODULE, "run_static", side_effect=valid_app_static_result
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.PublicationError, "download-era toolchain resource"
+                    ):
+                        validate_app_fixture(app, public_key)
+
+    def test_app_bundle_rejects_a_retained_bootstrap_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            app, public_key = write_app_fixture(Path(temporary))
+            (app / "Contents/Resources/ToolchainBootstrap").mkdir(parents=True)
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "load_plist",
+                    return_value=dict(MODULE.expected_app_plist(VERSION)),
+                ),
+                mock.patch.object(
+                    MODULE, "run_static", side_effect=valid_app_static_result
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.PublicationError, "toolchain bootstrap directory"
+                ):
+                    validate_app_fixture(app, public_key)
+
+    def test_app_bundle_rejects_a_symlinked_helper(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             app, public_key = write_app_fixture(root)
-            resource = app / APP_TOOLCHAIN_RESOURCE_PATHS[0]
-            resource.unlink()
-            resource.symlink_to(public_key)
+            helper = app / APP_BUNDLED_HELPERS[0]
+            helper.unlink()
+            helper.symlink_to(public_key)
             with self.assertRaisesRegex(MODULE.PublicationError, "symbolic link"):
                 validate_app_fixture(app, public_key)
 

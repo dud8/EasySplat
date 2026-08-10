@@ -7,34 +7,32 @@ struct ViewerView: View {
     let onNewSplat: () -> Void
 
     @EnvironmentObject private var model: AppModel
-    @StateObject private var artifactLoader = ViewerArtifactLoader<ProjectArtifactSnapshot>()
-    @State private var isInspectorPresented = true
+    @AppStorage(ViewerView.inspectorPreferenceKey) private var storedInspectorPreference: Bool?
+    @State private var hasResolvedInitialInspector = false
     @State private var isTechnicalExpanded = false
     @State private var resetCameraToken = 0
-    @State private var artifactSnapshot: ProjectArtifactSnapshot?
-    @State private var loadedMetadataProjectURL: URL?
-    @State private var artifactLoadError: String?
     @State private var viewerAlert: ViewerAlert?
     @State private var isExporting = false
+    @State private var isUprightHintDismissed = false
+    @State private var isPartialCoverageHintDismissed = false
+    @State private var isRetrainSheetPresented = false
+    @State private var isRemoveSubjectConfirmationPresented = false
+    @State private var retrainProfile: DetailProfile = .balanced
 
     var body: some View {
         Group {
-            if let plyURL = model.outputPlyURL,
+            if let plyURL = model.displayedOutputURL,
                let projectURL = model.currentProjectURL {
-                if let artifactLoadError {
-                    ContentUnavailableView(
-                        "Splat unavailable",
-                        systemImage: "exclamationmark.triangle",
-                        description: Text(artifactLoadError)
-                    )
-                } else if loadedMetadataProjectURL == model.currentProjectURL?.standardizedFileURL,
-                          artifactSnapshot != nil {
+                if model.hasResolvedViewerPresentation {
                     SplatViewerView(
                         splatURL: plyURL,
                         resetCameraToken: resetCameraToken,
                         sceneConfiguration: viewerSceneConfiguration,
                         onLoadStateChanged: { state in
-                            guard state == .ready else { return }
+                            guard state == .ready,
+                                  model.selectedSplatOutputVariant == .original else {
+                                return
+                            }
                             model.resultViewerDidBecomeReady(
                                 projectURL: projectURL,
                                 outputURL: plyURL
@@ -43,9 +41,21 @@ struct ViewerView: View {
                         overlayDensity: .compact
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(Theme.Spacing.large)
+                    .overlay(alignment: .bottom) {
+                        VStack(spacing: Theme.Spacing.small) {
+                            previousResultNotice
+                            partialCoverageHint
+                            uprightHint
+                            subjectIsolationStatusRow
+                        }
+                        .padding(.bottom, Theme.Spacing.extraLarge)
+                    }
                 } else {
-                    ProgressView("Opening splat…")
+                    ContentUnavailableView(
+                        "Splat unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text("The project artifacts could not be verified.")
+                    )
                 }
             } else {
                 ContentUnavailableView(
@@ -58,9 +68,9 @@ struct ViewerView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle(projectTitle)
         .toolbar { resultToolbar }
-        .inspector(isPresented: $isInspectorPresented) {
+        .inspector(isPresented: inspectorPresentation) {
             resultInspector
-                .inspectorColumnWidth(min: 240, ideal: 280, max: 360)
+                .inspectorColumnWidth(min: 240, ideal: Self.inspectorIdealWidth, max: 360)
         }
         .alert(item: $viewerAlert) { alert in
             Alert(
@@ -69,15 +79,65 @@ struct ViewerView: View {
                 dismissButton: .default(Text("OK"))
             )
         }
-        .onAppear { requestArtifactLoad() }
-        .onChange(of: model.currentProjectURL) { _, _ in requestArtifactLoad() }
-        .onChange(of: model.outputPlyURL) { _, _ in requestArtifactLoad() }
-        .onDisappear { artifactLoader.cancel() }
+        .sheet(isPresented: $isRetrainSheetPresented) { retrainSheet }
+        .sheet(isPresented: subjectChoicePresentation) {
+            if let request = model.subjectChoiceRequest {
+                SubjectChoiceSheet(
+                    request: request,
+                    onCancel: dismissSubjectChoice,
+                    onIsolate: { anchor in
+                        _ = model.retrySubjectIsolation(anchor: anchor)
+                    }
+                )
+            }
+        }
+        .confirmationDialog(
+            "Remove Subject Version?",
+            isPresented: $isRemoveSubjectConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Remove Subject Version", role: .destructive) {
+                Task {
+                    _ = await model.removeSubjectVersion()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This removes the isolated version. The original remains unchanged.")
+        }
+        .onAppear {
+            resolveInitialInspectorIfNeeded(workspaceWidth: model.workspaceWidthHint)
+        }
+        .onChange(of: model.currentProjectURL) { _, _ in
+            isUprightHintDismissed = false
+            isPartialCoverageHintDismissed = false
+            viewerAlert = nil
+        }
+        .onChange(of: model.exportMenuRequestCount) { _, _ in presentExportPanel() }
     }
 
     @ToolbarContentBuilder
     private var resultToolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
+            if Self.availableOutputVariants(
+                hasSubjectOutput: model.subjectOutput != nil
+            ).count > 1 {
+                Picker(
+                    "Splat version",
+                    selection: Binding(
+                        get: { model.selectedSplatOutputVariant },
+                        set: { _ = model.setSelectedSplatOutputVariant($0) }
+                    )
+                ) {
+                    Text("Original").tag(SplatOutputVariant.original)
+                    Text("Subject").tag(SplatOutputVariant.subject)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .accessibilityLabel("Splat version")
+                .accessibilityIdentifier("result.outputVariant")
+            }
+
             Button(action: presentExportPanel) {
                 if isExporting {
                     ProgressView()
@@ -87,12 +147,12 @@ struct ViewerView: View {
                     Label("Export…", systemImage: "square.and.arrow.down")
                 }
             }
-            .disabled(model.outputPlyURL == nil || isExporting)
+            .disabled(model.displayedOutputURL == nil || isExporting)
             .help("Save a copy of the validated PLY")
             .accessibilityIdentifier("result.export")
 
             ShareToolbarButton(
-                isEnabled: model.outputPlyURL != nil
+                isEnabled: model.displayedOutputURL != nil
                     && !model.isPreparingShare
                     && !model.isShareSheetActive
             ) { sourceView in
@@ -107,29 +167,29 @@ struct ViewerView: View {
             }
 
             Button {
-                isInspectorPresented.toggle()
+                inspectorPresentation.wrappedValue.toggle()
             } label: {
                 Label("Inspector", systemImage: "sidebar.right")
             }
-            .help(isInspectorPresented ? "Hide Inspector" : "Show Inspector")
+            .help(model.isResultInspectorPresented ? "Hide Inspector" : "Show Inspector")
             .accessibilityIdentifier("result.inspector")
 
             Menu {
                 Button("Show in Finder", systemImage: "folder") {
                     revealOutputInFinder()
                 }
-                .disabled(model.outputPlyURL == nil)
+                .disabled(model.displayedOutputURL == nil)
 
                 Button("Reset View", systemImage: "arrow.counterclockwise") {
                     resetCameraToken &+= 1
                 }
-                .disabled(model.outputPlyURL == nil)
+                .disabled(model.displayedOutputURL == nil)
 
-                if Self.offersUprightFlip(for: artifactSnapshot?.geometryArtifact) {
+                if displayedAllowsViewOnlyUprightFlip {
                     Toggle(
                         "Flip Upright",
                         isOn: Binding(
-                            get: { artifactSnapshot?.viewerPreferences.isUprightFlipActive == true },
+                            get: { model.currentViewerPreferences.isUprightFlipActive },
                             set: { isActive in updateUprightFlip(isActive) }
                         )
                     )
@@ -137,11 +197,43 @@ struct ViewerView: View {
                     .accessibilityHint("Changes only the viewer. The exported PLY is unchanged.")
                 }
 
-                Button("View Releases…", systemImage: "arrow.triangle.2.circlepath") {
-                    let releases = AppConfig.projectHomeURL
-                        .appendingPathComponent("releases", isDirectory: true)
-                    NSWorkspace.shared.open(releases)
+                Divider()
+
+                Button(
+                    model.subjectOutput == nil
+                        ? "Isolate Subject"
+                        : "Isolate Again",
+                    systemImage: "person.crop.rectangle"
+                ) {
+                    _ = model.startSubjectIsolation()
                 }
+                .disabled(
+                    model.hasActiveWork
+                        || (model.isShowingPreviousResult && model.subjectOutput == nil)
+                )
+                .accessibilityIdentifier("result.isolateSubject")
+
+                if model.subjectOutput != nil {
+                    Button(
+                        "Remove Subject Version…",
+                        systemImage: "trash",
+                        role: .destructive
+                    ) {
+                        isRemoveSubjectConfirmationPresented = true
+                    }
+                    .disabled(model.hasActiveWork)
+                    .accessibilityIdentifier("result.removeSubject")
+                }
+
+                Button("Re-train…", systemImage: "arrow.clockwise.square") {
+                    retrainProfile = model.displayedResultPresentation?
+                        .requestedRunOptions.detailProfile
+                        ?? artifactSnapshot?.metadata.requestedRunOptions
+                        .detailProfile ?? .balanced
+                    isRetrainSheetPresented = true
+                }
+                .disabled(model.currentProjectURL == nil || model.hasActiveWork)
+                .accessibilityIdentifier("result.retrain")
 
                 Divider()
 
@@ -154,6 +246,222 @@ struct ViewerView: View {
             }
             .help("More result actions")
         }
+    }
+
+    private var retrainSheet: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.medium) {
+            Text("Re-train")
+                .font(.headline)
+            Picker("Detail", selection: $retrainProfile) {
+                Text("Fast").tag(DetailProfile.fast)
+                Text("Balanced")
+                    .tag(DetailProfile.balanced)
+                    .disabled(!RunPlanResolver.supports(
+                        detail: .balanced,
+                        memoryGB: model.hardwareProfile.memoryGB
+                    ))
+                Text("High Detail")
+                    .tag(DetailProfile.highDetail)
+                    .disabled(!RunPlanResolver.supports(
+                        detail: .highDetail,
+                        memoryGB: model.hardwareProfile.memoryGB
+                    ))
+            }
+            .accessibilityIdentifier("result.retrainDetail")
+            Text(Self.retrainPreservationMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    isRetrainSheetPresented = false
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Re-train") {
+                    isRetrainSheetPresented = false
+                    if let projectURL = model.currentProjectURL {
+                        model.retrainProject(at: projectURL, profile: retrainProfile)
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("result.retrainConfirm")
+            }
+        }
+        .padding(Theme.Spacing.large)
+        .frame(width: 320)
+    }
+
+    @ViewBuilder
+    private var previousResultNotice: some View {
+        if model.isShowingPreviousResult {
+            Label(
+                Self.previousResultBanner(
+                    for: model.previousResultAttemptOutcome ?? .failed
+                ),
+                systemImage: "arrow.uturn.backward.circle.fill"
+            )
+                .font(.caption.weight(.medium))
+                .padding(.horizontal, Theme.Spacing.medium)
+                .padding(.vertical, Theme.Spacing.small)
+                .background(.ultraThinMaterial)
+                .clipShape(
+                    RoundedRectangle(
+                        cornerRadius: Theme.Radius.standard,
+                        style: .continuous
+                    )
+                )
+                .accessibilityIdentifier("result.previousResultBanner")
+        }
+    }
+
+    @ViewBuilder
+    private var uprightHint: some View {
+        if !isUprightHintDismissed,
+           displayedOrientationStatus == .unresolved {
+            HStack(spacing: Theme.Spacing.small) {
+                Text("If this splat looks upside down, use Flip Upright in the More menu.")
+                    .font(.caption)
+                Button {
+                    isUprightHintDismissed = true
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss orientation hint")
+            }
+            .padding(.horizontal, Theme.Spacing.medium)
+            .padding(.vertical, Theme.Spacing.small)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
+            .accessibilityIdentifier("result.uprightHint")
+        }
+    }
+
+    private var partialCoverage: (registered: Int, total: Int, separateGroupViewCount: Int)? {
+        if let reconstruction = model.displayedResultPresentation?.reconstruction {
+            let componentCounts = reconstruction.secondLargestModelRegisteredViewCount > 0
+                ? [
+                    reconstruction.registeredViewCount,
+                    reconstruction.secondLargestModelRegisteredViewCount,
+                ]
+                : nil
+            return Self.partialCoverageSummary(
+                registeredViewCount: reconstruction.registeredViewCount,
+                totalViewCount: reconstruction.totalViewCount,
+                builtFromPartialAcceptance:
+                    reconstruction.usedPartialCoverageAcceptance,
+                componentViewCounts: componentCounts
+            )
+        }
+        guard let geometry = artifactSnapshot?.geometryArtifact else { return nil }
+        return Self.partialCoverageSummary(
+            registeredViewCount: geometry.registeredViewCount,
+            totalViewCount: geometry.totalViewCount,
+            builtFromPartialAcceptance: geometry.usedPartialCoverageAcceptance,
+            componentViewCounts: geometry.pairGraph.measurement?.componentViewCounts
+        )
+    }
+
+    @ViewBuilder
+    private var partialCoverageHint: some View {
+        if !isPartialCoverageHintDismissed, let coverage = partialCoverage {
+            HStack(spacing: Theme.Spacing.small) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.yellow)
+                Text(Self.partialCoverageMessage(coverage))
+                    .font(.caption)
+                Button {
+                    isPartialCoverageHintDismissed = true
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss coverage warning")
+            }
+            .padding(.horizontal, Theme.Spacing.medium)
+            .padding(.vertical, Theme.Spacing.small)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
+            .accessibilityIdentifier("result.partialCoverageHint")
+        }
+    }
+
+    @ViewBuilder
+    private var subjectIsolationStatusRow: some View {
+        if model.isSubjectIsolationActive {
+            HStack(spacing: Theme.Spacing.small) {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+                Text("Isolating subject…")
+                    .font(.caption)
+                Button("Cancel") {
+                    model.cancelSubjectIsolation()
+                }
+                .controlSize(.small)
+                .accessibilityLabel("Cancel subject isolation")
+            }
+            .shadow(color: .black.opacity(0.6), radius: 2)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("result.subjectIsolationProgress")
+        } else if let message = model.subjectIsolationStatusMessage,
+                  message == "No clear subject to isolate. The original is unchanged."
+                    || model.subjectIsolationStatusIsError {
+            HStack(spacing: Theme.Spacing.small) {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(
+                        model.subjectIsolationStatusIsError
+                            ? Color.red
+                            : Color.primary
+                    )
+                Button {
+                    model.subjectIsolationStatusMessage = nil
+                    model.subjectIsolationStatusIsError = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss subject isolation status")
+            }
+            .shadow(color: .black.opacity(0.6), radius: 2)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("result.subjectIsolationStatus")
+        }
+    }
+
+    /// Present only when the splat was built from part of the capture, keyed
+    /// off the persisted acceptance state (dominant-group continuation or a
+    /// partial camera solve) rather than a registration fraction so
+    /// near-threshold continuations still warn.
+    static func partialCoverageSummary(
+        registeredViewCount: Int,
+        totalViewCount: Int,
+        builtFromPartialAcceptance: Bool,
+        componentViewCounts: [Int]?
+    ) -> (registered: Int, total: Int, separateGroupViewCount: Int)? {
+        guard builtFromPartialAcceptance,
+              totalViewCount > 0,
+              registeredViewCount > 0,
+              registeredViewCount <= totalViewCount else {
+            return nil
+        }
+        let separateGroup = componentViewCounts?.dropFirst().first ?? 0
+        return (registeredViewCount, totalViewCount, separateGroup > 1 ? separateGroup : 0)
+    }
+
+    static func partialCoverageMessage(
+        _ coverage: (registered: Int, total: Int, separateGroupViewCount: Int)
+    ) -> String {
+        if coverage.separateGroupViewCount > 1 {
+            return "This splat covers \(coverage.registered) of \(coverage.total) photos. A separate group of \(coverage.separateGroupViewCount) photos couldn't be connected to it. Add photos that bridge the two areas, then use Re-train in the More menu."
+        }
+        return "This splat covers \(coverage.registered) of \(coverage.total) photos. To include the rest, add photos that overlap the missing areas, then use Re-train in the More menu."
     }
 
     private var resultInspector: some View {
@@ -173,6 +481,7 @@ struct ViewerView: View {
             }
             .padding(Theme.Spacing.large)
         }
+        .pageScrollEdgeEffect()
         .accessibilityIdentifier("result.inspectorContent")
     }
 
@@ -181,7 +490,7 @@ struct ViewerView: View {
             Text("Output")
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
-            if let outputURL = model.outputPlyURL {
+            if let outputURL = model.displayedOutputURL {
                 LabeledContent("File") {
                     Text(outputURL.lastPathComponent)
                         .lineLimit(2)
@@ -189,7 +498,7 @@ struct ViewerView: View {
                         .help(outputURL.lastPathComponent)
                 }
             }
-            if let info = model.currentOutputPlyInfo {
+            if let info = model.displayedOutputPlyInfo {
                 LabeledContent(
                     "Contents",
                     value: info.vertexCount == 1 ? "1 splat" : info.splatCountText
@@ -197,6 +506,21 @@ struct ViewerView: View {
                 if let size = info.sizeText {
                     LabeledContent("Size", value: size)
                 }
+            }
+            if let bounds = displayedSceneBounds {
+                LabeledContent("Center") {
+                    Text(
+                        "\(bounds.center.x.formatted(.number.precision(.fractionLength(0...3)))), "
+                            + "\(bounds.center.y.formatted(.number.precision(.fractionLength(0...3)))), "
+                            + "\(bounds.center.z.formatted(.number.precision(.fractionLength(0...3))))"
+                    )
+                }
+                LabeledContent(
+                    "Radius",
+                    value: bounds.radius.formatted(
+                        .number.precision(.fractionLength(0...3))
+                    )
+                )
             }
             if let status = model.shareStatusMessage {
                 Text(status)
@@ -213,7 +537,7 @@ struct ViewerView: View {
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
             if let input = model.currentInput {
-                LabeledContent("Input", value: inputDescription(input))
+                LabeledContent("Input", value: input.displaySummary)
             }
             let options = displayedRunOptions
             LabeledContent("Path", value: capturePathLabel(options.capturePath))
@@ -242,20 +566,23 @@ struct ViewerView: View {
             Text("Reconstruction")
                 .font(.headline)
                 .accessibilityAddTraits(.isHeader)
-            if let geometry = artifactSnapshot?.geometryArtifact {
-                LabeledContent(
-                    "Registered",
-                    value: "\(geometry.registeredViewCount) of \(geometry.totalViewCount)"
+            if let reconstruction = model.displayedResultPresentation?.reconstruction {
+                reconstructionRows(
+                    registeredViewCount: reconstruction.registeredViewCount,
+                    totalViewCount: reconstruction.totalViewCount,
+                    pointCount: reconstruction.pointCount,
+                    observationCount: reconstruction.observationCount,
+                    medianPixelResidual: reconstruction.medianPixelResidual,
+                    p90PixelResidual: reconstruction.p90PixelResidual
                 )
-                LabeledContent("Points", value: geometry.pointCount.formatted())
-                LabeledContent("Observations", value: geometry.observationCount.formatted())
-                LabeledContent(
-                    "Median residual",
-                    value: geometry.medianPixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
-                )
-                LabeledContent(
-                    "P90 residual",
-                    value: geometry.p90PixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
+            } else if let geometry = artifactSnapshot?.geometryArtifact {
+                reconstructionRows(
+                    registeredViewCount: geometry.registeredViewCount,
+                    totalViewCount: geometry.totalViewCount,
+                    pointCount: geometry.pointCount,
+                    observationCount: geometry.observationCount,
+                    medianPixelResidual: geometry.medianPixelResidual,
+                    p90PixelResidual: geometry.p90PixelResidual
                 )
             } else {
                 Text("No reconstruction measurements were recorded.")
@@ -263,6 +590,42 @@ struct ViewerView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private func reconstructionRows(
+        registeredViewCount: Int,
+        totalViewCount: Int,
+        pointCount: Int,
+        observationCount: Int,
+        medianPixelResidual: Double,
+        p90PixelResidual: Double
+    ) -> some View {
+        LabeledContent("Registered") {
+            HStack(spacing: Theme.Spacing.small) {
+                if partialCoverage != nil {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.yellow)
+                        .accessibilityLabel("Built from part of the capture")
+                }
+                Text("\(registeredViewCount) of \(totalViewCount)")
+            }
+        }
+        LabeledContent("Points", value: pointCount.formatted())
+        LabeledContent("Observations", value: observationCount.formatted())
+        LabeledContent(
+            "Median residual",
+            value: medianPixelResidual.formatted(
+                .number.precision(.fractionLength(2))
+            ) + " px"
+        )
+        LabeledContent(
+            "P90 residual",
+            value: p90PixelResidual.formatted(
+                .number.precision(.fractionLength(2))
+            ) + " px"
+        )
     }
 
     private var timingSection: some View {
@@ -345,25 +708,57 @@ struct ViewerView: View {
     }
 
     private var technicalSection: some View {
-        DisclosureGroup(isExpanded: $isTechnicalExpanded) {
+        DisclosureSection(isExpanded: $isTechnicalExpanded) {
             VStack(alignment: .leading, spacing: Theme.Spacing.small) {
-                if let geometry = artifactSnapshot?.geometryArtifact {
-                    LabeledContent("Solver", value: geometry.solverVersion)
-                    LabeledContent("Model", value: geometry.modelVersion)
-                    LabeledContent("Camera", value: geometry.cameraModel)
-                    LabeledContent("Residuals", value: geometry.residualProvenance)
-                    if geometry.canonicalOrientation.status == .unresolved {
+                if let presentation = model.displayedResultPresentation {
+                    LabeledContent("Solver", value: presentation.reconstruction.solverVersion)
+                    LabeledContent("Model", value: presentation.reconstruction.modelVersion)
+                    LabeledContent("Camera", value: presentation.reconstruction.cameraModel)
+                    LabeledContent(
+                        "Residuals",
+                        value: presentation.reconstruction.residualProvenance
+                    )
+                    if presentation.orientation.status == .unresolved {
                         LabeledContent("Upright", value: "Not determined")
                     }
+                    LabeledContent("Trainer", value: presentation.trainerVersion)
+                    LabeledContent("Runtime", value: presentation.runtimeVersion)
+                    LabeledContent(
+                        "Iterations",
+                        value: presentation.completedIteration.formatted()
+                    )
+                    LabeledContent(
+                        "Training",
+                        value: StageTimingDisplay.formatDuration(
+                            seconds: presentation.trainingDurationSeconds
+                        )
+                    )
+                    LabeledContent(
+                        "Memory tier",
+                        value: presentation.autoTunerSnapshot.memoryTier
+                    )
+                } else {
+                    if let geometry = artifactSnapshot?.geometryArtifact {
+                        LabeledContent("Solver", value: geometry.solverVersion)
+                        LabeledContent("Model", value: geometry.modelVersion)
+                        LabeledContent("Camera", value: geometry.cameraModel)
+                        LabeledContent("Residuals", value: geometry.residualProvenance)
+                        if geometry.canonicalOrientation.status == .unresolved {
+                            LabeledContent("Upright", value: "Not determined")
+                        }
+                    }
+                    if let trainer = artifactSnapshot?.trainingArtifact {
+                        LabeledContent("Trainer", value: trainer.trainerVersion)
+                        LabeledContent(
+                            "Iterations",
+                            value: trainer.completedIteration.formatted()
+                        )
+                    }
                 }
-                if let trainer = artifactSnapshot?.trainingArtifact {
-                    LabeledContent("Trainer", value: trainer.trainerVersion)
-                    LabeledContent("Iterations", value: trainer.completedIteration.formatted())
-                }
-                if let format = model.currentOutputPlyInfo?.formatLabel {
+                if let format = model.displayedOutputPlyInfo?.formatLabel {
                     LabeledContent("Format", value: format)
                 }
-                if let relativePath = artifactSnapshot?.trainingArtifact?.outputPath {
+                if let relativePath = displayedProjectRelativePath {
                     LabeledContent("Project path") {
                         Text(relativePath)
                             .lineLimit(2)
@@ -401,7 +796,8 @@ struct ViewerView: View {
     }
 
     private var displayedRunOptions: RequestedRunOptions {
-        artifactSnapshot?.metadata.requestedRunOptions
+        model.displayedResultPresentation?.requestedRunOptions
+            ?? artifactSnapshot?.metadata.requestedRunOptions
             ?? model.currentRunOptions
             ?? RequestedRunOptions()
     }
@@ -413,73 +809,20 @@ struct ViewerView: View {
            }) {
             return summary.title
         }
-        if let title = artifactSnapshot?.metadata.title, !title.isEmpty { return title }
+        if let title = model.displayedResultLiveProject?.title, !title.isEmpty {
+            return title
+        }
         guard let projectURL = model.currentProjectURL else { return "Result" }
         return projectURL.deletingPathExtension().lastPathComponent
-    }
-
-    private func requestArtifactLoad(
-        preservingCurrentSnapshot: Bool = false,
-        failurePresentation: ArtifactLoadFailurePresentation = .workspace
-    ) {
-        guard let projectURL = model.currentProjectURL,
-              let outputURL = model.outputPlyURL else {
-            artifactLoader.cancel()
-            artifactSnapshot = nil
-            loadedMetadataProjectURL = nil
-            artifactLoadError = nil
-            return
-        }
-
-        if !preservingCurrentSnapshot {
-            artifactSnapshot = nil
-            loadedMetadataProjectURL = nil
-            artifactLoadError = nil
-            viewerAlert = nil
-        }
-
-        let request = ViewerArtifactLoadRequest(
-            projectURL: projectURL,
-            outputURL: outputURL
-        )
-        artifactLoader.load(
-            request,
-            operation: { projectURL in
-                try ProjectArtifactSnapshotStore.load(projectURL: projectURL)
-            }
-        ) { request, outcome in
-            guard ProjectSummary.hasSameLocation(model.currentProjectURL, request.projectURL),
-                  ProjectSummary.hasSameLocation(model.outputPlyURL, request.outputURL) else {
-                return
-            }
-
-            switch outcome {
-            case .success(let snapshot):
-                artifactSnapshot = snapshot
-                loadedMetadataProjectURL = request.projectURL
-                artifactLoadError = nil
-            case .failure(let message):
-                if failurePresentation == .alert {
-                    viewerAlert = ViewerAlert(
-                        title: "Couldn’t update view",
-                        message: message
-                    )
-                } else {
-                    artifactSnapshot = nil
-                    loadedMetadataProjectURL = nil
-                    artifactLoadError = "The project artifacts could not be verified."
-                }
-            }
-        }
     }
 
     private func presentExportPanel() {
         guard !isExporting else { return }
         isExporting = true
         Task { @MainActor in
-            let source: URL
+            let source: AppModel.CurrentSplatPublicationSource
             do {
-                source = try await model.validatedCurrentSplatForExport()
+                source = try await model.validatedCurrentSplatForPublication()
             } catch is CancellationError {
                 isExporting = false
                 return
@@ -504,7 +847,7 @@ struct ViewerView: View {
             let panel = NSSavePanel()
             panel.title = "Export Splat"
             panel.prompt = "Export"
-            panel.nameFieldStringValue = source.lastPathComponent
+            panel.nameFieldStringValue = source.defaultFilename
             panel.canCreateDirectories = true
             panel.isExtensionHidden = false
             panel.allowsOtherFileTypes = false
@@ -517,7 +860,10 @@ struct ViewerView: View {
                 Task { @MainActor in
                     defer { isExporting = false }
                     do {
-                        try await model.exportCurrentSplat(to: destination)
+                        try await model.exportCurrentSplat(
+                            source,
+                            to: destination
+                        )
                     } catch {
                         viewerAlert = ViewerAlert(
                             title: "Couldn’t export splat",
@@ -531,13 +877,16 @@ struct ViewerView: View {
 
     private func revealOutputInFinder() {
         Task { @MainActor in
-            guard let output = try? await model.validatedCurrentSplatForExport() else { return }
-            NSWorkspace.shared.activateFileViewerSelecting([output])
+            guard let source = try? await model
+                .validatedCurrentSplatForPublication() else {
+                return
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([source.outputURL])
         }
     }
 
     private var viewerSceneConfiguration: SplatViewerSceneConfiguration {
-        let storedBounds = artifactSnapshot?.trainingArtifact?.sceneBounds
+        let storedBounds = displayedSceneBounds
         let bounds = storedBounds.map { stored in
             let center = SIMD3<Float>(
                 Float(stored.center.x),
@@ -547,32 +896,58 @@ struct ViewerView: View {
             let radius = Float(stored.radius)
             return ViewerSceneBounds(center: center, radius: radius)
         }
-        let storedDirection = artifactSnapshot?.geometryArtifact?
-            .canonicalOrientation.canonicalOpeningViewDirection
+        let storedDirection = displayedOpeningDirection
         let openingDirection = storedDirection.map {
             SIMD3<Float>(Float($0.x), Float($0.y), Float($0.z))
         }
-        let canFlip = artifactSnapshot?.geometryArtifact?.allowsViewOnlyUprightFlip == true
+        let canFlip = displayedAllowsViewOnlyUprightFlip
         return SplatViewerSceneConfiguration(
             bounds: bounds,
             openingDirection: openingDirection,
             isViewOnlyFlipActive: canFlip
-                && artifactSnapshot?.viewerPreferences.isUprightFlipActive == true
+                && model.currentViewerPreferences.isUprightFlipActive
         )
+    }
+
+    private var displayedSceneBounds: SplatSceneBounds? {
+        model.displayedOutputSceneBounds
+            ?? artifactSnapshot?.trainingArtifact?.sceneBounds
+    }
+
+    private var displayedProjectRelativePath: String? {
+        if model.selectedSplatOutputVariant == .subject,
+           let output = model.subjectOutput?.url {
+            return "Output/\(output.lastPathComponent)"
+        }
+        return model.displayedPublishedResult?.receipt.outputPath
+            ?? artifactSnapshot?.trainingArtifact?.outputPath
+    }
+
+    private var subjectChoicePresentation: Binding<Bool> {
+        Binding(
+            get: { model.subjectChoiceRequest != nil },
+            set: { isPresented in
+                if !isPresented {
+                    dismissSubjectChoice()
+                }
+            }
+        )
+    }
+
+    private func dismissSubjectChoice() {
+        model.subjectChoiceRequest = nil
+        model.subjectIsolationStatusMessage = nil
+        model.subjectIsolationStatusIsError = false
     }
 
     private func updateUprightFlip(_ isActive: Bool) {
         guard let projectURL = model.currentProjectURL else { return }
         do {
-            _ = try ProjectMetadataStore.update(
-                at: ProjectPaths(root: projectURL).metadataURL
-            ) { metadata in
-                metadata.viewerPreferences.isUprightFlipActive = isActive
-            }
-            requestArtifactLoad(
-                preservingCurrentSnapshot: true,
-                failurePresentation: .alert
+            let metadata = try model.updateViewerUprightFlip(
+                at: projectURL,
+                isActive: isActive
             )
+            model.currentViewerPreferences = metadata.viewerPreferences
         } catch {
             viewerAlert = ViewerAlert(
                 title: "Couldn’t update view",
@@ -581,22 +956,71 @@ struct ViewerView: View {
         }
     }
 
-    private func inputDescription(_ input: InputSpec) -> String {
-        switch input {
-        case .video(let files):
-            return files.count == 1 ? "1 video" : "\(files.count) videos"
-        case .photos:
-            return "Photo folder"
-        case .mixed(let videos, _):
-            return "\(videos.count) video\(videos.count == 1 ? "" : "s") and photos"
+    /// Closed until the seed has run so the panel never flashes. Changes made
+    /// while the result is on screen are the user's and are remembered;
+    /// pre-seed and teardown writes are not.
+    private var inspectorPresentation: Binding<Bool> {
+        Binding(
+            get: { hasResolvedInitialInspector && model.isResultInspectorPresented },
+            set: { newValue in
+                model.isResultInspectorPresented = newValue
+                if hasResolvedInitialInspector, model.viewState == .viewer {
+                    storedInspectorPreference = newValue
+                }
+            }
+        )
+    }
+
+    private func resolveInitialInspectorIfNeeded(workspaceWidth: CGFloat) {
+        guard !hasResolvedInitialInspector else { return }
+        model.isResultInspectorPresented = Self.initialInspectorPresentation(
+            storedPreference: storedInspectorPreference,
+            workspaceWidth: workspaceWidth
+        )
+        hasResolvedInitialInspector = true
+    }
+
+    nonisolated static let inspectorPreferenceKey = "EasySplatResultInspectorShown"
+    nonisolated static let previousResultBanner =
+        "Retrain failed — showing the previous result."
+    nonisolated static func previousResultBanner(
+        for outcome: PreviousResultAttemptOutcome
+    ) -> String {
+        switch outcome {
+        case .failed:
+            previousResultBanner
+        case .interrupted:
+            "Run interrupted — showing the previous result."
         }
+    }
+    nonisolated static let retrainPreservationMessage =
+        "Your current splat stays available unless the new one finishes."
+    nonisolated static let inspectorIdealWidth: CGFloat = 280
+    nonisolated static let minimumComfortableCanvasWidth: CGFloat = 440
+
+    nonisolated static func availableOutputVariants(
+        hasSubjectOutput: Bool
+    ) -> [SplatOutputVariant] {
+        hasSubjectOutput ? [.original, .subject] : [.original]
+    }
+
+    /// The inspector opens by default only when it leaves the canvas a useful
+    /// share of the workspace. A remembered explicit choice always wins.
+    nonisolated static func initialInspectorPresentation(
+        storedPreference: Bool?,
+        workspaceWidth: CGFloat
+    ) -> Bool {
+        if let storedPreference { return storedPreference }
+        return workspaceWidth - inspectorIdealWidth >= minimumComfortableCanvasWidth
     }
 
     nonisolated static func inputContainsPhotos(_ input: InputSpec?) -> Bool {
         switch input {
         case .photos, .mixed:
             return true
-        case .video, nil:
+        case .video, .dataset, nil:
+            // Dataset images are photo-carried internally, but the Photo Use
+            // row describes a selection choice datasets never make.
             return false
         }
     }
@@ -605,6 +1029,27 @@ struct ViewerView: View {
         for artifact: GeometryArtifact?
     ) -> Bool {
         artifact?.allowsViewOnlyUprightFlip == true
+    }
+
+    private var artifactSnapshot: ProjectArtifactSnapshot? {
+        model.displayedResultSnapshot
+    }
+
+    private var displayedOrientationStatus: CanonicalOrientationStatus? {
+        model.displayedResultPresentation?.orientation.status
+            ?? artifactSnapshot?.geometryArtifact?.canonicalOrientation.status
+    }
+
+    private var displayedOpeningDirection: CanonicalDirection? {
+        model.displayedResultPresentation?.orientation.openingDirection
+            ?? artifactSnapshot?.geometryArtifact?.canonicalOrientation
+                .canonicalOpeningViewDirection
+    }
+
+    private var displayedAllowsViewOnlyUprightFlip: Bool {
+        model.displayedResultPresentation?.orientation.allowsViewOnlyUprightFlip
+            ?? artifactSnapshot?.geometryArtifact?.allowsViewOnlyUprightFlip
+            ?? false
     }
 
     private func capturePathLabel(_ path: CapturePath) -> String {

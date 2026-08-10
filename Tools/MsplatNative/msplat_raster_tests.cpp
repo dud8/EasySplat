@@ -47,6 +47,16 @@ void msplat_quaternion_vjp_for_testing(
     const float *rotationGradient,
     float *quaternionGradient
 );
+void msplat_projection_vjp_for_testing(
+    const float *mat,
+    const float *point,
+    unsigned int width,
+    unsigned int height,
+    const float *principalPoint,
+    const float *viewGradient,
+    float *outPixel,
+    float *outGradient
+);
 
 namespace {
 
@@ -102,6 +112,174 @@ double quaternionRotationObjective(
         result += rotation[index] * static_cast<double>(rotationGradient[index]);
     }
     return result;
+}
+
+// project_pix divides by the homogeneous w, so its VJP has to carry the quotient-rule
+// term for w and the projection matrix's denominator row. Both were absent, which left
+// the world-space position gradient pointing in the wrong direction for every visible
+// gaussian rather than merely being mis-scaled. Central differences of the forward are
+// the only check that catches that: the shipped form stayed finite, stayed smooth, and
+// stayed wrong.
+void verifyProjectionVJP() {
+    // A perspective matrix with a non-trivial denominator row, row major, at bonsai's
+    // images_2 intrinsics.
+    const unsigned int width = 1559;
+    const unsigned int height = 1039;
+    const float focal = 1611.35f;
+    const float znear = 0.01f;
+    const float zfar = 100.0f;
+    const float principalPoint[2] = {0.5f * width, 0.5f * height};
+
+    const float projection[16] = {
+        2.0f * focal / width, 0.0f, 0.0f, 0.0f,
+        0.0f, 2.0f * focal / height, 0.0f, 0.0f,
+        0.0f, 0.0f, (zfar + znear) / (zfar - znear), -2.0f * zfar * znear / (zfar - znear),
+        0.0f, 0.0f, 1.0f, 0.0f,
+    };
+
+    const float points[5][3] = {
+        {0.10f, -0.05f, 2.00f},
+        {-0.60f, 0.40f, 1.20f},
+        {0.85f, 0.70f, 3.50f},
+        {-0.30f, -0.90f, 0.80f},
+        {0.02f, 0.01f, 6.00f},
+    };
+    const float cotangents[3][2] = {
+        {1.0f, 0.0f},
+        {0.0f, 1.0f},
+        {0.7f, -1.3f},
+    };
+
+    double worst = 0;
+    double worstExact = 0;
+    double worstAbsolute = 0;
+    // Gradients here run to order 1e3 (focal length over depth), so a bare 1e-5
+    // absolute bound would be stricter than single precision can represent. Scale it
+    // by the largest gradient the sweep produces.
+    double gradientScale = 0;
+    for (const auto &point : points) {
+        for (const auto &cotangent : cotangents) {
+            float pixel[2];
+            float gradient[3];
+            msplat_projection_vjp_for_testing(
+                projection, point, width, height, principalPoint, cotangent, pixel, gradient
+            );
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!std::isfinite(gradient[axis])) {
+                    throw std::runtime_error("projection VJP contains a non-finite value");
+                }
+                gradientScale = std::max(gradientScale, std::abs(static_cast<double>(gradient[axis])));
+            }
+
+            // Central differences of the same forward, stepped in world space.
+            double reference[3];
+            for (int axis = 0; axis < 3; ++axis) {
+                const float step = 1.0e-3f;
+                float forward[3] = {point[0], point[1], point[2]};
+                float backward[3] = {point[0], point[1], point[2]};
+                forward[axis] += step;
+                backward[axis] -= step;
+                float forwardPixel[2];
+                float backwardPixel[2];
+                float ignored[3];
+                msplat_projection_vjp_for_testing(
+                    projection, forward, width, height, principalPoint, cotangent,
+                    forwardPixel, ignored
+                );
+                msplat_projection_vjp_for_testing(
+                    projection, backward, width, height, principalPoint, cotangent,
+                    backwardPixel, ignored
+                );
+                reference[axis] =
+                    (static_cast<double>(cotangent[0]) *
+                         (forwardPixel[0] - backwardPixel[0]) +
+                     static_cast<double>(cotangent[1]) *
+                         (forwardPixel[1] - backwardPixel[1])) /
+                    (2.0 * step);
+            }
+
+            // Closed-form reference in double. This is the helper-level check the
+            // contract asks for; the finite differences below are the independent
+            // end-to-end one, and they are what would catch a sign or index slip that
+            // an algebra transcription could reproduce faithfully in both places.
+            double homogeneous[4] = {0, 0, 0, 0};
+            for (int row = 0; row < 4; ++row) {
+                homogeneous[row] =
+                    static_cast<double>(projection[row * 4 + 0]) * point[0] +
+                    static_cast<double>(projection[row * 4 + 1]) * point[1] +
+                    static_cast<double>(projection[row * 4 + 2]) * point[2] +
+                    static_cast<double>(projection[row * 4 + 3]);
+            }
+            const double reciprocalW = 1.0 / (homogeneous[3] + 1.0e-6);
+            const double ndcX = 0.5 * width * static_cast<double>(cotangent[0]);
+            const double ndcY = 0.5 * height * static_cast<double>(cotangent[1]);
+            const double projected[4] = {
+                ndcX * reciprocalW,
+                ndcY * reciprocalW,
+                0.0,
+                -(ndcX * homogeneous[0] + ndcY * homogeneous[1]) *
+                    reciprocalW * reciprocalW,
+            };
+            double exact[3];
+            for (int axis = 0; axis < 3; ++axis) {
+                exact[axis] =
+                    static_cast<double>(projection[axis]) * projected[0] +
+                    static_cast<double>(projection[4 + axis]) * projected[1] +
+                    static_cast<double>(projection[8 + axis]) * projected[2] +
+                    static_cast<double>(projection[12 + axis]) * projected[3];
+            }
+
+            double exactNumerator = 0;
+            double exactDenominator = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double difference = static_cast<double>(gradient[axis]) - exact[axis];
+                exactNumerator += difference * difference;
+                exactDenominator += exact[axis] * exact[axis];
+                worstAbsolute = std::max(worstAbsolute, std::abs(difference));
+            }
+            if (exactDenominator > 0) {
+                worstExact = std::max(worstExact, std::sqrt(exactNumerator / exactDenominator));
+            }
+
+            double numerator = 0;
+            double denominator = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                const double difference =
+                    static_cast<double>(gradient[axis]) - reference[axis];
+                numerator += difference * difference;
+                denominator += reference[axis] * reference[axis];
+            }
+            if (denominator <= 0) {
+                continue;
+            }
+            worst = std::max(worst, std::sqrt(numerator / denominator));
+        }
+    }
+
+    // research-quality-v1: helpers are 1e-5 absolute and 1e-4 relative against CPU
+    // double; end-to-end finite differences are 1e-3. The finite-difference figure is
+    // looser because a 1e-3 world step in single precision cannot do better.
+    if (worstExact > 1.0e-4) {
+        throw std::runtime_error(
+            "projection VJP disagrees with the double-precision closed form: relative L2 " +
+            std::to_string(worstExact)
+        );
+    }
+    if (worstAbsolute > 1.0e-5 * std::max(1.0, gradientScale)) {
+        throw std::runtime_error(
+            "projection VJP absolute error exceeds tolerance: " +
+            std::to_string(worstAbsolute)
+        );
+    }
+    if (worst > 1.0e-3) {
+        throw std::runtime_error(
+            "projection VJP disagrees with central differences: relative L2 " +
+            std::to_string(worst)
+        );
+    }
+    std::cout << "projection_vjp passed (exact relative L2 " << worstExact
+              << ", absolute " << worstAbsolute
+              << ", central-difference relative L2 " << worst << ")\n";
 }
 
 void verifyQuaternionVJP() {
@@ -771,6 +949,519 @@ Model makeModel(const InputData &inputData, int shDegreeInterval = 1000) {
     );
 }
 
+struct IsolationProjection {
+    std::vector<float> xys;
+    std::vector<float> depths;
+    std::vector<int> radii;
+    std::vector<float> conics;
+};
+
+struct IsolationLiftResources {
+    MTensor mask;
+    MTensor selected;
+    MTensor records;
+    MTensor counts;
+    MTensor alpha;
+    MTensor status;
+};
+
+struct IsolationLiftSnapshot {
+    std::vector<MsplatIsolationContributionRecord> records;
+    std::vector<std::uint32_t> counts;
+    std::vector<float> alpha;
+};
+
+void encodeIsolationPrepare(
+    Model &model,
+    Camera &camera,
+    Model::CamSetup &setup
+) {
+    msplat_prepare_isolation_view(
+        model.num_active,
+        model.means,
+        model.scales,
+        1.0f,
+        model.quats,
+        camera.cachedViewMat,
+        camera.cachedProjViewMat,
+        setup.fx,
+        setup.fy,
+        setup.cx,
+        setup.cy,
+        static_cast<unsigned>(setup.height),
+        static_cast<unsigned>(setup.width),
+        setup.tileBounds,
+        0.01f,
+        static_cast<unsigned>(setup.degree),
+        static_cast<unsigned>(setup.degreesToUse),
+        setup.cam_pos,
+        model.featuresDc,
+        model.featuresRest,
+        model.opacities,
+        model.backgroundColor
+    );
+    msplat_commit();
+}
+
+IsolationLiftResources makeIsolationLiftResources(
+    int pointCount,
+    int width,
+    int height
+) {
+    const std::int64_t pixelCount =
+        static_cast<std::int64_t>(width) * static_cast<std::int64_t>(height);
+    const std::int64_t recordCount =
+        pixelCount * MSPLAT_ISOLATION_RECORDS_PER_PIXEL;
+    IsolationLiftResources resources {
+        gpu_empty({height, width}, DType::UInt8),
+        gpu_empty({pointCount}, DType::UInt8),
+        gpu_empty(
+            {
+                recordCount *
+                    static_cast<std::int64_t>(
+                        sizeof(MsplatIsolationContributionRecord)
+                    )
+            },
+            DType::UInt8
+        ),
+        gpu_empty({pixelCount}, DType::Int32),
+        gpu_empty({pixelCount}, DType::Float32),
+        gpu_empty({1}, DType::Int32),
+    };
+    std::fill(
+        resources.selected.data<std::uint8_t>(),
+        resources.selected.data<std::uint8_t>() + pointCount,
+        std::uint8_t {1}
+    );
+    std::uint8_t *labels = resources.mask.data<std::uint8_t>();
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const std::size_t pixel =
+                static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(x);
+            labels[pixel] =
+                x < width / 3 ? std::uint8_t {0}
+                : x < 2 * width / 3 ? std::uint8_t {7}
+                                    : std::uint8_t {203};
+        }
+    }
+    return resources;
+}
+
+IsolationLiftSnapshot captureIsolationLift(
+    IsolationLiftResources &resources,
+    int width,
+    int height
+) {
+    resources.records.zero();
+    resources.counts.zero();
+    resources.alpha.zero();
+    resources.status.zero();
+    msplat_lift_isolation_stripe(
+        static_cast<unsigned>(height),
+        static_cast<unsigned>(width),
+        resources.mask,
+        resources.selected,
+        false,
+        0,
+        static_cast<unsigned>(height),
+        resources.records,
+        resources.counts,
+        resources.alpha,
+        resources.status
+    );
+    msplat_commit();
+    msplat_gpu_sync();
+    if (resources.status.data<std::uint32_t>()[0] != 0) {
+        throw std::runtime_error(
+            "isolation lift exceeded its bounded per-pixel record capacity"
+        );
+    }
+
+    const std::size_t pixelCount =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    const std::size_t recordCount =
+        pixelCount * MSPLAT_ISOLATION_RECORDS_PER_PIXEL;
+    const auto *recordValues =
+        resources.records.data<MsplatIsolationContributionRecord>();
+    const auto *countValues = resources.counts.data<std::uint32_t>();
+    const auto *alphaValues = resources.alpha.data<float>();
+    return IsolationLiftSnapshot {
+        std::vector<MsplatIsolationContributionRecord>(
+            recordValues,
+            recordValues + recordCount
+        ),
+        std::vector<std::uint32_t>(
+            countValues,
+            countValues + pixelCount
+        ),
+        std::vector<float>(alphaValues, alphaValues + pixelCount),
+    };
+}
+
+void requireIsolationLiftMatchesOracle(
+    const IsolationLiftSnapshot &actual,
+    const IsolationProjection &projection,
+    const std::vector<float> &opacityLogits,
+    const std::uint8_t *labels,
+    int width,
+    int height
+) {
+    constexpr float contributionFloor = 0.04f;
+    constexpr float weightTolerance = 2.0e-5f;
+    constexpr float alphaTolerance = 2.0e-5f;
+    const std::size_t pointCount = opacityLogits.size();
+    std::vector<std::size_t> order(pointCount);
+    std::iota(order.begin(), order.end(), std::size_t {0});
+    std::stable_sort(
+        order.begin(),
+        order.end(),
+        [&](std::size_t left, std::size_t right) {
+            if (projection.depths[left] != projection.depths[right]) {
+                return projection.depths[left] < projection.depths[right];
+            }
+            return left < right;
+        }
+    );
+
+    std::size_t comparedRecords = 0;
+    std::size_t foregroundRecords = 0;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const std::size_t pixel =
+                static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                static_cast<std::size_t>(x);
+            std::vector<MsplatIsolationContributionRecord> expected;
+            float transmittance = 1.0f;
+            const float normalizedX =
+                (static_cast<float>(x) + 0.5f - 0.5f * width) /
+                std::max(0.5f * width, 1.0f);
+            const float normalizedY =
+                (static_cast<float>(y) + 0.5f - 0.5f * height) /
+                std::max(0.5f * height, 1.0f);
+            const float centrality = std::clamp(
+                1.0f -
+                    std::sqrt(
+                        normalizedX * normalizedX +
+                        normalizedY * normalizedY
+                    ) /
+                        std::sqrt(2.0f),
+                0.0f,
+                1.0f
+            );
+            for (std::size_t gaussian : order) {
+                if (projection.radii[gaussian] <= 0) continue;
+                const float deltaX =
+                    projection.xys[gaussian * 2] - static_cast<float>(x);
+                const float deltaY =
+                    projection.xys[gaussian * 2 + 1] - static_cast<float>(y);
+                const float *conic = &projection.conics[gaussian * 3];
+                const float sigma = std::fma(
+                    0.5f,
+                    std::fma(
+                        conic[0],
+                        deltaX * deltaX,
+                        conic[2] * deltaY * deltaY
+                    ),
+                    conic[1] * deltaX * deltaY
+                );
+                if (sigma < 0.0f || sigma >= 5.55f) continue;
+                const float opacity =
+                    1.0f / (1.0f + std::exp(-opacityLogits[gaussian]));
+                const float alpha =
+                    std::min(0.999f, opacity * std::exp(-sigma));
+                if (alpha < 1.0f / 255.0f) continue;
+                const float nextTransmittance =
+                    transmittance * (1.0f - alpha);
+                if (nextTransmittance <= 1.0e-4f) break;
+                const float weight = alpha * transmittance;
+                if (weight >= contributionFloor) {
+                    expected.push_back(MsplatIsolationContributionRecord {
+                        static_cast<std::uint32_t>(gaussian),
+                        labels[pixel],
+                        0,
+                        weight,
+                        weight * centrality,
+                    });
+                }
+                transmittance = nextTransmittance;
+            }
+
+            if (actual.counts[pixel] != expected.size()) {
+                throw std::runtime_error(
+                    "isolation lift record count differs from the CPU alpha*T "
+                    "oracle at pixel " +
+                    std::to_string(pixel) + ": actual=" +
+                    std::to_string(actual.counts[pixel]) + " expected=" +
+                    std::to_string(expected.size())
+                );
+            }
+            const float expectedAlpha = 1.0f - transmittance;
+            if (!std::isfinite(actual.alpha[pixel]) ||
+                std::abs(actual.alpha[pixel] - expectedAlpha) > alphaTolerance) {
+                throw std::runtime_error(
+                    "isolation lift soft alpha differs from the CPU oracle at "
+                    "pixel " +
+                    std::to_string(pixel)
+                );
+            }
+
+            std::vector<std::uint32_t> seen;
+            for (std::size_t index = 0; index < expected.size(); ++index) {
+                const auto &candidate =
+                    actual.records[
+                        pixel * MSPLAT_ISOLATION_RECORDS_PER_PIXEL + index
+                    ];
+                const auto &reference = expected[index];
+                if (candidate.gaussian_id != reference.gaussian_id ||
+                    candidate.label != reference.label ||
+                    candidate.reserved != 0 ||
+                    std::abs(candidate.weight - reference.weight) >
+                        weightTolerance ||
+                    std::abs(
+                        candidate.centrality_weight -
+                        reference.centrality_weight
+                    ) > weightTolerance) {
+                    throw std::runtime_error(
+                        "isolation lift record differs from the CPU alpha*T "
+                        "oracle at pixel " +
+                        std::to_string(pixel) + " record " +
+                        std::to_string(index)
+                    );
+                }
+                if (std::find(
+                        seen.begin(),
+                        seen.end(),
+                        candidate.gaussian_id
+                    ) != seen.end()) {
+                    throw std::runtime_error(
+                        "isolation lift duplicated a Gaussian within one pixel"
+                    );
+                }
+                seen.push_back(candidate.gaussian_id);
+                ++comparedRecords;
+                if (candidate.label != 0) ++foregroundRecords;
+            }
+        }
+    }
+    if (comparedRecords < pointCount || foregroundRecords == 0) {
+        throw std::runtime_error(
+            "isolation oracle fixture did not expose sufficient labeled "
+            "contributions"
+        );
+    }
+}
+
+void requireIsolationSnapshotsIdentical(
+    const IsolationLiftSnapshot &reference,
+    const IsolationLiftSnapshot &candidate
+) {
+    if (reference.counts != candidate.counts ||
+        reference.alpha != candidate.alpha ||
+        reference.records.size() != candidate.records.size() ||
+        std::memcmp(
+            reference.records.data(),
+            candidate.records.data(),
+            reference.records.size() *
+                sizeof(MsplatIsolationContributionRecord)
+        ) != 0) {
+        throw std::runtime_error(
+            "isolation exact-capacity replay changed lifted evidence"
+        );
+    }
+}
+
+void verifyIsolationLiftOracle(const std::string &dataset) {
+    constexpr int pointCount = 4;
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(false);
+
+    {
+        InputData inputData = inputDataFromX(dataset);
+        if (inputData.cameras.empty() ||
+            inputData.points.count < pointCount) {
+            throw std::runtime_error(
+                "isolation oracle fixture lacks a camera or sparse points"
+            );
+        }
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        model.num_active = pointCount;
+        model.refreshViews();
+        Model::CamSetup setup = model.prepareCam(camera, 1);
+        if (setup.width != 32 || setup.height != 32) {
+            throw std::runtime_error(
+                "isolation oracle requires the 32x32 parity camera"
+            );
+        }
+
+        const float opacities[pointCount] = {0.52f, 0.46f, 0.40f, 0.34f};
+        for (int index = 0; index < pointCount; ++index) {
+            const float depth =
+                2.35f + 0.12f * static_cast<float>(index);
+            for (int axis = 0; axis < 3; ++axis) {
+                model.means.data<float>()[index * 3 + axis] =
+                    setup.cam_pos[axis] -
+                    camera.camToWorld[axis * 4 + 2] * depth;
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+                model.scales.data<float>()[index * 3 + axis] =
+                    std::log(0.065f);
+            }
+            model.quats.data<float>()[index * 4] = 0.0f;
+            model.quats.data<float>()[index * 4 + 1] = 0.0f;
+            model.quats.data<float>()[index * 4 + 2] = 0.0f;
+            model.quats.data<float>()[index * 4 + 3] = 1.0f;
+            model.opacities.data<float>()[index] =
+                std::log(opacities[index] / (1.0f - opacities[index]));
+        }
+        const std::vector<float> opacityLogits = copyTensor(model.opacities);
+        IsolationLiftResources resources = makeIsolationLiftResources(
+            pointCount,
+            setup.width,
+            setup.height
+        );
+
+        encodeIsolationPrepare(model, camera, setup);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats initialOverflow = msplat_get_raster_stats();
+        if (!initialOverflow.capacity_exceeded ||
+            initialOverflow.memory_budget_exceeded ||
+            initialOverflow.resource_limit_exceeded ||
+            initialOverflow.latest_intersection_count <= 1 ||
+            initialOverflow.dropped_intersection_count != 0) {
+            throw std::runtime_error(
+                "isolation oracle did not establish a recoverable exact "
+                "capacity probe"
+            );
+        }
+        msplat_grow_exact_raster_capacity(
+            initialOverflow.latest_intersection_count
+        );
+        msplat_clear_raster_capacity_failure();
+        encodeIsolationPrepare(model, camera, setup);
+        msplat_gpu_sync();
+
+        IsolationProjection projection {
+            std::vector<float>(pointCount * 2),
+            std::vector<float>(pointCount),
+            std::vector<int>(pointCount),
+            std::vector<float>(pointCount * 3),
+        };
+        msplat_copy_isolation_projection_for_testing(
+            projection.xys.data(),
+            projection.depths.data(),
+            projection.radii.data(),
+            projection.conics.data(),
+            pointCount
+        );
+        for (int index = 0; index < pointCount; ++index) {
+            if (!std::isfinite(projection.xys[index * 2]) ||
+                !std::isfinite(projection.xys[index * 2 + 1]) ||
+                !std::isfinite(projection.depths[index]) ||
+                projection.radii[index] < 2 ||
+                std::abs(
+                    projection.xys[index * 2] -
+                    static_cast<float>(setup.width) / 2.0f
+                ) > 1.0f ||
+                std::abs(
+                    projection.xys[index * 2 + 1] -
+                    static_cast<float>(setup.height) / 2.0f
+                ) > 1.0f) {
+                throw std::runtime_error(
+                    "isolation oracle Gaussians did not form the expected "
+                    "centered layers"
+                );
+            }
+        }
+
+        const IsolationLiftSnapshot reference = captureIsolationLift(
+            resources,
+            setup.width,
+            setup.height
+        );
+        requireIsolationLiftMatchesOracle(
+            reference,
+            projection,
+            opacityLogits,
+            resources.mask.data<std::uint8_t>(),
+            setup.width,
+            setup.height
+        );
+
+        msplat_set_exact_execution_capacity_for_testing(1);
+        encodeIsolationPrepare(model, camera, setup);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats forcedOverflow = msplat_get_raster_stats();
+        if (!forcedOverflow.capacity_exceeded ||
+            forcedOverflow.memory_budget_exceeded ||
+            forcedOverflow.resource_limit_exceeded ||
+            forcedOverflow.latest_intersection_count !=
+                initialOverflow.latest_intersection_count ||
+            forcedOverflow.dropped_intersection_count != 0) {
+            throw std::runtime_error(
+                "forced isolation exact-capacity failure lost authoritative "
+                "intersection evidence"
+            );
+        }
+
+        bool refusedBeforeReplay = false;
+        try {
+            msplat_lift_isolation_stripe(
+                static_cast<unsigned>(setup.height),
+                static_cast<unsigned>(setup.width),
+                resources.mask,
+                resources.selected,
+                false,
+                0,
+                static_cast<unsigned>(setup.height),
+                resources.records,
+                resources.counts,
+                resources.alpha,
+                resources.status
+            );
+        } catch (const std::invalid_argument &) {
+            refusedBeforeReplay = true;
+        }
+        if (!refusedBeforeReplay) {
+            throw std::runtime_error(
+                "isolation lift accepted a failed exact prepare before replay"
+            );
+        }
+
+        msplat_grow_exact_raster_capacity(
+            forcedOverflow.latest_intersection_count
+        );
+        msplat_clear_raster_capacity_failure();
+        encodeIsolationPrepare(model, camera, setup);
+        msplat_gpu_sync();
+        const IsolationLiftSnapshot replayed = captureIsolationLift(
+            resources,
+            setup.width,
+            setup.height
+        );
+        requireIsolationSnapshotsIdentical(reference, replayed);
+
+        const MsplatRasterStats completed = msplat_get_raster_stats();
+        if (completed.capacity_exceeded ||
+            completed.memory_budget_exceeded ||
+            completed.resource_limit_exceeded ||
+            completed.dropped_intersection_count != 0 ||
+            completed.fallback_count < 2 ||
+            completed.exact_buffer_growth_count == 0 ||
+            completed.exact_buffer_bytes_added == 0) {
+            throw std::runtime_error(
+                "isolation exact replay did not finish losslessly with "
+                "durable recovery metrics"
+            );
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "isolation_lift_oracle passed\n";
+}
+
 void verifyPartialThreadgroupLossAccounting(const std::string &dataset) {
     constexpr int width = 33;
     constexpr int height = 35;
@@ -948,11 +1639,19 @@ void verifyDensificationScratchLifecycle(const std::string &dataset) {
             throw std::runtime_error("sufficient densification scratch memory was reallocated");
         }
 
+        // Culling continues past stopSplitAt, so the compaction scratch must survive the
+        // growth boundary rather than being released there. Zeroed visibility counts
+        // make the classify kernel early-return, so this exercises the cull path
+        // deterministically without needing a full training iteration.
         model.radii = gpu_zeros({pointCount}, DType::Float32);
+        model.xysGradNorm = gpu_zeros({pointCount}, DType::Float32);
+        model.visCounts = gpu_zeros({pointCount}, DType::Float32);
+        model.max2DSize = gpu_zeros({pointCount}, DType::Float32);
         model.afterTrain(model.stopSplitAt);
-        if (model.densify_compact_scratch.defined()) {
-            throw std::runtime_error("densification scratch memory survived the final boundary");
+        if (!model.densify_compact_scratch.defined()) {
+            throw std::runtime_error("densification scratch memory was released at the growth boundary");
         }
+        const void *survivingStorage = model.densify_compact_scratch.data_ptr();
         try {
             model.ensureDensificationCompactScratch(0);
             throw std::runtime_error("invalid densification point count was accepted");
@@ -962,12 +1661,200 @@ void verifyDensificationScratchLifecycle(const std::string &dataset) {
                 throw;
             }
         }
-        if (model.densify_compact_scratch.defined()) {
-            throw std::runtime_error("invalid densification request retained scratch memory");
+        if (!model.densify_compact_scratch.defined() ||
+            model.densify_compact_scratch.data_ptr() != survivingStorage) {
+            throw std::runtime_error("a rejected densification request disturbed scratch memory");
         }
     }
     cleanup_msplat_metal();
     std::cout << "densification scratch lifecycle passed\n";
+}
+
+// Drive a model to the point where a densify pass would fire, so a caller can observe
+// whether the capacity ceiling refuses it. Zeroed visibility counts make the classify
+// kernel early-return, so the gradients have to be primed explicitly.
+void primeForDensification(Model &model) {
+    const int pointCount = model.num_active;
+    model.lastWidth = 1024;
+    model.lastHeight = 1024;
+    model.radii = gpu_zeros({pointCount}, DType::Float32);
+    model.xysGradNorm = gpu_zeros({pointCount}, DType::Float32);
+    model.visCounts = gpu_zeros({pointCount}, DType::Float32);
+    model.max2DSize = gpu_zeros({pointCount}, DType::Float32);
+    float *grad = model.xysGradNorm.data<float>();
+    float *vis = model.visCounts.data<float>();
+    for (int i = 0; i < pointCount; i++) {
+        grad[i] = 1.0f;
+        vis[i] = 1.0f;
+    }
+}
+
+void verifyCapacityCeilingBoundsGrowth(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        // Inside the growth window: past warmupLength, before stopSplitAt (maxSteps/2),
+        // on a refineEvery boundary, and clear of the post-reset blackout.
+        const int growthStep = 600;
+
+        // Baseline with the ceiling disabled, to prove the fixture actually grows here.
+        // Without it a ceiling that silently did nothing would still pass.
+        {
+            Model model = makeModel(inputData);
+            model.maxCapacity = 0;
+            primeForDensification(model);
+            const int before = model.num_active;
+            model.afterTrain(growthStep);
+            if (model.num_active <= before) {
+                throw std::runtime_error(
+                    "capacity ceiling fixture does not densify without a ceiling");
+            }
+        }
+
+        Model model = makeModel(inputData);
+        const int pointCount = model.num_active;
+        // One slot below the worst case the pass could allocate. The population is far
+        // under this, so a ceiling that gates on population instead of capacity would
+        // admit the pass and let buf_capacity settle above the bound for good.
+        model.maxCapacity = 3 * pointCount - 1;
+        const int capacityBefore = model.buf_capacity;
+        primeForDensification(model);
+        model.afterTrain(growthStep);
+
+        if (model.num_active > pointCount) {
+            throw std::runtime_error(
+                "capacity ceiling admitted a densify pass that grew the population");
+        }
+        // The bound governs growth, not the seed allocation: setupOptimizers already
+        // reserved 4x the point count before the ceiling could have any say.
+        if (model.buf_capacity != capacityBefore) {
+            throw std::runtime_error(
+                "capacity ceiling did not prevent buffer growth");
+        }
+        if (!model.densify_compact_scratch.defined()) {
+            throw std::runtime_error(
+                "capacity ceiling suppressed the cull pass along with densification");
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "capacity ceiling bounds growth passed\n";
+}
+
+void verifyTailCullRemovesOversizedOnShortRuns(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Model model = makeModel(inputData);
+        const int pointCount = model.num_active;
+
+        // Scale culling used to be gated on step > refineEvery * resetAlphaEvery, which
+        // is 3000 - exactly where the fast profile ends. Its entire tail therefore ran
+        // opacity culling only. Plant an oversized round gaussian well inside that
+        // window and require the tail pass to remove it.
+        float *scales = model.scales.data<float>();
+        scales[0] = scales[1] = scales[2] = 0.0f;  // exp(0) = 1.0, far above kCullScale
+
+        model.radii = gpu_zeros({pointCount}, DType::Float32);
+        model.xysGradNorm = gpu_zeros({pointCount}, DType::Float32);
+        model.visCounts = gpu_zeros({pointCount}, DType::Float32);
+        model.max2DSize = gpu_zeros({pointCount}, DType::Float32);
+        model.lastWidth = 1024;
+        model.lastHeight = 1024;
+
+        // stopSplitAt is maxSteps / 2 = 1500 for this model, and the tail culls every
+        // 500 steps, so this is the first tail pass - and it is below 3000.
+        const int tailStep = model.stopSplitAt;
+        if (tailStep >= 3000) {
+            throw std::runtime_error("tail-cull fixture no longer exercises a short run");
+        }
+        model.afterTrain(tailStep);
+
+        const float *survivors = model.scales.data<float>();
+        float largest = 0.0f;
+        for (int i = 0; i < model.num_active; i++) {
+            for (int axis = 0; axis < 3; axis++) {
+                largest = (std::max)(largest, std::exp(survivors[i * 3 + axis]));
+            }
+        }
+        if (largest >= 1.0f) {
+            throw std::runtime_error(
+                "tail cull left an oversized gaussian on a run shorter than the "
+                "opacity-reset interval");
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "tail cull removes oversized on short runs passed\n";
+}
+
+// The capacity ceiling takes the same relaxed scale threshold as the post-stopSplitAt
+// tail, and it fires inside the growth window rather than after it. That is the common
+// production path, not an edge case: training always carries a memory budget, so the
+// ceiling is always live, and on mip-NeRF 360 flowers it binds at step 6000 of 15000.
+// verifyCapacityCeilingBoundsGrowth proves growth is refused and a cull still runs, but
+// it never touches scales, so nothing observed which threshold that cull used.
+void verifyCeilingCullKeepsOrdinaryGeometry(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Model model = makeModel(inputData);
+        const int pointCount = model.num_active;
+
+        // One slot below the worst case, so the pass is refused and takes the tail
+        // branch. Step 600 is past warmupLength, before stopSplitAt, on a refine
+        // boundary, and clear of the post-reset blackout.
+        model.maxCapacity = 3 * pointCount - 1;
+        const int growthStep = 600;
+
+        // Well clear of the 0.005 opacity cull that still applies inside the window,
+        // so opacity cannot explain either outcome below.
+        setUniformOpacity(model, 0.5f);
+
+        // Round, so the thin-disc exemption cannot explain a survival, and uniformly
+        // below kCullScale so the two planted scales identify themselves afterwards.
+        float *scales = model.scales.data<float>();
+        std::fill(scales, scales + 3 * pointCount, std::log(0.05f));
+        for (int axis = 0; axis < 3; axis++) {
+            scales[0 * 3 + axis] = std::log(0.2f);  // over kCullScale, under kTailCullScale
+            scales[1 * 3 + axis] = std::log(1.0f);  // over both
+        }
+
+        primeForDensification(model);
+        model.afterTrain(growthStep);
+
+        int ordinary = 0;
+        int oversized = 0;
+        const float *survivors = model.scales.data<float>();
+        for (int i = 0; i < model.num_active; i++) {
+            float largest = 0.0f;
+            for (int axis = 0; axis < 3; axis++) {
+                largest = (std::max)(largest, std::exp(survivors[i * 3 + axis]));
+            }
+            if (largest > 0.15f && largest < 0.5f) {
+                ordinary++;
+            } else if (largest >= 0.5f) {
+                oversized++;
+            }
+        }
+        if (ordinary != 1) {
+            throw std::runtime_error(
+                "the capacity-ceiling cull removed ordinary geometry that densification "
+                "is no longer running to replace");
+        }
+        if (oversized != 0) {
+            throw std::runtime_error(
+                "the capacity-ceiling cull kept an oversized gaussian");
+        }
+        if (model.num_active != pointCount - 1) {
+            throw std::runtime_error(
+                "the capacity-ceiling cull removed something other than the oversized "
+                "gaussian");
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "ceiling cull keeps ordinary geometry passed\n";
 }
 
 void enqueueStep(Model &model, Camera &camera, int step, std::size_t cameraIndex) {
@@ -1670,6 +2557,26 @@ void verifyGeometryAdamFusionParity(const std::string &dataset) {
     std::cout << "geometry_adam_fusion_parity passed\n";
 }
 
+void verifyGeometryAdamMultiSIMDParity(const std::string &dataset) {
+    constexpr int lastStep = 8;
+    const ModelSnapshot legacy = runGeometryAdamWindow(
+        dataset, false, false, 1, lastStep
+    );
+    const ModelSnapshot fused = runGeometryAdamWindow(
+        dataset, true, false, 1, lastStep
+    );
+    constexpr std::size_t channels = 3;
+    constexpr std::size_t simdWidth = 32;
+    if (legacy.rendered.size() <= channels * simdWidth ||
+        fused.rendered.size() != legacy.rendered.size()) {
+        throw std::runtime_error(
+            "geometry-Adam multi-SIMD fixture did not span multiple SIMD groups"
+        );
+    }
+    requireModelNear("geometry_adam_multisimd", legacy, fused);
+    std::cout << "geometry_adam_multisimd_parity passed\n";
+}
+
 double benchmarkCommonPath(const std::string &dataset, bool exactDispatchEnabled) {
     cleanup_msplat_metal();
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
@@ -2071,15 +2978,21 @@ void verifyWindowReplayNumericalParity(const std::string &dataset) {
 void verifyRepeatedExactFallbackMetrics(const std::string &dataset) {
     cleanup_msplat_metal();
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    // A fallback means some tile exceeded MAX_TILE_ELEMS intersections, so a restored
+    // history claiming a fallback must also report a global capacity above that budget.
+    // These values track MAX_TILE_ELEMS and must move with it.
+    constexpr std::uint64_t kTileElementBudget = 2048;
+    constexpr std::uint64_t kCapacityAtBudget = kTileElementBudget;
+    constexpr std::uint64_t kCapacityAboveBudget = kTileElementBudget + 512;
     const std::vector<std::tuple<std::uint64_t, double, std::uint64_t,
                                  std::uint64_t, std::uint64_t>> invalidHistory {
         {0, 0.1, 0, 0, 0},
         {1, 0.0, 0, 0, 0},
         {1, 0.1, 0, 0, 0},
-        {1, 0.1, 1, 0, 2304},
-        {1, 0.1, 1, 4096, 2048},
-        {1, 0.1, 2, 4096, 2304},
-        {1, 0.1, 1, memoryBudgetBytes + 1, 2304},
+        {1, 0.1, 1, 0, kCapacityAboveBudget},
+        {1, 0.1, 1, 4096, kCapacityAtBudget},
+        {1, 0.1, 2, 4096, kCapacityAboveBudget},
+        {1, 0.1, 1, memoryBudgetBytes + 1, kCapacityAboveBudget},
         {1, 0.1, 1, 4096, std::uint64_t {1} << 32},
     };
     for (const auto &[fallbacks, elapsed, growths, bytes, peak] : invalidHistory) {
@@ -2093,12 +3006,12 @@ void verifyRepeatedExactFallbackMetrics(const std::string &dataset) {
             throw std::runtime_error("native raster restore accepted inconsistent history");
         }
     }
-    msplat_restore_raster_metrics(3, 0.1, 2, memoryBudgetBytes + 1, 2304);
+    msplat_restore_raster_metrics(3, 0.1, 2, memoryBudgetBytes + 1, kCapacityAboveBudget);
     const MsplatRasterStats restored = msplat_get_raster_stats();
     if (restored.fallback_count != 3 || restored.exact_fallback_elapsed_seconds != 0.1 ||
         restored.exact_buffer_growth_count != 2 ||
         restored.exact_buffer_bytes_added != memoryBudgetBytes + 1 ||
-        restored.peak_exact_intersection_capacity != 2304) {
+        restored.peak_exact_intersection_capacity != kCapacityAboveBudget) {
         throw std::runtime_error("native raster restore rejected consistent history");
     }
     cleanup_msplat_metal();
@@ -2758,6 +3671,10 @@ int main(int argc, char **argv) {
             verifyQuaternionVJP();
             return 0;
         }
+        if (argc == 2 && std::string(argv[1]) == "--projection-vjp") {
+            verifyProjectionVJP();
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--geometry-adam-benchmark") {
             benchmarkGeometryAdamFusion(argv[2]);
             return 0;
@@ -2778,6 +3695,7 @@ int main(int argc, char **argv) {
                 "       msplat-raster-tests --prefix-oracle\n"
                 "       msplat-raster-tests --radix-oracle\n"
                 "       msplat-raster-tests --quaternion-vjp\n"
+                "       msplat-raster-tests --projection-vjp\n"
                 "       msplat-raster-tests --overflow-cpu-reference <overflow dataset>\n"
                 "       msplat-raster-tests --stage-timing <profile dataset>\n"
                 "       msplat-raster-tests --geometry-adam-benchmark <dataset>"
@@ -2807,6 +3725,7 @@ int main(int argc, char **argv) {
         requireNear("opacity_first_moment", fast.opacityFirstMoment, exact.opacityFirstMoment);
         requireNear("opacity_second_moment", fast.opacitySecondMoment, exact.opacitySecondMoment);
 
+        verifyIsolationLiftOracle(dataset);
         verifyPartialThreadgroupLossAccounting(dataset);
 
         const RasterResult culledFast = runSingleStep(dataset, false, true);
@@ -2875,7 +3794,11 @@ int main(int argc, char **argv) {
             throw std::runtime_error("zero-group exact dispatch materially slowed the common path");
         }
         verifyGeometryAdamFusionParity(argv[2]);
+        verifyGeometryAdamMultiSIMDParity(dataset);
         verifyDensificationScratchLifecycle(dataset);
+        verifyCapacityCeilingBoundsGrowth(dataset);
+        verifyCeilingCullKeepsOrdinaryGeometry(dataset);
+        verifyTailCullRemovesOversizedOnShortRuns(dataset);
         verifyMixedResolutionGrowth(argv[2]);
         verifyExactOnlyBudgetEvidence(argv[6]);
         verifySharedAllocationBudget(argv[3]);

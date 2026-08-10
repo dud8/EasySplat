@@ -37,19 +37,12 @@ class BuildDMGTrustBoundaryTests(unittest.TestCase):
                     "0.2.0",
                     "--toolchain-version",
                     "2.0.0",
-                    "--manifest-url",
-                    "https://example.com/manifest.json",
-                    "--core-artifact-url",
-                    "https://example.com/core.zip",
-                    "--da3-base-artifact-url",
-                    "https://example.com/base.zip",
-                    "--da3-small-artifact-url",
-                    "https://example.com/small.zip",
+                    "--toolchain-dir",
+                    os.fspath(repository / "Toolchains/out"),
                     "--build-root",
                     os.fspath(build_root),
                     "--output-dir",
                     os.fspath(output),
-                    "--use-existing-toolchain",
                     "--production",
                     "--identity-fingerprint",
                     "A" * 40,
@@ -97,7 +90,7 @@ class BuildDMGTrustBoundaryTests(unittest.TestCase):
                 )
 
             key = base64.b64encode(bytes(range(32))).decode("ascii") + "\n"
-            (repository / "EasySplatApp/Resources/public_key_ed25519.txt").write_text(
+            (repository / "scripts/release/toolchain_authority_public_key.txt").write_text(
                 key, encoding="ascii"
             )
             (prepared / "toolchain/out").mkdir(parents=True)
@@ -156,23 +149,14 @@ class BuildDMGTrustBoundaryTests(unittest.TestCase):
                     "0.2.0",
                     "--toolchain-version",
                     "2.0.0",
-                    "--manifest-url",
-                    "https://example.com/manifest.json",
-                    "--core-artifact-url",
-                    "https://example.com/core.zip",
-                    "--da3-base-artifact-url",
-                    "https://example.com/base.zip",
-                    "--da3-small-artifact-url",
-                    "https://example.com/small.zip",
-                    "--use-existing-toolchain",
+                    "--toolchain-dir",
+                    os.fspath(repository / "Toolchains/out"),
                     "--prepared-release-root",
                     os.fspath(prepared),
                     "--prepared-manifest-sha256",
                     prepared_manifest_sha256,
                     "--source-commit",
                     "0123456789abcdef0123456789abcdef01234567",
-                    "--manifest-tool-bin",
-                    os.fspath(trusted_tool),
                     "--production",
                     "--identity-fingerprint",
                     "A" * 40,
@@ -188,7 +172,9 @@ class BuildDMGTrustBoundaryTests(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(trusted_marker.is_file(), result.stderr)
+            # There is no ManifestTool in the release path any more, so the
+            # boundary is simply that nothing inside the prepared artifact runs.
+            self.assertFalse(trusted_marker.exists(), result.stderr)
             self.assertFalse(malicious_marker.exists(), result.stderr)
             self.assertIn("prepare-release", result.stderr)
 

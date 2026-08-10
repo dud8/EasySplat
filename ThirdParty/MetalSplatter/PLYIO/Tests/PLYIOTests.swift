@@ -168,6 +168,75 @@ final class PLYIOTests: XCTestCase {
         XCTAssertFalse(content.didFail)
     }
 
+    func testInjectedReadOperationSupportsShortReadsWithoutOpeningItsLabel() {
+        let bytes = Array("""
+        ply
+        format ascii 1.0
+        element vertex 1
+        property float x
+        property float y
+        property float z
+        end_header
+        0 0 0
+        """.utf8)
+        var offset = 0
+        var readCount = 0
+        let reader = PLYReader(
+            sourceLabel: URL(fileURLWithPath: "/path/that/must/not/be/opened.ply"),
+            read: { buffer, maximumLength in
+                readCount += 1
+                guard offset < bytes.count else { return 0 }
+                let count = min(3, maximumLength, bytes.count - offset)
+                bytes.withUnsafeBytes { source in
+                    guard let baseAddress = source.baseAddress else { return }
+                    memcpy(buffer, baseAddress.advanced(by: offset), count)
+                }
+                offset += count
+                return count
+            }
+        )
+        let content = ContentCounter()
+
+        reader.read(to: content)
+
+        XCTAssertTrue(content.didFinish)
+        XCTAssertFalse(content.didFail)
+        XCTAssertEqual(content.elements, [1])
+        XCTAssertGreaterThan(readCount, 2)
+    }
+
+    func testInjectedReadOperationRejectsCountsOutsideItsBuffer() {
+        let reader = PLYReader(
+            sourceLabel: URL(fileURLWithPath: "/unopened-label.ply"),
+            read: { _, maximumLength in maximumLength + 1 }
+        )
+        let content = ContentCounter()
+
+        reader.read(to: content)
+
+        XCTAssertFalse(content.didFinish)
+        XCTAssertTrue(content.didFail)
+        XCTAssertNotNil(content.failure)
+    }
+
+    func testInjectedReadOperationChecksCancellationBeforeReading() {
+        var didRead = false
+        let reader = PLYReader(
+            sourceLabel: URL(fileURLWithPath: "/unopened-label.ply"),
+            read: { _, _ in
+                didRead = true
+                return 0
+            }
+        )
+        let content = ContentCounter()
+
+        reader.read(to: content, shouldCancel: { true })
+
+        XCTAssertFalse(didRead)
+        XCTAssertFalse(content.didFinish)
+        XCTAssertTrue(content.failure is CancellationError)
+    }
+
     func testReadFailsOnInvalidHeader() throws {
         let url = try makeTempPLY(contents: """
         notply

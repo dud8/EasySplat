@@ -12,7 +12,9 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
@@ -37,8 +39,10 @@
 
 #include "bindings.h"
 #include "input_data.hpp"
+#include "isolation_runtime.hpp"
 #include "loaders.hpp"
 #include "model.hpp"
+#include "msplat_c_api.h"
 #include "random_iter.hpp"
 
 namespace fs = std::filesystem;
@@ -112,6 +116,120 @@ private:
     int descriptor_;
     std::uint64_t sequence_ = 0;
 };
+
+constexpr int maximumPreparseArgumentCount = 4096;
+constexpr std::size_t maximumPreparseTokenBytes = 128;
+
+struct PreparseIntent {
+    bool suppressParseDiagnostics = false;
+};
+
+std::optional<std::string_view> boundedPreparseToken(const char *argument) {
+    if (argument == nullptr) return std::nullopt;
+    const std::size_t length = ::strnlen(
+        argument,
+        maximumPreparseTokenBytes + 1
+    );
+    if (length > maximumPreparseTokenBytes) return std::nullopt;
+    return std::string_view(argument, length);
+}
+
+bool reservesStandardEventDescriptor(std::string_view value) {
+    int descriptor = -1;
+    if (!CLI::detail::lexical_cast(std::string(value), descriptor)) {
+        return false;
+    }
+    return descriptor == STDOUT_FILENO || descriptor == STDERR_FILENO;
+}
+
+PreparseIntent scanPreparseIntent(int argc, char *argv[]) {
+    if (argc < 0 || argc > maximumPreparseArgumentCount || argv == nullptr) {
+        return {true};
+    }
+
+    PreparseIntent intent;
+    for (int index = 1; index < argc; ++index) {
+        if (argv[index] == nullptr) return {true};
+        const auto token = boundedPreparseToken(argv[index]);
+        if (!token.has_value()) return {true};
+        if (*token == "--") break;
+        if (*token == "--isolate") {
+            intent.suppressParseDiagnostics = true;
+            continue;
+        }
+        constexpr std::string_view eventsOption = "--events-fd";
+        if (token->size() > eventsOption.size() &&
+            token->substr(0, eventsOption.size()) == eventsOption &&
+            (*token)[eventsOption.size()] == '=') {
+            if (reservesStandardEventDescriptor(
+                    token->substr(eventsOption.size() + 1)
+                )) {
+                intent.suppressParseDiagnostics = true;
+            }
+            continue;
+        }
+        if (*token != eventsOption || index + 1 >= argc) continue;
+        if (argv[index + 1] == nullptr) return {true};
+        const auto value = boundedPreparseToken(argv[index + 1]);
+        if (!value.has_value()) return {true};
+        if (reservesStandardEventDescriptor(*value)) {
+            intent.suppressParseDiagnostics = true;
+        }
+    }
+    return intent;
+}
+
+void emitCapturedParseDiagnostics(
+    const std::string &standardOutput,
+    const std::string &standardError
+) {
+    std::cout << standardOutput << std::flush;
+    std::cerr << standardError << std::flush;
+}
+
+using BoundEventFileIdentity =
+    std::pair<std::uint64_t, std::uint64_t>;
+
+std::optional<BoundEventFileIdentity> boundEventFileIdentity(int descriptor) {
+    if (descriptor < 0) return std::nullopt;
+    struct stat status {};
+    if (::fstat(descriptor, &status) != 0) {
+        throw std::runtime_error(
+            "cannot bind event file descriptor: " +
+            std::string(std::strerror(errno))
+        );
+    }
+    if (!S_ISREG(status.st_mode)) return std::nullopt;
+    return BoundEventFileIdentity {
+        static_cast<std::uint64_t>(status.st_dev),
+        static_cast<std::uint64_t>(status.st_ino),
+    };
+}
+
+void rejectEventDescriptorAliases(
+    const std::optional<BoundEventFileIdentity> &eventIdentity,
+    const std::vector<fs::path> &protectedPaths
+) {
+    if (!eventIdentity.has_value()) return;
+    for (const fs::path &path : protectedPaths) {
+        if (path.empty()) continue;
+        struct stat status {};
+        if (::lstat(path.c_str(), &status) != 0) {
+            if (errno == ENOENT) continue;
+            throw std::runtime_error(
+                "cannot inspect protected isolation path before event emission"
+            );
+        }
+        if (static_cast<std::uint64_t>(status.st_dev) ==
+                eventIdentity->first &&
+            static_cast<std::uint64_t>(status.st_ino) ==
+                eventIdentity->second) {
+            throw std::runtime_error(
+                "event file descriptor must not alias an isolation artifact"
+            );
+        }
+    }
+}
 
 struct TrainingProfileConfig {
     const char *name;
@@ -255,6 +373,48 @@ SceneBounds robustSceneBounds(const std::vector<GaussianBoundsSample> &finiteSam
     return bounds;
 }
 
+void requireFiniteOutputTransform(const Model &model) {
+    if (model.keepCrs && (!std::isfinite(model.scale) || model.scale <= 0 ||
+        !std::isfinite(model.translation[0]) || !std::isfinite(model.translation[1]) ||
+        !std::isfinite(model.translation[2]))) {
+        throw std::runtime_error("final Gaussian coordinate transform is invalid");
+    }
+}
+
+/// One bounds sample in published coordinates. Shared by the final scene bounds and
+/// the training preview so the two can never describe different frames.
+std::optional<GaussianBoundsSample> makeOutputBoundsSample(
+    const Model &model,
+    const float *means,
+    const float *scales,
+    const float *opacities,
+    int index
+) {
+    auto sample = makeBoundsSample(
+        means + index * 3,
+        scales + index * 3,
+        opacities[index]
+    );
+    if (!sample) return std::nullopt;
+    if (!model.keepCrs) return sample;
+
+    bool outputTransformIsFinite = true;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        sample->position[axis] =
+            sample->position[axis] / model.scale + model.translation[axis];
+        outputTransformIsFinite = outputTransformIsFinite &&
+            std::isfinite(sample->position[axis]) &&
+            std::abs(sample->position[axis]) <= std::numeric_limits<float>::max();
+    }
+    sample->largestPhysicalScale /= model.scale;
+    outputTransformIsFinite = outputTransformIsFinite &&
+        std::isfinite(sample->largestPhysicalScale) &&
+        sample->largestPhysicalScale > 0 &&
+        sample->largestPhysicalScale <= std::numeric_limits<float>::max();
+    if (!outputTransformIsFinite) return std::nullopt;
+    return sample;
+}
+
 SceneBounds robustSceneBounds(const Model &model) {
     if (model.num_active <= 0 || model.means.numel() < model.num_active * 3LL ||
         model.scales.numel() < model.num_active * 3LL ||
@@ -265,36 +425,11 @@ SceneBounds robustSceneBounds(const Model &model) {
     const float *means = model.means.data<float>();
     const float *scales = model.scales.data<float>();
     const float *opacities = model.opacities.data<float>();
-    if (model.keepCrs && (!std::isfinite(model.scale) || model.scale <= 0 ||
-        !std::isfinite(model.translation[0]) || !std::isfinite(model.translation[1]) ||
-        !std::isfinite(model.translation[2]))) {
-        throw std::runtime_error("final Gaussian coordinate transform is invalid");
-    }
+    requireFiniteOutputTransform(model);
     std::vector<GaussianBoundsSample> samples;
     samples.reserve(static_cast<std::size_t>(model.num_active));
     for (int index = 0; index < model.num_active; ++index) {
-        auto sample = makeBoundsSample(
-            means + index * 3,
-            scales + index * 3,
-            opacities[index]
-        );
-        if (sample) {
-            if (model.keepCrs) {
-                bool outputTransformIsFinite = true;
-                for (std::size_t axis = 0; axis < 3; ++axis) {
-                    sample->position[axis] =
-                        sample->position[axis] / model.scale + model.translation[axis];
-                    outputTransformIsFinite = outputTransformIsFinite &&
-                        std::isfinite(sample->position[axis]) &&
-                        std::abs(sample->position[axis]) <= std::numeric_limits<float>::max();
-                }
-                sample->largestPhysicalScale /= model.scale;
-                outputTransformIsFinite = outputTransformIsFinite &&
-                    std::isfinite(sample->largestPhysicalScale) &&
-                    sample->largestPhysicalScale > 0 &&
-                    sample->largestPhysicalScale <= std::numeric_limits<float>::max();
-                if (!outputTransformIsFinite) continue;
-            }
+        if (auto sample = makeOutputBoundsSample(model, means, scales, opacities, index)) {
             samples.push_back(*sample);
         }
     }
@@ -446,6 +581,7 @@ bool rasterRecoveryMetricsAreValid(
 
 void throwSystemError(const std::string &operation, const fs::path &path);
 void requirePlainDirectory(const fs::path &path);
+void syncDirectory(const fs::path &path);
 
 class Sha256Accumulator {
 public:
@@ -682,6 +818,773 @@ TrainingIdentity computeTrainingIdentity(
     return TrainingIdentity {digestFiles(images, imageNames, true), geometryDigest.finish()};
 }
 
+void copyAuthenticatedFile(
+    const fs::path &source,
+    const fs::path &destination
+) {
+    const struct stat namedBefore = requireRegularFile(source, true);
+    OpenFile input(source);
+    struct stat openedBefore {};
+    if (::fstat(input.descriptor, &openedBefore) != 0 ||
+        !sameStableFileMetadata(namedBefore, openedBefore)) {
+        throw std::runtime_error(
+            "dataset input changed while opening snapshot source: " +
+            source.string()
+        );
+    }
+    int output = ::open(
+        destination.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600
+    );
+    if (output < 0) {
+        throwSystemError("cannot create authenticated dataset snapshot", destination);
+    }
+    bool created = true;
+    try {
+        std::array<std::uint8_t, 1024 * 1024> buffer {};
+        std::uint64_t consumed = 0;
+        while (true) {
+            if (cancellationSignal != 0) {
+                throw easysplat::isolation::CancellationError();
+            }
+            const ssize_t count = ::read(
+                input.descriptor,
+                buffer.data(),
+                buffer.size()
+            );
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) {
+                throwSystemError("cannot read authenticated dataset input", source);
+            }
+            if (count == 0) break;
+            std::size_t written = 0;
+            while (written < static_cast<std::size_t>(count)) {
+                const ssize_t amount = ::write(
+                    output,
+                    buffer.data() + written,
+                    static_cast<std::size_t>(count) - written
+                );
+                if (amount < 0 && errno == EINTR) continue;
+                if (amount <= 0) {
+                    throwSystemError(
+                        "cannot write authenticated dataset snapshot",
+                        destination
+                    );
+                }
+                written += static_cast<std::size_t>(amount);
+            }
+            consumed += static_cast<std::uint64_t>(count);
+        }
+        if (openedBefore.st_size < 0 ||
+            consumed != static_cast<std::uint64_t>(openedBefore.st_size)) {
+            throw std::runtime_error(
+                "dataset input changed while copying snapshot source: " +
+                source.string()
+            );
+        }
+        struct stat openedAfter {};
+        struct stat namedAfter {};
+        if (::fstat(input.descriptor, &openedAfter) != 0 ||
+            ::lstat(source.c_str(), &namedAfter) != 0 ||
+            !sameStableFileMetadata(openedBefore, openedAfter) ||
+            !sameStableFileMetadata(openedBefore, namedAfter)) {
+            throw std::runtime_error(
+                "dataset input changed while copying snapshot source: " +
+                source.string()
+            );
+        }
+        if (::fsync(output) != 0) {
+            throwSystemError("cannot sync authenticated dataset snapshot", destination);
+        }
+        if (::close(output) != 0) {
+            output = -1;
+            throwSystemError("cannot close authenticated dataset snapshot", destination);
+        }
+        output = -1;
+        created = false;
+    } catch (...) {
+        if (output >= 0) (void)::close(output);
+        if (created) (void)::unlink(destination.c_str());
+        throw;
+    }
+}
+
+class ScopedDescriptor {
+public:
+    explicit ScopedDescriptor(int descriptor = -1) : descriptor_(descriptor) {}
+
+    ~ScopedDescriptor() {
+        if (descriptor_ >= 0) (void)::close(descriptor_);
+    }
+
+    ScopedDescriptor(const ScopedDescriptor &) = delete;
+    ScopedDescriptor &operator=(const ScopedDescriptor &) = delete;
+
+    int get() const { return descriptor_; }
+
+private:
+    int descriptor_;
+};
+
+bool sameIsolationSnapshotEntry(
+    const struct stat &expected,
+    const struct stat &actual
+) {
+    return (expected.st_mode & S_IFMT) == (actual.st_mode & S_IFMT) &&
+        expected.st_dev == actual.st_dev &&
+        expected.st_ino == actual.st_ino &&
+        expected.st_uid == actual.st_uid;
+}
+
+[[noreturn]] void throwIsolationSnapshotCleanupError(
+    const std::string &operation
+) {
+    const int savedError = errno;
+    throw std::runtime_error(
+        operation + ": " + std::string(std::strerror(savedError))
+    );
+}
+
+void restoreIsolationSnapshotClaim(
+    int parentDescriptor,
+    const std::string &claimedName,
+    const std::string &originalName
+) noexcept {
+    (void)::renameatx_np(
+        parentDescriptor,
+        claimedName.c_str(),
+        parentDescriptor,
+        originalName.c_str(),
+        RENAME_EXCL
+    );
+}
+
+std::string claimIsolationSnapshotEntry(
+    int parentDescriptor,
+    const std::string &originalName,
+    const struct stat &expected,
+    std::string_view claimPrefix
+) {
+    const auto token = static_cast<unsigned long long>(
+        std::chrono::steady_clock::now().time_since_epoch().count()
+    );
+    for (unsigned int attempt = 0; attempt < 128; ++attempt) {
+        const std::string claimedName =
+            std::string(claimPrefix) + "." +
+            std::to_string(static_cast<long long>(::getpid())) + "." +
+            std::to_string(token) + "." +
+            std::to_string(attempt);
+        if (::renameatx_np(
+                parentDescriptor,
+                originalName.c_str(),
+                parentDescriptor,
+                claimedName.c_str(),
+                RENAME_EXCL
+            ) != 0) {
+            if (errno == EEXIST) continue;
+            throwIsolationSnapshotCleanupError(
+                "cannot claim private isolation snapshot entry"
+            );
+        }
+
+        struct stat claimedMetadata {};
+        if (::fstatat(
+                parentDescriptor,
+                claimedName.c_str(),
+                &claimedMetadata,
+                AT_SYMLINK_NOFOLLOW
+            ) != 0 ||
+            !sameIsolationSnapshotEntry(expected, claimedMetadata)) {
+            restoreIsolationSnapshotClaim(
+                parentDescriptor,
+                claimedName,
+                originalName
+            );
+            throw std::runtime_error(
+                "private isolation snapshot entry changed while claiming it"
+            );
+        }
+        return claimedName;
+    }
+    throw std::runtime_error(
+        "cannot reserve a private isolation snapshot cleanup name"
+    );
+}
+
+std::vector<std::string> isolationSnapshotEntryNames(int directoryDescriptor) {
+    const int duplicate = ::fcntl(
+        directoryDescriptor,
+        F_DUPFD_CLOEXEC,
+        0
+    );
+    if (duplicate < 0) {
+        throwIsolationSnapshotCleanupError(
+            "cannot duplicate private isolation snapshot directory"
+        );
+    }
+    DIR *directory = ::fdopendir(duplicate);
+    if (directory == nullptr) {
+        const int savedError = errno;
+        (void)::close(duplicate);
+        errno = savedError;
+        throwIsolationSnapshotCleanupError(
+            "cannot enumerate private isolation snapshot directory"
+        );
+    }
+
+    std::vector<std::string> names;
+    errno = 0;
+    while (dirent *entry = ::readdir(directory)) {
+        const std::string name(entry->d_name);
+        if (name != "." && name != "..") names.push_back(name);
+        errno = 0;
+    }
+    const int enumerationError = errno;
+    const int closeStatus = ::closedir(directory);
+    if (enumerationError != 0) {
+        errno = enumerationError;
+        throwIsolationSnapshotCleanupError(
+            "cannot enumerate private isolation snapshot directory"
+        );
+    }
+    if (closeStatus != 0) {
+        throwIsolationSnapshotCleanupError(
+            "cannot close private isolation snapshot directory"
+        );
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+void removeIsolationSnapshotContentsAt(int directoryDescriptor) {
+    for (const std::string &name :
+         isolationSnapshotEntryNames(directoryDescriptor)) {
+        struct stat expected {};
+        if (::fstatat(
+                directoryDescriptor,
+                name.c_str(),
+                &expected,
+                AT_SYMLINK_NOFOLLOW
+            ) != 0) {
+            throwIsolationSnapshotCleanupError(
+                "cannot inspect private isolation snapshot entry"
+            );
+        }
+        const std::string claimedName = claimIsolationSnapshotEntry(
+            directoryDescriptor,
+            name,
+            expected,
+            ".easysplat-isolation-entry"
+        );
+        bool removed = false;
+        try {
+            if (S_ISDIR(expected.st_mode)) {
+                {
+                    ScopedDescriptor child(::openat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                    ));
+                    if (child.get() < 0) {
+                        throwIsolationSnapshotCleanupError(
+                            "cannot open private isolation snapshot directory"
+                        );
+                    }
+                    struct stat opened {};
+                    if (::fstat(child.get(), &opened) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, opened)) {
+                        throw std::runtime_error(
+                            "private isolation snapshot directory changed while opening it"
+                        );
+                    }
+                    removeIsolationSnapshotContentsAt(child.get());
+                    struct stat openedAfter {};
+                    struct stat namedAfter {};
+                    if (::fstat(child.get(), &openedAfter) != 0 ||
+                        ::fstatat(
+                            directoryDescriptor,
+                            claimedName.c_str(),
+                            &namedAfter,
+                            AT_SYMLINK_NOFOLLOW
+                        ) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, openedAfter) ||
+                        !sameIsolationSnapshotEntry(expected, namedAfter)) {
+                        throw std::runtime_error(
+                            "private isolation snapshot directory changed during cleanup"
+                        );
+                    }
+                }
+                if (::unlinkat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        AT_REMOVEDIR
+                    ) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot remove private isolation snapshot directory"
+                    );
+                }
+            } else if (S_ISREG(expected.st_mode)) {
+                {
+                    ScopedDescriptor file(::openat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+                    ));
+                    if (file.get() < 0) {
+                        throwIsolationSnapshotCleanupError(
+                            "cannot open private isolation snapshot file"
+                        );
+                    }
+                    struct stat opened {};
+                    struct stat namedAfter {};
+                    if (::fstat(file.get(), &opened) != 0 ||
+                        ::fstatat(
+                            directoryDescriptor,
+                            claimedName.c_str(),
+                            &namedAfter,
+                            AT_SYMLINK_NOFOLLOW
+                        ) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, opened) ||
+                        !sameIsolationSnapshotEntry(expected, namedAfter)) {
+                        throw std::runtime_error(
+                            "private isolation snapshot file changed during cleanup"
+                        );
+                    }
+                }
+                if (::unlinkat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        0
+                    ) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot remove private isolation snapshot file"
+                    );
+                }
+            } else if (S_ISLNK(expected.st_mode)) {
+                if (::unlinkat(
+                        directoryDescriptor,
+                        claimedName.c_str(),
+                        0
+                    ) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot remove private isolation snapshot link"
+                    );
+                }
+            } else {
+                throw std::runtime_error(
+                    "unsupported entry in private isolation snapshot"
+                );
+            }
+            removed = true;
+        } catch (...) {
+            if (!removed) {
+                restoreIsolationSnapshotClaim(
+                    directoryDescriptor,
+                    claimedName,
+                    name
+                );
+            }
+            throw;
+        }
+    }
+    if (::fsync(directoryDescriptor) != 0) {
+        throwIsolationSnapshotCleanupError(
+            "cannot sync private isolation snapshot directory"
+        );
+    }
+}
+
+std::string claimIsolationSnapshotRoot(
+    int parentDescriptor,
+    const std::string &rootName,
+    const struct stat &expected
+) {
+    return claimIsolationSnapshotEntry(
+        parentDescriptor,
+        rootName,
+        expected,
+        ".easysplat-isolation-cleanup"
+    );
+}
+
+class IsolationDatasetSnapshot {
+public:
+    explicit IsolationDatasetSnapshot(const fs::path &dataset) {
+        std::string pattern = (
+            fs::temp_directory_path() /
+            ("easysplat-isolation-dataset." +
+             std::to_string(static_cast<long long>(::getpid())) +
+             ".XXXXXX")
+        ).string();
+        std::vector<char> mutablePattern(pattern.begin(), pattern.end());
+        mutablePattern.push_back('\0');
+        char *created = ::mkdtemp(mutablePattern.data());
+        if (created == nullptr) {
+            throwSystemError(
+                "cannot create private isolation dataset snapshot",
+                fs::temp_directory_path()
+            );
+        }
+        root_ = fs::path(created);
+        try {
+            if (::chmod(root_.c_str(), 0700) != 0) {
+                throwSystemError(
+                    "cannot protect private isolation dataset snapshot",
+                    root_
+                );
+            }
+            struct stat rootStatus {};
+            if (::lstat(root_.c_str(), &rootStatus) != 0 ||
+                !S_ISDIR(rootStatus.st_mode) ||
+                rootStatus.st_uid != ::getuid() ||
+                rootStatus.st_nlink < 2) {
+                throw std::runtime_error(
+                    "private isolation dataset snapshot identity is invalid"
+                );
+            }
+            rootDevice_ = static_cast<std::uint64_t>(rootStatus.st_dev);
+            rootInode_ = static_cast<std::uint64_t>(rootStatus.st_ino);
+            fs::create_directories(sparsePath());
+            fs::create_directory(imagesPath());
+            if (::chmod((root_ / "sparse").c_str(), 0700) != 0 ||
+                ::chmod(sparsePath().c_str(), 0700) != 0 ||
+                ::chmod(imagesPath().c_str(), 0700) != 0) {
+                throwSystemError(
+                    "cannot protect isolation dataset snapshot directories",
+                    root_
+                );
+            }
+
+            const fs::path sourceSparse = dataset / "sparse" / "0";
+            for (const char *name : {
+                     "cameras.bin",
+                     "images.bin",
+                     "points3D.bin",
+                     "easysplat_orientation.json",
+                 }) {
+                copyAuthenticatedFile(
+                    sourceSparse / name,
+                    sparsePath() / name
+                );
+            }
+
+            std::vector<std::string> imageNames;
+            for (const fs::directory_entry &entry :
+                 fs::directory_iterator(dataset / "images")) {
+                imageNames.push_back(entry.path().filename().string());
+            }
+            std::sort(imageNames.begin(), imageNames.end());
+            if (imageNames.empty() ||
+                std::adjacent_find(imageNames.begin(), imageNames.end()) !=
+                    imageNames.end()) {
+                throw std::runtime_error(
+                    "dataset image set is empty or ambiguous during snapshot"
+                );
+            }
+            for (const std::string &name : imageNames) {
+                if (!isSupportedTrainingImageName(name)) {
+                    throw std::runtime_error(
+                        "unsupported entry in dataset images: " + name
+                    );
+                }
+                copyAuthenticatedFile(
+                    dataset / "images" / name,
+                    imagesPath() / name
+                );
+            }
+            syncDirectory(sparsePath());
+            syncDirectory(imagesPath());
+            syncDirectory(root_ / "sparse");
+            syncDirectory(root_);
+        } catch (...) {
+            removeSafely();
+            throw;
+        }
+    }
+
+    ~IsolationDatasetSnapshot() {
+        removeSafely();
+    }
+
+    IsolationDatasetSnapshot(const IsolationDatasetSnapshot &) = delete;
+    IsolationDatasetSnapshot &operator=(const IsolationDatasetSnapshot &) = delete;
+
+    const fs::path &rootPath() const { return root_; }
+    fs::path sparsePath() const { return root_ / "sparse" / "0"; }
+    fs::path imagesPath() const { return root_ / "images"; }
+
+    void verifySnapshotIdentity(
+        const TrainingIdentity &expected,
+        const std::string &orientationContentDigest
+    ) const {
+        verifyRootIdentity();
+        const TrainingIdentity actual = computeTrainingIdentity(
+            root_,
+            orientationContentDigest
+        );
+        verifyRootIdentity();
+        if (actual.inputDigest != expected.inputDigest ||
+            actual.geometryDigest != expected.geometryDigest) {
+            throw std::runtime_error(
+                "private isolation dataset snapshot digest mismatch"
+            );
+        }
+    }
+
+    void verifyCameraResources(const InputData &inputData) const {
+        verifyRootIdentity();
+        const fs::path expectedParent = imagesPath().lexically_normal();
+        for (const Camera &camera : inputData.cameras) {
+            const fs::path path = fs::path(camera.filePath).lexically_normal();
+            if (path.parent_path() != expectedParent) {
+                throw std::runtime_error(
+                    "COLMAP camera escaped the authenticated image snapshot"
+                );
+            }
+            (void)requireRegularFile(path, true);
+        }
+        verifyRootIdentity();
+    }
+
+private:
+    void verifyRootIdentity() const {
+        struct stat status {};
+        if (root_.empty() ||
+            ::lstat(root_.c_str(), &status) != 0 ||
+            !S_ISDIR(status.st_mode) ||
+            static_cast<std::uint64_t>(status.st_dev) != rootDevice_ ||
+            static_cast<std::uint64_t>(status.st_ino) != rootInode_ ||
+            status.st_uid != ::getuid()) {
+            throw std::runtime_error(
+                "private isolation dataset snapshot identity changed"
+            );
+        }
+    }
+
+    void removeSafely() noexcept {
+        if (root_.empty()) return;
+        try {
+            const fs::path parentPath = root_.parent_path();
+            const std::string rootName = root_.filename().string();
+            ScopedDescriptor parent(::open(
+                parentPath.c_str(),
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            ));
+            if (parent.get() < 0 || rootName.empty()) {
+                root_.clear();
+                return;
+            }
+
+            struct stat expected {};
+            if (::fstatat(
+                    parent.get(),
+                    rootName.c_str(),
+                    &expected,
+                    AT_SYMLINK_NOFOLLOW
+                ) != 0 ||
+                !S_ISDIR(expected.st_mode) ||
+                static_cast<std::uint64_t>(expected.st_dev) != rootDevice_ ||
+                static_cast<std::uint64_t>(expected.st_ino) != rootInode_ ||
+                expected.st_uid != ::getuid()) {
+                root_.clear();
+                return;
+            }
+
+            const std::string claimedName = claimIsolationSnapshotRoot(
+                parent.get(),
+                rootName,
+                expected
+            );
+            bool removed = false;
+            try {
+                {
+                    ScopedDescriptor claimed(::openat(
+                        parent.get(),
+                        claimedName.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                    ));
+                    if (claimed.get() < 0) {
+                        throwIsolationSnapshotCleanupError(
+                            "cannot open claimed private isolation snapshot"
+                        );
+                    }
+                    struct stat opened {};
+                    if (::fstat(claimed.get(), &opened) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, opened)) {
+                        throw std::runtime_error(
+                            "claimed private isolation snapshot identity changed"
+                        );
+                    }
+                    removeIsolationSnapshotContentsAt(claimed.get());
+                    struct stat openedAfter {};
+                    struct stat namedAfter {};
+                    if (::fstat(claimed.get(), &openedAfter) != 0 ||
+                        ::fstatat(
+                            parent.get(),
+                            claimedName.c_str(),
+                            &namedAfter,
+                            AT_SYMLINK_NOFOLLOW
+                        ) != 0 ||
+                        !sameIsolationSnapshotEntry(expected, openedAfter) ||
+                        !sameIsolationSnapshotEntry(expected, namedAfter)) {
+                        throw std::runtime_error(
+                            "claimed private isolation snapshot changed during cleanup"
+                        );
+                    }
+                }
+                if (::unlinkat(
+                        parent.get(),
+                        claimedName.c_str(),
+                        AT_REMOVEDIR
+                    ) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot remove claimed private isolation snapshot"
+                    );
+                }
+                if (::fsync(parent.get()) != 0) {
+                    throwIsolationSnapshotCleanupError(
+                        "cannot sync private isolation snapshot parent"
+                    );
+                }
+                removed = true;
+            } catch (...) {
+                if (!removed) {
+                    restoreIsolationSnapshotClaim(
+                        parent.get(),
+                        claimedName,
+                        rootName
+                    );
+                }
+                throw;
+            }
+        } catch (...) {
+            // Cleanup is best-effort and must never escape the destructor. Any
+            // identity uncertainty preserves the claimed tree or replacement.
+        }
+        root_.clear();
+    }
+
+    fs::path root_;
+    std::uint64_t rootDevice_ = 0;
+    std::uint64_t rootInode_ = 0;
+};
+
+std::pair<std::uint64_t, std::uint64_t> stableColmapRecordCount(
+    const fs::path &path,
+    std::uint64_t minimumRecordBytes
+) {
+    const struct stat pathMetadata = requireRegularFile(path, true);
+    if (pathMetadata.st_size < 8) {
+        throw std::runtime_error(
+            "COLMAP binary header is truncated: " + path.string()
+        );
+    }
+    OpenFile file(path);
+    struct stat openedMetadata {};
+    if (::fstat(file.descriptor, &openedMetadata) != 0 ||
+        !sameStableFileMetadata(pathMetadata, openedMetadata)) {
+        throw std::runtime_error(
+            "COLMAP binary changed while opening: " + path.string()
+        );
+    }
+    std::uint64_t count = 0;
+    std::size_t consumed = 0;
+    while (consumed < sizeof(count)) {
+        const ssize_t amount = ::pread(
+            file.descriptor,
+            reinterpret_cast<std::uint8_t *>(&count) + consumed,
+            sizeof(count) - consumed,
+            static_cast<off_t>(consumed)
+        );
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) {
+            throw std::runtime_error(
+                "COLMAP binary header is truncated: " + path.string()
+            );
+        }
+        consumed += static_cast<std::size_t>(amount);
+    }
+    struct stat finalOpenedMetadata {};
+    struct stat finalPathMetadata {};
+    if (::fstat(file.descriptor, &finalOpenedMetadata) != 0 ||
+        ::lstat(path.c_str(), &finalPathMetadata) != 0 ||
+        !sameStableFileMetadata(openedMetadata, finalOpenedMetadata) ||
+        !sameStableFileMetadata(openedMetadata, finalPathMetadata)) {
+        throw std::runtime_error(
+            "COLMAP binary changed while reading its header: " +
+            path.string()
+        );
+    }
+    const std::uint64_t bytes =
+        static_cast<std::uint64_t>(openedMetadata.st_size);
+    if (count > (bytes - sizeof(count)) / minimumRecordBytes) {
+        throw std::runtime_error(
+            "COLMAP binary record count exceeds its file size: " +
+            path.string()
+        );
+    }
+    return {count, bytes};
+}
+
+void enforceIsolationColmapLoadBudget(
+    const fs::path &sparse,
+    std::uint64_t memoryBudgetBytes
+) {
+    const auto [cameraCount, cameraBytes] = stableColmapRecordCount(
+        sparse / "cameras.bin",
+        48
+    );
+    const auto [imageCount, imageBytes] = stableColmapRecordCount(
+        sparse / "images.bin",
+        73
+    );
+    const auto [pointCount, pointBytes] = stableColmapRecordCount(
+        sparse / "points3D.bin",
+        51
+    );
+    (void)cameraBytes;
+    (void)pointBytes;
+    constexpr std::uint64_t conservativeCameraBytes = 256;
+    constexpr std::uint64_t conservativeImageBytes = 1024;
+    constexpr std::uint64_t conservativePointBytes = 32;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 3>
+        allocations = {{
+            {cameraCount, conservativeCameraBytes},
+            {imageCount, conservativeImageBytes},
+            {pointCount, conservativePointBytes},
+        }};
+    std::uint64_t requiredBytes = 0;
+    for (const auto &[count, bytesPerRecord] : allocations) {
+        if (count >
+            (std::numeric_limits<std::uint64_t>::max() - requiredBytes) /
+                bytesPerRecord) {
+            throw easysplat::isolation::MemoryLimitError(
+                "COLMAP loader allocation exceeds the native range"
+            );
+        }
+        requiredBytes += count * bytesPerRecord;
+    }
+    // The pinned COLMAP reader appends each image name one byte at a time.
+    // Its vector allocation is covered above, but a malformed authenticated
+    // file can otherwise hide an arbitrarily large string behind one record.
+    // Two input bytes per file byte conservatively cover libc++ string growth.
+    constexpr std::uint64_t imageParserBytesPerInputByte = 2;
+    if (imageBytes >
+        (std::numeric_limits<std::uint64_t>::max() - requiredBytes) /
+            imageParserBytesPerInputByte) {
+        throw easysplat::isolation::MemoryLimitError(
+            "COLMAP image metadata exceeds the native range"
+        );
+    }
+    requiredBytes += imageBytes * imageParserBytesPerInputByte;
+    if (requiredBytes > memoryBudgetBytes) {
+        throw easysplat::isolation::MemoryLimitError(
+            "COLMAP loader allocation exceeds the isolation memory budget"
+        );
+    }
+}
+
 fs::path trainerExecutablePath() {
     std::uint32_t capacity = 0;
     if (_NSGetExecutablePath(nullptr, &capacity) != -1 || capacity == 0 || capacity > 1024 * 1024) {
@@ -694,13 +1597,24 @@ fs::path trainerExecutablePath() {
     return fs::canonical(fs::path(buffer.data()));
 }
 
+// Set once from --metallib before any mode dispatch; empty means the
+// executable-adjacent default.metallib.
+fs::path explicitMetallibPath;
+
+fs::path resolvedMetallibPath() {
+    if (!explicitMetallibPath.empty()) return explicitMetallibPath;
+    return trainerExecutablePath().parent_path() / "default.metallib";
+}
+
 std::string computeTrainerBuildDigest() {
     const fs::path executable = trainerExecutablePath();
-    const fs::path directory = executable.parent_path();
-    return digestFiles(
-        directory,
-        {executable.filename().string(), "default.metallib"}
-    );
+    // The digest labels stay location-independent so a relocated metallib with
+    // identical content yields the identical build digest.
+    Sha256Accumulator digest;
+    digest.update("EasySplat file digest v1");
+    hashFileInto(digest, executable, executable.filename().string());
+    hashFileInto(digest, resolvedMetallibPath(), "default.metallib");
+    return digest.finish();
 }
 
 struct BenchmarkDecodeOutput {
@@ -1965,6 +2879,190 @@ PlyValidation validateBinaryPly(const fs::path &path) {
     return {vertices, properties, actualBytes};
 }
 
+// The preview is a display cache, not an artifact: a decimated, spherical-harmonic
+// degree 0 copy of the live model that the app renders while training continues.
+// It carries the same CRS transform the final PLY applies, so the preview and the
+// finished splat share one coordinate frame and the viewer camera survives the
+// handover.
+constexpr int previewPropertyCount = 17;
+constexpr std::int64_t previewGaussianCap = 400000;
+
+struct PreviewPublication {
+    std::int64_t sourceGaussianCount;
+    std::int64_t previewGaussianCount;
+    std::uintmax_t bytes;
+    std::string sha256;
+    SceneBounds bounds;
+};
+
+// Exact-count midpoint sampling. Striding by ceil(N/cap) collapses 400001 points to
+// 200001; this always emits exactly min(N, cap) and degrades smoothly. Storage order
+// is structured by densification, so this is bounded and deterministic rather than
+// statistically uniform - the UI says the preview is approximate.
+std::int64_t previewSampleIndex(std::int64_t emitted, std::int64_t total, std::int64_t count) {
+    const std::int64_t index = static_cast<std::int64_t>(
+        (static_cast<double>(emitted) + 0.5) * static_cast<double>(total) /
+        static_cast<double>(count)
+    );
+    if (index < 0) return 0;
+    if (index >= total) return total - 1;
+    return index;
+}
+
+// Stricter than validateBinaryPly, which only enforces a property floor: a preview
+// must carry exactly the degree 0 layout, because MetalSplatter rejects any partial
+// f_rest_* set and would otherwise fail the load with a shape error.
+void validatePreviewPly(const fs::path &path, std::int64_t expectedVertices) {
+    static const std::array<std::string, previewPropertyCount> expectedProperties = {
+        "x", "y", "z",
+        "nx", "ny", "nz",
+        "f_dc_0", "f_dc_1", "f_dc_2",
+        "opacity",
+        "scale_0", "scale_1", "scale_2",
+        "rot_0", "rot_1", "rot_2", "rot_3",
+    };
+
+    const PlyValidation validation = validateBinaryPly(path);
+    if (validation.properties != previewPropertyCount) {
+        throw std::runtime_error("preview PLY does not use the degree 0 layout");
+    }
+    if (validation.vertices != static_cast<std::uint64_t>(expectedVertices)) {
+        throw std::runtime_error("preview PLY vertex count does not match the sampled count");
+    }
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) throw std::runtime_error("cannot open preview PLY for validation");
+    std::string line;
+    std::size_t matched = 0;
+    for (int headerLine = 0; headerLine < 512 && std::getline(input, line); ++headerLine) {
+        if (line == "end_header") break;
+        constexpr std::string_view propertyPrefix = "property float ";
+        if (line.rfind(propertyPrefix, 0) != 0) continue;
+        if (matched >= expectedProperties.size() ||
+            line.substr(propertyPrefix.size()) != expectedProperties[matched]) {
+            throw std::runtime_error("preview PLY properties are out of contract order");
+        }
+        ++matched;
+    }
+    if (matched != expectedProperties.size()) {
+        throw std::runtime_error("preview PLY is missing contract properties");
+    }
+}
+
+PreviewPublication publishPreviewAtomically(
+    Model &model,
+    const fs::path &output,
+    int step
+) {
+    fs::path parent = output.parent_path();
+    if (parent.empty()) parent = fs::current_path();
+    fs::create_directories(parent);
+
+    const std::int64_t total = model.num_active;
+    if (total <= 0) throw std::runtime_error("preview requested with no active gaussians");
+    const std::int64_t count = std::min(total, previewGaussianCap);
+
+    const fs::path temporary = parent / ("." + output.filename().string() + ".preview.tmp." +
+                                        std::to_string(static_cast<long long>(::getpid())) + ".ply");
+    std::error_code ignored;
+    fs::remove(temporary, ignored);
+
+    try {
+        msplat_gpu_sync();
+        requireFiniteOutputTransform(model);
+
+        std::ostringstream header;
+        header << "ply\nformat binary_little_endian 1.0\n";
+        header << "comment easysplat preview iteration " << step << "\n";
+        header << "element vertex " << count << "\n";
+        header << "property float x\nproperty float y\nproperty float z\n";
+        header << "property float nx\nproperty float ny\nproperty float nz\n";
+        header << "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n";
+        header << "property float opacity\n";
+        header << "property float scale_0\nproperty float scale_1\nproperty float scale_2\n";
+        header << "property float rot_0\nproperty float rot_1\n";
+        header << "property float rot_2\nproperty float rot_3\n";
+        header << "end_header\n";
+        const std::string headerText = header.str();
+
+        Sha256Accumulator digest;
+        std::ofstream out;
+        out.exceptions(std::ios::failbit | std::ios::badbit);
+        out.open(temporary, std::ios::binary | std::ios::trunc);
+        out.write(headerText.data(), static_cast<std::streamsize>(headerText.size()));
+        digest.update(headerText);
+
+        const float *means = model.means.data<float>();
+        const float *scales = model.scales.data<float>();
+        const float *quats = model.quats.data<float>();
+        const float *featuresDc = model.featuresDc.data<float>();
+        const float *opacities = model.opacities.data<float>();
+
+        // Bounds are computed over exactly the gaussians published, in published
+        // coordinates. The viewer refuses a scene without authenticated bounds, so
+        // this travels with the preview rather than being derived downstream.
+        std::vector<GaussianBoundsSample> boundsSamples;
+        boundsSamples.reserve(static_cast<std::size_t>(count));
+
+        std::array<float, previewPropertyCount> row {};
+        for (std::int64_t emitted = 0; emitted < count; ++emitted) {
+            const std::int64_t i = previewSampleIndex(emitted, total, count);
+            if (auto sample = makeOutputBoundsSample(
+                    model, means, scales, opacities, static_cast<int>(i))) {
+                boundsSamples.push_back(*sample);
+            }
+            int cursor = 0;
+            for (int axis = 0; axis < 3; ++axis) {
+                row[cursor++] = model.keepCrs
+                    ? (means[i * 3 + axis] / model.scale + model.translation[axis])
+                    : means[i * 3 + axis];
+            }
+            row[cursor++] = 0;
+            row[cursor++] = 0;
+            row[cursor++] = 0;
+            for (int channel = 0; channel < 3; ++channel) {
+                row[cursor++] = featuresDc[i * 3 + channel];
+            }
+            row[cursor++] = opacities[i];
+            for (int axis = 0; axis < 3; ++axis) {
+                row[cursor++] = model.keepCrs
+                    ? std::log(std::exp(scales[i * 3 + axis]) / model.scale)
+                    : scales[i * 3 + axis];
+            }
+            for (int component = 0; component < 4; ++component) {
+                row[cursor++] = quats[i * 4 + component];
+            }
+            for (float value : row) {
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error("preview contains a non-finite value");
+                }
+            }
+            out.write(reinterpret_cast<const char *>(row.data()), sizeof(row));
+            digest.update(row.data(), sizeof(row));
+        }
+
+        out.flush();
+        out.close();
+
+        const SceneBounds bounds = robustSceneBounds(boundsSamples);
+        if (!std::isfinite(bounds.radius) || bounds.radius <= 0) {
+            throw std::runtime_error("preview produced no representable scene bounds");
+        }
+
+        validatePreviewPly(temporary, count);
+        const std::uintmax_t bytes = fs::file_size(temporary);
+        syncFile(temporary);
+        if (::rename(temporary.c_str(), output.c_str()) != 0) {
+            throwSystemError("cannot atomically replace preview", output);
+        }
+        syncDirectory(parent);
+        return PreviewPublication {total, count, bytes, digest.finish(), bounds};
+    } catch (...) {
+        fs::remove(temporary, ignored);
+        throw;
+    }
+}
+
 bool savePlyAtomically(Model &model, const fs::path &output, int step) {
     fs::path parent = output.parent_path();
     if (parent.empty()) parent = fs::current_path();
@@ -2001,31 +3099,79 @@ bool savePlyAtomically(Model &model, const fs::path &output, int step) {
 } // namespace
 
 int main(int argc, char *argv[]) {
+    const PreparseIntent preparseIntent = scanPreparseIntent(argc, argv);
     CLI::App app{"EasySplat native msplat trainer"};
     app.set_help_flag("-h,--help", "Show this help message");
     app.set_version_flag("--version", APP_VERSION);
 
     std::string datasetPath;
     std::string outputPath;
+    std::string previewOutputPath;
+    int previewIntervalSeconds = 20;
     std::string profileName;
     std::string checkpointPath;
     std::string resumePath;
+    std::string sourcePlyPath;
+    std::string maskManifestPath;
+    std::string analysisCachePath;
+    std::string expectedSourcePlyDigest;
     std::string expectedInputDigest;
     std::string expectedGeometryDigest;
+    std::string expectedSelectedFramesDigest;
+    std::string expectedTrainingManifestDigest;
+    std::string anchorImage;
     std::uint64_t seed = 42;
     std::uint64_t memoryBudgetBytes = 0;
+    int anchorInstance = 0;
     int iterationLimitOverride = 0;
     int plateauWindowOverride = 0;
+    int holdoutEvery = 0;
     int eventsFileDescriptor = -1;
+    bool isolate = false;
     bool selfCheck = false;
     std::string plyToValidate;
     std::string benchmarkDecodePath;
     std::string benchmarkDecodeOutputPath;
 
+    CLI::Option *isolateOption = app.add_flag(
+        "--isolate",
+        isolate,
+        "Run deterministic subject isolation without constructing training state"
+    );
     CLI::Option *datasetOption = app.add_option(
         "--dataset", datasetPath, "Canonical COLMAP dataset directory"
     );
-    CLI::Option *outputOption = app.add_option("--output", outputPath, "Final PLY output path");
+    CLI::Option *sourcePlyOption = app.add_option(
+        "--source-ply",
+        sourcePlyPath,
+        "Authenticated source binary Gaussian PLY"
+    );
+    CLI::Option *maskManifestOption = app.add_option(
+        "--mask-manifest",
+        maskManifestPath,
+        "Authenticated subject-isolation mask manifest"
+    );
+    CLI::Option *analysisCacheOption = app.add_option(
+        "--analysis-cache",
+        analysisCachePath,
+        "Bounded resumable subject-isolation analysis cache"
+    );
+    CLI::Option *outputOption = app.add_option(
+        "--output",
+        outputPath,
+        "Final trained or isolated PLY output path"
+    );
+    CLI::Option *previewOutputOption = app.add_option(
+        "--preview-output",
+        previewOutputPath,
+        "Optional decimated preview PLY republished during training"
+    );
+    CLI::Option *previewIntervalOption = app.add_option(
+        "--preview-interval-seconds",
+        previewIntervalSeconds,
+        "Minimum wall-clock seconds between preview publications"
+    );
+    previewIntervalOption->check(CLI::Range(1, 3600));
     CLI::Option *profileOption = app.add_option(
         "--profile", profileName, "Training profile: fast, balanced, or high-detail"
     );
@@ -2041,6 +3187,29 @@ int main(int argc, char *argv[]) {
         "Positive early-stop plateau window"
     );
     plateauWindowOption->check(CLI::Range(1, 1000000));
+    CLI::Option *holdoutEveryOption = app.add_option(
+        "--holdout-every",
+        holdoutEvery,
+        "Hold out every Nth camera for validation PSNR; 0 disables"
+    );
+    // 1 would hold out every camera, leaving nothing to train on, and it also slipped
+    // past the resume conflict below because only values above 1 create a split.
+    holdoutEveryOption->check(CLI::Validator(
+        [](std::string &value) -> std::string {
+            const char *begin = value.c_str();
+            char *end = nullptr;
+            errno = 0;
+            const long parsed = std::strtol(begin, &end, 10);
+            // strtol rather than stoi: a throwing validator escapes CLI11's error
+            // reporting and surfaces as a crash instead of a usage message.
+            if (errno != 0 || end == begin || *end != '\0') {
+                return "--holdout-every must be an integer";
+            }
+            if (parsed == 0 || (parsed >= 2 && parsed <= 1000)) return {};
+            return "--holdout-every must be 0 or between 2 and 1000";
+        },
+        "0 or 2..1000"
+    ));
     CLI::Option *seedOption = app.add_option(
         "--seed", seed, "UInt64 seed for reproducible camera ordering"
     );
@@ -2052,24 +3221,67 @@ int main(int argc, char *argv[]) {
     CLI::Option *checkpointOption = app.add_option(
         "--checkpoint", checkpointPath, "Atomic optimizer-checkpoint directory"
     );
-    app.add_option(
+    CLI::Option *expectedSourcePlyDigestOption = app.add_option(
+        "--expected-source-ply-digest",
+        expectedSourcePlyDigest,
+        "Expected lowercase SHA-256 digest of the source PLY"
+    );
+    CLI::Option *expectedInputDigestOption = app.add_option(
         "--expected-input-digest",
         expectedInputDigest,
         "Expected SHA-256 digest of the prepared training images"
     );
-    app.add_option(
+    CLI::Option *expectedGeometryDigestOption = app.add_option(
         "--expected-geometry-digest",
         expectedGeometryDigest,
         "Expected SHA-256 digest of the prepared sparse geometry"
     );
-    app.add_option("--resume", resumePath, "Validated optimizer-checkpoint directory");
+    CLI::Option *expectedSelectedFramesDigestOption = app.add_option(
+        "--expected-selected-frames-digest",
+        expectedSelectedFramesDigest,
+        "Expected lowercase SHA-256 digest of the selected-frame identity"
+    );
+    CLI::Option *expectedTrainingManifestDigestOption = app.add_option(
+        "--expected-training-manifest-digest",
+        expectedTrainingManifestDigest,
+        "Expected lowercase SHA-256 digest of the training manifest"
+    );
+    CLI::Option *anchorImageOption = app.add_option(
+        "--anchor-image",
+        anchorImage,
+        "Optional selected-frame identity for disambiguation"
+    );
+    CLI::Option *anchorInstanceOption = app.add_option(
+        "--anchor-instance",
+        anchorInstance,
+        "Optional nonzero 8-bit frame-local instance paired with --anchor-image"
+    );
+    CLI::Option *resumeOption = app.add_option(
+        "--resume",
+        resumePath,
+        "Validated optimizer-checkpoint directory"
+    );
     CLI::Option *eventsOption = app.add_option(
         "--events-fd", eventsFileDescriptor, "Descriptor for schema-v2 JSONL events"
     );
     eventsOption->check(CLI::Range(0, std::numeric_limits<int>::max()));
-    app.add_flag("--self-check", selfCheck, "Initialize Metal and load the adjacent metallib");
-    app.add_option("--validate-ply", plyToValidate, "Validate a binary Gaussian PLY")
-        ->check(CLI::ExistingFile);
+    CLI::Option *selfCheckOption = app.add_flag(
+        "--self-check",
+        selfCheck,
+        "Initialize Metal and load the adjacent metallib"
+    );
+    std::string metallibPathArgument;
+    CLI::Option *metallibOption = app.add_option(
+        "--metallib",
+        metallibPathArgument,
+        "Metal library path (defaults to default.metallib beside the executable)"
+    );
+    CLI::Option *validatePlyOption = app.add_option(
+        "--validate-ply",
+        plyToValidate,
+        "Validate a binary Gaussian PLY"
+    );
+    validatePlyOption->check(CLI::ExistingFile);
     CLI::Option *benchmarkDecodeOption = app.add_option(
         "--benchmark-decode",
         benchmarkDecodePath,
@@ -2081,9 +3293,49 @@ int main(int argc, char *argv[]) {
         "Write the production-decoded benchmark source as tightly packed RGB8"
     );
 
-    CLI11_PARSE(app, argc, argv);
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError &error) {
+        std::ostringstream capturedStandardOutput;
+        std::ostringstream capturedStandardError;
+        const int parserExit = app.exit(
+            error,
+            capturedStandardOutput,
+            capturedStandardError
+        );
+        if (preparseIntent.suppressParseDiagnostics) {
+            return parserExit == 0 ? 0 : 1;
+        }
+        emitCapturedParseDiagnostics(
+            capturedStandardOutput.str(),
+            capturedStandardError.str()
+        );
+        return parserExit == 0 ? 0 : 1;
+    }
+
+    if (eventsFileDescriptor == STDERR_FILENO) {
+        std::cerr.rdbuf(std::cout.rdbuf());
+    }
+
+    if (metallibOption->count() != 0) {
+        if (metallibOption->count() != 1) {
+            std::cerr << "easysplat-train: --metallib must be provided at most once\n";
+            return 1;
+        }
+        try {
+            const fs::path candidate(metallibPathArgument);
+            (void)requireRegularFile(candidate, true);
+            explicitMetallibPath = fs::canonical(candidate);
+            msplat_set_metallib_path(explicitMetallibPath.c_str());
+        } catch (const std::exception &error) {
+            std::cerr << "easysplat-train: invalid --metallib: " << error.what() << '\n';
+            return 1;
+        }
+    }
 
     std::optional<EventWriter> events;
+    std::optional<BoundEventFileIdentity> boundEventFile;
+    bool isolationEventEmissionSafe = true;
     int terminalIteration = 0;
     try {
         struct sigaction ignoreBrokenPipe {};
@@ -2093,11 +3345,258 @@ int main(int argc, char *argv[]) {
         if (sigaction(SIGPIPE, &ignoreBrokenPipe, nullptr) != 0) {
             throw std::runtime_error("failed to configure event-pipe handling");
         }
+        boundEventFile = boundEventFileIdentity(eventsFileDescriptor);
+        if (isolate) {
+            rejectEventDescriptorAliases(
+                boundEventFile,
+                {
+                    fs::path(sourcePlyPath),
+                    fs::path(maskManifestPath),
+                    fs::path(analysisCachePath),
+                    fs::path(outputPath),
+                }
+            );
+        }
         events.emplace(eventsFileDescriptor);
         if (eventsFileDescriptor == STDOUT_FILENO) std::cout.rdbuf(std::cerr.rdbuf());
 
+        const bool isolationOnlyArgumentProvided =
+            sourcePlyOption->count() != 0 ||
+            maskManifestOption->count() != 0 ||
+            analysisCacheOption->count() != 0 ||
+            expectedSourcePlyDigestOption->count() != 0 ||
+            expectedSelectedFramesDigestOption->count() != 0 ||
+            expectedTrainingManifestDigestOption->count() != 0 ||
+            anchorImageOption->count() != 0 ||
+            anchorInstanceOption->count() != 0;
+        if (!isolate && isolationOnlyArgumentProvided) {
+            throw std::runtime_error(
+                "subject-isolation options require --isolate"
+            );
+        }
+
         const bool benchmarkDecodeRequested =
             benchmarkDecodeOption->count() != 0 || benchmarkDecodeOutputOption->count() != 0;
+        if (isolate) {
+            if (isolateOption->count() != 1) {
+                throw std::runtime_error("--isolate must be provided exactly once");
+            }
+            if (profileOption->count() != 0 ||
+                iterationLimitOption->count() != 0 ||
+                plateauWindowOption->count() != 0 ||
+                seedOption->count() != 0 ||
+                checkpointOption->count() != 0 ||
+                resumeOption->count() != 0 ||
+                previewOutputOption->count() != 0 ||
+                previewIntervalOption->count() != 0) {
+                throw std::runtime_error(
+                    "--isolate cannot be combined with training-only options"
+                );
+            }
+            if (selfCheckOption->count() != 0 ||
+                validatePlyOption->count() != 0 ||
+                benchmarkDecodeRequested) {
+                throw std::runtime_error(
+                    "--isolate cannot be combined with self-check, PLY validation, or benchmark mode"
+                );
+            }
+
+            const std::array<std::pair<CLI::Option *, const char *>, 11>
+                requiredIsolationOptions = {{
+                    {datasetOption, "--dataset"},
+                    {sourcePlyOption, "--source-ply"},
+                    {maskManifestOption, "--mask-manifest"},
+                    {analysisCacheOption, "--analysis-cache"},
+                    {outputOption, "--output"},
+                    {expectedSourcePlyDigestOption, "--expected-source-ply-digest"},
+                    {expectedInputDigestOption, "--expected-input-digest"},
+                    {expectedGeometryDigestOption, "--expected-geometry-digest"},
+                    {expectedSelectedFramesDigestOption, "--expected-selected-frames-digest"},
+                    {expectedTrainingManifestDigestOption, "--expected-training-manifest-digest"},
+                    {memoryBudgetOption, "--memory-budget-bytes"},
+                }};
+            for (const auto &[option, name] : requiredIsolationOptions) {
+                if (option->count() != 1) {
+                    throw std::runtime_error(
+                        std::string(name) + " is required exactly once with --isolate"
+                    );
+                }
+            }
+            if (eventsOption->count() != 1) {
+                throw std::runtime_error(
+                    "--events-fd is required exactly once with --isolate"
+                );
+            }
+            if ((anchorImageOption->count() == 0) !=
+                (anchorInstanceOption->count() == 0) ||
+                anchorImageOption->count() > 1 ||
+                anchorInstanceOption->count() > 1) {
+                throw std::runtime_error(
+                    "--anchor-image and --anchor-instance must be provided together at most once"
+                );
+            }
+            if (anchorImageOption->count() == 1 &&
+                (anchorImage.empty() || anchorInstance < 1 || anchorInstance > 255)) {
+                throw std::runtime_error(
+                    "--anchor-instance must be a nonzero 8-bit label and --anchor-image cannot be empty"
+                );
+            }
+            const std::array<std::pair<const std::string *, const char *>, 5>
+                requiredIsolationDigests = {{
+                    {&expectedSourcePlyDigest, "--expected-source-ply-digest"},
+                    {&expectedInputDigest, "--expected-input-digest"},
+                    {&expectedGeometryDigest, "--expected-geometry-digest"},
+                    {&expectedSelectedFramesDigest, "--expected-selected-frames-digest"},
+                    {&expectedTrainingManifestDigest, "--expected-training-manifest-digest"},
+                }};
+            for (const auto &[digest, name] : requiredIsolationDigests) {
+                if (!isLowercaseHex(*digest)) {
+                    throw std::runtime_error(
+                        std::string(name) + " must be a lowercase 64-character SHA-256 digest"
+                    );
+                }
+            }
+            if (memoryBudgetBytes == 0) {
+                throw std::runtime_error(
+                    "--memory-budget-bytes must be positive with --isolate"
+                );
+            }
+            if (fs::path(outputPath).extension() != ".ply") {
+                throw std::runtime_error("--output must end in .ply");
+            }
+            isolationEventEmissionSafe = false;
+
+            struct sigaction action {};
+            action.sa_handler = observeCancellation;
+            sigemptyset(&action.sa_mask);
+            action.sa_flags = 0;
+            if (sigaction(SIGINT, &action, nullptr) != 0 ||
+                sigaction(SIGTERM, &action, nullptr) != 0) {
+                throw std::runtime_error("failed to install cancellation handlers");
+            }
+            auto throwIfIsolationCancelled = []() {
+                if (cancellationSignal != 0) {
+                    throw easysplat::isolation::CancellationError();
+                }
+            };
+            throwIfIsolationCancelled();
+
+            const fs::path isolationDataset(datasetPath);
+            const fs::path canonicalSparse =
+                isolationDataset / "sparse" / "0";
+            const fs::path canonicalImages =
+                isolationDataset / "images";
+            requirePlainDirectory(isolationDataset);
+            requirePlainDirectory(isolationDataset / "sparse");
+            requirePlainDirectory(canonicalSparse);
+            requirePlainDirectory(canonicalImages);
+            msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+
+            const OrientationOverlay orientation = readOrientationOverlay(datasetPath);
+            throwIfIsolationCancelled();
+            const TrainingIdentity identity = computeTrainingIdentity(
+                datasetPath,
+                orientation.contentDigest
+            );
+            throwIfIsolationCancelled();
+            if (identity.inputDigest != expectedInputDigest ||
+                identity.geometryDigest != expectedGeometryDigest) {
+                throw std::runtime_error(
+                    "prepared dataset identity does not match the expected digests"
+                );
+            }
+
+            IsolationDatasetSnapshot snapshot(isolationDataset);
+            const OrientationOverlay snapshotOrientation =
+                readOrientationOverlay(snapshot.rootPath());
+            if (snapshotOrientation.contentDigest != orientation.contentDigest) {
+                throw std::runtime_error(
+                    "orientation changed while creating the isolation dataset snapshot"
+                );
+            }
+            snapshot.verifySnapshotIdentity(
+                identity,
+                snapshotOrientation.contentDigest
+            );
+            enforceIsolationColmapLoadBudget(
+                snapshot.sparsePath(),
+                memoryBudgetBytes
+            );
+            InputData inputData = loaders::loadColmap(
+                snapshot.sparsePath().string(),
+                snapshot.imagesPath().string()
+            );
+            applyOrientationOverlay(inputData, snapshotOrientation);
+            throwIfIsolationCancelled();
+            const TrainingIdentity loadedIdentity = computeTrainingIdentity(
+                snapshot.rootPath(),
+                snapshotOrientation.contentDigest
+            );
+            if (loadedIdentity.inputDigest != expectedInputDigest ||
+                loadedIdentity.geometryDigest != expectedGeometryDigest) {
+                throw std::runtime_error(
+                    "private dataset snapshot changed while loading isolation cameras"
+                );
+            }
+            snapshot.verifySnapshotIdentity(
+                identity,
+                snapshotOrientation.contentDigest
+            );
+            snapshot.verifyCameraResources(inputData);
+            if (inputData.cameras.empty()) {
+                throw std::runtime_error("input dataset contains no isolation cameras");
+            }
+            inputData.points = Points {};
+
+            easysplat::isolation::IsolationRequest request {
+                fs::path(sourcePlyPath),
+                fs::path(maskManifestPath),
+                fs::path(analysisCachePath),
+                fs::path(outputPath),
+                expectedSourcePlyDigest,
+                expectedInputDigest,
+                expectedGeometryDigest,
+                expectedSelectedFramesDigest,
+                expectedTrainingManifestDigest,
+                static_cast<std::size_t>(memoryBudgetBytes),
+                std::nullopt,
+                boundEventFile,
+            };
+            if (anchorImageOption->count() == 1) {
+                request.anchor = easysplat::isolation::Anchor {
+                    anchorImage,
+                    static_cast<std::uint16_t>(anchorInstance),
+                };
+            }
+            const easysplat::isolation::IsolationRunResult result =
+                easysplat::isolation::runIsolation(
+                    request,
+                    inputData,
+                    [&](const std::string &event, json fields) {
+                        isolationEventEmissionSafe = true;
+                        events->emit(event, std::move(fields));
+                    },
+                    []() { return cancellationSignal != 0; }
+                );
+            if (!events->enabled()) {
+                switch (result.outcome) {
+                case easysplat::isolation::IsolationRunOutcome::completed:
+                    std::cout << "EasySplat subject isolation completed: " << outputPath << '\n';
+                    break;
+                case easysplat::isolation::IsolationRunOutcome::ambiguous:
+                    std::cout << "EasySplat subject isolation requires an anchor\n";
+                    break;
+                case easysplat::isolation::IsolationRunOutcome::noSubject:
+                    std::cout << "EasySplat subject isolation found no subject\n";
+                    break;
+                case easysplat::isolation::IsolationRunOutcome::heldOutRejected:
+                    std::cout << "EasySplat subject isolation failed held-out validation\n";
+                    break;
+                }
+            }
+            return 0;
+        }
+
         if (benchmarkDecodeRequested) {
             if (benchmarkDecodeOption->count() != 1 ||
                 benchmarkDecodeOutputOption->count() != 1) {
@@ -2137,7 +3636,7 @@ int main(int argc, char *argv[]) {
             const fs::path executable = trainerExecutablePath();
             const auto [executableDigest, executableBytes] = hashFileContent(executable, true);
             const auto [metallibDigest, metallibBytes] = hashFileContent(
-                executable.parent_path() / "default.metallib",
+                resolvedMetallibPath(),
                 true
             );
             const std::string trainerBuildDigest = computeTrainerBuildDigest();
@@ -2182,6 +3681,7 @@ int main(int argc, char *argv[]) {
             verifyOrientationOverlaySelfCheck();
             verifySceneBoundsSelfCheck();
             events->emit("self_check", {
+                {"isolation_mode_version", 1},
                 {"scene_bounds_status", "ok"},
                 {"status", "ok"},
                 {"version", APP_VERSION},
@@ -2223,6 +3723,37 @@ int main(int argc, char *argv[]) {
         }
         if (!fs::is_directory(datasetPath)) throw std::runtime_error("dataset directory does not exist");
         if (fs::path(outputPath).extension() != ".ply") throw std::runtime_error("--output must end in .ply");
+        if (previewIntervalOption->count() != 0 && previewOutputOption->count() == 0) {
+            throw std::runtime_error(
+                "--preview-interval-seconds requires --preview-output"
+            );
+        }
+        if (previewOutputOption->count() != 0) {
+            if (fs::path(previewOutputPath).extension() != ".ply") {
+                throw std::runtime_error("--preview-output must end in .ply");
+            }
+            // Compared after normalization, not as raw strings: a preview that
+            // aliases the durable output would replace a finished splat with a
+            // decimated one on the first publication.
+            std::error_code aliasError;
+            const fs::path previewPath = fs::weakly_canonical(previewOutputPath, aliasError);
+            const fs::path finalPath = fs::weakly_canonical(outputPath, aliasError);
+            if (previewPath == finalPath ||
+                fs::path(previewOutputPath).lexically_normal()
+                    == fs::path(outputPath).lexically_normal()) {
+                throw std::runtime_error("--preview-output cannot collide with --output");
+            }
+            if (!checkpointPath.empty()) {
+                const fs::path checkpointRoot =
+                    fs::weakly_canonical(checkpointPath, aliasError);
+                if (!checkpointRoot.empty() &&
+                    previewPath.string().rfind(checkpointRoot.string() + "/", 0) == 0) {
+                    throw std::runtime_error(
+                        "--preview-output cannot live inside the checkpoint directory"
+                    );
+                }
+            }
+        }
         msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
 
         struct sigaction action {};
@@ -2231,6 +3762,15 @@ int main(int argc, char *argv[]) {
         action.sa_flags = 0;
         if (sigaction(SIGINT, &action, nullptr) != 0 || sigaction(SIGTERM, &action, nullptr) != 0) {
             throw std::runtime_error("failed to install cancellation handlers");
+        }
+
+        // Reject the unsupported combination before touching the dataset or allocating
+        // Metal state, so an unrelated input error cannot mask the contract violation.
+        if (holdoutEvery > 1 && !resumePath.empty()) {
+            throw std::runtime_error(
+                "--resume cannot be combined with --holdout-every; the checkpoint "
+                "contract does not yet identify the held-out camera split"
+            );
         }
 
         const OrientationOverlay orientation = readOrientationOverlay(datasetPath);
@@ -2250,6 +3790,16 @@ int main(int argc, char *argv[]) {
         InputData inputData = inputDataFromX(datasetPath);
         applyOrientationOverlay(inputData, orientation);
 
+        // Hold out every Nth camera so novel-view quality can be measured. Training
+        // loss cannot detect a model that fits its own views while degrading between
+        // them, which is precisely the failure this trainer had no signal for.
+        std::vector<Camera> heldOutCameras;
+        if (holdoutEvery > 1) {
+            auto split = inputData.splitTrainTest(holdoutEvery);
+            heldOutCameras = std::move(std::get<1>(split));
+            inputData.cameras = std::move(std::get<0>(split));
+        }
+
         std::vector<Camera> &cameras = inputData.cameras;
         if (cameras.empty()) throw std::runtime_error("input dataset contains no training cameras");
 
@@ -2262,7 +3812,13 @@ int main(int argc, char *argv[]) {
         constexpr int resetAlphaEvery = 30;
         constexpr float densifyGradThreshold = 0.0002f;
         constexpr float densifySizeThreshold = 0.01f;
-        constexpr int stopScreenSizeAt = 4000;
+        // Screen-size splitting is an early-densification heuristic. The shipped literal
+        // 4000 was tuned against the built-in profiles (3000/7000/15000 iterations), so
+        // raising the budget silently shrank its share of the run: at 40000 it covered
+        // 10% instead of the ~27% it had at 15000. Express it as that same fraction of
+        // the growth window so every budget gets equivalent treatment.
+        const int stopScreenSizeAt =
+            (std::max)(refineEvery * 2, (profile.iterationLimit * 4000) / 15000);
         constexpr float splitScreenSize = 0.05f;
         constexpr float ssimWeight = 0.2f;
         constexpr float background[3] = {0.0f, 0.0f, 0.0f};
@@ -2273,6 +3829,79 @@ int main(int argc, char *argv[]) {
                     warmupLength, resetAlphaEvery, densifyGradThreshold,
                     densifySizeThreshold, stopScreenSizeAt, splitScreenSize,
                     profile.iterationLimit, true, background);
+
+        // Bound the gaussian population to what the admitted memory can hold. The
+        // binding constraint is not parameter storage but a single exact-raster
+        // allocation, which scales with tile intersections and so with scene density:
+        // mip-NeRF 360 treehill demanded 38.2 GB at 4.52M gaussians while flowers ran
+        // to 2.7M inside 14.8 GB. 10 KB per gaussian is the conservative empirical
+        // envelope across both, tuned in both directions - 8000 aborted treehill, and
+        // 6000 aborted it again while making flowers 30% slower for no quality gain.
+        // It is calibrated, not derived: driving it from live raster pressure would be
+        // the principled version. Without any bound the run aborts mid-training
+        // instead of simply ceasing to grow.
+        constexpr std::uint64_t kEstimatedBytesPerGaussian = 10000;
+        // Never bind below this. The per-gaussian estimate is calibrated against
+        // multi-gigabyte training budgets; applied to a small one it yields an absurd
+        // ceiling - a 96 MB budget admits about 10k gaussians - and throttles work that
+        // memory was never going to constrain. Below this floor the ceiling is inert.
+        constexpr std::uint64_t kMinimumPopulationCeiling = 500000;
+        if (memoryBudgetBytes > 0) {
+            // Part of the budget is spent before a single gaussian exists. The raster
+            // keeps six full-resolution image buffers (31 floats per pixel: colour,
+            // transmittance, final index, loss intermediates, the SSIM row buffer and
+            // the rendered-image gradient) plus one tile-local intersection arena of
+            // MAX_TILE_ELEMS 64-bit keys per 16x16 tile. Both scale with resolution and
+            // not at all with population, so charging them to the per-gaussian estimate
+            // overstated the headroom - at 2304x1296 by roughly 560 MB.
+            constexpr std::uint64_t kBytesPerPixel = 31 * sizeof(float);
+            constexpr std::uint64_t kTileSide = 16;
+            // Queried rather than duplicated: a literal here would drift silently the
+            // first time MAX_TILE_ELEMS changes in the kernels.
+            const std::uint64_t bytesPerTile =
+                msplat_max_tile_elements() * sizeof(std::uint64_t) + 4 * sizeof(std::int32_t);
+            std::uint64_t largestFixed = 0;
+            bool mixedResolutions = false;
+            int firstWidth = 0;
+            int firstHeight = 0;
+            for (const Camera &camera : cameras) {
+                if (camera.width <= 0 || camera.height <= 0) continue;
+                if (firstWidth == 0) {
+                    firstWidth = camera.width;
+                    firstHeight = camera.height;
+                } else if (camera.width != firstWidth || camera.height != firstHeight) {
+                    mixedResolutions = true;
+                }
+                const std::uint64_t w = static_cast<std::uint64_t>(camera.width);
+                const std::uint64_t h = static_cast<std::uint64_t>(camera.height);
+                const std::uint64_t tiles =
+                    ((w + kTileSide - 1) / kTileSide) * ((h + kTileSide - 1) / kTileSide);
+                largestFixed = (std::max<std::uint64_t>)(
+                    largestFixed, w * h * kBytesPerPixel + tiles * bytesPerTile);
+            }
+            // The raster reserves the new resolution's image and tile buffers while the
+            // previous ones are still resident, so a capture that alternates between
+            // resolutions - portrait stills among landscape video, say - transiently
+            // needs two of these. Charge for both rather than let the ceiling promise
+            // headroom that a resolution switch immediately spends.
+            const std::uint64_t fixedBytes =
+                mixedResolutions ? 2 * largestFixed : largestFixed;
+            const std::uint64_t gaussianBudget =
+                memoryBudgetBytes > fixedBytes ? memoryBudgetBytes - fixedBytes : 0;
+            const std::uint64_t population = (std::max<std::uint64_t>)(
+                kMinimumPopulationCeiling,
+                gaussianBudget / kEstimatedBytesPerGaussian
+            );
+            // The model bounds allocated slots, not the population, because a densify
+            // pass can triple its input and the buffers never shrink. Three slots per
+            // admitted gaussian preserves the calibrated ceiling above while making the
+            // worst case bounded rather than open-ended.
+            const std::uint64_t slots = (std::min<std::uint64_t>)(
+                3 * population,
+                static_cast<std::uint64_t>(std::numeric_limits<int>::max() / 4)
+            );
+            model.maxCapacity = static_cast<int>(slots);
+        }
 
         std::vector<size_t> camIndices(cameras.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
@@ -2288,6 +3917,17 @@ int main(int argc, char *argv[]) {
             requirePlainDirectory(resumePath);
             if (fs::canonical(resumePath) != fs::canonical(checkpointRoot)) {
                 throw std::runtime_error("--resume must identify the --checkpoint directory");
+            }
+            // The checkpoint contract records the training-camera count but not which
+            // cameras were held out, and two different strides can leave the same count
+            // while selecting different subsets. Until the split is versioned into the
+            // manifest, refuse the combination rather than silently resume against a
+            // different set of views.
+            if (holdoutEvery > 1) {
+                throw std::runtime_error(
+                    "--resume cannot be combined with --holdout-every; the checkpoint "
+                    "contract does not yet identify the held-out camera split"
+                );
             }
         }
         const CheckpointContext checkpointContext {
@@ -2309,6 +3949,8 @@ int main(int argc, char *argv[]) {
         );
         int lastImprovementIteration = warmupLength;
         double latestWindowLoss = std::numeric_limits<double>::quiet_NaN();
+        double latestHeldOutPsnr = std::numeric_limits<double>::quiet_NaN();
+        int latestHeldOutIteration = 0;
         int latestLossIteration = 0;
         int completedIteration = 0;
         double priorElapsedSeconds = 0;
@@ -2540,6 +4182,11 @@ int main(int argc, char *argv[]) {
         emitCheckpoint(resumed ? "checkpoint_loaded" : "checkpoint_completed", *lastCheckpoint);
 
         auto lastProgressAt = startedAt;
+        auto lastPreviewAt = startedAt;
+        std::uint64_t previewPublicationID = 0;
+        // One write failure disables the preview for the rest of the run. A preview is
+        // a convenience; it must never take the training run down with it.
+        bool previewEnabled = previewOutputOption->count() != 0;
         auto cumulativeElapsed = [&]() {
             return priorElapsedSeconds + std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - startedAt
@@ -2635,6 +4282,57 @@ int main(int argc, char *argv[]) {
                 plateauSampleCount = lossSlot + 1;
             }
             msplat_commit();
+        };
+
+        // Held-out evaluation. Runs only at a drained pipeline boundary, and resolves
+        // any raster capacity failure inline so no evidence from a non-training camera
+        // index reaches synchronizeWindow's rewind logic.
+        auto evaluateHeldOut = [&](int step,
+                                   std::size_t *evaluatedOut,
+                                   std::string *failureOut) -> double {
+            if (heldOutCameras.empty()) return std::numeric_limits<double>::quiet_NaN();
+            const std::size_t count = heldOutCameras.size();
+            double total = 0;
+            int counted = 0;
+            for (std::size_t index = 0; index < count; ++index) {
+                Camera &camera = heldOutCameras[index];
+                // Contained per camera: one view that cannot be rendered costs its own
+                // measurement, not every measurement gathered before it. Only a pending
+                // capacity failure is cleared, so an unrelated GPU or synchronization
+                // fault is still visible to whatever runs next.
+                try {
+                    if (camera.image.empty()) {
+                        camera.loadImage(1.0f);
+                        if (camera.image.empty()) continue;
+                    }
+                    MTensor target = camera.getGPUImage(model.getDownscaleFactor(step));
+                    bool measured = false;
+                    for (int attempt = 0; attempt < 2 && !measured; ++attempt) {
+                        MTensor rendered = model.render(camera, step);
+                        msplat_commit();
+                        msplat_gpu_sync_for_raster_replay();
+                        const MsplatRasterStats stats = msplat_get_raster_stats();
+                        if (stats.capacity_exceeded) {
+                            msplat_grow_exact_raster_capacity(stats.latest_intersection_count);
+                            msplat_clear_raster_capacity_failure();
+                            continue;
+                        }
+                        total += psnr(rendered, target);
+                        ++counted;
+                        measured = true;
+                    }
+                } catch (const std::exception &error) {
+                    if (failureOut && failureOut->empty()) *failureOut = error.what();
+                    if (msplat_raster_memory_budget_was_exceeded()) {
+                        msplat_clear_raster_capacity_failure();
+                    }
+                }
+                releaseCameraResources(camera);
+            }
+            if (evaluatedOut) *evaluatedOut = static_cast<std::size_t>(counted);
+            return counted > 0
+                ? total / static_cast<double>(counted)
+                : std::numeric_limits<double>::quiet_NaN();
         };
 
         auto synchronizeWindow = [&](int windowEnd) {
@@ -2777,6 +4475,40 @@ int main(int argc, char *argv[]) {
                 lastProgressAt = now;
             }
 
+            // Published here because the window has already synchronized and afterTrain
+            // has settled densification: the tensors are quiescent and readable without
+            // a second GPU sync. Serialization is synchronous on the training thread -
+            // a background reader would race the next window's densify and prune.
+            if (previewEnabled && step < profile.iterationLimit &&
+                now - lastPreviewAt >= std::chrono::seconds(previewIntervalSeconds)) {
+                try {
+                    const PreviewPublication publication = publishPreviewAtomically(
+                        model,
+                        fs::path(previewOutputPath),
+                        step
+                    );
+                    ++previewPublicationID;
+                    events->emit("preview_published", {
+                        {"iteration", step},
+                        {"preview_bytes", static_cast<std::uint64_t>(publication.bytes)},
+                        {"preview_gaussian_count", publication.previewGaussianCount},
+                        {"preview_publication", previewPublicationID},
+                        {"preview_schema", 1},
+                        {"preview_sha256", publication.sha256},
+                        {"scene_center", publication.bounds.center},
+                        {"scene_radius", publication.bounds.radius},
+                        {"source_gaussian_count", publication.sourceGaussianCount},
+                    });
+                } catch (const std::exception &error) {
+                    previewEnabled = false;
+                    events->emit("preview_disabled", {
+                        {"iteration", step},
+                        {"reason", std::string(error.what())},
+                    });
+                }
+                lastPreviewAt = std::chrono::steady_clock::now();
+            }
+
             if (plateauReached && step < profile.iterationLimit) {
                 stopReason = "plateau";
                 events->emit("early_stop", {{"iteration", step},
@@ -2836,8 +4568,53 @@ int main(int argc, char *argv[]) {
             if (handleCancellation()) return 130;
             throw std::runtime_error("final output was not published");
         }
+        // Snapshot training raster telemetry before any validation render, so held-out
+        // work cannot inflate the fallback counts the completed event reports. Those
+        // counts must never regress below the last checkpoint's, and a validation
+        // render after the snapshot would attribute non-training work to training.
         const MsplatRasterStats finalRasterStats =
             emitRasterFallbackIfNeeded(completedIteration);
+
+        // Validation is a measurement and must never fail the thing it measures. A
+        // held-out view can demand exact-raster growth that throws on the memory
+        // budget; the model is already published, so swallow it and report what was
+        // actually evaluated rather than losing a finished run.
+        if (!heldOutCameras.empty()) {
+            std::size_t evaluated = 0;
+            std::string failure;
+            double heldOutPsnr = std::numeric_limits<double>::quiet_NaN();
+            try {
+                heldOutPsnr = evaluateHeldOut(completedIteration, &evaluated, &failure);
+            } catch (const std::exception &error) {
+                if (failure.empty()) failure = error.what();
+                if (msplat_raster_memory_budget_was_exceeded()) {
+                    msplat_clear_raster_capacity_failure();
+                }
+            }
+            const bool usable = std::isfinite(heldOutPsnr) && evaluated > 0;
+            if (usable) {
+                latestHeldOutPsnr = heldOutPsnr;
+                latestHeldOutIteration = completedIteration;
+            }
+            if (!failure.empty()) {
+                fprintf(stderr, "held-out evaluation incomplete (%zu of %zu views): %s\n",
+                        evaluated, heldOutCameras.size(), failure.c_str());
+            }
+            // Emitted unconditionally. A missing event would be indistinguishable from
+            // validation never having been requested, which is the one thing a quality
+            // signal must not be ambiguous about.
+            json holdout = {
+                {"iteration", completedIteration},
+                {"holdout_camera_count", static_cast<int>(heldOutCameras.size())},
+                {"holdout_evaluated", static_cast<int>(evaluated)},
+                {"full_set", evaluated == heldOutCameras.size()},
+                {"status", failure.empty() ? (usable ? "ok" : "empty") : "partial"}
+            };
+            if (usable) holdout["holdout_psnr"] = heldOutPsnr;
+            if (!failure.empty()) holdout["failure"] = failure;
+            events->emit("holdout_eval", holdout);
+        }
+
         const std::uintmax_t outputBytes = fs::file_size(outputPath);
         const double elapsed = cumulativeElapsed();
 
@@ -2870,10 +4647,87 @@ int main(int argc, char *argv[]) {
                           {"stop_reason", stopReason},
                           {"trainer_build_digest", trainerBuildDigest},
                           {"version", APP_VERSION}};
+        if (std::isfinite(latestHeldOutPsnr)) {
+            completed["holdout_psnr"] = latestHeldOutPsnr;
+            completed["holdout_psnr_iteration"] = latestHeldOutIteration;
+            completed["holdout_camera_count"] = static_cast<int>(heldOutCameras.size());
+        }
         events->emit("completed", completed);
         if (!events->enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
         return 0;
+    } catch (const easysplat::isolation::CancellationError &error) {
+        if (events && isolationEventEmissionSafe) {
+            try {
+                events->emit("isolation_cancelled", {
+                    {"signal", cancellationSignal},
+                    {"status", "cancelled"},
+                });
+            } catch (const std::exception &eventError) {
+                std::cerr << "easysplat-train: cannot report subject-isolation cancellation: "
+                          << eventError.what() << '\n';
+            }
+        }
+        std::cerr << "easysplat-train: " << error.what() << '\n';
+        return 130;
+    } catch (const easysplat::isolation::MemoryLimitError &error) {
+        if (isolate && events && isolationEventEmissionSafe) {
+            try {
+                events->emit("isolation_memory_refused", {
+                    {"budget_bytes", memoryBudgetBytes},
+                    {"reason", "working_set"},
+                    {"status", "refused"},
+                });
+            } catch (const std::exception &eventError) {
+                std::cerr << "easysplat-train: cannot report subject-isolation memory refusal: "
+                          << eventError.what() << '\n';
+            }
+        }
+        std::cerr << "easysplat-train: " << error.what() << '\n';
+        return isolate ? 75 : 1;
     } catch (const std::exception &error) {
+        if (isolate &&
+            (msplat_raster_resource_limit_was_exceeded() ||
+             msplat_raster_memory_budget_was_exceeded())) {
+            const MsplatRasterStats stats = msplat_get_raster_stats();
+            if (events && isolationEventEmissionSafe) {
+                try {
+                    json fields = {
+                        {"allocation_bytes", stats.allocation_bytes},
+                        {"budget_bytes", memoryBudgetBytes},
+                        {"reason",
+                         msplat_raster_resource_limit_was_exceeded()
+                             ? "resource_limit"
+                             : "memory_budget"},
+                        {"required_bytes", stats.required_bytes},
+                        {"status", "refused"},
+                    };
+                    if (stats.latest_intersection_count > 0) {
+                        fields["intersection_count"] = stats.latest_intersection_count;
+                    }
+                    events->emit("isolation_memory_refused", std::move(fields));
+                } catch (const std::exception &eventError) {
+                    std::cerr << "easysplat-train: cannot report subject-isolation memory refusal: "
+                              << eventError.what() << '\n';
+                }
+            }
+            std::cerr << "easysplat-train: " << error.what() << '\n';
+            return 75;
+        }
+        if (isolate) {
+            if (events && isolationEventEmissionSafe) {
+                try {
+                    events->emit("isolation_failed", {
+                        {"message", error.what()},
+                        {"status", "failed"},
+                    });
+                } catch (const std::exception &eventError) {
+                    std::cerr << "easysplat-train: cannot report subject-isolation failure: "
+                              << eventError.what() << '\n';
+                }
+            }
+            std::cerr << "easysplat-train: " << error.what() << '\n';
+            return 1;
+        }
         if (msplat_raster_resource_limit_was_exceeded()) {
             const MsplatRasterStats stats = msplat_get_raster_stats();
             if (events) {

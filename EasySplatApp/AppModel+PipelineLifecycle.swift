@@ -1,6 +1,58 @@
 import AppKit
+import Darwin
 import EasySplatCore
 import Foundation
+
+private enum ProjectTrashDisposition {
+    case completed
+    case scheduled
+    case failed
+}
+
+private enum ProjectTrashLeafState {
+    case absent
+    case directory(AppProjectRootIdentity)
+    case other
+
+    func matches(_ identity: AppProjectRootIdentity) -> Bool {
+        guard case .directory(let candidate) = self else { return false }
+        return candidate == identity
+    }
+}
+
+private enum ProjectTrashQuarantineError: LocalizedError {
+    case invalidProjectPath
+    case system(operation: String, code: Int32)
+    case handlerFailure(Error)
+    case handlerDidNotMove
+    case identityConflict(String)
+
+    var isIdentityConflict: Bool {
+        if case .identityConflict = self { return true }
+        return false
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidProjectPath:
+            "The project path is not safe to move."
+        case .system(let operation, let code):
+            "\(operation) failed: \(String(cString: strerror(code)))"
+        case .handlerFailure(let error):
+            error.localizedDescription
+        case .handlerDidNotMove:
+            "Finder did not move the project."
+        case .identityConflict(let details):
+            details
+        }
+    }
+}
+
+private enum ProjectTrashHandlerOutcome {
+    case completed
+    case restored
+    case conflict
+}
 
 extension AppModel {
     func isCurrentTaskToken(_ taskToken: UUID?) -> Bool {
@@ -13,11 +65,32 @@ extension AppModel {
             self.pendingCloseWindow = window
         }
 
+        if isSubjectIsolationActive {
+            stopAction = deleteProject ? .deleteProject : .keepProject
+            subjectIsolationStatusMessage = deleteProject
+                ? "Cancelling isolation before moving to Trash…"
+                : "Cancelling subject isolation…"
+            cancelSubjectIsolation()
+            return
+        }
+
+        if isSubjectVersionRemovalActive {
+            stopAction = deleteProject ? .deleteProject : .keepProject
+            subjectIsolationStatusMessage = deleteProject
+                ? "Finishing Subject removal before moving to Trash…"
+                : "Finishing Subject removal…"
+            subjectIsolationStatusIsError = false
+            return
+        }
+
         guard currentTask != nil else {
             if deleteProject, let projectURL = currentProjectURL {
-                if moveProjectToTrash(at: projectURL) {
+                switch requestProjectTrashMove(at: projectURL) {
+                case .completed:
                     finalizeExitIfNeeded()
-                } else {
+                case .scheduled:
+                    break
+                case .failed:
                     abortPendingExitAfterStopFailure()
                 }
                 return
@@ -55,31 +128,509 @@ extension AppModel {
 
     @discardableResult
     func moveProjectToTrash(at projectURL: URL) -> Bool {
+        switch requestProjectTrashMove(at: projectURL) {
+        case .completed, .scheduled:
+            true
+        case .failed:
+            false
+        }
+    }
+
+    private func requestProjectTrashMove(
+        at projectURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) -> ProjectTrashDisposition {
+        guard !hasActiveWork else { return .failed }
+        if let timingTask = cancelResultViewerTiming() {
+            // A detached timing worker may be inside the publication lock or
+            // the post-commit metadata retry. Let it release the exact root
+            // lease before Finder can move that root. A supplied long-run
+            // owner belongs to the finishing run task and must not escape it;
+            // the deferred move acquires its own short owner after the wait.
+            deferredProjectMutationTask = Task { [weak self, timingTask] in
+                await timingTask.value
+                guard let self else { return }
+                self.deferredProjectMutationTask = nil
+                let moved = self.moveProjectToTrashNow(
+                    at: projectURL,
+                    projectRunLeaseOwner: nil
+                )
+                guard self.exitIntent != .none else { return }
+                if moved {
+                    self.finalizeExitIfNeeded()
+                } else {
+                    self.abortPendingExitAfterStopFailure()
+                }
+            }
+            return .scheduled
+        }
+        return moveProjectToTrashNow(
+            at: projectURL,
+            projectRunLeaseOwner: projectRunLeaseOwner
+        ) ? .completed : .failed
+    }
+
+    @discardableResult
+    private func moveProjectToTrashNow(
+        at projectURL: URL,
+        projectRunLeaseOwner suppliedProjectRunLeaseOwner:
+            AppProjectRunLeaseOwner?
+    ) -> Bool {
         actionFailure = nil
+        let acquiredProjectRunLeaseOwner: AppProjectRunLeaseOwner?
+        do {
+            if suppliedProjectRunLeaseOwner == nil {
+                acquiredProjectRunLeaseOwner = try acquireAppProjectRunLeaseOwner(
+                    at: projectURL
+                )
+            } else {
+                acquiredProjectRunLeaseOwner = nil
+            }
+        } catch {
+            statusTitle = error.localizedDescription
+            statusDetail = "The project stayed in place. Try again when processing finishes."
+            lastError = statusTitle
+            errorDetails = String(reflecting: error)
+            progress = nil
+            presentPendingNotesSaveFailureIfNeeded(at: projectURL)
+            return false
+        }
+        defer { acquiredProjectRunLeaseOwner?.release() }
+        let projectRunLeaseOwner = suppliedProjectRunLeaseOwner
+            ?? acquiredProjectRunLeaseOwner
+        let leasedProjectRootIdentity: AppProjectRootIdentity
+        do {
+            guard let projectRunLeaseOwner else {
+                throw ProjectRunLeaseError.unsafeProject
+            }
+            leasedProjectRootIdentity = try projectRunLeaseOwner
+                .lockedProjectRootIdentity()
+        } catch {
+            statusTitle = error.localizedDescription
+            statusDetail = "The project stayed in place. Try again when processing finishes."
+            lastError = statusTitle
+            errorDetails = String(reflecting: error)
+            progress = nil
+            presentPendingNotesSaveFailureIfNeeded(at: projectURL)
+            return false
+        }
         if ProjectSummary.hasSameLocation(currentProjectURL, projectURL) {
-            guard flushPendingNotesSave() else { return false }
+            guard flushPendingNotesSave(
+                projectRunLeaseOwner: projectRunLeaseOwner
+            ) else { return false }
         }
         do {
-            try projectTrashHandler(projectURL)
+            try moveIdentityBoundProjectToTrash(
+                at: projectURL,
+                leasedProjectRootIdentity: leasedProjectRootIdentity
+            )
         } catch {
+            let quarantineError = error as? ProjectTrashQuarantineError
+            let message: String
+            if quarantineError?.isIdentityConflict == true {
+                message = "The project folder changed while it was being moved. Every item was preserved. Check Finder and try again."
+            } else {
+                message = "The project stayed in place. Check Finder permissions and try again."
+            }
             statusTitle = "Couldn’t move project to Trash"
-            statusDetail = "The project stayed in place. Check Finder permissions and try again."
+            statusDetail = message
             lastError = statusTitle
             errorDetails = String(reflecting: error)
             progress = nil
             actionFailure = ActionFailurePresentation(
                 title: "Couldn’t move project to Trash",
-                message: "The project stayed in place. Check Finder permissions and try again."
+                message: message
             )
             refreshProjectSummaries()
             return false
         }
         if ProjectSummary.hasSameLocation(currentProjectURL, projectURL) {
-            reset()
+            reset(projectRunLeaseOwner: projectRunLeaseOwner)
             viewState = .home
         }
         refreshProjectSummaries()
         return true
+    }
+
+    private func moveIdentityBoundProjectToTrash(
+        at requestedProjectURL: URL,
+        leasedProjectRootIdentity: AppProjectRootIdentity
+    ) throws {
+        let projectURL = requestedProjectURL.standardizedFileURL
+        let parentURL = projectURL.deletingLastPathComponent()
+            .standardizedFileURL
+        let projectLeaf = projectURL.lastPathComponent
+        guard Self.isSafeTrashLeaf(projectLeaf),
+              parentURL.appendingPathComponent(
+                projectLeaf,
+                isDirectory: true
+              ).standardizedFileURL.path == projectURL.path else {
+            throw ProjectTrashQuarantineError.invalidProjectPath
+        }
+
+        let parentDescriptor = Darwin.open(
+            parentURL.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard parentDescriptor >= 0 else {
+            throw ProjectTrashQuarantineError.system(
+                operation: "Opening the project folder",
+                code: errno
+            )
+        }
+        defer { Darwin.close(parentDescriptor) }
+        let parentIdentity = try AppProjectRootIdentity.capture(
+            descriptor: parentDescriptor
+        )
+        guard try AppProjectRootIdentity.capture(at: parentURL)
+                == parentIdentity,
+              try Self.trashLeafState(
+                parentDescriptor: parentDescriptor,
+                leaf: projectLeaf
+              ).matches(leasedProjectRootIdentity) else {
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The selected project path no longer names the leased project."
+            )
+        }
+
+        try projectTrashQuarantineCheckpointHook.handle(
+            .canonicalIdentityValidated
+        )
+
+        let quarantineLeaf = ".easysplat-trash-\(UUID().uuidString.lowercased())"
+        try Self.renameTrashLeaf(
+            parentDescriptor: parentDescriptor,
+            sourceLeaf: projectLeaf,
+            destinationLeaf: quarantineLeaf
+        )
+        do {
+            try Self.syncTrashParent(parentDescriptor)
+        } catch {
+            _ = try? Self.restoreTrashLeafIfCanonicalAbsent(
+                parentDescriptor: parentDescriptor,
+                quarantineLeaf: quarantineLeaf,
+                canonicalLeaf: projectLeaf
+            )
+            throw error
+        }
+
+        let quarantineState = try Self.trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        guard quarantineState.matches(leasedProjectRootIdentity) else {
+            _ = try? Self.restoreTrashLeafIfCanonicalAbsent(
+                parentDescriptor: parentDescriptor,
+                quarantineLeaf: quarantineLeaf,
+                canonicalLeaf: projectLeaf
+            )
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The project leaf changed before it could be quarantined."
+            )
+        }
+
+        let quarantineDescriptor = quarantineLeaf.withCString {
+            Darwin.openat(
+                parentDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard quarantineDescriptor >= 0 else {
+            _ = try? Self.restoreTrashLeafIfCanonicalAbsent(
+                parentDescriptor: parentDescriptor,
+                quarantineLeaf: quarantineLeaf,
+                canonicalLeaf: projectLeaf
+            )
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The quarantined project could not be reopened safely."
+            )
+        }
+        defer { Darwin.close(quarantineDescriptor) }
+
+        guard try AppProjectRootIdentity.capture(
+            descriptor: quarantineDescriptor
+        ) == leasedProjectRootIdentity,
+        try AppProjectRootIdentity.capture(at: parentURL) == parentIdentity,
+        case .absent = try Self.trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: projectLeaf
+        ) else {
+            _ = try? Self.restoreTrashLeafIfCanonicalAbsent(
+                parentDescriptor: parentDescriptor,
+                quarantineLeaf: quarantineLeaf,
+                canonicalLeaf: projectLeaf
+            )
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The project namespace changed before the Trash operation."
+            )
+        }
+
+        let quarantineURL = parentURL.appendingPathComponent(
+            quarantineLeaf,
+            isDirectory: true
+        )
+        do {
+            try projectTrashHandler(quarantineURL)
+        } catch {
+            try Self.syncTrashParent(parentDescriptor)
+            let outcome = try Self.reconcileTrashHandlerFailure(
+                parentDescriptor: parentDescriptor,
+                canonicalLeaf: projectLeaf,
+                quarantineLeaf: quarantineLeaf,
+                expectedIdentity: leasedProjectRootIdentity
+            )
+            switch outcome {
+            case .completed:
+                return
+            case .restored:
+                throw ProjectTrashQuarantineError.handlerFailure(error)
+            case .conflict:
+                throw ProjectTrashQuarantineError.identityConflict(
+                    "The Trash handler failed after the project namespace changed."
+                )
+            }
+        }
+        try Self.syncTrashParent(parentDescriptor)
+
+        let outcome = try Self.reconcileSuccessfulTrashHandler(
+            parentDescriptor: parentDescriptor,
+            canonicalLeaf: projectLeaf,
+            quarantineLeaf: quarantineLeaf,
+            expectedIdentity: leasedProjectRootIdentity
+        )
+        switch outcome {
+        case .completed:
+            return
+        case .restored:
+            throw ProjectTrashQuarantineError.handlerDidNotMove
+        case .conflict:
+            throw ProjectTrashQuarantineError.identityConflict(
+                "The Trash handler returned after the project namespace changed."
+            )
+        }
+    }
+
+    private static func reconcileTrashHandlerFailure(
+        parentDescriptor: Int32,
+        canonicalLeaf: String,
+        quarantineLeaf: String,
+        expectedIdentity: AppProjectRootIdentity
+    ) throws -> ProjectTrashHandlerOutcome {
+        let canonicalState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        )
+        let quarantineState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        if case .absent = quarantineState {
+            if canonicalState.matches(expectedIdentity) {
+                return .restored
+            }
+            if case .absent = canonicalState {
+                return .completed
+            }
+            return .conflict
+        }
+        guard quarantineState.matches(expectedIdentity) else {
+            return .conflict
+        }
+        if canonicalState.matches(expectedIdentity) {
+            return .restored
+        }
+        guard case .absent = canonicalState else {
+            return .conflict
+        }
+        guard try restoreTrashLeafIfCanonicalAbsent(
+            parentDescriptor: parentDescriptor,
+            quarantineLeaf: quarantineLeaf,
+            canonicalLeaf: canonicalLeaf
+        ) else {
+            return .conflict
+        }
+        let restoredCanonicalState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        )
+        let restoredQuarantineState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        guard restoredCanonicalState.matches(expectedIdentity),
+              case .absent = restoredQuarantineState else {
+            return .conflict
+        }
+        return .restored
+    }
+
+    private static func reconcileSuccessfulTrashHandler(
+        parentDescriptor: Int32,
+        canonicalLeaf: String,
+        quarantineLeaf: String,
+        expectedIdentity: AppProjectRootIdentity
+    ) throws -> ProjectTrashHandlerOutcome {
+        let canonicalState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        )
+        let quarantineState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        if case .absent = quarantineState {
+            return canonicalState.matches(expectedIdentity)
+                ? .restored
+                : .completed
+        }
+        guard quarantineState.matches(expectedIdentity) else {
+            return .conflict
+        }
+        guard case .absent = canonicalState else {
+            return .conflict
+        }
+        guard try restoreTrashLeafIfCanonicalAbsent(
+            parentDescriptor: parentDescriptor,
+            quarantineLeaf: quarantineLeaf,
+            canonicalLeaf: canonicalLeaf
+        ) else {
+            return .conflict
+        }
+        let restoredCanonicalState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        )
+        let restoredQuarantineState = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: quarantineLeaf
+        )
+        guard restoredCanonicalState.matches(expectedIdentity),
+              case .absent = restoredQuarantineState else {
+            return .conflict
+        }
+        return .restored
+    }
+
+    private static func restoreTrashLeafIfCanonicalAbsent(
+        parentDescriptor: Int32,
+        quarantineLeaf: String,
+        canonicalLeaf: String
+    ) throws -> Bool {
+        guard case .absent = try trashLeafState(
+            parentDescriptor: parentDescriptor,
+            leaf: canonicalLeaf
+        ) else {
+            return false
+        }
+        do {
+            try renameTrashLeaf(
+                parentDescriptor: parentDescriptor,
+                sourceLeaf: quarantineLeaf,
+                destinationLeaf: canonicalLeaf
+            )
+        } catch let error as ProjectTrashQuarantineError {
+            if case .system(_, let code) = error,
+               code == EEXIST || code == ENOTEMPTY {
+                return false
+            }
+            throw error
+        }
+        try syncTrashParent(parentDescriptor)
+        return true
+    }
+
+    private static func trashLeafState(
+        parentDescriptor: Int32,
+        leaf: String
+    ) throws -> ProjectTrashLeafState {
+        var status = stat()
+        let statusResult = leaf.withCString {
+            Darwin.fstatat(
+                parentDescriptor,
+                $0,
+                &status,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        if statusResult != 0 {
+            let code = errno
+            if code == ENOENT { return .absent }
+            throw ProjectTrashQuarantineError.system(
+                operation: "Inspecting the project namespace",
+                code: code
+            )
+        }
+        guard status.st_mode & S_IFMT == S_IFDIR else { return .other }
+        let descriptor = leaf.withCString {
+            Darwin.openat(
+                parentDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+        guard descriptor >= 0 else { return .other }
+        defer { Darwin.close(descriptor) }
+        return .directory(
+            try AppProjectRootIdentity.capture(descriptor: descriptor)
+        )
+    }
+
+    private static func renameTrashLeaf(
+        parentDescriptor: Int32,
+        sourceLeaf: String,
+        destinationLeaf: String
+    ) throws {
+        let result = sourceLeaf.withCString { sourcePointer in
+            destinationLeaf.withCString { destinationPointer in
+                Darwin.renameatx_np(
+                    parentDescriptor,
+                    sourcePointer,
+                    parentDescriptor,
+                    destinationPointer,
+                    UInt32(RENAME_EXCL | RENAME_NOFOLLOW_ANY)
+                )
+            }
+        }
+        guard result == 0 else {
+            throw ProjectTrashQuarantineError.system(
+                operation: "Renaming the project",
+                code: errno
+            )
+        }
+    }
+
+    private static func syncTrashParent(_ descriptor: Int32) throws {
+        while Darwin.fcntl(descriptor, F_FULLFSYNC) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            if code != EINVAL && code != ENOTSUP {
+                throw ProjectTrashQuarantineError.system(
+                    operation: "Saving the project folder change",
+                    code: code
+                )
+            }
+            break
+        }
+        while Darwin.fsync(descriptor) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw ProjectTrashQuarantineError.system(
+                operation: "Saving the project folder change",
+                code: code
+            )
+        }
+    }
+
+    private static func isSafeTrashLeaf(_ leaf: String) -> Bool {
+        !leaf.isEmpty
+            && leaf != "."
+            && leaf != ".."
+            && !leaf.contains("/")
+            && !leaf.contains("\\")
+            && !leaf.unicodeScalars.contains(where: {
+                CharacterSet.controlCharacters.contains($0)
+            })
     }
 
     func elapsedSinceStageStart(now: Date) -> TimeInterval? {
@@ -118,6 +669,9 @@ extension AppModel {
     }
 
     func presentExitConfirmation() -> ExitDecision {
+        if let exitDecisionOverride {
+            return exitDecisionOverride()
+        }
         let presentation = exitConfirmationPresentation
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -232,14 +786,23 @@ extension AppModel {
     @discardableResult
     func startProject(
         input: InputSpec,
+        photoURLs: [URL]? = nil,
+        datasetInputSource: DatasetInputSource? = nil,
         title: String,
         taskToken: UUID? = nil,
         timingBoundary: RunTimingBoundary? = nil
     ) async -> ToolchainPaths? {
         guard isCurrentTaskToken(taskToken) else { return nil }
         let timingBoundary = timingBoundary ?? .capture()
-        defer { finishRun(taskToken: taskToken) }
-        reset()
+        var projectRunLeaseOwner: AppProjectRunLeaseOwner?
+        defer { projectRunLeaseOwner?.release() }
+        defer {
+            finishRun(
+                taskToken: taskToken,
+                projectRunLeaseOwner: projectRunLeaseOwner
+            )
+        }
+        reset(projectRunLeaseOwner: projectRunLeaseOwner)
         viewState = .processing
         phaseStartedAt = Date()
         statusTitle = "Preparing project"
@@ -247,10 +810,13 @@ extension AppModel {
         progress = nil
         var preparedVideoInput: PreparedVideoInput?
         var preparedPhotoInput: PreparedPhotoInput?
+        var preparedDatasetInput: PreparedDatasetInput?
         var projectPublication: ProjectPublicationTransaction?
         var emptyMixedPhotoInput = false
+        var runnerStarted = false
         defer { preparedVideoInput?.discard() }
         defer { preparedPhotoInput?.discard() }
+        defer { preparedDatasetInput?.discard() }
         defer { try? projectPublication?.abort() }
 
         do {
@@ -261,7 +827,7 @@ extension AppModel {
                 hardware: hardwareProfile
             )
             let developmentOverrides = AppConfig.currentDevelopmentOverrides
-            let resolvedRunPlan = RunPlanResolver.resolve(
+            var resolvedRunPlan = RunPlanResolver.resolve(
                 requestedOptions: requestedOptions,
                 input: input,
                 hardware: hardwareProfile,
@@ -275,7 +841,69 @@ extension AppModel {
             )
             defer { idleSleepAssertion.release() }
 
-            if let photosFolder = input.photosFolder {
+            if input.isDataset {
+                statusTitle = "Checking dataset"
+                statusDetail = nil
+                progress = nil
+                guard let datasetKind = input.datasetKind, let datasetInputSource else {
+                    throw DatasetInputError.unreadableDataset
+                }
+                let prepared = try await datasetInputPreflight(
+                    datasetInputSource,
+                    datasetKind,
+                    projectBaseDirectory()
+                )
+                preparedDatasetInput = prepared
+                // The imported poses fix the geometry route and image count, so
+                // re-resolve the plan with that context before the images ride
+                // the photo admission machinery.
+                resolvedRunPlan = RunPlanResolver.resolve(
+                    requestedOptions: requestedOptions,
+                    input: input,
+                    hardware: hardwareProfile,
+                    developmentOverrides: developmentOverrides,
+                    datasetImport: RunPlanResolver.DatasetImportContext(
+                        route: prepared.plan.route,
+                        imageCount: prepared.imageCount,
+                        maximumImagePixelDimension: prepared.maximumImagePixelDimension
+                    )
+                )
+                guard isCurrentTaskToken(taskToken) else { return nil }
+                let datasetReserveBytes = VideoInputPreflight.requiredAtomicWorkspaceReserveBytes(
+                    keyframeBudget: resolvedRunPlan.keyframeBudget,
+                    maximumImageDimension: resolvedRunPlan.maximumImageDimension,
+                    maximumFeatureCount: resolvedRunPlan.colmapMaximumFeatureCount,
+                    maximumMatchCount: resolvedRunPlan.colmapMaximumMatchCount,
+                    retrievalCandidateCount: resolvedRunPlan.retrievalCandidateCount
+                )
+                let datasetPhotoLimits = PhotoInputPreflightLimits(
+                    maximumDecodedDimension: min(4_096, resolvedRunPlan.maximumImageDimension)
+                )
+                let onDatasetProgress: @Sendable (Double, String) -> Void = { [weak self] fraction, message in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isCurrentTaskToken(taskToken) else { return }
+                        self.progress = fraction
+                        self.statusTitle = "Checking dataset"
+                        self.statusDetail = message
+                    }
+                }
+                let datasetPhotoInput = try await PhotoInputPreflight.prepare(
+                    photos: prepared.stagedImages.map(\.url),
+                    stagingParent: projectBaseDirectory(),
+                    photoSelection: resolvedRunPlan.photoSelection,
+                    inputOrdering: resolvedRunPlan.inputOrdering,
+                    keyframeBudget: resolvedRunPlan.keyframeBudget,
+                    requiredAtomicWorkspaceReserveBytes: datasetReserveBytes,
+                    limits: datasetPhotoLimits,
+                    progress: onDatasetProgress
+                )
+                preparedPhotoInput = datasetPhotoInput
+                try RunPlanResolver.validatePhotoSelection(
+                    validPhotoCount: datasetPhotoInput.summary.validPhotoCount,
+                    resolvedPlan: resolvedRunPlan,
+                    input: input
+                )
+            } else if input.hasPhotos {
                 statusTitle = "Checking photos"
                 statusDetail = nil
                 progress = nil
@@ -286,31 +914,50 @@ extension AppModel {
                 let photoBudget = resolvedRunPlan.photoSelection == .automatic
                     ? resolvedRunPlan.keyframeBudget
                     : max(1, resolvedRunPlan.keyframeBudget - reservedVideoFrames)
+                let photoReserveBytes = VideoInputPreflight.requiredAtomicWorkspaceReserveBytes(
+                    keyframeBudget: resolvedRunPlan.keyframeBudget,
+                    maximumImageDimension: resolvedRunPlan.maximumImageDimension,
+                    maximumFeatureCount: resolvedRunPlan.colmapMaximumFeatureCount,
+                    maximumMatchCount: resolvedRunPlan.colmapMaximumMatchCount,
+                    retrievalCandidateCount: resolvedRunPlan.retrievalCandidateCount
+                )
+                let photoLimits = PhotoInputPreflightLimits(
+                    maximumDecodedDimension: min(4_096, resolvedRunPlan.maximumImageDimension)
+                )
+                let onPhotoProgress: @Sendable (Double, String) -> Void = { [weak self] fraction, message in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isCurrentTaskToken(taskToken) else { return }
+                        self.progress = fraction
+                        self.statusTitle = "Checking photos"
+                        self.statusDetail = message
+                    }
+                }
                 do {
-                    preparedPhotoInput = try await PhotoInputPreflight.prepare(
-                        folder: URL(fileURLWithPath: photosFolder, isDirectory: true),
-                        stagingParent: projectBaseDirectory(),
-                        photoSelection: resolvedRunPlan.photoSelection,
-                        inputOrdering: resolvedRunPlan.inputOrdering,
-                        keyframeBudget: photoBudget,
-                        requiredAtomicWorkspaceReserveBytes: VideoInputPreflight
-                            .requiredAtomicWorkspaceReserveBytes(
-                                keyframeBudget: resolvedRunPlan.keyframeBudget,
-                                maximumImageDimension: resolvedRunPlan.maximumImageDimension,
-                                maximumFeatureCount: resolvedRunPlan.colmapMaximumFeatureCount,
-                                maximumMatchCount: resolvedRunPlan.colmapMaximumMatchCount,
-                                retrievalCandidateCount: resolvedRunPlan.retrievalCandidateCount
-                            ),
-                        limits: .init(
-                            maximumDecodedDimension: min(4_096, resolvedRunPlan.maximumImageDimension)
+                    // Selection supplies an explicit file list (which may span
+                    // several folders); callers that still name a single folder
+                    // fall back to the hardened folder walk.
+                    if let photoURLs {
+                        preparedPhotoInput = try await PhotoInputPreflight.prepare(
+                            photos: photoURLs,
+                            stagingParent: projectBaseDirectory(),
+                            photoSelection: resolvedRunPlan.photoSelection,
+                            inputOrdering: resolvedRunPlan.inputOrdering,
+                            keyframeBudget: photoBudget,
+                            requiredAtomicWorkspaceReserveBytes: photoReserveBytes,
+                            limits: photoLimits,
+                            progress: onPhotoProgress
                         )
-                    ) { [weak self] fraction, message in
-                        Task { @MainActor [weak self] in
-                            guard let self, self.isCurrentTaskToken(taskToken) else { return }
-                            self.progress = fraction
-                            self.statusTitle = "Checking photos"
-                            self.statusDetail = message
-                        }
+                    } else if let photosFolder = input.photosFolder {
+                        preparedPhotoInput = try await PhotoInputPreflight.prepare(
+                            folder: URL(fileURLWithPath: photosFolder, isDirectory: true),
+                            stagingParent: projectBaseDirectory(),
+                            photoSelection: resolvedRunPlan.photoSelection,
+                            inputOrdering: resolvedRunPlan.inputOrdering,
+                            keyframeBudget: photoBudget,
+                            requiredAtomicWorkspaceReserveBytes: photoReserveBytes,
+                            limits: photoLimits,
+                            progress: onPhotoProgress
+                        )
                     }
                 } catch let failure as PhotoInputPreflightFailure
                     where input.hasVideos && failure.issue == .noValidPhotos {
@@ -367,9 +1014,7 @@ extension AppModel {
             statusDetail = nil
             progress = nil
             let progressForwarder = ProgressForwarder(model: self, taskToken: taskToken)
-            let toolchain = try await toolchainManager.ensureToolchain(
-                manifestURL: AppConfig.toolchainManifestURL,
-                publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
+            let toolchain = try await toolchainManager.resolveToolchain(
                 request: capabilityRequest
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
@@ -395,7 +1040,16 @@ extension AppModel {
                 try publication.reached(.videoAdopted)
             }
             try Task.checkCancellation()
-            if let preparedPhotoInput {
+            if let preparedDatasetInput, let preparedPhotoInput {
+                // Dataset images are photo-carried; adoption admits them and
+                // binds the pose seed, so this reuses the photosAdopted gate.
+                try inputAdoption.adoptDataset(
+                    preparedDatasetInput,
+                    into: paths,
+                    photoInput: preparedPhotoInput
+                )
+                try publication.reached(.photosAdopted)
+            } else if let preparedPhotoInput {
                 try inputAdoption.adoptPhotos(preparedPhotoInput, into: paths)
                 try publication.reached(.photosAdopted)
             } else if emptyMixedPhotoInput {
@@ -411,6 +1065,7 @@ extension AppModel {
                 videoInputReceipts: inputAdoption.videoInputReceipts,
                 photoInputReceipts: inputAdoption.photoInputReceipts,
                 photoSelectionReceipt: inputAdoption.photoSelectionReceipt,
+                datasetPoseSeed: inputAdoption.datasetPoseSeed,
                 requestedRunOptions: requestedOptions,
                 resolvedRunPlan: resolvedRunPlan,
                 lastRunStartedAt: Date()
@@ -433,6 +1088,9 @@ extension AppModel {
             defer { freshPublication.attestation.discard() }
             let projectURL = freshPublication.projectURL
             projectPublication = nil
+            projectRunLeaseOwner = try acquireAppProjectRunLeaseOwner(
+                at: projectURL
+            )
             currentProjectURL = projectURL
             currentRunOptions = requestedOptions
             currentInput = inputAdoption.input
@@ -452,10 +1110,12 @@ extension AppModel {
                     resolvedRunPlan: resolvedRunPlan,
                     developmentOverrides: developmentOverrides,
                     prePipelineDurationSeconds: timingBoundary.elapsedSeconds(),
-                    prePipelineStartedAt: timingBoundary.startedAt
+                    prePipelineStartedAt: timingBoundary.startedAt,
+                    projectRunLeaseOwner: projectRunLeaseOwner
                 )
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
+            runnerStarted = true
             try await runner.run(
                 resumeFrom: Optional<PipelineStage>.none,
                 freshPublicationAttestation: freshPublication.attestation
@@ -464,31 +1124,32 @@ extension AppModel {
             }
             guard isCurrentTaskToken(taskToken) else { return nil }
 
-            guard let outputURL = try await validatedFinishedOutputURL(projectURL: projectURL) else {
-                presentOutputMissingFailure(projectURL: projectURL)
+            let installedResult: InstalledCurrentPublishedResult
+            do {
+                installedResult = try await resolveAndInstallCurrentPublishedResult(
+                    at: projectURL
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                presentOutputMissingFailure(
+                    projectURL: projectURL,
+                    projectRunLeaseOwner: projectRunLeaseOwner
+                )
+                await refreshPreviousResultAvailability(at: projectURL)
                 return nil
             }
-            outputPlyURL = outputURL
-            currentStageTimings = loadStageTimings(projectURL: projectURL)
-            currentCreateToViewerReadySeconds = loadCreateToViewerReadySeconds(
-                projectURL: projectURL
-            )
-            currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
-            if let config = loadProjectConfig(projectURL: projectURL) {
-                currentRunOptions = config.options
-                currentInput = config.input
-            } else {
-                currentRunOptions = nil
-                currentInput = nil
-            }
-            currentProjectNotes = loadProjectNotes(projectURL: projectURL)
+            guard isCurrentTaskToken(taskToken) else { return nil }
             markProjectOpened(at: projectURL)
-            prepareResultViewerTiming(
-                projectID: projectID,
+            prepareViewerTiming(
+                for: installedResult,
                 projectURL: projectURL,
-                outputURL: outputURL,
+                projectRootIdentity: try? projectRunLeaseOwner?
+                    .lockedProjectRootIdentity(),
                 boundary: timingBoundary
             )
+            await reloadSubjectIsolationArtifact(for: projectURL)
+            guard isCurrentTaskToken(taskToken) else { return nil }
             viewState = .viewer
             refreshProjectSummaries()
             refreshFreeDiskSpace()
@@ -502,13 +1163,24 @@ extension AppModel {
             lastError = message
             statusTitle = message
             statusDetail = nil
-            errorDetails = "Preflight stopped before downloading tools or creating a project."
+            errorDetails = "Preflight stopped before preparing tools or creating a project."
             progress = nil
             viewState = .processing
         } catch let failure as PhotoInputPreflightFailure {
             guard isCurrentTaskToken(taskToken) else { return nil }
             if case .unsupportedSpherical(let issue) = failure.issue {
                 let presentation = Self.unsupportedSphericalMediaPresentation(issue)
+                lastError = presentation.title
+                statusTitle = presentation.title
+                statusDetail = nil
+                errorDetails = presentation.details
+                progress = nil
+                failureRetryAllowed = false
+                viewState = .processing
+                return nil
+            }
+            if case .accessDenied(let relativePath) = failure.issue {
+                let presentation = Self.accessDeniedPresentation(name: relativePath)
                 lastError = presentation.title
                 statusTitle = presentation.title
                 statusDetail = nil
@@ -535,7 +1207,7 @@ extension AppModel {
                 validationRecovery = Self.validationRecovery(for: validationError)
                 lastError = message
                 statusTitle = message
-                errorDetails = "Preflight stopped before downloading tools or creating a project."
+                errorDetails = "Preflight stopped before preparing tools or creating a project."
             } else {
                 lastError = "Photos couldn’t be prepared"
                 statusTitle = "Photos couldn’t be prepared"
@@ -553,6 +1225,15 @@ extension AppModel {
             statusTitle = presentation.title
             statusDetail = nil
             errorDetails = presentation.details
+            progress = nil
+            failureRetryAllowed = false
+            viewState = .processing
+        } catch let error as DatasetInputError {
+            guard isCurrentTaskToken(taskToken) else { return nil }
+            lastError = "Dataset couldn’t be imported"
+            statusTitle = "Dataset couldn’t be imported"
+            statusDetail = nil
+            errorDetails = error.localizedDescription
             progress = nil
             failureRetryAllowed = false
             viewState = .processing
@@ -574,11 +1255,43 @@ extension AppModel {
             } else {
                 fallbackMessage = "Processing stopped. Try again."
             }
-            let failureMessage = lastError ?? stopFailureCopy?.detail ?? fallbackMessage
+            let metadataFailure = error as? PipelineMetadataPersistenceFailure
+            let failureMessage = metadataFailure?.originalProcessingFailure?.userMessage
+                ?? lastError
+                ?? stopFailureCopy?.detail
+                ?? fallbackMessage
             if lastError == nil {
                 lastError = failureMessage
             }
-            persistProjectFailure(failureMessage, at: currentProjectURL)
+            if let metadataFailure {
+                if !metadataFailure.terminalFailureWasPersisted,
+                   let projectURL = currentProjectURL {
+                    do {
+                        try persistProjectFailureChecked(
+                            failureMessage,
+                            stage: metadataFailure.stage,
+                            at: projectURL,
+                            projectRunLeaseOwner: projectRunLeaseOwner
+                        )
+                    } catch {
+                        presentUnsavedProjectState(
+                            pipelineFailure: metadataFailure,
+                            fallbackError: error
+                        )
+                        return nil
+                    }
+                }
+            } else if !runnerStarted,
+                      let projectURL = currentProjectURL,
+                      !persistProjectFailureOrPresentUnsaved(
+                        failureMessage,
+                        stage: nil,
+                        at: projectURL,
+                        projectRunLeaseOwner: projectRunLeaseOwner,
+                        primaryFailureDescription: String(reflecting: error)
+                      ) {
+                return nil
+            }
             let envDetails = failureTechnicalDetails(for: error)
             if let existing = errorDetails, !existing.isEmpty {
                 errorDetails = existing + "\n\n" + envDetails
@@ -609,6 +1322,9 @@ extension AppModel {
         }).first {
             return unsupportedSphericalMediaPresentation(issue)
         }
+        if let denied = failure.rejectedVideos.first(where: { $0.issue == .accessDenied }) {
+            return accessDeniedPresentation(name: denied.safeDisplayName)
+        }
         let count = failure.rejectedVideos.count
         let issues = failure.rejectedVideos.map(\.issue)
         let title: String
@@ -634,9 +1350,9 @@ extension AppModel {
 
     private static func isVideoSelectionIssue(_ issue: VideoInputPreflightIssue) -> Bool {
         switch issue {
-        case .noVideosSelected, .sourceUnavailable, .symbolicLink, .notRegularFile,
-             .emptyFile, .duplicateSource, .sourceChanged, .tooManyVideos,
-             .totalBytesExceeded, .invalidLimits:
+        case .noVideosSelected, .sourceUnavailable, .accessDenied, .symbolicLink,
+             .notRegularFile, .emptyFile, .duplicateSource, .sourceChanged,
+             .tooManyVideos, .totalBytesExceeded, .invalidLimits:
             return true
         case .unreadableMedia, .noUsableVideoTrack, .decodeFailed,
              .insufficientSpace, .stagingUnavailable, .capacityUnavailable,
@@ -662,6 +1378,8 @@ extension AppModel {
             return "no videos were selected"
         case .sourceUnavailable:
             return "the selected file is no longer available"
+        case .accessDenied:
+            return "macOS did not let EasySplat read the file — choose it again"
         case .symbolicLink:
             return "choose the original file instead of an alias"
         case .notRegularFile:
@@ -697,6 +1415,18 @@ extension AppModel {
         }
     }
 
+    /// macOS refused the read. The file is where the user left it, so the answer
+    /// is to grant access again rather than to look for a damaged photo.
+    static func accessDeniedPresentation(name: String) -> (title: String, details: String) {
+        (
+            title: "EasySplat can’t read your files",
+            details: """
+            macOS did not let EasySplat read “\(name)”.
+            Choose your photos or video again, then start the splat.
+            """
+        )
+    }
+
     static func unsupportedSphericalMediaPresentation(
         _ issue: UnsupportedSphericalMediaIssue
     ) -> (title: String, details: String) {
@@ -706,11 +1436,32 @@ extension AppModel {
         )
     }
 
-    func resumeProjectTask(at url: URL, taskToken: UUID? = nil) async {
+    func resumeProjectTask(
+        at url: URL,
+        taskToken: UUID? = nil,
+        bypassFinishedOutput: Bool = false,
+        projectRunLeaseOwner suppliedProjectRunLeaseOwner:
+            AppProjectRunLeaseOwner? = nil,
+        timingBoundary: RunTimingBoundary? = nil
+    ) async {
+        var projectRunLeaseOwner = suppliedProjectRunLeaseOwner
+        // Registered before finishRun so the app's terminal handling, fallback
+        // persistence, and optional Trash move all execute while ownership is
+        // still held. Swift runs defers in reverse order.
+        defer { projectRunLeaseOwner?.release() }
         guard isCurrentTaskToken(taskToken) else { return }
-        defer { finishRun(taskToken: taskToken) }
-        reset()
-        viewState = .processing
+        defer {
+            finishRun(
+                taskToken: taskToken,
+                projectRunLeaseOwner: projectRunLeaseOwner
+            )
+        }
+        reset(projectRunLeaseOwner: projectRunLeaseOwner)
+        // Immediately after reset, before any suspension: the opened project
+        // must stay current across the whole task so selection and the
+        // sidebar's lock never see a run with no project.
+        currentProjectURL = url
+        viewState = .opening
         phaseStartedAt = Date()
         statusTitle = "Preparing project"
         statusDetail = nil
@@ -719,31 +1470,122 @@ extension AppModel {
 
         do {
             let paths = ProjectPaths(root: url)
-            let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+            let openedProjectRootIdentity = try AppProjectRootIdentity.capture(
+                at: url
+            )
+            var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
             if metadata.input.hasVideos {
                 statusDetail = "Checking saved videos"
+                let metadataSnapshot = metadata
                 try await Task.detached(priority: .userInitiated) {
                     try VideoInputReceiptValidator.validateFiles(
-                        metadata: metadata,
+                        metadata: metadataSnapshot,
                         paths: paths
                     )
                 }.value
             }
-            currentProjectURL = url
+            if metadata.input.isDataset, let datasetPoseSeed = metadata.datasetPoseSeed {
+                // Datasets ride the photo machinery, but their pose seed and
+                // source images have their own receipt; re-verify it on resume
+                // exactly as videos re-verify their staged copies.
+                statusDetail = "Checking saved dataset"
+                try await Task.detached(priority: .userInitiated) {
+                    try DatasetPoseSeedReceiptValidator.validateFiles(
+                        receipt: datasetPoseSeed,
+                        projectRoot: url
+                    )
+                }.value
+            }
             currentRunOptions = metadata.requestedRunOptions
             currentInput = metadata.input
-            if let outputURL = try await validatedFinishedOutputURL(projectURL: url) {
+            let resolvedResult: ResolvedPublishedResult? = if bypassFinishedOutput {
+                nil
+            } else {
+                try await resolvePublishedResult(at: url)
+            }
+            if let resolvedResult,
+               case .current = resolvedResult,
+               installResolvedPublishedResult(
+                resolvedResult,
+                projectURL: url,
+                latestMetadata: metadata
+               ),
+               let outputURL = outputPlyURL {
                 guard isCurrentTaskToken(taskToken) else { return }
-                outputPlyURL = outputURL
-                currentStageTimings = metadata.stageTimings ?? []
-                currentCreateToViewerReadySeconds = metadata.createToViewerReadySeconds
-                currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
-                currentProjectNotes = metadata.notes ?? ""
                 markProjectOpened(at: url)
+                if case .current(.receiptBound(let current)) = resolvedResult,
+                   let generation = current.publishedResult.generation {
+                    if let elapsedSeconds = current.presentation
+                        .createToViewerReadySeconds {
+                        if metadata.createToViewerReadySeconds
+                            != elapsedSeconds {
+                            prepareResultViewerTimingMetadataHealing(
+                                projectID: metadata.id,
+                                projectURL: url,
+                                outputURL: outputURL,
+                                expectedPublicationID: current.publishedResult
+                                    .receipt.publicationID,
+                                expectedGeneration: generation,
+                                elapsedSeconds: elapsedSeconds,
+                                projectRootIdentity:
+                                    openedProjectRootIdentity
+                            )
+                        }
+                    } else if let timingBoundary {
+                        prepareResultViewerTiming(
+                            projectID: metadata.id,
+                            projectURL: url,
+                            outputURL: outputURL,
+                            expectedPublicationID: current.publishedResult
+                                .receipt.publicationID,
+                            expectedGeneration: generation,
+                            projectRootIdentity: openedProjectRootIdentity,
+                            boundary: timingBoundary
+                        )
+                    }
+                } else {
+                    cancelResultViewerTiming()
+                }
+                await reloadSubjectIsolationArtifact(for: url)
+                guard isCurrentTaskToken(taskToken) else { return }
                 viewState = .viewer
                 refreshProjectSummaries()
                 return
             }
+            // No validated finished output, so this resume re-runs the pipeline.
+            if projectRunLeaseOwner == nil {
+                projectRunLeaseOwner = try acquireAppProjectRunLeaseOwner(at: url)
+            }
+            guard let projectRunLeaseOwner else {
+                throw ProjectRunLeaseBorrowError.released
+            }
+            metadata = try projectRunLeaseOwner
+                .withLockedProjectRootDescriptor {
+                    try ProjectMetadataStore.load(
+                        fromProjectRootDescriptor: $0
+                    )
+                }
+            if metadata.input.hasVideos {
+                let metadataSnapshot = metadata
+                try await Task.detached(priority: .userInitiated) {
+                    try VideoInputReceiptValidator.validateFiles(
+                        metadata: metadataSnapshot,
+                        paths: paths
+                    )
+                }.value
+            }
+            if metadata.input.isDataset,
+               let datasetPoseSeed = metadata.datasetPoseSeed {
+                try await Task.detached(priority: .userInitiated) {
+                    try DatasetPoseSeedReceiptValidator.validateFiles(
+                        receipt: datasetPoseSeed,
+                        projectRoot: url
+                    )
+                }.value
+            }
+            currentRunOptions = metadata.requestedRunOptions
+            currentInput = metadata.input
+            viewState = .processing
             refreshProjectSummaries()
             let developmentOverrides = AppConfig.currentDevelopmentOverrides
             let requestedOptions = metadata.requestedRunOptions
@@ -752,12 +1594,25 @@ extension AppModel {
                 input: metadata.input,
                 hardware: hardwareProfile
             )
+            let datasetImport = metadata.datasetPoseSeed.map { seed in
+                // Dataset images are adopted unscaled, so the photo receipts
+                // reproduce preflight's measured pixel ceiling; feeding it back
+                // keeps the resumed plan identical to the fresh run's.
+                RunPlanResolver.DatasetImportContext(
+                    route: seed.route,
+                    imageCount: seed.imageCount,
+                    maximumImagePixelDimension: metadata.photoInputReceipts?
+                        .map { max($0.pixelWidth, $0.pixelHeight) }
+                        .max()
+                )
+            }
             let resolvedRunPlan = RunPlanResolver.resolve(
                 requestedOptions: requestedOptions,
                 input: metadata.input,
                 hardware: hardwareProfile,
                 developmentOverrides: developmentOverrides,
-                trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes
+                trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes,
+                datasetImport: datasetImport
             )
             if metadata.input.photosFolder != nil {
                 let importedPhotos = paths.importedPhotosURL
@@ -788,9 +1643,9 @@ extension AppModel {
             appendLogLine("========== NEW LOG START (current run) ==========")
             appendLogLine("Resumed project")
 
-            // A resume that must re-run holds the awake assertion across the toolchain
-            // download and the run; a resume that just opens a ready project (returned
-            // above) never reaches here, so it does not hold one.
+            // A resume that must re-run holds the awake assertion across toolchain
+            // validation and the run; a resume that just opens a ready project
+            // (returned above) never reaches here, so it does not hold one.
             let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is preparing and resuming a project")
             defer { idleSleepAssertion.release() }
 
@@ -798,9 +1653,7 @@ extension AppModel {
             statusDetail = nil
             progress = nil
             let progressForwarder = ProgressForwarder(model: self, taskToken: taskToken)
-            let toolchain = try await toolchainManager.ensureToolchain(
-                manifestURL: AppConfig.toolchainManifestURL,
-                publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
+            let toolchain = try await toolchainManager.resolveToolchain(
                 request: capabilityRequest
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
@@ -812,12 +1665,17 @@ extension AppModel {
                 pipelineConfig(
                     toolchain: toolchain,
                     resolvedRunPlan: resolvedRunPlan,
-                    developmentOverrides: developmentOverrides
+                    developmentOverrides: developmentOverrides,
+                    runIntent: bypassFinishedOutput ? .retrain : .resume,
+                    projectRunLeaseOwner: projectRunLeaseOwner
                 )
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
+            let requestedResumeBoundary: PipelineStage? = bypassFinishedOutput
+                ? .sfmMapping
+                : resumeStage(from: metadata)
             let stageToResume = RunPlanResolver.safeResumeStage(
-                resumeStage(from: metadata),
+                requestedResumeBoundary,
                 input: metadata.input,
                 previousPlan: metadata.resolvedRunPlan,
                 currentPlan: resolvedRunPlan
@@ -828,24 +1686,32 @@ extension AppModel {
             }
             guard isCurrentTaskToken(taskToken) else { return }
 
-            guard let outputURL = try await validatedFinishedOutputURL(projectURL: url) else {
-                presentOutputMissingFailure(projectURL: url)
+            let installedResult: InstalledCurrentPublishedResult
+            do {
+                installedResult = try await resolveAndInstallCurrentPublishedResult(
+                    at: url
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                presentOutputMissingFailure(
+                    projectURL: url,
+                    projectRunLeaseOwner: projectRunLeaseOwner
+                )
+                await refreshPreviousResultAvailability(at: url)
                 return
             }
-            outputPlyURL = outputURL
-            currentStageTimings = loadStageTimings(projectURL: url)
-            currentCreateToViewerReadySeconds = loadCreateToViewerReadySeconds(projectURL: url)
-            currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
-            if let config = loadProjectConfig(projectURL: url) {
-                currentRunOptions = config.options
-                currentInput = config.input
-            } else {
-                currentRunOptions = nil
-                currentInput = nil
-            }
-            currentProjectNotes = loadProjectNotes(projectURL: url)
+            guard isCurrentTaskToken(taskToken) else { return }
             markProjectOpened(at: url)
+            prepareViewerTiming(
+                for: installedResult,
+                projectURL: url,
+                projectRootIdentity: openedProjectRootIdentity,
+                boundary: timingBoundary
+            )
             refreshFreeDiskSpace()
+            await reloadSubjectIsolationArtifact(for: url)
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .viewer
             refreshProjectSummaries()
         } catch is CancellationError {
@@ -857,8 +1723,13 @@ extension AppModel {
             lastError = message
             statusTitle = message
             statusDetail = "The saved project and its checkpoint are unchanged."
-            errorDetails = "Resume preflight stopped before downloading tools or changing project files."
+            errorDetails = "Resume preflight stopped before preparing tools or changing project files."
             progress = nil
+            await refreshPreviousResultAvailability(
+                at: url,
+                expectedTaskToken: taskToken
+            )
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .processing
             refreshProjectSummaries()
         } catch let error as VideoInputReceiptValidationError {
@@ -869,6 +1740,26 @@ extension AppModel {
             errorDetails = error.localizedDescription
             progress = nil
             failureRetryAllowed = false
+            await refreshPreviousResultAvailability(
+                at: url,
+                expectedTaskToken: taskToken
+            )
+            guard isCurrentTaskToken(taskToken) else { return }
+            viewState = .processing
+            refreshProjectSummaries()
+        } catch let error as ProjectRunLeaseError {
+            guard isCurrentTaskToken(taskToken) else { return }
+            presentProjectMutationFailure(
+                error,
+                fallbackTitle: "Couldn’t resume this project"
+            )
+            errorDetails = String(reflecting: error)
+            progress = nil
+            await refreshPreviousResultAvailability(
+                at: url,
+                expectedTaskToken: taskToken
+            )
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .processing
             refreshProjectSummaries()
         } catch {
@@ -889,12 +1780,33 @@ extension AppModel {
             } else {
                 fallbackMessage = "Couldn’t open this project. It was not changed."
             }
-            let failureMessage = lastError ?? stopFailureCopy?.detail ?? fallbackMessage
+            let metadataFailure = error as? PipelineMetadataPersistenceFailure
+            let failureMessage = metadataFailure?.originalProcessingFailure?.userMessage
+                ?? lastError
+                ?? stopFailureCopy?.detail
+                ?? fallbackMessage
             if lastError == nil {
                 lastError = failureMessage
             }
             if runnerStarted {
-                persistProjectFailure(failureMessage, at: currentProjectURL)
+                if let metadataFailure {
+                    if !metadataFailure.terminalFailureWasPersisted {
+                        do {
+                            try persistProjectFailureChecked(
+                                failureMessage,
+                                stage: metadataFailure.stage,
+                                at: url,
+                                projectRunLeaseOwner: projectRunLeaseOwner
+                            )
+                        } catch {
+                            presentUnsavedProjectState(
+                                pipelineFailure: metadataFailure,
+                                fallbackError: error
+                            )
+                            return
+                        }
+                    }
+                }
             }
             let envDetails = failureTechnicalDetails(for: error)
             if let existing = errorDetails, !existing.isEmpty {
@@ -913,48 +1825,38 @@ extension AppModel {
                     : "The saved project and its checkpoint are unchanged."
                 progress = nil
             }
+            await refreshPreviousResultAvailability(
+                at: url,
+                expectedTaskToken: taskToken
+            )
+            guard isCurrentTaskToken(taskToken) else { return }
             viewState = .processing
             refreshProjectSummaries()
         }
     }
 
     private func toolchainPreparationFailureMessage(for error: Error) -> String {
-        if let toolchainError = error as? ToolchainManager.ToolchainError,
-           case .manifestHTTPFailure(let statusCode, _) = toolchainError,
-           statusCode == 404 || statusCode == 410 {
-            return "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
+        guard error is ToolchainManager.ToolchainError else {
+            return "Couldn’t prepare the required tools."
         }
-        return "Couldn’t prepare the required tools. Check your connection and try again."
+        return "EasySplat’s built-in tools are missing or damaged. Reinstall EasySplat."
     }
 
     private func failureTechnicalDetails(for error: Error) -> String {
-        var lines: [String]
-        if let toolchainError = error as? ToolchainManager.ToolchainError,
-           case .manifestHTTPFailure(let statusCode, let resourceURL) = toolchainError {
-            lines = ["Underlying error: EasySplatCore.ToolchainManager.ToolchainError.manifestHTTPFailure"]
-            lines.append("HTTP status: \(statusCode)")
-            lines.append("HTTP resource: \(redactedDiagnosticURL(resourceURL))")
-        } else {
-            lines = ["Underlying error: \(String(reflecting: error))"]
+        var lines = ["Underlying error: \(String(reflecting: error))"]
+        if AppConfig.allowsDevelopmentOverrides {
+            lines.append(
+                "Development builds resolve tools from EASYSPLAT_LOCAL_TOOLCHAIN_ROOT."
+            )
         }
-        lines.append("Manifest URL: \(redactedDiagnosticURL(AppConfig.toolchainManifestURL))")
-        lines.append("Public key present: \(!AppConfig.toolchainPublicKeyBase64.isEmpty)")
         return lines.joined(separator: "\n")
     }
 
-    private func redactedDiagnosticURL(_ url: URL) -> String {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return "<invalid URL>"
-        }
-        components.user = nil
-        components.password = nil
-        components.query = nil
-        components.fragment = nil
-        return components.string ?? "<invalid URL>"
-    }
-
-    func reset() {
+    func reset(
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) {
         cancelForcedExitIfNeeded()
+        cancelResultViewerTiming()
         stage = nil
         progress = nil
         statusTitle = "Ready"
@@ -982,18 +1884,22 @@ extension AppModel {
         // Flush any pending notes save before tearing down so the user's last
         // edit isn't lost when they start or resume a different project (or
         // when reset() runs as part of app teardown).
-        let notesSaved = flushPendingNotesSave()
+        let notesSaved = flushPendingNotesSave(
+            projectRunLeaseOwner: projectRunLeaseOwner
+        )
         outputPlyURL = nil
+        clearTrainingPreview()
         currentStageTimings = []
         currentCreateToViewerReadySeconds = nil
         currentOutputPlyInfo = nil
         currentRunOptions = nil
         currentInput = nil
         currentProjectNotes = ""
+        clearResolvedPublishedResult()
         currentProjectURL = nil
-        pendingResultViewerTiming = nil
         stopAction = nil
         cancelSharing()
+        clearSubjectIsolationSession()
         shareStatusMessage = nil
         shareStatusIsError = false
         if notesSaved {
@@ -1029,19 +1935,25 @@ extension AppModel {
         )
     }
 
-    private func finishRun(taskToken: UUID?) {
+    func finishRun(
+        taskToken: UUID?,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner?
+    ) {
         guard currentTaskToken == taskToken else { return }
         currentTask = nil
         currentTaskToken = nil
         isRunActive = false
         if stopAction != nil {
-            completeStop()
+            completeStop(projectRunLeaseOwner: projectRunLeaseOwner)
         } else {
             refreshProjectSummaries()
         }
     }
 
-    func presentOutputMissingFailure(projectURL: URL) {
+    func presentOutputMissingFailure(
+        projectURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) {
         let message = "Processing failed. Expected outputs were missing."
         lastError = message
         statusTitle = message
@@ -1052,17 +1964,33 @@ extension AppModel {
         currentOutputPlyInfo = nil
         currentRunOptions = nil
         currentInput = nil
-        persistProjectFailure(message, at: projectURL)
+        guard persistProjectFailureOrPresentUnsaved(
+            message,
+            stage: nil,
+            at: projectURL,
+            projectRunLeaseOwner: projectRunLeaseOwner,
+            primaryFailureDescription: errorDetails ?? message
+        ) else {
+            return
+        }
         appendLogLine("[err] \(message)", isError: true)
         viewState = .processing
         refreshProjectSummaries()
     }
 
-    private func persistProjectFailure(_ message: String, at projectURL: URL?) {
-        guard let projectURL else { return }
-        mutateProjectMetadata(at: projectURL) { metadata in
+    @discardableResult
+    private func persistProjectFailureChecked(
+        _ message: String,
+        stage: PipelineStage?,
+        at projectURL: URL,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) throws -> ProjectMetadata {
+        try updateProjectMetadata(
+            at: projectURL,
+            leaseOwner: projectRunLeaseOwner
+        ) { metadata in
             metadata.state = PipelineState(
-                stage: metadata.state.stage,
+                stage: stage ?? metadata.state.stage,
                 lastError: message
             )
             metadata.checkpoint = nil
@@ -1071,20 +1999,115 @@ extension AppModel {
         }
     }
 
-    @discardableResult
-    func mutateProjectMetadata(
+    private func persistProjectFailureOrPresentUnsaved(
+        _ message: String,
+        stage: PipelineStage?,
         at projectURL: URL,
-        mutation: (inout ProjectMetadata) -> Void
-    ) -> ProjectMetadata? {
-        let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        guard var metadata = try? ProjectMetadataStore.load(from: metadataURL) else {
-            return nil
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil,
+        primaryFailureDescription: String
+    ) -> Bool {
+        do {
+            try persistProjectFailureChecked(
+                message,
+                stage: stage,
+                at: projectURL,
+                projectRunLeaseOwner: projectRunLeaseOwner
+            )
+            return true
+        } catch {
+            presentUnsavedProjectState(
+                primaryFailureDescription: primaryFailureDescription,
+                fallbackError: error
+            )
+            return false
         }
-        mutation(&metadata)
-        guard (try? ProjectMetadataStore.save(metadata, to: metadataURL)) != nil else {
-            return nil
+    }
+
+    private func presentUnsavedProjectState(
+        pipelineFailure: PipelineMetadataPersistenceFailure,
+        fallbackError: Error
+    ) {
+        var details = [
+            "Pipeline metadata failure: \(pipelineFailure.localizedDescription)",
+            "Fallback metadata failure: \(String(reflecting: fallbackError))",
+        ]
+        if let original = pipelineFailure.originalProcessingFailure {
+            details.append("Original processing message: \(original.userMessage)")
+            details.append("Original technical details: \(original.technicalMessage)")
         }
-        return metadata
+        presentUnsavedProjectState(details: details)
+    }
+
+    private func presentUnsavedProjectState(
+        primaryFailureDescription: String,
+        fallbackError: Error
+    ) {
+        presentUnsavedProjectState(details: [
+            "Processing failure: \(primaryFailureDescription)",
+            "Fallback metadata failure: \(String(reflecting: fallbackError))",
+        ])
+    }
+
+    private func presentUnsavedProjectState(details: [String]) {
+        let message = "Project state wasn’t saved. Free up disk space or restore write access, then try again. Work after the last saved stage may repeat."
+        cancelForcedExitIfNeeded()
+        stopAction = nil
+        abortPendingExitAfterStopFailure()
+        lastError = message
+        statusTitle = message
+        statusDetail = nil
+        progress = nil
+        failureRetryAllowed = true
+        errorDetails = details.joined(separator: "\n")
+        viewState = .processing
+    }
+
+    func acquireAppProjectRunLeaseOwner(
+        at projectURL: URL
+    ) throws -> AppProjectRunLeaseOwner {
+        try AppProjectRunLeaseOwner(
+            projectURL: projectURL,
+            acquire: projectRunLeaseOwnerAcquirer
+        )
+    }
+
+    @discardableResult
+    func updateProjectMetadata(
+        at projectURL: URL,
+        leaseOwner suppliedLeaseOwner: AppProjectRunLeaseOwner? = nil,
+        mutation: @escaping ProjectMetadataMutation
+    ) throws -> ProjectMetadata {
+        let acquiredLeaseOwner: AppProjectRunLeaseOwner?
+        if suppliedLeaseOwner == nil {
+            acquiredLeaseOwner = try acquireAppProjectRunLeaseOwner(
+                at: projectURL
+            )
+        } else {
+            acquiredLeaseOwner = nil
+        }
+        defer { acquiredLeaseOwner?.release() }
+        let leaseOwner = suppliedLeaseOwner ?? acquiredLeaseOwner
+        guard let leaseOwner else {
+            throw ProjectRunLeaseBorrowError.released
+        }
+        return try leaseOwner.withLockedProjectRootDescriptor {
+            projectRootDescriptor in
+            try projectMetadataUpdater(projectRootDescriptor, mutation)
+        }
+    }
+
+    func presentProjectMutationFailure(
+        _ error: Error?,
+        fallbackTitle: String
+    ) {
+        if let leaseError = error as? ProjectRunLeaseError {
+            statusTitle = leaseError.localizedDescription
+            statusDetail = "The project was not changed. Try again when processing finishes."
+        } else {
+            statusTitle = fallbackTitle
+            statusDetail = "The project was not changed. Check folder permissions and try again."
+        }
+        lastError = statusTitle
     }
 
     func pipelineConfig(
@@ -1092,41 +2115,69 @@ extension AppModel {
         resolvedRunPlan: ResolvedRunPlan? = nil,
         developmentOverrides: DevelopmentOverrides = AppConfig.currentDevelopmentOverrides,
         prePipelineDurationSeconds: TimeInterval = 0,
-        prePipelineStartedAt: Date? = nil
+        prePipelineStartedAt: Date? = nil,
+        runIntent: PipelineRunner.RunIntent = .resume,
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
     ) -> PipelineRunner.PipelineConfig {
-        PipelineRunner.PipelineConfig(
+        let config = PipelineRunner.PipelineConfig(
             toolchain: toolchain,
             developmentOverrides: developmentOverrides,
             hardwareProfile: hardwareProfile,
             resolvedRunPlan: resolvedRunPlan,
             prePipelineDurationSeconds: prePipelineDurationSeconds,
-            prePipelineStartedAt: prePipelineStartedAt
+            prePipelineStartedAt: prePipelineStartedAt,
+            // Deliberately not tied to the display preference. Publication is what
+            // the run can afford; showing is what the user wants to look at. Binding
+            // them made Show Preview inert for any run started while hidden, and the
+            // publication itself is the cheap half. Admission still decides whether
+            // any preview is produced at all.
+            trainingPreviewPolicy: .enabled,
+            runIntent: runIntent
         )
+        guard let projectRunLeaseOwner else { return config }
+        return projectRunLeaseOwner.borrowingLease(in: config)
     }
 
-    func completeStop() {
+    func completeStop(
+        projectRunLeaseOwner: AppProjectRunLeaseOwner? = nil
+    ) {
         let action = stopAction
         stopAction = nil
 
         let projectURL = currentProjectURL
         if action == .deleteProject, let projectURL {
-            if moveProjectToTrash(at: projectURL) {
+            switch requestProjectTrashMove(
+                at: projectURL,
+                projectRunLeaseOwner: projectRunLeaseOwner
+            ) {
+            case .completed:
                 finalizeExitIfNeeded()
-            } else {
+            case .scheduled:
+                break
+            case .failed:
                 abortPendingExitAfterStopFailure()
             }
             return
         }
-        reset()
+        reset(projectRunLeaseOwner: projectRunLeaseOwner)
         viewState = .home
         refreshProjectSummaries()
         finalizeExitIfNeeded()
     }
 }
 
+/// Forwards pipeline events to the model on the main actor, coalescing
+/// bursts: events buffer under a lock and a single scheduled drain delivers
+/// everything pending in one main-actor turn. When the main thread is busy
+/// the batch grows instead of the task queue, so a chatty trainer (many
+/// events per second) costs one SwiftUI invalidation per drain rather than
+/// one per event. Ordering is preserved by the single buffer.
 private final class EventForwarder: @unchecked Sendable {
     private weak var model: AppModel?
     private let taskToken: UUID?
+    private let lock = NSLock()
+    private var pending: [PipelineEvent] = []
+    private var drainScheduled = false
 
     init(model: AppModel, taskToken: UUID?) {
         self.model = model
@@ -1134,10 +2185,29 @@ private final class EventForwarder: @unchecked Sendable {
     }
 
     func handle(_ event: PipelineEvent) {
-        Task { @MainActor in
-            guard let model = self.model, model.isCurrentTaskToken(self.taskToken) else { return }
-            model.handle(event: event)
+        lock.lock()
+        pending.append(event)
+        let shouldSchedule = !drainScheduled
+        if shouldSchedule {
+            drainScheduled = true
         }
+        lock.unlock()
+        guard shouldSchedule else { return }
+        Task { @MainActor in
+            for event in self.takePendingBatch() {
+                guard let model = self.model, model.isCurrentTaskToken(self.taskToken) else { return }
+                model.handle(event: event)
+            }
+        }
+    }
+
+    private func takePendingBatch() -> [PipelineEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        let batch = pending
+        pending.removeAll(keepingCapacity: true)
+        drainScheduled = false
+        return batch
     }
 }
 

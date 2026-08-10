@@ -1180,6 +1180,50 @@ raise SystemExit(exit_status)
 PY
 }
 
+# Waits for the supervisor to publish quiescence, in one process.
+#
+# Polling from the shell costs a python start per read, so what reads as a
+# 3.5-second bound becomes 3.5 seconds plus 70 process launches — on a loaded
+# machine that runs longer than the supervised work it is supposed to bound.
+# One process holds the deadline in monotonic time, so the bound is real.
+#
+# This waits and nothing more: it decides nothing and always succeeds. The
+# caller still reads the state through the validating reader below, which is
+# where every authorization decision is made.
+_easysplat_await_supervised_quiescence() {
+  local group_file="${1:-}"
+  [ -n "$group_file" ] || return 2
+  /usr/bin/python3 - "$group_file" <<'PY'
+import os
+import stat
+import sys
+import time
+
+path = sys.argv[1]
+if not hasattr(os, "O_NOFOLLOW"):
+    raise SystemExit(0)
+# O_NOFOLLOW turns away a symbolic link but not a named pipe, and opening one
+# read-only blocks until somebody writes to it. Without O_NONBLOCK a swapped
+# state path would hold this open forever, which is the deadline's whole point.
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+deadline = time.monotonic() + 3.5
+while True:
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        break
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            break
+        payload = os.read(descriptor, 256)
+    finally:
+        os.close(descriptor)
+    if payload.startswith(b"quiescent ") or time.monotonic() >= deadline:
+        break
+    time.sleep(0.05)
+PY
+}
+
 easysplat_read_supervised_process_group_state() {
   local group_file="${1:-}"
   [ -n "$group_file" ] || return 2
@@ -1189,10 +1233,12 @@ import re
 import stat
 import sys
 path = sys.argv[1]
-flags = os.O_RDONLY | os.O_CLOEXEC
 if not hasattr(os, "O_NOFOLLOW"):
     raise SystemExit(1)
-flags |= os.O_NOFOLLOW
+# O_NOFOLLOW refuses a symbolic link but admits a named pipe, whose read-only
+# open blocks until a writer arrives. O_NONBLOCK keeps a swapped state path from
+# stalling the caller; the file type is rejected a few lines below.
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 try:
     descriptor = os.open(path, flags)
 except OSError:
@@ -1584,16 +1630,13 @@ easysplat_cleanup_supervised_process_group() {
       echo "Could not publish the authenticated process-supervisor stop request." >&2
       return 1
     fi
-    for _ in {1..70}; do
-      if ! state="$(
-        easysplat_read_supervised_process_group_state "$group_file" 2>/dev/null
-      )"; then
-        echo "Process-group state became invalid during cleanup." >&2
-        return 1
-      fi
-      [[ "$state" == quiescent:* ]] && break
-      sleep 0.05
-    done
+    _easysplat_await_supervised_quiescence "$group_file"
+    if ! state="$(
+      easysplat_read_supervised_process_group_state "$group_file" 2>/dev/null
+    )"; then
+      echo "Process-group state became invalid during cleanup." >&2
+      return 1
+    fi
     if [[ "$state" != quiescent:* ]]; then
       echo "Process supervisor did not acknowledge its bounded stop request." >&2
       return 1

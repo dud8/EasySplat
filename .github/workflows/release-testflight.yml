@@ -1,0 +1,465 @@
+name: Release TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Existing protected-main release tag version"
+        required: true
+        default: "0.2.0"
+        type: string
+      build_number:
+        description: "Unique App Store CFBundleVersion"
+        required: true
+        type: string
+      toolchain_version:
+        description: "Published toolchain version"
+        required: true
+        default: "2.0.0"
+        type: string
+      apple_id:
+        description: "Numeric App Store Connect Apple ID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: testflight-publication
+  cancel-in-progress: false
+
+jobs:
+  authorize-source:
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Bind protected main, release tag, and Store identifiers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VERSION: ${{ inputs.version }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
+          APPLE_ID: ${{ inputs.apple_id }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I - "$VERSION" "$BUILD_NUMBER" "$TOOLCHAIN_VERSION" "$APPLE_ID" <<'PY'
+          import re
+          import sys
+
+          version, build, toolchain, apple_id = sys.argv[1:]
+          stable = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+          bundle = r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){0,2}"
+          if re.fullmatch(stable, version) is None:
+              raise SystemExit("app version must be stable semantic versioning")
+          if re.fullmatch(bundle, build) is None:
+              raise SystemExit("build number must contain up to three decimal components")
+          if re.fullmatch(stable, toolchain) is None:
+              raise SystemExit("toolchain version must be stable semantic versioning")
+          if re.fullmatch(r"[1-9][0-9]{5,19}", apple_id) is None:
+              raise SystemExit("Apple ID must be a positive decimal identifier")
+          PY
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$DEFAULT_BRANCH" = "main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+          test "$(git rev-parse "v$VERSION^{commit}")" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq .protected)" = "true"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/branches/main" --jq .commit.sha)" = "$GITHUB_SHA"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/commits/v$VERSION" --jq .sha)" = "$GITHUB_SHA"
+
+  build-store-package:
+    needs: authorize-source
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: [self-hosted, macOS, ARM64, easysplat-signing, easysplat-ephemeral]
+    timeout-minutes: 240
+    environment: testflight-signing
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      package_artifact_id: ${{ steps.upload-package.outputs.artifact-id }}
+      package_artifact_digest: ${{ format('sha256:{0}', steps.upload-package.outputs.artifact-digest) }}
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -p -e -u -o pipefail {0}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Verify the isolated arm64 signing host and checkout
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = "self-hosted"
+          test "$(/usr/bin/uname -m)" = "arm64"
+          test "$(/usr/bin/xcodebuild -version | /usr/bin/sed -n '1s/^Xcode //p')" = "26.6"
+          test "$(/usr/bin/xcodebuild -version | /usr/bin/sed -n '2s/^Build version //p')" = "17F113"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+          test "$(git rev-parse "v$VERSION^{commit}")" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Stage the published self-contained toolchain outside the checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_DOWNLOAD="$RUNNER_TEMP/easysplat-testflight-toolchain-download"
+          TOOLCHAIN_OUT="$RUNNER_TEMP/easysplat-testflight-toolchain"
+          test ! -e "$TOOLCHAIN_DOWNLOAD"
+          test ! -e "$TOOLCHAIN_OUT"
+          mkdir -m 0700 "$TOOLCHAIN_DOWNLOAD" "$TOOLCHAIN_OUT"
+          gh release download "toolchain-v$TOOLCHAIN_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$TOOLCHAIN_DOWNLOAD" \
+            --pattern "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip"
+          /usr/bin/ditto --noqtn -x -k \
+            "$TOOLCHAIN_DOWNLOAD/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
+            "$TOOLCHAIN_OUT"
+          for required in bin/colmap bin/easysplat-train bin/default.metallib \
+            lib/libomp.dylib supply-chain/components.json; do
+            test -f "$TOOLCHAIN_OUT/$required"
+          done
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          printf 'TOOLCHAIN_OUT=%s\n' "$TOOLCHAIN_OUT" >>"$GITHUB_ENV"
+
+      - name: Build and inspect the exact App Store-signed arm64 package
+        env:
+          EASYSPLAT_APPLE_DISTRIBUTION_SHA1: ${{ secrets.EASYSPLAT_APPLE_DISTRIBUTION_SHA1 }}
+          EASYSPLAT_MAC_INSTALLER_DISTRIBUTION_SHA1: ${{ secrets.EASYSPLAT_MAC_INSTALLER_DISTRIBUTION_SHA1 }}
+          EASYSPLAT_MAS_PROVISIONING_PROFILE_BASE64: ${{ secrets.EASYSPLAT_MAS_PROVISIONING_PROFILE_BASE64 }}
+          EASYSPLAT_MAS_TEAM_ID: ${{ secrets.EASYSPLAT_MAS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for required in EASYSPLAT_APPLE_DISTRIBUTION_SHA1 \
+            EASYSPLAT_MAC_INSTALLER_DISTRIBUTION_SHA1 \
+            EASYSPLAT_MAS_PROVISIONING_PROFILE_BASE64 EASYSPLAT_MAS_TEAM_ID; do
+            test -n "${!required}"
+          done
+          PROFILE_ROOT="$RUNNER_TEMP/easysplat-testflight-profile"
+          BUILD_ROOT="$RUNNER_TEMP/easysplat-testflight-build"
+          PACKAGE_ROOT="$RUNNER_TEMP/easysplat-testflight-package"
+          CLOSURE="$RUNNER_TEMP/easysplat-testflight-package-closure"
+          test ! -e "$PROFILE_ROOT"
+          test ! -e "$BUILD_ROOT"
+          test ! -e "$PACKAGE_ROOT"
+          test ! -e "$CLOSURE"
+          mkdir -m 0700 "$PROFILE_ROOT" "$PACKAGE_ROOT" "$CLOSURE"
+          PROFILE="$PROFILE_ROOT/EasySplat.provisionprofile"
+          cleanup_profile() {
+            local status=$?
+            trap - EXIT
+            /bin/rm -f "$PROFILE"
+            /bin/rmdir "$PROFILE_ROOT" 2>/dev/null || true
+            exit "$status"
+          }
+          trap cleanup_profile EXIT
+          /usr/bin/python3 -I - "$PROFILE" <<'PY'
+          import base64
+          import os
+          import sys
+
+          destination = sys.argv[1]
+          encoded = os.environ["EASYSPLAT_MAS_PROVISIONING_PROFILE_BASE64"]
+          try:
+              payload = base64.b64decode(encoded, validate=True)
+          except ValueError as error:
+              raise SystemExit(f"MAS provisioning profile secret is not strict base64: {error}")
+          if not payload:
+              raise SystemExit("MAS provisioning profile secret is empty")
+          descriptor = os.open(
+              destination,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+              0o600,
+          )
+          try:
+              if os.write(descriptor, payload) != len(payload):
+                  raise SystemExit("MAS provisioning profile write was incomplete")
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          PY
+          unset EASYSPLAT_MAS_PROVISIONING_PROFILE_BASE64
+          scripts/release/build_app.sh \
+            --toolchain-dir "$TOOLCHAIN_OUT" \
+            --version "${{ inputs.version }}" \
+            --build-number "${{ inputs.build_number }}" \
+            --project-url "https://github.com/$GITHUB_REPOSITORY" \
+            --build-root "$BUILD_ROOT" \
+            --source-commit "$GITHUB_SHA" \
+            --provisioning-profile "$PROFILE" \
+            --identity-fingerprint "$EASYSPLAT_APPLE_DISTRIBUTION_SHA1" \
+            --team-id "$EASYSPLAT_MAS_TEAM_ID" \
+            --app-store
+          scripts/release/build_mas_package.sh \
+            --app "$BUILD_ROOT/Export/EasySplat.app" \
+            --app-signing-receipt "$BUILD_ROOT/Export/EasySplat.app-signing.json" \
+            --app-version "${{ inputs.version }}" \
+            --app-build "${{ inputs.build_number }}" \
+            --identity-fingerprint "$EASYSPLAT_MAC_INSTALLER_DISTRIBUTION_SHA1" \
+            --team-id "$EASYSPLAT_MAS_TEAM_ID" \
+            --source-commit "$GITHUB_SHA" \
+            --output-dir "$PACKAGE_ROOT"
+          PACKAGE="$PACKAGE_ROOT/EasySplat-${{ inputs.version }}.pkg"
+          EVIDENCE="$PACKAGE.provenance.json"
+          CHECKSUM="$PACKAGE.sha256"
+          /usr/bin/python3 -I scripts/release/mas_release_evidence.py verify \
+            --repository "$GITHUB_WORKSPACE" \
+            --package "$PACKAGE" \
+            --evidence "$EVIDENCE"
+          test "$(/usr/bin/lipo -archs "$BUILD_ROOT/Export/EasySplat.app/Contents/MacOS/EasySplatApp")" = "arm64"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 \
+            "$BUILD_ROOT/Export/EasySplat.app"
+          /usr/sbin/pkgutil --check-signature "$PACKAGE"
+          install -m 0600 "$PACKAGE" "$CLOSURE/$(/usr/bin/basename "$PACKAGE")"
+          install -m 0600 "$EVIDENCE" "$CLOSURE/$(/usr/bin/basename "$EVIDENCE")"
+          install -m 0600 "$CHECKSUM" "$CLOSURE/$(/usr/bin/basename "$CHECKSUM")"
+          install -m 0600 "$BUILD_ROOT/Export/EasySplat.app-signing.json" \
+            "$CLOSURE/EasySplat-${{ inputs.version }}-${{ inputs.build_number }}.app-signing.json"
+          /usr/bin/ditto -c -k --keepParent \
+            "$BUILD_ROOT/Export/EasySplat.app.dSYM" \
+            "$CLOSURE/EasySplat-${{ inputs.version }}-${{ inputs.build_number }}-dSYM.zip"
+          /bin/chmod 0600 "$CLOSURE/EasySplat-${{ inputs.version }}-${{ inputs.build_number }}-dSYM.zip"
+
+      - name: Upload exact Store package closure
+        id: upload-package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-testflight-package-${{ github.sha }}-${{ inputs.build_number }}
+          path: ${{ runner.temp }}/easysplat-testflight-package-closure
+          if-no-files-found: error
+          retention-days: 14
+
+  submit-testflight:
+    needs: build-store-package
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: [self-hosted, macOS, ARM64, easysplat-signing, easysplat-ephemeral]
+    timeout-minutes: 240
+    environment: testflight-submission
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      submission_artifact_id: ${{ steps.upload-submission.outputs.artifact-id }}
+      submission_artifact_digest: ${{ format('sha256:{0}', steps.upload-submission.outputs.artifact-digest) }}
+    defaults:
+      run:
+        shell: /bin/bash --noprofile --norc -p -e -u -o pipefail {0}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Reverify package artifact identity before credentials exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_ARTIFACT_ID: ${{ needs.build-store-package.outputs.package_artifact_id }}
+          PACKAGE_ARTIFACT_DIGEST: ${{ needs.build-store-package.outputs.package_artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$PACKAGE_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PACKAGE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          API="repos/$GITHUB_REPOSITORY/actions/artifacts/$PACKAGE_ARTIFACT_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .expired)" = "false"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .digest)" = "$PACKAGE_ARTIFACT_DIGEST"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-store-package.outputs.package_artifact_id }}
+          path: ${{ runner.temp }}/easysplat-testflight-submission
+      - name: Upload once and wait for terminal App Store processing
+        env:
+          EASYSPLAT_ASC_KEY_ID: ${{ secrets.EASYSPLAT_ASC_KEY_ID }}
+          EASYSPLAT_ASC_ISSUER_ID: ${{ secrets.EASYSPLAT_ASC_ISSUER_ID }}
+          EASYSPLAT_ASC_PRIVATE_KEY_BASE64: ${{ secrets.EASYSPLAT_ASC_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$EASYSPLAT_ASC_KEY_ID"
+          test -n "$EASYSPLAT_ASC_ISSUER_ID"
+          test -n "$EASYSPLAT_ASC_PRIVATE_KEY_BASE64"
+          SUBMISSION="$RUNNER_TEMP/easysplat-testflight-submission"
+          PACKAGE="$SUBMISSION/EasySplat-${{ inputs.version }}.pkg"
+          EVIDENCE="$PACKAGE.provenance.json"
+          SUBMISSION_HOME="$RUNNER_TEMP/easysplat-testflight-private-home"
+          KEY_DIR="$SUBMISSION_HOME/.appstoreconnect/private_keys"
+          mkdir -m 0700 -p "$KEY_DIR"
+          KEY_PATH="$KEY_DIR/AuthKey_${EASYSPLAT_ASC_KEY_ID}.p8"
+          cleanup_key() {
+            local status=$?
+            trap - EXIT
+            /bin/rm -f "$KEY_PATH"
+            /bin/rmdir "$KEY_DIR" "$SUBMISSION_HOME/.appstoreconnect" "$SUBMISSION_HOME" 2>/dev/null || true
+            exit "$status"
+          }
+          trap cleanup_key EXIT
+          /usr/bin/python3 -I - "$KEY_PATH" <<'PY'
+          import base64
+          import os
+          import sys
+
+          payload = base64.b64decode(
+              os.environ["EASYSPLAT_ASC_PRIVATE_KEY_BASE64"], validate=True
+          )
+          if not payload:
+              raise SystemExit("App Store Connect private key is empty")
+          descriptor = os.open(
+              sys.argv[1],
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+              0o600,
+          )
+          try:
+              if os.write(descriptor, payload) != len(payload):
+                  raise SystemExit("App Store Connect key write was incomplete")
+              os.fsync(descriptor)
+          finally:
+              os.close(descriptor)
+          PY
+          unset EASYSPLAT_ASC_PRIVATE_KEY_BASE64
+          HOME="$SUBMISSION_HOME" scripts/release/upload_mas_package.sh \
+            --package "$PACKAGE" \
+            --evidence "$EVIDENCE" \
+            --key-id "$EASYSPLAT_ASC_KEY_ID" \
+            --issuer-id "$EASYSPLAT_ASC_ISSUER_ID" \
+            --apple-id "${{ inputs.apple_id }}" \
+            --bundle-short-version "${{ inputs.version }}" \
+            --bundle-version "${{ inputs.build_number }}" \
+            --upload
+          /usr/bin/python3 -I scripts/release/mas_release_evidence.py verify-processing \
+            --repository "$GITHUB_WORKSPACE" \
+            --package "$PACKAGE" \
+            --evidence "$EVIDENCE" \
+            --apple-id "${{ inputs.apple_id }}" \
+            --expected-version "${{ inputs.version }}" \
+            --expected-build "${{ inputs.build_number }}" \
+            --upload-receipt "$PACKAGE.upload.json" \
+            --processing-receipt "$PACKAGE.processing.json"
+          test -f "$PACKAGE.upload.json"
+          test -f "$PACKAGE.processing.json"
+
+      - name: Upload exact processed TestFlight closure
+        id: upload-submission
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-testflight-processed-${{ github.sha }}-${{ inputs.build_number }}
+          path: ${{ runner.temp }}/easysplat-testflight-submission
+          if-no-files-found: error
+          retention-days: 14
+
+  approve-dogfood:
+    needs: submit-testflight
+    if: github.ref == 'refs/heads/main' && github.event.repository.default_branch == 'main'
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment: testflight-dogfood
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Require explicit exact-build dogfood records
+        env:
+          FRESH_DOGFOOD_RESULT_BASE64: ${{ vars.EASYSPLAT_TESTFLIGHT_FRESH_RESULT_BASE64 }}
+          AFFECTED_DOGFOOD_RESULT_BASE64: ${{ vars.EASYSPLAT_TESTFLIGHT_AFFECTED_RESULT_BASE64 }}
+        run: |
+          test -n "$FRESH_DOGFOOD_RESULT_BASE64"
+          test -n "$AFFECTED_DOGFOOD_RESULT_BASE64"
+      - name: Reverify processed artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBMISSION_ARTIFACT_ID: ${{ needs.submit-testflight.outputs.submission_artifact_id }}
+          SUBMISSION_ARTIFACT_DIGEST: ${{ needs.submit-testflight.outputs.submission_artifact_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$SUBMISSION_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$SUBMISSION_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          API="repos/$GITHUB_REPOSITORY/actions/artifacts/$SUBMISSION_ARTIFACT_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .expired)" = "false"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .digest)" = "$SUBMISSION_ARTIFACT_DIGEST"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.id)" = "$GITHUB_RUN_ID"
+          test "$(gh api -H 'X-GitHub-Api-Version: 2026-03-10' "$API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.submit-testflight.outputs.submission_artifact_id }}
+          path: ${{ runner.temp }}/easysplat-testflight-approved
+      - name: Bind the approved build to its package, source, and terminal receipts
+        env:
+          SUBMISSION_ARTIFACT_ID: ${{ needs.submit-testflight.outputs.submission_artifact_id }}
+          SUBMISSION_ARTIFACT_DIGEST: ${{ needs.submit-testflight.outputs.submission_artifact_digest }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          VERSION: ${{ inputs.version }}
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          APPLE_ID: ${{ inputs.apple_id }}
+          FRESH_DOGFOOD_RESULT_BASE64: ${{ vars.EASYSPLAT_TESTFLIGHT_FRESH_RESULT_BASE64 }}
+          AFFECTED_DOGFOOD_RESULT_BASE64: ${{ vars.EASYSPLAT_TESTFLIGHT_AFFECTED_RESULT_BASE64 }}
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/easysplat-testflight-approved"
+          PACKAGE="$ROOT/EasySplat-${{ inputs.version }}.pkg"
+          /usr/bin/python3 -I scripts/release/mas_release_evidence.py verify-processing \
+            --repository "$GITHUB_WORKSPACE" \
+            --package "$PACKAGE" \
+            --evidence "$PACKAGE.provenance.json" \
+            --apple-id "${{ inputs.apple_id }}" \
+            --expected-version "${{ inputs.version }}" \
+            --expected-build "${{ inputs.build_number }}" \
+            --upload-receipt "$PACKAGE.upload.json" \
+            --processing-receipt "$PACKAGE.processing.json"
+          GATE="$RUNNER_TEMP/easysplat-testflight-gate"
+          mkdir -m 0700 "$GATE"
+          FRESH_RESULT="$GATE/fresh-container-result.json"
+          AFFECTED_RESULT="$GATE/affected-internal-container-result.json"
+          /usr/bin/python3 -I scripts/release/testflight_dogfood_evidence.py materialize \
+            --environment-variable FRESH_DOGFOOD_RESULT_BASE64 \
+            --output "$FRESH_RESULT"
+          /usr/bin/python3 -I scripts/release/testflight_dogfood_evidence.py materialize \
+            --environment-variable AFFECTED_DOGFOOD_RESULT_BASE64 \
+            --output "$AFFECTED_RESULT"
+          /usr/bin/python3 -I scripts/release/testflight_dogfood_evidence.py build-gate \
+            --package "$PACKAGE" \
+            --evidence "$PACKAGE.provenance.json" \
+            --upload-receipt "$PACKAGE.upload.json" \
+            --processing-receipt "$PACKAGE.processing.json" \
+            --fresh-result "$FRESH_RESULT" \
+            --affected-result "$AFFECTED_RESULT" \
+            --source-commit "$SOURCE_COMMIT" \
+            --apple-id "$APPLE_ID" \
+            --version "$VERSION" \
+            --build "$BUILD_NUMBER" \
+            --submission-artifact-id "$SUBMISSION_ARTIFACT_ID" \
+            --submission-artifact-digest "$SUBMISSION_ARTIFACT_DIGEST" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$GATE/testflight-gate.json"
+      - name: Upload approved TestFlight gate
+        id: upload-gate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-testflight-gate-${{ github.sha }}-${{ inputs.build_number }}
+          path: ${{ runner.temp }}/easysplat-testflight-gate
+          if-no-files-found: error
+          retention-days: 14

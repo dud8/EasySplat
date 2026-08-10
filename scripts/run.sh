@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${VERSION:-2.0.0}"
-PORT="${EASYSPLAT_DEV_PORT:-8000}"
 TOOLCHAIN_ROOT=""
 FAST=0
 REBUILD=0
@@ -14,51 +13,12 @@ log() {
 
 launch_app() {
   local launch_mode="$1"
+  # `swift run` produces a bare executable rather than an app bundle, so the
+  # override is the only way the app can find its tools here.
+  export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
   log "Launching EasySplatApp ($launch_mode)."
   log "If the window does not come to the front automatically, switch to EasySplatApp in the Dock."
   swift run --package-path "$ROOT" EasySplatApp
-}
-
-wait_for_local_manifest_server() {
-  local port="$1"
-  local manifest_path="$2"
-  local server_pid="$3"
-  local attempts=50
-
-  while [ "$attempts" -gt 0 ]; do
-    if ! kill -0 "$server_pid" 2>/dev/null; then
-      wait "$server_pid" 2>/dev/null || true
-      echo "Local toolchain server exited before serving the staged manifest on port $port. Is that port already in use?" >&2
-      return 1
-    fi
-
-    if python3 - "$port" "$manifest_path" <<'PY' >/dev/null 2>&1
-import sys
-import urllib.request
-from pathlib import Path
-
-port = int(sys.argv[1])
-manifest_path = Path(sys.argv[2])
-expected_manifest = manifest_path.read_bytes()
-try:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/manifest.json", timeout=0.2) as response:
-        actual_manifest = response.read()
-except Exception:
-    raise SystemExit(1)
-
-if actual_manifest != expected_manifest:
-    raise SystemExit(1)
-PY
-    then
-      return 0
-    fi
-
-    attempts=$((attempts - 1))
-    sleep 0.1
-  done
-
-  echo "Timed out waiting for the local toolchain server to serve the staged manifest on port $port." >&2
-  return 1
 }
 
 usage() {
@@ -66,11 +26,10 @@ usage() {
 Usage: ./scripts/run.sh [options]
 
 Options:
-  --fast                 Run with the installed toolchain (no rebuild/download).
-  --rebuild              Force a toolchain rebuild (preserve models when possible).
-  --version <semver>     Toolchain version (default: 2.0.0).
-  --toolchain-root <dir> Override with a version leaf under an EasySplat toolchain root.
-  --port <port>          Local manifest server port on 127.0.0.1 (default: 8000).
+  --fast                 Run with the built toolchain as-is (no rebuild).
+  --rebuild              Force a toolchain rebuild.
+  --version <semver>     Toolchain version to package (default: 2.0.0).
+  --toolchain-root <dir> Toolchain tree to run against (default: Toolchains/out).
   -h, --help             Show this help.
 EOF
 }
@@ -83,10 +42,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --toolchain-root)
       TOOLCHAIN_ROOT="$2"
-      shift 2
-      ;;
-    --port)
-      PORT="$2"
       shift 2
       ;;
     --fast)
@@ -113,13 +68,20 @@ if [ "$FAST" -eq 1 ] && [ "$REBUILD" -eq 1 ]; then
   exit 1
 fi
 
-if [ -z "$TOOLCHAIN_ROOT" ]; then
-  TOOLCHAIN_ROOT="$HOME/Library/Application Support/EasySplat/Toolchains/$VERSION"
-fi
+TOOLCHAINS="$ROOT/Toolchains"
+OUT="$TOOLCHAINS/out"
 
+# The app resolves tools from this tree; packaging writes it in place.
+if [ -z "$TOOLCHAIN_ROOT" ]; then
+  TOOLCHAIN_ROOT="$OUT"
+fi
+# This script extracts archives into the toolchain root and replaces payload
+# directories inside it, so the root is bounded to the staging tree and the
+# per-version install locations. An arbitrary path would be destroyed.
 TOOLCHAIN_ROOT="$(python3 - \
   "$TOOLCHAIN_ROOT" \
   "$VERSION" \
+  "$OUT" \
   "$HOME/Library/Application Support/EasySplat/Toolchains" \
   "$ROOT/Toolchains/dev" \
   "${TMPDIR:-/tmp}/EasySplat/Toolchains" <<'PY'
@@ -129,7 +91,8 @@ from pathlib import Path
 
 root = Path(sys.argv[1]).expanduser().resolve(strict=False)
 version = sys.argv[2]
-allowed_parents = {Path(value).expanduser().resolve(strict=False) for value in sys.argv[3:]}
+staging = Path(sys.argv[3]).expanduser().resolve(strict=False)
+allowed_parents = {Path(value).expanduser().resolve(strict=False) for value in sys.argv[4:]}
 semver = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
@@ -137,8 +100,8 @@ semver = re.compile(
 )
 if not semver.fullmatch(version):
     raise SystemExit(f"Invalid toolchain version: {version}")
-if root.name != version or root.parent not in allowed_parents:
-    allowed = ", ".join(str(parent / version) for parent in sorted(allowed_parents))
+if root != staging and (root.name != version or root.parent not in allowed_parents):
+    allowed = ", ".join([str(staging)] + [str(parent / version) for parent in sorted(allowed_parents)])
     raise SystemExit(
         f"Refusing unsafe toolchain root: {root}. Expected one of: {allowed}"
     )
@@ -146,15 +109,21 @@ print(root)
 PY
 )"
 
-TOOLCHAINS="$ROOT/Toolchains"
-OUT="$TOOLCHAINS/out"
+python3 - "$VERSION" <<'PY'
+import re
+import sys
+
+semver = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+if not semver.fullmatch(sys.argv[1]):
+    raise SystemExit(f"Invalid toolchain version: {sys.argv[1]}")
+PY
 CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
 DA3_BASE_ZIP="$OUT/toolchain-geometry-da3-base-$VERSION.zip"
 DA3_SMALL_ZIP="$OUT/toolchain-geometry-da3-small-$VERSION.zip"
-MANIFEST="$TOOLCHAINS/manifest.json"
-PUBLIC_SERVE_ROOT=""
-PUB="$TOOLCHAINS/public_key_ed25519.txt"
-PRIV="$TOOLCHAINS/private_key_ed25519.txt"
 MSPLAT_INSTALL="${MSPLAT_INSTALL:-$ROOT/Toolchains/build/msplat/install}"
 MSPLAT_BUNDLE="$MSPLAT_INSTALL/msplat"
 MSPLAT_BUILD="$ROOT/scripts/toolchain/build_msplat.sh"
@@ -464,32 +433,6 @@ validate_installed_da3_small() {
   test -f "$root/da3_mps/models/DA3-SMALL/LICENSE" || return 1
 }
 
-models_present() {
-  local root="$1"
-  test -f "$root/da3_mps/models/DA3-BASE/model.safetensors" \
-    && test -f "$root/da3_mps/models/DA3-BASE/config.json" \
-    && test -f "$root/da3_mps/models/DA3-BASE/easysplat_model_info.json" \
-    && test -f "$root/da3_mps/models/DA3-SMALL/model.safetensors" \
-    && test -f "$root/da3_mps/models/DA3-SMALL/config.json" \
-    && test -f "$root/da3_mps/models/DA3-SMALL/easysplat_model_info.json"
-}
-
-wipe_installed_core() {
-  local root="$1"
-  if [ -z "$root" ] || [ "$root" = "/" ]; then
-    echo "Refusing to clear an unsafe toolchain root: $root" >&2
-    return 1
-  fi
-  rm -rf \
-    "${root:?}/bin" \
-    "${root:?}/msplat" \
-    "${root:?}/da3_mps/bin" \
-    "${root:?}/da3_mps/python" \
-    "${root:?}/da3_mps/build_info.json" \
-    "${root:?}/da3_mps/vendor" \
-    "${root:?}/da3_mps/app"
-}
-
 INSTALLED_CORE_OK=0
 INSTALLED_FULL_OK=0
 if [ -d "$TOOLCHAIN_ROOT" ] && validate_installed_core "$TOOLCHAIN_ROOT"; then
@@ -506,13 +449,11 @@ if [ "$FAST" -eq 1 ]; then
     echo "Run ./scripts/run.sh to auto-build/install it, or use --rebuild to force a fresh toolchain." >&2
     exit 1
   fi
-  export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
   launch_app "installed toolchain at $TOOLCHAIN_ROOT"
   exit 0
 fi
 
 if [ "$REBUILD" -eq 0 ] && [ "$INSTALLED_FULL_OK" -eq 1 ]; then
-  export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
   launch_app "installed toolchain at $TOOLCHAIN_ROOT"
   exit 0
 fi
@@ -537,67 +478,27 @@ if [ "$NEED_PACKAGE" -eq 1 ]; then
   "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 fi
 
-if [ ! -f "$PUB" ] || [ ! -f "$PRIV" ]; then
-  swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool generate-keypair \
-    --public-key-out "$PUB" \
-    --private-key-out "$PRIV"
-fi
-chmod 600 "$PRIV"
-
-PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
-  --version "$VERSION" \
-  --published-at "$PUBLISHED_AT" \
-  --core-zip "$CORE_ZIP" \
-  --core-url "http://localhost:$PORT/out/$(basename "$CORE_ZIP")" \
-  --da3-base-zip "$DA3_BASE_ZIP" \
-  --da3-base-url "http://localhost:$PORT/out/$(basename "$DA3_BASE_ZIP")" \
-  --da3-small-zip "$DA3_SMALL_ZIP" \
-  --da3-small-url "http://localhost:$PORT/out/$(basename "$DA3_SMALL_ZIP")" \
-  --app-version-minimum "0.0.0" \
-  --app-version-maximum-exclusive "9999.0.0" \
-  --private-key-file "$PRIV" \
-  --manifest-out "$MANIFEST"
-
-SERVER_PID=""
-cleanup() {
-  if [ -n "${SERVER_PID:-}" ]; then
-    kill "$SERVER_PID" 2>/dev/null || true
-  fi
-  if [ -n "${PUBLIC_SERVE_ROOT:-}" ]; then
-    rm -rf "$PUBLIC_SERVE_ROOT"
-  fi
-}
-trap cleanup EXIT
-
-PUBLIC_SERVE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-toolchain-public.XXXXXX")"
-cp "$MANIFEST" "$PUBLIC_SERVE_ROOT/manifest.json"
-mkdir -p "$PUBLIC_SERVE_ROOT/out"
-ln -s "$CORE_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$CORE_ZIP")"
-ln -s "$DA3_BASE_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$DA3_BASE_ZIP")"
-ln -s "$DA3_SMALL_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$DA3_SMALL_ZIP")"
-
-pushd "$PUBLIC_SERVE_ROOT" >/dev/null
-python3 -m http.server --bind 127.0.0.1 "$PORT" >/dev/null 2>&1 &
-SERVER_PID=$!
-popd >/dev/null
-
-wait_for_local_manifest_server "$PORT" "$PUBLIC_SERVE_ROOT/manifest.json" "$SERVER_PID"
-log "Serving local toolchain manifest at http://localhost:$PORT/manifest.json."
-
-export EASYSPLAT_TOOLCHAIN_MANIFEST_URL="http://localhost:$PORT/manifest.json"
-EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64="$(<"$PUB")"
-export EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64
-
-if [ -d "$TOOLCHAIN_ROOT" ]; then
-  if models_present "$TOOLCHAIN_ROOT"; then
-    echo "Preserving installed models; removing core to force reinstall: $TOOLCHAIN_ROOT" >&2
-    wipe_installed_core "$TOOLCHAIN_ROOT"
-  else
-    echo "Removing installed toolchain to force reinstall: $TOOLCHAIN_ROOT" >&2
-    rm -rf "$TOOLCHAIN_ROOT"
-  fi
+# The packaged archives are the durable artifact; the tree is derived from them.
+# A root that has no tree yet gets one, whether packaging just ran or the cached
+# archives were reused.
+if ! validate_installed_core "$TOOLCHAIN_ROOT"; then
+  mkdir -p "$TOOLCHAIN_ROOT"
+  for archive in "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"; do
+    if [ -f "$archive" ]; then
+      /usr/bin/ditto -x -k "$archive" "$TOOLCHAIN_ROOT"
+    fi
+  done
+  for executable in bin/colmap bin/easysplat-train; do
+    if [ -f "$TOOLCHAIN_ROOT/$executable" ]; then
+      chmod 755 "$TOOLCHAIN_ROOT/$executable"
+    fi
+  done
 fi
 
-launch_app "fresh local manifest at http://localhost:$PORT/manifest.json"
+if ! validate_installed_core "$TOOLCHAIN_ROOT"; then
+  echo "Toolchain tree is incomplete after packaging: $TOOLCHAIN_ROOT" >&2
+  echo "Expected bin/colmap, bin/easysplat-train, lib/libomp.dylib, provenance/, supply-chain/." >&2
+  exit 1
+fi
+
+launch_app "toolchain at $TOOLCHAIN_ROOT"

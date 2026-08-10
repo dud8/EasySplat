@@ -90,6 +90,73 @@ final class PhotoInputAdmissionTests: XCTestCase {
         XCTAssertFalse(prepared.photos.contains { $0.stagedURL.pathExtension == "dng" })
     }
 
+    func testPhotoListAdmissionMergesFilesFromMultipleFolders() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        let folderA = root.appendingPathComponent("ShootA", isDirectory: true)
+        let folderB = root.appendingPathComponent("ShootB", isDirectory: true)
+        for dir in [library, folderA, folderB] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        var photos: [URL] = []
+        for (folderIndex, folder) in [folderA, folderB].enumerated() {
+            for offset in 0..<2 {
+                let url = folder.appendingPathComponent("shot-\(folderIndex)-\(offset).png")
+                try writeTaggedRGBPNG(at: url, width: 24 + folderIndex * 4 + offset, height: 32 + offset)
+                photos.append(url)
+            }
+        }
+
+        let prepared = try await PhotoInputPreflight.prepare(
+            photos: photos,
+            stagingParent: library,
+            photoSelection: .useAllValidPhotos,
+            inputOrdering: .automatic,
+            keyframeBudget: 10,
+            requiredAtomicWorkspaceReserveBytes: 0,
+            limits: .init(minimumFreeSpaceReserveBytes: 0),
+            availableCapacity: { _ in 128 * 1_024 * 1_024 },
+            progress: { _, _ in }
+        )
+        defer { prepared.discard() }
+
+        XCTAssertEqual(prepared.summary.validPhotoCount, 4, "Photos from both folders should be admitted.")
+        XCTAssertEqual(prepared.photos.count, 4)
+    }
+
+    func testPhotoListAdmissionRejectsSymbolicLink() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let real = source.appendingPathComponent("real.png")
+        try writeTaggedRGBPNG(at: real, width: 24, height: 24)
+        let link = source.appendingPathComponent("link.png")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await PhotoInputPreflight.prepare(
+                photos: [link],
+                stagingParent: library,
+                photoSelection: .useAllValidPhotos,
+                inputOrdering: .automatic,
+                keyframeBudget: 10,
+                requiredAtomicWorkspaceReserveBytes: 0,
+                limits: .init(minimumFreeSpaceReserveBytes: 0),
+                availableCapacity: { _ in 128 * 1_024 * 1_024 },
+                progress: { _, _ in }
+            )
+        } errorHandler: { error in
+            guard let failure = error as? PhotoInputPreflightFailure,
+                  case .symbolicLink = failure.issue else {
+                return XCTFail("Expected a symbolic-link rejection, got \(error)")
+            }
+        }
+    }
+
     func testRawAdmissionDeduplicatesOriginalsButAllowsIdenticalDevelopedPNGs() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1207,6 +1274,152 @@ final class PhotoInputAdmissionTests: XCTestCase {
         let replacement = library.appendingPathComponent(".easysplat-photo-input-staging/sentinel")
         XCTAssertEqual(try Data(contentsOf: replacement), sentinelBytes)
         XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
+    }
+
+    /// Staging opened its parent by walking down from the root, opening every
+    /// directory on the way. That needs read permission on each one, which the
+    /// App Sandbox does not give for `/Users` — so a store build could stage
+    /// nothing at all. An ancestor a process may cross but not read reproduces
+    /// exactly that condition without a sandbox.
+    func testStagingWorksWhenAnAncestorCannotBeRead() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let crossable = root.appendingPathComponent("crossable", isDirectory: true)
+        let library = crossable.appendingPathComponent("Projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeRGBJPEG(at: source.appendingPathComponent("capture.jpg"), properties: [:])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o111],
+            ofItemAtPath: crossable.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: crossable.path
+            )
+        }
+
+        let prepared = try await prepareOnePhoto(source: source, library: library)
+        defer { prepared.discard() }
+        XCTAssertEqual(prepared.photos.count, 1)
+    }
+
+    /// A staging parent that is itself a symbolic link is refused outright.
+    func testStagingRefusesAParentThatIsASymbolicLink() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let real = root.appendingPathComponent("real-projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeRGBJPEG(at: source.appendingPathComponent("capture.jpg"), properties: [:])
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: library, withDestinationURL: real)
+
+        do {
+            let prepared = try await prepareOnePhoto(source: source, library: library)
+            prepared.discard()
+            XCTFail("A staging parent that is a link must be refused.")
+        } catch let failure as PhotoInputPreflightFailure {
+            XCTAssertEqual(failure.issue, .stagingUnavailable)
+        }
+    }
+
+    /// A link on the way to the staging parent is resolved once, and staging
+    /// lands on the real directory rather than on the path that led there.
+    func testStagingLandsOnTheResolvedParentWhenAnAncestorIsALink() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let real = root.appendingPathComponent("real", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: real.appendingPathComponent("Projects", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeRGBJPEG(at: source.appendingPathComponent("capture.jpg"), properties: [:])
+        let link = root.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+
+        let prepared = try await prepareOnePhoto(
+            source: source,
+            library: link.appendingPathComponent("Projects", isDirectory: true)
+        )
+        defer { prepared.discard() }
+        XCTAssertEqual(prepared.photos.count, 1)
+        let staged = prepared.stagingRoot.path
+        XCTAssertTrue(
+            staged.contains("/real/Projects/"),
+            "Staging must live under the resolved parent: \(staged)"
+        )
+        XCTAssertFalse(
+            staged.contains("/link/"),
+            "Staging must not record the path that led there: \(staged)"
+        )
+    }
+
+    /// A refused read is what the App Sandbox does when the grant that came with
+    /// the user's selection has lapsed. Calling that "the source changed" sends
+    /// the user hunting for a damaged photo that is fine.
+    func testRefusedPhotoReadReportsAccessDenied() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let photo = source.appendingPathComponent("locked.jpg")
+        try writeRGBJPEG(at: photo, properties: [:])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0],
+            ofItemAtPath: photo.path
+        )
+
+        do {
+            _ = try await PhotoInputPreflight.prepare(
+                photos: [photo],
+                stagingParent: library,
+                photoSelection: .automatic,
+                inputOrdering: .automatic,
+                keyframeBudget: 10,
+                requiredAtomicWorkspaceReserveBytes: 0,
+                limits: .init(minimumFreeSpaceReserveBytes: 0),
+                availableCapacity: { _ in 1_024 * 1_024 },
+                progress: { _, _ in }
+            )
+            XCTFail("A photo the system refuses to read must be rejected.")
+        } catch let failure as PhotoInputPreflightFailure {
+            XCTAssertEqual(failure.issue, .accessDenied(relativePath: "locked.jpg"))
+        }
+    }
+
+    func testRefusedFolderReadReportsAccessDenied() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = root.appendingPathComponent("Projects", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeRGBJPEG(at: source.appendingPathComponent("capture.jpg"), properties: [:])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0],
+            ofItemAtPath: source.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: source.path
+            )
+        }
+
+        do {
+            _ = try await prepareOnePhoto(source: source, library: library)
+            XCTFail("A folder the system refuses to open must be rejected.")
+        } catch let failure as PhotoInputPreflightFailure {
+            XCTAssertEqual(failure.issue, .accessDenied(relativePath: "Photos"))
+        }
     }
 
     private func prepareOnePhoto(source: URL, library: URL) async throws -> PreparedPhotoInput {

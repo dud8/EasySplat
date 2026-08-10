@@ -62,7 +62,7 @@ struct WindowAccessor: NSViewRepresentable {
             // half-typed annotation doesn't drop it on the floor.
             guard model.flushPendingNotesSave() else { return false }
 
-            guard model.currentTask != nil else { return true }
+            guard model.hasActiveWork else { return true }
 
             let decision = model.presentExitConfirmation()
             switch decision {

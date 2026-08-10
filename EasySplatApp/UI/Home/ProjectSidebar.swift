@@ -42,17 +42,9 @@ struct ProjectSidebar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Button(action: onNewSplat) {
-                Label("New Splat", systemImage: "plus")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .disabled(isRunActive)
-            .keyboardShortcut("n", modifiers: .command)
-            .padding(Theme.Spacing.medium)
-
-            Divider()
+            SidebarSearchField(text: $searchText, prompt: "Search Projects")
+                .padding(.horizontal, Theme.Spacing.medium)
+                .padding(.top, Theme.Spacing.small)
 
             HStack(spacing: Theme.Spacing.small) {
                 statusMenu
@@ -70,16 +62,25 @@ struct ProjectSidebar: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(visibleProjects, id: \.url) { project in
+                        ForEach(visibleProjects, id: \.selectionID) { project in
                             projectRow(project)
-                                .tag(Self.selectionID(for: project))
+                                .tag(project.selectionID)
                                 .contextMenu { projectMenu(project) }
                         }
                     }
                 }
             }
             .listStyle(.sidebar)
-            .searchable(text: $searchText, placement: .sidebar, prompt: "Search Projects")
+        }
+        .toolbar {
+            ToolbarItem {
+                Button(action: onNewSplat) {
+                    Label("New Splat", systemImage: "plus")
+                }
+                .disabled(isRunActive)
+                .help("New Splat")
+                .accessibilityIdentifier("sidebar.newSplat")
+            }
         }
         .confirmationDialog(
             "Move project to Trash?",
@@ -145,6 +146,7 @@ struct ProjectSidebar: View {
             Label(filter.displayName, systemImage: "line.3.horizontal.decrease")
         }
         .menuStyle(.borderlessButton)
+        .tint(Color.primary)
         .fixedSize()
     }
 
@@ -162,6 +164,7 @@ struct ProjectSidebar: View {
             Label(sort.displayName, systemImage: "arrow.up.arrow.down")
         }
         .menuStyle(.borderlessButton)
+        .tint(Color.primary)
         .fixedSize()
     }
 
@@ -179,11 +182,15 @@ struct ProjectSidebar: View {
             }
 
             if !isRunActive,
-               let actionTitle = Self.rowActionTitle(status: project.status) {
+               let actionTitle = Self.rowActionTitle(
+                status: project.status,
+                hasPreviousResultHint: project.hasPreviousResultHint
+               ) {
                 Button(actionTitle) {
                     open(project)
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.bordered)
+                .tint(Color.primary)
                 .controlSize(.small)
                 .fixedSize()
                 .accessibilityLabel("\(actionTitle) \(project.title)")
@@ -191,23 +198,39 @@ struct ProjectSidebar: View {
             }
         }
         .padding(.vertical, 2)
+        .selectionDisabled(rowIsUnavailable(project))
     }
 
     private func projectLabel(_ project: ProjectSummary) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        let unavailable = rowIsUnavailable(project)
+        return VStack(alignment: .leading, spacing: 3) {
             Text(project.title)
                 .font(.body)
+                .foregroundStyle(unavailable ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .help(project.title)
+                .help(unavailable ? "Opens after the current run finishes." : project.title)
 
-            HStack(spacing: Theme.Spacing.small) {
-                Text(statusText(for: project))
-                Spacer(minLength: Theme.Spacing.small)
-                Text(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted))
+            let caption = Self.rowCaption(
+                status: project.status,
+                isInterrupted: project.isInterrupted,
+                hasPreviousResultHint: project.hasPreviousResultHint
+            )
+            let date = project.lastActivityAt.formatted(date: .abbreviated, time: .omitted)
+            // At tight widths the date yields rather than truncating both.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: Theme.Spacing.small) {
+                    if let caption { Text(caption).fixedSize() }
+                    Spacer(minLength: Theme.Spacing.small)
+                    Text(date).fixedSize()
+                }
+                HStack(spacing: Theme.Spacing.small) {
+                    if let caption { Text(caption) }
+                    Spacer(minLength: 0)
+                }
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(unavailable ? .tertiary : .secondary)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
@@ -222,6 +245,13 @@ struct ProjectSidebar: View {
             open(project)
         }
         .disabled(isRunActive)
+
+        if project.status == .failed, project.hasPreviousResultHint {
+            Button("Try Again") {
+                _ = model.resumeProject(at: project.url)
+            }
+            .disabled(isRunActive)
+        }
 
         Button("Rename…") {
             renameDraft = project.title
@@ -268,40 +298,85 @@ struct ProjectSidebar: View {
 
     private func beginOpening(_ project: ProjectSummary) -> Bool {
         guard !isRunActive else { return false }
+        if project.status == .failed, project.hasPreviousResultHint {
+            return model.viewPreviousResult(at: project.url)
+        }
         return model.resumeProject(at: project.url)
     }
 
     private func isLocked(_ project: ProjectSummary) -> Bool {
-        isRunActive && ProjectSummary.hasSameLocation(model.currentProjectURL, project.url)
+        isRunActive
+    }
+
+    private func rowIsUnavailable(_ project: ProjectSummary) -> Bool {
+        Self.rowIsUnavailableDuringRun(
+            isRunActive: isRunActive,
+            isActiveProject: ProjectSummary.hasSameLocation(model.currentProjectURL, project.url)
+        )
     }
 
     private func statusText(for project: ProjectSummary) -> String {
-        if project.isInterrupted {
-            return "Unfinished"
-        }
-        switch project.status {
-        case .ready: return "Ready"
+        Self.rowCaption(
+            status: project.status,
+            isInterrupted: project.isInterrupted,
+            hasPreviousResultHint: project.hasPreviousResultHint
+        ) ?? "Ready"
+    }
+
+    /// Visible status caption for a row; ready rows carry none. The full
+    /// status stays in the row's accessibility label.
+    nonisolated static func rowCaption(
+        status: ProjectStatus,
+        isInterrupted: Bool,
+        hasPreviousResultHint: Bool = false
+    ) -> String? {
+        if isInterrupted { return "Unfinished" }
+        switch status {
+        case .ready: return nil
         case .inProgress: return "In Progress"
-        case .failed: return "Failed"
+        case .failed:
+            return hasPreviousResultHint
+                ? "Failed · Previous result available"
+                : "Failed"
         }
     }
 
     private func openActionTitle(for project: ProjectSummary) -> String {
         switch project.status {
         case .ready: return "Open"
-        case .failed: return "Try Again"
+        case .failed:
+            return project.hasPreviousResultHint
+                ? "View Previous Result"
+                : "Try Again"
         case .inProgress: return "Resume"
         }
     }
 
-    nonisolated static func opensOnSelection(status: ProjectStatus) -> Bool {
-        status == .ready
+    nonisolated static func opensOnSelection(
+        status: ProjectStatus,
+        hasPreviousResultHint: Bool = false
+    ) -> Bool {
+        status == .ready || (status == .failed && hasPreviousResultHint)
     }
 
-    nonisolated static func rowActionTitle(status: ProjectStatus) -> String? {
+    /// While a run is active every other project is inert; the selection
+    /// binding already refuses it, so the row must also look and act held.
+    /// The running project keeps full prominence.
+    nonisolated static func rowIsUnavailableDuringRun(
+        isRunActive: Bool,
+        isActiveProject: Bool
+    ) -> Bool {
+        isRunActive && !isActiveProject
+    }
+
+    nonisolated static func rowActionTitle(
+        status: ProjectStatus,
+        hasPreviousResultHint: Bool = false
+    ) -> String? {
         switch status {
         case .inProgress: return "Resume"
-        case .failed: return "Try Again"
+        case .failed:
+            return hasPreviousResultHint ? "View Previous Result" : "Try Again"
         case .ready: return nil
         }
     }
@@ -312,7 +387,7 @@ struct ProjectSidebar: View {
     }
 
     nonisolated static func selectionID(for project: ProjectSummary) -> URL {
-        selectionID(for: project.url)
+        project.selectionID
     }
 
     nonisolated static func selectionID(for projectURL: URL) -> URL {
@@ -333,7 +408,10 @@ struct ProjectSidebar: View {
     ) -> URL? {
         guard let requestedSelection,
               let project = project(forSelectionID: requestedSelection, in: projects),
-              opensOnSelection(status: project.status) else {
+              opensOnSelection(
+                status: project.status,
+                hasPreviousResultHint: project.hasPreviousResultHint
+              ) else {
             return current
         }
         return selectionID(for: project)

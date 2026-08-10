@@ -58,6 +58,76 @@ final class CanonicalOrientationEstimatorTests: XCTestCase {
         XCTAssertNotNil(solution.artifact.sourceToCanonicalQuaternionWXYZ)
     }
 
+    func testResidualTailWithinFifteenDegreesYieldsSignUnverifiedAxis() throws {
+        // The user-visible failure this covers: a minority of shaky frames pushes
+        // p90 past the strict 8-degree gate while the axis and sign stay strong.
+        let physicalUp = OrientationVector3(x: 0, y: -1, z: 0)
+        var cameras = orbitCameras(up: physicalUp, count: 24)
+        for index in 0..<4 {
+            let original = cameras[index]
+            let forward = original.forwardInWorld
+            let sideways = physicalUp.cross(forward).normalized!
+            let rollRadians = 12 * Double.pi / 180
+            cameras[index] = camera(
+                name: original.imageName,
+                imageUp: physicalUp * cos(rollRadians) + sideways * sin(rollRadians),
+                forward: forward,
+                center: original.centerInWorld,
+                observations: original.trackedObservationCount
+            )
+        }
+
+        let solution = CanonicalOrientationEstimator.estimate(
+            cameras: cameras,
+            orderedImageNames: cameras.map(\.imageName),
+            orderedInput: true,
+            allowCameraUpFallback: false,
+            deterministicSeed: 42
+        )
+
+        XCTAssertEqual(solution.artifact.status, .axisAlignedSignUnverified)
+        XCTAssertEqual(solution.artifact.method, .cameraRightNullspace)
+        XCTAssertNotNil(solution.artifact.sourceToCanonicalQuaternionWXYZ)
+        let p90 = try XCTUnwrap(solution.artifact.evidence?.p90ResidualDegrees)
+        XCTAssertGreaterThan(p90, 8)
+        XCTAssertLessThanOrEqual(p90, 15)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(solution.artifact.evidence?.medianResidualDegrees), 3)
+        // Sign evidence is strong, so the best sign guess is applied: the
+        // inverted scene comes out upright.
+        let mappedUp = solution.sourceToCanonical.applied(to: physicalUp)
+        XCTAssertGreaterThan(mappedUp.dot(.unitY), cos(5 * Double.pi / 180))
+    }
+
+    func testResidualTailBeyondFifteenDegreesStaysUnresolved() {
+        let physicalUp = OrientationVector3(x: 0, y: -1, z: 0)
+        var cameras = orbitCameras(up: physicalUp, count: 24)
+        for index in 0..<4 {
+            let original = cameras[index]
+            let forward = original.forwardInWorld
+            let sideways = physicalUp.cross(forward).normalized!
+            let rollRadians = 25 * Double.pi / 180
+            cameras[index] = camera(
+                name: original.imageName,
+                imageUp: physicalUp * cos(rollRadians) + sideways * sin(rollRadians),
+                forward: forward,
+                center: original.centerInWorld,
+                observations: original.trackedObservationCount
+            )
+        }
+
+        let solution = CanonicalOrientationEstimator.estimate(
+            cameras: cameras,
+            orderedImageNames: cameras.map(\.imageName),
+            orderedInput: false,
+            allowCameraUpFallback: false,
+            deterministicSeed: 42
+        )
+
+        XCTAssertEqual(solution.artifact.status, .unresolved)
+        XCTAssertNil(solution.artifact.sourceToCanonicalQuaternionWXYZ)
+        XCTAssertEqual(solution.sourceToCanonical, .identity)
+    }
+
     func testDegenerateNonWalkthroughDoesNotInventAnAxis() {
         let cameras = (0..<12).map { index in
             camera(

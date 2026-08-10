@@ -44,7 +44,8 @@ reject_raster_test_symbols() {
     msplat_stage_profiling_status_for_testing \
     msplat_gpu_timestamp_calibration_for_testing \
     msplat_copy_last_raster_debug \
-    msplat_copy_last_raster_reference_debug; do
+    msplat_copy_last_raster_reference_debug \
+    msplat_copy_isolation_projection_for_testing; do
     if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
       fail "native trainer exports raster test hook: $symbol"
     fi
@@ -113,9 +114,21 @@ expected_keys = {
     "dependencies",
     "deployment_target",
     "densification_memory_patch_sha256",
+    "alpha_cap_patch_sha256",
+    "density_control_patch_sha256",
     "exact_raster_patch_sha256",
     "executable_sha256",
     "geometry_adam_fusion_patch_sha256",
+    "isolation_header_sha256",
+    "isolation_lift_source_sha256",
+    "isolation_mask_header_sha256",
+    "isolation_mask_source_sha256",
+    "isolation_mask_test_sha256",
+    "isolation_patch_sha256",
+    "isolation_runtime_header_sha256",
+    "isolation_runtime_source_sha256",
+    "isolation_source_sha256",
+    "isolation_test_sha256",
     "parallel_radix_scan_patch_sha256",
     "metallib_sha256",
     "metal_safety_patch_sha256",
@@ -123,6 +136,8 @@ expected_keys = {
     "ninja",
     "numeric_stability_patch_sha256",
     "overlay_sha256",
+    "projection_oracle_patch_sha256",
+    "projection_vjp_patch_sha256",
     "patch_sha256",
     "raster_test_sha256",
     "row_span_culling_patch_sha256",
@@ -149,8 +164,22 @@ exact_values = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
-    "overlay_sha256": "ff776be07eaf49219b23b3c460d5d1834d1227882b5f4e54aed627cad72f0e23",
-    "raster_test_sha256": "3cf418fcd564240f1157f3206cb01974454f617327abc9b0c41b71ec49d46e30",
+    "density_control_patch_sha256": "895df7c0562f885b6389897a990683419cdcb319faf2b24e4d1c44d0950432b9",
+    "projection_vjp_patch_sha256": "e283e1c608f2ea940c46cdcc08252ba0381fa7c33f9490c2812e2f1a83157667",
+    "alpha_cap_patch_sha256": "ee5b7f1563248d279f0b1a9d5fe9637feeb171cfa42546004772e7424b7bd7a6",
+    "projection_oracle_patch_sha256": "cfcf5a0c70bb6cbd05c25c1263d19ff87792abfc326fb43df4e1d17baf77c0a3",
+    "overlay_sha256": "a7c9ccd00e697c820b6f1335653922e114350b97141443adcda2175b161ddbbf",
+    "raster_test_sha256": "a7066c5ce8eff0a1ebb0586c83b77ac235446bd500e465fc3bb0e68d88c4ac2e",
+    "isolation_header_sha256": "ecb457dc03d75aaa5a76b34c0d39a5d110629b0a3025b60976e1c1d3f7a9cbc8",
+    "isolation_source_sha256": "65504b0448c61b4f2602d86150ff6ce83be61bfc48cc9f632fa72d95b4992e61",
+    "isolation_runtime_header_sha256": "f3fae8409eeb24446bd9b5f4970b64522f01b1048c25827b712f4bef087b7d82",
+    "isolation_runtime_source_sha256": "87499dde716e8a4ae687ba220684fc5730013e7a6fd8ad7979db9f505c7025dd",
+    "isolation_mask_header_sha256": "51956923935621ef2e3681f33e11b1f63a6d1ed969234ee9e50edab927f712d7",
+    "isolation_mask_source_sha256": "ad9844c13dd427517311f0ad0725ffa348beb4c590d6febc6efe11c38d7240e8",
+    "isolation_lift_source_sha256": "c063a934eee67eb22e04483f32e798e6844ee722dde9daddeed79f5db56c13bc",
+    "isolation_test_sha256": "56b9fd653f70026d93adde200d8b7375bf30df9409b28e78d7db27006a2d5cdf",
+    "isolation_mask_test_sha256": "f4900f77878a22417c1bd397ee87d2730c21344d9ba9ab7e1579bfa083e7d2bc",
+    "isolation_patch_sha256": "a8a579d9d2a5ca23ce87ae0dd2a1f79de8da56bbfa62851244cfdda51bc37f59",
     "patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e",
     "source_notice_patch_sha256": "6deee598c9321c9b98d74b92fd5cce9808069a7a63effcd80615eb7d208d2ffb",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
@@ -163,7 +192,7 @@ exact_values = {
     "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
     "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
     "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
-    "allocation_pressure_patch_sha256": "d5235770565c75387ad42ec4b534895322275822ab5913d0bc05bcf3bba95083",
+    "allocation_pressure_patch_sha256": "34611e91e896f56c9ad81ae2c4bd55352b4172d5cbdb83da7658e9050382b4a8",
     "exact_prefix_hardening_patch_sha256": "510d70ac3413cbf1260881ed1399e5301cc1fce0d783a1e451381c9e3ec8c9fb",
     "quaternion_stability_patch_sha256": "d0aabc26d10b316a669c120ebdfdf573dd645c30c857e97b6ceeaa8c2c76b786",
     "deployment_target": "macOS 15.0",
@@ -202,7 +231,20 @@ if payload.get("cmake_arguments") != expected_cmake_arguments:
 hash_pattern = re.compile(r"[0-9a-f]{64}\Z")
 for key in (
     "source_tree_sha256",
+    "projection_vjp_patch_sha256",
+    "alpha_cap_patch_sha256",
+    "projection_oracle_patch_sha256",
     "overlay_sha256",
+    "isolation_header_sha256",
+    "isolation_source_sha256",
+    "isolation_runtime_header_sha256",
+    "isolation_runtime_source_sha256",
+    "isolation_mask_header_sha256",
+    "isolation_mask_source_sha256",
+    "isolation_lift_source_sha256",
+    "isolation_test_sha256",
+    "isolation_mask_test_sha256",
+    "isolation_patch_sha256",
     "patch_sha256",
     "checkpoint_patch_sha256",
     "numeric_stability_patch_sha256",
@@ -304,6 +346,7 @@ from pathlib import Path
 lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
 expected = {
     "event": "self_check",
+    "isolation_mode_version": 1,
     "scene_bounds_status": "ok",
     "schema_version": 2,
     "sequence": 1,
@@ -316,7 +359,12 @@ try:
     actual = json.loads(lines[0])
 except Exception as exc:
     raise SystemExit(f"native msplat validation failed: self-check emitted invalid JSON: {exc}")
-if actual != expected:
+integer_keys = ("isolation_mode_version", "schema_version", "sequence")
+has_exact_integer_types = (
+    type(actual) is dict
+    and all(type(actual.get(key)) is int for key in integer_keys)
+)
+if not has_exact_integer_types or actual != expected:
     raise SystemExit(
         "native msplat validation failed: self-check event mismatch; "
         f"expected {expected!r}, got {actual!r}"

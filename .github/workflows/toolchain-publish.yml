@@ -405,7 +405,7 @@ jobs:
             --producer "$HANDOFF/producer" \
             --request "$HANDOFF/request/toolchain-release-request.json" \
             --authority-handoff "$HANDOFF/authority-handoff" \
-            --public-key "EasySplatApp/Resources/public_key_ed25519.txt" \
+            --public-key "scripts/release/toolchain_authority_public_key.txt" \
             --benchmark-suite "$HANDOFF/benchmark/verified-suite.json" \
             --benchmark-evidence "$HANDOFF/benchmark/benchmark-transport.json" \
             --output "$OUTPUT" \

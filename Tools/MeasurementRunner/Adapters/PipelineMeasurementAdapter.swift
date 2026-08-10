@@ -273,19 +273,65 @@ func requestedOptions(_ configuration: [String: Any]) throws -> RequestedRunOpti
 
 func toolchain(at root: URL) -> ToolchainPaths {
   let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
-  return ToolchainPaths(
-    root: root,
-    colmap: root.appendingPathComponent("bin/colmap"),
-    msplat: root.appendingPathComponent("bin/easysplat-train"),
-    da3: Da3Toolchain(
-      root: da3Root,
-      sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
-      python: da3Root.appendingPathComponent("python/bin/python3"),
-      models: da3Root.appendingPathComponent("models", isDirectory: true),
-      modelBundle: da3Root.appendingPathComponent("models/DA3-BASE", isDirectory: true),
-      smallModelBundle: da3Root.appendingPathComponent("models/DA3-SMALL", isDirectory: true)
+  #if BASELINE_ADAPTER
+    return ToolchainPaths(
+      root: root,
+      colmap: root.appendingPathComponent("bin/colmap"),
+      msplat: root.appendingPathComponent("bin/easysplat-train"),
+      da3: Da3Toolchain(
+        root: da3Root,
+        sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
+        python: da3Root.appendingPathComponent("python/bin/python3"),
+        models: da3Root.appendingPathComponent("models", isDirectory: true),
+        modelBundle: da3Root.appendingPathComponent("models/DA3-BASE", isDirectory: true),
+        fallbackModelBundle: da3Root.appendingPathComponent(
+          "models/DA3-SMALL", isDirectory: true)
+      )
     )
-  )
+  #else
+    return ToolchainPaths(
+      root: root,
+      dataRoot: root,
+      toolchainIdentity: "local-\(root.lastPathComponent)",
+      colmap: root.appendingPathComponent("bin/colmap"),
+      msplat: root.appendingPathComponent("bin/easysplat-train"),
+      metallib: root.appendingPathComponent("bin/default.metallib"),
+      da3: Da3Toolchain(
+        root: da3Root,
+        sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
+        python: da3Root.appendingPathComponent("python/bin/python3"),
+        models: da3Root.appendingPathComponent("models", isDirectory: true),
+        modelBundle: da3Root.appendingPathComponent("models/DA3-BASE", isDirectory: true),
+        smallModelBundle: da3Root.appendingPathComponent(
+          "models/DA3-SMALL", isDirectory: true)
+      )
+    )
+  #endif
+}
+
+func runMeasurementModelConverter(
+  colmapPath: URL,
+  inputPath: URL,
+  outputPath: URL,
+  outputType: String
+) async throws {
+  #if BASELINE_ADAPTER
+    try ColmapRunner().runModelConverter(
+      colmapPath: colmapPath,
+      inputPath: inputPath,
+      outputPath: outputPath,
+      outputType: outputType,
+      onLog: { _, _ in }
+    )
+  #else
+    try await ColmapRunner().runModelConverter(
+      colmapPath: colmapPath,
+      inputPath: inputPath,
+      outputPath: outputPath,
+      outputType: outputType,
+      onLog: { _, _ in }
+    )
+  #endif
 }
 
 func configuredPlan(
@@ -444,7 +490,7 @@ func prepareMeasurementDataset(
   toolchainRoot: URL,
   label: String,
   orientationQuaternion: [Double]? = nil
-) throws -> PreparedMeasurementDataset {
+) async throws -> PreparedMeasurementDataset {
   guard holdoutIndices == holdoutIndices.sorted(),
     Set(holdoutIndices).count == holdoutIndices.count,
     holdoutIndices.allSatisfy(selectedImageNames.indices.contains)
@@ -486,12 +532,11 @@ func prepareMeasurementDataset(
     try fileManager.copyItem(at: source, to: destination)
     copiedImages.append(destination)
   }
-  try ColmapRunner().runModelConverter(
+  try await runMeasurementModelConverter(
     colmapPath: toolchain(at: toolchainRoot).colmap,
     inputPath: filteredText,
     outputPath: sparse,
-    outputType: "BIN",
-    onLog: { _, _ in }
+    outputType: "BIN"
   )
   var overlay = try JSONSerialization.data(
     withJSONObject: [
@@ -570,6 +615,7 @@ func runMeasurementTraining(
   #else
     return try await MsplatRunner().runTrain(
       msplatPath: toolchain(at: toolchainRoot).msplat,
+      metallibPath: toolchain(at: toolchainRoot).metallib,
       datasetPath: dataset.url,
       outputPath: output,
       expectedIdentity: dataset.identity,
@@ -873,7 +919,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
       isDirectory: true
     )
     try FileManager.default.createDirectory(at: textModel, withIntermediateDirectories: true)
-    try geometry.runModelConverter(
+    try await geometry.runModelConverter(
       colmapPath: toolchain(at: arguments.toolchainRoot).colmap,
       inputPath: adjustedModel,
       outputPath: textModel,
@@ -881,7 +927,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
       onLog: { _, _ in }
     )
     let measured = try ColmapResidualAnalyzer.analyze(modelDirectory: textModel)
-    let dataset = try prepareMeasurementDataset(
+    let dataset = try await prepareMeasurementDataset(
       paths: paths,
       textModel: textModel,
       selectedImageNames: selectedImages,
@@ -2668,7 +2714,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
     pairEvidence: PairGraphEvidence,
     selectedImageNames: [String]
   ) throws -> GeometryRecoveryState {
-    guard metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion,
+    guard ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion),
       metadata.lastRunStartedAt == nil,
       metadata.resolvedRunPlan == resolvedPlan,
       let recovery = metadata.geometryRecovery,
@@ -2688,6 +2734,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
     try recovery.validateBinding(
       expectedImageNames: selectedImageNames,
       expectedSelectedFramesDigest: pairEvidence.selectedFramesDigest,
+      expectedGeometryBackend: .colmap,
       expectedPlannedIncrementalCadence: resolvedPlan.incrementalMappingCadence
     )
     try recovery.validatePairGraphBinding(
@@ -2838,7 +2885,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
       try metadataBinding.dataSnapshot(),
       metadataURL: decisionPaths.metadataURL
     )
-    guard metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion,
+    guard ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion),
       metadata.state.stage == .sfmMatching,
       metadata.state.lastError == nil,
       metadata.lastRunStartedAt == nil,
@@ -3267,12 +3314,11 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
       parent: trialRoot,
       name: "mapper-text-model"
     )
-    try ColmapRunner().runModelConverter(
+    try await runMeasurementModelConverter(
       colmapPath: colmapPath,
       inputPath: selectedBinaryModel,
       outputPath: textModel,
-      outputType: "TXT",
-      onLog: { _, _ in }
+      outputType: "TXT"
     )
     guard try ColmapRunner().captureRuntimeClosure(colmapPath: colmapPath) == runtimeClosure
     else {
@@ -3452,7 +3498,7 @@ func publishMeasurementPLY(_ source: URL, paths: ProjectPaths) throws -> URL {
       try metadataBinding.dataSnapshot(),
       metadataURL: paths.metadataURL
     )
-    guard metadata.formatVersion == ProjectMetadataStore.supportedFormatVersion,
+    guard ProjectMetadataStore.acceptedFormatVersions.contains(metadata.formatVersion),
       metadata.state.stage == .sfmMatching,
       metadata.state.lastError == nil,
       metadata.lastRunStartedAt == nil,
@@ -3950,7 +3996,10 @@ struct PipelineMeasurementAdapter {
             resolvedRunPlan: plan,
             prePipelineDurationSeconds: ProcessInfo.processInfo.systemUptime
               - candidateStartedMonotonicSeconds,
-            prePipelineStartedAt: candidatePreparationStartedAt
+            prePipelineStartedAt: candidatePreparationStartedAt,
+            // Measurements describe training cost, so they must never carry the
+            // preview's overhead. Stated rather than inherited from the default.
+            trainingPreviewPolicy: .disabled
           )
         #endif
         #if BASELINE_ADAPTER
@@ -3992,25 +4041,35 @@ struct PipelineMeasurementAdapter {
             return
           }
         #endif
-        let snapshot = try ProjectArtifactSnapshotStore.load(projectURL: paths.root)
-        guard snapshot.metadata.state.stage == .sfmMapping,
-          snapshot.metadata.state.lastError == nil,
-          snapshot.geometryArtifact != nil else {
-          throw AdapterError.pipelineFailed(
-            snapshot.metadata.state.lastError ?? "pipeline did not complete"
-          )
-        }
+        #if BASELINE_ADAPTER
+          let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+          guard metadata.state.stage == .sfmMapping,
+            metadata.state.lastError == nil else {
+            throw AdapterError.pipelineFailed(
+              metadata.state.lastError ?? "pipeline did not complete"
+            )
+          }
+        #else
+          let snapshot = try ProjectArtifactSnapshotStore.load(projectURL: paths.root)
+          guard snapshot.metadata.state.stage == .sfmMapping,
+            snapshot.metadata.state.lastError == nil,
+            snapshot.geometryArtifact != nil else {
+            throw AdapterError.pipelineFailed(
+              snapshot.metadata.state.lastError ?? "pipeline did not complete"
+            )
+          }
+          let metadata = snapshot.metadata
+        #endif
         let selectedImageNames = try orderedGeometryImageNames(from: paths.geometryManifestURL)
         let textModel = try createMeasurementTextModelDirectory(
           paths: paths,
           variant: arguments.variant
         )
-        try ColmapRunner().runModelConverter(
+        try await runMeasurementModelConverter(
           colmapPath: toolchain(at: arguments.toolchainRoot).colmap,
           inputPath: paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true),
           outputPath: textModel,
-          outputType: "TXT",
-          onLog: { _, _ in }
+          outputType: "TXT"
         )
         let measured = try ColmapResidualAnalyzer.analyze(modelDirectory: textModel)
         if arguments.geometryOnly {
@@ -4052,7 +4111,7 @@ struct PipelineMeasurementAdapter {
             throw AdapterError.invalidArguments("geometry-only is unavailable for this worker")
           #endif
         }
-        let dataset = try prepareMeasurementDataset(
+        let dataset = try await prepareMeasurementDataset(
           paths: paths,
           textModel: textModel,
           selectedImageNames: selectedImageNames,

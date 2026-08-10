@@ -11,6 +11,17 @@ enum SplatViewerOverlayDensity {
     case compact
 }
 
+/// How much of its own chrome the viewer draws.
+///
+/// `.standard` owns the canvas and shows its own controls. `.subordinate` draws the
+/// splat and nothing else: the training preview sits under a panel that already
+/// carries the run's state, and two floating material layers on one canvas read as
+/// clutter rather than as one surface.
+enum SplatViewerPresentation {
+    case standard
+    case subordinate
+}
+
 struct SplatViewerView: View {
     let splatURL: URL
     var reloadToken: Int = 0
@@ -19,13 +30,40 @@ struct SplatViewerView: View {
     var showsLoadErrors: Bool = true
     var onLoadStateChanged: ((SplatViewerLoadState) -> Void)? = nil
     var overlayDensity: SplatViewerOverlayDensity = .regular
+    var presentation: SplatViewerPresentation = .standard
     @StateObject private var controller = SplatViewerController()
     @State private var showHelp = false
 
     var body: some View {
+        if presentation == .subordinate {
+            subordinateBody
+        } else {
+            standardBody
+        }
+    }
+
+    /// Canvas only. The host supplies status, controls, and error reporting, so
+    /// nothing here competes with it.
+    private var subordinateBody: some View {
+        MetalKitSceneView(
+            splatURL: splatURL,
+            reloadToken: reloadToken,
+            loadAttemptRevision: controller.loadAttemptRevision,
+            controller: controller,
+            sceneConfiguration: sceneConfiguration,
+            isTrainingPreview: true,
+            onLoadStateChanged: onLoadStateChanged
+        )
+        .onChange(of: resetCameraToken) { _, _ in
+            controller.resetCamera()
+        }
+    }
+
+    @ViewBuilder
+    private var standardBody: some View {
         let isCompactOverlay = overlayDensity == .compact
         let toolbarSpacing: CGFloat = isCompactOverlay ? 6 : 8
-        let toolbarPadding: CGFloat = isCompactOverlay ? 8 : 12
+        let toolbarPadding: CGFloat = 12
         let toolbarControlSize: ControlSize = isCompactOverlay ? .small : .regular
 
         ZStack(alignment: .topLeading) {
@@ -37,7 +75,6 @@ struct SplatViewerView: View {
                 sceneConfiguration: sceneConfiguration,
                 onLoadStateChanged: onLoadStateChanged
             )
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
 
             HStack(spacing: toolbarSpacing) {
                 Button("Fit") { controller.fitToView() }
@@ -52,12 +89,15 @@ struct SplatViewerView: View {
             .popover(isPresented: $showHelp) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Controls").font(.headline)
+                    Text("Fly: W A S D · E up · Q down")
+                    Text("Sprint: hold Shift")
+                    Divider()
                     Text("Orbit: Drag")
+                    Text("Look: Right-drag or Control-drag")
                     Text("Pan: Option + Drag")
                     Text("Zoom: Scroll or pinch")
                     Divider()
-                    Text("Keyboard: arrows orbit")
-                    Text("Option + arrows pan")
+                    Text("Arrows orbit · Option + arrows pan")
                     Text("+ / − zoom · F fit · R reset")
                 }
                 .padding(12)
