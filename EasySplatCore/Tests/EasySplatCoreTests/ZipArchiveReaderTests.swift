@@ -441,6 +441,44 @@ final class ZipArchiveReaderTests: XCTestCase {
         )
     }
 
+    func testSnapshotRejectsOneRemovedLinkWhileSourceRemainsPathnameReachable() throws {
+        let archive = try ZipFixtureBuilder.build(
+            at: root.appendingPathComponent("linked-source.zip"),
+            entries: [.file(path: "a.txt", contents: Data("payload".utf8))]
+        )
+        let secondLink = root.appendingPathComponent("linked-source-copy.zip")
+        XCTAssertEqual(Darwin.link(archive.path, secondLink.path), 0)
+        let snapshot = try ZipArchiveReader.Snapshot(opening: archive)
+        let entry = try XCTUnwrap(snapshot.entries.first)
+        XCTAssertEqual(Darwin.unlink(secondLink.path), 0)
+
+        let destination = root.appendingPathComponent("linked-source-out", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let destinationDescriptor = Darwin.open(
+            destination.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC
+        )
+        XCTAssertGreaterThanOrEqual(destinationDescriptor, 0)
+        defer { Darwin.close(destinationDescriptor) }
+
+        XCTAssertThrowsError(
+            try snapshot.extract(
+                entry: entry,
+                into: destinationDescriptor,
+                leafName: "a.txt",
+                maximumOutputBytes: 1 << 20,
+                shouldCancel: { false }
+            )
+        ) { error in
+            XCTAssertEqual(error as? ZipArchiveReader.ReaderError, .archiveChanged)
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: destination.appendingPathComponent("a.txt").path
+            )
+        )
+    }
+
     func testSnapshotRejectsEntryOwnedByAnotherSnapshot() throws {
         let archive = try ZipFixtureBuilder.build(
             at: root.appendingPathComponent("snapshot-bound.zip"),

@@ -587,18 +587,18 @@ enum ZipArchiveReader {
             guard Darwin.fstat(descriptor, &current) == 0,
                   current.st_nlink >= 0 else { return false }
             let currentLinkCount = UInt64(current.st_nlink)
-            let oneLinkWasRemoved = allowingOneRemovedLink
-                && linkCount > 0
-                && currentLinkCount + 1 == linkCount
+            let sourceWasFullyUnlinked = allowingOneRemovedLink
+                && linkCount == 1
+                && currentLinkCount == 0
             return (current.st_mode & S_IFMT) == S_IFREG
                 && UInt64(current.st_dev) == device
                 && UInt64(current.st_ino) == inode
                 && current.st_size >= 0
                 && UInt64(current.st_size) == size
-                && (currentLinkCount == linkCount || oneLinkWasRemoved)
+                && (currentLinkCount == linkCount || sourceWasFullyUnlinked)
                 && Int64(current.st_mtimespec.tv_sec) == modificationSeconds
                 && Int64(current.st_mtimespec.tv_nsec) == modificationNanoseconds
-                && (oneLinkWasRemoved
+                && (sourceWasFullyUnlinked
                     || (Int64(current.st_ctimespec.tv_sec) == changeSeconds
                         && Int64(current.st_ctimespec.tv_nsec) == changeNanoseconds))
                 && Int64(current.st_birthtimespec.tv_sec) == birthSeconds
