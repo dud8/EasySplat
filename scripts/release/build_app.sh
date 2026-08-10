@@ -389,6 +389,9 @@ if [ "$RELEASE_MODE" != development-unsigned ]; then
     --output "$INPUT_SNAPSHOT_DIR/source" \
     >"$INPUT_SNAPSHOT_DIR/source-export.json"
   BUILD_SOURCE_ROOT="$INPUT_SNAPSHOT_DIR/source"
+  # Xcode uses this empty SwiftPM support directory as a compiler working
+  # directory. It carries no source bytes and is locked with the reviewed tree.
+  install -d -m 0700 "$BUILD_SOURCE_ROOT/.swiftpm/xcode"
   /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/export_reviewed_source.py" \
     --repository "$ROOT" \
     --source-commit "$SOURCE_COMMIT" \
