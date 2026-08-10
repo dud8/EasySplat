@@ -600,6 +600,10 @@ grep -Fq 'cd "$BUILD_SOURCE_ROOT"' "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'install -d -m 0700 "$BUILD_SOURCE_ROOT/.swiftpm/xcode"' \
   "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'make_owned_tree_writable() {' "$ROOT/scripts/release/build_app.sh"
+grep -Fq 'normalize_distribution_bundle_permissions() {' \
+  "$ROOT/scripts/release/build_app.sh"
+test "$(grep -Fc 'normalize_distribution_bundle_permissions "$APP_BUNDLE"' \
+  "$ROOT/scripts/release/build_app.sh")" -eq 1
 test "$(grep -Fc 'make_owned_tree_writable "$APP_BUNDLE"' \
   "$ROOT/scripts/release/build_app.sh")" -eq 2
 for normalized_tree in \
@@ -651,13 +655,23 @@ metal_bundle_normalize = source.index(
     metal_bundle_copy,
 )
 final_normalize = source.index('make_owned_tree_writable "$APP_BUNDLE"', metal_bundle_normalize)
-seal = source.index("mas_release_evidence.py\" seal-source", final_normalize)
+distribution_permissions = source.index(
+    'normalize_distribution_bundle_permissions "$APP_BUNDLE"',
+    final_normalize,
+)
+seal = source.index("mas_release_evidence.py\" seal-source", distribution_permissions)
 
 assert cleanup < cleanup_normalize < cleanup_remove
 assert derived < preclean_derived < preclean_output < preclean_remove
 assert direct_copy < direct_normalize < first_override
 assert swift_bundle_copy < swift_bundle_normalize < swift_bundle_override
-assert metal_bundle_copy < metal_bundle_normalize < final_normalize < seal
+assert (
+    metal_bundle_copy
+    < metal_bundle_normalize
+    < final_normalize
+    < distribution_permissions
+    < seal
+)
 PY
 normalizer_function="$TMP_DIR/build-app-tree-normalizer.sh"
 awk '/^make_owned_tree_writable\(\) \{/ { include = 1 } \
@@ -688,6 +702,51 @@ awk '/^make_owned_tree_writable\(\) \{/ { include = 1 } \
   ln -s "$normalizer_fixture/locked" "$normalizer_fixture/linked"
   if make_owned_tree_writable "$normalizer_fixture/linked" 2>/dev/null; then
     echo "Build app tree normalization accepted a linked root." >&2
+    exit 1
+  fi
+)
+permission_normalizer_function="$TMP_DIR/build-app-distribution-permissions.sh"
+awk '/^normalize_distribution_bundle_permissions\(\) \{/ { include = 1 } \
+     include { print } \
+     include && /^}/ { exit }' \
+  "$ROOT/scripts/release/build_app.sh" >"$permission_normalizer_function"
+(
+  # shellcheck source=/dev/null
+  source "$permission_normalizer_function"
+  permission_fixture="$TMP_DIR/build-app-distribution-permissions"
+  mkdir -p "$permission_fixture/app/Contents/Resources"
+  touch "$permission_fixture/app/Contents/Resources/resource"
+  touch "$permission_fixture/app/Contents/Resources/executable"
+  chmod 0600 "$permission_fixture/app/Contents/Resources/resource"
+  chmod 0700 "$permission_fixture/app/Contents/Resources/executable"
+  chmod 0700 \
+    "$permission_fixture/app" \
+    "$permission_fixture/app/Contents" \
+    "$permission_fixture/app/Contents/Resources"
+  chflags uchg "$permission_fixture/app/Contents/Resources/resource"
+
+  normalize_distribution_bundle_permissions "$permission_fixture/app"
+
+  test "$(stat -f '%Lp' "$permission_fixture/app")" = 755
+  test "$(stat -f '%Lp' "$permission_fixture/app/Contents/Resources")" = 755
+  test "$(stat -f '%Lp' "$permission_fixture/app/Contents/Resources/resource")" = 644
+  test "$(stat -f '%Lp' "$permission_fixture/app/Contents/Resources/executable")" = 755
+  if find "$permission_fixture/app" -type f ! -perm -004 -print | grep -q .; then
+    echo "Distribution app staging retained root-only-readable files." >&2
+    exit 1
+  fi
+  if find "$permission_fixture/app" -type d ! -perm -005 -print | grep -q .; then
+    echo "Distribution app staging retained root-only-traversable directories." >&2
+    exit 1
+  fi
+  if find "$permission_fixture/app" -flags +uchg -print | grep -q .; then
+    echo "Distribution app staging retained immutable paths." >&2
+    exit 1
+  fi
+  ln -s "$permission_fixture/app" "$permission_fixture/linked"
+  if normalize_distribution_bundle_permissions \
+    "$permission_fixture/linked" 2>/dev/null; then
+    echo "Distribution app permission normalization accepted a linked root." >&2
     exit 1
   fi
 )
