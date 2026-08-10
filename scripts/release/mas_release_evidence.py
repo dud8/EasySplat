@@ -2248,16 +2248,30 @@ def _validate_submission_altool(value: object, label: str) -> dict[str, object]:
 def _upload_delivery_id(response: object) -> str:
     if not isinstance(response, dict):
         _fail("MAS upload response must be a JSON object.")
-    delivery_id = response.get("delivery-id")
-    if (
-        not isinstance(delivery_id, str)
-        or DELIVERY_ID_PATTERN.fullmatch(delivery_id.lower()) is None
+    delivery_ids: list[object] = []
+    legacy_delivery_id = response.get("delivery-id")
+    if legacy_delivery_id is not None:
+        delivery_ids.append(legacy_delivery_id)
+    details = response.get("details")
+    if details is not None:
+        if not isinstance(details, dict):
+            _fail("MAS upload response has invalid delivery details.")
+        current_delivery_id = details.get("delivery-uuid")
+        if current_delivery_id is not None:
+            delivery_ids.append(current_delivery_id)
+    if not delivery_ids or any(
+        not isinstance(value, str)
+        or DELIVERY_ID_PATTERN.fullmatch(value.lower()) is None
+        for value in delivery_ids
     ):
         _fail("MAS upload response has no valid delivery ID.")
+    normalized_delivery_ids = {str(value).lower() for value in delivery_ids}
+    if len(normalized_delivery_ids) != 1:
+        _fail("MAS upload response contains conflicting delivery IDs.")
     success = response.get("success-message")
     if not isinstance(success, str) or not success.strip():
         _fail("MAS upload response does not confirm acceptance.")
-    return delivery_id.lower()
+    return normalized_delivery_ids.pop()
 
 
 def _require_successful_processing_response(
