@@ -597,6 +597,8 @@ grep -Fq 'INPUT_SNAPSHOT_DIR=' "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'TOOLCHAIN_DIR' "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'export_reviewed_source.py' "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'cd "$BUILD_SOURCE_ROOT"' "$ROOT/scripts/release/build_app.sh"
+grep -Fq 'install -d -m 0700 "$BUILD_SOURCE_ROOT/.swiftpm/xcode"' \
+  "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'validate_mas_provisioning_profile.py' \
   "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'PROVISIONING_PROFILE="$VALIDATED_PROVISIONING_PROFILE"' \

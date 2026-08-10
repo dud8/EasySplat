@@ -191,6 +191,31 @@ class ExportReviewedSourceTests(unittest.TestCase):
         finally:
             module.unlock_reviewed_source(destination)
 
+    def test_locked_export_allows_empty_build_support_directories(self) -> None:
+        module = load_module()
+        commit = self.commit_fixture()
+        destination = self.root / "exported"
+        module.export_reviewed_source(
+            repository=self.repository,
+            source_commit=commit,
+            output=destination,
+        )
+        working_directory = destination / ".swiftpm/xcode"
+        working_directory.mkdir(parents=True, mode=0o700)
+
+        try:
+            receipt = module.lock_reviewed_source(
+                repository=self.repository,
+                source_commit=commit,
+                output=destination,
+            )
+
+            self.assertTrue(receipt["locked"])
+            self.assertTrue(os.lstat(working_directory).st_flags & stat.UF_IMMUTABLE)
+            self.assertEqual(list(working_directory.iterdir()), [])
+        finally:
+            module.unlock_reviewed_source(destination)
+
     def test_reverification_detects_a_changed_export(self) -> None:
         module = load_module()
         commit = self.commit_fixture()
