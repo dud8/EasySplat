@@ -2279,6 +2279,36 @@ def _require_successful_processing_response(
 ) -> None:
     if not isinstance(response, dict):
         _fail("MAS processing response must be a JSON object.")
+    legacy_fields = {"delivery-id", "internal-build-state", "processing-errors"}
+    current_fields = {
+        "app-store-attributes",
+        "build-status",
+        "delivery-uuid",
+        "import-status",
+    }
+    has_legacy_schema = any(field in response for field in legacy_fields)
+    has_current_schema = any(field in response for field in current_fields)
+    if has_legacy_schema == has_current_schema:
+        _fail("MAS processing response has an unknown or mixed schema.")
+    if has_current_schema:
+        attributes = response.get("app-store-attributes")
+        if (
+            response.get("build-status") != "VALID"
+            or response.get("import-status") != "VALID"
+            or not isinstance(attributes, dict)
+            or attributes.get("processingState") != "VALID"
+        ):
+            _fail("MAS processing response is not in the valid terminal state.")
+        if response.get("is-on-app-store-connect") is not True:
+            _fail("MAS processing response does not confirm App Store Connect visibility.")
+        response_delivery_id = response.get("delivery-uuid")
+        if (
+            not isinstance(response_delivery_id, str)
+            or DELIVERY_ID_PATTERN.fullmatch(response_delivery_id.lower()) is None
+            or response_delivery_id.lower() != expected_delivery_id
+        ):
+            _fail("MAS processing response names a different delivery ID.")
+        return
     if response.get("internal-build-state") != "READY_TO_TEST":
         _fail("MAS processing response is not in the ready-to-test terminal state.")
     if response.get("is-on-app-store-connect") is not True:

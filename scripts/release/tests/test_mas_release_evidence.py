@@ -1968,6 +1968,131 @@ test ! -e "$4"
         with self.assertRaisesRegex(module.ReleaseEvidenceError, "delivery"):
             module._upload_delivery_id(response)
 
+    def test_processing_receipt_accepts_current_altool_valid_schema(self) -> None:
+        module = self.load_module()
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            repository, _ = self.make_repository(root)
+            app = self.make_app(root, repository)
+            runner = FixtureCommandRunner()
+            package, evidence = self.finalize_fixture(
+                module,
+                root=root,
+                repository=repository,
+                app=app,
+                runner=runner,
+            )
+            upload_response = root / "upload-response.json"
+            upload_response.write_text(
+                '{"delivery-id":"be9c5d83-4150-40cb-91a1-739cf69a6f35",'
+                '"success-message":"accepted"}\n',
+                encoding="utf-8",
+            )
+            upload_receipt = root / "EasySplat.pkg.upload.json"
+            module.record_upload_submission(
+                repository=repository,
+                package=package,
+                evidence=evidence,
+                apple_id="1234567890",
+                expected_version=APP_VERSION,
+                expected_build=APP_BUILD,
+                altool_version="26.40.1 (174001)",
+                response=upload_response,
+                output=upload_receipt,
+                command_runner=runner,
+            )
+            processing_response = root / "processing-response.json"
+            processing_response.write_text(
+                json.dumps(
+                    {
+                        "app-store-attributes": {
+                            "buildAudienceType": "APP_STORE_ELIGIBLE",
+                            "processingState": "VALID",
+                            "version": APP_BUILD,
+                        },
+                        "build-audience-type": "APP_STORE_ELIGIBLE",
+                        "build-status": "VALID",
+                        "delivery-uuid": "be9c5d83-4150-40cb-91a1-739cf69a6f35",
+                        "import-status": "VALID",
+                        "is-on-app-store-connect": True,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            processing_receipt = root / "EasySplat.pkg.processing.json"
+
+            processing = module.record_processing_submission(
+                repository=repository,
+                package=package,
+                evidence=evidence,
+                upload_receipt=upload_receipt,
+                expected_apple_id="1234567890",
+                expected_version=APP_VERSION,
+                expected_build=APP_BUILD,
+                altool_version="26.40.1 (174001)",
+                response=processing_response,
+                output=processing_receipt,
+                command_runner=runner,
+            )
+
+            self.assertEqual(processing["recordType"], "masProcessingSubmission")
+            self.assertEqual(processing["state"], "processed")
+
+    def test_processing_response_rejects_mixed_altool_schemas(self) -> None:
+        module = self.load_module()
+        response = {
+            "app-store-attributes": {"processingState": "VALID"},
+            "build-status": "VALID",
+            "delivery-uuid": "be9c5d83-4150-40cb-91a1-739cf69a6f35",
+            "import-status": "VALID",
+            "is-on-app-store-connect": True,
+            "internal-build-state": "READY_TO_TEST",
+            "processing-errors": [],
+            "delivery-id": "be9c5d83-4150-40cb-91a1-739cf69a6f35",
+        }
+
+        with self.assertRaisesRegex(module.ReleaseEvidenceError, "processing|schema"):
+            module._require_successful_processing_response(
+                response,
+                "be9c5d83-4150-40cb-91a1-739cf69a6f35",
+            )
+
+    def test_processing_response_rejects_nonterminal_current_status(self) -> None:
+        module = self.load_module()
+        delivery_id = "be9c5d83-4150-40cb-91a1-739cf69a6f35"
+        valid = {
+            "app-store-attributes": {"processingState": "VALID"},
+            "build-status": "VALID",
+            "delivery-uuid": delivery_id,
+            "import-status": "VALID",
+            "is-on-app-store-connect": True,
+        }
+        invalid_responses = {
+            "processing build": {**valid, "build-status": "PROCESSING"},
+            "failed import": {**valid, "import-status": "FAILED"},
+            "invalid attributes": {**valid, "app-store-attributes": []},
+            "processing attributes": {
+                **valid,
+                "app-store-attributes": {"processingState": "PROCESSING"},
+            },
+            "not visible": {**valid, "is-on-app-store-connect": False},
+            "missing delivery": {
+                key: value for key, value in valid.items() if key != "delivery-uuid"
+            },
+            "wrong delivery": {
+                **valid,
+                "delivery-uuid": "8b7fd37b-6faf-4c4a-8f32-f20c114d347b",
+            },
+        }
+
+        for label, response in invalid_responses.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                module.ReleaseEvidenceError,
+                "processing|terminal|visibility|delivery|schema",
+            ):
+                module._require_successful_processing_response(response, delivery_id)
+
     def test_upload_attempt_recovers_and_cleans_only_after_a_durable_receipt(self) -> None:
         module = self.load_module()
         with tempfile.TemporaryDirectory() as scratch:
