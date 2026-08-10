@@ -587,10 +587,14 @@ def _validate_profile(
         != expected_team_id
     ):
         _fail("provisioning profile application does not match")
-    if entitlements.get("com.apple.security.app-sandbox") is not True:
+    if (
+        "com.apple.security.app-sandbox" in entitlements
+        and entitlements["com.apple.security.app-sandbox"] is not True
+    ):
         _fail("provisioning profile does not require the app sandbox")
     if (
-        entitlements.get("com.apple.security.files.user-selected.read-write")
+        "com.apple.security.files.user-selected.read-write" in entitlements
+        and entitlements["com.apple.security.files.user-selected.read-write"]
         is not True
     ):
         _fail("provisioning profile does not allow selected file access")
