@@ -28,6 +28,19 @@ APP_BUNDLE=""
 SIGNING_RECEIPT=""
 SIGNED_BUILD_COMPLETE=0
 
+make_owned_tree_writable() {
+  local target="$1"
+  if [ -z "$target" ] || [ ! -e "$target" ]; then
+    return 0
+  fi
+  if [ -L "$target" ] || [ ! -d "$target" ]; then
+    echo "Refusing to normalize a linked or non-directory build tree: $target" >&2
+    return 1
+  fi
+  /usr/bin/chflags -R nouchg "$target"
+  /bin/chmod -R u+rwX "$target"
+}
+
 cleanup() {
   local status=$?
   trap - EXIT
@@ -45,6 +58,7 @@ cleanup() {
   fi
   if [ "$RELEASE_MODE" = production ] || [ "$RELEASE_MODE" = app-store ]; then
    if [ "$SIGNED_BUILD_COMPLETE" -ne 1 ]; then
+    make_owned_tree_writable "$APP_BUNDLE" 2>/dev/null || true
     [ -z "$APP_BUNDLE" ] || rm -rf "$APP_BUNDLE"
     [ -z "$SIGNING_RECEIPT" ] || rm -f "$SIGNING_RECEIPT"
    fi
@@ -459,6 +473,8 @@ if [ -z "$PROJECT_URL" ] \
   PROJECT_URL="$(cat "$BUILD_SOURCE_ROOT/EasySplatApp/Resources/project_home_url.txt")"
 fi
 
+make_owned_tree_writable "$DERIVED"
+make_owned_tree_writable "$OUT"
 rm -rf "$DERIVED" "$OUT"
 
 xcodebuild_arguments=(
@@ -603,6 +619,9 @@ EOF
 # Copy direct resources used by Bundle.main
 if [ -d "$BUILD_SOURCE_ROOT/EasySplatApp/Resources" ]; then
   cp -R "$BUILD_SOURCE_ROOT/EasySplatApp/Resources/." "$RES_DIR/"
+  # cp -R preserves the immutable flags that bind the reviewed source. The app
+  # staging tree must remain writable until its approved overrides are sealed.
+  make_owned_tree_writable "$RES_DIR"
 fi
 # Code signing treats every plain file under Contents/Helpers as unsigned nested
 # code, so only Mach-Os live there; the payload is sealed as ordinary resources.
@@ -649,9 +668,11 @@ if [ ! -s "$RES_DIR/EasySplatAppIcon.icns" ]; then
 fi
 LICENSE_DIR="$RES_DIR/Licenses"
 mkdir -p "$LICENSE_DIR"
-install -m 0644 "$BUILD_SOURCE_ROOT/LICENSE" "$LICENSE_DIR/EasySplat-LICENSE.txt"
-install -m 0644 "$BUILD_SOURCE_ROOT/NOTICE.md" "$LICENSE_DIR/EasySplat-NOTICE.md"
-install -m 0644 "$BUILD_SOURCE_ROOT/ThirdParty/MetalSplatter/LICENSE" "$LICENSE_DIR/MetalSplatter-LICENSE.txt"
+/bin/cp -X "$BUILD_SOURCE_ROOT/LICENSE" "$LICENSE_DIR/EasySplat-LICENSE.txt"
+/bin/cp -X "$BUILD_SOURCE_ROOT/NOTICE.md" "$LICENSE_DIR/EasySplat-NOTICE.md"
+/bin/cp -X "$BUILD_SOURCE_ROOT/ThirdParty/MetalSplatter/LICENSE" \
+  "$LICENSE_DIR/MetalSplatter-LICENSE.txt"
+/bin/chmod 0644 "$LICENSE_DIR"/*
 
 mkdir -p "$OVERRIDE_RES_DIR"
 printf "%s" "$PROJECT_URL" > "$OVERRIDE_RES_DIR/project_home_url.txt"
@@ -669,6 +690,7 @@ fi
 # Copy SwiftPM resource bundles (if present)
 if [ -d "$DERIVED/Build/Products/Release/EasySplat_EasySplatApp.bundle" ]; then
   cp -R "$DERIVED/Build/Products/Release/EasySplat_EasySplatApp.bundle" "$RES_DIR/"
+  make_owned_tree_writable "$RES_DIR/EasySplat_EasySplatApp.bundle"
   cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/EasySplat_EasySplatApp.bundle/"
   if [ -d "$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources" ]; then
     cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources/"
@@ -676,7 +698,12 @@ if [ -d "$DERIVED/Build/Products/Release/EasySplat_EasySplatApp.bundle" ]; then
 fi
 if [ -d "$DERIVED/Build/Products/Release/MetalSplatter_MetalSplatter.bundle" ]; then
   cp -R "$DERIVED/Build/Products/Release/MetalSplatter_MetalSplatter.bundle" "$RES_DIR/"
+  make_owned_tree_writable "$RES_DIR/MetalSplatter_MetalSplatter.bundle"
 fi
+
+# No copied source or toolchain flag may make the staged app resistant to
+# validation, signing, or failure cleanup.
+make_owned_tree_writable "$APP_BUNDLE"
 
 if [ "$RELEASE_MODE" != development-unsigned ]; then
   /usr/bin/python3 -I "$BUILD_SOURCE_ROOT/scripts/release/mas_release_evidence.py" seal-source \

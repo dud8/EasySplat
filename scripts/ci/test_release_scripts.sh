@@ -599,6 +599,98 @@ grep -Fq 'export_reviewed_source.py' "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'cd "$BUILD_SOURCE_ROOT"' "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'install -d -m 0700 "$BUILD_SOURCE_ROOT/.swiftpm/xcode"' \
   "$ROOT/scripts/release/build_app.sh"
+grep -Fq 'make_owned_tree_writable() {' "$ROOT/scripts/release/build_app.sh"
+test "$(grep -Fc 'make_owned_tree_writable "$APP_BUNDLE"' \
+  "$ROOT/scripts/release/build_app.sh")" -eq 2
+for normalized_tree in \
+  '$DERIVED' \
+  '$OUT' \
+  '$RES_DIR' \
+  '$RES_DIR/EasySplat_EasySplatApp.bundle' \
+  '$RES_DIR/MetalSplatter_MetalSplatter.bundle'; do
+  grep -Fq "make_owned_tree_writable \"$normalized_tree\"" \
+    "$ROOT/scripts/release/build_app.sh"
+done
+if grep -Eq 'install -m 0644 "\$BUILD_SOURCE_ROOT/(LICENSE|NOTICE\.md|ThirdParty/MetalSplatter/LICENSE)"' \
+  "$ROOT/scripts/release/build_app.sh"; then
+  echo "Reviewed-source license staging preserves immutable source flags." >&2
+  exit 1
+fi
+/usr/bin/python3 -I - "$ROOT/scripts/release/build_app.sh" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+
+cleanup = source.index("cleanup() {")
+cleanup_normalize = source.index('make_owned_tree_writable "$APP_BUNDLE"', cleanup)
+cleanup_remove = source.index('rm -rf "$APP_BUNDLE"', cleanup_normalize)
+derived = source.index('DERIVED="$BUILD_ROOT/DerivedData"')
+preclean_derived = source.index('make_owned_tree_writable "$DERIVED"', derived)
+preclean_output = source.index('make_owned_tree_writable "$OUT"', preclean_derived)
+preclean_remove = source.index('rm -rf "$DERIVED" "$OUT"', preclean_output)
+direct_copy = source.index('cp -R "$BUILD_SOURCE_ROOT/EasySplatApp/Resources/."')
+direct_normalize = source.index('make_owned_tree_writable "$RES_DIR"', direct_copy)
+first_override = source.index('cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/"', direct_normalize)
+swift_bundle_copy = source.index(
+    'cp -R "$DERIVED/Build/Products/Release/EasySplat_EasySplatApp.bundle"'
+)
+swift_bundle_normalize = source.index(
+    'make_owned_tree_writable "$RES_DIR/EasySplat_EasySplatApp.bundle"',
+    swift_bundle_copy,
+)
+swift_bundle_override = source.index(
+    'cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/EasySplat_EasySplatApp.bundle/"',
+    swift_bundle_normalize,
+)
+metal_bundle_copy = source.index(
+    'cp -R "$DERIVED/Build/Products/Release/MetalSplatter_MetalSplatter.bundle"'
+)
+metal_bundle_normalize = source.index(
+    'make_owned_tree_writable "$RES_DIR/MetalSplatter_MetalSplatter.bundle"',
+    metal_bundle_copy,
+)
+final_normalize = source.index('make_owned_tree_writable "$APP_BUNDLE"', metal_bundle_normalize)
+seal = source.index("mas_release_evidence.py\" seal-source", final_normalize)
+
+assert cleanup < cleanup_normalize < cleanup_remove
+assert derived < preclean_derived < preclean_output < preclean_remove
+assert direct_copy < direct_normalize < first_override
+assert swift_bundle_copy < swift_bundle_normalize < swift_bundle_override
+assert metal_bundle_copy < metal_bundle_normalize < final_normalize < seal
+PY
+normalizer_function="$TMP_DIR/build-app-tree-normalizer.sh"
+awk '/^make_owned_tree_writable\(\) \{/ { include = 1 } \
+     include { print } \
+     include && /^}/ { exit }' \
+  "$ROOT/scripts/release/build_app.sh" >"$normalizer_function"
+(
+  # shellcheck source=/dev/null
+  source "$normalizer_function"
+  normalizer_fixture="$TMP_DIR/build-app-tree-normalizer"
+  mkdir -p "$normalizer_fixture/locked/nested"
+  touch "$normalizer_fixture/locked/nested/resource"
+  chmod 0400 "$normalizer_fixture/locked/nested/resource"
+  chmod 0500 "$normalizer_fixture/locked/nested" "$normalizer_fixture/locked"
+  chflags uchg \
+    "$normalizer_fixture/locked/nested/resource" \
+    "$normalizer_fixture/locked/nested" \
+    "$normalizer_fixture/locked"
+
+  make_owned_tree_writable "$normalizer_fixture/locked"
+
+  test -w "$normalizer_fixture/locked/nested/resource"
+  test -w "$normalizer_fixture/locked/nested"
+  if find "$normalizer_fixture/locked" -flags +uchg -print | grep -q .; then
+    echo "Build app tree normalization left immutable staging paths." >&2
+    exit 1
+  fi
+  ln -s "$normalizer_fixture/locked" "$normalizer_fixture/linked"
+  if make_owned_tree_writable "$normalizer_fixture/linked" 2>/dev/null; then
+    echo "Build app tree normalization accepted a linked root." >&2
+    exit 1
+  fi
+)
 grep -Fq 'validate_mas_provisioning_profile.py' \
   "$ROOT/scripts/release/build_app.sh"
 grep -Fq 'PROVISIONING_PROFILE="$VALIDATED_PROVISIONING_PROFILE"' \
