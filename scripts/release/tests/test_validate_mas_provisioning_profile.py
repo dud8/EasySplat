@@ -360,9 +360,9 @@ class ValidateMasProvisioningProfileTests(unittest.TestCase):
         for label, key, value in (
             ("sandbox disabled", "com.apple.security.app-sandbox", False),
             (
-                "file access missing",
+                "file access disabled",
                 "com.apple.security.files.user-selected.read-write",
-                None,
+                False,
             ),
             ("debugging enabled", "get-task-allow", True),
         ):
@@ -389,6 +389,30 @@ class ValidateMasProvisioningProfileTests(unittest.TestCase):
             profile = self.valid_profile()
             entitlements = dict(profile["Entitlements"])  # type: ignore[arg-type]
             entitlements["get-task-allow"] = False
+            profile["Entitlements"] = entitlements
+
+            module.validate_and_snapshot(
+                input_profile=str(source),
+                output_profile=str(output),
+                expected_team_id=TEAM_ID,
+                expected_bundle_identifier=BUNDLE_ID,
+                certificate_sha1=CERTIFICATE_SHA1,
+                command_runner=CMSRunner(profile),
+            )
+
+            self.assertTrue(output.is_file())
+
+    def test_accepts_store_profile_without_app_managed_entitlements(self) -> None:
+        module = self.load_module()
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch).resolve()
+            source = root / "selected.provisionprofile"
+            output = root / "validated.provisionprofile"
+            source.write_bytes(b"opaque CMS fixture")
+            profile = self.valid_profile()
+            entitlements = dict(profile["Entitlements"])  # type: ignore[arg-type]
+            del entitlements["com.apple.security.app-sandbox"]
+            del entitlements["com.apple.security.files.user-selected.read-write"]
             profile["Entitlements"] = entitlements
 
             module.validate_and_snapshot(
